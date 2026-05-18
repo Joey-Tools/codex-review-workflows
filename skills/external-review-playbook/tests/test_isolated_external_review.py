@@ -985,6 +985,9 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         env["PATH"] = f"{self.fake_bin}:{env['PATH']}"
         env["ISOLATED_EXTERNAL_REVIEW_TEST_FAKE_CODEX"] = "1"
         env["FAKE_CODEX_PATH"] = str((self.fake_bin / "codex").resolve())
+        env["CODEX_GH_COPILOT_COMPANION_PATH"] = str(
+            (self.fake_bin / "copilot").resolve()
+        )
         return env
 
     def _load_script_module(self):
