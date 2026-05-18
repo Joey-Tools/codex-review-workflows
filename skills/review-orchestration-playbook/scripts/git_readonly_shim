@@ -1,0 +1,432 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+
+
+ALLOWED_SUBCOMMANDS = {
+    "blame",
+    "cat-file",
+    "describe",
+    "diff",
+    "diff-files",
+    "diff-index",
+    "diff-tree",
+    "grep",
+    "log",
+    "ls-files",
+    "ls-tree",
+    "merge-base",
+    "name-rev",
+    "rev-list",
+    "rev-parse",
+    "show",
+    "status",
+    "symbolic-ref",
+}
+
+SAFE_FLAGS_WITH_VALUE = {
+    "-C",
+    "--git-common-dir",
+    "--git-dir",
+    "--namespace",
+    "--super-prefix",
+    "--work-tree",
+}
+
+BLOCKED_FLAGS_WITH_VALUE = {
+    "-c",
+    "--config-env",
+    "--exec-path",
+}
+
+META_FLAGS = {"--help", "--version"}
+
+SAFE_LONG_FLAGS_WITH_VALUE = {
+    "--git-common-dir",
+    "--git-dir",
+    "--namespace",
+    "--super-prefix",
+    "--work-tree",
+}
+
+BLOCKED_LONG_FLAGS_WITH_VALUE = {
+    "--config-env",
+    "--exec-path",
+}
+
+STRIPPED_ENV_KEYS = {
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_DIR",
+    "GIT_EXEC_PATH",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_PAGER",
+    "GIT_WORK_TREE",
+    "PAGER",
+}
+
+STRIPPED_ENV_PREFIXES = (
+    "GIT_CONFIG_KEY_",
+    "GIT_CONFIG_VALUE_",
+)
+
+GLOBAL_HARDENING_ARGS = [
+    "--no-pager",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    f"core.hooksPath={os.devnull}",
+    "-c",
+    "diff.external=",
+    "-c",
+    "gpg.program=",
+    "-c",
+    "gpg.ssh.program=",
+    "-c",
+    "gpg.x509.program=",
+]
+
+DIFFISH_SUBCOMMANDS = {
+    "blame",
+    "diff",
+    "diff-files",
+    "diff-index",
+    "diff-tree",
+    "log",
+    "show",
+}
+
+DIFFISH_HARDENING_ARGS = [
+    "--no-ext-diff",
+    "--no-textconv",
+]
+
+BLOCKED_SUBCOMMAND_FLAGS = {
+    "blame": {"--textconv"},
+    "cat-file": {"--filters", "--textconv"},
+    "diff": {"--ext-diff", "--textconv"},
+    "diff-files": {"--ext-diff", "--textconv"},
+    "diff-index": {"--ext-diff", "--textconv"},
+    "diff-tree": {"--ext-diff", "--textconv"},
+    "grep": {"--open-files-in-pager", "--textconv"},
+    "log": {"--ext-diff", "--textconv"},
+    "show": {"--ext-diff", "--textconv"},
+}
+
+BLOCKED_SUBCOMMAND_SHORT_FLAG_ALIASES = {
+    "grep": {
+        "-O": "--open-files-in-pager",
+    },
+}
+
+VALUE_TAKING_SUBCOMMAND_FLAGS = {
+    "grep": {
+        "-A",
+        "-B",
+        "-C",
+        "-e",
+        "-f",
+        "-m",
+        "--after-context",
+        "--before-context",
+        "--color",
+        "--context",
+        "--max-count",
+        "--max-depth",
+        "--open-files-in-pager",
+        "--threads",
+    },
+}
+
+FILTERED_WORKTREE_SUBCOMMANDS = {
+    "blame",
+    "diff",
+    "diff-files",
+    "diff-index",
+    "status",
+}
+
+FILTER_KEY_RE = re.compile(
+    r"^filter\.(?P<driver>.+)\.(?:clean|process|required|smudge)$"
+)
+FILTER_QUERY_PATTERN = r"^filter\..*"
+
+
+def _parse_argv(argv: list[str]) -> tuple[str, str | None, int | None]:
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg in META_FLAGS:
+            return "meta", arg, index
+        if arg in BLOCKED_FLAGS_WITH_VALUE:
+            return "blocked-option", arg, index
+        if arg.startswith("-c") and arg != "-c":
+            return "blocked-option", "-c", index
+        if any(
+            arg == flag or arg.startswith(flag + "=")
+            for flag in BLOCKED_LONG_FLAGS_WITH_VALUE
+        ):
+            return "blocked-option", arg.split("=", 1)[0], index
+        if arg in SAFE_FLAGS_WITH_VALUE:
+            index += 2
+            continue
+        if any(arg.startswith(flag + "=") for flag in SAFE_LONG_FLAGS_WITH_VALUE):
+            index += 1
+            continue
+        if arg == "--":
+            return "blocked-subcommand", None, None
+        if arg.startswith("-"):
+            index += 1
+            continue
+        return "subcommand", arg, index
+    return "blocked-subcommand", None, None
+
+
+def _sanitized_exec_env(real_git: str) -> dict[str, str]:
+    env = dict(os.environ)
+    for key in STRIPPED_ENV_KEYS:
+        env.pop(key, None)
+    for key in list(env):
+        if key.startswith(STRIPPED_ENV_PREFIXES):
+            env.pop(key, None)
+
+    env["CODEX_REAL_GIT"] = real_git
+    env["GIT_ATTR_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_PAGER"] = "cat"
+    env["PAGER"] = "cat"
+    trusted_path_entries = [os.path.dirname(os.path.realpath(real_git))]
+    for entry in os.defpath.split(os.pathsep):
+        if entry and entry not in trusted_path_entries:
+            trusted_path_entries.append(entry)
+    env["PATH"] = os.pathsep.join(trusted_path_entries)
+    return env
+
+
+def _selector_args(
+    forwarded_args: list[str],
+    *,
+    subcommand_index: int | None,
+) -> list[str]:
+    limit = len(forwarded_args) if subcommand_index is None else subcommand_index
+    selectors: list[str] = []
+    index = 0
+    while index < limit:
+        arg = forwarded_args[index]
+        if arg in SAFE_FLAGS_WITH_VALUE and index + 1 < limit:
+            selectors.extend([arg, forwarded_args[index + 1]])
+            index += 2
+            continue
+        if any(arg.startswith(flag + "=") for flag in SAFE_LONG_FLAGS_WITH_VALUE):
+            selectors.append(arg)
+            index += 1
+            continue
+        index += 1
+    return selectors
+
+
+def _discover_filter_drivers(
+    real_git: str,
+    forwarded_args: list[str],
+    *,
+    subcommand: str | None,
+    subcommand_index: int | None,
+) -> list[str]:
+    if subcommand not in FILTERED_WORKTREE_SUBCOMMANDS:
+        return []
+
+    selectors = _selector_args(forwarded_args, subcommand_index=subcommand_index)
+    completed = subprocess.run(
+        [
+            real_git,
+            *selectors,
+            "config",
+            "--local",
+            "--name-only",
+            "--get-regexp",
+            FILTER_QUERY_PATTERN,
+        ],
+        capture_output=True,
+        check=False,
+        env=_sanitized_exec_env(real_git),
+        text=True,
+    )
+    if completed.returncode == 1:
+        return []
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip() or "unknown error"
+        if any(
+            marker in detail
+            for marker in (
+                "--local can only be used inside a git repository",
+                "not a git repository",
+                "not in a git directory",
+            )
+        ):
+            return []
+        raise RuntimeError(
+            f"readonly git shim could not inspect local filter config: {detail}"
+        )
+
+    drivers: set[str] = set()
+    for line in completed.stdout.splitlines():
+        match = FILTER_KEY_RE.fullmatch(line.strip())
+        if match:
+            drivers.add(match.group("driver"))
+    return sorted(drivers)
+
+
+def _apply_filter_override_env(
+    env: dict[str, str],
+    drivers: list[str],
+) -> dict[str, str]:
+    if not drivers:
+        return env
+
+    override_pairs: list[tuple[str, str]] = []
+    for driver in drivers:
+        override_pairs.extend(
+            [
+                (f"filter.{driver}.clean", ""),
+                (f"filter.{driver}.smudge", ""),
+                (f"filter.{driver}.process", ""),
+                (f"filter.{driver}.required", "false"),
+            ]
+        )
+
+    env["GIT_CONFIG_COUNT"] = str(len(override_pairs))
+    for index, (key, value) in enumerate(override_pairs):
+        env[f"GIT_CONFIG_KEY_{index}"] = key
+        env[f"GIT_CONFIG_VALUE_{index}"] = value
+    return env
+
+
+def _blocked_subcommand_flag(
+    forwarded_args: list[str],
+    *,
+    subcommand: str | None,
+    subcommand_index: int | None,
+) -> str | None:
+    if subcommand is None or subcommand_index is None:
+        return None
+
+    blocked_flags = BLOCKED_SUBCOMMAND_FLAGS.get(subcommand)
+    short_aliases = BLOCKED_SUBCOMMAND_SHORT_FLAG_ALIASES.get(subcommand, {})
+    value_taking_flags = VALUE_TAKING_SUBCOMMAND_FLAGS.get(subcommand, set())
+
+    index = subcommand_index + 1
+    while index < len(forwarded_args):
+        arg = forwarded_args[index]
+        if arg == "--":
+            break
+        if blocked_flags:
+            for flag in blocked_flags:
+                if arg == flag or arg.startswith(flag + "="):
+                    return flag
+        for flag, display in short_aliases.items():
+            if arg == flag or arg.startswith(flag):
+                return display
+        if arg in value_taking_flags and index + 1 < len(forwarded_args):
+            index += 2
+            continue
+        index += 1
+    return None
+
+
+def _exec_argv(
+    real_git: str,
+    forwarded_args: list[str],
+    *,
+    subcommand: str | None,
+    subcommand_index: int | None,
+) -> tuple[list[str], dict[str, str]]:
+    env = _sanitized_exec_env(real_git)
+    env = _apply_filter_override_env(
+        env,
+        _discover_filter_drivers(
+            real_git,
+            forwarded_args,
+            subcommand=subcommand,
+            subcommand_index=subcommand_index,
+        ),
+    )
+    argv = [real_git, *GLOBAL_HARDENING_ARGS, *forwarded_args]
+    if subcommand in DIFFISH_SUBCOMMANDS and subcommand_index is not None:
+        insert_at = (
+            1
+            + len(GLOBAL_HARDENING_ARGS)
+            + subcommand_index
+            + 1
+        )
+        argv[insert_at:insert_at] = DIFFISH_HARDENING_ARGS
+    return argv, env
+
+
+def main() -> int:
+    real_git = os.environ.get("CODEX_REAL_GIT")
+    if not real_git:
+        print("readonly git shim missing CODEX_REAL_GIT", file=sys.stderr)
+        return 127
+
+    forwarded_args = sys.argv[1:]
+    action, value, subcommand_index = _parse_argv(forwarded_args)
+    if action == "blocked-option":
+        print(f"readonly git shim blocked global option: {value}", file=sys.stderr)
+        return 126
+    blocked_flag = _blocked_subcommand_flag(
+        forwarded_args,
+        subcommand=value,
+        subcommand_index=subcommand_index,
+    )
+    if blocked_flag is not None:
+        print(
+            f"readonly git shim blocked subcommand option: {blocked_flag}",
+            file=sys.stderr,
+        )
+        return 126
+    if (
+        action == "meta"
+        or value == "help"
+        or value in ALLOWED_SUBCOMMANDS
+    ):
+        try:
+            exec_argv, exec_env = _exec_argv(
+                real_git,
+                forwarded_args,
+                subcommand=value,
+                subcommand_index=subcommand_index,
+            )
+        except RuntimeError as error:
+            print(str(error), file=sys.stderr)
+            return 126
+        os.execve(
+            real_git,
+            exec_argv,
+            exec_env,
+        )
+
+    blocked = value or "(none)"
+    print(
+        f"readonly git shim blocked subcommand: {blocked}",
+        file=sys.stderr,
+    )
+    return 126
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

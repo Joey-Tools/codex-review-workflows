@@ -1,0 +1,4 @@
+interface:
+  display_name: "External Review Playbook (Compatibility Alias)"
+  short_description: "Compatibility alias for the canonical Review Orchestration Playbook."
+  default_prompt: "If an older prompt names $external-review-playbook, load it as a compatibility alias and then follow $review-orchestration-playbook for the current review workflow."

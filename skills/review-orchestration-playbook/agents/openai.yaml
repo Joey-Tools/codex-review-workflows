@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review Orchestration Playbook"
+  short_description: "Choose and drive reliable internal or external review lanes."
+  default_prompt: "Use $review-orchestration-playbook to choose the right internal or external review lane and report only terminal findings or explicit failure modes."
