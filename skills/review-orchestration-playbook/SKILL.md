@@ -1,6 +1,6 @@
 ---
 name: review-orchestration-playbook
-description: Orchestrate the user's helper-backed internal Codex review, fresh-context GPT/Codex subagent-style review requests, offline frozen-diff baselines, and explicit opt-in external reviewer lanes when entrypoint choice, sandbox/runtime shape, frozen review scope, or deterministic fallback behavior is part of the problem. Do not orchestrate review-only child prompts that forbid starting reviewers; those prompts should directly inspect and output findings.
+description: Orchestrate the user's helper-backed internal Codex review, fresh-context GPT/Codex subagent-style review requests, offline-frozen-diff-review baselines, and explicit opt-in external reviewer lanes when entrypoint choice, sandbox/runtime shape, frozen review scope, or deterministic fallback behavior is part of the problem. Do not orchestrate review-only child prompts that forbid starting reviewers; those prompts should directly inspect and output findings.
 ---
 
 # Review Orchestration Playbook
@@ -9,18 +9,18 @@ description: Orchestrate the user's helper-backed internal Codex review, fresh-c
 
 Use this skill when the hard part is not "what code changed" but "which review lane can produce a trustworthy final result in the current environment."
 
-For PR readiness, load `$pr-readiness-review-workflow` first. That workflow owns the independent online Codex PR review thread. This playbook provides the offline/helper review lanes and explicit external-review opt-ins; it must not silently replace the online PR review thread.
+For PR readiness, load `$pr-readiness-review-workflow` first. That workflow owns `independent-codex-pr-review` and also checks the separate best-effort-by-default GitHub `@codex review` / `codex/review-gate` lane when it exists or is required by branch protection. This playbook provides `offline-frozen-diff-review` and explicit external-review opt-ins; it must not silently replace either PR-level lane.
 
 ## Workflow
 
 1. Classify the review job first.
 - Review-only child lane: if the prompt says `independent code reviewer`, `review-only`, `不要启动其他 reviewer`, `不要等待 CI`, or `不要执行 PR readiness orchestration`, perform direct findings-only code review. Do not call `$pr-readiness-review-workflow` and do not start another helper or external reviewer.
-- Parent PR readiness online review orchestration: do not handle it here as a helper lane. Use `$pr-readiness-review-workflow` and start a separate Codex CLI review-only thread for the PR.
-- Internal/offline Codex review: default to `codex-review`, fall back to `codex-readonly` for a deterministic diff-fed baseline, and use `codex-parallel` only when the caller explicitly wants dual-lane coverage and can consume an aggregate final artifact.
+- Parent PR readiness `independent-codex-pr-review` orchestration: do not handle it here as a helper lane. Use `$pr-readiness-review-workflow` and start a separate Codex CLI review-only thread for the PR.
+- `offline-frozen-diff-review` / internal Codex review: default to `codex-review`, fall back to `codex-readonly` for a deterministic diff-fed baseline, and use `codex-parallel` only when the caller explicitly wants dual-lane coverage and can consume an aggregate final artifact.
 - Non-Codex external review: choose among `opencode`, Cursor `agent`, `copilot`, `gh copilot`, Claude, or similar only when the user explicitly asks for that lane or the active workflow explicitly marks it opt-in.
 - Fresh-context GPT/Codex subagent review requests are still review-lane work. First decide whether the helper-backed `codex-review` lane satisfies the request. If the user specifically wants an in-process child agent, use the `reviewer` agent role; do not prompt a `default` coding worker as the reviewer unless the user explicitly requires an exact model that the reviewer role cannot provide, and report that as a non-standard fallback.
 - When `codex-readonly` is the chosen lane, default to the helper's `stateful start|status|wait|final` lifecycle instead of a plain one-shot run.
-- A helper-backed subagent/internal lane is not equivalent to the independent Codex CLI PR review prompt that the user runs from outside the parent workflow. Do not substitute one for the other in PR readiness gates.
+- A helper-backed subagent/internal lane is not equivalent to `independent-codex-pr-review`, and GitHub `@codex review` / `codex/review-gate` is also a separate best-effort-by-default lane. Do not substitute any one of these for another in PR readiness gates.
 
 2. Preflight the real runtime.
 - Probe the exact local entrypoint, model id, auth state, report-sink shape, and sandbox behavior before building a large review prompt.
@@ -65,7 +65,7 @@ For PR readiness, load `$pr-readiness-review-workflow` first. That workflow owns
 
 - Do not claim a clean review unless the final reviewer artifact actually says so.
 - Do not silently replace the default internal `codex-review` lane with `codex-parallel`.
-- Do not treat helper-backed internal review as a replacement for `$pr-readiness-review-workflow`'s independent online Codex PR review thread.
+- Do not treat helper-backed internal review as a replacement for `$pr-readiness-review-workflow`'s `independent-codex-pr-review`.
 - Do not make OpenCode, Cursor `agent`, Copilot, Claude, or other non-Codex external reviewers required by default.
 - Do not treat a cheap readiness smoke or trivial prompt as a finished review.
 - Do not widen git or sandbox access just because one reviewer tried the wrong command shape.

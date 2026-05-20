@@ -9,7 +9,7 @@ description: "Run a local pre-commit delivery gate for non-trivial repo changes:
 
 这个 skill 只负责本地落地到 commit 前的门禁：`plan -> code -> test -> review -> commit`。
 
-不要把 PR readiness、线上 PR comments、merge 前 review、远端 CI 等待混入这个 skill。那些任务使用 `$pr-readiness-review-workflow`，并按它的 online + offline review gate 处理。
+不要把 PR readiness、线上 PR comments、merge 前 review、远端 CI 等待混入这个 skill。那些任务使用 `$pr-readiness-review-workflow`，并按命名的 PR readiness gates 处理。
 
 如果 the user 要求的是完整流程、feature ready 到 merge-ready、`在合并前停止`、`stop before merge`，或类似“用 workflow 完成”且上下文已经在讨论 PR readiness，这个 skill 只是第一阶段。commit 通过后必须继续 hand off 到 `$pr-readiness-review-workflow`；不要把本地 commit 当作终点，除非 the user 明确说只做 local/pre-commit gate。
 
@@ -44,7 +44,7 @@ description: "Run a local pre-commit delivery gate for non-trivial repo changes:
 - 只有实现、验证、文档和本地/internal review 都干净后才 commit。
 - Commit 保持聚焦；本地 review anchor commits 可以用于冻结范围，最终目标分支落地仍应是经过 gate 的 landing shape。
 - local-gate-only 任务不 push，除非 the user 另行明确要求。
-- 如果第 1 步记录了 PR readiness handoff，commit 不是终点，且该 handoff 明确授权后续阶段 push 当前分支并创建/更新 review-ready PR。继续进入 `$pr-readiness-review-workflow`，在那里创建/更新 PR、启动 online Codex PR review 和 offline frozen-diff review，并最终停在 merge-ready 或清晰 blocked state。
+- 如果第 1 步记录了 PR readiness handoff，commit 不是终点，且该 handoff 明确授权后续阶段 push 当前分支并创建/更新 review-ready PR。继续进入 `$pr-readiness-review-workflow`，在那里创建/更新 PR、处理命名 PR readiness gates、CI/comments，并最终停在 merge-ready 或清晰 blocked state。
 
 ## cbth For Long Gates
 

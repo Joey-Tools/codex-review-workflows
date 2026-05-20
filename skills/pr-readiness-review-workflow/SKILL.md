@@ -1,13 +1,13 @@
 ---
 name: pr-readiness-review-workflow
-description: "Drive the user's parent PR readiness gate for feature-ready or review-ready changes when the current agent owns PR creation or update, online Codex PR review orchestration, offline frozen-diff review, PR comments, CI follow-up, or merge-readiness reporting before merge. Do not use for independent or review-only code reviewer prompts that forbid PR orchestration, fixes, CI waiting, or starting other reviewers."
+description: "Drive the user's parent PR readiness gate for feature-ready or review-ready changes when the current agent owns PR creation or update, best-effort github-codex-review, independent-codex-pr-review, offline-frozen-diff-review, PR comments, CI follow-up, or merge-readiness reporting before merge. Do not use for independent or review-only code reviewer prompts that forbid PR orchestration, fixes, CI waiting, or starting other reviewers."
 ---
 
 # PR Readiness Review Workflow
 
 ## Overview
 
-使用这个 skill 处理 feature ready 之后的 PR readiness gate：`review-ready PR -> online Codex review thread + offline frozen-diff review -> fix loop -> merge-ready`。
+使用这个 skill 处理 feature ready 之后的 PR readiness gate：`review-ready PR -> best-effort github-codex-review + independent-codex-pr-review + offline-frozen-diff-review + required CI/comments -> fix loop -> merge-ready`。
 
 当 `$change-delivery-workflow` 已经完成本地 commit，且 the user 要求完整流程、merge-ready、`在合并前停止` 或 `stop before merge` 时，必须继续使用这个 skill。这里的停止点是 merge-ready 报告或清晰 blocked state；不是本地 commit。
 
@@ -32,47 +32,73 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 - 如果没有 PR URL，但当前分支/commit 已通过本地 gate，且 the user 要求 full workflow、merge-ready、`在合并前停止` 或 ready-for-review PR，先创建或复用 PR。该措辞授权 push 分支和创建/更新 PR；不授权 merge。
 - 创建 PR 前确认 base branch、head branch、是否 draft/ready、PR body 的 LLM authorship note 和 repo merge model。若 auth、network、branch protection 或 required metadata 缺失，停在明确 blocked state，不要把 commit-only 状态报告成完成。
 - 读取线上 PR comments、review threads、requested changes 和 CI 状态；GitHub 交互优先使用 `gh`。
+- 读取 GitHub `@codex review` / `codex/review-gate` check 状态；这属于 best-effort `github-codex-review`，不能和独立 Codex review-only 子线程混用。
+- 读取 branch protection / merge requirements。如果 GitHub 把 `codex/review-gate` / `@codex review` 列为 required status check，则 `github-codex-review` 不再是 skippable best-effort lane，而是 required CI/check gate。如果 GitHub 要求 `Require conversation resolution before merging`，未解决的 review threads 是必须处理的 merge gate：先修复 actionable comments，再用简短回复说明处理结果并 resolve；若 thread 已过期或不再适用，也回复说明理由后 resolve。只有需要 the user 决策或权限不足时才停在 blocked state。
 - 在这个 PR repair workflow 中，如果用户提供 `codex thread <session-ID>`，用 `$codex-session-mining` 找到对应 rollout/thread evidence，再结合线上 comments 和本地 diff 决定修复方向。
 
-2. 冻结 offline review scope。
+2. 冻结 `offline-frozen-diff-review` scope。
 - 对本地可审范围记录 `base_sha..head_sha` 或明确 diff artifact。
 - PR 分支落后于目标分支时，先计算 `merge_base=$(git merge-base <base_ref> <head_ref>)`，再把正式 review scope 冻结为 `<merge_base>..<head_ref>`。不要直接用 GitHub 当前 `baseRefOid..headRefOid`，否则会把目标分支后续提交算成反向 diff。单独记录当前 `baseRefOid` 和 behind 状态，并在 merge-ready 前更新分支或说明 blocker。
 - 不用 live working tree 作为正式 review scope，除非当前任务就是 uncommitted local review。
 - 后续 fix 追加在已审范围之后；不要重写已经作为 review evidence 的 commits。
 
-3. 启动 online Codex PR review thread。
+3. 验证 `github-codex-review`。
+- 这是 PR 里的 GitHub `@codex review` / `codex/review-gate` lane，不是本地 `codex exec`，也不是独立 review-only 子线程。
+- 默认是 best-effort。若远端当前 head 没有触发 `@codex review` / `codex/review-gate`，且 branch protection 没有把它列为 required check，记录为 `not triggered` 并继续，不要把缺失 check 作为 merge-ready blocker。
+- 若远端已经触发，或 branch protection 把它列为 required check，则绑定到当前 PR head commit，等待或查询到 completed 结果；缺失、失败、绑定到旧 head、requested changes 或 actionable Codex comments 都进入 fix loop / blocked state。
+- Clean 条件：未触发且非 required 时为 best-effort skipped；已触发或 required 时，当前 head commit 的 GitHub Codex review gate 成功，且没有未处理的 Codex review comments、requested changes 或 unresolved review threads。
+- 不要主动为了满足 best-effort lane 反复触发 `@codex review`；只有 the user 明确要求、远端已有触发证据，或 branch protection 明确要求该 check 时才处理它的结果。
+
+4. 启动 `independent-codex-pr-review`。
 - 使用独立 Codex CLI review-only thread。prompt 必须声明这是 parent PR readiness workflow 调起的纯 review lane，禁止子线程再次执行 PR readiness orchestration、创建/更新 PR、修复代码、启动新的 reviewer 或等待 CI。
 - 优先采用这个不递归的 prompt shape：
   - `请作为 independent code reviewer 审查 <PR URL>，本地 checkout 在 cwd。这是 review-only 子线程；不要执行 PR readiness orchestration，不要创建或更新 PR，不要修复代码，不要启动其他 reviewer，不要等待 CI；只输出 code review findings。`
-- 这条 online lane 是 PR finding 主 lane。helper-backed internal review 不能替代它。
+- 这条 lane 是独立 Codex PR finding 主 lane。GitHub `@codex review` 和 helper-backed `offline-frozen-diff-review` 都不能替代它。
 - 必须等到 final review artifact 或明确 blocked/inconclusive 结果；中间 reasoning 和 file-read progress 不算结果。
+- Clean 条件：final artifact 明确 `LGTM` / no actionable findings；如果有 finding，修复后重跑这条 lane。
 
-4. 启动 offline frozen-diff review。
-- 使用 `$review-orchestration-playbook` 的 helper stateful lane，对冻结 range 做本地/offline review。
+5. 启动 `offline-frozen-diff-review`。
+- 使用 `$review-orchestration-playbook` 的 helper stateful lane，对冻结 range 做 `offline-frozen-diff-review`。
 - 默认从 `codex-review` 开始；需要 exact diff-fed baseline、prompt contract 或 fallback 时用 stateful `codex-readonly`。
 - 非 Codex reviewers（OpenCode、Cursor `agent`、Copilot、Claude 等）只在 the user 明确要求或当前任务显式 opt-in 时运行。
+- Clean 条件：stateful lane 产出 final artifact，明确 `LGTM` / no actionable findings；review scope 必须是冻结 `base_sha..head_sha` 或明确 diff artifact，不是 live working tree。
 
-5. Fix loop。
-- 合并 online review、offline review、PR comments 和 CI 证据。
+6. Fix loop。
+- 合并 best-effort `github-codex-review`、required `independent-codex-pr-review`、required `offline-frozen-diff-review`、PR comments 和 CI 证据。
 - 对每个 finding 判断是否 actionable；修复后重跑受影响测试，再重新进入必要 review gate。
+- 如果 PR 有 CI checks 或 branch protection required checks，则 CI 是 required gate：失败、取消、pending 超过合理等待窗口、缺失 required check 或绑定到旧 head 都必须处理或报告为 blocked。只有仓库没有 CI / 没有远端 checks 时，才能报告 `CI: none observed`。
+- 如果 merge gate 要求 conversation resolution，自动处理 unresolved review threads：actionable thread 先修复和验证，再回复并 resolve；non-actionable 或 stale thread 直接回复说明并 resolve；无法 resolve 时报告具体 thread 和权限/API blocker。
+- 回复 review threads 时，正文必须简要标注这是 Codex / agent 生成的回复，并尽量标明模型；如果无法确认具体型号，用 `GPT-5` 或省略模型。推荐 note 形状：
+
+```markdown
+> [!NOTE]
+> This response is purely generated by LLM: OpenAI Codex (gpt-5.5 (reasoning xhigh)).
+```
+
 - 修复方向以正确性和长期可维护性优先，不要求最小补丁。
 
-6. 长等待和恢复。
+7. 长等待和恢复。
 - CI、review、外部任务或长测试可用 `cbth` 后台化。
 - 同步路径只 poll/await，不关闭异步 delivery。
 - 异步路径当前只依赖 idle 后 `turn/start`；active turn 下等待 idle 或进入恢复状态。
 - 使用 `cbth` 前读取 [cbth-agent-delivery.md](references/cbth-agent-delivery.md)。
 
-7. 报告 merge-readiness。
-- 明确列出 online Codex review、offline frozen-diff review、PR comments、CI/tests 的终态。
+8. 报告 merge-readiness。
+- 明确列出 best-effort `github-codex-review`、required `independent-codex-pr-review`、required `offline-frozen-diff-review`、PR comments/review threads、CI/tests 和 branch/base 状态的终态。
 - 如果某个 gate blocked 或 inconclusive，说明证据、缺口和建议决策，不要把它折叠成 success。
-- 只有所有 required gate clean 或 the user 明确接受例外后，才报告 merge-ready。
+- `github-codex-review` 缺失/未触发且非 required 时只报告 best-effort skipped；远端已触发、branch protection 要求它、失败、有 requested changes 或有 actionable unresolved threads 时必须处理。
+- 只有 required review gates、required CI、required conversation resolution 和 branch/base 状态 clean，或 the user 明确接受例外后，才报告 merge-ready。
 - 如果 the user 要求 `在合并前停止` 或 `stop before merge`，到 merge-ready 报告后停止，不要 merge。
 
 ## Guardrails
 
-- 不要用 helper-backed subagent/internal lane 替代独立 online Codex PR review thread。
-- 不要把 local commit 当作 `在合并前停止` 的终点；该措辞默认要求 PR creation/reuse、online review、offline review、CI/comments follow-up 和 merge-ready report。
+- 不要再用裸 `online review` / `offline review` 作为 gate 名称；使用 `github-codex-review`、`independent-codex-pr-review` 和 `offline-frozen-diff-review`。
+- 不要把缺失的 GitHub `@codex review` / `codex/review-gate` 当作 blocker；它默认是 best-effort，远端没有触发就记录并继续，除非 branch protection 明确把它列为 required check。
+- 不要用 GitHub `@codex review` / `codex/review-gate` 替代 `independent-codex-pr-review`。
+- 不要用 helper-backed subagent/internal lane 替代 `independent-codex-pr-review`。
+- 不要忽略已存在的 CI 或 branch protection required checks；远端有 CI 时必须处理到 clean 或明确 blocked。
+- 不要在 `Require conversation resolution before merging` gate 存在时留下 unresolved review threads；完成修复或判断为 stale/non-actionable 后，回复并 resolve。
+- 不要把 local commit 当作 `在合并前停止` 的终点；该措辞默认要求 PR creation/reuse、best-effort GitHub Codex review evidence、required independent/offline review gates、CI/comments follow-up 和 merge-ready report。
 - 不要把非 Codex external reviewers 作为默认 required gate。
 - 不要把 `turn/steer` 当作当前可用 delivery path。
 - 不要在没有读取 `codex thread <session-ID>` evidence 的情况下修复这类 review comments。
