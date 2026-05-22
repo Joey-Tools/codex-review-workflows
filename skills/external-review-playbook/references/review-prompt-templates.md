@@ -16,6 +16,7 @@ Use these templates when drafting bounded external review prompts. They are opti
 - Tell the reviewer not to spend time on style-only nits or unrelated rewrites.
 - Prefer concrete failure modes, triggering conditions, or measurable regression risks over vague quality comments.
 - For readonly Codex review lanes, also tell the reviewer to prefer direct argv tool calls and avoid `bash -lc`, `zsh -lc`, here-docs, or similar shell-wrapper probes.
+- Include an evidence budget for agentic reviewers: start from the supplied diff, changed-file list, `--stat` / `--numstat`, or exact symbol windows; do not default to wide selected-file diffs such as `git diff --unified=30/40/50/60/80`, whole-file `nl -ba`, or broad `rg`; after any 800+ line or 10k+ original-token result, narrow the next read instead of widening it.
 
 ## Bounded Diff Review
 
@@ -24,6 +25,7 @@ Use these templates when drafting bounded external review prompts. They are opti
 Workspace: {workspace}
 Primary diff: {diff_file}
 Review scope: Review the current change only. Use the diff as the primary review surface, but you may read nearby workspace files when needed for context.
+Evidence budget: Start with the supplied diff, changed-file list, `--stat` / `--numstat`, or exact symbol windows. Do not default to wide selected-file diffs such as `git diff --unified=30/40/50/60/80`, whole-file `nl -ba`, or broad `rg`; after any 800+ line or 10k+ original-token result, narrow the next read instead of widening it.
 </context>
 
 <focus_areas>
@@ -63,6 +65,7 @@ Review scope: Review the current change only.
 The diff is already available at {diff_file}. Read that file directly instead of running git commands such as `git diff` or `git status`.
 You may read nearby workspace files when needed for context, but keep the review centered on the supplied diff and touched files.
 Prefer direct argv tool calls over shell wrappers; avoid `bash -lc`, `zsh -lc`, here-docs, or `python - <<'PY'` probes.
+Evidence budget: Start with the supplied diff file, its headers, and exact symbol windows from nearby source files. Do not run `git diff --stat` / `git diff --numstat`, wide selected-file diffs such as `git diff --unified=30/40/50/60/80`, whole-file `nl -ba`, or broad `rg`; after any 800+ line or 10k+ original-token result, narrow the next read instead of widening it.
 </context>
 
 <focus_areas>
@@ -100,6 +103,7 @@ Review scope:
 - path/to/file_a
 - path/to/file_b
 You may read nearby workspace files when needed for context, but keep the review centered on the listed files.
+Evidence budget: Start with exact symbol windows and directly relevant nearby context. Do not default to wide selected-file diffs such as `git diff --unified=30/40/50/60/80`, whole-file `nl -ba`, or broad `rg`; after any 800+ line or 10k+ original-token result, narrow the next read instead of widening it.
 </context>
 
 <focus_areas>
