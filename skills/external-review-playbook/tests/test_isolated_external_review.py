@@ -607,6 +607,9 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                     used_review_subcommand = True
                 output = None
                 probe_git_commit = os.environ.get("FAKE_CODEX_PROBE_GIT_COMMIT") == "1"
+                probe_git_self_check = (
+                    os.environ.get("FAKE_CODEX_PROBE_GIT_SELF_CHECK") == "1"
+                )
                 pointer = 0
                 while pointer < len(review_args):
                     arg = review_args[pointer]
@@ -693,6 +696,24 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                         check=False,
                     )
                     payload["git_commit"] = {
+                        "returncode": completed.returncode,
+                        "stdout": completed.stdout,
+                        "stderr": completed.stderr,
+                    }
+                if probe_git_self_check:
+                    completed = subprocess.run(
+                        [
+                            "git",
+                            "-c",
+                            f"core.hooksPath={os.devnull}",
+                            "rev-parse",
+                            "--is-inside-work-tree",
+                        ],
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    payload["git_self_check"] = {
                         "returncode": completed.returncode,
                         "stdout": completed.stdout,
                         "stderr": completed.stderr,
@@ -2696,6 +2717,61 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
             payload["git_exec_path"]["stderr"],
         )
 
+    def test_readonly_git_shim_allows_only_safe_hardening_global_config(self) -> None:
+        other_repo = self._create_plain_repo("safe-config-probe")
+
+        completed = self._run_shim(
+            "-C",
+            str(other_repo),
+            "-c",
+            f"core.hooksPath={os.devnull}",
+            "rev-parse",
+            "--is-inside-work-tree",
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "true")
+
+        compact_completed = self._run_shim(
+            "-C",
+            str(other_repo),
+            f"-ccore.hooksPath={os.devnull}",
+            "rev-parse",
+            "--is-inside-work-tree",
+        )
+        self.assertEqual(compact_completed.returncode, 126)
+        self.assertIn(
+            "readonly git shim blocked global option: -c",
+            compact_completed.stderr,
+        )
+
+        unsafe_hooks_path = self._run_shim(
+            "-C",
+            str(other_repo),
+            "-c",
+            f"core.hooksPath={self.root / 'hooks'}",
+            "rev-parse",
+            "--is-inside-work-tree",
+        )
+        self.assertEqual(unsafe_hooks_path.returncode, 126)
+        self.assertIn(
+            "readonly git shim blocked global option: -c",
+            unsafe_hooks_path.stderr,
+        )
+
+        unsafe_diff_external = self._run_shim(
+            "-C",
+            str(other_repo),
+            "-c",
+            "diff.external=echo BYPASS",
+            "diff",
+            "HEAD",
+        )
+        self.assertEqual(unsafe_diff_external.returncode, 126)
+        self.assertIn(
+            "readonly git shim blocked global option: -c",
+            unsafe_diff_external.stderr,
+        )
+
     def test_readonly_git_shim_keeps_cross_repo_history_access(self) -> None:
         other_repo = self._create_plain_repo("history-probe")
 
@@ -3455,6 +3531,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
     def test_codex_review_start_wait_final_uses_readonly_root_session(self) -> None:
         env = self._base_env()
         env["FAKE_CODEX_PROBE_GIT_COMMIT"] = "1"
+        env["FAKE_CODEX_PROBE_GIT_SELF_CHECK"] = "1"
         repo, base, head = self._create_review_range_repo("codex-range-review")
         start = run(
             [
@@ -3514,6 +3591,8 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
             "readonly git shim blocked subcommand: commit",
             payload["git_commit"]["stderr"],
         )
+        self.assertEqual(payload["git_self_check"]["returncode"], 0)
+        self.assertEqual(payload["git_self_check"]["stdout"].strip(), "true")
 
         final = run(
             [

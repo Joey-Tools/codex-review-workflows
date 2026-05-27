@@ -39,7 +39,6 @@ SAFE_FLAGS_WITH_VALUE = {
 }
 
 BLOCKED_FLAGS_WITH_VALUE = {
-    "-c",
     "--config-env",
     "--exec-path",
 }
@@ -99,6 +98,15 @@ GLOBAL_HARDENING_ARGS = [
     "-c",
     "gpg.x509.program=",
 ]
+
+ALLOWED_GLOBAL_CONFIGS = {
+    "core.fsmonitor": {"false"},
+    "core.hookspath": {os.devnull},
+    "diff.external": {""},
+    "gpg.program": {""},
+    "gpg.ssh.program": {""},
+    "gpg.x509.program": {""},
+}
 
 DIFFISH_SUBCOMMANDS = {
     "blame",
@@ -166,6 +174,13 @@ FILTER_KEY_RE = re.compile(
 FILTER_QUERY_PATTERN = r"^filter\..*"
 
 
+def _is_allowed_global_config(config: str) -> bool:
+    key, separator, value = config.partition("=")
+    if not separator:
+        return False
+    return value in ALLOWED_GLOBAL_CONFIGS.get(key.lower(), set())
+
+
 def _parse_argv(argv: list[str]) -> tuple[str, str | None, int | None]:
     index = 0
     while index < len(argv):
@@ -174,7 +189,12 @@ def _parse_argv(argv: list[str]) -> tuple[str, str | None, int | None]:
             return "meta", arg, index
         if arg in BLOCKED_FLAGS_WITH_VALUE:
             return "blocked-option", arg, index
-        if arg.startswith("-c") and arg != "-c":
+        if arg == "-c":
+            if index + 1 >= len(argv) or not _is_allowed_global_config(argv[index + 1]):
+                return "blocked-option", "-c", index
+            index += 2
+            continue
+        if arg.startswith("-c"):
             return "blocked-option", "-c", index
         if any(
             arg == flag or arg.startswith(flag + "=")
