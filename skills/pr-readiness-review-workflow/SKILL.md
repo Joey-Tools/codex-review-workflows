@@ -52,7 +52,7 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 4. 启动 `independent-codex-pr-review`。
 - 使用独立 Codex CLI review-only thread。prompt 必须声明这是 parent PR readiness workflow 调起的纯 review lane，禁止子线程再次执行 PR readiness orchestration、创建/更新 PR、修复代码、启动新的 reviewer 或等待 CI。
 - 优先采用这个不递归的 prompt shape：
-  - `请作为 independent code reviewer 审查 <PR URL>，本地 checkout 在 cwd。这是 review-only 子线程；不要执行 PR readiness orchestration，不要创建或更新 PR，不要修复代码，不要启动其他 reviewer，不要等待 CI；只输出 code review findings。先看 changed-file list / --stat / --numstat 或 helper diff headers；不要默认用 git diff --unified=30/40/50/60/80、整文件 nl -ba、或 broad rg。任何单次输出达到 800+ 行或 10k+ original tokens 后，必须改用单文件/单 hunk/精确 symbol window。`
+  - `请作为 independent code reviewer 审查 <PR URL>，本地 checkout 在 cwd。这是 review-only 子线程；不要执行 PR readiness orchestration，不要创建或更新 PR，不要修复代码，不要启动其他 reviewer，不要等待 CI；只输出 code review findings。先看 changed-file list / --stat / --numstat、helper diff headers、rg -l 或 rg --count；不要默认用 git diff --unified=30/40/50/60/80、整文件 nl -ba、或 path-wide / large-alternation raw rg -n。任何单次输出达到 800+ 行或 10k+ original tokens 后，必须改用单文件/单 hunk/精确 symbol window，只有在小文件集合上再用 line-producing rg -n。`
 - 这条 lane 是独立 Codex PR finding 主 lane。GitHub `@codex review` 和 helper-backed `offline-frozen-diff-review` 都不能替代它。
 - 必须等到 final review artifact 或明确 blocked/inconclusive 结果；中间 reasoning 和 file-read progress 不算结果。
 - Clean 条件：final artifact 明确 `LGTM` / no actionable findings；如果有 finding，修复后重跑这条 lane。
