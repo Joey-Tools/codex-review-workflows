@@ -24,13 +24,13 @@ For PR readiness, load `$pr-readiness-review-workflow` first. That workflow owns
 
 2. Preflight the real runtime.
 - Probe the exact local entrypoint, model id, auth state, report-sink shape, and sandbox behavior before building a large review prompt.
-- Use the helper-backed root script when approval reuse, isolated workspaces, or frozen review ranges matter.
+- Use the installed helper path when approval reuse, isolated workspaces, or frozen review ranges matter: `$HOME/.codex/skills/review-orchestration-playbook/scripts/isolated_review`. In public docs and prompts, prefer `$HOME` over account-specific absolute paths, and avoid repo-local `skills/...` helper invocations unless you are intentionally testing the checkout copy.
 - On Linux or Ubuntu, treat `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted` as a helper/runtime issue, not a prompt issue; let the helper probe and select the backend.
 - Distinguish `blocked by approval/auth/sandbox` from `runtime exists but the review still fails to converge`.
 
 3. Prefer an explicit review scope.
 - For reviewable work, prefer a `wip/<topic>` branch plus frozen `base_sha..head_sha` over a live working tree.
-- Use `scripts/isolated_review --base-ref <base_sha> --head-ref <head_sha>` when you need the helper to snapshot the exact range.
+- Use `$HOME/.codex/skills/review-orchestration-playbook/scripts/isolated_review --base-ref <base_sha> --head-ref <head_sha>` when you need the helper to snapshot the exact range.
 - Move to `codex-readonly` when you need a deterministic findings-only baseline or when builtin `codex-review` cannot honor the required prompt contract.
 - Once you move to `codex-readonly`, keep it on `stateful` by default so the lane has a pollable state dir and durable final artifact instead of a silent one-shot pipe.
 - In a review subprocess, do not combine skill reads or setup probes with a full `git diff` in one shell invocation. First inspect a bounded changed-file list or the helper-provided diff-file headers, then read focused diff chunks or source files; avoid dumping large diffs into a single tool result.
