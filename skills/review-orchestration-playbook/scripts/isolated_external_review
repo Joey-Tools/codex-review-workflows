@@ -2193,8 +2193,8 @@ def _build_default_external_review_prompt(
     lines = [
         "Review the provided diff for correctness, security, data-loss, and regression risks.",
         f"Primary diff: {diff_file}",
-        "Evidence budget: start with the supplied diff, changed-file list, --stat/--numstat, or exact symbol windows.",
-        "Do not default to wide selected-file diffs such as git diff --unified=30/40/50/60/80, whole-file nl -ba, or broad rg.",
+        "Evidence budget: start with the supplied diff, changed-file list, --stat/--numstat, rg -l, rg --count, or exact symbol windows.",
+        "Do not default to wide selected-file diffs such as git diff --unified=30/40/50/60/80, whole-file nl -ba, or path-wide / large-alternation raw rg -n.",
         "After any 800+ line or 10k+ original-token result, narrow the next read instead of widening it.",
     ]
     if placeholders["{review_range}"] is not None:
@@ -2504,8 +2504,8 @@ def _build_codex_readonly_prompt(
             "",
             "Review discipline:",
             "- Use the supplied diff file as the primary review surface and read additional repo files only when needed to verify a concern.",
-            "- Start with changed-file lists, --stat/--numstat, helper diff-file headers, or exact symbol windows before reading large hunks.",
-            "- Do not default to wide selected-file diffs such as git diff --unified=30/40/50/60/80, whole-file nl -ba, or broad rg searches.",
+            "- Start with changed-file lists, --stat/--numstat, helper diff-file headers, rg -l, rg --count, or exact symbol windows before reading large hunks.",
+            "- Do not default to wide selected-file diffs such as git diff --unified=30/40/50/60/80, whole-file nl -ba, or path-wide / large-alternation raw rg -n searches.",
             "- After any 800+ line or 10k+ original-token result, narrow the next read to one file, one hunk, or one exact symbol window instead of widening it.",
             "- Focus on correctness, regressions, performance or resource risks, and missing tests.",
             "- Skip style-only, naming-only, formatting-only, and documentation-only comments.",
@@ -2823,8 +2823,8 @@ def _build_opencode_instruction_text(
             "Review discipline:",
             "- Preserve this contract across the whole session, including after compaction.",
             "- Keep the review focused on correctness, regressions, performance/resource risks, and test coverage reasoning.",
-            "- Start with the supplied diff, changed-file lists, --stat/--numstat, or exact symbol windows before reading large hunks.",
-            "- Do not default to wide selected-file diffs such as git diff --unified=30/40/50/60/80, whole-file nl -ba, or broad rg searches.",
+            "- Start with the supplied diff, changed-file lists, --stat/--numstat, rg -l, rg --count, or exact symbol windows before reading large hunks.",
+            "- Do not default to wide selected-file diffs such as git diff --unified=30/40/50/60/80, whole-file nl -ba, or path-wide / large-alternation raw rg -n searches.",
             "- After any 800+ line or 10k+ original-token result, narrow the next read to one file, one hunk, or one exact symbol window instead of widening it.",
             "- Skip style, formatting, naming, documentation-only, and hypothetical findings.",
             "- Verify concerns in code before flagging them.",
