@@ -14,10 +14,11 @@ The canonical skill is `$review-orchestration-playbook`.
 
 - If the user or an older prompt explicitly names `$external-review-playbook`, load this alias and then follow `../review-orchestration-playbook/SKILL.md`.
 - Keep this directory during the transition because it still holds the compatibility wrappers, shared references, tests, and older approved script paths.
-- For new prompts, docs, and helper references, prefer `review-orchestration-playbook` plus `scripts/isolated_review`.
+- For new prompts, docs, and helper references, prefer `$review-orchestration-playbook` plus the installed helper path `$HOME/.codex/skills/review-orchestration-playbook/scripts/isolated_review`. Use repo-local `scripts/...` helper paths only when intentionally testing the checkout copy.
 
 ## Compatibility Entry Points
 
 - `scripts/isolated_external_review`: legacy helper path that still resolves to the current implementation.
 - `scripts/isolated_copilot_review`: older runtime alias retained for approved prefixes.
-- `../review-orchestration-playbook/scripts/isolated_review`: new canonical helper path for fresh callers.
+- `$HOME/.codex/skills/review-orchestration-playbook/scripts/isolated_review`: canonical installed helper path for fresh callers.
+- `../review-orchestration-playbook/scripts/isolated_review`: checkout-copy wrapper for local development and tests.
