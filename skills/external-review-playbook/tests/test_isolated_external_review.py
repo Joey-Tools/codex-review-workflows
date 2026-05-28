@@ -3578,8 +3578,11 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertTrue(payload["used_review_subcommand"])
         self.assertIn("review", payload["args"])
         self.assertEqual(payload["review_args"][:2], ["--base", base])
-        self.assertIn("git ls-files --others", payload["review_args"][-1])
-        self.assertIn("git status --short --untracked-files=no", payload["review_args"][-1])
+        self.assertNotIn("git ls-files --others", " ".join(payload["review_args"]))
+        self.assertNotIn(
+            "git status --short --untracked-files=no",
+            " ".join(payload["review_args"]),
+        )
         self.assertIsNone(payload["prompt_stdin"])
         self.assertIn("--add-dir", payload["args"])
         self.assertEqual(payload["tmpdir"], payload["tmp"])
@@ -5898,8 +5901,8 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         )
         self.assertEqual(prompt_delivery, "builtin-review")
         self.assertIsNone(stdin_bytes)
-        self.assertIn("git ls-files --others", command[-1])
-        self.assertIn("git status --short --untracked-files=no", command[-1])
+        self.assertNotIn("git ls-files --others", " ".join(command))
+        self.assertNotIn("git status --short --untracked-files=no", " ".join(command))
         self.assertEqual(resolved_final_path.resolve(), final_path.resolve())
 
     def test_apply_codex_readonly_defaults_injects_linux_landlock_flags(self) -> None:
@@ -6082,8 +6085,11 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         payload = json.loads(completed.stdout.splitlines()[-1])["payload"]
         self.assertTrue(payload["used_review_subcommand"])
         self.assertEqual(payload["review_args"][0], "--uncommitted")
-        self.assertIn("git ls-files --others", payload["review_args"][-1])
-        self.assertIn("git status --short --untracked-files=no", payload["review_args"][-1])
+        self.assertNotIn("git ls-files --others", " ".join(payload["review_args"]))
+        self.assertNotIn(
+            "git status --short --untracked-files=no",
+            " ".join(payload["review_args"]),
+        )
         self.assertIn("-C", payload["exec_args"])
         cd_index = payload["exec_args"].index("-C")
         self.assertEqual(
@@ -8428,8 +8434,11 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertTrue(payload["used_review_subcommand"])
         self.assertIn("review", payload["args"])
         self.assertEqual(payload["review_args"][0], "--uncommitted")
-        self.assertIn("git ls-files --others", payload["review_args"][-1])
-        self.assertIn("git status --short --untracked-files=no", payload["review_args"][-1])
+        self.assertNotIn("git ls-files --others", " ".join(payload["review_args"]))
+        self.assertNotIn(
+            "git status --short --untracked-files=no",
+            " ".join(payload["review_args"]),
+        )
         self.assertNotIn("-", payload["review_args"])
         self.assertIsNone(payload["prompt_stdin"])
         self.assertIsNone(payload["diff_file"])
