@@ -2194,7 +2194,8 @@ def _build_default_external_review_prompt(
         "Review the provided diff for correctness, security, data-loss, and regression risks.",
         f"Primary diff: {diff_file}",
         "Evidence budget: start with the supplied diff, changed-file list, --stat/--numstat, rg -l, rg --count, or exact symbol windows.",
-        "Do not default to wide selected-file diffs such as git diff --unified=30/40/50/60/80, whole-file nl -ba, or path-wide / large-alternation raw rg -n.",
+        "Do not default to wide selected-file diffs such as git diff --unified=30/40/50/60/80, whole-file nl -ba, path-wide / large-alternation raw rg -n, or full untracked inventories such as git status --short --untracked-files=all / git ls-files --others.",
+        "If untracked files are in scope, start with git status --short --untracked-files=no, then use counts or capped path samples with recursive generated/dependency excludes before inspecting selected paths.",
         "After any 800+ line or 10k+ original-token result, narrow the next read instead of widening it.",
     ]
     if placeholders["{review_range}"] is not None:
@@ -2448,19 +2449,19 @@ def _apply_codex_review_defaults(
     if base_ref is not None:
         if has_prompt_arg:
             raise UserError(
-                "codex-review cannot combine an explicit prompt with helper-managed `--base`; remove the prompt and let `codex exec review` use the frozen range directly"
+                "codex-review cannot combine an explicit prompt with helper-managed `--base`; use codex-readonly when a helper-managed prompt contract is required"
             )
         review_args = ["--base", base_ref, *review_args]
         prompt_delivery = "builtin-review"
     else:
         if has_prompt_arg:
             raise UserError(
-                "codex-review cannot combine an explicit prompt with `--uncommitted`; remove the prompt and let builtin review inspect the uncommitted diff directly"
+                "codex-review cannot combine an explicit prompt with `--uncommitted`; use codex-readonly when a helper-managed prompt contract is required"
             )
         review_args = ["--uncommitted", *review_args]
         if prompt_text is not None:
             raise UserError(
-                "codex-review cannot honor helper-managed prompt contracts with `--uncommitted`; remove the prompt contract flags and let builtin review inspect the uncommitted diff directly"
+                "codex-review cannot honor helper-managed prompt contracts with `--uncommitted`; use codex-readonly when a helper-managed prompt contract is required"
             )
         prompt_delivery = "builtin-review"
 
@@ -2505,7 +2506,8 @@ def _build_codex_readonly_prompt(
             "Review discipline:",
             "- Use the supplied diff file as the primary review surface and read additional repo files only when needed to verify a concern.",
             "- Start with changed-file lists, --stat/--numstat, helper diff-file headers, rg -l, rg --count, or exact symbol windows before reading large hunks.",
-            "- Do not default to wide selected-file diffs such as git diff --unified=30/40/50/60/80, whole-file nl -ba, or path-wide / large-alternation raw rg -n searches.",
+            "- Do not default to wide selected-file diffs such as git diff --unified=30/40/50/60/80, whole-file nl -ba, path-wide / large-alternation raw rg -n searches, or full untracked inventories such as git status --short --untracked-files=all / git ls-files --others.",
+            "- If untracked files are in scope, start with git status --short --untracked-files=no, then use counts or capped path samples with recursive generated/dependency excludes before inspecting selected paths.",
             "- After any 800+ line or 10k+ original-token result, narrow the next read to one file, one hunk, or one exact symbol window instead of widening it.",
             "- Focus on correctness, regressions, performance or resource risks, and missing tests.",
             "- Skip style-only, naming-only, formatting-only, and documentation-only comments.",
@@ -2697,10 +2699,10 @@ def _reject_codex_review_explicit_prompt(
         return
     if frozen_range:
         raise UserError(
-            "codex-review cannot combine an explicit prompt with helper-managed `--base`; remove the prompt and let `codex exec review` use the frozen range directly"
+            "codex-review cannot combine an explicit prompt with helper-managed `--base`; use codex-readonly when a helper-managed prompt contract is required"
         )
     raise UserError(
-        "codex-review cannot combine an explicit prompt with `--uncommitted`; remove the prompt and let builtin review inspect the uncommitted diff directly"
+        "codex-review cannot combine an explicit prompt with `--uncommitted`; use codex-readonly when a helper-managed prompt contract is required"
     )
 
 
@@ -2824,7 +2826,8 @@ def _build_opencode_instruction_text(
             "- Preserve this contract across the whole session, including after compaction.",
             "- Keep the review focused on correctness, regressions, performance/resource risks, and test coverage reasoning.",
             "- Start with the supplied diff, changed-file lists, --stat/--numstat, rg -l, rg --count, or exact symbol windows before reading large hunks.",
-            "- Do not default to wide selected-file diffs such as git diff --unified=30/40/50/60/80, whole-file nl -ba, or path-wide / large-alternation raw rg -n searches.",
+            "- Do not default to wide selected-file diffs such as git diff --unified=30/40/50/60/80, whole-file nl -ba, path-wide / large-alternation raw rg -n searches, or full untracked inventories such as git status --short --untracked-files=all / git ls-files --others.",
+            "- If untracked files are in scope, start with git status --short --untracked-files=no, then use counts or capped path samples with recursive generated/dependency excludes before inspecting selected paths.",
             "- After any 800+ line or 10k+ original-token result, narrow the next read to one file, one hunk, or one exact symbol window instead of widening it.",
             "- Skip style, formatting, naming, documentation-only, and hypothetical findings.",
             "- Verify concerns in code before flagging them.",
