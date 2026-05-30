@@ -1,6 +1,6 @@
 ---
 name: pr-readiness-review-workflow
-description: "Drive the user's parent PR readiness gate for feature-ready or review-ready changes when the current agent owns PR creation or update, best-effort github-codex-review, independent-codex-pr-review, offline-frozen-diff-review, PR comments, CI follow-up, or merge-readiness reporting before merge. Do not use for independent or review-only code reviewer prompts that forbid PR orchestration, fixes, CI waiting, or starting other reviewers."
+description: "Drive the user's parent PR readiness gate for feature-ready or review-ready changes when the current agent owns PR creation or update, best-effort github-codex-review, thread-scoped Codex review egress consent, independent-codex-pr-review, offline-frozen-diff-review, PR comments, CI follow-up, or merge-readiness reporting before merge. Do not use for independent or review-only code reviewer prompts that forbid PR orchestration, fixes, CI waiting, or starting other reviewers."
 ---
 
 # PR Readiness Review Workflow
@@ -36,20 +36,35 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 - 读取 branch protection / merge requirements。如果 GitHub 把实际 check/status context（例如 `codex/review-gate`）列为 required status check，则 `github-codex-review` 不再是 skippable best-effort lane，而是 required CI/check gate；单纯 `@codex review` 评论不是 required status check。如果 GitHub 要求 `Require conversation resolution before merging`，未解决的 review threads 是必须处理的 merge gate：先修复 actionable comments，再用简短回复说明处理结果并 resolve；若 thread 已过期或不再适用，也回复说明理由后 resolve。只有需要 the user 决策或权限不足时才停在 blocked state。
 - 在这个 PR repair workflow 中，如果用户提供 `codex thread <session-ID>`，用 `$codex-session-mining` 找到对应 rollout/thread evidence，再结合线上 comments 和本地 diff 决定修复方向。
 
-2. 冻结 `offline-frozen-diff-review` scope。
+2. 做 Codex review egress consent preflight。
+- 这里的 egress lane 指会把 PR diff、changed-file content、review prompt 或必要邻近上下文发送给 OpenAI Codex 的本地 review lane，包括 `independent-codex-pr-review`，以及由 Codex CLI/helper 承载的 `offline-frozen-diff-review`。
+- 先用 GitHub metadata 或 repo manifest 记录 repo visibility/trust evidence，例如 `gh repo view <owner/repo> --json visibility,isPrivate`、当前 remote URL、PR URL 和 head commit。public repo 可把 public visibility 作为低风险证据写入后续审批说明，但不要声称存在 user consent；private 或未验证 repo 必须有明确 user consent。
+- 如果当前 parent thread 已经包含明确 consent，复用该 consent，不要每次 rerun 都问。明确 consent 应覆盖：目标 repo/PR、允许发送的数据类别、同一 PR fix loop rerun、有效期和排除项。如果没有明确 consent，但 repo 已验证为 public，则后续审批说明只能引用 public visibility evidence 和当前 PR readiness 请求，不能写成 “the user authorized egress”。private、unverified 或仅本地标记 trusted 的 repo 都不能用这个 public path。
+- 推荐 consent 形状：
+
+```text
+本 thread 中，我授权你把 <repo> PR #<number> 的 diff、changed files 和必要邻近上下文发送给 OpenAI Codex，用于 independent-codex-pr-review 和 offline-frozen-diff-review；授权包括同一 PR 修复后的 rerun，直到 merge-ready 报告、blocked 报告或我撤销。不要发送 secrets、untracked private files 或无关仓库内容。
+```
+
+- 对后续每次 `codex exec` 或 helper-backed Codex review escalated call，在 `justification` 中引用匹配当前 evidence 的说明：
+  - explicit consent path: `The user authorized OpenAI Codex review egress for <repo> PR #<number> in this parent thread, including reruns after fixes; scope is changed files/diff plus necessary nearby context, excluding secrets, untracked private files, and unrelated repositories.`
+  - verified public path: `<repo> PR #<number> is verified public; this Codex review is scoped to changed files/diff plus necessary nearby context for the user-requested PR readiness gate, excluding secrets, untracked private files, and unrelated repositories.`
+- 如果审批器仍拒绝，停止并报告拒绝理由以及缺失的 repo trust/consent evidence；不要通过 `default.rules`、shell wrapper、不同 entrypoint 或 indirect execution 绕过 egress decision。
+
+3. 冻结 `offline-frozen-diff-review` scope。
 - 对本地可审范围记录 `base_sha..head_sha` 或明确 diff artifact。
 - PR 分支落后于目标分支时，先计算 `merge_base=$(git merge-base <base_ref> <head_ref>)`，再把正式 review scope 冻结为 `<merge_base>..<head_ref>`。不要直接用 GitHub 当前 `baseRefOid..headRefOid`，否则会把目标分支后续提交算成反向 diff。单独记录当前 `baseRefOid` 和 behind 状态，并在 merge-ready 前更新分支或说明 blocker。
 - 不用 live working tree 作为正式 review scope，除非当前任务就是 uncommitted local review。
 - 后续 fix 追加在已审范围之后；不要重写已经作为 review evidence 的 commits。
 
-3. 验证 `github-codex-review`。
+4. 验证 `github-codex-review`。
 - 这是 PR 里的 GitHub `@codex review` / `codex/review-gate` lane，不是本地 `codex exec`，也不是独立 review-only 子线程。
 - 默认是 best-effort。若远端当前 head 没有触发 `@codex review` / `codex/review-gate`，且 branch protection 没有把实际 `codex/review-gate` status context 列为 required check，记录为 `not triggered` 并继续，不要把缺失 check 作为 merge-ready blocker。
 - 若远端已经触发，或 branch protection 把它列为 required check，则绑定到当前 PR head commit，等待或查询到 completed 结果；缺失、失败、绑定到旧 head、requested changes 或 actionable Codex comments 都进入 fix loop / blocked state。
 - Clean 条件：未触发且非 required 时为 best-effort skipped；已触发或 required 时，当前 head commit 的 GitHub Codex review gate 成功，且没有未处理的 Codex review comments 或 requested changes；若 branch protection 要求 conversation resolution，还必须没有 unresolved review threads。
 - 不要主动为了满足 best-effort lane 反复触发 `@codex review`；只有 the user 明确要求、远端已有触发证据，或 branch protection 明确要求该 check 时才处理它的结果。
 
-4. 启动 `independent-codex-pr-review`。
+5. 启动 `independent-codex-pr-review`。
 - 使用独立 Codex CLI review-only thread。prompt 必须声明这是 parent PR readiness workflow 调起的纯 review lane，禁止子线程再次执行 PR readiness orchestration、创建/更新 PR、修复代码、启动新的 reviewer 或等待 CI。
 - 优先采用这个不递归的 prompt shape：
   - `请作为 independent code reviewer 审查 <PR URL>，本地 checkout 在 cwd。这是 review-only 子线程；不要执行 PR readiness orchestration，不要创建或更新 PR，不要修复代码，不要启动其他 reviewer，不要等待 CI；只输出 code review findings。先看 changed-file list / --stat / --numstat、helper diff headers、rg -l 或 rg --count；不要默认用 git diff --unified=30/40/50/60/80、整文件 nl -ba、或 path-wide / large-alternation raw rg -n。如果 untracked files 在审查范围内，不要打印完整 git status --short --untracked-files=all 或 git ls-files --others；先用 git status --short --untracked-files=no，再用带递归 generated/dependency excludes 的 count 或 capped path sample 选定路径。任何单次输出达到 800+ 行或 10k+ original tokens 后，必须改用单文件/单 hunk/精确 symbol window，只有在小文件集合上再用 line-producing rg -n。`
@@ -57,13 +72,13 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 - 必须等到 final review artifact 或明确 blocked/inconclusive 结果；中间 reasoning 和 file-read progress 不算结果。
 - Clean 条件：final artifact 明确 `LGTM` / no actionable findings；如果有 finding，修复后重跑这条 lane。
 
-5. 启动 `offline-frozen-diff-review`。
+6. 启动 `offline-frozen-diff-review`。
 - 使用 `$review-orchestration-playbook` 的 helper stateful lane，对冻结 range 做 `offline-frozen-diff-review`。
 - 默认从 `codex-review` 开始；需要 exact diff-fed baseline、prompt contract 或 fallback 时用 stateful `codex-readonly`。
 - 非 Codex reviewers（OpenCode、Cursor `agent`、Copilot、Claude 等）只在 the user 明确要求或当前任务显式 opt-in 时运行。
 - Clean 条件：stateful lane 产出 final artifact，明确 `LGTM` / no actionable findings；review scope 必须是冻结 `base_sha..head_sha` 或明确 diff artifact，不是 live working tree。
 
-6. Fix loop。
+7. Fix loop。
 - 合并 best-effort `github-codex-review`、required `independent-codex-pr-review`、required `offline-frozen-diff-review`、PR comments 和 CI 证据。
 - 对每个 finding 判断是否 actionable；修复后重跑受影响测试，再重新进入必要 review gate。
 - 读取所有 CI checks，但只有 branch protection / ruleset 标记为 required 的 check 是 merge-readiness required gate：失败、取消、pending 超过合理等待窗口、缺失 required check 或绑定到旧 head 都必须处理或报告为 blocked。非 required 的失败/取消 checks 应记录并按 repo/user policy 判断是否需要修复，但不要仅因其存在就阻止 merge-ready。只有仓库没有 CI / 没有远端 checks 时，才能报告 `CI: none observed`。
@@ -77,13 +92,13 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 
 - 修复方向以正确性和长期可维护性优先，不要求最小补丁。
 
-7. 长等待和恢复。
+8. 长等待和恢复。
 - CI、review、外部任务或长测试可用 `cbth` 后台化。
 - 同步路径只 poll/await，不关闭异步 delivery。
 - 异步路径当前只依赖 idle 后 `turn/start`；active turn 下等待 idle 或进入恢复状态。
 - 使用 `cbth` 前读取 [cbth-agent-delivery.md](references/cbth-agent-delivery.md)。
 
-8. 报告 merge-readiness。
+9. 报告 merge-readiness。
 - 明确列出 best-effort `github-codex-review`、required `independent-codex-pr-review`、required `offline-frozen-diff-review`、PR comments/review threads、CI/tests 和 branch/base 状态的终态。
 - 如果某个 gate blocked 或 inconclusive，说明证据、缺口和建议决策，不要把它折叠成 success。
 - `github-codex-review` 缺失/未触发且非 required 时只报告 best-effort skipped；远端已触发、branch protection 要求它、失败、有 requested changes 或有 actionable unresolved threads 时必须处理。
@@ -103,3 +118,4 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 - 不要把 `turn/steer` 当作当前可用 delivery path。
 - 不要在没有读取 `codex thread <session-ID>` evidence 的情况下修复这类 review comments。
 - 不要无限等待 reviewer 或 CI；用 `cbth` receipt/recovery 信息或清晰 blocked state 收口。
+- 不要把 `default.rules` 或稳定命令 prefix 当作 repo/diff egress consent；rules 只降低命令审批摩擦，不能代替 user consent 或 repo trust evidence。
