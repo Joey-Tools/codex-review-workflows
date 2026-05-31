@@ -84,6 +84,30 @@ def git_commit(repo: pathlib.Path, message: str) -> None:
         raise RuntimeError(completed.stderr)
 
 
+class SkillDocumentationTest(unittest.TestCase):
+    def test_pr_readiness_independent_review_prompt_requires_exact_evidence_budget(self) -> None:
+        skill_path = (
+            pathlib.Path(__file__).resolve().parents[2]
+            / "pr-readiness-review-workflow"
+            / "SKILL.md"
+        )
+        text = skill_path.read_text(encoding="utf-8")
+        section = text.split("5. 启动 `independent-codex-pr-review`。", 1)[1]
+        section = section.split("6. 启动 `offline-frozen-diff-review`。", 1)[0]
+
+        for needle in (
+            "git diff --unified=30/40/50/60/80",
+            "path-wide / large-alternation raw rg -n",
+            "800+ 行或 10k+ original tokens",
+            "git status --short --untracked-files=no",
+            "rg -l",
+            "rg --count",
+            "不要把它弱化成",
+            "avoid dumping huge diffs",
+        ):
+            self.assertIn(needle, section)
+
+
 class IsolatedCopilotReviewTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory(prefix="isolated-review-test-")
