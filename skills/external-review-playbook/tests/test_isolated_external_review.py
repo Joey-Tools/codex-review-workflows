@@ -5644,6 +5644,51 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertFalse(diff_copy.exists())
         self.assertFalse(runtime_temp_dir.exists())
 
+    def test_codex_review_reuse_workspace_rejects_large_uncommitted_scope(self) -> None:
+        repo = self._create_plain_repo("codex-review-reuse-large-uncommitted")
+        prepare = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--repo",
+                str(repo),
+                "--prepare-only",
+            ],
+            env=self._base_env(),
+        )
+        self.assertEqual(prepare.returncode, 0, prepare.stderr)
+        workspace_root = pathlib.Path(
+            [line.strip() for line in prepare.stdout.splitlines() if line.strip()][-1]
+        )
+        (workspace_root / "generated.txt").write_text(
+            ("x" * 12_000) + "\n",
+            encoding="utf-8",
+        )
+
+        failed = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "stateful",
+                "start",
+                "--repo",
+                str(repo),
+                "--reuse-workspace",
+                str(workspace_root),
+                "--entrypoint",
+                "codex-review",
+            ],
+            env=self._base_env(),
+        )
+
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn(
+            "codex-review builtin prompt cannot honor the helper-managed evidence budget",
+            failed.stderr,
+        )
+        self.assertIn("codex-readonly", failed.stderr)
+        self.assertIn("max changed-line bytes", failed.stderr)
+
     def test_run_prepared_review_returns_failure_when_cleanup_breaks_after_success(self) -> None:
         module = self._load_script_module()
         workspace_root = self.root / "run-prepared-workspace"

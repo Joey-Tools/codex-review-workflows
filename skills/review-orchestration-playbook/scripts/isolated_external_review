@@ -4420,7 +4420,7 @@ def _prepare_review_execution(args: argparse.Namespace) -> dict[str, object]:
                 else None
             )
             _reject_oversized_codex_review_builtin_scope(
-                source_root=source_root,
+                source_root=workspace_root,
                 base_ref=base_ref,
                 head_ref=head_ref,
                 diff_file=diff_file,
