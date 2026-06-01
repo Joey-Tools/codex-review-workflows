@@ -3691,6 +3691,43 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertIn("codex-readonly", failed.stderr)
         self.assertIn("changed lines", failed.stderr)
 
+    def test_codex_review_rejects_single_long_line_builtin_prompt_scope(self) -> None:
+        env = self._base_env()
+        repo = self._create_plain_repo("codex-long-line-range-review")
+        base = git(repo, "rev-parse", "HEAD").stdout.strip()
+        self.assertEqual(git(repo, "switch", "-c", "wip/long-line-review").returncode, 0)
+        (repo / "generated.txt").write_text(("x" * 12_000) + "\n", encoding="utf-8")
+        self.assertEqual(git(repo, "add", "generated.txt").returncode, 0)
+        git_commit(repo, "add generated long line")
+        head = git(repo, "rev-parse", "HEAD").stdout.strip()
+
+        failed = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "stateful",
+                "start",
+                "--repo",
+                str(repo),
+                "--entrypoint",
+                "codex-review",
+                "--base-ref",
+                base,
+                "--head-ref",
+                head,
+            ],
+            env=env,
+        )
+
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn(
+            "codex-review builtin prompt cannot honor the helper-managed evidence budget",
+            failed.stderr,
+        )
+        self.assertIn("codex-readonly", failed.stderr)
+        self.assertIn("diff bytes", failed.stderr)
+        self.assertIn("max changed-line bytes", failed.stderr)
+
     def test_stateful_opencode_start_uses_default_prompt_for_frozen_range(self) -> None:
         env = self._base_env()
         env["FAKE_REVIEW_OUTPUT_FILE"] = str(self.output_file)
@@ -4450,6 +4487,26 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
 
         self.assertEqual(changed_files, 1)
         self.assertEqual(changed_lines, 3)
+
+    def test_review_diff_budget_metrics_records_long_changed_lines(self) -> None:
+        module = self._load_script_module()
+        long_added_line = b"+" + (b"x" * 12_000) + b"\n"
+        diff_bytes = (
+            b"diff --git a/generated.txt b/generated.txt\n"
+            b"--- /dev/null\n"
+            b"+++ b/generated.txt\n"
+            b"@@ -0,0 +1 @@\n"
+            + long_added_line
+        )
+
+        changed_files, changed_lines, total_bytes, max_changed_line_bytes = (
+            module._review_diff_budget_metrics_from_bytes(diff_bytes)
+        )
+
+        self.assertEqual(changed_files, 1)
+        self.assertEqual(changed_lines, 1)
+        self.assertEqual(total_bytes, len(diff_bytes))
+        self.assertEqual(max_changed_line_bytes, 12_000)
 
     def test_count_tracked_repo_files_counts_submodule_contents_recursively(self) -> None:
         module = self._load_script_module()

@@ -286,6 +286,8 @@ CODEX_REVIEW_DISALLOWED_FLAGS = frozenset(
 CODEX_REVIEW_RESERVED_SUBCOMMANDS = frozenset({"help", "resume", "review", "exec"})
 CODEX_REVIEW_BUILTIN_MAX_CHANGED_FILES = 25
 CODEX_REVIEW_BUILTIN_MAX_CHANGED_LINES = 800
+CODEX_REVIEW_BUILTIN_MAX_DIFF_BYTES = 40_000
+CODEX_REVIEW_BUILTIN_MAX_CHANGED_LINE_BYTES = 10_000
 LANE_AUTO_PRIORITIES: dict[str, tuple[str, ...]] = {
     "custom": ("agent", "copilot", "gh-copilot"),
     "bounded-semantic": ("opencode", "agent", "copilot", "gh-copilot"),
@@ -1000,11 +1002,16 @@ def _parse_diff_numstat(stdout: bytes) -> tuple[int, int]:
     return changed_files, changed_lines
 
 
-def _review_diff_metrics_from_lines(lines: Iterable[bytes]) -> tuple[int, int]:
+def _review_diff_budget_metrics_from_lines(
+    lines: Iterable[bytes],
+) -> tuple[int, int, int, int]:
     changed_files = 0
     changed_lines = 0
+    diff_bytes = 0
+    max_changed_line_bytes = 0
     in_hunk = False
     for raw_line in lines:
+        diff_bytes += len(raw_line)
         if raw_line.startswith(b"diff --git "):
             changed_files += 1
             in_hunk = False
@@ -1016,6 +1023,13 @@ def _review_diff_metrics_from_lines(lines: Iterable[bytes]) -> tuple[int, int]:
             continue
         if raw_line.startswith((b"+", b"-")):
             changed_lines += 1
+            line_bytes = max(0, len(raw_line.rstrip(b"\r\n")) - 1)
+            max_changed_line_bytes = max(max_changed_line_bytes, line_bytes)
+    return changed_files, changed_lines, diff_bytes, max_changed_line_bytes
+
+
+def _review_diff_metrics_from_lines(lines: Iterable[bytes]) -> tuple[int, int]:
+    changed_files, changed_lines, _, _ = _review_diff_budget_metrics_from_lines(lines)
     return changed_files, changed_lines
 
 
@@ -1023,9 +1037,25 @@ def _review_diff_metrics_from_bytes(diff_bytes: bytes) -> tuple[int, int]:
     return _review_diff_metrics_from_lines(diff_bytes.splitlines())
 
 
+def _review_diff_budget_metrics_from_bytes(
+    diff_bytes: bytes,
+) -> tuple[int, int, int, int]:
+    changed_files, changed_lines, _, max_changed_line_bytes = (
+        _review_diff_budget_metrics_from_lines(diff_bytes.splitlines())
+    )
+    return changed_files, changed_lines, len(diff_bytes), max_changed_line_bytes
+
+
 def _review_diff_file_metrics(diff_file: pathlib.Path) -> tuple[int, int]:
     with diff_file.open("rb") as handle:
         return _review_diff_metrics_from_lines(handle)
+
+
+def _review_diff_file_budget_metrics(
+    diff_file: pathlib.Path,
+) -> tuple[int, int, int, int]:
+    with diff_file.open("rb") as handle:
+        return _review_diff_budget_metrics_from_lines(handle)
 
 
 def _review_scope_change_metrics(
@@ -1070,6 +1100,45 @@ def _review_scope_change_metrics(
     changed_files = max(changed_files, diff_changed_files)
     changed_lines = max(changed_lines, diff_changed_lines)
     return changed_files, changed_lines
+
+
+def _review_scope_change_budget_metrics(
+    repo_root: pathlib.Path,
+    *,
+    base_ref: str | None,
+    head_ref: str | None,
+) -> tuple[int, int, int, int]:
+    changed_files, changed_lines = _review_scope_change_metrics(
+        repo_root,
+        base_ref=base_ref,
+        head_ref=head_ref,
+    )
+    if base_ref is not None and head_ref is not None:
+        diff_bytes = _run(
+            [
+                _resolve_real_git(),
+                "-C",
+                str(repo_root),
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--submodule=diff",
+                base_ref,
+                head_ref,
+            ],
+            capture_output=True,
+        ).stdout
+    else:
+        diff_bytes = _uncommitted_diff_section(repo_root, scope_label=None)
+    diff_changed_files, diff_changed_lines, total_bytes, max_changed_line_bytes = (
+        _review_diff_budget_metrics_from_bytes(diff_bytes)
+    )
+    return (
+        max(changed_files, diff_changed_files),
+        max(changed_lines, diff_changed_lines),
+        total_bytes,
+        max_changed_line_bytes,
+    )
 
 
 def _parallel_agentic_review_policy(
@@ -2642,9 +2711,19 @@ def _reject_oversized_codex_review_builtin_scope(
     diff_file: pathlib.Path | None,
 ) -> None:
     if diff_file is not None and diff_file.is_file():
-        changed_files, changed_lines = _review_diff_file_metrics(diff_file)
+        (
+            changed_files,
+            changed_lines,
+            diff_bytes,
+            max_changed_line_bytes,
+        ) = _review_diff_file_budget_metrics(diff_file)
     else:
-        changed_files, changed_lines = _review_scope_change_metrics(
+        (
+            changed_files,
+            changed_lines,
+            diff_bytes,
+            max_changed_line_bytes,
+        ) = _review_scope_change_budget_metrics(
             source_root,
             base_ref=base_ref,
             head_ref=head_ref,
@@ -2652,11 +2731,14 @@ def _reject_oversized_codex_review_builtin_scope(
     if (
         changed_files < CODEX_REVIEW_BUILTIN_MAX_CHANGED_FILES
         and changed_lines < CODEX_REVIEW_BUILTIN_MAX_CHANGED_LINES
+        and diff_bytes < CODEX_REVIEW_BUILTIN_MAX_DIFF_BYTES
+        and max_changed_line_bytes < CODEX_REVIEW_BUILTIN_MAX_CHANGED_LINE_BYTES
     ):
         return
     raise UserError(
         "codex-review builtin prompt cannot honor the helper-managed evidence budget "
-        f"for this scope ({changed_files} changed files, {changed_lines} changed lines). "
+        f"for this scope ({changed_files} changed files, {changed_lines} changed lines, "
+        f"{diff_bytes} diff bytes, {max_changed_line_bytes} max changed-line bytes). "
         "Use `--entrypoint codex-readonly`, which receives the generated diff file and "
         "bounded-read prompt contract."
     )
