@@ -4655,6 +4655,61 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertEqual(total_bytes, 0)
         self.assertEqual(max_changed_line_bytes, 0)
 
+    def test_prepare_workspace_materializes_tracked_codex_tmp_changes(self) -> None:
+        repo = self._create_plain_repo("tracked-codex-tmp-snapshot")
+        tracked_tmp = repo / ".codex-tmp" / "tracked.txt"
+        tracked_tmp.parent.mkdir()
+        tracked_tmp.write_text("base\n", encoding="utf-8")
+        self.assertEqual(git(repo, "add", ".codex-tmp/tracked.txt").returncode, 0)
+        git_commit(repo, "track codex tmp")
+        tracked_tmp.write_text("dirty\n", encoding="utf-8")
+        staged_tmp = repo / ".codex-tmp" / "staged.txt"
+        staged_tmp.write_text("staged\n", encoding="utf-8")
+        self.assertEqual(git(repo, "add", ".codex-tmp/staged.txt").returncode, 0)
+        (repo / ".codex-tmp" / "untracked.txt").write_text(
+            "helper scratch\n",
+            encoding="utf-8",
+        )
+
+        prepare = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--repo",
+                str(repo),
+                "--prepare-only",
+            ],
+            env=self._base_env(),
+        )
+
+        self.assertEqual(prepare.returncode, 0, prepare.stderr)
+        workspace_root = pathlib.Path(
+            [line.strip() for line in prepare.stdout.splitlines() if line.strip()][-1]
+        )
+        self.assertEqual(
+            (workspace_root / ".codex-tmp" / "tracked.txt").read_text(
+                encoding="utf-8",
+            ),
+            "dirty\n",
+        )
+        self.assertEqual(
+            (workspace_root / ".codex-tmp" / "staged.txt").read_text(
+                encoding="utf-8",
+            ),
+            "staged\n",
+        )
+        staged_diff = git(
+            workspace_root,
+            "diff",
+            "--name-only",
+            "HEAD",
+            "--",
+            ".codex-tmp/staged.txt",
+        )
+        self.assertEqual(staged_diff.returncode, 0, staged_diff.stderr)
+        self.assertIn(".codex-tmp/staged.txt", staged_diff.stdout)
+        self.assertFalse((workspace_root / ".codex-tmp" / "untracked.txt").exists())
+
     def test_codex_review_rejects_frozen_budget_before_generating_inputs(self) -> None:
         module = self._load_script_module()
         repo = self._create_plain_repo("codex-review-early-budget")
@@ -4679,6 +4734,44 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                 base,
                 "--head-ref",
                 head,
+            ]
+        )
+
+        with mock.patch.object(
+            module,
+            "_prepare_inputs",
+            side_effect=module.UserError("prepare_inputs should not run"),
+        ) as prepare_inputs:
+            with self.assertRaises(module.UserError) as raised:
+                module._prepare_review_execution(args)
+
+        prepare_inputs.assert_not_called()
+        self.assertIn(
+            "codex-review builtin prompt cannot honor the helper-managed evidence budget",
+            str(raised.exception),
+        )
+
+    def test_codex_review_uncommitted_budget_includes_tracked_codex_tmp_changes(
+        self,
+    ) -> None:
+        module = self._load_script_module()
+        repo = self._create_plain_repo("codex-review-codex-tmp-budget")
+        tracked_tmp = repo / ".codex-tmp" / "tracked.txt"
+        tracked_tmp.parent.mkdir()
+        tracked_tmp.write_text("base\n", encoding="utf-8")
+        self.assertEqual(git(repo, "add", ".codex-tmp/tracked.txt").returncode, 0)
+        git_commit(repo, "track codex tmp")
+        tracked_tmp.write_text(("x" * 12_000) + "\n", encoding="utf-8")
+        (repo / ".codex-tmp" / "untracked.txt").write_text(
+            "helper scratch\n",
+            encoding="utf-8",
+        )
+        args = module._build_parser().parse_args(
+            [
+                "--repo",
+                str(repo),
+                "--entrypoint",
+                "codex-review",
             ]
         )
 

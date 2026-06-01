@@ -785,6 +785,85 @@ def _materialize_path(
     _copy_file_or_symlink(source_path, target_path)
 
 
+def _tracked_codex_tmp_change_paths(repo_root: pathlib.Path) -> list[pathlib.Path]:
+    completed = _run(
+        [
+            _resolve_real_git(),
+            "-C",
+            str(repo_root),
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--name-only",
+            "-z",
+            "HEAD",
+            "--",
+            ".codex-tmp",
+        ],
+        capture_output=True,
+    )
+    paths: list[pathlib.Path] = []
+    for raw_path in completed.stdout.split(b"\0"):
+        if not raw_path:
+            continue
+        relative_path = pathlib.Path(os.fsdecode(raw_path))
+        if relative_path.parts and relative_path.parts[0] == ".codex-tmp":
+            paths.append(relative_path)
+    return paths
+
+
+def _git_path_is_tracked(repo_root: pathlib.Path, relative_path: pathlib.Path) -> bool:
+    command = [
+        _resolve_real_git(),
+        "-C",
+        str(repo_root),
+        "ls-files",
+        "--error-unmatch",
+        "--",
+        relative_path.as_posix(),
+    ]
+    completed = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode == 0:
+        return True
+    if completed.returncode == 1:
+        return False
+    raise UserError(_format_command_error(command, completed))
+
+
+def _materialize_tracked_codex_tmp_changes(
+    source_repo: pathlib.Path,
+    target_repo: pathlib.Path,
+) -> None:
+    for relative_path in _tracked_codex_tmp_change_paths(source_repo):
+        source_path = source_repo / relative_path
+        target_path = target_repo / relative_path
+        if source_path.exists() or source_path.is_symlink():
+            if source_path.is_dir() and not source_path.is_symlink():
+                continue
+            _copy_file_or_symlink(source_path, target_path)
+            if not _git_path_is_tracked(target_repo, relative_path):
+                _run(
+                    [
+                        _resolve_real_git(),
+                        "-C",
+                        str(target_repo),
+                        "add",
+                        "--intent-to-add",
+                        "--force",
+                        "--",
+                        relative_path.as_posix(),
+                    ],
+                    capture_output=True,
+                )
+            continue
+        _remove_path(target_path)
+
+
 def _materialize_repo_snapshot(source_repo: pathlib.Path, target_repo: pathlib.Path) -> None:
     _ensure_no_conflicts(source_repo)
     source_head = _git_stdout(source_repo, "rev-parse", "HEAD")
@@ -804,6 +883,7 @@ def _materialize_repo_snapshot(source_repo: pathlib.Path, target_repo: pathlib.P
         source_root=source_repo,
         excluded_paths=excluded_paths,
     )
+    _materialize_tracked_codex_tmp_changes(source_repo, target_repo)
 
     for submodule_path in direct_submodules:
         source_submodule = source_repo / submodule_path
