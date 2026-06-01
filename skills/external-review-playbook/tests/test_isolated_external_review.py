@@ -4753,6 +4753,48 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertEqual(deleted_diff.returncode, 0, deleted_diff.stderr)
         self.assertIn("D\t.codex-tmp/tracked.txt", deleted_diff.stdout)
 
+    def test_prepare_workspace_preserves_staged_codex_tmp_deletion_with_worktree_file(
+        self,
+    ) -> None:
+        repo = self._create_plain_repo("tracked-codex-tmp-staged-delete")
+        tracked_tmp = repo / ".codex-tmp" / "tracked.txt"
+        tracked_tmp.parent.mkdir()
+        tracked_tmp.write_text("base\n", encoding="utf-8")
+        self.assertEqual(git(repo, "add", ".codex-tmp/tracked.txt").returncode, 0)
+        git_commit(repo, "track codex tmp")
+        self.assertEqual(
+            git(repo, "rm", "--cached", ".codex-tmp/tracked.txt").returncode,
+            0,
+        )
+        self.assertTrue(tracked_tmp.is_file())
+
+        prepare = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--repo",
+                str(repo),
+                "--prepare-only",
+            ],
+            env=self._base_env(),
+        )
+
+        self.assertEqual(prepare.returncode, 0, prepare.stderr)
+        workspace_root = pathlib.Path(
+            [line.strip() for line in prepare.stdout.splitlines() if line.strip()][-1]
+        )
+        self.assertFalse((workspace_root / ".codex-tmp" / "tracked.txt").exists())
+        deleted_diff = git(
+            workspace_root,
+            "diff",
+            "--name-status",
+            "HEAD",
+            "--",
+            ".codex-tmp/tracked.txt",
+        )
+        self.assertEqual(deleted_diff.returncode, 0, deleted_diff.stderr)
+        self.assertIn("D\t.codex-tmp/tracked.txt", deleted_diff.stdout)
+
     def test_codex_review_rejects_frozen_budget_before_generating_inputs(self) -> None:
         module = self._load_script_module()
         repo = self._create_plain_repo("codex-review-early-budget")
@@ -4848,6 +4890,44 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
             "helper scratch\n",
             encoding="utf-8",
         )
+        args = module._build_parser().parse_args(
+            [
+                "--repo",
+                str(repo),
+                "--entrypoint",
+                "codex-review",
+            ]
+        )
+
+        with mock.patch.object(
+            module,
+            "_prepare_inputs",
+            side_effect=module.UserError("prepare_inputs should not run"),
+        ) as prepare_inputs:
+            with self.assertRaises(module.UserError) as raised:
+                module._prepare_review_execution(args)
+
+        prepare_inputs.assert_not_called()
+        self.assertIn(
+            "codex-review builtin prompt cannot honor the helper-managed evidence budget",
+            str(raised.exception),
+        )
+
+    def test_codex_review_uncommitted_budget_includes_staged_codex_tmp_deletion(
+        self,
+    ) -> None:
+        module = self._load_script_module()
+        repo = self._create_plain_repo("codex-review-codex-tmp-staged-delete-budget")
+        tracked_tmp = repo / ".codex-tmp" / "tracked.txt"
+        tracked_tmp.parent.mkdir()
+        tracked_tmp.write_text(("x" * 12_000) + "\n", encoding="utf-8")
+        self.assertEqual(git(repo, "add", ".codex-tmp/tracked.txt").returncode, 0)
+        git_commit(repo, "track large codex tmp")
+        self.assertEqual(
+            git(repo, "rm", "--cached", ".codex-tmp/tracked.txt").returncode,
+            0,
+        )
+        self.assertTrue(tracked_tmp.is_file())
         args = module._build_parser().parse_args(
             [
                 "--repo",
@@ -6985,8 +7065,8 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                 "--entrypoint",
                 "codex-review",
                 "--",
-                "-o",
-                "custom-final.txt",
+                "--model",
+                "fake-model",
             ],
             env=first_env,
         )
@@ -7005,7 +7085,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
             env=first_env,
         )
         self.assertEqual(first_wait.returncode, 0, first_wait.stderr)
-        self.assertTrue((workspace_root / "custom-final.txt").is_file())
+        self.assertTrue((state_dir / "final.txt").is_file())
         self.assertFalse((state_dir / "stdin.txt").exists())
         first_final = run(
             [
@@ -7046,7 +7126,6 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         time.sleep(0.2)
         self.assertFalse((state_dir / "exit_code").exists())
         self.assertFalse((state_dir / "final.txt").exists())
-        self.assertFalse((workspace_root / "custom-final.txt").exists())
 
         status = run(
             [
@@ -7312,11 +7391,9 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertNotEqual(failed.returncode, 0)
         self.assertIn("diff_file must stay inside", failed.stderr)
 
-    def test_codex_review_final_respects_output_override(self) -> None:
-        env = self._base_env()
-        env["FAKE_CODEX_FINAL_MESSAGE"] = "Override findings.\n"
+    def test_codex_review_rejects_output_override(self) -> None:
         repo, base, head = self._create_review_range_repo("codex-range-output-override")
-        start = run(
+        failed = run(
             [
                 sys.executable,
                 str(SCRIPT_PATH),
@@ -7332,55 +7409,20 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                 head,
                 "--",
                 "-o",
-                "custom-final.txt",
+                "root.txt",
             ],
-            env=env,
+            env=self._base_env(),
         )
-        self.assertEqual(start.returncode, 0, start.stderr)
-        state_dir = pathlib.Path(start.stdout.strip().splitlines()[-1])
-
-        waited = run(
-            [
-                sys.executable,
-                str(SCRIPT_PATH),
-                "stateful",
-                "wait",
-                "--state-dir",
-                str(state_dir),
-            ],
-            env=env,
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn(
+            "codex-review does not allow caller-supplied `-o/--output-last-message`",
+            failed.stderr,
         )
-        self.assertEqual(waited.returncode, 0, waited.stderr)
-
-        state = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
-        self.assertEqual(
-            state["final_path"],
-            str(state_dir / "final.txt"),
-        )
-
-        final = run(
-            [
-                sys.executable,
-                str(SCRIPT_PATH),
-                "stateful",
-                "final",
-                "--state-dir",
-                str(state_dir),
-            ],
-            env=env,
-        )
-        self.assertEqual(final.returncode, 0, final.stderr)
-        self.assertEqual(final.stdout, "Override findings.\n")
+        self.assertIn("cleanup cannot mutate the review scope", failed.stderr)
 
     def test_codex_review_rejects_output_override_outside_workspace(self) -> None:
         repo, base, head = self._create_review_range_repo("codex-range-output-escape")
-        for output_path, expected_message in (
-            ("../escaped-final.txt", "must not escape the isolated workspace"),
-            (
-                str(self.root / "escaped-final.txt"),
-                "must be relative to the isolated workspace",
-            ),
-        ):
+        for output_path in ("../escaped-final.txt", str(self.root / "escaped-final.txt")):
             with self.subTest(output_path=output_path):
                 failed = run(
                     [
@@ -7403,8 +7445,10 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                     env=self._base_env(),
                 )
                 self.assertNotEqual(failed.returncode, 0)
-                self.assertIn("codex-review --output-last-message", failed.stderr)
-                self.assertIn(expected_message, failed.stderr)
+                self.assertIn(
+                    "codex-review does not allow caller-supplied `-o/--output-last-message`",
+                    failed.stderr,
+                )
 
     def test_codex_review_rejects_output_override_symlink_escape(self) -> None:
         repo, base, head = self._create_review_range_repo("codex-range-output-symlink")
@@ -7437,7 +7481,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         )
         self.assertNotEqual(failed.returncode, 0)
         self.assertIn(
-            "must stay inside the isolated workspace after symlink resolution",
+            "codex-review does not allow caller-supplied `-o/--output-last-message`",
             failed.stderr,
         )
 
@@ -7608,8 +7652,8 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                 "--entrypoint",
                 "codex-review",
                 "--",
-                "-o",
-                "custom-final.txt",
+                "--model",
+                "fake-model",
             ],
             cwd=self.repo,
             env=env,

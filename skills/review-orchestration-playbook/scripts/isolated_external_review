@@ -842,6 +842,9 @@ def _materialize_tracked_codex_tmp_changes(
     for relative_path in _tracked_codex_tmp_change_paths(source_repo):
         source_path = source_repo / relative_path
         target_path = target_repo / relative_path
+        if not _git_path_is_tracked(source_repo, relative_path):
+            _remove_path(target_path)
+            continue
         if source_path.exists() or source_path.is_symlink():
             if source_path.is_dir() and not source_path.is_symlink():
                 _remove_path(target_path)
@@ -3323,6 +3326,18 @@ def _reject_codex_review_explicit_prompt(
     )
 
 
+def _reject_codex_review_output_override(args: argparse.Namespace) -> None:
+    raw_review_args = list(args.review_args)
+    if raw_review_args and raw_review_args[0] == "--":
+        raw_review_args = raw_review_args[1:]
+    if not _has_option(raw_review_args, "-o", "--output-last-message"):
+        return
+    raise UserError(
+        "codex-review does not allow caller-supplied `-o/--output-last-message`; "
+        "the helper owns the final output path so cleanup cannot mutate the review scope"
+    )
+
+
 def _split_codex_review_child_args(
     args: list[str],
 ) -> tuple[list[str], list[str], bool]:
@@ -4909,6 +4924,7 @@ def _prepare_review_execution(args: argparse.Namespace) -> dict[str, object]:
                 args,
                 frozen_range=frozen_range,
             )
+            _reject_codex_review_output_override(args)
             if frozen_range:
                 _reject_frozen_codex_review_prompt_contracts(args)
             else:
