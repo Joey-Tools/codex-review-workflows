@@ -1058,7 +1058,105 @@ def _review_diff_file_budget_metrics(
         return _review_diff_budget_metrics_from_lines(handle)
 
 
-def _review_scope_change_metrics(
+def _codex_review_builtin_budget_exceeded(metrics: tuple[int, int, int, int]) -> bool:
+    changed_files, changed_lines, diff_bytes, max_changed_line_bytes = metrics
+    return (
+        changed_files >= CODEX_REVIEW_BUILTIN_MAX_CHANGED_FILES
+        or changed_lines >= CODEX_REVIEW_BUILTIN_MAX_CHANGED_LINES
+        or diff_bytes >= CODEX_REVIEW_BUILTIN_MAX_DIFF_BYTES
+        or max_changed_line_bytes >= CODEX_REVIEW_BUILTIN_MAX_CHANGED_LINE_BYTES
+    )
+
+
+def _streaming_review_diff_budget_metrics(
+    command: list[str],
+    *,
+    stop_when_oversized: bool = False,
+) -> tuple[int, int, int, int]:
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdout is not None
+    changed_files = 0
+    changed_lines = 0
+    diff_bytes = 0
+    max_changed_line_bytes = 0
+    in_hunk = False
+    continuation_kind: str | None = None
+    current_changed_line_bytes = 0
+    stopped_for_budget = False
+    read_limit = CODEX_REVIEW_BUILTIN_MAX_CHANGED_LINE_BYTES + 2
+    while True:
+        raw_line = process.stdout.readline(read_limit)
+        if not raw_line:
+            break
+        diff_bytes += len(raw_line)
+        ends_line = raw_line.endswith(b"\n")
+        segment = raw_line.rstrip(b"\r\n") if ends_line else raw_line
+
+        if continuation_kind == "changed":
+            current_changed_line_bytes += len(segment)
+            max_changed_line_bytes = max(
+                max_changed_line_bytes,
+                current_changed_line_bytes,
+            )
+            if ends_line:
+                continuation_kind = None
+                current_changed_line_bytes = 0
+        elif continuation_kind == "other":
+            if ends_line:
+                continuation_kind = None
+        elif raw_line.startswith(b"diff --git "):
+            changed_files += 1
+            in_hunk = False
+            if not ends_line:
+                continuation_kind = "other"
+        elif raw_line.startswith(b"@@"):
+            in_hunk = True
+            if not ends_line:
+                continuation_kind = "other"
+        elif in_hunk and raw_line.startswith((b"+", b"-")):
+            changed_lines += 1
+            current_changed_line_bytes = max(0, len(segment) - 1)
+            max_changed_line_bytes = max(
+                max_changed_line_bytes,
+                current_changed_line_bytes,
+            )
+            if not ends_line:
+                continuation_kind = "changed"
+        elif not ends_line:
+            continuation_kind = "other"
+
+        metrics = (
+            changed_files,
+            changed_lines,
+            diff_bytes,
+            max_changed_line_bytes,
+        )
+        if stop_when_oversized and _codex_review_builtin_budget_exceeded(metrics):
+            stopped_for_budget = True
+            process.terminate()
+            break
+
+    try:
+        _stdout, stderr = process.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        _stdout, stderr = process.communicate()
+    if process.returncode != 0 and not stopped_for_budget:
+        completed = subprocess.CompletedProcess(
+            command,
+            process.returncode,
+            stdout=b"",
+            stderr=stderr,
+        )
+        raise UserError(_format_command_error(command, completed))
+    return changed_files, changed_lines, diff_bytes, max_changed_line_bytes
+
+
+def _review_scope_numstat_metrics(
     repo_root: pathlib.Path,
     *,
     base_ref: str | None,
@@ -1078,25 +1176,74 @@ def _review_scope_change_metrics(
     else:
         command.append("HEAD")
     completed = _run(command, capture_output=True)
-    changed_files, changed_lines = _parse_diff_numstat(completed.stdout)
+    return _parse_diff_numstat(completed.stdout)
+
+
+def _review_scope_diff_budget_metrics(
+    repo_root: pathlib.Path,
+    *,
+    base_ref: str,
+    head_ref: str,
+    stop_when_oversized: bool = False,
+) -> tuple[int, int, int, int]:
+    return _streaming_review_diff_budget_metrics(
+        [
+            _resolve_real_git(),
+            "-C",
+            str(repo_root),
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--binary",
+            "--submodule=diff",
+            base_ref,
+            head_ref,
+        ],
+        stop_when_oversized=stop_when_oversized,
+    )
+
+
+def _uncommitted_tracked_diff_budget_metrics(
+    repo_root: pathlib.Path,
+    *,
+    stop_when_oversized: bool = False,
+) -> tuple[int, int, int, int]:
+    return _streaming_review_diff_budget_metrics(
+        [
+            _resolve_real_git(),
+            "-C",
+            str(repo_root),
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--binary",
+            "--submodule=diff",
+            "HEAD",
+        ],
+        stop_when_oversized=stop_when_oversized,
+    )
+
+
+def _review_scope_change_metrics(
+    repo_root: pathlib.Path,
+    *,
+    base_ref: str | None,
+    head_ref: str | None,
+) -> tuple[int, int]:
+    changed_files, changed_lines = _review_scope_numstat_metrics(
+        repo_root,
+        base_ref=base_ref,
+        head_ref=head_ref,
+    )
     if base_ref is not None and head_ref is not None:
-        expanded_diff = _run(
-            [
-                _resolve_real_git(),
-                "-C",
-                str(repo_root),
-                "diff",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--submodule=diff",
-                base_ref,
-                head_ref,
-            ],
-            capture_output=True,
-        ).stdout
+        diff_changed_files, diff_changed_lines, _, _ = _review_scope_diff_budget_metrics(
+            repo_root,
+            base_ref=base_ref,
+            head_ref=head_ref,
+        )
     else:
         expanded_diff = _uncommitted_diff_section(repo_root, scope_label=None)
-    diff_changed_files, diff_changed_lines = _review_diff_metrics_from_bytes(expanded_diff)
+        diff_changed_files, diff_changed_lines = _review_diff_metrics_from_bytes(expanded_diff)
     changed_files = max(changed_files, diff_changed_files)
     changed_lines = max(changed_lines, diff_changed_lines)
     return changed_files, changed_lines
@@ -1111,27 +1258,20 @@ def _review_scope_change_budget_metrics(
     if base_ref is None or head_ref is None:
         return _uncommitted_scope_change_budget_metrics(repo_root)
 
-    changed_files, changed_lines = _review_scope_change_metrics(
+    changed_files, changed_lines = _review_scope_numstat_metrics(
         repo_root,
         base_ref=base_ref,
         head_ref=head_ref,
     )
-    diff_bytes = _run(
-        [
-            _resolve_real_git(),
-            "-C",
-            str(repo_root),
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--submodule=diff",
-            base_ref,
-            head_ref,
-        ],
-        capture_output=True,
-    ).stdout
+    if _codex_review_builtin_budget_exceeded((changed_files, changed_lines, 0, 0)):
+        return changed_files, changed_lines, 0, 0
     diff_changed_files, diff_changed_lines, total_bytes, max_changed_line_bytes = (
-        _review_diff_budget_metrics_from_bytes(diff_bytes)
+        _review_scope_diff_budget_metrics(
+            repo_root,
+            base_ref=base_ref,
+            head_ref=head_ref,
+            stop_when_oversized=True,
+        )
     )
     return (
         max(changed_files, diff_changed_files),
@@ -1235,35 +1375,34 @@ def _combine_budget_metrics(
     )
 
 
-def _untracked_repo_budget_metrics(repo_root: pathlib.Path) -> tuple[int, int, int, int]:
-    metrics = (0, 0, 0, 0)
+def _untracked_repo_budget_metrics(
+    repo_root: pathlib.Path,
+    *,
+    initial_metrics: tuple[int, int, int, int] = (0, 0, 0, 0),
+) -> tuple[int, int, int, int]:
+    metrics = initial_metrics
     for relative_path in _untracked_repo_paths(repo_root):
         metrics = _combine_budget_metrics(
             metrics,
             _untracked_path_budget_metrics(repo_root, relative_path),
         )
+        if _codex_review_builtin_budget_exceeded(metrics):
+            return metrics
     return metrics
 
 
 def _uncommitted_scope_change_budget_metrics(
     repo_root: pathlib.Path,
 ) -> tuple[int, int, int, int]:
-    tracked_diff = _run(
-        [
-            _resolve_real_git(),
-            "-C",
-            str(repo_root),
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--binary",
-            "--submodule=diff",
-            "HEAD",
-        ],
-        capture_output=True,
-    ).stdout
-    metrics = _review_diff_budget_metrics_from_bytes(tracked_diff)
-    metrics = _combine_budget_metrics(metrics, _untracked_repo_budget_metrics(repo_root))
+    metrics = _uncommitted_tracked_diff_budget_metrics(
+        repo_root,
+        stop_when_oversized=True,
+    )
+    if _codex_review_builtin_budget_exceeded(metrics):
+        return metrics
+    metrics = _untracked_repo_budget_metrics(repo_root, initial_metrics=metrics)
+    if _codex_review_builtin_budget_exceeded(metrics):
+        return metrics
     for submodule_path in _list_direct_submodules(repo_root):
         submodule_root = repo_root / submodule_path
         if not submodule_root.exists() or not _is_git_worktree_root(submodule_root):
@@ -1272,6 +1411,8 @@ def _uncommitted_scope_change_budget_metrics(
             metrics,
             _uncommitted_scope_change_budget_metrics(submodule_root),
         )
+        if _codex_review_builtin_budget_exceeded(metrics):
+            return metrics
     return metrics
 
 
@@ -4592,6 +4733,14 @@ def _prepare_review_execution(args: argparse.Namespace) -> dict[str, object]:
             cleanup_submodule_worktrees,
         ) = _prepare_workspace(args)
 
+        if args.entrypoint == "codex-review" and not args.prepare_only:
+            _reject_oversized_codex_review_builtin_scope(
+                source_root=workspace_root,
+                base_ref=base_ref,
+                head_ref=head_ref,
+                diff_file=None,
+            )
+
         placeholders = _prepare_inputs(
             args,
             source_root=source_root,
@@ -4599,19 +4748,6 @@ def _prepare_review_execution(args: argparse.Namespace) -> dict[str, object]:
             base_ref=base_ref,
             head_ref=head_ref,
         )
-        if args.entrypoint == "codex-review" and not args.prepare_only:
-            diff_file_raw = placeholders.get("{diff_file}")
-            diff_file = (
-                pathlib.Path(diff_file_raw)
-                if isinstance(diff_file_raw, str) and diff_file_raw
-                else None
-            )
-            _reject_oversized_codex_review_builtin_scope(
-                source_root=workspace_root,
-                base_ref=base_ref,
-                head_ref=head_ref,
-                diff_file=diff_file,
-            )
         prepared = {
             "args": args,
             "source_root": source_root,

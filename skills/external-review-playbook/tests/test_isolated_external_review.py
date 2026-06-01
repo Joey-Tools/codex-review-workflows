@@ -4595,6 +4595,80 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertEqual(total_bytes, len(generated_patch))
         self.assertEqual(max_changed_line_bytes, 3995)
 
+    def test_untracked_budget_metrics_stops_after_threshold(self) -> None:
+        module = self._load_script_module()
+        paths = [pathlib.Path("first.txt"), pathlib.Path("second.txt")]
+        calls: list[pathlib.Path] = []
+
+        def fake_path_budget(
+            _repo: pathlib.Path,
+            relative_path: pathlib.Path,
+        ) -> tuple[int, int, int, int]:
+            calls.append(relative_path)
+            return 1, 0, 1, 0
+
+        with (
+            mock.patch.object(module, "_untracked_repo_paths", return_value=paths),
+            mock.patch.object(
+                module,
+                "_untracked_path_budget_metrics",
+                side_effect=fake_path_budget,
+            ),
+        ):
+            metrics = module._untracked_repo_budget_metrics(
+                self.repo,
+                initial_metrics=(
+                    module.CODEX_REVIEW_BUILTIN_MAX_CHANGED_FILES - 1,
+                    0,
+                    0,
+                    0,
+                ),
+            )
+
+        self.assertEqual(calls, [paths[0]])
+        self.assertEqual(metrics[0], module.CODEX_REVIEW_BUILTIN_MAX_CHANGED_FILES)
+
+    def test_codex_review_rejects_frozen_budget_before_generating_inputs(self) -> None:
+        module = self._load_script_module()
+        repo = self._create_plain_repo("codex-review-early-budget")
+        base = git(repo, "rev-parse", "HEAD").stdout.strip()
+        binary_path = repo / "asset.bin"
+        payload = bytearray(b"\0")
+        seed = b"codex-review-early-budget"
+        while len(payload) <= module.CODEX_REVIEW_BUILTIN_MAX_DIFF_BYTES + 4096:
+            seed = hashlib.sha256(seed).digest()
+            payload.extend(seed)
+        binary_path.write_bytes(bytes(payload))
+        self.assertEqual(git(repo, "add", "asset.bin").returncode, 0)
+        git_commit(repo, "add large binary")
+        head = git(repo, "rev-parse", "HEAD").stdout.strip()
+        args = module._build_parser().parse_args(
+            [
+                "--repo",
+                str(repo),
+                "--entrypoint",
+                "codex-review",
+                "--base-ref",
+                base,
+                "--head-ref",
+                head,
+            ]
+        )
+
+        with mock.patch.object(
+            module,
+            "_prepare_inputs",
+            side_effect=module.UserError("prepare_inputs should not run"),
+        ) as prepare_inputs:
+            with self.assertRaises(module.UserError) as raised:
+                module._prepare_review_execution(args)
+
+        prepare_inputs.assert_not_called()
+        self.assertIn(
+            "codex-review builtin prompt cannot honor the helper-managed evidence budget",
+            str(raised.exception),
+        )
+
     def test_count_tracked_repo_files_counts_submodule_contents_recursively(self) -> None:
         module = self._load_script_module()
         submodule = self.repo / "deps/sub"
@@ -4694,20 +4768,20 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         with mock.patch.object(
             module,
             "_run",
-            side_effect=[
-                subprocess.CompletedProcess(
-                    args=["git", "diff", "--numstat"],
-                    returncode=0,
-                    stdout=numstat_output,
-                    stderr=b"",
-                ),
-                subprocess.CompletedProcess(
-                    args=["git", "diff", "--submodule=diff"],
-                    returncode=0,
-                    stdout=patch_output,
-                    stderr=b"",
-                ),
-            ],
+            return_value=subprocess.CompletedProcess(
+                args=["git", "diff", "--numstat"],
+                returncode=0,
+                stdout=numstat_output,
+                stderr=b"",
+            ),
+        ), mock.patch.object(
+            module,
+            "_review_scope_diff_budget_metrics",
+            return_value=(
+                *module._review_diff_budget_metrics_from_bytes(patch_output)[:2],
+                0,
+                0,
+            ),
         ):
             changed_files, changed_lines = module._review_scope_change_metrics(
                 self.repo,
