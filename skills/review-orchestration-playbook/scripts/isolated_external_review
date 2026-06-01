@@ -1316,6 +1316,38 @@ def _untracked_repo_paths(repo_root: pathlib.Path) -> list[pathlib.Path]:
     return paths
 
 
+def _repo_dirty_paths(repo_root: pathlib.Path) -> list[pathlib.PurePath]:
+    completed = _run(
+        [
+            _resolve_real_git(),
+            "-C",
+            str(repo_root),
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ],
+        capture_output=True,
+    )
+    paths: list[pathlib.PurePath] = []
+    records = completed.stdout.split(b"\0")
+    index = 0
+    while index < len(records):
+        record = records[index]
+        index += 1
+        if not record:
+            continue
+        status = record[:2].decode("ascii", errors="replace")
+        path_bytes = record[3:] if record[2:3] == b" " else record[2:].lstrip()
+        if path_bytes:
+            relative_path = pathlib.PurePath(os.fsdecode(path_bytes))
+            if not (relative_path.parts and relative_path.parts[0] == ".codex-tmp"):
+                paths.append(relative_path)
+        if status[:1] in {"R", "C"} or status[1:2] in {"R", "C"}:
+            index += 1
+    return paths
+
+
 def _untracked_repo_patch(repo_root: pathlib.Path, relative_path: pathlib.Path) -> bytes:
     file_path = repo_root / relative_path
     path_label = relative_path.as_posix()
@@ -3465,6 +3497,7 @@ def _validate_reused_workspace(
     *,
     source_root: pathlib.Path,
     expected_head: str | None,
+    require_clean: bool = False,
 ) -> pathlib.Path:
     resolved_workspace = workspace_root.resolve()
     resolved_source_root = source_root.resolve(strict=False)
@@ -3484,6 +3517,17 @@ def _validate_reused_workspace(
             raise UserError(
                 "reused workspace HEAD does not match the requested frozen head: "
                 f"{workspace_head} != {expected_head}"
+            )
+    if require_clean:
+        dirty_paths = _repo_dirty_paths(resolved_workspace)
+        if dirty_paths:
+            sample_paths = ", ".join(path.as_posix() for path in dirty_paths[:5])
+            more_count = len(dirty_paths) - 5
+            more_suffix = f", and {more_count} more" if more_count > 0 else ""
+            raise UserError(
+                "reused frozen codex-review workspace must be clean so the builtin "
+                "`--base` scope matches the helper evidence-budget check; dirty paths: "
+                f"{sample_paths}{more_suffix}"
             )
     return resolved_workspace
 
@@ -4059,6 +4103,11 @@ def _prepare_workspace(
             pathlib.Path(args.reuse_workspace),
             source_root=source_root,
             expected_head=head_ref,
+            require_clean=(
+                args.entrypoint == "codex-review"
+                and base_ref is not None
+                and head_ref is not None
+            ),
         )
         if args.state_dir:
             container_dir = pathlib.Path(args.state_dir).resolve()

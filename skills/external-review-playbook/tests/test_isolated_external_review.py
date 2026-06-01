@@ -5689,6 +5689,57 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertIn("codex-readonly", failed.stderr)
         self.assertIn("max changed-line bytes", failed.stderr)
 
+    def test_codex_review_reuse_frozen_workspace_requires_clean_worktree(self) -> None:
+        repo, base, head = self._create_review_range_repo(
+            "codex-review-reuse-frozen-dirty"
+        )
+        prepare = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--repo",
+                str(repo),
+                "--prepare-only",
+                "--base-ref",
+                base,
+                "--head-ref",
+                head,
+            ],
+            env=self._base_env(),
+        )
+        self.assertEqual(prepare.returncode, 0, prepare.stderr)
+        workspace_root = pathlib.Path(
+            [line.strip() for line in prepare.stdout.splitlines() if line.strip()][-1]
+        )
+        (workspace_root / "root.txt").write_text(
+            ("x" * 12_000) + "\n",
+            encoding="utf-8",
+        )
+
+        failed = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "stateful",
+                "start",
+                "--repo",
+                str(repo),
+                "--reuse-workspace",
+                str(workspace_root),
+                "--entrypoint",
+                "codex-review",
+                "--base-ref",
+                base,
+                "--head-ref",
+                head,
+            ],
+            env=self._base_env(),
+        )
+
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("reused frozen codex-review workspace must be clean", failed.stderr)
+        self.assertIn("root.txt", failed.stderr)
+
     def test_run_prepared_review_returns_failure_when_cleanup_breaks_after_success(self) -> None:
         module = self._load_script_module()
         workspace_root = self.root / "run-prepared-workspace"
