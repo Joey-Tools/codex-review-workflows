@@ -4598,6 +4598,8 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
     def test_untracked_budget_metrics_stops_after_threshold(self) -> None:
         module = self._load_script_module()
         paths = [pathlib.Path("first.txt"), pathlib.Path("second.txt")]
+        for path in paths:
+            (self.repo / path).write_text("generated\n", encoding="utf-8")
         calls: list[pathlib.Path] = []
 
         def fake_path_budget(
@@ -4607,13 +4609,10 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
             calls.append(relative_path)
             return 1, 0, 1, 0
 
-        with (
-            mock.patch.object(module, "_untracked_repo_paths", return_value=paths),
-            mock.patch.object(
-                module,
-                "_untracked_path_budget_metrics",
-                side_effect=fake_path_budget,
-            ),
+        with mock.patch.object(
+            module,
+            "_untracked_path_budget_metrics",
+            side_effect=fake_path_budget,
         ):
             metrics = module._untracked_repo_budget_metrics(
                 self.repo,
@@ -4627,6 +4626,34 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
 
         self.assertEqual(calls, [paths[0]])
         self.assertEqual(metrics[0], module.CODEX_REVIEW_BUILTIN_MAX_CHANGED_FILES)
+
+    def test_frozen_budget_metrics_stops_after_numstat_threshold(self) -> None:
+        module = self._load_script_module()
+        repo = self._create_plain_repo("frozen-numstat-budget")
+        base = git(repo, "rev-parse", "HEAD").stdout.strip()
+        for index in range(module.CODEX_REVIEW_BUILTIN_MAX_CHANGED_FILES + 5):
+            (repo / f"file-{index:02d}.txt").write_text("content\n", encoding="utf-8")
+        self.assertEqual(git(repo, "add", ".").returncode, 0)
+        git_commit(repo, "add many files")
+        head = git(repo, "rev-parse", "HEAD").stdout.strip()
+
+        with mock.patch.object(
+            module,
+            "_review_scope_diff_budget_metrics",
+            side_effect=AssertionError("expanded diff should not be generated"),
+        ):
+            changed_files, changed_lines, total_bytes, max_changed_line_bytes = (
+                module._review_scope_change_budget_metrics(
+                    repo,
+                    base_ref=base,
+                    head_ref=head,
+                )
+            )
+
+        self.assertEqual(changed_files, module.CODEX_REVIEW_BUILTIN_MAX_CHANGED_FILES)
+        self.assertGreater(changed_lines, 0)
+        self.assertEqual(total_bytes, 0)
+        self.assertEqual(max_changed_line_bytes, 0)
 
     def test_codex_review_rejects_frozen_budget_before_generating_inputs(self) -> None:
         module = self._load_script_module()
@@ -4750,7 +4777,6 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
 
     def test_review_scope_change_metrics_uses_frozen_submodule_patch_lines(self) -> None:
         module = self._load_script_module()
-        numstat_output = b"1\t1\tdeps/sub\n"
         patch_output = (
             b"Submodule deps/sub 1111111..2222222:\n"
             b"diff --git a/deps/sub/f.txt b/deps/sub/f.txt\n"
@@ -4767,13 +4793,8 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
 
         with mock.patch.object(
             module,
-            "_run",
-            return_value=subprocess.CompletedProcess(
-                args=["git", "diff", "--numstat"],
-                returncode=0,
-                stdout=numstat_output,
-                stderr=b"",
-            ),
+            "_review_scope_numstat_metrics",
+            return_value=(1, 2),
         ), mock.patch.object(
             module,
             "_review_scope_diff_budget_metrics",
@@ -5902,6 +5923,73 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertNotEqual(failed.returncode, 0)
         self.assertIn("reused frozen codex-review workspace must be clean", failed.stderr)
         self.assertIn("root.txt", failed.stderr)
+
+    def test_codex_review_reuse_frozen_workspace_reports_tracked_codex_tmp_dirty(
+        self,
+    ) -> None:
+        repo = self._create_plain_repo("codex-review-reuse-frozen-codex-tmp-dirty")
+        tracked_tmp = repo / ".codex-tmp/tracked.txt"
+        tracked_tmp.parent.mkdir()
+        tracked_tmp.write_text("base\n", encoding="utf-8")
+        self.assertEqual(git(repo, "add", ".codex-tmp/tracked.txt").returncode, 0)
+        git_commit(repo, "track codex tmp fixture")
+        base = git(repo, "rev-parse", "HEAD").stdout.strip()
+        (repo / "root.txt").write_text("head\n", encoding="utf-8")
+        self.assertEqual(git(repo, "add", "root.txt").returncode, 0)
+        git_commit(repo, "add review head")
+        head = git(repo, "rev-parse", "HEAD").stdout.strip()
+
+        prepare = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--repo",
+                str(repo),
+                "--prepare-only",
+                "--base-ref",
+                base,
+                "--head-ref",
+                head,
+            ],
+            env=self._base_env(),
+        )
+        self.assertEqual(prepare.returncode, 0, prepare.stderr)
+        workspace_root = pathlib.Path(
+            [line.strip() for line in prepare.stdout.splitlines() if line.strip()][-1]
+        )
+        (workspace_root / ".codex-tmp/tracked.txt").write_text(
+            "dirty\n",
+            encoding="utf-8",
+        )
+        (workspace_root / ".codex-tmp/untracked.txt").write_text(
+            "helper scratch\n",
+            encoding="utf-8",
+        )
+
+        failed = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "stateful",
+                "start",
+                "--repo",
+                str(repo),
+                "--reuse-workspace",
+                str(workspace_root),
+                "--entrypoint",
+                "codex-review",
+                "--base-ref",
+                base,
+                "--head-ref",
+                head,
+            ],
+            env=self._base_env(),
+        )
+
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("reused frozen codex-review workspace must be clean", failed.stderr)
+        self.assertIn(".codex-tmp/tracked.txt", failed.stderr)
+        self.assertNotIn(".codex-tmp/untracked.txt", failed.stderr)
 
     def test_run_prepared_review_returns_failure_when_cleanup_breaks_after_success(self) -> None:
         module = self._load_script_module()
