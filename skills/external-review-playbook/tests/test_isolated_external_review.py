@@ -107,6 +107,23 @@ class SkillDocumentationTest(unittest.TestCase):
         ):
             self.assertIn(needle, section)
 
+    def test_review_orchestration_prefers_readonly_for_enforceable_evidence_budget(self) -> None:
+        skill_path = (
+            pathlib.Path(__file__).resolve().parents[2]
+            / "review-orchestration-playbook"
+            / "SKILL.md"
+        )
+        text = skill_path.read_text(encoding="utf-8")
+        self.assertIn(
+            "default to `codex-readonly` when the review needs an enforceable evidence budget",
+            text,
+        )
+        self.assertIn(
+            "builtin child prompt can ask the reviewer to run `git diff <base>` directly",
+            text,
+        )
+        self.assertIn("cannot receive the helper's evidence-budget text", text)
+
 
 class IsolatedCopilotReviewTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -3637,6 +3654,80 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertEqual(final.returncode, 0, final.stderr)
         self.assertEqual(final.stdout, "No findings.\n")
 
+    def test_codex_review_rejects_large_builtin_prompt_scope(self) -> None:
+        env = self._base_env()
+        repo, base, _ = self._create_review_range_repo("codex-large-range-review")
+        (repo / "root.txt").write_text(
+            "\n".join(f"root-head-{index}" for index in range(900)) + "\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(git(repo, "add", "root.txt").returncode, 0)
+        git_commit(repo, "large update")
+        head = git(repo, "rev-parse", "HEAD").stdout.strip()
+
+        failed = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "stateful",
+                "start",
+                "--repo",
+                str(repo),
+                "--entrypoint",
+                "codex-review",
+                "--base-ref",
+                base,
+                "--head-ref",
+                head,
+            ],
+            env=env,
+        )
+
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn(
+            "codex-review builtin prompt cannot honor the helper-managed evidence budget",
+            failed.stderr,
+        )
+        self.assertIn("codex-readonly", failed.stderr)
+        self.assertIn("changed lines", failed.stderr)
+
+    def test_codex_review_rejects_single_long_line_builtin_prompt_scope(self) -> None:
+        env = self._base_env()
+        repo = self._create_plain_repo("codex-long-line-range-review")
+        base = git(repo, "rev-parse", "HEAD").stdout.strip()
+        self.assertEqual(git(repo, "switch", "-c", "wip/long-line-review").returncode, 0)
+        (repo / "generated.txt").write_text(("x" * 12_000) + "\n", encoding="utf-8")
+        self.assertEqual(git(repo, "add", "generated.txt").returncode, 0)
+        git_commit(repo, "add generated long line")
+        head = git(repo, "rev-parse", "HEAD").stdout.strip()
+
+        failed = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "stateful",
+                "start",
+                "--repo",
+                str(repo),
+                "--entrypoint",
+                "codex-review",
+                "--base-ref",
+                base,
+                "--head-ref",
+                head,
+            ],
+            env=env,
+        )
+
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn(
+            "codex-review builtin prompt cannot honor the helper-managed evidence budget",
+            failed.stderr,
+        )
+        self.assertIn("codex-readonly", failed.stderr)
+        self.assertIn("diff bytes", failed.stderr)
+        self.assertIn("max changed-line bytes", failed.stderr)
+
     def test_stateful_opencode_start_uses_default_prompt_for_frozen_range(self) -> None:
         env = self._base_env()
         env["FAKE_REVIEW_OUTPUT_FILE"] = str(self.output_file)
@@ -4397,6 +4488,469 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertEqual(changed_files, 1)
         self.assertEqual(changed_lines, 3)
 
+    def test_review_diff_budget_metrics_records_long_changed_lines(self) -> None:
+        module = self._load_script_module()
+        long_added_line = b"+" + (b"x" * 12_000) + b"\n"
+        diff_bytes = (
+            b"diff --git a/generated.txt b/generated.txt\n"
+            b"--- /dev/null\n"
+            b"+++ b/generated.txt\n"
+            b"@@ -0,0 +1 @@\n"
+            + long_added_line
+        )
+
+        changed_files, changed_lines, total_bytes, max_changed_line_bytes = (
+            module._review_diff_budget_metrics_from_bytes(diff_bytes)
+        )
+
+        self.assertEqual(changed_files, 1)
+        self.assertEqual(changed_lines, 1)
+        self.assertEqual(total_bytes, len(diff_bytes))
+        self.assertEqual(max_changed_line_bytes, 12_000)
+
+    def test_uncommitted_budget_metrics_bounds_large_untracked_files(self) -> None:
+        module = self._load_script_module()
+        large_file = self.repo / "large-generated.txt"
+        large_file.write_bytes(b"x" * (module.CODEX_REVIEW_BUILTIN_MAX_DIFF_BYTES + 1))
+
+        with mock.patch.object(
+            module,
+            "_untracked_repo_patch",
+            side_effect=AssertionError("budget metrics must not build full patches"),
+        ):
+            changed_files, changed_lines, total_bytes, max_changed_line_bytes = (
+                module._review_scope_change_budget_metrics(
+                    self.repo,
+                    base_ref=None,
+                    head_ref=None,
+                )
+            )
+
+        self.assertGreaterEqual(changed_files, 1)
+        self.assertGreaterEqual(changed_lines, 1)
+        self.assertGreater(total_bytes, module.CODEX_REVIEW_BUILTIN_MAX_DIFF_BYTES)
+        self.assertGreater(
+            max_changed_line_bytes,
+            module.CODEX_REVIEW_BUILTIN_MAX_CHANGED_LINE_BYTES,
+        )
+
+    def test_uncommitted_budget_metrics_handles_non_utf8_untracked_paths(self) -> None:
+        module = self._load_script_module()
+        repo = self._create_plain_repo("non-utf8-untracked-budget")
+        relative_path = pathlib.Path(os.fsdecode(b"bad-\xff.txt"))
+
+        metrics = module._untracked_path_budget_metrics(repo, relative_path)
+
+        self.assertEqual(metrics, (0, 0, 0, 0))
+
+    def test_uncommitted_budget_metrics_counts_binary_tracked_diff_payload(self) -> None:
+        module = self._load_script_module()
+        repo = self._create_plain_repo("tracked-binary-budget")
+        binary_path = repo / "asset.bin"
+        binary_path.write_bytes(b"\0base\n")
+        self.assertEqual(git(repo, "add", "asset.bin").returncode, 0)
+        git_commit(repo, "add binary asset")
+
+        payload = bytearray(b"\0")
+        seed = b"tracked-binary-budget"
+        while len(payload) <= module.CODEX_REVIEW_BUILTIN_MAX_DIFF_BYTES + 4096:
+            seed = hashlib.sha256(seed).digest()
+            payload.extend(seed)
+        binary_path.write_bytes(bytes(payload))
+
+        changed_files, _changed_lines, total_bytes, _max_changed_line_bytes = (
+            module._review_scope_change_budget_metrics(
+                repo,
+                base_ref=None,
+                head_ref=None,
+            )
+        )
+
+        self.assertEqual(changed_files, 1)
+        self.assertGreater(total_bytes, module.CODEX_REVIEW_BUILTIN_MAX_DIFF_BYTES)
+
+    def test_untracked_budget_metrics_include_generated_patch_overhead(self) -> None:
+        module = self._load_script_module()
+        repo = self._create_plain_repo("untracked-overhead-budget")
+        relative_path = pathlib.Path("near-limit.txt")
+        payload = (("x" * 3995) + "\n") * 10
+        self.assertLess(
+            len(payload.encode("utf-8")),
+            module.CODEX_REVIEW_BUILTIN_MAX_DIFF_BYTES,
+        )
+        (repo / relative_path).write_text(payload, encoding="utf-8")
+        generated_patch = module._untracked_repo_patch(repo, relative_path)
+        self.assertGreater(len(generated_patch), module.CODEX_REVIEW_BUILTIN_MAX_DIFF_BYTES)
+
+        changed_files, changed_lines, total_bytes, max_changed_line_bytes = (
+            module._review_scope_change_budget_metrics(
+                repo,
+                base_ref=None,
+                head_ref=None,
+            )
+        )
+
+        self.assertEqual(changed_files, 1)
+        self.assertEqual(changed_lines, 10)
+        self.assertEqual(total_bytes, len(generated_patch))
+        self.assertEqual(max_changed_line_bytes, 3995)
+
+    def test_untracked_budget_metrics_stops_after_threshold(self) -> None:
+        module = self._load_script_module()
+        paths = [pathlib.Path("first.txt"), pathlib.Path("second.txt")]
+        for path in paths:
+            (self.repo / path).write_text("generated\n", encoding="utf-8")
+        calls: list[pathlib.Path] = []
+
+        def fake_path_budget(
+            _repo: pathlib.Path,
+            relative_path: pathlib.Path,
+        ) -> tuple[int, int, int, int]:
+            calls.append(relative_path)
+            return 1, 0, 1, 0
+
+        with mock.patch.object(
+            module,
+            "_untracked_path_budget_metrics",
+            side_effect=fake_path_budget,
+        ):
+            metrics = module._untracked_repo_budget_metrics(
+                self.repo,
+                initial_metrics=(
+                    module.CODEX_REVIEW_BUILTIN_MAX_CHANGED_FILES - 1,
+                    0,
+                    0,
+                    0,
+                ),
+            )
+
+        self.assertEqual(calls, [paths[0]])
+        self.assertEqual(metrics[0], module.CODEX_REVIEW_BUILTIN_MAX_CHANGED_FILES)
+
+    def test_frozen_budget_metrics_stops_after_numstat_threshold(self) -> None:
+        module = self._load_script_module()
+        repo = self._create_plain_repo("frozen-numstat-budget")
+        base = git(repo, "rev-parse", "HEAD").stdout.strip()
+        for index in range(module.CODEX_REVIEW_BUILTIN_MAX_CHANGED_FILES + 5):
+            (repo / f"file-{index:02d}.txt").write_text("content\n", encoding="utf-8")
+        self.assertEqual(git(repo, "add", ".").returncode, 0)
+        git_commit(repo, "add many files")
+        head = git(repo, "rev-parse", "HEAD").stdout.strip()
+
+        with mock.patch.object(
+            module,
+            "_review_scope_diff_budget_metrics",
+            side_effect=AssertionError("expanded diff should not be generated"),
+        ):
+            changed_files, changed_lines, total_bytes, max_changed_line_bytes = (
+                module._review_scope_change_budget_metrics(
+                    repo,
+                    base_ref=base,
+                    head_ref=head,
+                )
+            )
+
+        self.assertEqual(changed_files, module.CODEX_REVIEW_BUILTIN_MAX_CHANGED_FILES)
+        self.assertGreater(changed_lines, 0)
+        self.assertEqual(total_bytes, 0)
+        self.assertEqual(max_changed_line_bytes, 0)
+
+    def test_prepare_workspace_materializes_tracked_codex_tmp_changes(self) -> None:
+        repo = self._create_plain_repo("tracked-codex-tmp-snapshot")
+        tracked_tmp = repo / ".codex-tmp" / "tracked.txt"
+        tracked_tmp.parent.mkdir()
+        tracked_tmp.write_text("base\n", encoding="utf-8")
+        self.assertEqual(git(repo, "add", ".codex-tmp/tracked.txt").returncode, 0)
+        git_commit(repo, "track codex tmp")
+        tracked_tmp.write_text("dirty\n", encoding="utf-8")
+        staged_tmp = repo / ".codex-tmp" / "staged.txt"
+        staged_tmp.write_text("staged\n", encoding="utf-8")
+        self.assertEqual(git(repo, "add", ".codex-tmp/staged.txt").returncode, 0)
+        (repo / ".codex-tmp" / "untracked.txt").write_text(
+            "helper scratch\n",
+            encoding="utf-8",
+        )
+
+        prepare = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--repo",
+                str(repo),
+                "--prepare-only",
+            ],
+            env=self._base_env(),
+        )
+
+        self.assertEqual(prepare.returncode, 0, prepare.stderr)
+        workspace_root = pathlib.Path(
+            [line.strip() for line in prepare.stdout.splitlines() if line.strip()][-1]
+        )
+        self.assertEqual(
+            (workspace_root / ".codex-tmp" / "tracked.txt").read_text(
+                encoding="utf-8",
+            ),
+            "dirty\n",
+        )
+        self.assertEqual(
+            (workspace_root / ".codex-tmp" / "staged.txt").read_text(
+                encoding="utf-8",
+            ),
+            "staged\n",
+        )
+        staged_diff = git(
+            workspace_root,
+            "diff",
+            "--name-only",
+            "HEAD",
+            "--",
+            ".codex-tmp/staged.txt",
+        )
+        self.assertEqual(staged_diff.returncode, 0, staged_diff.stderr)
+        self.assertIn(".codex-tmp/staged.txt", staged_diff.stdout)
+        self.assertFalse((workspace_root / ".codex-tmp" / "untracked.txt").exists())
+
+    def test_prepare_workspace_removes_tracked_codex_tmp_file_replaced_by_directory(
+        self,
+    ) -> None:
+        repo = self._create_plain_repo("tracked-codex-tmp-replaced-by-dir")
+        tracked_tmp = repo / ".codex-tmp" / "tracked.txt"
+        tracked_tmp.parent.mkdir()
+        tracked_tmp.write_text("base\n", encoding="utf-8")
+        self.assertEqual(git(repo, "add", ".codex-tmp/tracked.txt").returncode, 0)
+        git_commit(repo, "track codex tmp")
+        tracked_tmp.unlink()
+        tracked_tmp.mkdir()
+        (tracked_tmp / "untracked-child.txt").write_text(
+            "helper scratch\n",
+            encoding="utf-8",
+        )
+
+        prepare = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--repo",
+                str(repo),
+                "--prepare-only",
+            ],
+            env=self._base_env(),
+        )
+
+        self.assertEqual(prepare.returncode, 0, prepare.stderr)
+        workspace_root = pathlib.Path(
+            [line.strip() for line in prepare.stdout.splitlines() if line.strip()][-1]
+        )
+        self.assertFalse((workspace_root / ".codex-tmp" / "tracked.txt").exists())
+        deleted_diff = git(
+            workspace_root,
+            "diff",
+            "--name-status",
+            "HEAD",
+            "--",
+            ".codex-tmp/tracked.txt",
+        )
+        self.assertEqual(deleted_diff.returncode, 0, deleted_diff.stderr)
+        self.assertIn("D\t.codex-tmp/tracked.txt", deleted_diff.stdout)
+
+    def test_prepare_workspace_preserves_staged_codex_tmp_deletion_with_worktree_file(
+        self,
+    ) -> None:
+        repo = self._create_plain_repo("tracked-codex-tmp-staged-delete")
+        tracked_tmp = repo / ".codex-tmp" / "tracked.txt"
+        tracked_tmp.parent.mkdir()
+        tracked_tmp.write_text("base\n", encoding="utf-8")
+        self.assertEqual(git(repo, "add", ".codex-tmp/tracked.txt").returncode, 0)
+        git_commit(repo, "track codex tmp")
+        self.assertEqual(
+            git(repo, "rm", "--cached", ".codex-tmp/tracked.txt").returncode,
+            0,
+        )
+        self.assertTrue(tracked_tmp.is_file())
+
+        prepare = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--repo",
+                str(repo),
+                "--prepare-only",
+            ],
+            env=self._base_env(),
+        )
+
+        self.assertEqual(prepare.returncode, 0, prepare.stderr)
+        workspace_root = pathlib.Path(
+            [line.strip() for line in prepare.stdout.splitlines() if line.strip()][-1]
+        )
+        self.assertFalse((workspace_root / ".codex-tmp" / "tracked.txt").exists())
+        deleted_diff = git(
+            workspace_root,
+            "diff",
+            "--name-status",
+            "HEAD",
+            "--",
+            ".codex-tmp/tracked.txt",
+        )
+        self.assertEqual(deleted_diff.returncode, 0, deleted_diff.stderr)
+        self.assertIn("D\t.codex-tmp/tracked.txt", deleted_diff.stdout)
+
+    def test_codex_review_rejects_frozen_budget_before_generating_inputs(self) -> None:
+        module = self._load_script_module()
+        repo = self._create_plain_repo("codex-review-early-budget")
+        base = git(repo, "rev-parse", "HEAD").stdout.strip()
+        binary_path = repo / "asset.bin"
+        payload = bytearray(b"\0")
+        seed = b"codex-review-early-budget"
+        while len(payload) <= module.CODEX_REVIEW_BUILTIN_MAX_DIFF_BYTES + 4096:
+            seed = hashlib.sha256(seed).digest()
+            payload.extend(seed)
+        binary_path.write_bytes(bytes(payload))
+        self.assertEqual(git(repo, "add", "asset.bin").returncode, 0)
+        git_commit(repo, "add large binary")
+        head = git(repo, "rev-parse", "HEAD").stdout.strip()
+        args = module._build_parser().parse_args(
+            [
+                "--repo",
+                str(repo),
+                "--entrypoint",
+                "codex-review",
+                "--base-ref",
+                base,
+                "--head-ref",
+                head,
+            ]
+        )
+
+        with mock.patch.object(
+            module,
+            "_prepare_inputs",
+            side_effect=module.UserError("prepare_inputs should not run"),
+        ) as prepare_inputs:
+            with self.assertRaises(module.UserError) as raised:
+                module._prepare_review_execution(args)
+
+        prepare_inputs.assert_not_called()
+        self.assertIn(
+            "codex-review builtin prompt cannot honor the helper-managed evidence budget",
+            str(raised.exception),
+        )
+
+    def test_codex_review_uncommitted_budget_includes_tracked_codex_tmp_changes(
+        self,
+    ) -> None:
+        module = self._load_script_module()
+        repo = self._create_plain_repo("codex-review-codex-tmp-budget")
+        tracked_tmp = repo / ".codex-tmp" / "tracked.txt"
+        tracked_tmp.parent.mkdir()
+        tracked_tmp.write_text("base\n", encoding="utf-8")
+        self.assertEqual(git(repo, "add", ".codex-tmp/tracked.txt").returncode, 0)
+        git_commit(repo, "track codex tmp")
+        tracked_tmp.write_text(("x" * 12_000) + "\n", encoding="utf-8")
+        (repo / ".codex-tmp" / "untracked.txt").write_text(
+            "helper scratch\n",
+            encoding="utf-8",
+        )
+        args = module._build_parser().parse_args(
+            [
+                "--repo",
+                str(repo),
+                "--entrypoint",
+                "codex-review",
+            ]
+        )
+
+        with mock.patch.object(
+            module,
+            "_prepare_inputs",
+            side_effect=module.UserError("prepare_inputs should not run"),
+        ) as prepare_inputs:
+            with self.assertRaises(module.UserError) as raised:
+                module._prepare_review_execution(args)
+
+        prepare_inputs.assert_not_called()
+        self.assertIn(
+            "codex-review builtin prompt cannot honor the helper-managed evidence budget",
+            str(raised.exception),
+        )
+
+    def test_codex_review_uncommitted_budget_includes_codex_tmp_file_replaced_by_directory(
+        self,
+    ) -> None:
+        module = self._load_script_module()
+        repo = self._create_plain_repo("codex-review-codex-tmp-replaced-dir-budget")
+        tracked_tmp = repo / ".codex-tmp" / "tracked.txt"
+        tracked_tmp.parent.mkdir()
+        tracked_tmp.write_text(("x" * 12_000) + "\n", encoding="utf-8")
+        self.assertEqual(git(repo, "add", ".codex-tmp/tracked.txt").returncode, 0)
+        git_commit(repo, "track large codex tmp")
+        tracked_tmp.unlink()
+        tracked_tmp.mkdir()
+        (tracked_tmp / "untracked-child.txt").write_text(
+            "helper scratch\n",
+            encoding="utf-8",
+        )
+        args = module._build_parser().parse_args(
+            [
+                "--repo",
+                str(repo),
+                "--entrypoint",
+                "codex-review",
+            ]
+        )
+
+        with mock.patch.object(
+            module,
+            "_prepare_inputs",
+            side_effect=module.UserError("prepare_inputs should not run"),
+        ) as prepare_inputs:
+            with self.assertRaises(module.UserError) as raised:
+                module._prepare_review_execution(args)
+
+        prepare_inputs.assert_not_called()
+        self.assertIn(
+            "codex-review builtin prompt cannot honor the helper-managed evidence budget",
+            str(raised.exception),
+        )
+
+    def test_codex_review_uncommitted_budget_includes_staged_codex_tmp_deletion(
+        self,
+    ) -> None:
+        module = self._load_script_module()
+        repo = self._create_plain_repo("codex-review-codex-tmp-staged-delete-budget")
+        tracked_tmp = repo / ".codex-tmp" / "tracked.txt"
+        tracked_tmp.parent.mkdir()
+        tracked_tmp.write_text(("x" * 12_000) + "\n", encoding="utf-8")
+        self.assertEqual(git(repo, "add", ".codex-tmp/tracked.txt").returncode, 0)
+        git_commit(repo, "track large codex tmp")
+        self.assertEqual(
+            git(repo, "rm", "--cached", ".codex-tmp/tracked.txt").returncode,
+            0,
+        )
+        self.assertTrue(tracked_tmp.is_file())
+        args = module._build_parser().parse_args(
+            [
+                "--repo",
+                str(repo),
+                "--entrypoint",
+                "codex-review",
+            ]
+        )
+
+        with mock.patch.object(
+            module,
+            "_prepare_inputs",
+            side_effect=module.UserError("prepare_inputs should not run"),
+        ) as prepare_inputs:
+            with self.assertRaises(module.UserError) as raised:
+                module._prepare_review_execution(args)
+
+        prepare_inputs.assert_not_called()
+        self.assertIn(
+            "codex-review builtin prompt cannot honor the helper-managed evidence budget",
+            str(raised.exception),
+        )
+
     def test_count_tracked_repo_files_counts_submodule_contents_recursively(self) -> None:
         module = self._load_script_module()
         submodule = self.repo / "deps/sub"
@@ -4478,7 +5032,6 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
 
     def test_review_scope_change_metrics_uses_frozen_submodule_patch_lines(self) -> None:
         module = self._load_script_module()
-        numstat_output = b"1\t1\tdeps/sub\n"
         patch_output = (
             b"Submodule deps/sub 1111111..2222222:\n"
             b"diff --git a/deps/sub/f.txt b/deps/sub/f.txt\n"
@@ -4495,21 +5048,16 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
 
         with mock.patch.object(
             module,
-            "_run",
-            side_effect=[
-                subprocess.CompletedProcess(
-                    args=["git", "diff", "--numstat"],
-                    returncode=0,
-                    stdout=numstat_output,
-                    stderr=b"",
-                ),
-                subprocess.CompletedProcess(
-                    args=["git", "diff", "--submodule=diff"],
-                    returncode=0,
-                    stdout=patch_output,
-                    stderr=b"",
-                ),
-            ],
+            "_review_scope_numstat_metrics",
+            return_value=(1, 2),
+        ), mock.patch.object(
+            module,
+            "_review_scope_diff_budget_metrics",
+            return_value=(
+                *module._review_diff_budget_metrics_from_bytes(patch_output)[:2],
+                0,
+                0,
+            ),
         ):
             changed_files, changed_lines = module._review_scope_change_metrics(
                 self.repo,
@@ -5287,6 +5835,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                 "--prompt-file",
             ),
             (["--diff-file", str(range_diff)], "--diff-file"),
+            (["--copy-path", str(repo / "root.txt")], "--copy-path"),
             (["--final-reply", "DONE"], "--final-reply"),
         )
         for extra_args, expected_flag in cases:
@@ -5350,6 +5899,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         cases = (
             (["--prompt-file", str(self.repo / ".codex-tmp" / "review.prompt")], "--prompt-file"),
             (["--diff-file", str(self.repo / ".codex-tmp" / "review.diff")], "--diff-file"),
+            (["--copy-path", str(self.repo / "root.txt")], "--copy-path"),
             (["--final-reply", "DONE"], "--final-reply"),
             (["--prompt-delivery", "inline"], "--prompt-delivery"),
             (["--prompt-inline-max-bytes", "1"], "--prompt-inline-max-bytes"),
@@ -5532,6 +6082,169 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         )
         self.assertFalse(diff_copy.exists())
         self.assertFalse(runtime_temp_dir.exists())
+
+    def test_codex_review_reuse_workspace_rejects_large_uncommitted_scope(self) -> None:
+        repo = self._create_plain_repo("codex-review-reuse-large-uncommitted")
+        prepare = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--repo",
+                str(repo),
+                "--prepare-only",
+            ],
+            env=self._base_env(),
+        )
+        self.assertEqual(prepare.returncode, 0, prepare.stderr)
+        workspace_root = pathlib.Path(
+            [line.strip() for line in prepare.stdout.splitlines() if line.strip()][-1]
+        )
+        (workspace_root / "generated.txt").write_text(
+            ("x" * 12_000) + "\n",
+            encoding="utf-8",
+        )
+
+        failed = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "stateful",
+                "start",
+                "--repo",
+                str(repo),
+                "--reuse-workspace",
+                str(workspace_root),
+                "--entrypoint",
+                "codex-review",
+            ],
+            env=self._base_env(),
+        )
+
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn(
+            "codex-review builtin prompt cannot honor the helper-managed evidence budget",
+            failed.stderr,
+        )
+        self.assertIn("codex-readonly", failed.stderr)
+        self.assertIn("max changed-line bytes", failed.stderr)
+
+    def test_codex_review_reuse_frozen_workspace_requires_clean_worktree(self) -> None:
+        repo, base, head = self._create_review_range_repo(
+            "codex-review-reuse-frozen-dirty"
+        )
+        prepare = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--repo",
+                str(repo),
+                "--prepare-only",
+                "--base-ref",
+                base,
+                "--head-ref",
+                head,
+            ],
+            env=self._base_env(),
+        )
+        self.assertEqual(prepare.returncode, 0, prepare.stderr)
+        workspace_root = pathlib.Path(
+            [line.strip() for line in prepare.stdout.splitlines() if line.strip()][-1]
+        )
+        (workspace_root / "root.txt").write_text(
+            ("x" * 12_000) + "\n",
+            encoding="utf-8",
+        )
+
+        failed = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "stateful",
+                "start",
+                "--repo",
+                str(repo),
+                "--reuse-workspace",
+                str(workspace_root),
+                "--entrypoint",
+                "codex-review",
+                "--base-ref",
+                base,
+                "--head-ref",
+                head,
+            ],
+            env=self._base_env(),
+        )
+
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("reused frozen codex-review workspace must be clean", failed.stderr)
+        self.assertIn("root.txt", failed.stderr)
+
+    def test_codex_review_reuse_frozen_workspace_reports_tracked_codex_tmp_dirty(
+        self,
+    ) -> None:
+        repo = self._create_plain_repo("codex-review-reuse-frozen-codex-tmp-dirty")
+        tracked_tmp = repo / ".codex-tmp/tracked.txt"
+        tracked_tmp.parent.mkdir()
+        tracked_tmp.write_text("base\n", encoding="utf-8")
+        self.assertEqual(git(repo, "add", ".codex-tmp/tracked.txt").returncode, 0)
+        git_commit(repo, "track codex tmp fixture")
+        base = git(repo, "rev-parse", "HEAD").stdout.strip()
+        (repo / "root.txt").write_text("head\n", encoding="utf-8")
+        self.assertEqual(git(repo, "add", "root.txt").returncode, 0)
+        git_commit(repo, "add review head")
+        head = git(repo, "rev-parse", "HEAD").stdout.strip()
+
+        prepare = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--repo",
+                str(repo),
+                "--prepare-only",
+                "--base-ref",
+                base,
+                "--head-ref",
+                head,
+            ],
+            env=self._base_env(),
+        )
+        self.assertEqual(prepare.returncode, 0, prepare.stderr)
+        workspace_root = pathlib.Path(
+            [line.strip() for line in prepare.stdout.splitlines() if line.strip()][-1]
+        )
+        (workspace_root / ".codex-tmp/tracked.txt").write_text(
+            "dirty\n",
+            encoding="utf-8",
+        )
+        (workspace_root / ".codex-tmp/untracked.txt").write_text(
+            "helper scratch\n",
+            encoding="utf-8",
+        )
+
+        failed = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "stateful",
+                "start",
+                "--repo",
+                str(repo),
+                "--reuse-workspace",
+                str(workspace_root),
+                "--entrypoint",
+                "codex-review",
+                "--base-ref",
+                base,
+                "--head-ref",
+                head,
+            ],
+            env=self._base_env(),
+        )
+
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("reused frozen codex-review workspace must be clean", failed.stderr)
+        self.assertIn(".codex-tmp/tracked.txt", failed.stderr)
+        self.assertNotIn(".codex-tmp/untracked.txt", failed.stderr)
 
     def test_run_prepared_review_returns_failure_when_cleanup_breaks_after_success(self) -> None:
         module = self._load_script_module()
@@ -6352,8 +7065,8 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                 "--entrypoint",
                 "codex-review",
                 "--",
-                "-o",
-                "custom-final.txt",
+                "--model",
+                "fake-model",
             ],
             env=first_env,
         )
@@ -6372,7 +7085,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
             env=first_env,
         )
         self.assertEqual(first_wait.returncode, 0, first_wait.stderr)
-        self.assertTrue((workspace_root / "custom-final.txt").is_file())
+        self.assertTrue((state_dir / "final.txt").is_file())
         self.assertFalse((state_dir / "stdin.txt").exists())
         first_final = run(
             [
@@ -6413,7 +7126,6 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         time.sleep(0.2)
         self.assertFalse((state_dir / "exit_code").exists())
         self.assertFalse((state_dir / "final.txt").exists())
-        self.assertFalse((workspace_root / "custom-final.txt").exists())
 
         status = run(
             [
@@ -6679,11 +7391,9 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertNotEqual(failed.returncode, 0)
         self.assertIn("diff_file must stay inside", failed.stderr)
 
-    def test_codex_review_final_respects_output_override(self) -> None:
-        env = self._base_env()
-        env["FAKE_CODEX_FINAL_MESSAGE"] = "Override findings.\n"
+    def test_codex_review_rejects_output_override(self) -> None:
         repo, base, head = self._create_review_range_repo("codex-range-output-override")
-        start = run(
+        failed = run(
             [
                 sys.executable,
                 str(SCRIPT_PATH),
@@ -6699,55 +7409,20 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                 head,
                 "--",
                 "-o",
-                "custom-final.txt",
+                "root.txt",
             ],
-            env=env,
+            env=self._base_env(),
         )
-        self.assertEqual(start.returncode, 0, start.stderr)
-        state_dir = pathlib.Path(start.stdout.strip().splitlines()[-1])
-
-        waited = run(
-            [
-                sys.executable,
-                str(SCRIPT_PATH),
-                "stateful",
-                "wait",
-                "--state-dir",
-                str(state_dir),
-            ],
-            env=env,
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn(
+            "codex-review does not allow caller-supplied `-o/--output-last-message`",
+            failed.stderr,
         )
-        self.assertEqual(waited.returncode, 0, waited.stderr)
-
-        state = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
-        self.assertEqual(
-            state["final_path"],
-            str(state_dir / "final.txt"),
-        )
-
-        final = run(
-            [
-                sys.executable,
-                str(SCRIPT_PATH),
-                "stateful",
-                "final",
-                "--state-dir",
-                str(state_dir),
-            ],
-            env=env,
-        )
-        self.assertEqual(final.returncode, 0, final.stderr)
-        self.assertEqual(final.stdout, "Override findings.\n")
+        self.assertIn("cleanup cannot mutate the review scope", failed.stderr)
 
     def test_codex_review_rejects_output_override_outside_workspace(self) -> None:
         repo, base, head = self._create_review_range_repo("codex-range-output-escape")
-        for output_path, expected_message in (
-            ("../escaped-final.txt", "must not escape the isolated workspace"),
-            (
-                str(self.root / "escaped-final.txt"),
-                "must be relative to the isolated workspace",
-            ),
-        ):
+        for output_path in ("../escaped-final.txt", str(self.root / "escaped-final.txt")):
             with self.subTest(output_path=output_path):
                 failed = run(
                     [
@@ -6770,8 +7445,10 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                     env=self._base_env(),
                 )
                 self.assertNotEqual(failed.returncode, 0)
-                self.assertIn("codex-review --output-last-message", failed.stderr)
-                self.assertIn(expected_message, failed.stderr)
+                self.assertIn(
+                    "codex-review does not allow caller-supplied `-o/--output-last-message`",
+                    failed.stderr,
+                )
 
     def test_codex_review_rejects_output_override_symlink_escape(self) -> None:
         repo, base, head = self._create_review_range_repo("codex-range-output-symlink")
@@ -6804,7 +7481,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         )
         self.assertNotEqual(failed.returncode, 0)
         self.assertIn(
-            "must stay inside the isolated workspace after symlink resolution",
+            "codex-review does not allow caller-supplied `-o/--output-last-message`",
             failed.stderr,
         )
 
@@ -6975,8 +7652,8 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                 "--entrypoint",
                 "codex-review",
                 "--",
-                "-o",
-                "custom-final.txt",
+                "--model",
+                "fake-model",
             ],
             cwd=self.repo,
             env=env,
