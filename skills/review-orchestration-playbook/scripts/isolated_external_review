@@ -2692,6 +2692,8 @@ def _reject_frozen_codex_review_prompt_contracts(args: argparse.Namespace) -> No
         rejected_flags.append("--prompt-file")
     if args.diff_file:
         rejected_flags.append("--diff-file")
+    if args.copy_path:
+        rejected_flags.append("--copy-path")
     if args.final_reply:
         rejected_flags.append("--final-reply")
     if args.prompt_delivery != "auto":
@@ -2712,6 +2714,8 @@ def _reject_uncommitted_codex_review_prompt_contracts(args: argparse.Namespace) 
         rejected_flags.append("--prompt-file")
     if args.diff_file:
         rejected_flags.append("--diff-file")
+    if args.copy_path:
+        rejected_flags.append("--copy-path")
     if args.final_reply:
         rejected_flags.append("--final-reply")
     if args.prompt_delivery != "auto":

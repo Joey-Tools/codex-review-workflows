@@ -5398,6 +5398,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                 "--prompt-file",
             ),
             (["--diff-file", str(range_diff)], "--diff-file"),
+            (["--copy-path", str(repo / "root.txt")], "--copy-path"),
             (["--final-reply", "DONE"], "--final-reply"),
         )
         for extra_args, expected_flag in cases:
@@ -5461,6 +5462,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         cases = (
             (["--prompt-file", str(self.repo / ".codex-tmp" / "review.prompt")], "--prompt-file"),
             (["--diff-file", str(self.repo / ".codex-tmp" / "review.diff")], "--diff-file"),
+            (["--copy-path", str(self.repo / "root.txt")], "--copy-path"),
             (["--final-reply", "DONE"], "--final-reply"),
             (["--prompt-delivery", "inline"], "--prompt-delivery"),
             (["--prompt-inline-max-bytes", "1"], "--prompt-inline-max-bytes"),
