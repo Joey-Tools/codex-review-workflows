@@ -107,6 +107,23 @@ class SkillDocumentationTest(unittest.TestCase):
         ):
             self.assertIn(needle, section)
 
+    def test_review_orchestration_prefers_readonly_for_enforceable_evidence_budget(self) -> None:
+        skill_path = (
+            pathlib.Path(__file__).resolve().parents[2]
+            / "review-orchestration-playbook"
+            / "SKILL.md"
+        )
+        text = skill_path.read_text(encoding="utf-8")
+        self.assertIn(
+            "default to `codex-readonly` when the review needs an enforceable evidence budget",
+            text,
+        )
+        self.assertIn(
+            "builtin child prompt can ask the reviewer to run `git diff <base>` directly",
+            text,
+        )
+        self.assertIn("cannot receive the helper's evidence-budget text", text)
+
 
 class IsolatedCopilotReviewTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -3636,6 +3653,43 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         )
         self.assertEqual(final.returncode, 0, final.stderr)
         self.assertEqual(final.stdout, "No findings.\n")
+
+    def test_codex_review_rejects_large_builtin_prompt_scope(self) -> None:
+        env = self._base_env()
+        repo, base, _ = self._create_review_range_repo("codex-large-range-review")
+        (repo / "root.txt").write_text(
+            "\n".join(f"root-head-{index}" for index in range(900)) + "\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(git(repo, "add", "root.txt").returncode, 0)
+        git_commit(repo, "large update")
+        head = git(repo, "rev-parse", "HEAD").stdout.strip()
+
+        failed = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "stateful",
+                "start",
+                "--repo",
+                str(repo),
+                "--entrypoint",
+                "codex-review",
+                "--base-ref",
+                base,
+                "--head-ref",
+                head,
+            ],
+            env=env,
+        )
+
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn(
+            "codex-review builtin prompt cannot honor the helper-managed evidence budget",
+            failed.stderr,
+        )
+        self.assertIn("codex-readonly", failed.stderr)
+        self.assertIn("changed lines", failed.stderr)
 
     def test_stateful_opencode_start_uses_default_prompt_for_frozen_range(self) -> None:
         env = self._base_env()

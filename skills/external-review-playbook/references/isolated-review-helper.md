@@ -214,7 +214,7 @@ state_dir="$(
 
 This keeps the internal reviewer on a fresh root `read-only` Codex `exec` session, while still preserving the isolated snapshot, submodule handling, and reusable helper prefix. For frozen `codex-review` runs, do not pass helper-managed prompt contracts such as `--prompt-file`, `--diff-file`, `--report-path`, or `--final-reply`; builtin `codex exec review --base` cannot honor them, so the helper now rejects those flags instead of silently dropping them.
 
-For the default agentic lane, keep the same `stateful start|status|wait|final` shape and switch only `--entrypoint codex-readonly` to `--entrypoint codex-review`.
+For the historical agentic lane, keep the same `stateful start|status|wait|final` shape and switch only `--entrypoint codex-readonly` to `--entrypoint codex-review`. Do this only for narrow scopes where builtin `codex exec review` is acceptable: that builtin prompt cannot receive the helper-managed evidence budget and may tell the child to run `git diff <base>` directly. For large, generated-heavy, or evidence-budget-sensitive scopes, keep `--entrypoint codex-readonly`.
 
 Progress-visible example when you want `stream-json` timing or ingest traces:
 

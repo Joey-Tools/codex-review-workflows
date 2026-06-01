@@ -284,6 +284,8 @@ CODEX_REVIEW_DISALLOWED_FLAGS = frozenset(
     }
 )
 CODEX_REVIEW_RESERVED_SUBCOMMANDS = frozenset({"help", "resume", "review", "exec"})
+CODEX_REVIEW_BUILTIN_MAX_CHANGED_FILES = 25
+CODEX_REVIEW_BUILTIN_MAX_CHANGED_LINES = 800
 LANE_AUTO_PRIORITIES: dict[str, tuple[str, ...]] = {
     "custom": ("agent", "copilot", "gh-copilot"),
     "bounded-semantic": ("opencode", "agent", "copilot", "gh-copilot"),
@@ -2632,6 +2634,34 @@ def _reject_codex_review_report_path(args: argparse.Namespace) -> None:
     )
 
 
+def _reject_oversized_codex_review_builtin_scope(
+    *,
+    source_root: pathlib.Path,
+    base_ref: str | None,
+    head_ref: str | None,
+    diff_file: pathlib.Path | None,
+) -> None:
+    if diff_file is not None and diff_file.is_file():
+        changed_files, changed_lines = _review_diff_file_metrics(diff_file)
+    else:
+        changed_files, changed_lines = _review_scope_change_metrics(
+            source_root,
+            base_ref=base_ref,
+            head_ref=head_ref,
+        )
+    if (
+        changed_files < CODEX_REVIEW_BUILTIN_MAX_CHANGED_FILES
+        and changed_lines < CODEX_REVIEW_BUILTIN_MAX_CHANGED_LINES
+    ):
+        return
+    raise UserError(
+        "codex-review builtin prompt cannot honor the helper-managed evidence budget "
+        f"for this scope ({changed_files} changed files, {changed_lines} changed lines). "
+        "Use `--entrypoint codex-readonly`, which receives the generated diff file and "
+        "bounded-read prompt contract."
+    )
+
+
 def _reject_codex_readonly_customizations(args: argparse.Namespace) -> None:
     rejected_flags: list[str] = []
     if args.prompt_file:
@@ -4300,6 +4330,19 @@ def _prepare_review_execution(args: argparse.Namespace) -> dict[str, object]:
             base_ref=base_ref,
             head_ref=head_ref,
         )
+        if args.entrypoint == "codex-review" and not args.prepare_only:
+            diff_file_raw = placeholders.get("{diff_file}")
+            diff_file = (
+                pathlib.Path(diff_file_raw)
+                if isinstance(diff_file_raw, str) and diff_file_raw
+                else None
+            )
+            _reject_oversized_codex_review_builtin_scope(
+                source_root=source_root,
+                base_ref=base_ref,
+                head_ref=head_ref,
+                diff_file=diff_file,
+            )
         prepared = {
             "args": args,
             "source_root": source_root,
