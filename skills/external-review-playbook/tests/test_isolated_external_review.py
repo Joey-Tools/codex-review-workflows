@@ -4710,6 +4710,49 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertIn(".codex-tmp/staged.txt", staged_diff.stdout)
         self.assertFalse((workspace_root / ".codex-tmp" / "untracked.txt").exists())
 
+    def test_prepare_workspace_removes_tracked_codex_tmp_file_replaced_by_directory(
+        self,
+    ) -> None:
+        repo = self._create_plain_repo("tracked-codex-tmp-replaced-by-dir")
+        tracked_tmp = repo / ".codex-tmp" / "tracked.txt"
+        tracked_tmp.parent.mkdir()
+        tracked_tmp.write_text("base\n", encoding="utf-8")
+        self.assertEqual(git(repo, "add", ".codex-tmp/tracked.txt").returncode, 0)
+        git_commit(repo, "track codex tmp")
+        tracked_tmp.unlink()
+        tracked_tmp.mkdir()
+        (tracked_tmp / "untracked-child.txt").write_text(
+            "helper scratch\n",
+            encoding="utf-8",
+        )
+
+        prepare = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--repo",
+                str(repo),
+                "--prepare-only",
+            ],
+            env=self._base_env(),
+        )
+
+        self.assertEqual(prepare.returncode, 0, prepare.stderr)
+        workspace_root = pathlib.Path(
+            [line.strip() for line in prepare.stdout.splitlines() if line.strip()][-1]
+        )
+        self.assertFalse((workspace_root / ".codex-tmp" / "tracked.txt").exists())
+        deleted_diff = git(
+            workspace_root,
+            "diff",
+            "--name-status",
+            "HEAD",
+            "--",
+            ".codex-tmp/tracked.txt",
+        )
+        self.assertEqual(deleted_diff.returncode, 0, deleted_diff.stderr)
+        self.assertIn("D\t.codex-tmp/tracked.txt", deleted_diff.stdout)
+
     def test_codex_review_rejects_frozen_budget_before_generating_inputs(self) -> None:
         module = self._load_script_module()
         repo = self._create_plain_repo("codex-review-early-budget")
@@ -4763,6 +4806,45 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         git_commit(repo, "track codex tmp")
         tracked_tmp.write_text(("x" * 12_000) + "\n", encoding="utf-8")
         (repo / ".codex-tmp" / "untracked.txt").write_text(
+            "helper scratch\n",
+            encoding="utf-8",
+        )
+        args = module._build_parser().parse_args(
+            [
+                "--repo",
+                str(repo),
+                "--entrypoint",
+                "codex-review",
+            ]
+        )
+
+        with mock.patch.object(
+            module,
+            "_prepare_inputs",
+            side_effect=module.UserError("prepare_inputs should not run"),
+        ) as prepare_inputs:
+            with self.assertRaises(module.UserError) as raised:
+                module._prepare_review_execution(args)
+
+        prepare_inputs.assert_not_called()
+        self.assertIn(
+            "codex-review builtin prompt cannot honor the helper-managed evidence budget",
+            str(raised.exception),
+        )
+
+    def test_codex_review_uncommitted_budget_includes_codex_tmp_file_replaced_by_directory(
+        self,
+    ) -> None:
+        module = self._load_script_module()
+        repo = self._create_plain_repo("codex-review-codex-tmp-replaced-dir-budget")
+        tracked_tmp = repo / ".codex-tmp" / "tracked.txt"
+        tracked_tmp.parent.mkdir()
+        tracked_tmp.write_text(("x" * 12_000) + "\n", encoding="utf-8")
+        self.assertEqual(git(repo, "add", ".codex-tmp/tracked.txt").returncode, 0)
+        git_commit(repo, "track large codex tmp")
+        tracked_tmp.unlink()
+        tracked_tmp.mkdir()
+        (tracked_tmp / "untracked-child.txt").write_text(
             "helper scratch\n",
             encoding="utf-8",
         )

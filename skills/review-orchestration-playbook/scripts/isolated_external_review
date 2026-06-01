@@ -844,6 +844,7 @@ def _materialize_tracked_codex_tmp_changes(
         target_path = target_repo / relative_path
         if source_path.exists() or source_path.is_symlink():
             if source_path.is_dir() and not source_path.is_symlink():
+                _remove_path(target_path)
                 continue
             _copy_file_or_symlink(source_path, target_path)
             if not _git_path_is_tracked(target_repo, relative_path):
