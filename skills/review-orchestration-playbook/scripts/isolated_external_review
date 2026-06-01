@@ -1108,28 +1108,28 @@ def _review_scope_change_budget_metrics(
     base_ref: str | None,
     head_ref: str | None,
 ) -> tuple[int, int, int, int]:
+    if base_ref is None or head_ref is None:
+        return _uncommitted_scope_change_budget_metrics(repo_root)
+
     changed_files, changed_lines = _review_scope_change_metrics(
         repo_root,
         base_ref=base_ref,
         head_ref=head_ref,
     )
-    if base_ref is not None and head_ref is not None:
-        diff_bytes = _run(
-            [
-                _resolve_real_git(),
-                "-C",
-                str(repo_root),
-                "diff",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--submodule=diff",
-                base_ref,
-                head_ref,
-            ],
-            capture_output=True,
-        ).stdout
-    else:
-        diff_bytes = _uncommitted_diff_section(repo_root, scope_label=None)
+    diff_bytes = _run(
+        [
+            _resolve_real_git(),
+            "-C",
+            str(repo_root),
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--submodule=diff",
+            base_ref,
+            head_ref,
+        ],
+        capture_output=True,
+    ).stdout
     diff_changed_files, diff_changed_lines, total_bytes, max_changed_line_bytes = (
         _review_diff_budget_metrics_from_bytes(diff_bytes)
     )
@@ -1139,6 +1139,106 @@ def _review_scope_change_budget_metrics(
         total_bytes,
         max_changed_line_bytes,
     )
+
+
+def _line_budget_metrics_from_bytes(data: bytes) -> tuple[int, int]:
+    if not data:
+        return 0, 0
+    if b"\0" in data:
+        return 1, min(len(data), CODEX_REVIEW_BUILTIN_MAX_CHANGED_LINE_BYTES + 1)
+    lines = data.splitlines()
+    if not lines:
+        return 1, 0
+    return len(lines), max(len(line.rstrip(b"\r")) for line in lines)
+
+
+def _untracked_path_budget_metrics(
+    repo_root: pathlib.Path,
+    relative_path: pathlib.Path,
+) -> tuple[int, int, int, int]:
+    file_path = repo_root / relative_path
+    path_label = relative_path.as_posix()
+    header_bytes = len(
+        (
+            f"diff --git a/{path_label} b/{path_label}\n"
+            f"new file mode {'120000' if file_path.is_symlink() else '100644'}\n"
+        ).encode("utf-8")
+    )
+    if file_path.is_symlink():
+        data = os.readlink(file_path).encode("utf-8", errors="surrogateescape")
+        changed_lines, max_changed_line_bytes = _line_budget_metrics_from_bytes(data)
+        return 1, changed_lines, header_bytes + len(data), max_changed_line_bytes
+    if not file_path.is_file():
+        return 0, 0, 0, 0
+
+    file_size = file_path.stat().st_size
+    if file_size > CODEX_REVIEW_BUILTIN_MAX_DIFF_BYTES:
+        return (
+            1,
+            1,
+            header_bytes + file_size,
+            min(file_size, CODEX_REVIEW_BUILTIN_MAX_CHANGED_LINE_BYTES + 1),
+        )
+
+    data = file_path.read_bytes()
+    changed_lines, max_changed_line_bytes = _line_budget_metrics_from_bytes(data)
+    return (
+        1,
+        changed_lines,
+        header_bytes + len(data) + changed_lines,
+        max_changed_line_bytes,
+    )
+
+
+def _combine_budget_metrics(
+    left: tuple[int, int, int, int],
+    right: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    return (
+        left[0] + right[0],
+        left[1] + right[1],
+        left[2] + right[2],
+        max(left[3], right[3]),
+    )
+
+
+def _untracked_repo_budget_metrics(repo_root: pathlib.Path) -> tuple[int, int, int, int]:
+    metrics = (0, 0, 0, 0)
+    for relative_path in _untracked_repo_paths(repo_root):
+        metrics = _combine_budget_metrics(
+            metrics,
+            _untracked_path_budget_metrics(repo_root, relative_path),
+        )
+    return metrics
+
+
+def _uncommitted_scope_change_budget_metrics(
+    repo_root: pathlib.Path,
+) -> tuple[int, int, int, int]:
+    tracked_diff = _run(
+        [
+            _resolve_real_git(),
+            "-C",
+            str(repo_root),
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--submodule=diff",
+            "HEAD",
+        ],
+        capture_output=True,
+    ).stdout
+    metrics = _review_diff_budget_metrics_from_bytes(tracked_diff)
+    metrics = _combine_budget_metrics(metrics, _untracked_repo_budget_metrics(repo_root))
+    for submodule_path in _list_direct_submodules(repo_root):
+        submodule_root = repo_root / submodule_path
+        if not submodule_root.exists() or not _is_git_worktree_root(submodule_root):
+            continue
+        metrics = _combine_budget_metrics(
+            metrics,
+            _uncommitted_scope_change_budget_metrics(submodule_root),
+        )
+    return metrics
 
 
 def _parallel_agentic_review_policy(

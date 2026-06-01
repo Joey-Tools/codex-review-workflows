@@ -4508,6 +4508,32 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertEqual(total_bytes, len(diff_bytes))
         self.assertEqual(max_changed_line_bytes, 12_000)
 
+    def test_uncommitted_budget_metrics_bounds_large_untracked_files(self) -> None:
+        module = self._load_script_module()
+        large_file = self.repo / "large-generated.txt"
+        large_file.write_bytes(b"x" * (module.CODEX_REVIEW_BUILTIN_MAX_DIFF_BYTES + 1))
+
+        with mock.patch.object(
+            module,
+            "_untracked_repo_patch",
+            side_effect=AssertionError("budget metrics must not build full patches"),
+        ):
+            changed_files, changed_lines, total_bytes, max_changed_line_bytes = (
+                module._review_scope_change_budget_metrics(
+                    self.repo,
+                    base_ref=None,
+                    head_ref=None,
+                )
+            )
+
+        self.assertGreaterEqual(changed_files, 1)
+        self.assertGreaterEqual(changed_lines, 1)
+        self.assertGreater(total_bytes, module.CODEX_REVIEW_BUILTIN_MAX_DIFF_BYTES)
+        self.assertGreater(
+            max_changed_line_bytes,
+            module.CODEX_REVIEW_BUILTIN_MAX_CHANGED_LINE_BYTES,
+        )
+
     def test_count_tracked_repo_files_counts_submodule_contents_recursively(self) -> None:
         module = self._load_script_module()
         submodule = self.repo / "deps/sub"
