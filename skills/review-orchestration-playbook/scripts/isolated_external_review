@@ -1141,15 +1141,41 @@ def _review_scope_change_budget_metrics(
     )
 
 
-def _line_budget_metrics_from_bytes(data: bytes) -> tuple[int, int]:
-    if not data:
-        return 0, 0
-    if b"\0" in data:
-        return 1, min(len(data), CODEX_REVIEW_BUILTIN_MAX_CHANGED_LINE_BYTES + 1)
-    lines = data.splitlines()
-    if not lines:
-        return 1, 0
-    return len(lines), max(len(line.rstrip(b"\r")) for line in lines)
+def _untracked_text_patch_budget_metrics(
+    *,
+    path_label: str,
+    file_mode: str,
+    contents: str,
+) -> tuple[int, int, int, int]:
+    patch_text = "".join(
+        difflib.unified_diff(
+            [],
+            contents.splitlines(keepends=True),
+            fromfile="/dev/null",
+            tofile=f"b/{path_label}",
+            n=0,
+        )
+    )
+    patch_bytes = (
+        f"diff --git a/{path_label} b/{path_label}\n"
+        f"new file mode {file_mode}\n"
+        f"{patch_text}"
+    ).encode("utf-8", errors="surrogateescape")
+    return _review_diff_budget_metrics_from_bytes(patch_bytes)
+
+
+def _untracked_binary_patch_budget_metrics(
+    *,
+    path_label: str,
+    file_mode: str,
+    file_size: int,
+) -> tuple[int, int, int, int]:
+    patch_bytes = (
+        f"diff --git a/{path_label} b/{path_label}\n"
+        f"new file mode {file_mode}\n"
+        f"Binary file added: {path_label} ({file_size} bytes)\n"
+    ).encode("utf-8", errors="surrogateescape")
+    return _review_diff_budget_metrics_from_bytes(patch_bytes)
 
 
 def _untracked_path_budget_metrics(
@@ -1162,12 +1188,14 @@ def _untracked_path_budget_metrics(
         (
             f"diff --git a/{path_label} b/{path_label}\n"
             f"new file mode {'120000' if file_path.is_symlink() else '100644'}\n"
-        ).encode("utf-8")
+        ).encode("utf-8", errors="surrogateescape")
     )
     if file_path.is_symlink():
-        data = os.readlink(file_path).encode("utf-8", errors="surrogateescape")
-        changed_lines, max_changed_line_bytes = _line_budget_metrics_from_bytes(data)
-        return 1, changed_lines, header_bytes + len(data), max_changed_line_bytes
+        return _untracked_text_patch_budget_metrics(
+            path_label=path_label,
+            file_mode="120000",
+            contents=os.readlink(file_path),
+        )
     if not file_path.is_file():
         return 0, 0, 0, 0
 
@@ -1180,13 +1208,18 @@ def _untracked_path_budget_metrics(
             min(file_size, CODEX_REVIEW_BUILTIN_MAX_CHANGED_LINE_BYTES + 1),
         )
 
+    file_mode = "100755" if os.access(file_path, os.X_OK) else "100644"
     data = file_path.read_bytes()
-    changed_lines, max_changed_line_bytes = _line_budget_metrics_from_bytes(data)
-    return (
-        1,
-        changed_lines,
-        header_bytes + len(data) + changed_lines,
-        max_changed_line_bytes,
+    if b"\0" in data:
+        return _untracked_binary_patch_budget_metrics(
+            path_label=path_label,
+            file_mode=file_mode,
+            file_size=len(data),
+        )
+    return _untracked_text_patch_budget_metrics(
+        path_label=path_label,
+        file_mode=file_mode,
+        contents=data.decode("utf-8", errors="surrogateescape"),
     )
 
 
@@ -1223,6 +1256,7 @@ def _uncommitted_scope_change_budget_metrics(
             "diff",
             "--no-ext-diff",
             "--no-textconv",
+            "--binary",
             "--submodule=diff",
             "HEAD",
         ],
@@ -1463,7 +1497,7 @@ def _untracked_repo_patch(repo_root: pathlib.Path, relative_path: pathlib.Path) 
                 f"diff --git a/{path_label} b/{path_label}\n"
                 f"new file mode {file_mode}\n"
                 f"Binary file added: {path_label} ({len(data)} bytes)\n"
-            ).encode("utf-8")
+            ).encode("utf-8", errors="surrogateescape")
         contents = data.decode("utf-8", errors="surrogateescape")
         lines = contents.splitlines(keepends=True)
 

@@ -4534,6 +4534,67 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
             module.CODEX_REVIEW_BUILTIN_MAX_CHANGED_LINE_BYTES,
         )
 
+    def test_uncommitted_budget_metrics_handles_non_utf8_untracked_paths(self) -> None:
+        module = self._load_script_module()
+        repo = self._create_plain_repo("non-utf8-untracked-budget")
+        relative_path = pathlib.Path(os.fsdecode(b"bad-\xff.txt"))
+
+        metrics = module._untracked_path_budget_metrics(repo, relative_path)
+
+        self.assertEqual(metrics, (0, 0, 0, 0))
+
+    def test_uncommitted_budget_metrics_counts_binary_tracked_diff_payload(self) -> None:
+        module = self._load_script_module()
+        repo = self._create_plain_repo("tracked-binary-budget")
+        binary_path = repo / "asset.bin"
+        binary_path.write_bytes(b"\0base\n")
+        self.assertEqual(git(repo, "add", "asset.bin").returncode, 0)
+        git_commit(repo, "add binary asset")
+
+        payload = bytearray(b"\0")
+        seed = b"tracked-binary-budget"
+        while len(payload) <= module.CODEX_REVIEW_BUILTIN_MAX_DIFF_BYTES + 4096:
+            seed = hashlib.sha256(seed).digest()
+            payload.extend(seed)
+        binary_path.write_bytes(bytes(payload))
+
+        changed_files, _changed_lines, total_bytes, _max_changed_line_bytes = (
+            module._review_scope_change_budget_metrics(
+                repo,
+                base_ref=None,
+                head_ref=None,
+            )
+        )
+
+        self.assertEqual(changed_files, 1)
+        self.assertGreater(total_bytes, module.CODEX_REVIEW_BUILTIN_MAX_DIFF_BYTES)
+
+    def test_untracked_budget_metrics_include_generated_patch_overhead(self) -> None:
+        module = self._load_script_module()
+        repo = self._create_plain_repo("untracked-overhead-budget")
+        relative_path = pathlib.Path("near-limit.txt")
+        payload = (("x" * 3995) + "\n") * 10
+        self.assertLess(
+            len(payload.encode("utf-8")),
+            module.CODEX_REVIEW_BUILTIN_MAX_DIFF_BYTES,
+        )
+        (repo / relative_path).write_text(payload, encoding="utf-8")
+        generated_patch = module._untracked_repo_patch(repo, relative_path)
+        self.assertGreater(len(generated_patch), module.CODEX_REVIEW_BUILTIN_MAX_DIFF_BYTES)
+
+        changed_files, changed_lines, total_bytes, max_changed_line_bytes = (
+            module._review_scope_change_budget_metrics(
+                repo,
+                base_ref=None,
+                head_ref=None,
+            )
+        )
+
+        self.assertEqual(changed_files, 1)
+        self.assertEqual(changed_lines, 10)
+        self.assertEqual(total_bytes, len(generated_patch))
+        self.assertEqual(max_changed_line_bytes, 3995)
+
     def test_count_tracked_repo_files_counts_submodule_contents_recursively(self) -> None:
         module = self._load_script_module()
         submodule = self.repo / "deps/sub"
