@@ -97,7 +97,8 @@ class SkillDocumentationTest(unittest.TestCase):
 
         for needle in (
             "git diff --unified=30/40/50/60/80",
-            "path-wide / large-alternation raw rg -n",
+            "path-wide / multi-file / large-alternation raw rg -n",
+            "rg -n -C context search",
             "800+ 行或 10k+ original tokens",
             "git status --short --untracked-files=no",
             "rg -l",
@@ -3781,7 +3782,8 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertIn("git diff --unified=30/40/50/60/80", prompt_text)
         self.assertIn("rg -l", prompt_text)
         self.assertIn("rg --count", prompt_text)
-        self.assertIn("path-wide / large-alternation raw rg -n", prompt_text)
+        self.assertIn("path-wide / multi-file / large-alternation raw rg -n", prompt_text)
+        self.assertIn("rg -n -C context searches", prompt_text)
         self.assertIn("git ls-files --others", prompt_text)
         self.assertIn("git status --short --untracked-files=no", prompt_text)
         self.assertIn(payload["diff_file"], prompt_text)
@@ -3844,7 +3846,11 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertIn("git diff --unified=30/40/50/60/80", payload["prompt_stdin"])
         self.assertIn("rg -l", payload["prompt_stdin"])
         self.assertIn("rg --count", payload["prompt_stdin"])
-        self.assertIn("path-wide / large-alternation raw rg -n", payload["prompt_stdin"])
+        self.assertIn(
+            "path-wide / multi-file / large-alternation raw rg -n",
+            payload["prompt_stdin"],
+        )
+        self.assertIn("rg -n -C context searches", payload["prompt_stdin"])
         self.assertIn("git ls-files --others", payload["prompt_stdin"])
         self.assertIn("git status --short --untracked-files=no", payload["prompt_stdin"])
         self.assertIn("--add-dir", payload["args"])
