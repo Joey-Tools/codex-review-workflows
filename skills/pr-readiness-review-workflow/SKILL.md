@@ -39,7 +39,10 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 2. 做 Codex review egress consent preflight。
 - 这里的 egress lane 指会把 PR diff、changed-file content、review prompt 或必要邻近上下文发送给 OpenAI Codex 的本地 review lane，包括 `independent-codex-pr-review`，以及由 Codex CLI/helper 承载的 `offline-frozen-diff-review`。
 - 先用 GitHub metadata 或 repo manifest 记录 repo visibility/trust evidence，例如 `gh repo view <owner/repo> --json visibility,isPrivate`、当前 remote URL、PR URL 和 head commit。public repo 可把 public visibility 作为低风险证据写入后续审批说明，但不要声称存在 user consent；private 或未验证 repo 必须有明确 user consent。
-- 如果当前 parent thread 已经包含明确 consent，复用该 consent，不要每次 rerun 都问。明确 consent 应覆盖：目标 repo/PR、允许发送的数据类别、同一 PR fix loop rerun、有效期和排除项。如果没有明确 consent，但 repo 已验证为 public，则后续审批说明只能引用 public visibility evidence 和当前 PR readiness 请求，不能写成 “the user authorized egress”。private、unverified 或仅本地标记 trusted 的 repo 都不能用这个 public path。
+- 如果当前 parent thread 已经包含明确 consent，复用该 consent，不要每次 rerun 都问。明确 consent 应覆盖：目标 repo/PR、允许发送的数据类别、同一 PR fix loop rerun、有效期和排除项。
+- 如果更高优先级的 `AGENTS.md`、user policy 或 repo policy 包含 OpenAI Codex / GitHub PR workflow trusted-destination standing consent，也可复用；它只覆盖该 policy 列出的 scoped repo/PR data 和排除项，仍必须绑定到当前目标 repo/PR、head commit 和当前 workflow。
+- 对这个 skill 而言，the user 在 parent thread 中明确要求目标 PR 的完整 PR readiness、triple review、`review-ready PR`、`在合并前停止` / `stop before merge`，或等价措辞时，视为已经给出 thread-scoped OpenAI Codex review egress consent；不要再要求 the user 单独发送模板授权句。原因是该 workflow 本身定义为包含 GitHub `@codex review` / `codex/review-gate`、`independent-codex-pr-review` 和 `offline-frozen-diff-review`，这些 Codex review lane 都会把 PR diff、changed-file content、review prompt 或必要邻近上下文发送给 OpenAI Codex。使用这条 implicit-by-workflow consent 前必须确认目标 repo/PR、head commit、允许数据类别和排除项，且用户没有限制“不做 Codex review”“不要外发”“只本地看”等范围。该 consent 不覆盖非 Codex external reviewers（OpenCode、Cursor `agent`、Copilot、Claude 等）、secrets、untracked private files 或无关仓库内容。
+- 如果没有明确、standing 或 workflow-implied consent，但 repo 已验证为 public，则后续审批说明只能引用 public visibility evidence 和当前 PR readiness 请求，不能写成 “the user authorized egress”。private、unverified 或仅本地标记 trusted 的 repo 都不能用这个 public path。
 - 推荐 consent 形状：
 
 ```text
@@ -47,7 +50,7 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 ```
 
 - 对后续每次 `codex exec` 或 helper-backed Codex review escalated call，在 `justification` 中引用匹配当前 evidence 的说明：
-  - explicit consent path: `The user authorized OpenAI Codex review egress for <repo> PR #<number> in this parent thread, including reruns after fixes; scope is changed files/diff plus necessary nearby context, excluding secrets, untracked private files, and unrelated repositories.`
+  - standing, explicit, or workflow-implied consent path: `The user authorized OpenAI Codex/GitHub PR review egress for <repo> PR #<number> via standing instructions or this parent-thread PR readiness/triple-review request, including same-PR reruns after fixes; scope is changed files/diff plus necessary nearby context and review prompts/results, excluding secrets, credentials, untracked private files, unrelated repositories, broad workspace dumps, and non-Codex external reviewers.`
   - verified public path: `<repo> PR #<number> is verified public; this Codex review is scoped to changed files/diff plus necessary nearby context for the user-requested PR readiness gate, excluding secrets, untracked private files, and unrelated repositories.`
 - 如果审批器仍拒绝，停止并报告拒绝理由以及缺失的 repo trust/consent evidence；不要通过 `default.rules`、shell wrapper、不同 entrypoint 或 indirect execution 绕过 egress decision。
 
