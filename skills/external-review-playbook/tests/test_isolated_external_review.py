@@ -107,6 +107,11 @@ class SkillDocumentationTest(unittest.TestCase):
             "avoid dumping huge diffs",
         ):
             self.assertIn(needle, section)
+        self.assertIn(
+            "只有在单文件、单 hunk 或精确 symbol window 上再用 line-producing rg -n",
+            section,
+        )
+        self.assertNotIn("小文件集合上再用 line-producing rg -n", section)
 
     def test_review_orchestration_prefers_readonly_for_enforceable_evidence_budget(self) -> None:
         skill_path = (
