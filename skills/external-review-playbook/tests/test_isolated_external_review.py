@@ -85,6 +85,30 @@ def git_commit(repo: pathlib.Path, message: str) -> None:
 
 
 class SkillDocumentationTest(unittest.TestCase):
+    def test_pr_readiness_github_query_probes_are_quote_safe(self) -> None:
+        skill_path = (
+            pathlib.Path(__file__).resolve().parents[2]
+            / "pr-readiness-review-workflow"
+            / "SKILL.md"
+        )
+        text = skill_path.read_text(encoding="utf-8")
+        section = text.split("1. 建立 PR 上下文。", 1)[1]
+        section = section.split("2. 做 Codex review egress consent preflight。", 1)[0]
+
+        for needle in (
+            "gh pr view --json",
+            "gh api graphql",
+            "含 `$owner`、braces、aliases、multiline selection 或长 field list",
+            "task-scoped `.codex-tmp/.../*.graphql`",
+            "quoting-safe invocation",
+            "gh api 'repos/<owner>/<repo>/rulesets?ref=refs/heads/<base>'",
+            "zsh 会把它当 glob",
+            "Field ... doesn't exist on type ...",
+            "Expected NAME",
+        ):
+            self.assertIn(needle, section)
+        self.assertNotIn("-f query=query($owner", section)
+
     def test_pr_readiness_independent_review_prompt_requires_exact_evidence_budget(self) -> None:
         skill_path = (
             pathlib.Path(__file__).resolve().parents[2]
