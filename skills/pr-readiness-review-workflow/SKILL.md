@@ -30,7 +30,7 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 
 1. 建立 PR 上下文。
 - 确认 PR URL、当前 cwd、目标分支、当前 head commit、本地 dirty state、repo merge model 和 PR body 的 LLM authorship note。
-- 如果没有 PR URL，但当前分支/commit 已通过本地 gate，且 the user 要求 full workflow、merge-ready、`在合并前停止` 或 ready-for-review PR，先创建或复用 PR。该措辞授权 push 分支和创建/更新 PR；不授权 merge。
+- 如果没有 PR URL，但当前分支/commit 已通过本地 gate，且 the user 要求 full workflow、merge-ready、`在合并前停止` 或 ready-for-review PR，先创建或复用 PR。该措辞授权 push 分支和创建/更新 PR；不授权 merge。创建/复用 PR 前确认 base branch、head branch、是否 draft/ready 和 required metadata；若 auth、network、branch protection 或 required metadata 缺失，停在明确 blocked state，不要把 commit-only 状态报告成完成。
 - 读取线上 PR comments、review threads、requested changes、CI 状态、branch protection / rules 和 merge requirements；GitHub 交互优先使用 `gh`。
 - 对 PR metadata、review threads、rulesets、branch protection、rules 或 custom GraphQL probe，按需读取 [github-pr-probes.md](references/github-pr-probes.md)。该 reference 包含 typed `gh` 优先级、`gh api graphql -F query=@...`、REST `?` path quoting 和 schema/parse failure 处理。
 - 读取 GitHub `@codex review` trigger/comment evidence 和实际 `codex/review-gate` status check 状态；这属于 best-effort `github-codex-review`，不能和独立 Codex review-only 子线程混用。
@@ -73,7 +73,7 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 - 合并 best-effort `github-codex-review`、required `independent-codex-pr-review`、required `offline-frozen-diff-review`、PR comments 和 CI 证据。
 - 对每个 finding 判断是否 actionable；修复后重跑受影响测试，再重新进入必要 review gate。
 - 读取所有 CI checks，但只有 branch protection / ruleset 标记为 required 的 check 是 merge-readiness required gate：失败、取消、pending 超过合理等待窗口、缺失 required check 或绑定到旧 head 都必须处理或报告为 blocked。非 required 的失败/取消 checks 应记录并按 repo/user policy 判断是否需要修复，但不要仅因其存在就阻止 merge-ready。只有仓库没有 CI / 没有远端 checks 时，才能报告 `CI: none observed`。
-- 如果 merge gate 要求 conversation resolution，自动处理 unresolved review threads：actionable thread 先修复和验证，再回复并 resolve；non-actionable 或 stale thread 直接回复说明并 resolve。回复格式见 [review-lane-contracts.md](references/review-lane-contracts.md)。
+- 如果 merge gate 要求 conversation resolution，自动处理 unresolved review threads：actionable thread 先修复和验证，再回复并 resolve；non-actionable 或 stale thread 直接回复说明并 resolve；无法 resolve 时报告具体 thread 和权限/API blocker。回复格式见 [review-lane-contracts.md](references/review-lane-contracts.md)。
 - 修复方向以正确性和长期可维护性优先，不要求最小补丁。
 
 8. 长等待和恢复。

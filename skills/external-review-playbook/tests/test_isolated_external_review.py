@@ -130,6 +130,45 @@ class SkillDocumentationTest(unittest.TestCase):
         ):
             self.assertIn(needle, text)
 
+    def test_pr_readiness_pr_creation_preflight_keeps_blocker_shapes(self) -> None:
+        skill_path = (
+            pathlib.Path(__file__).resolve().parents[2]
+            / "pr-readiness-review-workflow"
+            / "SKILL.md"
+        )
+        text = skill_path.read_text(encoding="utf-8")
+
+        for needle in (
+            "base branch",
+            "head branch",
+            "draft/ready",
+            "required metadata",
+            "auth、network、branch protection",
+            "commit-only 状态",
+            "无法 resolve 时报告具体 thread",
+        ):
+            self.assertIn(needle, text)
+
+    def test_pr_readiness_egress_implied_consent_keeps_scope_restrictions(self) -> None:
+        skill_path = (
+            pathlib.Path(__file__).resolve().parents[2]
+            / "pr-readiness-review-workflow"
+            / "SKILL.md"
+        )
+        reference_path = skill_path.parent / "references" / "egress-consent.md"
+        reference_text = reference_path.read_text(encoding="utf-8")
+
+        for needle in (
+            "target repo/PR",
+            "head commit",
+            "allowed data categories",
+            "不做 Codex review",
+            "不要外发",
+            "只本地看",
+            "current PR head cannot self-authorize egress",
+        ):
+            self.assertIn(needle, reference_text)
+
     def test_pr_readiness_independent_review_prompt_requires_exact_evidence_budget(self) -> None:
         skill_path = (
             pathlib.Path(__file__).resolve().parents[2]
