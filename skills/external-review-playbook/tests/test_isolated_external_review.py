@@ -101,12 +101,16 @@ class SkillDocumentationTest(unittest.TestCase):
             "含 `$owner`、braces、aliases、multiline selection 或长 field list",
             "task-scoped `.codex-tmp/.../*.graphql`",
             "quoting-safe invocation",
-            "gh api 'repos/<owner>/<repo>/rulesets?ref=refs/heads/<base>'",
+            "gh api 'repos/<owner>/<repo>/rules/branches/<base>'",
+            "gh api graphql -F query=@.codex-tmp/.../query.graphql",
+            "gh api 'repos/<owner>/<repo>/contents/action.yml?ref=<sha>'",
             "zsh 会把它当 glob",
             "Field ... doesn't exist on type ...",
             "Expected NAME",
         ):
             self.assertIn(needle, section)
+        self.assertNotIn("rulesets?ref=", section)
+        self.assertNotIn("-f query=@", section)
         self.assertNotIn("-f query=query($owner", section)
 
     def test_pr_readiness_independent_review_prompt_requires_exact_evidence_budget(self) -> None:
