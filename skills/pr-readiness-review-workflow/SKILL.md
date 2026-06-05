@@ -72,7 +72,7 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 7. Fix loop。
 - 合并 best-effort `github-codex-review`、required `independent-codex-pr-review`、required `offline-frozen-diff-review`、PR comments 和 CI 证据。
 - 对每个 finding 判断是否 actionable；修复后重跑受影响测试，再重新进入必要 review gate。
-- 读取所有 CI checks，但只有 branch protection / ruleset 标记为 required 的 check 是 merge-readiness required gate。非 required 的失败/取消 checks 应记录并按 repo/user policy 判断是否需要修复，但不要仅因其存在就阻止 merge-ready。
+- 读取所有 CI checks，但只有 branch protection / ruleset 标记为 required 的 check 是 merge-readiness required gate：失败、取消、pending 超过合理等待窗口、缺失 required check 或绑定到旧 head 都必须处理或报告为 blocked。非 required 的失败/取消 checks 应记录并按 repo/user policy 判断是否需要修复，但不要仅因其存在就阻止 merge-ready。只有仓库没有 CI / 没有远端 checks 时，才能报告 `CI: none observed`。
 - 如果 merge gate 要求 conversation resolution，自动处理 unresolved review threads：actionable thread 先修复和验证，再回复并 resolve；non-actionable 或 stale thread 直接回复说明并 resolve。回复格式见 [review-lane-contracts.md](references/review-lane-contracts.md)。
 - 修复方向以正确性和长期可维护性优先，不要求最小补丁。
 

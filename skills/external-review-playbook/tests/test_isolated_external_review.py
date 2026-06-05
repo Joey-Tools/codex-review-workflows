@@ -114,6 +114,22 @@ class SkillDocumentationTest(unittest.TestCase):
         self.assertNotIn("-f query=@", reference_text)
         self.assertNotIn("-f query=query($owner", reference_text)
 
+    def test_pr_readiness_required_ci_guardrail_keeps_failure_shapes(self) -> None:
+        skill_path = (
+            pathlib.Path(__file__).resolve().parents[2]
+            / "pr-readiness-review-workflow"
+            / "SKILL.md"
+        )
+        text = skill_path.read_text(encoding="utf-8")
+
+        for needle in (
+            "失败、取消、pending 超过合理等待窗口",
+            "缺失 required check",
+            "绑定到旧 head",
+            "CI: none observed",
+        ):
+            self.assertIn(needle, text)
+
     def test_pr_readiness_independent_review_prompt_requires_exact_evidence_budget(self) -> None:
         skill_path = (
             pathlib.Path(__file__).resolve().parents[2]
