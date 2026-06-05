@@ -91,27 +91,28 @@ class SkillDocumentationTest(unittest.TestCase):
             / "pr-readiness-review-workflow"
             / "SKILL.md"
         )
-        text = skill_path.read_text(encoding="utf-8")
-        section = text.split("1. 建立 PR 上下文。", 1)[1]
-        section = section.split("2. 做 Codex review egress consent preflight。", 1)[0]
+        reference_path = skill_path.parent / "references" / "github-pr-probes.md"
+        skill_text = skill_path.read_text(encoding="utf-8")
+        reference_text = reference_path.read_text(encoding="utf-8")
+
+        self.assertIn("[github-pr-probes.md](references/github-pr-probes.md)", skill_text)
 
         for needle in (
             "gh pr view --json",
             "gh api graphql",
-            "含 `$owner`、braces、aliases、multiline selection 或长 field list",
+            "$owner`, braces, aliases, multiline selection, or a long field list",
             "task-scoped `.codex-tmp/.../*.graphql`",
-            "quoting-safe invocation",
+            "gh api graphql -F query=@.codex-tmp/<task>/query.graphql",
             "gh api 'repos/<owner>/<repo>/rules/branches/<base>'",
-            "gh api graphql -F query=@.codex-tmp/.../query.graphql",
             "gh api 'repos/<owner>/<repo>/contents/action.yml?ref=<sha>'",
-            "zsh 会把它当 glob",
+            "zsh cannot treat it as a glob",
             "Field ... doesn't exist on type ...",
             "Expected NAME",
         ):
-            self.assertIn(needle, section)
-        self.assertNotIn("rulesets?ref=", section)
-        self.assertNotIn("-f query=@", section)
-        self.assertNotIn("-f query=query($owner", section)
+            self.assertIn(needle, reference_text)
+        self.assertNotIn("rulesets?ref=", reference_text)
+        self.assertNotIn("-f query=@", reference_text)
+        self.assertNotIn("-f query=query($owner", reference_text)
 
     def test_pr_readiness_independent_review_prompt_requires_exact_evidence_budget(self) -> None:
         skill_path = (
@@ -119,9 +120,14 @@ class SkillDocumentationTest(unittest.TestCase):
             / "pr-readiness-review-workflow"
             / "SKILL.md"
         )
-        text = skill_path.read_text(encoding="utf-8")
-        section = text.split("5. 启动 `independent-codex-pr-review`。", 1)[1]
-        section = section.split("6. 启动 `offline-frozen-diff-review`。", 1)[0]
+        reference_path = skill_path.parent / "references" / "review-lane-contracts.md"
+        skill_text = skill_path.read_text(encoding="utf-8")
+        reference_text = reference_path.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "[review-lane-contracts.md](references/review-lane-contracts.md)",
+            skill_text,
+        )
 
         for needle in (
             "git diff --unified=30/40/50/60/80",
@@ -134,12 +140,15 @@ class SkillDocumentationTest(unittest.TestCase):
             "不要把它弱化成",
             "avoid dumping huge diffs",
         ):
-            self.assertIn(needle, section)
+            self.assertIn(needle, reference_text)
         self.assertIn(
             "只有在单文件、单 hunk 或精确 symbol window 上再用 line-producing rg -n",
-            section,
+            reference_text,
         )
-        self.assertNotIn("小文件集合上再用 line-producing rg -n", section)
+        self.assertNotIn(
+            "小文件集合上再用 line-producing rg -n",
+            reference_text,
+        )
 
     def test_review_orchestration_prefers_readonly_for_enforceable_evidence_budget(self) -> None:
         skill_path = (
