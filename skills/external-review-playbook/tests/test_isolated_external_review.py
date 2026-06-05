@@ -162,6 +162,7 @@ class SkillDocumentationTest(unittest.TestCase):
             "target repo/PR",
             "head commit",
             "allowed data categories",
+            "that request or a higher-priority policy binds the allowed data categories",
             "不做 Codex review",
             "不要外发",
             "只本地看",
