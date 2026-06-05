@@ -45,13 +45,14 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 
 3. 冻结 review scope。
 - 对本地可审范围记录 `base_sha..head_sha` 或明确 diff artifact。
-- PR 分支落后于目标分支时，先计算 `merge_base=$(git merge-base <base_ref> <head_ref>)`，再把正式 review scope 冻结为 `<merge_base>..<head_ref>`。不要直接用 GitHub 当前 `baseRefOid..headRefOid`，否则会把目标分支后续提交算成反向 diff。
+- PR 分支落后于目标分支时，先记录 GitHub `baseRefOid` / behind 状态，计算 `merge_base=$(git merge-base <base_ref> <head_ref>)`，再把正式 review scope 冻结为 `<merge_base>..<head_ref>`。不要直接用 GitHub 当前 `baseRefOid..headRefOid`，否则会把目标分支后续提交算成反向 diff。
+- 报告 merge-ready 前必须重新确认 branch/base 状态；如果 PR 仍 behind、base 已移动、branch protection 要求 up-to-date，或无法更新并验证到 clean，先更新分支并重跑必要 checks/reviews，或报告 blocked。不要把只完成 frozen review scope 的 stale PR 报告成 merge-ready。
 - 不用 live working tree 作为正式 review scope，除非当前任务就是 uncommitted local review。
 - 后续 fix 追加在已审范围之后；不要重写已经作为 review evidence 的 commits。
 
 4. 验证 `github-codex-review`。
 - 这是 PR 里的 GitHub `@codex review` / `codex/review-gate` lane，不是本地 `codex exec`，也不是独立 review-only 子线程。
-- 默认是 best-effort。若远端当前 head 没有触发 `@codex review` / `codex/review-gate`，且 branch protection 没有把实际 `codex/review-gate` status context 列为 required check，记录为 `not triggered` 并继续。
+- 默认是 best-effort。若远端当前 head 没有触发 `@codex review` / `codex/review-gate`，且 branch protection 没有把实际 `codex/review-gate` status context 列为 required check，记录为 `not triggered` 并继续；不要为了满足 best-effort lane 主动触发或反复触发 `@codex review`。
 - 若远端已经触发，或 branch protection 把它列为 required check，则绑定到当前 PR head commit，等待或查询到 completed 结果；缺失、失败、绑定到旧 head、requested changes 或 actionable Codex comments 都进入 fix loop / blocked state。
 - Clean 条件：未触发且非 required 时为 best-effort skipped；已触发或 required 时，当前 head commit 的 GitHub Codex review gate 成功，且没有未处理的 Codex review comments 或 requested changes。
 
@@ -96,7 +97,7 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 ## Guardrails
 
 - 不要再用裸 `online review` / `offline review` 作为 gate 名称；使用 `github-codex-review`、`independent-codex-pr-review` 和 `offline-frozen-diff-review`。
-- 不要把缺失的 GitHub `@codex review` / `codex/review-gate` 当作 blocker；它默认是 best-effort，远端没有触发就记录并继续，除非 branch protection 明确把实际 `codex/review-gate` status context 列为 required check。
+- 不要把缺失的 GitHub `@codex review` / `codex/review-gate` 当作 blocker；它默认是 best-effort，远端没有触发就记录并继续，除非 branch protection 明确把实际 `codex/review-gate` status context 列为 required check。也不要为了补齐 best-effort evidence 主动触发或反复触发 `@codex review`。
 - 不要用 GitHub `@codex review` / `codex/review-gate` 替代 `independent-codex-pr-review`。
 - 不要用 helper-backed subagent/internal lane 替代 `independent-codex-pr-review`。
 - 不要忽略已存在的 CI 或 branch protection required checks；required checks 必须处理到 clean 或明确 blocked。
