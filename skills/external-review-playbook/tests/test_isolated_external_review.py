@@ -114,6 +114,34 @@ class SkillDocumentationTest(unittest.TestCase):
         self.assertNotIn("-f query=@", reference_text)
         self.assertNotIn("-f query=query($owner", reference_text)
 
+    def test_pr_readiness_github_actions_logs_are_budgeted(self) -> None:
+        skill_path = (
+            pathlib.Path(__file__).resolve().parents[2]
+            / "pr-readiness-review-workflow"
+            / "SKILL.md"
+        )
+        reference_path = skill_path.parent / "references" / "github-pr-probes.md"
+        skill_text = skill_path.read_text(encoding="utf-8")
+        reference_text = reference_path.read_text(encoding="utf-8")
+
+        for needle in (
+            "CI checks / GitHub Actions logs",
+            "Actions log evidence budgets",
+        ):
+            self.assertIn(needle, skill_text)
+
+        for needle in (
+            "## GitHub Actions Logs",
+            "Do not run a chat-visible bare log dump",
+            "gh run view <run-id> --repo <owner>/<repo> --job <job-id> --log-failed > .codex-tmp/<task>/<job-id>.failed.log",
+            "wc -l -c .codex-tmp/<task>/<job-id>.failed.log",
+            "sed -n '1,80p'",
+            "tail -n 120",
+            "800 lines or 10k original tokens",
+            "Do not pipe a large `gh run view --log-failed` stream directly into broad `rg -C` output",
+        ):
+            self.assertIn(needle, reference_text)
+
     def test_pr_readiness_required_ci_guardrail_keeps_failure_shapes(self) -> None:
         skill_path = (
             pathlib.Path(__file__).resolve().parents[2]

@@ -41,3 +41,19 @@ gh api 'repos/<owner>/<repo>/contents/action.yml?ref=<sha>'
 ```
 
 Do not use the repository rulesets endpoint with a `ref` query as the branch rules probe. Use `gh api 'repos/<owner>/<repo>/rules/branches/<base>'` for rules that apply to a branch.
+
+## GitHub Actions Logs
+
+Use `gh pr checks <number>` or typed PR status first to identify the failing run and job. Do not run a chat-visible bare log dump such as `gh run view <run> --job <job> --log` or `gh run view <run> --job <job> --log-failed`.
+
+Save full GitHub Actions logs to a task-scoped file under `.codex-tmp/`, then extract only targeted evidence:
+
+```sh
+mkdir -p .codex-tmp/<task>
+gh run view <run-id> --repo <owner>/<repo> --job <job-id> --log-failed > .codex-tmp/<task>/<job-id>.failed.log
+wc -l -c .codex-tmp/<task>/<job-id>.failed.log
+rg -n "FAIL|error:|Exception|XCTAssert|#expect|TEST FAILED" .codex-tmp/<task>/<job-id>.failed.log | sed -n '1,80p'
+tail -n 120 .codex-tmp/<task>/<job-id>.failed.log
+```
+
+If the targeted extraction is still above roughly 800 lines or 10k original tokens, narrow the pattern or print small line windows around the decisive matches. Do not pipe a large `gh run view --log-failed` stream directly into broad `rg -C` output; saving first lets you count, re-filter, and report only the key lines.
