@@ -32,7 +32,7 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 - 确认 PR URL、当前 cwd、目标分支、当前 head commit、本地 dirty state、repo merge model 和 PR body 的 LLM authorship note。
 - 如果没有 PR URL，但当前分支/commit 已通过本地 gate，且 the user 要求 full workflow、merge-ready、`在合并前停止` 或 ready-for-review PR，先创建或复用 PR。该措辞授权 push 分支和创建/更新 PR；不授权 merge。创建/复用 PR 前确认 base branch、head branch、是否 draft/ready 和 required metadata；若 auth、network、branch protection 或 required metadata 缺失，停在明确 blocked state，不要把 commit-only 状态报告成完成。
 - 读取线上 PR comments、review threads、requested changes、CI 状态、branch protection / rules 和 merge requirements；GitHub 交互优先使用 `gh`。
-- 对 PR metadata、review threads、rulesets、branch protection、rules 或 custom GraphQL probe，按需读取 [github-pr-probes.md](references/github-pr-probes.md)。该 reference 包含 typed `gh` 优先级、`gh api graphql -F query=@...`、REST `?` path quoting 和 schema/parse failure 处理。
+- 对 PR metadata、review threads、rulesets、branch protection、rules、CI checks / GitHub Actions logs 或 custom GraphQL probe，按需读取 [github-pr-probes.md](references/github-pr-probes.md)。该 reference 包含 typed `gh` 优先级、`gh api graphql -F query=@...`、REST `?` path quoting、Actions log evidence budgets 和 schema/parse failure 处理。
 - 读取 GitHub `@codex review` trigger/comment evidence 和实际 `codex/review-gate` status check 状态；这属于 best-effort `github-codex-review`，不能和独立 Codex review-only 子线程混用。
 - 如果 GitHub 要求 `Require conversation resolution before merging`，未解决的 review threads 是必须处理的 merge gate。
 - 如果用户提供 `codex thread <session-ID>`，用 `$codex-session-mining` 找到 rollout/thread evidence，再结合线上 comments 和本地 diff 决定修复方向。
@@ -89,7 +89,7 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 
 ## References
 
-- [github-pr-probes.md](references/github-pr-probes.md): typed `gh` probes, custom GraphQL shape, REST path quoting, and schema/parse failure handling.
+- [github-pr-probes.md](references/github-pr-probes.md): typed `gh` probes, custom GraphQL shape, REST path quoting, Actions log evidence budgets, and schema/parse failure handling.
 - [egress-consent.md](references/egress-consent.md): Codex review egress consent decisions, explicit consent template, and escalation justification shapes.
 - [review-lane-contracts.md](references/review-lane-contracts.md): independent review prompt, evidence-budget contract, offline review contract, and review-thread reply note.
 - [cbth-agent-delivery.md](references/cbth-agent-delivery.md): background task delivery and recovery contract.
