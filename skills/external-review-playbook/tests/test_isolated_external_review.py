@@ -620,6 +620,13 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                     payload["opencode_config_content"] = pathlib.Path(
                         payload["opencode_config"]
                     ).read_text(encoding="utf-8")
+                    opencode_config = json.loads(payload["opencode_config_content"])
+                    payload["opencode_instruction_contents"] = {
+                        str(instruction_path): pathlib.Path(instruction_path).read_text(
+                            encoding="utf-8"
+                        )
+                        for instruction_path in opencode_config.get("instructions", [])
+                    }
                 if payload["report_file"]:
                     report_path = pathlib.Path(payload["report_file"])
                     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1660,6 +1667,12 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
             config["permission"]["bash"][f"mkdir -p {report_parent}"],
             "allow",
         )
+        self.assertEqual(len(config["instructions"]), 1)
+        contract_text = payload["opencode_instruction_contents"][config["instructions"][0]]
+        self.assertIn("git diff --unified=30/40/50/60/80", contract_text)
+        self.assertIn("git diff --function-context", contract_text)
+        self.assertIn("git show <rev>:<path>", contract_text)
+        self.assertIn("cat <file>", contract_text)
         self.assertFalse(payload["opencode_config_dir"])
         self.assertFalse(payload["xdg_data_home"])
 
