@@ -216,6 +216,7 @@ class SkillDocumentationTest(unittest.TestCase):
         for needle in (
             "git diff --unified=30/40/50/60/80",
             "git diff --function-context",
+            "git diff -W",
             "git show <rev>:<path>",
             "cat <file>",
             "path-wide / multi-file / large-alternation raw rg -n",
@@ -1671,6 +1672,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         contract_text = payload["opencode_instruction_contents"][config["instructions"][0]]
         self.assertIn("git diff --unified=30/40/50/60/80", contract_text)
         self.assertIn("git diff --function-context", contract_text)
+        self.assertIn("git diff -W", contract_text)
         self.assertIn("git show <rev>:<path>", contract_text)
         self.assertIn("cat <file>", contract_text)
         self.assertFalse(payload["opencode_config_dir"])
@@ -3923,6 +3925,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertIn("Evidence budget:", prompt_text)
         self.assertIn("git diff --unified=30/40/50/60/80", prompt_text)
         self.assertIn("git diff --function-context", prompt_text)
+        self.assertIn("git diff -W", prompt_text)
         self.assertIn("rg -l", prompt_text)
         self.assertIn("git show <rev>:<path>", prompt_text)
         self.assertIn("cat <file>", prompt_text)
@@ -3991,6 +3994,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertIn("Start with changed-file lists", payload["prompt_stdin"])
         self.assertIn("git diff --unified=30/40/50/60/80", payload["prompt_stdin"])
         self.assertIn("git diff --function-context", payload["prompt_stdin"])
+        self.assertIn("git diff -W", payload["prompt_stdin"])
         self.assertIn("git show <rev>:<path>", payload["prompt_stdin"])
         self.assertIn("cat <file>", payload["prompt_stdin"])
         self.assertIn("narrow sed -n '<start>,<end>p' window", payload["prompt_stdin"])

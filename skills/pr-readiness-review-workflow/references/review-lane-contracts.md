@@ -9,13 +9,13 @@ Start a separate Codex CLI review-only thread. The prompt must say that it is a 
 Preferred prompt:
 
 ```text
-请作为 independent code reviewer 审查 <PR URL>，本地 checkout 在 cwd。这是 review-only 子线程；不要执行 PR readiness orchestration，不要创建或更新 PR，不要修复代码，不要启动其他 reviewer，不要等待 CI；只输出 code review findings。先看 changed-file list / --stat / --numstat、helper diff headers、rg -l 或 rg --count；不要默认用 git diff --unified=30/40/50/60/80 或 git diff --function-context、整文件 nl -ba、裸 cat <file>、裸 git show <rev>:<path>、或 path-wide / multi-file / large-alternation raw rg -n。line-producing rg -n（包括 rg -n -C context search）只能作为第二阶段读取：先用 rg -l / rg --count 缩小范围，再只对一个 exact file、一个 hunk 或一个 exact symbol window 使用。如果需要 nearby file context，把 git show / nl -ba 接到窄 sed -n '<start>,<end>p' window，或用 exact-symbol rg -n 定位后只读相关窗口。如果 untracked files 在审查范围内，不要打印完整 git status --short --untracked-files=all 或 git ls-files --others；先用 git status --short --untracked-files=no，再用带递归 generated/dependency excludes 的 count 或 capped path sample 选定路径。任何单次输出达到 800+ 行或 10k+ original tokens 后，必须改用单文件/单 hunk/精确 symbol window；只有在单文件、单 hunk 或精确 symbol window 上再用 line-producing rg -n。
+请作为 independent code reviewer 审查 <PR URL>，本地 checkout 在 cwd。这是 review-only 子线程；不要执行 PR readiness orchestration，不要创建或更新 PR，不要修复代码，不要启动其他 reviewer，不要等待 CI；只输出 code review findings。先看 changed-file list / --stat / --numstat、helper diff headers、rg -l 或 rg --count；不要默认用 git diff --unified=30/40/50/60/80 或 git diff --function-context / git diff -W、整文件 nl -ba、裸 cat <file>、裸 git show <rev>:<path>、或 path-wide / multi-file / large-alternation raw rg -n。line-producing rg -n（包括 rg -n -C context search）只能作为第二阶段读取：先用 rg -l / rg --count 缩小范围，再只对一个 exact file、一个 hunk 或一个 exact symbol window 使用。如果需要 nearby file context，把 git show / nl -ba 接到窄 sed -n '<start>,<end>p' window，或用 exact-symbol rg -n 定位后只读相关窗口。如果 untracked files 在审查范围内，不要打印完整 git status --short --untracked-files=all 或 git ls-files --others；先用 git status --short --untracked-files=no，再用带递归 generated/dependency excludes 的 count 或 capped path sample 选定路径。任何单次输出达到 800+ 行或 10k+ original tokens 后，必须改用单文件/单 hunk/精确 symbol window；只有在单文件、单 hunk 或精确 symbol window 上再用 line-producing rg -n。
 ```
 
 If you hand-write, shorten, or replay this prompt, preserve these exact evidence-budget constraints:
 
 - `git diff --unified=30/40/50/60/80`
-- `git diff --function-context`
+- `git diff --function-context` / `git diff -W`
 - `git show <rev>:<path>`
 - `cat <file>`
 - `path-wide / multi-file / large-alternation raw rg -n`
