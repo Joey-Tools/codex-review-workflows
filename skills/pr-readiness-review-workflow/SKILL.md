@@ -58,7 +58,7 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 
 5. 启动 `independent-codex-pr-review`。
 - 使用独立 Codex CLI review-only thread。prompt 必须声明这是 parent PR readiness workflow 调起的纯 review lane，禁止子线程再次执行 PR readiness orchestration、创建/更新 PR、修复代码、启动新的 reviewer 或等待 CI。
-- 读取 [review-lane-contracts.md](references/review-lane-contracts.md) 并保留其中 independent review prompt 和 evidence-budget contract，尤其是 `git diff --unified=30/40/50/60/80`、`git show <rev>:<path>`、`cat <file>`、`path-wide / multi-file / large-alternation raw rg -n`、`rg -n -C context search`、`800+ 行或 10k+ original tokens`、`git status --short --untracked-files=no`、`rg -l` / `rg --count`。
+- 读取 [review-lane-contracts.md](references/review-lane-contracts.md) 并保留其中 independent review prompt 和 evidence-budget contract，尤其是 `git diff --unified=30/40/50/60/80` / `git diff --function-context` / `git diff -W`、`git show <rev>:<path>`、`cat <file>`、`path-wide / multi-file / large-alternation raw rg -n`、`rg -n -C context search`、`800+ 行或 10k+ original tokens`、`git status --short --untracked-files=no`、`rg -l` / `rg --count`。
 - 这条 lane 是独立 Codex PR finding 主 lane。GitHub `@codex review` 和 helper-backed `offline-frozen-diff-review` 都不能替代它。
 - 必须等到 final review artifact 或明确 blocked/inconclusive 结果；中间 reasoning 和 file-read progress 不算结果。
 - Clean 条件：final artifact 明确 `LGTM` / no actionable findings；如果有 finding，修复后重跑这条 lane。
