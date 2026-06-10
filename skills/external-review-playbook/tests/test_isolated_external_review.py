@@ -215,6 +215,7 @@ class SkillDocumentationTest(unittest.TestCase):
 
         for needle in (
             "git diff --unified=30/40/50/60/80",
+            "git diff --function-context",
             "git show <rev>:<path>",
             "cat <file>",
             "path-wide / multi-file / large-alternation raw rg -n",
@@ -3908,6 +3909,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertIn("Review the provided diff", prompt_text)
         self.assertIn("Evidence budget:", prompt_text)
         self.assertIn("git diff --unified=30/40/50/60/80", prompt_text)
+        self.assertIn("git diff --function-context", prompt_text)
         self.assertIn("rg -l", prompt_text)
         self.assertIn("git show <rev>:<path>", prompt_text)
         self.assertIn("cat <file>", prompt_text)
@@ -3975,6 +3977,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertIn("Frozen review range:", payload["prompt_stdin"])
         self.assertIn("Start with changed-file lists", payload["prompt_stdin"])
         self.assertIn("git diff --unified=30/40/50/60/80", payload["prompt_stdin"])
+        self.assertIn("git diff --function-context", payload["prompt_stdin"])
         self.assertIn("git show <rev>:<path>", payload["prompt_stdin"])
         self.assertIn("cat <file>", payload["prompt_stdin"])
         self.assertIn("narrow sed -n '<start>,<end>p' window", payload["prompt_stdin"])
