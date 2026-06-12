@@ -225,6 +225,9 @@ class SkillDocumentationTest(unittest.TestCase):
             "git status --short --untracked-files=no",
             "rg -l",
             "rg --count",
+            "删减版 `Evidence-budget contract` 是无效的",
+            "bare `git show <rev>:<path>`",
+            "整文件 `nl -ba`",
             "不要把它弱化成",
             "avoid dumping huge diffs",
         ):
@@ -245,6 +248,14 @@ class SkillDocumentationTest(unittest.TestCase):
             / "SKILL.md"
         )
         text = skill_path.read_text(encoding="utf-8")
+        self.assertIn(
+            "direct findings-only review-only child prompts",
+            text,
+        )
+        self.assertIn(
+            "shortened `Evidence-budget contract`",
+            text,
+        )
         self.assertIn(
             "default to `codex-readonly` when the review needs an enforceable evidence budget",
             text,
