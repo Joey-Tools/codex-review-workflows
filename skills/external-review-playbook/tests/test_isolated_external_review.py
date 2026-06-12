@@ -257,6 +257,14 @@ class SkillDocumentationTest(unittest.TestCase):
             text,
         )
         self.assertIn(
+            "use a pollable TTY/PTY session",
+            text,
+        )
+        self.assertIn(
+            "do not depend on `write_stdin`",
+            text,
+        )
+        self.assertIn(
             "default to `codex-readonly` when the review needs an enforceable evidence budget",
             text,
         )

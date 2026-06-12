@@ -41,6 +41,7 @@ For PR readiness, load `$pr-readiness-review-workflow` first. That workflow owns
 4. Drive the lane to a terminal artifact.
 - Use the helper's `stateful start|status|wait|final` path when the final reviewer message matters more than stream progress.
 - For `stateful status`, `stateful wait`, and `stateful final`, always pass the state directory as `--state-dir <dir>`; the state dir is not a positional argument.
+- When running a long `stateful wait` from Codex, use a pollable TTY/PTY session or prefer repeated short `stateful status` / bounded `stateful wait` calls; do not depend on `write_stdin` to keep polling a plain-pipe wait after stdin closes.
 - For external stateful lanes such as `opencode`, `agent`, `copilot`, or `gh-copilot`, prefer a frozen range or explicit diff file. If no prompt or child args were supplied, the helper injects a conservative findings-only default prompt for that diff.
 - Pass a custom prompt only when the review needs specialized scope or output. Promptless live-scope external lanes still need explicit child args before waiting.
 - Treat `codex-readonly` as stateful-by-default; reserve direct one-shot readonly runs for quick smoke/debug probes where losing the final artifact would be acceptable.
