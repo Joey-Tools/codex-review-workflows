@@ -9,6 +9,7 @@ import sys
 
 
 ALLOWED_SUBCOMMANDS = {
+    "apply",
     "blame",
     "cat-file",
     "describe",
@@ -172,6 +173,12 @@ FILTER_KEY_RE = re.compile(
     r"^filter\.(?P<driver>.+)\.(?:clean|process|required|smudge)$"
 )
 FILTER_QUERY_PATTERN = r"^filter\..*"
+
+READONLY_APPLY_FLAGS = {
+    "--numstat",
+    "--stat",
+    "--summary",
+}
 
 
 def _is_allowed_global_config(config: str) -> bool:
@@ -368,6 +375,23 @@ def _blocked_subcommand_flag(
     return None
 
 
+def _is_readonly_apply(
+    forwarded_args: list[str],
+    *,
+    subcommand_index: int | None,
+) -> bool:
+    if subcommand_index is None:
+        return False
+
+    for arg in forwarded_args[subcommand_index + 1:]:
+        if arg == "--":
+            break
+        for flag in READONLY_APPLY_FLAGS:
+            if arg == flag or arg.startswith(flag + "="):
+                return True
+    return False
+
+
 def _exec_argv(
     real_git: str,
     forwarded_args: list[str],
@@ -418,6 +442,15 @@ def main() -> int:
             f"readonly git shim blocked subcommand option: {blocked_flag}",
             file=sys.stderr,
         )
+        return 126
+    if (
+        value == "apply"
+        and not _is_readonly_apply(
+            forwarded_args,
+            subcommand_index=subcommand_index,
+        )
+    ):
+        print("readonly git shim blocked subcommand: apply", file=sys.stderr)
         return 126
     if (
         action == "meta"

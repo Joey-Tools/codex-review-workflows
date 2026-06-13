@@ -3303,6 +3303,41 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                     completed.stderr,
                 )
 
+    def test_readonly_git_shim_allows_apply_stat_modes_only(self) -> None:
+        other_repo = self._create_plain_repo("apply-stat-probe")
+        (other_repo / "file.txt").write_text("changed\n", encoding="utf-8")
+        patch_file = self.root / "apply-stat.patch"
+        diff = git(other_repo, "diff", "--", "file.txt")
+        self.assertEqual(diff.returncode, 0, diff.stderr)
+        patch_file.write_text(diff.stdout, encoding="utf-8")
+
+        for flag in ("--stat", "--numstat", "--summary"):
+            with self.subTest(flag=flag):
+                control = git(other_repo, "apply", flag, str(patch_file))
+                completed = self._run_shim(
+                    "-C",
+                    str(other_repo),
+                    "apply",
+                    flag,
+                    str(patch_file),
+                )
+
+                self.assertEqual(completed.returncode, control.returncode)
+                self.assertEqual(completed.stdout, control.stdout)
+                self.assertEqual(completed.stderr, control.stderr)
+
+        blocked = self._run_shim(
+            "-C",
+            str(other_repo),
+            "apply",
+            str(patch_file),
+        )
+        self.assertEqual(blocked.returncode, 126)
+        self.assertIn(
+            "readonly git shim blocked subcommand: apply",
+            blocked.stderr,
+        )
+
     def test_readonly_git_shim_preserves_diff_no_index_outside_repo(self) -> None:
         scratch = self.root / "no-index-probe"
         scratch.mkdir()
