@@ -3338,6 +3338,24 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
             blocked.stderr,
         )
 
+        blocked_apply = self._run_shim(
+            "-C",
+            str(other_repo),
+            "apply",
+            "--stat",
+            "--apply",
+            str(patch_file),
+        )
+        self.assertEqual(blocked_apply.returncode, 126)
+        self.assertIn(
+            "readonly git shim blocked subcommand: apply",
+            blocked_apply.stderr,
+        )
+        self.assertEqual(
+            (other_repo / "file.txt").read_text(encoding="utf-8"),
+            "changed\n",
+        )
+
     def test_readonly_git_shim_preserves_diff_no_index_outside_repo(self) -> None:
         scratch = self.root / "no-index-probe"
         scratch.mkdir()

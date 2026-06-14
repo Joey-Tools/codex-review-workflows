@@ -180,6 +180,10 @@ READONLY_APPLY_FLAGS = {
     "--summary",
 }
 
+BLOCKED_APPLY_FLAGS = {
+    "--apply",
+}
+
 
 def _is_allowed_global_config(config: str) -> bool:
     key, separator, value = config.partition("=")
@@ -383,13 +387,17 @@ def _is_readonly_apply(
     if subcommand_index is None:
         return False
 
+    saw_readonly_flag = False
     for arg in forwarded_args[subcommand_index + 1:]:
         if arg == "--":
             break
+        for flag in BLOCKED_APPLY_FLAGS:
+            if arg == flag or arg.startswith(flag + "="):
+                return False
         for flag in READONLY_APPLY_FLAGS:
             if arg == flag or arg.startswith(flag + "="):
-                return True
-    return False
+                saw_readonly_flag = True
+    return saw_readonly_flag
 
 
 def _exec_argv(
