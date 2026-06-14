@@ -186,12 +186,6 @@ READONLY_APPLY_DISABLE_FLAGS = {
     "--no-summary": "summary",
 }
 
-BLOCKED_APPLY_FLAGS = {
-    "--apply",
-    "--build-fake-ancestor",
-}
-
-
 def _is_allowed_global_config(config: str) -> bool:
     key, separator, value = config.partition("=")
     if not separator:
@@ -402,9 +396,6 @@ def _is_readonly_apply(
     for arg in forwarded_args[subcommand_index + 1:]:
         if arg == "--":
             break
-        for flag in BLOCKED_APPLY_FLAGS:
-            if arg == flag or arg.startswith(flag + "="):
-                return False
         matched_readonly_mode = None
         for flag, mode in READONLY_APPLY_ENABLE_FLAGS.items():
             if arg == flag or arg.startswith(flag + "="):
