@@ -174,14 +174,21 @@ FILTER_KEY_RE = re.compile(
 )
 FILTER_QUERY_PATTERN = r"^filter\..*"
 
-READONLY_APPLY_FLAGS = {
-    "--numstat",
-    "--stat",
-    "--summary",
+READONLY_APPLY_ENABLE_FLAGS = {
+    "--numstat": "numstat",
+    "--stat": "stat",
+    "--summary": "summary",
+}
+
+READONLY_APPLY_DISABLE_FLAGS = {
+    "--no-numstat": "numstat",
+    "--no-stat": "stat",
+    "--no-summary": "summary",
 }
 
 BLOCKED_APPLY_FLAGS = {
     "--apply",
+    "--build-fake-ancestor",
 }
 
 
@@ -387,17 +394,29 @@ def _is_readonly_apply(
     if subcommand_index is None:
         return False
 
-    saw_readonly_flag = False
+    readonly_modes = {
+        "numstat": False,
+        "stat": False,
+        "summary": False,
+    }
     for arg in forwarded_args[subcommand_index + 1:]:
         if arg == "--":
             break
         for flag in BLOCKED_APPLY_FLAGS:
             if arg == flag or arg.startswith(flag + "="):
                 return False
-        for flag in READONLY_APPLY_FLAGS:
+        matched_readonly_mode = None
+        for flag, mode in READONLY_APPLY_ENABLE_FLAGS.items():
             if arg == flag or arg.startswith(flag + "="):
-                saw_readonly_flag = True
-    return saw_readonly_flag
+                matched_readonly_mode = mode
+                break
+        if matched_readonly_mode is not None:
+            readonly_modes[matched_readonly_mode] = True
+            continue
+        if arg in READONLY_APPLY_DISABLE_FLAGS:
+            readonly_modes[READONLY_APPLY_DISABLE_FLAGS[arg]] = False
+            continue
+    return any(readonly_modes.values())
 
 
 def _exec_argv(

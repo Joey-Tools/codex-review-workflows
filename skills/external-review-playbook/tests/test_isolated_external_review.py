@@ -3311,7 +3311,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertEqual(diff.returncode, 0, diff.stderr)
         patch_file.write_text(diff.stdout, encoding="utf-8")
 
-        for flag in ("--stat", "--numstat", "--summary"):
+        for flag in ("--stat", "--stat=80", "--numstat", "--summary"):
             with self.subTest(flag=flag):
                 control = git(other_repo, "apply", flag, str(patch_file))
                 completed = self._run_shim(
@@ -3351,6 +3351,45 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
             "readonly git shim blocked subcommand: apply",
             blocked_apply.stderr,
         )
+        self.assertEqual(
+            (other_repo / "file.txt").read_text(encoding="utf-8"),
+            "changed\n",
+        )
+
+        blocked_no_stat = self._run_shim(
+            "-C",
+            str(other_repo),
+            "apply",
+            "--stat",
+            "--no-stat",
+            str(patch_file),
+        )
+        self.assertEqual(blocked_no_stat.returncode, 126)
+        self.assertIn(
+            "readonly git shim blocked subcommand: apply",
+            blocked_no_stat.stderr,
+        )
+        self.assertEqual(
+            (other_repo / "file.txt").read_text(encoding="utf-8"),
+            "changed\n",
+        )
+
+        fake_ancestor = self.root / "fake-ancestor.index"
+        blocked_fake_ancestor = self._run_shim(
+            "-C",
+            str(other_repo),
+            "apply",
+            "--stat",
+            "--build-fake-ancestor",
+            str(fake_ancestor),
+            str(patch_file),
+        )
+        self.assertEqual(blocked_fake_ancestor.returncode, 126)
+        self.assertIn(
+            "readonly git shim blocked subcommand: apply",
+            blocked_fake_ancestor.stderr,
+        )
+        self.assertFalse(fake_ancestor.exists())
         self.assertEqual(
             (other_repo / "file.txt").read_text(encoding="utf-8"),
             "changed\n",
