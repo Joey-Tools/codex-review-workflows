@@ -18,6 +18,7 @@ If you hand-write, shorten, or replay this prompt, preserve these exact evidence
 - `git diff --function-context` / `git diff -W`
 - `git show <rev>:<path>`
 - `cat <file>`
+- 整文件 `nl -ba`
 - `path-wide / multi-file / large-alternation raw rg -n`
 - `rg -n -C context search`
 - `800+ 行或 10k+ original tokens`

@@ -212,6 +212,7 @@ class SkillDocumentationTest(unittest.TestCase):
             "[review-lane-contracts.md](references/review-lane-contracts.md)",
             skill_text,
         )
+        self.assertIn("整文件 `nl -ba`", skill_text)
 
         for needle in (
             "git diff --unified=30/40/50/60/80",
@@ -236,6 +237,11 @@ class SkillDocumentationTest(unittest.TestCase):
             "只有在单文件、单 hunk 或精确 symbol window 上再用 line-producing rg -n",
             reference_text,
         )
+        constraint_list = reference_text.split(
+            "If you hand-write, shorten, or replay this prompt, preserve these exact evidence-budget constraints:",
+            1,
+        )[1].split("删减版 `Evidence-budget contract` 是无效的", 1)[0]
+        self.assertIn("- 整文件 `nl -ba`", constraint_list)
         self.assertNotIn(
             "小文件集合上再用 line-producing rg -n",
             reference_text,
