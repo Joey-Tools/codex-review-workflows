@@ -3374,6 +3374,42 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
             "changed\n",
         )
 
+        blocked_directory_value = self._run_shim(
+            "-C",
+            str(other_repo),
+            "apply",
+            "--directory",
+            "--stat",
+            str(patch_file),
+        )
+        self.assertEqual(blocked_directory_value.returncode, 126)
+        self.assertIn(
+            "readonly git shim blocked subcommand: apply",
+            blocked_directory_value.stderr,
+        )
+        self.assertEqual(
+            (other_repo / "file.txt").read_text(encoding="utf-8"),
+            "changed\n",
+        )
+
+        blocked_apply_abbreviation = self._run_shim(
+            "-C",
+            str(other_repo),
+            "apply",
+            "--stat",
+            "--app",
+            str(patch_file),
+        )
+        self.assertEqual(blocked_apply_abbreviation.returncode, 126)
+        self.assertIn(
+            "readonly git shim blocked subcommand: apply",
+            blocked_apply_abbreviation.stderr,
+        )
+        self.assertEqual(
+            (other_repo / "file.txt").read_text(encoding="utf-8"),
+            "changed\n",
+        )
+
         fake_ancestor = self.root / "fake-ancestor.index"
         blocked_fake_ancestor = self._run_shim(
             "-C",

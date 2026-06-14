@@ -416,6 +416,8 @@ def _is_readonly_apply(
         if arg in READONLY_APPLY_DISABLE_FLAGS:
             readonly_modes[READONLY_APPLY_DISABLE_FLAGS[arg]] = False
             continue
+        if arg.startswith("-") and arg != "-":
+            return False
     return any(readonly_modes.values())
 
 
