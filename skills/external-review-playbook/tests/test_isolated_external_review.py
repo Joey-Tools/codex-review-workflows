@@ -212,6 +212,7 @@ class SkillDocumentationTest(unittest.TestCase):
             "[review-lane-contracts.md](references/review-lane-contracts.md)",
             skill_text,
         )
+        self.assertIn("整文件 `nl -ba`", skill_text)
 
         for needle in (
             "git diff --unified=30/40/50/60/80",
@@ -225,6 +226,9 @@ class SkillDocumentationTest(unittest.TestCase):
             "git status --short --untracked-files=no",
             "rg -l",
             "rg --count",
+            "删减版 `Evidence-budget contract` 是无效的",
+            "bare `git show <rev>:<path>`",
+            "整文件 `nl -ba`",
             "不要把它弱化成",
             "avoid dumping huge diffs",
         ):
@@ -233,6 +237,11 @@ class SkillDocumentationTest(unittest.TestCase):
             "只有在单文件、单 hunk 或精确 symbol window 上再用 line-producing rg -n",
             reference_text,
         )
+        constraint_list = reference_text.split(
+            "If you hand-write, shorten, or replay this prompt, preserve these exact evidence-budget constraints:",
+            1,
+        )[1].split("删减版 `Evidence-budget contract` 是无效的", 1)[0]
+        self.assertIn("- 整文件 `nl -ba`", constraint_list)
         self.assertNotIn(
             "小文件集合上再用 line-producing rg -n",
             reference_text,
@@ -245,6 +254,22 @@ class SkillDocumentationTest(unittest.TestCase):
             / "SKILL.md"
         )
         text = skill_path.read_text(encoding="utf-8")
+        self.assertIn(
+            "direct findings-only review-only child prompts",
+            text,
+        )
+        self.assertIn(
+            "shortened `Evidence-budget contract`",
+            text,
+        )
+        self.assertIn(
+            "use a pollable TTY/PTY session",
+            text,
+        )
+        self.assertIn(
+            "do not depend on `write_stdin`",
+            text,
+        )
         self.assertIn(
             "default to `codex-readonly` when the review needs an enforceable evidence budget",
             text,
