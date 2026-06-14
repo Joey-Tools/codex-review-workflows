@@ -1,6 +1,6 @@
 ---
 name: review-orchestration-playbook
-description: Orchestrate the user's helper-backed internal Codex review, fresh-context GPT/Codex subagent-style review requests, offline-frozen-diff-review baselines, and explicit opt-in external reviewer lanes when entrypoint choice, sandbox/runtime shape, frozen review scope, or deterministic fallback behavior is part of the problem. Do not orchestrate review-only child prompts that forbid starting reviewers; those prompts should directly inspect and output findings.
+description: Orchestrate the user's helper-backed internal Codex review, fresh-context GPT/Codex subagent-style review requests, offline-frozen-diff-review baselines, explicit opt-in external reviewer lanes, and direct findings-only review-only child prompts when entrypoint choice, sandbox/runtime shape, frozen review scope, deterministic fallback behavior, or bounded evidence reads are part of the problem. Do not orchestrate review-only child prompts that forbid starting reviewers; those prompts should directly inspect and output findings.
 ---
 
 # Review Orchestration Playbook
@@ -14,7 +14,7 @@ For PR readiness, load `$pr-readiness-review-workflow` first. That workflow owns
 ## Workflow
 
 1. Classify the review job first.
-- Review-only child lane: if the prompt says `independent code reviewer`, `review-only`, `不要启动其他 reviewer`, `不要等待 CI`, or `不要执行 PR readiness orchestration`, perform direct findings-only code review. Do not call `$pr-readiness-review-workflow` and do not start another helper or external reviewer.
+- Review-only child lane: if the prompt says `independent code reviewer`, `review-only`, `不要启动其他 reviewer`, `不要等待 CI`, or `不要执行 PR readiness orchestration`, perform direct findings-only code review and apply the evidence-budget rules in step 3 even when the prompt omits them or includes a shortened `Evidence-budget contract`. Do not call `$pr-readiness-review-workflow` and do not start another helper or external reviewer.
 - Parent PR readiness `independent-codex-pr-review` orchestration: do not handle it here as a helper lane. Use `$pr-readiness-review-workflow` and start a separate Codex CLI review-only thread for the PR.
 - `offline-frozen-diff-review` / internal Codex review: default to `codex-readonly` when the review needs an enforceable evidence budget, a large/generated diff is possible, or the child prompt must preserve exact bounded-read instructions. Use `codex-review` only for narrow scopes where its builtin `codex exec review` prompt is acceptable; fall back to `codex-readonly` as soon as `codex-review` cannot honor the required prompt contract. Use `codex-parallel` only when the caller explicitly wants dual-lane coverage and can consume an aggregate final artifact.
 - Non-Codex external review: choose among `opencode`, Cursor `agent`, `copilot`, `gh copilot`, Claude, or similar only when the user explicitly asks for that lane or the active workflow explicitly marks it opt-in.
@@ -41,6 +41,7 @@ For PR readiness, load `$pr-readiness-review-workflow` first. That workflow owns
 4. Drive the lane to a terminal artifact.
 - Use the helper's `stateful start|status|wait|final` path when the final reviewer message matters more than stream progress.
 - For `stateful status`, `stateful wait`, and `stateful final`, always pass the state directory as `--state-dir <dir>`; the state dir is not a positional argument.
+- When running a long `stateful wait` from Codex, use a pollable TTY/PTY session or prefer repeated short `stateful status` / bounded `stateful wait` calls; do not depend on `write_stdin` to keep polling a plain-pipe wait after stdin closes.
 - For external stateful lanes such as `opencode`, `agent`, `copilot`, or `gh-copilot`, prefer a frozen range or explicit diff file. If no prompt or child args were supplied, the helper injects a conservative findings-only default prompt for that diff.
 - Pass a custom prompt only when the review needs specialized scope or output. Promptless live-scope external lanes still need explicit child args before waiting.
 - Treat `codex-readonly` as stateful-by-default; reserve direct one-shot readonly runs for quick smoke/debug probes where losing the final artifact would be acceptable.

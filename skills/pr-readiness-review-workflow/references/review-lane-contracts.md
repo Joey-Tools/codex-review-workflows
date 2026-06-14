@@ -18,12 +18,15 @@ If you hand-write, shorten, or replay this prompt, preserve these exact evidence
 - `git diff --function-context` / `git diff -W`
 - `git show <rev>:<path>`
 - `cat <file>`
+- 整文件 `nl -ba`
 - `path-wide / multi-file / large-alternation raw rg -n`
 - `rg -n -C context search`
 - `800+ 行或 10k+ original tokens`
 - `git status --short --untracked-files=no`
 - `rg -l`
 - `rg --count`
+
+删减版 `Evidence-budget contract` 是无效的：如果它没有点名 `git diff --function-context` / `git diff -W`、bare `git show <rev>:<path>`、bare `cat <file>`、整文件 `nl -ba`、`rg -n -C`、以及 800+ 行或 10k+ original-token 后必须收窄，就不要发送给 review-only 子线程。
 
 不要把它弱化成 `avoid dumping huge diffs`, `focused hunks`, or `avoid broad searches` 这类 soft phrasing.
 
