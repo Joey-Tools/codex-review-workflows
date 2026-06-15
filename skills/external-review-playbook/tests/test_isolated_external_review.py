@@ -231,8 +231,20 @@ class SkillDocumentationTest(unittest.TestCase):
             "整文件 `nl -ba`",
             "不要把它弱化成",
             "avoid dumping huge diffs",
+            "English variants are subject to the same contract",
+            "omits the full evidence-budget paragraph is invalid",
+            "Review-only validation commands also need an output budget",
+            "max_output_tokens=60000",
+            "repeated `unittest` `E` output",
         ):
             self.assertIn(needle, reference_text)
+        for needle in (
+            "英文 focus-heavy prompt",
+            "max_output_tokens=60000",
+            "pyenv shim",
+            "repeated `unittest` `E` 输出",
+        ):
+            self.assertIn(needle, skill_text)
         self.assertIn(
             "只有在单文件、单 hunk 或精确 symbol window 上再用 line-producing rg -n",
             reference_text,
@@ -279,6 +291,32 @@ class SkillDocumentationTest(unittest.TestCase):
             text,
         )
         self.assertIn("cannot receive the helper's evidence-budget text", text)
+        for needle in (
+            "validation commands need the same budget discipline",
+            "max_output_tokens=60000",
+            "pyenv shim",
+            "repeated `unittest` `E` output",
+        ):
+            self.assertIn(needle, text)
+
+    def test_review_prompt_templates_budget_validation_output(self) -> None:
+        reference_path = (
+            pathlib.Path(__file__).resolve().parents[2]
+            / "external-review-playbook"
+            / "references"
+            / "review-prompt-templates.md"
+        )
+        reference_text = reference_path.read_text(encoding="utf-8")
+
+        for needle in (
+            "validation-output budget",
+            "max_output_tokens=60000",
+            "max_output_tokens=100000",
+            "sandbox tempdir",
+            "pyenv shim",
+            "repeated `unittest` `E` output",
+        ):
+            self.assertIn(needle, reference_text)
 
 
 class IsolatedCopilotReviewTest(unittest.TestCase):
