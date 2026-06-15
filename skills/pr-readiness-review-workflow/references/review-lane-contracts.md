@@ -32,7 +32,7 @@ English variants are subject to the same contract. A prompt that says only `You 
 
 不要把它弱化成 `avoid dumping huge diffs`, `focused hunks`, or `avoid broad searches` 这类 soft phrasing.
 
-Review-only validation commands also need an output budget. In read-only or approval-gated child lanes, do not start with a full test or build command using a large visible budget such as `max_output_tokens=60000` or `max_output_tokens=100000`. First run a small syntax/targeted probe or the full command with a small visible cap, and if it fails due sandbox tempdir, pyenv shim, or repeated `unittest` `E` output, stop and summarize the failure shape before rerunning with escalation or a task-scoped log file. Do not let the first failed validation dump thousands of repeated error lines into the transcript.
+Review-only validation commands also need an output budget. In read-only or approval-gated child lanes, do not start with a full test or build command using a large visible budget such as `max_output_tokens=60000` or `max_output_tokens=100000`. First run a small syntax/targeted probe or the full command with a small visible cap, and if sandbox tempdir, pyenv shim, or repeated `unittest` `E` output appears, stop and summarize the failure shape before rerunning with escalation or a task-scoped log file. Do not let the first validation dump thousands of repeated error lines into the transcript.
 
 The lane is clean only when the final artifact says `LGTM` or no actionable findings. Intermediate reasoning, file reads, or progress output do not count.
 

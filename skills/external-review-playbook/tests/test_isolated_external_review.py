@@ -256,6 +256,11 @@ class SkillDocumentationTest(unittest.TestCase):
         self.assertIn("max_output_tokens=60000", preferred_prompt)
         self.assertIn("max_output_tokens=100000", preferred_prompt)
         self.assertIn("repeated `unittest` `E` output", preferred_prompt)
+        self.assertIn(
+            "if sandbox tempdir, pyenv shim, or repeated `unittest` `E` output appears",
+            reference_text,
+        )
+        self.assertNotIn("if it fails due sandbox tempdir", reference_text)
         constraint_list = reference_text.split(
             "If you hand-write, shorten, or replay this prompt, preserve these exact evidence-budget constraints:",
             1,
