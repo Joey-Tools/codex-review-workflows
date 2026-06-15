@@ -231,12 +231,36 @@ class SkillDocumentationTest(unittest.TestCase):
             "整文件 `nl -ba`",
             "不要把它弱化成",
             "avoid dumping huge diffs",
+            "English variants are subject to the same contract",
+            "omits the full evidence-budget paragraph is invalid",
+            "Review-only validation commands also need an output budget",
+            "max_output_tokens=60000",
+            "repeated `unittest` `E` output",
         ):
             self.assertIn(needle, reference_text)
+        for needle in (
+            "英文 focus-heavy prompt",
+            "max_output_tokens=60000",
+            "pyenv shim",
+            "repeated `unittest` `E` 输出",
+        ):
+            self.assertIn(needle, skill_text)
         self.assertIn(
             "只有在单文件、单 hunk 或精确 symbol window 上再用 line-producing rg -n",
             reference_text,
         )
+        preferred_prompt = reference_text.split("Preferred prompt:", 1)[1].split(
+            "If you hand-write, shorten, or replay this prompt, preserve these exact evidence-budget constraints:",
+            1,
+        )[0]
+        self.assertIn("max_output_tokens=60000", preferred_prompt)
+        self.assertIn("max_output_tokens=100000", preferred_prompt)
+        self.assertIn("repeated `unittest` `E` output", preferred_prompt)
+        self.assertIn(
+            "if sandbox tempdir, pyenv shim, or repeated `unittest` `E` output appears",
+            reference_text,
+        )
+        self.assertNotIn("if it fails due sandbox tempdir", reference_text)
         constraint_list = reference_text.split(
             "If you hand-write, shorten, or replay this prompt, preserve these exact evidence-budget constraints:",
             1,
@@ -279,6 +303,42 @@ class SkillDocumentationTest(unittest.TestCase):
             text,
         )
         self.assertIn("cannot receive the helper's evidence-budget text", text)
+        for needle in (
+            "validation commands need the same budget discipline",
+            "max_output_tokens=60000",
+            "pyenv shim",
+            "repeated `unittest` `E` output",
+        ):
+            self.assertIn(needle, text)
+
+    def test_review_prompt_templates_budget_validation_output(self) -> None:
+        reference_path = (
+            pathlib.Path(__file__).resolve().parents[2]
+            / "external-review-playbook"
+            / "references"
+            / "review-prompt-templates.md"
+        )
+        reference_text = reference_path.read_text(encoding="utf-8")
+
+        template_blocks = {
+            name: block
+            for name, block in (
+                ("bounded", reference_text.split("## Bounded Diff Review", 1)[1].split("## Bounded Diff Review Without Agentic Git", 1)[0]),
+                ("without_git", reference_text.split("## Bounded Diff Review Without Agentic Git", 1)[1].split("## Explicit File Review", 1)[0]),
+                ("explicit_file", reference_text.split("## Explicit File Review", 1)[1]),
+            )
+        }
+
+        for name, block in template_blocks.items():
+            for needle in (
+                "Validation-output budget",
+                "max_output_tokens=60000",
+                "max_output_tokens=100000",
+                "sandbox tempdir",
+                "pyenv shim",
+                "repeated `unittest` `E` output",
+            ):
+                self.assertIn(needle, block, name)
 
 
 class IsolatedCopilotReviewTest(unittest.TestCase):
@@ -4076,6 +4136,8 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertIsNotNone(prompt_text)
         self.assertIn("Review the provided diff", prompt_text)
         self.assertIn("Evidence budget:", prompt_text)
+        self.assertIn("Validation-output budget:", prompt_text)
+        self.assertIn("max_output_tokens=60000", prompt_text)
         self.assertIn("git diff --unified=30/40/50/60/80", prompt_text)
         self.assertIn("git diff --function-context", prompt_text)
         self.assertIn("git diff -W", prompt_text)

@@ -2779,6 +2779,17 @@ def _review_evidence_budget_lines(
     ]
 
 
+def _review_validation_output_budget_line(*, prefix: str) -> str:
+    return (
+        f"{prefix}Validation-output budget: In read-only or approval-gated lanes, "
+        "do not start full tests/builds with huge visible output caps such as "
+        "`max_output_tokens=60000` or `max_output_tokens=100000`; use a small "
+        "syntax/targeted probe or a low visible cap first. If sandbox tempdir, "
+        "pyenv shim, or repeated `unittest` `E` output appears, summarize that "
+        "failure shape before rerunning with escalation or a task-scoped log file."
+    )
+
+
 def _build_default_external_review_prompt(
     placeholders: dict[str, str | None],
 ) -> str | None:
@@ -2797,6 +2808,7 @@ def _build_default_external_review_prompt(
             narrow_after_large_result_to=None,
         )
     )
+    lines.append(_review_validation_output_budget_line(prefix=""))
     if placeholders["{review_range}"] is not None:
         lines.append(f"Review range: {placeholders['{review_range}']}")
     lines.extend(
