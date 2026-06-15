@@ -4131,6 +4131,8 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertIsNotNone(prompt_text)
         self.assertIn("Review the provided diff", prompt_text)
         self.assertIn("Evidence budget:", prompt_text)
+        self.assertIn("Validation-output budget:", prompt_text)
+        self.assertIn("max_output_tokens=60000", prompt_text)
         self.assertIn("git diff --unified=30/40/50/60/80", prompt_text)
         self.assertIn("git diff --function-context", prompt_text)
         self.assertIn("git diff -W", prompt_text)
