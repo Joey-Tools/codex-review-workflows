@@ -249,6 +249,13 @@ class SkillDocumentationTest(unittest.TestCase):
             "只有在单文件、单 hunk 或精确 symbol window 上再用 line-producing rg -n",
             reference_text,
         )
+        preferred_prompt = reference_text.split("Preferred prompt:", 1)[1].split(
+            "If you hand-write, shorten, or replay this prompt, preserve these exact evidence-budget constraints:",
+            1,
+        )[0]
+        self.assertIn("max_output_tokens=60000", preferred_prompt)
+        self.assertIn("max_output_tokens=100000", preferred_prompt)
+        self.assertIn("repeated `unittest` `E` output", preferred_prompt)
         constraint_list = reference_text.split(
             "If you hand-write, shorten, or replay this prompt, preserve these exact evidence-budget constraints:",
             1,
@@ -308,15 +315,25 @@ class SkillDocumentationTest(unittest.TestCase):
         )
         reference_text = reference_path.read_text(encoding="utf-8")
 
-        for needle in (
-            "validation-output budget",
-            "max_output_tokens=60000",
-            "max_output_tokens=100000",
-            "sandbox tempdir",
-            "pyenv shim",
-            "repeated `unittest` `E` output",
-        ):
-            self.assertIn(needle, reference_text)
+        template_blocks = {
+            name: block
+            for name, block in (
+                ("bounded", reference_text.split("## Bounded Diff Review", 1)[1].split("## Bounded Diff Review Without Agentic Git", 1)[0]),
+                ("without_git", reference_text.split("## Bounded Diff Review Without Agentic Git", 1)[1].split("## Explicit File Review", 1)[0]),
+                ("explicit_file", reference_text.split("## Explicit File Review", 1)[1]),
+            )
+        }
+
+        for name, block in template_blocks.items():
+            for needle in (
+                "Validation-output budget",
+                "max_output_tokens=60000",
+                "max_output_tokens=100000",
+                "sandbox tempdir",
+                "pyenv shim",
+                "repeated `unittest` `E` output",
+            ):
+                self.assertIn(needle, block, name)
 
 
 class IsolatedCopilotReviewTest(unittest.TestCase):

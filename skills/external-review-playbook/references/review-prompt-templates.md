@@ -107,6 +107,7 @@ Review scope:
 - path/to/file_b
 You may read nearby workspace files when needed for context, but keep the review centered on the listed files.
 Evidence budget: Start with exact symbol windows, `rg -l`, `rg --count`, and directly relevant nearby context. Treat line-producing `rg -n`, including `rg -n -C` context searches, as a second-stage read after `rg -l` / `rg --count`, and run it only against one exact file, one hunk, or one exact symbol window. Do not default to wide selected-file diffs such as `git diff --unified=30/40/50/60/80` / `git diff --function-context` / `git diff -W`, whole-file `nl -ba`, bare whole-file reads such as `cat <file>` or `git show <rev>:<path>`, or path-wide / multi-file / large-alternation raw `rg -n`; after any 800+ line or 10k+ original-token result, narrow the next read instead of widening it.
+Validation-output budget: In read-only or approval-gated lanes, do not start full tests/builds with huge visible output caps such as `max_output_tokens=60000` or `max_output_tokens=100000`; use a small syntax/targeted probe or a low visible cap first. If sandbox tempdir, pyenv shim, or repeated `unittest` `E` output appears, summarize that failure shape before rerunning with escalation or a task-scoped log file.
 </context>
 
 <focus_areas>
