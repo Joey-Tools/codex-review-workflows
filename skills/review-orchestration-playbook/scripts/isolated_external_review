@@ -701,6 +701,278 @@ def _is_relative_to(path: pathlib.Path, candidate: pathlib.Path) -> bool:
         return False
 
 
+def _is_safe_path_entry(path: str | pathlib.Path) -> bool:
+    return os.pathsep not in os.fspath(path)
+
+
+def _is_default_nvm_bin_entry(path: pathlib.Path, nvm_root: pathlib.Path) -> bool:
+    versions_root = nvm_root / "versions" / "node"
+    if not _is_relative_to(path, versions_root):
+        return False
+    relative = path.relative_to(versions_root)
+    return len(relative.parts) == 2 and relative.parts[1] == "bin"
+
+
+def _default_nvm_root() -> pathlib.Path:
+    nvm_dir = os.environ.get("NVM_DIR")
+    if nvm_dir and _is_safe_path_entry(nvm_dir):
+        candidate = pathlib.Path(nvm_dir).expanduser()
+        if candidate.is_absolute():
+            return candidate.resolve(strict=False)
+    return (pathlib.Path.home() / ".nvm").resolve(strict=False)
+
+
+def _read_nvm_alias_target(nvm_root: pathlib.Path, alias_name: str) -> str | None:
+    alias_root = (nvm_root / "alias").resolve(strict=False)
+    alias_path = (alias_root / alias_name).resolve(strict=False)
+    if not _is_relative_to(alias_path, alias_root):
+        return None
+    try:
+        alias_text = alias_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in alias_text.splitlines():
+        target = line.split("#", 1)[0].strip()
+        if target:
+            return target
+    return None
+
+
+def _nvm_version_bin_for_target(
+    nvm_root: pathlib.Path,
+    target: str,
+) -> pathlib.Path | None:
+    if target == "system":
+        return None
+    versions_root = nvm_root / "versions" / "node"
+    candidate_names = [target]
+    if target and not target.startswith("v"):
+        candidate_names.append(f"v{target}")
+    for candidate_name in candidate_names:
+        candidate = (versions_root / candidate_name / "bin").resolve(strict=False)
+        if _is_default_nvm_bin_entry(candidate, nvm_root) and candidate.is_dir():
+            return candidate
+    partial_match = re.match(r"\Av?(\d+)(?:\.(\d+))?\Z", target)
+    if partial_match:
+        raw_parts = partial_match.groups()
+        prefix = tuple(int(part) for part in raw_parts if part is not None)
+        matching_bins: list[pathlib.Path] = []
+        for candidate_bin in _installed_nvm_version_bins(nvm_root):
+            version_key = _nvm_version_key(candidate_bin.parent.name)
+            if version_key is None:
+                continue
+            if version_key[: len(prefix)] == prefix:
+                matching_bins.append(candidate_bin)
+        return _highest_nvm_version_bin(nvm_root, matching_bins)
+    return None
+
+
+def _nvm_version_key(version_name: str) -> tuple[int, int, int, int, str] | None:
+    match = re.match(r"\Av?(\d+)\.(\d+)\.(\d+)(.*)\Z", version_name)
+    if not match:
+        return None
+    major, minor, patch, suffix = match.groups()
+    release_rank = 1 if not suffix else 0
+    return (int(major), int(minor), int(patch), release_rank, suffix)
+
+
+def _highest_nvm_version_bin(
+    nvm_root: pathlib.Path,
+    candidate_bins: Iterable[pathlib.Path],
+) -> pathlib.Path | None:
+    candidates: list[tuple[tuple[int, int, int, int, str], pathlib.Path]] = []
+    for candidate_bin in candidate_bins:
+        resolved_bin = candidate_bin.resolve(strict=False)
+        if not _is_default_nvm_bin_entry(resolved_bin, nvm_root):
+            continue
+        if not resolved_bin.is_dir():
+            continue
+        version_key = _nvm_version_key(resolved_bin.parent.name)
+        if version_key is None:
+            continue
+        candidates.append((version_key, resolved_bin))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def _installed_nvm_version_bins(nvm_root: pathlib.Path) -> tuple[pathlib.Path, ...]:
+    versions_root = nvm_root / "versions" / "node"
+    try:
+        version_dirs = tuple(versions_root.iterdir())
+    except OSError:
+        return ()
+    return tuple(version_dir / "bin" for version_dir in version_dirs)
+
+
+def _lts_nvm_alias_bins(nvm_root: pathlib.Path) -> tuple[pathlib.Path, ...]:
+    bins: list[pathlib.Path] = []
+    literal_target = _read_nvm_alias_target(nvm_root, "lts/*")
+    if literal_target:
+        literal_bin = _nvm_version_bin_for_target(nvm_root, literal_target)
+        if literal_bin:
+            bins.append(literal_bin)
+
+    lts_alias_root = (nvm_root / "alias" / "lts").resolve(strict=False)
+    try:
+        alias_paths = tuple(lts_alias_root.iterdir())
+    except OSError:
+        return tuple(bins)
+    for alias_path in alias_paths:
+        alias_name = alias_path.name
+        target = _read_nvm_alias_target(nvm_root, f"lts/{alias_name}")
+        if not target:
+            continue
+        version_bin = _nvm_version_bin_for_target(nvm_root, target)
+        if version_bin:
+            bins.append(version_bin)
+    return tuple(bins)
+
+
+def _builtin_nvm_alias_bin(
+    nvm_root: pathlib.Path,
+    target: str,
+) -> pathlib.Path | None:
+    if target in {"node", "stable"}:
+        return _highest_nvm_version_bin(nvm_root, _installed_nvm_version_bins(nvm_root))
+    if target == "lts/*":
+        return _highest_nvm_version_bin(nvm_root, _lts_nvm_alias_bins(nvm_root))
+    return None
+
+
+def _default_nvm_alias_bin(nvm_root: pathlib.Path) -> pathlib.Path | None:
+    target = _read_nvm_alias_target(nvm_root, "default")
+    if not target:
+        return None
+
+    seen: set[str] = {"default"}
+    for _ in range(8):
+        if target in seen:
+            return None
+        seen.add(target)
+        if target == "system":
+            return None
+        alias_target = _read_nvm_alias_target(nvm_root, target)
+        if alias_target:
+            target = alias_target
+            continue
+        version_bin = _nvm_version_bin_for_target(nvm_root, target)
+        if version_bin:
+            return version_bin
+        builtin_bin = _builtin_nvm_alias_bin(nvm_root, target)
+        if builtin_bin:
+            return builtin_bin
+        return None
+    return None
+
+
+def _trusted_nvm_bin_entries() -> tuple[str, ...]:
+    nvm_root = _default_nvm_root()
+    entries: list[str] = []
+    seen: set[str] = set()
+
+    def add_candidate(raw_path: str | pathlib.Path | None) -> None:
+        if not raw_path:
+            return
+        candidate = pathlib.Path(raw_path).expanduser()
+        if not candidate.is_absolute():
+            return
+        resolved = candidate.resolve(strict=False)
+        if not _is_safe_path_entry(candidate) or not _is_safe_path_entry(resolved):
+            return
+        if not _is_default_nvm_bin_entry(resolved, nvm_root):
+            return
+        if not candidate.is_dir():
+            return
+        entry = str(resolved)
+        if entry in seen:
+            return
+        seen.add(entry)
+        entries.append(entry)
+
+    default_nvm_bin = _default_nvm_alias_bin(nvm_root)
+    add_candidate(default_nvm_bin)
+
+    raw_nvm_bin = os.environ.get("NVM_BIN")
+    if default_nvm_bin is not None and raw_nvm_bin:
+        nvm_bin = pathlib.Path(raw_nvm_bin).expanduser()
+        if nvm_bin.is_absolute() and nvm_bin.resolve(strict=False) == default_nvm_bin:
+            add_candidate(nvm_bin)
+
+    return tuple(entries)
+
+
+def _nvm_bin_for_resolved_path(
+    path: str | pathlib.Path,
+    nvm_root: pathlib.Path,
+) -> pathlib.Path | None:
+    if not _is_safe_path_entry(nvm_root):
+        return None
+    versions_root = nvm_root / "versions" / "node"
+    resolved = pathlib.Path(path).expanduser().resolve(strict=False)
+    if not _is_relative_to(resolved, versions_root):
+        return None
+    relative = resolved.relative_to(versions_root)
+    if len(relative.parts) < 2:
+        return None
+    nvm_bin = versions_root / relative.parts[0] / "bin"
+    if not nvm_bin.is_dir():
+        return None
+    return nvm_bin.resolve(strict=False)
+
+
+def _matching_default_nvm_bin_for_path(path: str | pathlib.Path) -> str | None:
+    nvm_root = _default_nvm_root()
+    nvm_bin = _nvm_bin_for_resolved_path(path, nvm_root)
+    if nvm_bin is None:
+        return None
+    default_nvm_bin = _default_nvm_alias_bin(nvm_root)
+    if default_nvm_bin is None:
+        return None
+    if nvm_bin != default_nvm_bin.resolve(strict=False):
+        return None
+    if not _is_safe_path_entry(nvm_bin):
+        return None
+    return str(nvm_bin)
+
+
+def _matching_default_nvm_version_root_for_bin_member(
+    path: str | pathlib.Path,
+) -> pathlib.Path | None:
+    nvm_root = _default_nvm_root()
+    if not _is_safe_path_entry(nvm_root):
+        return None
+    versions_root = nvm_root / "versions" / "node"
+    candidate = pathlib.Path(path).expanduser()
+    if not candidate.is_absolute():
+        return None
+    canonical_link = candidate.parent.resolve(strict=False) / candidate.name
+    if not _is_relative_to(canonical_link, versions_root):
+        return None
+    relative = canonical_link.relative_to(versions_root)
+    if len(relative.parts) < 3 or relative.parts[1] != "bin":
+        return None
+    nvm_bin = versions_root / relative.parts[0] / "bin"
+    default_nvm_bin = _default_nvm_alias_bin(nvm_root)
+    if default_nvm_bin is None:
+        return None
+    if nvm_bin.resolve(strict=False) != default_nvm_bin.resolve(strict=False):
+        return None
+    if not nvm_bin.is_dir():
+        return None
+    return (versions_root / relative.parts[0]).resolve(strict=False)
+
+
+def _is_trusted_default_nvm_codex_candidate(
+    path: pathlib.Path,
+    resolved_path: pathlib.Path,
+) -> bool | None:
+    version_root = _matching_default_nvm_version_root_for_bin_member(path)
+    if version_root is None:
+        return None
+    return _is_relative_to(resolved_path, version_root)
+
+
 def _is_excluded(
     relative_path: pathlib.Path,
     excluded_paths: Iterable[pathlib.Path],
@@ -2963,6 +3235,8 @@ def _probe_codex_linux_sandbox(
         *extra_args,
         _resolve_trusted_true_path(),
     ]
+    probe_env = dict(os.environ)
+    probe_env["PATH"] = _trusted_child_path(codex_path=codex_path)
     try:
         return subprocess.run(
             command,
@@ -2970,6 +3244,7 @@ def _probe_codex_linux_sandbox(
             stderr=subprocess.PIPE,
             check=False,
             timeout=CODEX_REVIEW_LINUX_SANDBOX_PROBE_TIMEOUT_SECONDS,
+            env=probe_env,
         )
     except subprocess.TimeoutExpired as error:
         probe_args_fragment = (
@@ -3744,10 +4019,22 @@ def _resolve_real_codex() -> str:
     def add_candidate(path: str | None) -> None:
         if not path:
             return
-        candidate_path = pathlib.Path(path)
+        candidate_path = pathlib.Path(path).expanduser()
         if candidate_path.stem != "codex":
             return
         resolved_path = candidate_path.resolve()
+        nvm_trust = _is_trusted_default_nvm_codex_candidate(
+            candidate_path,
+            resolved_path,
+        )
+        if nvm_trust is False:
+            return
+        nvm_root = _default_nvm_root()
+        if (
+            _nvm_bin_for_resolved_path(resolved_path, nvm_root) is not None
+            and _matching_default_nvm_bin_for_path(resolved_path) is None
+        ):
+            return
         if not resolved_path.name.startswith("codex"):
             return
         resolved = str(resolved_path)
@@ -3756,20 +4043,33 @@ def _resolve_real_codex() -> str:
         seen.add(resolved)
         candidates.append(resolved)
 
+    base_trusted_path_entries: list[str] = []
     trusted_path_entries: list[str] = []
     seen_entries: set[str] = set()
+
+    def add_trusted_path_entry(candidate: str, *, nvm_only: bool = False) -> None:
+        if not candidate:
+            return
+        if not _is_safe_path_entry(candidate):
+            return
+        resolved_candidate = str(pathlib.Path(candidate).resolve(strict=False))
+        if not _is_safe_path_entry(resolved_candidate):
+            return
+        if resolved_candidate in seen_entries:
+            return
+        seen_entries.add(resolved_candidate)
+        if not nvm_only:
+            base_trusted_path_entries.append(resolved_candidate)
+        trusted_path_entries.append(resolved_candidate)
+
     for candidate in [
         *(str(pathlib.Path(path).parent) for path in PREFERRED_CODEX_PATHS),
         *TRUSTED_CHILD_PATH_ENTRIES,
         *os.defpath.split(os.pathsep),
     ]:
-        if not candidate:
-            continue
-        resolved_candidate = str(pathlib.Path(candidate).resolve(strict=False))
-        if resolved_candidate in seen_entries:
-            continue
-        seen_entries.add(resolved_candidate)
-        trusted_path_entries.append(resolved_candidate)
+        add_trusted_path_entry(candidate)
+    for candidate in _trusted_nvm_bin_entries():
+        add_trusted_path_entry(candidate, nvm_only=True)
 
     if os.environ.get(FAKE_CODEX_TEST_ENV) == "1":
         test_override = os.environ.get("FAKE_CODEX_PATH")
@@ -3777,13 +4077,17 @@ def _resolve_real_codex() -> str:
 
     override = os.environ.get("CODEX_REAL_CODEX")
     if override:
-        resolved_override = pathlib.Path(override).resolve(strict=False)
-        if any(
-            _is_relative_to(
-                resolved_override,
-                pathlib.Path(candidate).resolve(strict=False),
-            )
-            for candidate in trusted_path_entries
+        override_path = pathlib.Path(override).expanduser()
+        canonical_override_link = override_path.parent.resolve(strict=False) / override_path.name
+        resolved_override = override_path.resolve(strict=False)
+        nvm_trust = _is_trusted_default_nvm_codex_candidate(
+            override_path,
+            resolved_override,
+        )
+        if nvm_trust is True or any(
+            _is_relative_to(path, pathlib.Path(candidate).resolve(strict=False))
+            for path in (canonical_override_link, resolved_override)
+            for candidate in base_trusted_path_entries
         ):
             add_candidate(override)
 
@@ -3791,15 +4095,29 @@ def _resolve_real_codex() -> str:
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             add_candidate(candidate)
 
-    add_candidate(shutil.which("codex", path=os.pathsep.join(trusted_path_entries)))
+    for trusted_path_entry in trusted_path_entries:
+        add_candidate(shutil.which("codex", path=trusted_path_entry))
 
     for candidate in candidates:
+        validation_path_entries: list[str] = []
+        seen_validation_entries: set[str] = set()
+        for entry in [
+            _matching_default_nvm_bin_for_path(candidate),
+            *base_trusted_path_entries,
+        ]:
+            if not entry or not _is_safe_path_entry(entry) or entry in seen_validation_entries:
+                continue
+            seen_validation_entries.add(entry)
+            validation_path_entries.append(entry)
+        validation_env = dict(os.environ)
+        validation_env["PATH"] = os.pathsep.join(validation_path_entries)
         try:
             completed = subprocess.run(
                 [candidate, "--version"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
+                env=validation_env,
             )
         except OSError:
             continue
@@ -4588,11 +4906,17 @@ def _build_stateful_runner_env(child_env: dict[str, str]) -> dict[str, str]:
     return runner_env
 
 
-def _trusted_child_path(*extra_entries: str) -> str:
+def _trusted_child_path(*extra_entries: str, codex_path: str | None = None) -> str:
     entries: list[str] = []
     seen: set[str] = set()
-    for candidate in [*extra_entries, *TRUSTED_CHILD_PATH_ENTRIES]:
+    for candidate in [
+        *extra_entries,
+        _matching_default_nvm_bin_for_path(codex_path) if codex_path else None,
+        *TRUSTED_CHILD_PATH_ENTRIES,
+    ]:
         if not candidate or candidate in seen:
+            continue
+        if not _is_safe_path_entry(candidate):
             continue
         seen.add(candidate)
         entries.append(candidate)
@@ -4924,7 +5248,10 @@ def _build_child_process(
             )
         )
     elif entrypoint_label in {"codex-review", "codex-readonly"}:
-        child_env["PATH"] = _trusted_child_path(str(readonly_git_shim_dir))
+        child_env["PATH"] = _trusted_child_path(
+            str(readonly_git_shim_dir),
+            codex_path=entrypoint_cmd[0],
+        )
     elif entrypoint_label == "gh-copilot":
         companion_path = _resolve_gh_copilot_companion()
         if companion_path:
