@@ -879,22 +879,9 @@ def _trusted_nvm_bin_entries() -> tuple[str, ...]:
         entries.append(entry)
 
     add_candidate(os.environ.get("NVM_BIN"))
-    for raw_entry in os.environ.get("PATH", "").split(os.pathsep):
-        add_candidate(raw_entry)
     add_candidate(_default_nvm_alias_bin(nvm_root))
 
     return tuple(entries)
-
-
-def _is_explicit_nvm_codex_override(path: pathlib.Path) -> bool:
-    nvm_root = _default_nvm_root()
-    absolute_path = pathlib.Path(os.path.abspath(str(path)))
-    canonical_link = path.parent.resolve(strict=False) / path.name
-    resolved_path = path.resolve(strict=False)
-    return any(
-        _is_default_nvm_bin_entry(candidate.parent.resolve(strict=False), nvm_root)
-        for candidate in (absolute_path, canonical_link, resolved_path)
-    )
 
 
 def _matching_default_nvm_bin_for_path(path: str | pathlib.Path) -> str | None:
@@ -4008,7 +3995,7 @@ def _resolve_real_codex() -> str:
             _is_relative_to(path, pathlib.Path(candidate).resolve(strict=False))
             for path in (absolute_override, canonical_override_link, resolved_override)
             for candidate in trusted_path_entries
-        ) or _is_explicit_nvm_codex_override(override_path):
+        ):
             add_candidate(override)
 
     for candidate in PREFERRED_CODEX_PATHS:

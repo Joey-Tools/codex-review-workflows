@@ -7066,7 +7066,9 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
             module.os.defpath = os.devnull
             os.environ["HOME"] = str(home)
             os.environ["NVM_DIR"] = str(home / ".nvm")
-            os.environ["PATH"] = f"{poison_bin}{os.pathsep}{os.defpath}"
+            os.environ["PATH"] = (
+                f"{older_nvm_bin}{os.pathsep}{poison_bin}{os.pathsep}{os.defpath}"
+            )
             module.PREFERRED_CODEX_PATHS = ()
             module.TRUSTED_CHILD_PATH_ENTRIES = ()
             resolved = module._resolve_real_codex()
@@ -7360,11 +7362,16 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
             if original_fake_override is not None:
                 os.environ["FAKE_CODEX_PATH"] = original_fake_override
 
-    def test_resolve_real_codex_accepts_explicit_other_nvm_override(self) -> None:
+    def test_resolve_real_codex_ignores_explicit_other_nvm_override(self) -> None:
         module = self._load_script_module()
         home = self.root / "nvm-explicit-other-version-home"
         override_nvm_bin = home / ".nvm" / "versions" / "node" / "v20.19.0" / "bin"
-        override_codex_js = self._write_fake_nvm_codex_cli(override_nvm_bin)
+        current_nvm_bin = home / ".nvm" / "versions" / "node" / "v22.18.0" / "bin"
+        self._write_fake_nvm_codex_cli(override_nvm_bin)
+        current_codex_js = self._write_fake_nvm_codex_cli(current_nvm_bin)
+        alias_dir = home / ".nvm" / "alias"
+        alias_dir.mkdir(parents=True)
+        (alias_dir / "default").write_text("v22.18.0\n", encoding="utf-8")
 
         original_defpath = os.defpath
         original_override = os.environ.get("CODEX_REAL_CODEX")
@@ -7411,7 +7418,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
             if original_fake_override is not None:
                 os.environ["FAKE_CODEX_PATH"] = original_fake_override
 
-        self.assertEqual(pathlib.Path(resolved).resolve(), override_codex_js.resolve())
+        self.assertEqual(pathlib.Path(resolved).resolve(), current_codex_js.resolve())
 
     def test_trusted_child_path_does_not_add_unmatched_nvm_bin(self) -> None:
         module = self._load_script_module()
