@@ -701,6 +701,66 @@ def _is_relative_to(path: pathlib.Path, candidate: pathlib.Path) -> bool:
         return False
 
 
+def _is_default_nvm_bin_entry(path: pathlib.Path, nvm_root: pathlib.Path) -> bool:
+    versions_root = nvm_root / "versions" / "node"
+    if not _is_relative_to(path, versions_root):
+        return False
+    relative = path.relative_to(versions_root)
+    return len(relative.parts) == 2 and relative.parts[1] == "bin"
+
+
+def _trusted_nvm_bin_entries() -> tuple[str, ...]:
+    nvm_root = (pathlib.Path.home() / ".nvm").resolve(strict=False)
+    entries: list[str] = []
+    seen: set[str] = set()
+
+    def add_candidate(raw_path: str | pathlib.Path | None) -> None:
+        if not raw_path:
+            return
+        candidate = pathlib.Path(raw_path).expanduser()
+        if not candidate.is_absolute():
+            return
+        resolved = candidate.resolve(strict=False)
+        if not _is_default_nvm_bin_entry(resolved, nvm_root):
+            return
+        if not candidate.is_dir():
+            return
+        entry = str(resolved)
+        if entry in seen:
+            return
+        seen.add(entry)
+        entries.append(entry)
+
+    add_candidate(os.environ.get("NVM_BIN"))
+    for raw_entry in os.environ.get("PATH", "").split(os.pathsep):
+        add_candidate(raw_entry)
+
+    versions_root = nvm_root / "versions" / "node"
+    try:
+        nvm_bins = sorted(versions_root.glob("*/bin"))
+    except OSError:
+        nvm_bins = []
+    for nvm_bin in nvm_bins:
+        add_candidate(nvm_bin)
+
+    return tuple(entries)
+
+
+def _matching_default_nvm_bin_for_path(path: str | pathlib.Path) -> str | None:
+    nvm_root = (pathlib.Path.home() / ".nvm").resolve(strict=False)
+    versions_root = nvm_root / "versions" / "node"
+    resolved = pathlib.Path(path).expanduser().resolve(strict=False)
+    if not _is_relative_to(resolved, versions_root):
+        return None
+    relative = resolved.relative_to(versions_root)
+    if len(relative.parts) < 2:
+        return None
+    nvm_bin = versions_root / relative.parts[0] / "bin"
+    if not nvm_bin.is_dir():
+        return None
+    return str(nvm_bin.resolve(strict=False))
+
+
 def _is_excluded(
     relative_path: pathlib.Path,
     excluded_paths: Iterable[pathlib.Path],
@@ -2962,6 +3022,8 @@ def _probe_codex_linux_sandbox(
         *extra_args,
         _resolve_trusted_true_path(),
     ]
+    probe_env = dict(os.environ)
+    probe_env["PATH"] = _trusted_child_path(codex_path=codex_path)
     try:
         return subprocess.run(
             command,
@@ -2969,6 +3031,7 @@ def _probe_codex_linux_sandbox(
             stderr=subprocess.PIPE,
             check=False,
             timeout=CODEX_REVIEW_LINUX_SANDBOX_PROBE_TIMEOUT_SECONDS,
+            env=probe_env,
         )
     except subprocess.TimeoutExpired as error:
         probe_args_fragment = (
@@ -3755,20 +3818,29 @@ def _resolve_real_codex() -> str:
         seen.add(resolved)
         candidates.append(resolved)
 
+    base_trusted_path_entries: list[str] = []
     trusted_path_entries: list[str] = []
     seen_entries: set[str] = set()
+
+    def add_trusted_path_entry(candidate: str, *, nvm_only: bool = False) -> None:
+        if not candidate:
+            return
+        resolved_candidate = str(pathlib.Path(candidate).resolve(strict=False))
+        if resolved_candidate in seen_entries:
+            return
+        seen_entries.add(resolved_candidate)
+        if not nvm_only:
+            base_trusted_path_entries.append(resolved_candidate)
+        trusted_path_entries.append(resolved_candidate)
+
     for candidate in [
         *(str(pathlib.Path(path).parent) for path in PREFERRED_CODEX_PATHS),
         *TRUSTED_CHILD_PATH_ENTRIES,
         *os.defpath.split(os.pathsep),
     ]:
-        if not candidate:
-            continue
-        resolved_candidate = str(pathlib.Path(candidate).resolve(strict=False))
-        if resolved_candidate in seen_entries:
-            continue
-        seen_entries.add(resolved_candidate)
-        trusted_path_entries.append(resolved_candidate)
+        add_trusted_path_entry(candidate)
+    for candidate in _trusted_nvm_bin_entries():
+        add_trusted_path_entry(candidate, nvm_only=True)
 
     if os.environ.get(FAKE_CODEX_TEST_ENV) == "1":
         test_override = os.environ.get("FAKE_CODEX_PATH")
@@ -3776,12 +3848,13 @@ def _resolve_real_codex() -> str:
 
     override = os.environ.get("CODEX_REAL_CODEX")
     if override:
-        resolved_override = pathlib.Path(override).resolve(strict=False)
+        override_path = pathlib.Path(override).expanduser()
+        absolute_override = pathlib.Path(os.path.abspath(str(override_path)))
+        canonical_override_link = override_path.parent.resolve(strict=False) / override_path.name
+        resolved_override = override_path.resolve(strict=False)
         if any(
-            _is_relative_to(
-                resolved_override,
-                pathlib.Path(candidate).resolve(strict=False),
-            )
+            _is_relative_to(path, pathlib.Path(candidate).resolve(strict=False))
+            for path in (absolute_override, canonical_override_link, resolved_override)
             for candidate in trusted_path_entries
         ):
             add_candidate(override)
@@ -3793,12 +3866,25 @@ def _resolve_real_codex() -> str:
     add_candidate(shutil.which("codex", path=os.pathsep.join(trusted_path_entries)))
 
     for candidate in candidates:
+        validation_path_entries: list[str] = []
+        seen_validation_entries: set[str] = set()
+        for entry in [
+            _matching_default_nvm_bin_for_path(candidate),
+            *base_trusted_path_entries,
+        ]:
+            if not entry or entry in seen_validation_entries:
+                continue
+            seen_validation_entries.add(entry)
+            validation_path_entries.append(entry)
+        validation_env = dict(os.environ)
+        validation_env["PATH"] = os.pathsep.join(validation_path_entries)
         try:
             completed = subprocess.run(
                 [candidate, "--version"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
+                env=validation_env,
             )
         except OSError:
             continue
@@ -4587,10 +4673,14 @@ def _build_stateful_runner_env(child_env: dict[str, str]) -> dict[str, str]:
     return runner_env
 
 
-def _trusted_child_path(*extra_entries: str) -> str:
+def _trusted_child_path(*extra_entries: str, codex_path: str | None = None) -> str:
     entries: list[str] = []
     seen: set[str] = set()
-    for candidate in [*extra_entries, *TRUSTED_CHILD_PATH_ENTRIES]:
+    for candidate in [
+        *extra_entries,
+        _matching_default_nvm_bin_for_path(codex_path) if codex_path else None,
+        *TRUSTED_CHILD_PATH_ENTRIES,
+    ]:
         if not candidate or candidate in seen:
             continue
         seen.add(candidate)
@@ -4923,7 +5013,10 @@ def _build_child_process(
             )
         )
     elif entrypoint_label in {"codex-review", "codex-readonly"}:
-        child_env["PATH"] = _trusted_child_path(str(readonly_git_shim_dir))
+        child_env["PATH"] = _trusted_child_path(
+            str(readonly_git_shim_dir),
+            codex_path=entrypoint_cmd[0],
+        )
     elif entrypoint_label == "gh-copilot":
         companion_path = _resolve_gh_copilot_companion()
         if companion_path:
