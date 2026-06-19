@@ -6998,7 +6998,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
             os.environ["NVM_DIR"] = str(home / ".nvm")
             os.environ["NVM_BIN"] = str(nvm_bin)
             os.environ["PATH"] = f"{poison_bin}{os.pathsep}{os.defpath}"
-            os.environ["CODEX_REAL_CODEX"] = str(nvm_bin / "codex")
+            os.environ["CODEX_REAL_CODEX"] = "~/.nvm/versions/node/v22.18.0/bin/codex"
             module.PREFERRED_CODEX_PATHS = ()
             module.TRUSTED_CHILD_PATH_ENTRIES = ()
             resolved = module._resolve_real_codex()

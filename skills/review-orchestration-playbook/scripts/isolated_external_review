@@ -3953,7 +3953,7 @@ def _resolve_real_codex() -> str:
     def add_candidate(path: str | None) -> None:
         if not path:
             return
-        candidate_path = pathlib.Path(path)
+        candidate_path = pathlib.Path(path).expanduser()
         if candidate_path.stem != "codex":
             return
         resolved_path = candidate_path.resolve()
