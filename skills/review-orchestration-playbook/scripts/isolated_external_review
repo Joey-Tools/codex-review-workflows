@@ -892,8 +892,10 @@ def _trusted_nvm_bin_entries() -> tuple[str, ...]:
     return tuple(entries)
 
 
-def _matching_default_nvm_bin_for_path(path: str | pathlib.Path) -> str | None:
-    nvm_root = _default_nvm_root()
+def _nvm_bin_for_resolved_path(
+    path: str | pathlib.Path,
+    nvm_root: pathlib.Path,
+) -> pathlib.Path | None:
     versions_root = nvm_root / "versions" / "node"
     resolved = pathlib.Path(path).expanduser().resolve(strict=False)
     if not _is_relative_to(resolved, versions_root):
@@ -904,7 +906,20 @@ def _matching_default_nvm_bin_for_path(path: str | pathlib.Path) -> str | None:
     nvm_bin = versions_root / relative.parts[0] / "bin"
     if not nvm_bin.is_dir():
         return None
-    return str(nvm_bin.resolve(strict=False))
+    return nvm_bin.resolve(strict=False)
+
+
+def _matching_default_nvm_bin_for_path(path: str | pathlib.Path) -> str | None:
+    nvm_root = _default_nvm_root()
+    nvm_bin = _nvm_bin_for_resolved_path(path, nvm_root)
+    if nvm_bin is None:
+        return None
+    default_nvm_bin = _default_nvm_alias_bin(nvm_root)
+    if default_nvm_bin is None:
+        return None
+    if nvm_bin != default_nvm_bin.resolve(strict=False):
+        return None
+    return str(nvm_bin)
 
 
 def _matching_default_nvm_version_root_for_bin_member(
@@ -3998,6 +4013,12 @@ def _resolve_real_codex() -> str:
         )
         if nvm_trust is False:
             return
+        nvm_root = _default_nvm_root()
+        if (
+            _nvm_bin_for_resolved_path(resolved_path, nvm_root) is not None
+            and _matching_default_nvm_bin_for_path(resolved_path) is None
+        ):
+            return
         if not resolved_path.name.startswith("codex"):
             return
         resolved = str(resolved_path)
@@ -4037,13 +4058,16 @@ def _resolve_real_codex() -> str:
     override = os.environ.get("CODEX_REAL_CODEX")
     if override:
         override_path = pathlib.Path(override).expanduser()
+        absolute_override = pathlib.Path(os.path.abspath(str(override_path)))
+        canonical_override_link = override_path.parent.resolve(strict=False) / override_path.name
         resolved_override = override_path.resolve(strict=False)
         nvm_trust = _is_trusted_default_nvm_codex_candidate(
             override_path,
             resolved_override,
         )
         if nvm_trust is True or any(
-            _is_relative_to(resolved_override, pathlib.Path(candidate).resolve(strict=False))
+            _is_relative_to(path, pathlib.Path(candidate).resolve(strict=False))
+            for path in (absolute_override, canonical_override_link, resolved_override)
             for candidate in base_trusted_path_entries
         ):
             add_candidate(override)
@@ -4052,7 +4076,8 @@ def _resolve_real_codex() -> str:
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             add_candidate(candidate)
 
-    add_candidate(shutil.which("codex", path=os.pathsep.join(trusted_path_entries)))
+    for trusted_path_entry in trusted_path_entries:
+        add_candidate(shutil.which("codex", path=trusted_path_entry))
 
     for candidate in candidates:
         validation_path_entries: list[str] = []
