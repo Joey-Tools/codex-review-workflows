@@ -709,6 +709,15 @@ def _is_default_nvm_bin_entry(path: pathlib.Path, nvm_root: pathlib.Path) -> boo
     return len(relative.parts) == 2 and relative.parts[1] == "bin"
 
 
+def _default_nvm_root() -> pathlib.Path:
+    nvm_dir = os.environ.get("NVM_DIR")
+    if nvm_dir:
+        candidate = pathlib.Path(nvm_dir).expanduser()
+        if candidate.is_absolute():
+            return candidate.resolve(strict=False)
+    return (pathlib.Path.home() / ".nvm").resolve(strict=False)
+
+
 def _read_nvm_alias_target(nvm_root: pathlib.Path, alias_name: str) -> str | None:
     alias_root = (nvm_root / "alias").resolve(strict=False)
     alias_path = (alias_root / alias_name).resolve(strict=False)
@@ -739,6 +748,18 @@ def _nvm_version_bin_for_target(
         candidate = (versions_root / candidate_name / "bin").resolve(strict=False)
         if _is_default_nvm_bin_entry(candidate, nvm_root) and candidate.is_dir():
             return candidate
+    partial_match = re.match(r"\Av?(\d+)(?:\.(\d+))?\Z", target)
+    if partial_match:
+        raw_parts = partial_match.groups()
+        prefix = tuple(int(part) for part in raw_parts if part is not None)
+        matching_bins: list[pathlib.Path] = []
+        for candidate_bin in _installed_nvm_version_bins(nvm_root):
+            version_key = _nvm_version_key(candidate_bin.parent.name)
+            if version_key is None:
+                continue
+            if version_key[: len(prefix)] == prefix:
+                matching_bins.append(candidate_bin)
+        return _highest_nvm_version_bin(nvm_root, matching_bins)
     return None
 
 
@@ -836,7 +857,7 @@ def _default_nvm_alias_bin(nvm_root: pathlib.Path) -> pathlib.Path | None:
 
 
 def _trusted_nvm_bin_entries() -> tuple[str, ...]:
-    nvm_root = (pathlib.Path.home() / ".nvm").resolve(strict=False)
+    nvm_root = _default_nvm_root()
     entries: list[str] = []
     seen: set[str] = set()
 
@@ -866,7 +887,7 @@ def _trusted_nvm_bin_entries() -> tuple[str, ...]:
 
 
 def _is_explicit_nvm_codex_override(path: pathlib.Path) -> bool:
-    nvm_root = (pathlib.Path.home() / ".nvm").resolve(strict=False)
+    nvm_root = _default_nvm_root()
     absolute_path = pathlib.Path(os.path.abspath(str(path)))
     canonical_link = path.parent.resolve(strict=False) / path.name
     resolved_path = path.resolve(strict=False)
@@ -877,7 +898,7 @@ def _is_explicit_nvm_codex_override(path: pathlib.Path) -> bool:
 
 
 def _matching_default_nvm_bin_for_path(path: str | pathlib.Path) -> str | None:
-    nvm_root = (pathlib.Path.home() / ".nvm").resolve(strict=False)
+    nvm_root = _default_nvm_root()
     versions_root = nvm_root / "versions" / "node"
     resolved = pathlib.Path(path).expanduser().resolve(strict=False)
     if not _is_relative_to(resolved, versions_root):
