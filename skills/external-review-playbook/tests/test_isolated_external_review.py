@@ -227,7 +227,7 @@ class SkillDocumentationTest(unittest.TestCase):
             "rg -l",
             "rg --count",
             "first-stage changed-file / `--stat` / `--numstat` / helper diff-header summaries must be count-capped",
-            "rg -o '^diff --git ...'",
+            "diff-header samples such as `rg -m 80 '^diff --git ' <diff>` must be capped after count-only probes",
             "删减版 `Evidence-budget contract` 是无效的",
             "bare `git show <rev>:<path>`",
             "整文件 `nl -ba`",
@@ -345,7 +345,7 @@ class SkillDocumentationTest(unittest.TestCase):
                 self.assertIn(needle, block, name)
         for name in ("bounded", "without_git"):
             self.assertIn("First-stage summaries are budgeted too", template_blocks[name], name)
-            self.assertIn("rg -o '^diff --git ...'", template_blocks[name], name)
+            self.assertIn("rg -m 80 '^diff --git ' <diff>", template_blocks[name], name)
             self.assertIn("head -n 80", template_blocks[name], name)
 
 
@@ -4157,7 +4157,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertIn("Budget first-stage summaries too", prompt_text)
         self.assertIn("git diff --stat/--numstat", prompt_text)
         self.assertIn("helper diff-file headers", prompt_text)
-        self.assertIn("rg -o '^diff --git ...'", prompt_text)
+        self.assertIn("rg -m 80 '^diff --git ' <diff>", prompt_text)
         self.assertIn("head -n 80", prompt_text)
         self.assertIn("path-wide / multi-file / large-alternation raw rg -n", prompt_text)
         self.assertIn("rg -n -C context searches", prompt_text)
@@ -4231,7 +4231,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertIn("Budget first-stage summaries too", payload["prompt_stdin"])
         self.assertIn("git diff --stat/--numstat", payload["prompt_stdin"])
         self.assertIn("helper diff-file headers", payload["prompt_stdin"])
-        self.assertIn("rg -o '^diff --git ...'", payload["prompt_stdin"])
+        self.assertIn("rg -m 80 '^diff --git ' <diff>", payload["prompt_stdin"])
         self.assertIn("head -n 80", payload["prompt_stdin"])
         self.assertIn(
             "path-wide / multi-file / large-alternation raw rg -n",
