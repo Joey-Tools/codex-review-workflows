@@ -701,6 +701,10 @@ def _is_relative_to(path: pathlib.Path, candidate: pathlib.Path) -> bool:
         return False
 
 
+def _is_safe_path_entry(path: str | pathlib.Path) -> bool:
+    return os.pathsep not in os.fspath(path)
+
+
 def _is_default_nvm_bin_entry(path: pathlib.Path, nvm_root: pathlib.Path) -> bool:
     versions_root = nvm_root / "versions" / "node"
     if not _is_relative_to(path, versions_root):
@@ -711,7 +715,7 @@ def _is_default_nvm_bin_entry(path: pathlib.Path, nvm_root: pathlib.Path) -> boo
 
 def _default_nvm_root() -> pathlib.Path:
     nvm_dir = os.environ.get("NVM_DIR")
-    if nvm_dir:
+    if nvm_dir and _is_safe_path_entry(nvm_dir):
         candidate = pathlib.Path(nvm_dir).expanduser()
         if candidate.is_absolute():
             return candidate.resolve(strict=False)
@@ -874,6 +878,8 @@ def _trusted_nvm_bin_entries() -> tuple[str, ...]:
         if not candidate.is_absolute():
             return
         resolved = candidate.resolve(strict=False)
+        if not _is_safe_path_entry(candidate) or not _is_safe_path_entry(resolved):
+            return
         if not _is_default_nvm_bin_entry(resolved, nvm_root):
             return
         if not candidate.is_dir():
@@ -900,6 +906,8 @@ def _nvm_bin_for_resolved_path(
     path: str | pathlib.Path,
     nvm_root: pathlib.Path,
 ) -> pathlib.Path | None:
+    if not _is_safe_path_entry(nvm_root):
+        return None
     versions_root = nvm_root / "versions" / "node"
     resolved = pathlib.Path(path).expanduser().resolve(strict=False)
     if not _is_relative_to(resolved, versions_root):
@@ -923,6 +931,8 @@ def _matching_default_nvm_bin_for_path(path: str | pathlib.Path) -> str | None:
         return None
     if nvm_bin != default_nvm_bin.resolve(strict=False):
         return None
+    if not _is_safe_path_entry(nvm_bin):
+        return None
     return str(nvm_bin)
 
 
@@ -930,6 +940,8 @@ def _matching_default_nvm_version_root_for_bin_member(
     path: str | pathlib.Path,
 ) -> pathlib.Path | None:
     nvm_root = _default_nvm_root()
+    if not _is_safe_path_entry(nvm_root):
+        return None
     versions_root = nvm_root / "versions" / "node"
     candidate = pathlib.Path(path).expanduser()
     if not candidate.is_absolute():
@@ -4038,7 +4050,11 @@ def _resolve_real_codex() -> str:
     def add_trusted_path_entry(candidate: str, *, nvm_only: bool = False) -> None:
         if not candidate:
             return
+        if not _is_safe_path_entry(candidate):
+            return
         resolved_candidate = str(pathlib.Path(candidate).resolve(strict=False))
+        if not _is_safe_path_entry(resolved_candidate):
+            return
         if resolved_candidate in seen_entries:
             return
         seen_entries.add(resolved_candidate)
@@ -4089,7 +4105,7 @@ def _resolve_real_codex() -> str:
             _matching_default_nvm_bin_for_path(candidate),
             *base_trusted_path_entries,
         ]:
-            if not entry or entry in seen_validation_entries:
+            if not entry or not _is_safe_path_entry(entry) or entry in seen_validation_entries:
                 continue
             seen_validation_entries.add(entry)
             validation_path_entries.append(entry)
@@ -4899,6 +4915,8 @@ def _trusted_child_path(*extra_entries: str, codex_path: str | None = None) -> s
         *TRUSTED_CHILD_PATH_ENTRIES,
     ]:
         if not candidate or candidate in seen:
+            continue
+        if not _is_safe_path_entry(candidate):
             continue
         seen.add(candidate)
         entries.append(candidate)

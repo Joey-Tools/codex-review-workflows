@@ -7705,6 +7705,68 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
 
         self.assertEqual(pathlib.Path(resolved).resolve(), codex_js.resolve())
 
+    def test_resolve_real_codex_rejects_nvm_dir_path_separator_injection(
+        self,
+    ) -> None:
+        module = self._load_script_module()
+        home = self.root / "nvm-pathsep-home"
+        declared_root_prefix = self.root / "nvm-pathsep-declared-root"
+        escaped_root = self.root / "nvm-pathsep-escaped-root"
+        injected_nvm_dir = f"{declared_root_prefix}{os.pathsep}{escaped_root}"
+        declared_nvm_root = pathlib.Path(injected_nvm_dir)
+        declared_nvm_bin = (
+            declared_nvm_root / "versions" / "node" / "v22.18.0" / "bin"
+        )
+        declared_nvm_bin.mkdir(parents=True)
+        alias_dir = declared_nvm_root / "alias"
+        alias_dir.mkdir(parents=True)
+        (alias_dir / "default").write_text("v22.18.0\n", encoding="utf-8")
+        escaped_nvm_bin = escaped_root / "versions" / "node" / "v22.18.0" / "bin"
+        self._write_fake_nvm_codex_cli(escaped_nvm_bin)
+
+        original_defpath = os.defpath
+        original_override = os.environ.pop("CODEX_REAL_CODEX", None)
+        original_home = os.environ.get("HOME")
+        original_nvm_dir = os.environ.get("NVM_DIR")
+        original_nvm_bin = os.environ.pop("NVM_BIN", None)
+        original_path = os.environ.get("PATH")
+        original_fake_override = os.environ.pop("FAKE_CODEX_PATH", None)
+        original_preferred = module.PREFERRED_CODEX_PATHS
+        original_trusted_entries = module.TRUSTED_CHILD_PATH_ENTRIES
+        try:
+            os.defpath = os.devnull
+            module.os.defpath = os.devnull
+            os.environ["HOME"] = str(home)
+            os.environ["NVM_DIR"] = injected_nvm_dir
+            os.environ["PATH"] = os.defpath
+            module.PREFERRED_CODEX_PATHS = ()
+            module.TRUSTED_CHILD_PATH_ENTRIES = ()
+            with self.assertRaises(module.UserError):
+                module._resolve_real_codex()
+        finally:
+            module.PREFERRED_CODEX_PATHS = original_preferred
+            module.TRUSTED_CHILD_PATH_ENTRIES = original_trusted_entries
+            os.defpath = original_defpath
+            module.os.defpath = original_defpath
+            if original_override is not None:
+                os.environ["CODEX_REAL_CODEX"] = original_override
+            if original_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = original_home
+            if original_nvm_dir is None:
+                os.environ.pop("NVM_DIR", None)
+            else:
+                os.environ["NVM_DIR"] = original_nvm_dir
+            if original_nvm_bin is not None:
+                os.environ["NVM_BIN"] = original_nvm_bin
+            if original_path is None:
+                os.environ.pop("PATH", None)
+            else:
+                os.environ["PATH"] = original_path
+            if original_fake_override is not None:
+                os.environ["FAKE_CODEX_PATH"] = original_fake_override
+
     def test_resolve_real_codex_does_not_auto_discover_other_nvm_versions(
         self,
     ) -> None:
