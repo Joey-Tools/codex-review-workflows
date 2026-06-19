@@ -742,6 +742,79 @@ def _nvm_version_bin_for_target(
     return None
 
 
+def _nvm_version_key(version_name: str) -> tuple[int, int, int, int, str] | None:
+    match = re.match(r"\Av?(\d+)\.(\d+)\.(\d+)(.*)\Z", version_name)
+    if not match:
+        return None
+    major, minor, patch, suffix = match.groups()
+    release_rank = 1 if not suffix else 0
+    return (int(major), int(minor), int(patch), release_rank, suffix)
+
+
+def _highest_nvm_version_bin(
+    nvm_root: pathlib.Path,
+    candidate_bins: Iterable[pathlib.Path],
+) -> pathlib.Path | None:
+    candidates: list[tuple[tuple[int, int, int, int, str], pathlib.Path]] = []
+    for candidate_bin in candidate_bins:
+        resolved_bin = candidate_bin.resolve(strict=False)
+        if not _is_default_nvm_bin_entry(resolved_bin, nvm_root):
+            continue
+        if not resolved_bin.is_dir():
+            continue
+        version_key = _nvm_version_key(resolved_bin.parent.name)
+        if version_key is None:
+            continue
+        candidates.append((version_key, resolved_bin))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def _installed_nvm_version_bins(nvm_root: pathlib.Path) -> tuple[pathlib.Path, ...]:
+    versions_root = nvm_root / "versions" / "node"
+    try:
+        version_dirs = tuple(versions_root.iterdir())
+    except OSError:
+        return ()
+    return tuple(version_dir / "bin" for version_dir in version_dirs)
+
+
+def _lts_nvm_alias_bins(nvm_root: pathlib.Path) -> tuple[pathlib.Path, ...]:
+    bins: list[pathlib.Path] = []
+    literal_target = _read_nvm_alias_target(nvm_root, "lts/*")
+    if literal_target:
+        literal_bin = _nvm_version_bin_for_target(nvm_root, literal_target)
+        if literal_bin:
+            bins.append(literal_bin)
+
+    lts_alias_root = (nvm_root / "alias" / "lts").resolve(strict=False)
+    try:
+        alias_paths = tuple(lts_alias_root.iterdir())
+    except OSError:
+        return tuple(bins)
+    for alias_path in alias_paths:
+        alias_name = alias_path.name
+        target = _read_nvm_alias_target(nvm_root, f"lts/{alias_name}")
+        if not target:
+            continue
+        version_bin = _nvm_version_bin_for_target(nvm_root, target)
+        if version_bin:
+            bins.append(version_bin)
+    return tuple(bins)
+
+
+def _builtin_nvm_alias_bin(
+    nvm_root: pathlib.Path,
+    target: str,
+) -> pathlib.Path | None:
+    if target in {"node", "stable"}:
+        return _highest_nvm_version_bin(nvm_root, _installed_nvm_version_bins(nvm_root))
+    if target == "lts/*":
+        return _highest_nvm_version_bin(nvm_root, _lts_nvm_alias_bins(nvm_root))
+    return None
+
+
 def _default_nvm_alias_bin(nvm_root: pathlib.Path) -> pathlib.Path | None:
     alias_name = "default"
     seen: set[str] = set()
@@ -755,6 +828,9 @@ def _default_nvm_alias_bin(nvm_root: pathlib.Path) -> pathlib.Path | None:
         version_bin = _nvm_version_bin_for_target(nvm_root, target)
         if version_bin:
             return version_bin
+        builtin_bin = _builtin_nvm_alias_bin(nvm_root, target)
+        if builtin_bin:
+            return builtin_bin
         alias_name = target
     return None
 
