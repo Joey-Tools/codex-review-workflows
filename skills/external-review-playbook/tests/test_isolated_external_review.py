@@ -7420,6 +7420,98 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                     current_codex_js.resolve(),
                 )
 
+    def test_resolve_real_codex_follows_nvm_alias_chain_before_builtins(
+        self,
+    ) -> None:
+        module = self._load_script_module()
+        alias_targets = ("node", "stable", "lts/*")
+
+        for alias_target in alias_targets:
+            with self.subTest(alias_target=alias_target):
+                alias_slug = alias_target.replace("/", "-").replace("*", "star")
+                home = self.root / f"nvm-alias-chain-home-{alias_slug}"
+                older_nvm_bin = (
+                    home / ".nvm" / "versions" / "node" / "v20.19.0" / "bin"
+                )
+                current_nvm_bin = (
+                    home / ".nvm" / "versions" / "node" / "v22.18.0" / "bin"
+                )
+                older_codex_js = self._write_fake_nvm_codex_cli(older_nvm_bin)
+                self._write_fake_nvm_codex_cli(current_nvm_bin)
+                alias_dir = home / ".nvm" / "alias"
+                alias_dir.mkdir(parents=True)
+                (alias_dir / "default").write_text(
+                    f"{alias_target}\n",
+                    encoding="utf-8",
+                )
+                if alias_target == "lts/*":
+                    lts_alias_dir = alias_dir / "lts"
+                    lts_alias_dir.mkdir()
+                    (lts_alias_dir / "*").write_text(
+                        "lts/iron\n",
+                        encoding="utf-8",
+                    )
+                    (lts_alias_dir / "iron").write_text(
+                        "v20.19.0\n",
+                        encoding="utf-8",
+                    )
+                    (lts_alias_dir / "jod").write_text(
+                        "v22.18.0\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    (alias_dir / alias_target).write_text(
+                        "v20.19.0\n",
+                        encoding="utf-8",
+                    )
+
+                original_defpath = os.defpath
+                original_override = os.environ.pop("CODEX_REAL_CODEX", None)
+                original_home = os.environ.get("HOME")
+                original_nvm_dir = os.environ.get("NVM_DIR")
+                original_nvm_bin = os.environ.pop("NVM_BIN", None)
+                original_path = os.environ.get("PATH")
+                original_fake_override = os.environ.pop("FAKE_CODEX_PATH", None)
+                original_preferred = module.PREFERRED_CODEX_PATHS
+                original_trusted_entries = module.TRUSTED_CHILD_PATH_ENTRIES
+                try:
+                    os.defpath = os.devnull
+                    module.os.defpath = os.devnull
+                    os.environ["HOME"] = str(home)
+                    os.environ["NVM_DIR"] = str(home / ".nvm")
+                    os.environ["PATH"] = os.defpath
+                    module.PREFERRED_CODEX_PATHS = ()
+                    module.TRUSTED_CHILD_PATH_ENTRIES = ()
+                    resolved = module._resolve_real_codex()
+                finally:
+                    module.PREFERRED_CODEX_PATHS = original_preferred
+                    module.TRUSTED_CHILD_PATH_ENTRIES = original_trusted_entries
+                    os.defpath = original_defpath
+                    module.os.defpath = original_defpath
+                    if original_override is not None:
+                        os.environ["CODEX_REAL_CODEX"] = original_override
+                    if original_home is None:
+                        os.environ.pop("HOME", None)
+                    else:
+                        os.environ["HOME"] = original_home
+                    if original_nvm_dir is None:
+                        os.environ.pop("NVM_DIR", None)
+                    else:
+                        os.environ["NVM_DIR"] = original_nvm_dir
+                    if original_nvm_bin is not None:
+                        os.environ["NVM_BIN"] = original_nvm_bin
+                    if original_path is None:
+                        os.environ.pop("PATH", None)
+                    else:
+                        os.environ["PATH"] = original_path
+                    if original_fake_override is not None:
+                        os.environ["FAKE_CODEX_PATH"] = original_fake_override
+
+                self.assertEqual(
+                    pathlib.Path(resolved).resolve(),
+                    older_codex_js.resolve(),
+                )
+
     def test_resolve_real_codex_uses_partial_nvm_default_aliases(self) -> None:
         module = self._load_script_module()
         alias_targets = ("22", "22.18")

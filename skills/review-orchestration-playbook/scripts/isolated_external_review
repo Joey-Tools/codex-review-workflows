@@ -837,24 +837,28 @@ def _builtin_nvm_alias_bin(
 
 
 def _default_nvm_alias_bin(nvm_root: pathlib.Path) -> pathlib.Path | None:
-    alias_name = "default"
-    seen: set[str] = set()
+    target = _read_nvm_alias_target(nvm_root, "default")
+    if not target:
+        return None
+
+    seen: set[str] = {"default"}
     for _ in range(8):
-        if alias_name in seen:
+        if target in seen:
             return None
-        seen.add(alias_name)
-        target = _read_nvm_alias_target(nvm_root, alias_name)
-        if not target:
-            return None
+        seen.add(target)
         if target == "system":
             return None
+        alias_target = _read_nvm_alias_target(nvm_root, target)
+        if alias_target:
+            target = alias_target
+            continue
         version_bin = _nvm_version_bin_for_target(nvm_root, target)
         if version_bin:
             return version_bin
         builtin_bin = _builtin_nvm_alias_bin(nvm_root, target)
         if builtin_bin:
             return builtin_bin
-        alias_name = target
+        return None
     return None
 
 
