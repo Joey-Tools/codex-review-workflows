@@ -6940,6 +6940,69 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
 
         self.assertEqual(pathlib.Path(resolved).resolve(), override_target.resolve())
 
+    def test_resolve_real_codex_rejects_override_through_trusted_symlink_dir(
+        self,
+    ) -> None:
+        module = self._load_script_module()
+        trusted_bin = self.root / "trusted-override-symlink-parent-bin"
+        trusted_bin.mkdir()
+        escaped_dir = self.root / "trusted-override-symlink-parent-target"
+        escaped_dir.mkdir()
+        escaped_codex = escaped_dir / "codex"
+        shutil.copy2(self.fake_bin / "codex", escaped_codex)
+        escaped_codex.chmod(0o755)
+        os.symlink(escaped_dir, trusted_bin / "linked-dir")
+        home = self.root / "trusted-override-symlink-parent-home"
+
+        original_defpath = os.defpath
+        original_override = os.environ.get("CODEX_REAL_CODEX")
+        original_home = os.environ.get("HOME")
+        original_nvm_dir = os.environ.get("NVM_DIR")
+        original_nvm_bin = os.environ.get("NVM_BIN")
+        original_path = os.environ.get("PATH")
+        original_fake_override = os.environ.pop("FAKE_CODEX_PATH", None)
+        original_preferred = module.PREFERRED_CODEX_PATHS
+        original_trusted_entries = module.TRUSTED_CHILD_PATH_ENTRIES
+        try:
+            os.defpath = os.devnull
+            module.os.defpath = os.devnull
+            os.environ["HOME"] = str(home)
+            os.environ["NVM_DIR"] = str(home / ".nvm")
+            os.environ.pop("NVM_BIN", None)
+            os.environ["PATH"] = os.defpath
+            os.environ["CODEX_REAL_CODEX"] = str(trusted_bin / "linked-dir" / "codex")
+            module.PREFERRED_CODEX_PATHS = ()
+            module.TRUSTED_CHILD_PATH_ENTRIES = (str(trusted_bin),)
+            with self.assertRaises(module.UserError):
+                module._resolve_real_codex()
+        finally:
+            module.PREFERRED_CODEX_PATHS = original_preferred
+            module.TRUSTED_CHILD_PATH_ENTRIES = original_trusted_entries
+            os.defpath = original_defpath
+            module.os.defpath = original_defpath
+            if original_override is None:
+                os.environ.pop("CODEX_REAL_CODEX", None)
+            else:
+                os.environ["CODEX_REAL_CODEX"] = original_override
+            if original_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = original_home
+            if original_nvm_dir is None:
+                os.environ.pop("NVM_DIR", None)
+            else:
+                os.environ["NVM_DIR"] = original_nvm_dir
+            if original_nvm_bin is None:
+                os.environ.pop("NVM_BIN", None)
+            else:
+                os.environ["NVM_BIN"] = original_nvm_bin
+            if original_path is None:
+                os.environ.pop("PATH", None)
+            else:
+                os.environ["PATH"] = original_path
+            if original_fake_override is not None:
+                os.environ["FAKE_CODEX_PATH"] = original_fake_override
+
     def test_resolve_real_codex_does_not_validate_non_nvm_candidate_with_nvm_path(self) -> None:
         module = self._load_script_module()
         trusted_bin = self.root / "trusted-bin-no-nvm-validation"

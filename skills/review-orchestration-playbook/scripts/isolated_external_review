@@ -4062,7 +4062,6 @@ def _resolve_real_codex() -> str:
     override = os.environ.get("CODEX_REAL_CODEX")
     if override:
         override_path = pathlib.Path(override).expanduser()
-        absolute_override = pathlib.Path(os.path.abspath(str(override_path)))
         canonical_override_link = override_path.parent.resolve(strict=False) / override_path.name
         resolved_override = override_path.resolve(strict=False)
         nvm_trust = _is_trusted_default_nvm_codex_candidate(
@@ -4071,7 +4070,7 @@ def _resolve_real_codex() -> str:
         )
         if nvm_trust is True or any(
             _is_relative_to(path, pathlib.Path(candidate).resolve(strict=False))
-            for path in (absolute_override, canonical_override_link, resolved_override)
+            for path in (canonical_override_link, resolved_override)
             for candidate in base_trusted_path_entries
         ):
             add_candidate(override)
