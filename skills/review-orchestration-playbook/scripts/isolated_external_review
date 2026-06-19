@@ -882,9 +882,7 @@ def _trusted_nvm_bin_entries() -> tuple[str, ...]:
     add_candidate(default_nvm_bin)
 
     raw_nvm_bin = os.environ.get("NVM_BIN")
-    if default_nvm_bin is None:
-        add_candidate(raw_nvm_bin)
-    elif raw_nvm_bin:
+    if default_nvm_bin is not None and raw_nvm_bin:
         nvm_bin = pathlib.Path(raw_nvm_bin).expanduser()
         if nvm_bin.is_absolute() and nvm_bin.resolve(strict=False) == default_nvm_bin:
             add_candidate(nvm_bin)
