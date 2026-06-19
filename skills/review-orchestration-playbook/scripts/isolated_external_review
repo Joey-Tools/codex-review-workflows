@@ -878,8 +878,16 @@ def _trusted_nvm_bin_entries() -> tuple[str, ...]:
         seen.add(entry)
         entries.append(entry)
 
-    add_candidate(os.environ.get("NVM_BIN"))
-    add_candidate(_default_nvm_alias_bin(nvm_root))
+    default_nvm_bin = _default_nvm_alias_bin(nvm_root)
+    add_candidate(default_nvm_bin)
+
+    raw_nvm_bin = os.environ.get("NVM_BIN")
+    if default_nvm_bin is None:
+        add_candidate(raw_nvm_bin)
+    elif raw_nvm_bin:
+        nvm_bin = pathlib.Path(raw_nvm_bin).expanduser()
+        if nvm_bin.is_absolute() and nvm_bin.resolve(strict=False) == default_nvm_bin:
+            add_candidate(nvm_bin)
 
     return tuple(entries)
 

@@ -7387,6 +7387,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
             module.os.defpath = os.devnull
             os.environ["HOME"] = str(home)
             os.environ["NVM_DIR"] = str(home / ".nvm")
+            os.environ["NVM_BIN"] = str(override_nvm_bin)
             os.environ["PATH"] = os.defpath
             os.environ["CODEX_REAL_CODEX"] = str(override_nvm_bin / "codex")
             module.PREFERRED_CODEX_PATHS = ()
