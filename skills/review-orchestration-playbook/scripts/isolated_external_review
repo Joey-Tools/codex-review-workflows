@@ -709,6 +709,56 @@ def _is_default_nvm_bin_entry(path: pathlib.Path, nvm_root: pathlib.Path) -> boo
     return len(relative.parts) == 2 and relative.parts[1] == "bin"
 
 
+def _read_nvm_alias_target(nvm_root: pathlib.Path, alias_name: str) -> str | None:
+    alias_root = (nvm_root / "alias").resolve(strict=False)
+    alias_path = (alias_root / alias_name).resolve(strict=False)
+    if not _is_relative_to(alias_path, alias_root):
+        return None
+    try:
+        alias_text = alias_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in alias_text.splitlines():
+        target = line.split("#", 1)[0].strip()
+        if target:
+            return target
+    return None
+
+
+def _nvm_version_bin_for_target(
+    nvm_root: pathlib.Path,
+    target: str,
+) -> pathlib.Path | None:
+    if target == "system":
+        return None
+    versions_root = nvm_root / "versions" / "node"
+    candidate_names = [target]
+    if target and not target.startswith("v"):
+        candidate_names.append(f"v{target}")
+    for candidate_name in candidate_names:
+        candidate = (versions_root / candidate_name / "bin").resolve(strict=False)
+        if _is_default_nvm_bin_entry(candidate, nvm_root) and candidate.is_dir():
+            return candidate
+    return None
+
+
+def _default_nvm_alias_bin(nvm_root: pathlib.Path) -> pathlib.Path | None:
+    alias_name = "default"
+    seen: set[str] = set()
+    for _ in range(8):
+        if alias_name in seen:
+            return None
+        seen.add(alias_name)
+        target = _read_nvm_alias_target(nvm_root, alias_name)
+        if not target:
+            return None
+        version_bin = _nvm_version_bin_for_target(nvm_root, target)
+        if version_bin:
+            return version_bin
+        alias_name = target
+    return None
+
+
 def _trusted_nvm_bin_entries() -> tuple[str, ...]:
     nvm_root = (pathlib.Path.home() / ".nvm").resolve(strict=False)
     entries: list[str] = []
@@ -734,16 +784,20 @@ def _trusted_nvm_bin_entries() -> tuple[str, ...]:
     add_candidate(os.environ.get("NVM_BIN"))
     for raw_entry in os.environ.get("PATH", "").split(os.pathsep):
         add_candidate(raw_entry)
-
-    versions_root = nvm_root / "versions" / "node"
-    try:
-        nvm_bins = sorted(versions_root.glob("*/bin"))
-    except OSError:
-        nvm_bins = []
-    for nvm_bin in nvm_bins:
-        add_candidate(nvm_bin)
+    add_candidate(_default_nvm_alias_bin(nvm_root))
 
     return tuple(entries)
+
+
+def _is_explicit_nvm_codex_override(path: pathlib.Path) -> bool:
+    nvm_root = (pathlib.Path.home() / ".nvm").resolve(strict=False)
+    absolute_path = pathlib.Path(os.path.abspath(str(path)))
+    canonical_link = path.parent.resolve(strict=False) / path.name
+    resolved_path = path.resolve(strict=False)
+    return any(
+        _is_default_nvm_bin_entry(candidate.parent.resolve(strict=False), nvm_root)
+        for candidate in (absolute_path, canonical_link, resolved_path)
+    )
 
 
 def _matching_default_nvm_bin_for_path(path: str | pathlib.Path) -> str | None:
@@ -3857,7 +3911,7 @@ def _resolve_real_codex() -> str:
             _is_relative_to(path, pathlib.Path(candidate).resolve(strict=False))
             for path in (absolute_override, canonical_override_link, resolved_override)
             for candidate in trusted_path_entries
-        ):
+        ) or _is_explicit_nvm_codex_override(override_path):
             add_candidate(override)
 
     for candidate in PREFERRED_CODEX_PATHS:
