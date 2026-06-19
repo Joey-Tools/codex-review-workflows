@@ -226,6 +226,8 @@ class SkillDocumentationTest(unittest.TestCase):
             "git status --short --untracked-files=no",
             "rg -l",
             "rg --count",
+            "first-stage changed-file / `--stat` / `--numstat` / helper diff-header summaries must be count-capped",
+            "diff-header samples such as `rg -m 80 '^diff --git ' <diff>` must be capped after count-only probes",
             "删减版 `Evidence-budget contract` 是无效的",
             "bare `git show <rev>:<path>`",
             "整文件 `nl -ba`",
@@ -305,6 +307,8 @@ class SkillDocumentationTest(unittest.TestCase):
         self.assertIn("cannot receive the helper's evidence-budget text", text)
         for needle in (
             "validation commands need the same budget discipline",
+            "Budget those first-stage summaries too",
+            "head -n 80",
             "max_output_tokens=60000",
             "pyenv shim",
             "repeated `unittest` `E` output",
@@ -339,6 +343,10 @@ class SkillDocumentationTest(unittest.TestCase):
                 "repeated `unittest` `E` output",
             ):
                 self.assertIn(needle, block, name)
+        for name in ("bounded", "without_git"):
+            self.assertIn("First-stage summaries are budgeted too", template_blocks[name], name)
+            self.assertIn("rg -m 80 '^diff --git ' <diff>", template_blocks[name], name)
+            self.assertIn("head -n 80", template_blocks[name], name)
 
 
 class IsolatedCopilotReviewTest(unittest.TestCase):
@@ -4146,6 +4154,11 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertIn("cat <file>", prompt_text)
         self.assertIn("narrow sed -n '<start>,<end>p' window", prompt_text)
         self.assertIn("rg --count", prompt_text)
+        self.assertIn("Budget first-stage summaries too", prompt_text)
+        self.assertIn("git diff --stat/--numstat", prompt_text)
+        self.assertIn("helper diff-file headers", prompt_text)
+        self.assertIn("rg -m 80 '^diff --git ' <diff>", prompt_text)
+        self.assertIn("head -n 80", prompt_text)
         self.assertIn("path-wide / multi-file / large-alternation raw rg -n", prompt_text)
         self.assertIn("rg -n -C context searches", prompt_text)
         self.assertIn("git ls-files --others", prompt_text)
@@ -4215,6 +4228,11 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertIn("narrow sed -n '<start>,<end>p' window", payload["prompt_stdin"])
         self.assertIn("rg -l", payload["prompt_stdin"])
         self.assertIn("rg --count", payload["prompt_stdin"])
+        self.assertIn("Budget first-stage summaries too", payload["prompt_stdin"])
+        self.assertIn("git diff --stat/--numstat", payload["prompt_stdin"])
+        self.assertIn("helper diff-file headers", payload["prompt_stdin"])
+        self.assertIn("rg -m 80 '^diff --git ' <diff>", payload["prompt_stdin"])
+        self.assertIn("head -n 80", payload["prompt_stdin"])
         self.assertIn(
             "path-wide / multi-file / large-alternation raw rg -n",
             payload["prompt_stdin"],
