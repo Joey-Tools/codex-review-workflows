@@ -10,6 +10,7 @@ Preferred prompt:
 
 ```text
 请作为 independent code reviewer 审查 <PR URL>，本地 checkout 在 cwd。这是 review-only 子线程；不要执行 PR readiness orchestration，不要创建或更新 PR，不要修复代码，不要启动其他 reviewer，不要等待 CI；只输出 code review findings。先看 changed-file list / --stat / --numstat、helper diff headers、rg -l 或 rg --count；这些 first-stage summaries 也要有预算：对 large/generated diff，先用 count-only probe，再把 changed-file list、`git diff --stat` / `git diff --numstat`、helper diff headers 或类似 `rg -m 80 '^diff --git ' <diff>` 的 diff-header 样本截断到约 80 行（例如 `head -n 80`）；如果 count 很高，改成按目录、单文件、单 hunk 或 exact symbol window 读取，不要倾倒完整 summary/header 列表。不要默认用 git diff --unified=30/40/50/60/80 或 git diff --function-context / git diff -W、整文件 nl -ba、裸 cat <file>、裸 git show <rev>:<path>、或 path-wide / multi-file / large-alternation raw rg -n。line-producing rg -n（包括 rg -n -C context search）只能作为第二阶段读取：先用 rg -l / rg --count 缩小范围，再只对一个 exact file、一个 hunk 或一个 exact symbol window 使用。如果需要 nearby file context，把 git show / nl -ba 接到窄 sed -n '<start>,<end>p' window，或用 exact-symbol rg -n 定位后只读相关窗口。如果 untracked files 在审查范围内，不要打印完整 git status --short --untracked-files=all 或 git ls-files --others；先用 git status --short --untracked-files=no，再用带递归 generated/dependency excludes 的 count 或 capped path sample 选定路径。任何单次输出达到 800+ 行或 10k+ original tokens 后，必须改用单文件/单 hunk/精确 symbol window；只有在单文件、单 hunk 或精确 symbol window 上再用 line-producing rg -n。Review-only validation commands also need an output budget: in read-only or approval-gated child lanes, do not start with a full test or build command using a large visible budget such as `max_output_tokens=60000` or `max_output_tokens=100000`; first run a small syntax/targeted probe or the full command with a small visible cap, and if sandbox tempdir, pyenv shim, or repeated `unittest` `E` output appears, stop and summarize the failure shape before rerunning with escalation or a task-scoped log file.
+Before each tool call, self-check the command against the forbidden shapes above; if it includes bare `nl -ba <file>`, `cat <file>`, `git show <rev>:<path>`, multi-file/path-wide `rg -n`, or a wide selected-file diff, rewrite it to a count probe, exact symbol lookup, or narrow `sed -n '<start>,<end>p'` window before executing.
 ```
 
 If you hand-write, shorten, or replay this prompt, preserve these exact evidence-budget constraints:
@@ -27,12 +28,15 @@ If you hand-write, shorten, or replay this prompt, preserve these exact evidence
 - `rg --count`
 - first-stage changed-file / `--stat` / `--numstat` / helper diff-header summaries must be count-capped
 - diff-header samples such as `rg -m 80 '^diff --git ' <diff>` must be capped after count-only probes
+- before every tool call, self-check and rewrite forbidden whole-file, wide-diff, or multi-file/path-wide `rg -n` shapes before executing
 
 English variants are subject to the same contract. A prompt that says only `You are an independent code reviewer`, lists focus areas, and omits the full evidence-budget paragraph is invalid even if the focus areas are useful. Rebuild the prompt from this reference instead of sending a shortened focus-heavy variant.
 
 删减版 `Evidence-budget contract` 是无效的：如果它没有点名 `git diff --function-context` / `git diff -W`、bare `git show <rev>:<path>`、bare `cat <file>`、整文件 `nl -ba`、`rg -n -C`、以及 800+ 行或 10k+ original-token 后必须收窄，就不要发送给 review-only 子线程。
 
 不要把它弱化成 `avoid dumping huge diffs`, `focused hunks`, or `avoid broad searches` 这类 soft phrasing.
+
+在 review-only 子线程里，先说“只开窄窗口”不够；每次实际 tool call 前都要把命令形状和上面的禁令核对一遍。看到裸 `nl -ba <file>`、`cat <file>`、`git show <rev>:<path>`、multi-file/path-wide `rg -n` 或宽 `git diff --unified=*` 时，先改写成 count probe、exact symbol lookup、单 hunk 或窄 `sed -n '<start>,<end>p'` window，再执行。
 
 Review-only validation commands also need an output budget. In read-only or approval-gated child lanes, do not start with a full test or build command using a large visible budget such as `max_output_tokens=60000` or `max_output_tokens=100000`. First run a small syntax/targeted probe or the full command with a small visible cap, and if sandbox tempdir, pyenv shim, or repeated `unittest` `E` output appears, stop and summarize the failure shape before rerunning with escalation or a task-scoped log file. Do not let the first validation dump thousands of repeated error lines into the transcript.
 
