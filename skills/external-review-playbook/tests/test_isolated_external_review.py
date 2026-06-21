@@ -228,6 +228,7 @@ class SkillDocumentationTest(unittest.TestCase):
             "rg --count",
             "first-stage changed-file / `--stat` / `--numstat` / helper diff-header summaries must be count-capped",
             "diff-header samples such as `rg -m 80 '^diff --git ' <diff>` must be capped after count-only probes",
+            "before every tool call, self-check and rewrite forbidden whole-file, wide-diff, or multi-file/path-wide `rg -n` shapes before executing",
             "删减版 `Evidence-budget contract` 是无效的",
             "bare `git show <rev>:<path>`",
             "整文件 `nl -ba`",
@@ -262,6 +263,8 @@ class SkillDocumentationTest(unittest.TestCase):
             "if sandbox tempdir, pyenv shim, or repeated `unittest` `E` output appears",
             reference_text,
         )
+        self.assertIn("Before each tool call, self-check", preferred_prompt)
+        self.assertIn("narrow `sed -n '<start>,<end>p'` window before executing", preferred_prompt)
         self.assertNotIn("if it fails due sandbox tempdir", reference_text)
         constraint_list = reference_text.split(
             "If you hand-write, shorten, or replay this prompt, preserve these exact evidence-budget constraints:",
@@ -312,6 +315,8 @@ class SkillDocumentationTest(unittest.TestCase):
             "max_output_tokens=60000",
             "pyenv shim",
             "repeated `unittest` `E` output",
+            "evidence budget as a pre-tool-call checklist",
+            "Before every `exec_command`, rewrite bare `nl -ba <file>`",
         ):
             self.assertIn(needle, text)
 
@@ -341,6 +346,8 @@ class SkillDocumentationTest(unittest.TestCase):
                 "sandbox tempdir",
                 "pyenv shim",
                 "repeated `unittest` `E` output",
+                "Tool-call self-check",
+                "Before every tool call, rewrite bare `nl -ba <file>`",
             ):
                 self.assertIn(needle, block, name)
         for name in ("bounded", "without_git"):
@@ -4259,6 +4266,8 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertIn("head -n 80", prompt_text)
         self.assertIn("path-wide / multi-file / large-alternation raw rg -n", prompt_text)
         self.assertIn("rg -n -C context searches", prompt_text)
+        self.assertIn("Before every tool call, self-check the command", prompt_text)
+        self.assertIn("Rewrite bare nl -ba <file>", prompt_text)
         self.assertIn("git ls-files --others", prompt_text)
         self.assertIn("git status --short --untracked-files=no", prompt_text)
         self.assertIn(payload["diff_file"], prompt_text)
@@ -4336,6 +4345,8 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
             payload["prompt_stdin"],
         )
         self.assertIn("rg -n -C context searches", payload["prompt_stdin"])
+        self.assertIn("Before every tool call, self-check the command", payload["prompt_stdin"])
+        self.assertIn("Rewrite bare nl -ba <file>", payload["prompt_stdin"])
         self.assertIn("git ls-files --others", payload["prompt_stdin"])
         self.assertIn("git status --short --untracked-files=no", payload["prompt_stdin"])
         self.assertIn("--add-dir", payload["args"])
