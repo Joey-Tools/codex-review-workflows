@@ -88,9 +88,9 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 
 9. 报告 merge-readiness。
 - 明确列出 best-effort `github-codex-review`、required `independent-codex-pr-review`、required `offline-frozen-diff-review`、PR comments/review threads、CI/tests 和 branch/base 状态的终态。
-- 对 triple review / 本地双重 review，明确说明本地 Codex lane 是 helper-backed `codex-review` / `codex-readonly` clean，还是 clean-context `reviewer` fallback clean；如果 non-Codex external lane 已授权并启动，也必须列出该 lane 的 final artifact 状态、findings 处理结果和 clean/block/inconclusive 结论。不要把 inherited-context subagent 或 parent-thread review 当成 clean fallback，也不要把缺失的 external half 折叠成 Codex-only clean。
+- 对 triple review / 本地双重 review，明确说明本地 Codex lane 是 helper-backed `codex-review` / `codex-readonly` clean，还是 clean-context `reviewer` fallback clean；如果 non-Codex external lane 被请求，必须列出该 lane 的 final artifact 状态、findings 处理结果和 clean/block/inconclusive 结论，包括缺少 consent 导致未启动的 blocked 状态。不要把 inherited-context subagent 或 parent-thread review 当成 clean fallback，也不要把缺失的 external half 折叠成 Codex-only clean。
 - 如果某个 gate blocked 或 inconclusive，说明证据、缺口和建议决策，不要把它折叠成 success。
-- 只有 required review gates、已授权并启动的 requested review lanes、required CI、required conversation resolution 和 branch/base 状态 clean，或 the user 明确接受例外后，才报告 merge-ready。
+- 只有 required review gates、所有 requested review lanes（包括 requested 但因 consent/auth/runtime 缺失而 blocked 的 lanes）、required CI、required conversation resolution 和 branch/base 状态 clean，或 the user 明确接受例外后，才报告 merge-ready。
 - 如果 the user 要求 `在合并前停止` 或 `stop before merge`，到 merge-ready 报告后停止，不要 merge。
 
 ## References
