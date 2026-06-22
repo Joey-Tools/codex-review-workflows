@@ -18,6 +18,7 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 - `在合并前停止`
 - `stop before merge`
 - `开 ready for review PR`
+- `三重 review` / `triple review`，也就是 PR `github-codex-review` 加本地双重 review；该措辞授权 PR readiness 覆盖的 Codex/GitHub lanes，若本地双重 review 包含 non-Codex external reviewer，则还需要单独确认 non-Codex opt-in/consent
 - `请 review <PR URL>，对应本地是在 cwd`，且调用者要求当前 agent 驱动完整 PR readiness 或 merge-readiness
 - `codex thread <session-ID>`，且上下文是 PR review comments、线上 PR comments 修复或 merge-readiness fix loop
 - `线上也有需要你处理的 PR comments`
@@ -67,7 +68,9 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 6. 启动 `offline-frozen-diff-review`。
 - 使用 `$review-orchestration-playbook` 的 helper stateful lane，对冻结 range 做 `offline-frozen-diff-review`；读取 [review-lane-contracts.md](references/review-lane-contracts.md) 的 offline review contract。
 - 默认从 `codex-review` 开始；需要 exact diff-fed baseline、prompt contract 或 fallback 时用 stateful `codex-readonly`。
-- 非 Codex reviewers（OpenCode、Cursor `agent`、Copilot、Claude 等）只在 the user 明确要求或当前任务显式 opt-in 时运行。
+- 如果本地 Codex helper lane unavailable / blocked / inconclusive，而 triple review 或本地双重 review 仍需要 Codex-lane fallback，只能使用 clean-context `reviewer` agent。该 fallback prompt 必须完整包含冻结 scope、diff/range、evidence-budget contract 和 output contract，不能依赖 parent-thread inherited context。
+- clean-context `reviewer` fallback 必须使用最新配置的 Codex model 和最高配置 reasoning effort；如果无法确认或启动该形态，`offline-frozen-diff-review` 结果是 blocked/inconclusive，而不是 clean。
+- 非 Codex reviewers（OpenCode、Cursor `agent`、Copilot、Claude 等）只在 the user 明确要求且 egress/consent rules allow it，或当前任务显式 opt-in 时运行；如果 triple review 需要这些 lanes 但缺少 non-Codex consent，报告该 half blocked，不要静默降级为 Codex-only triple review。
 - Clean 条件：stateful lane 产出 final artifact，明确 `LGTM` / no actionable findings；review scope 必须是冻结 `base_sha..head_sha` 或明确 diff artifact，不是 live working tree。
 
 7. Fix loop。
@@ -84,6 +87,7 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 
 9. 报告 merge-readiness。
 - 明确列出 best-effort `github-codex-review`、required `independent-codex-pr-review`、required `offline-frozen-diff-review`、PR comments/review threads、CI/tests 和 branch/base 状态的终态。
+- 对 triple review / 本地双重 review，明确说明本地 Codex lane 是 helper-backed `codex-review` / `codex-readonly` clean，还是 clean-context `reviewer` fallback clean；不要把 inherited-context subagent 或 parent-thread review 当成 clean fallback。
 - 如果某个 gate blocked 或 inconclusive，说明证据、缺口和建议决策，不要把它折叠成 success。
 - 只有 required review gates、required CI、required conversation resolution 和 branch/base 状态 clean，或 the user 明确接受例外后，才报告 merge-ready。
 - 如果 the user 要求 `在合并前停止` 或 `stop before merge`，到 merge-ready 报告后停止，不要 merge。
@@ -101,6 +105,7 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 - 不要把缺失的 GitHub `@codex review` / `codex/review-gate` 当作 blocker；它默认是 best-effort，远端没有触发就记录并继续，除非 branch protection 明确把实际 `codex/review-gate` status context 列为 required check。也不要为了补齐 best-effort evidence 主动触发或反复触发 `@codex review`。
 - 不要用 GitHub `@codex review` / `codex/review-gate` 替代 `independent-codex-pr-review`。
 - 不要用 helper-backed subagent/internal lane 替代 `independent-codex-pr-review`。
+- 不要用 inherited-context subagent、default coding subagent 或 parent-thread continuation 替代 failed local Codex helper lane；只有 clean-context `reviewer` fallback 可以计入本地 Codex lane。
 - 不要忽略已存在的 CI 或 branch protection required checks；required checks 必须处理到 clean 或明确 blocked。
 - 不要在 `Require conversation resolution before merging` gate 存在时留下 unresolved review threads。
 - 不要把 local commit 当作 `在合并前停止` 的终点；该措辞默认要求 PR creation/reuse、best-effort GitHub Codex review evidence、required independent/offline review gates、CI/comments follow-up 和 merge-ready report。
