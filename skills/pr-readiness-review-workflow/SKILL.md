@@ -18,7 +18,7 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 - `在合并前停止`
 - `stop before merge`
 - `开 ready for review PR`
-- `三重 review` / `triple review`，也就是 PR `github-codex-review` 加本地双重 review；该措辞授权 PR readiness 覆盖的 Codex/GitHub lanes，若本地双重 review 包含 non-Codex external reviewer，则还需要单独确认 non-Codex opt-in/consent
+- `三重 review` / `triple review`，也就是 PR `github-codex-review` 加本地双重 review；本地双重 review 固定包含一条 non-Codex external lane 和一条本地 Codex lane。该措辞只授权 PR readiness 覆盖的 Codex/GitHub lanes；non-Codex external lane 还需要单独确认 opt-in/consent，缺失时该 half 是 blocked。
 - `请 review <PR URL>，对应本地是在 cwd`，且调用者要求当前 agent 驱动完整 PR readiness 或 merge-readiness
 - `codex thread <session-ID>`，且上下文是 PR review comments、线上 PR comments 修复或 merge-readiness fix loop
 - `线上也有需要你处理的 PR comments`
@@ -70,7 +70,7 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 - 默认从 `codex-review` 开始；需要 exact diff-fed baseline、prompt contract 或 fallback 时用 stateful `codex-readonly`。
 - 如果本地 Codex helper lane unavailable / blocked / inconclusive，而 workflow 仍需要 Codex-lane fallback，只能使用 clean-context `reviewer` agent。该 fallback prompt 必须完整包含冻结 scope、diff/range、evidence-budget contract 和 output contract，不能依赖 parent-thread inherited context。
 - clean-context `reviewer` fallback 必须使用最新配置的 Codex model 和最高配置 reasoning effort；如果无法确认或启动该形态，`offline-frozen-diff-review` 结果是 blocked/inconclusive，而不是 clean。
-- 非 Codex reviewers（OpenCode、Cursor `agent`、Copilot、Claude 等）只在 the user 明确要求且 egress/consent rules allow it，或当前任务显式 opt-in 时运行；如果 triple review 需要这些 lanes 但缺少 non-Codex consent，报告该 half blocked，不要静默降级为 Codex-only triple review。
+- 非 Codex reviewers（OpenCode、Cursor `agent`、Copilot、Claude 等）只在 the user 明确要求且 egress/consent rules allow it，或当前任务显式 opt-in 时运行；本地双重 review / triple review 请求固定包含该 non-Codex external half，但缺少 non-Codex consent 时只能报告该 half blocked，不要运行它，也不要静默降级为 Codex-only triple review。
 - Clean 条件：helper stateful lane final artifact，或 fallback 时 clean-context `reviewer` final artifact，明确 `LGTM` / no actionable findings；review scope 必须是冻结 `base_sha..head_sha` 或明确 diff artifact，不是 live working tree。
 
 7. Fix loop。
