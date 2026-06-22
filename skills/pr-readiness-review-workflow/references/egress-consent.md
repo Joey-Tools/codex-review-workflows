@@ -19,6 +19,8 @@ Workflow-implied consent applies only when the parent thread explicitly asks for
 
 Consent does not cover non-Codex external reviewers, secrets, credentials, untracked private files, unrelated repositories, or broad workspace dumps.
 
+When a triple-review request includes the local double-review half, that local double-review half includes a non-Codex external reviewer plus a local Codex lane. Treat the non-Codex reviewer as separately opt-in. Workflow-implied triple-review consent covers only the Codex/GitHub lanes described here; if separate non-Codex consent is absent, report that half as blocked instead of running it or silently downgrading the requested review shape.
+
 ## Recommended Explicit Consent
 
 ```text

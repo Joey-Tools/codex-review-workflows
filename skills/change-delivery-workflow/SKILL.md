@@ -36,7 +36,8 @@ description: "Run a local pre-commit delivery gate for non-trivial repo changes:
 
 5. 运行本地/internal review。
 - 默认用 `$review-orchestration-playbook` 的 helper-backed `codex-review` lane；需要 exact diff-fed baseline 或默认 lane 不可用时，改用 stateful `codex-readonly`。
-- 不要用普通 coding subagent 代替 internal review；`reviewer` agent 只作为明确的弱 fallback。
+- 如果本地 Codex helper lane unavailable / blocked / inconclusive，而当前门禁仍需要 Codex-lane fallback，只能启动 clean-context `reviewer` agent，并在 prompt 中提供完整 review scope、diff/range、evidence-budget contract 和 output contract；不要用普通 coding subagent、inherited-context subagent 或 parent-thread continuation 代替 internal review。
+- clean-context `reviewer` fallback 必须使用最新配置的 Codex model 和最高配置 reasoning effort；如果该形态不可用，报告 blocked/inconclusive，不要静默降级。
 - 对 reviewable `wip/<topic>` range，把 reviewer 绑定到固定 `base_sha..head_sha`，不要审 live working tree。
 - 如果本地/internal review 发现问题，修复后回到测试和文档步骤。
 

@@ -48,7 +48,11 @@ Use `$review-orchestration-playbook` helper stateful lane on the frozen `base_sh
 
 Default to helper-backed `codex-review` only for narrow scopes where its builtin prompt is acceptable. Use `codex-readonly` when the review needs an enforceable evidence budget, exact diff-fed baseline, or fallback behavior.
 
-The lane is clean only when the stateful final artifact says `LGTM` or no actionable findings, and the scope is the frozen range or explicit diff artifact rather than a live working tree.
+If the helper-backed Codex lane is unavailable, blocked, or inconclusive and the workflow still needs a local Codex-lane fallback, use only a clean-context `reviewer` agent. The fallback prompt must include the frozen range or explicit diff artifact, the complete evidence-budget contract from this reference, and the output contract. Do not rely on inherited parent-thread context, a default coding subagent, or a continuation of the orchestration thread.
+
+The clean-context `reviewer` fallback must run on the latest configured Codex model with the highest configured reasoning effort. If that shape cannot be verified or launched, classify `offline-frozen-diff-review` as blocked or inconclusive instead of silently weakening the fallback.
+
+The lane is clean only when the helper stateful final artifact, or the clean-context `reviewer` fallback final artifact when fallback is used, says `LGTM` or no actionable findings, and the scope is the frozen range or explicit diff artifact rather than a live working tree.
 
 ## Review Thread Replies
 
