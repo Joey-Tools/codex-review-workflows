@@ -68,10 +68,10 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 6. 启动 `offline-frozen-diff-review`。
 - 使用 `$review-orchestration-playbook` 的 helper stateful lane，对冻结 range 做 `offline-frozen-diff-review`；读取 [review-lane-contracts.md](references/review-lane-contracts.md) 的 offline review contract。
 - 默认从 `codex-review` 开始；需要 exact diff-fed baseline、prompt contract 或 fallback 时用 stateful `codex-readonly`。
-- 如果本地 Codex helper lane unavailable / blocked / inconclusive，而 triple review 或本地双重 review 仍需要 Codex-lane fallback，只能使用 clean-context `reviewer` agent。该 fallback prompt 必须完整包含冻结 scope、diff/range、evidence-budget contract 和 output contract，不能依赖 parent-thread inherited context。
+- 如果本地 Codex helper lane unavailable / blocked / inconclusive，而 workflow 仍需要 Codex-lane fallback，只能使用 clean-context `reviewer` agent。该 fallback prompt 必须完整包含冻结 scope、diff/range、evidence-budget contract 和 output contract，不能依赖 parent-thread inherited context。
 - clean-context `reviewer` fallback 必须使用最新配置的 Codex model 和最高配置 reasoning effort；如果无法确认或启动该形态，`offline-frozen-diff-review` 结果是 blocked/inconclusive，而不是 clean。
 - 非 Codex reviewers（OpenCode、Cursor `agent`、Copilot、Claude 等）只在 the user 明确要求且 egress/consent rules allow it，或当前任务显式 opt-in 时运行；如果 triple review 需要这些 lanes 但缺少 non-Codex consent，报告该 half blocked，不要静默降级为 Codex-only triple review。
-- Clean 条件：stateful lane 产出 final artifact，明确 `LGTM` / no actionable findings；review scope 必须是冻结 `base_sha..head_sha` 或明确 diff artifact，不是 live working tree。
+- Clean 条件：helper stateful lane final artifact，或 fallback 时 clean-context `reviewer` final artifact，明确 `LGTM` / no actionable findings；review scope 必须是冻结 `base_sha..head_sha` 或明确 diff artifact，不是 live working tree。
 
 7. Fix loop。
 - 合并 best-effort `github-codex-review`、required `independent-codex-pr-review`、required `offline-frozen-diff-review`、PR comments 和 CI 证据。

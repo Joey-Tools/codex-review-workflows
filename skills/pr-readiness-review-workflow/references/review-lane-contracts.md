@@ -52,7 +52,7 @@ If the helper-backed Codex lane is unavailable, blocked, or inconclusive and the
 
 The clean-context `reviewer` fallback must run on the latest configured Codex model with the highest configured reasoning effort. If that shape cannot be verified or launched, classify `offline-frozen-diff-review` as blocked or inconclusive instead of silently weakening the fallback.
 
-The lane is clean only when the stateful final artifact says `LGTM` or no actionable findings, and the scope is the frozen range or explicit diff artifact rather than a live working tree.
+The lane is clean only when the helper stateful final artifact, or the clean-context `reviewer` fallback final artifact when fallback is used, says `LGTM` or no actionable findings, and the scope is the frozen range or explicit diff artifact rather than a live working tree.
 
 ## Review Thread Replies
 
