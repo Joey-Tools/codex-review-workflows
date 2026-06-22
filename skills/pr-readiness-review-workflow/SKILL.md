@@ -31,7 +31,7 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 
 1. 建立 PR 上下文。
 - 确认 PR URL、当前 cwd、目标分支、当前 head commit、本地 dirty state、repo merge model 和 PR body 的 LLM authorship note。
-- 如果没有 PR URL，但当前分支/commit 已通过本地 gate，且 the user 要求 full workflow、merge-ready、`在合并前停止` 或 ready-for-review PR，先创建或复用 PR。该措辞授权 push 分支和创建/更新 PR；不授权 merge。创建/复用 PR 前确认 base branch、head branch、是否 draft/ready 和 required metadata；若 auth、network、branch protection 或 required metadata 缺失，停在明确 blocked state，不要把 commit-only 状态报告成完成。
+- 如果没有 PR URL，但当前分支/commit 已通过本地 gate，且 the user 要求 full workflow、merge-ready、`在合并前停止`、ready-for-review PR 或 `三重 review` / `triple review`，先创建或复用 PR。该措辞授权 push 分支和创建/更新 PR；不授权 merge。创建/复用 PR 前确认 base branch、head branch、是否 draft/ready 和 required metadata；若 auth、network、branch protection 或 required metadata 缺失，停在明确 blocked state，不要把 commit-only 状态报告成完成。
 - 读取线上 PR comments、review threads、requested changes、CI 状态、branch protection / rules 和 merge requirements；GitHub 交互优先使用 `gh`。
 - 对 PR metadata、review threads、rulesets、branch protection、rules、CI checks / GitHub Actions logs 或 custom GraphQL probe，按需读取 [github-pr-probes.md](references/github-pr-probes.md)。该 reference 包含 typed `gh` 优先级、`gh api graphql -F query=@...`、REST `?` path quoting、Actions log evidence budgets 和 schema/parse failure 处理。
 - 读取 GitHub `@codex review` trigger/comment evidence 和实际 `codex/review-gate` status check 状态；这属于 best-effort `github-codex-review`，不能和独立 Codex review-only 子线程混用。
@@ -54,8 +54,9 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 4. 验证 `github-codex-review`。
 - 这是 PR 里的 GitHub `@codex review` / `codex/review-gate` lane，不是本地 `codex exec`，也不是独立 review-only 子线程。
 - 默认是 best-effort。若远端当前 head 没有触发 `@codex review` / `codex/review-gate`，且 branch protection 没有把实际 `codex/review-gate` status context 列为 required check，记录为 `not triggered` 并继续；不要为了满足 best-effort lane 主动触发或反复触发 `@codex review`。
+- 对 `三重 review` / `triple review`，`github-codex-review` 是 requested lane，不是 best-effort optional lane；当前 head 没有触发时，必须通过仓库认可的 gate 触发并等待到 final evidence，或报告 blocked。不要把 explicit triple review 降级为 GitHub Codex skipped。
 - 若远端已经触发，或 branch protection 把它列为 required check，则绑定到当前 PR head commit，等待或查询到 completed 结果；缺失、失败、绑定到旧 head、requested changes 或 actionable Codex comments 都进入 fix loop / blocked state。
-- Clean 条件：未触发且非 required 时为 best-effort skipped；已触发或 required 时，当前 head commit 的 GitHub Codex review gate 成功，且没有未处理的 Codex review comments 或 requested changes。
+- Clean 条件：未触发且非 required、非 triple-review requested 时为 best-effort skipped；已触发、required 或 triple-review requested 时，当前 head commit 的 GitHub Codex review gate 成功，且没有未处理的 Codex review comments 或 requested changes。
 
 5. 启动 `independent-codex-pr-review`。
 - 使用独立 Codex CLI review-only thread。prompt 必须声明这是 parent PR readiness workflow 调起的纯 review lane，禁止子线程再次执行 PR readiness orchestration、创建/更新 PR、修复代码、启动新的 reviewer 或等待 CI。
@@ -103,7 +104,7 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 ## Guardrails
 
 - 不要再用裸 `online review` / `offline review` 作为 gate 名称；使用 `github-codex-review`、`independent-codex-pr-review` 和 `offline-frozen-diff-review`。
-- 不要把缺失的 GitHub `@codex review` / `codex/review-gate` 当作 blocker；它默认是 best-effort，远端没有触发就记录并继续，除非 branch protection 明确把实际 `codex/review-gate` status context 列为 required check。也不要为了补齐 best-effort evidence 主动触发或反复触发 `@codex review`。
+- 不要把缺失的 GitHub `@codex review` / `codex/review-gate` 当作 blocker；它默认是 best-effort，远端没有触发就记录并继续，除非 branch protection 明确把实际 `codex/review-gate` status context 列为 required check，或当前请求是 `三重 review` / `triple review`。也不要为了补齐 best-effort evidence 主动触发或反复触发 `@codex review`。
 - 不要用 GitHub `@codex review` / `codex/review-gate` 替代 `independent-codex-pr-review`。
 - 不要用 helper-backed subagent/internal lane 替代 `independent-codex-pr-review`。
 - 不要用 inherited-context subagent、default coding subagent 或 parent-thread continuation 替代 failed local Codex helper lane；只有 clean-context `reviewer` fallback 可以计入本地 Codex lane。
