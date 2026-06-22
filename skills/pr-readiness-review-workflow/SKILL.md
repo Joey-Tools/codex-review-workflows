@@ -27,11 +27,14 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 
 如果用户只是要恢复、审计或总结普通 Codex session/thread evidence，优先使用 `$codex-session-mining`，不要创建或更新 PR。
 
+PR target authorization 是独立 preflight。`full workflow`、`merge-ready`、`在合并前停止`、`stop before merge`、`开 PR`、`开 PR 合进去`、`三重 review` / `triple review` 或类似措辞，只在目标 repository 明显由 the user owns，或属于 the user 明确配置的 default-authorized owners/repos 时，才授权 push 分支并创建/更新 PR。其他目标 repository 必须先停下来请求明确确认；确认问题必须列出 exact target repository/repositories、base branch、head repository/branch 和 draft/ready 状态，让 the user 能判断是否允许。
+
 ## Workflow
 
 1. 建立 PR 上下文。
-- 确认 PR URL、当前 cwd、目标分支、当前 head commit、本地 dirty state、repo merge model 和 PR body 的 LLM authorship note。
-- 如果没有 PR URL，但当前分支/commit 已通过本地 gate，且 the user 要求 full workflow、merge-ready、`在合并前停止`、ready-for-review PR 或 `三重 review` / `triple review`，先创建或复用 PR。该措辞授权 push 分支和创建/更新 PR；不授权 merge。创建/复用 PR 前确认 base branch、head branch、是否 draft/ready 和 required metadata；若 auth、network、branch protection 或 required metadata 缺失，停在明确 blocked state，不要把 commit-only 状态报告成完成。
+- 确认 PR URL、当前 cwd、目标 repository owner/name、目标分支、当前 head commit、本地 dirty state、repo merge model 和 PR body 的 LLM authorship note。
+- 在 push 分支或创建/更新 PR 前完成 PR target authorization preflight：如果 target repository 不明显由 the user owns，也不在 the user 明确配置的 default-authorized owners/repos 内，先停止并请求明确确认。确认问题必须列出 exact target repository/repositories、base branch、head repository/branch 和 draft/ready 状态；多 repo 时逐一列出。
+- 如果没有 PR URL，但当前分支/commit 已通过本地 gate，且 the user 要求 full workflow、merge-ready、`在合并前停止`、ready-for-review PR 或 `三重 review` / `triple review`，通过 PR target authorization preflight 后先创建或复用 PR。该措辞在 preflight 通过后授权 push 分支和创建/更新 PR；不授权 merge。创建/复用 PR 前确认 base branch、head branch、是否 draft/ready 和 required metadata；若 auth、network、branch protection 或 required metadata 缺失，停在明确 blocked state，不要把 commit-only 状态报告成完成。
 - 读取线上 PR comments、review threads、requested changes、CI 状态、branch protection / rules 和 merge requirements；GitHub 交互优先使用 `gh`。
 - 对 PR metadata、review threads、rulesets、branch protection、rules、CI checks / GitHub Actions logs 或 custom GraphQL probe，按需读取 [github-pr-probes.md](references/github-pr-probes.md)。该 reference 包含 typed `gh` 优先级、`gh api graphql -F query=@...`、REST `?` path quoting、Actions log evidence budgets 和 schema/parse failure 处理。
 - 读取 GitHub `@codex review` trigger/comment evidence 和实际 `codex/review-gate` status check 状态；这属于 best-effort `github-codex-review`，不能和独立 Codex review-only 子线程混用。
@@ -116,3 +119,4 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 - 不要在没有读取 `codex thread <session-ID>` evidence 的情况下修复这类 review comments。
 - 不要无限等待 reviewer 或 CI；用 `cbth` receipt/recovery 信息或清晰 blocked state 收口。
 - 不要把 `default.rules` 或稳定命令 prefix 当作 repo/diff egress consent；rules 只降低命令审批摩擦，不能代替 user consent 或 repo trust evidence。
+- 不要把 `开 PR`、`开 PR 合进去`、`full workflow`、`merge-ready`、`在合并前停止` 或 `三重 review` / `triple review` 当作对非用户 owned、未 default-authorized repository 的 PR target 授权；先完成 PR target authorization preflight。
