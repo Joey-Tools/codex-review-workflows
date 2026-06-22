@@ -75,6 +75,7 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 
 7. Fix loop。
 - 合并 best-effort `github-codex-review`、required `independent-codex-pr-review`、required `offline-frozen-diff-review`、PR comments 和 CI 证据。
+- 如果 triple review / 本地双重 review 的 non-Codex external lane 已被单独授权并启动，它的 final artifact 也是请求范围内的 review evidence；actionable findings 必须进入同一个 fix loop，blocked/inconclusive/missing final artifact 必须在 merge-readiness 中显式报告，不能忽略后继续报 clean。
 - 对每个 finding 判断是否 actionable；修复后重跑受影响测试，再重新进入必要 review gate。
 - 读取所有 CI checks，但只有 branch protection / ruleset 标记为 required 的 check 是 merge-readiness required gate：失败、取消、pending 超过合理等待窗口、缺失 required check 或绑定到旧 head 都必须处理或报告为 blocked。非 required 的失败/取消 checks 应记录并按 repo/user policy 判断是否需要修复，但不要仅因其存在就阻止 merge-ready。只有仓库没有 CI / 没有远端 checks 时，才能报告 `CI: none observed`。
 - 如果 merge gate 要求 conversation resolution，自动处理 unresolved review threads：actionable thread 先修复和验证，再回复并 resolve；non-actionable 或 stale thread 直接回复说明并 resolve；无法 resolve 时报告具体 thread 和权限/API blocker。回复格式见 [review-lane-contracts.md](references/review-lane-contracts.md)。
@@ -87,9 +88,9 @@ description: "Drive the user's parent PR readiness gate for feature-ready or rev
 
 9. 报告 merge-readiness。
 - 明确列出 best-effort `github-codex-review`、required `independent-codex-pr-review`、required `offline-frozen-diff-review`、PR comments/review threads、CI/tests 和 branch/base 状态的终态。
-- 对 triple review / 本地双重 review，明确说明本地 Codex lane 是 helper-backed `codex-review` / `codex-readonly` clean，还是 clean-context `reviewer` fallback clean；不要把 inherited-context subagent 或 parent-thread review 当成 clean fallback。
+- 对 triple review / 本地双重 review，明确说明本地 Codex lane 是 helper-backed `codex-review` / `codex-readonly` clean，还是 clean-context `reviewer` fallback clean；如果 non-Codex external lane 已授权并启动，也必须列出该 lane 的 final artifact 状态、findings 处理结果和 clean/block/inconclusive 结论。不要把 inherited-context subagent 或 parent-thread review 当成 clean fallback，也不要把缺失的 external half 折叠成 Codex-only clean。
 - 如果某个 gate blocked 或 inconclusive，说明证据、缺口和建议决策，不要把它折叠成 success。
-- 只有 required review gates、required CI、required conversation resolution 和 branch/base 状态 clean，或 the user 明确接受例外后，才报告 merge-ready。
+- 只有 required review gates、已授权并启动的 requested review lanes、required CI、required conversation resolution 和 branch/base 状态 clean，或 the user 明确接受例外后，才报告 merge-ready。
 - 如果 the user 要求 `在合并前停止` 或 `stop before merge`，到 merge-ready 报告后停止，不要 merge。
 
 ## References
