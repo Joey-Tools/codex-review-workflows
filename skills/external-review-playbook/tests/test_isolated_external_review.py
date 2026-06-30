@@ -8556,6 +8556,150 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         )
 
         stderr_path.write_text(
+            "Error: temporary directory is at capacity\n",
+            encoding="utf-8",
+        )
+        self.assertFalse(
+            module._codex_model_fallback_error(
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                primary_model="gpt-5.6-sol",
+            )
+        )
+
+        stderr_path.write_text(
+            "Error: The model server is overloaded\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            module._codex_model_fallback_error(
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                primary_model="gpt-5.6-sol",
+            )
+        )
+
+        stderr_path.write_text(
+            "Error: The model service is overloaded\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            module._codex_model_fallback_error(
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                primary_model="gpt-5.6-sol",
+            )
+        )
+
+        stderr_path.write_text(
+            "Error: The model gpt-5.5 is overloaded\n",
+            encoding="utf-8",
+        )
+        self.assertFalse(
+            module._codex_model_fallback_error(
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                primary_model="gpt-5.6-sol",
+            )
+        )
+
+        for message in (
+            "Error: The gpt-5.5 model is overloaded\n",
+            "Error: The model gpt-4o is unavailable\n",
+            "Error: The model gpt-5.5 not found\n",
+            "Error: The model other-model is overloaded\n",
+            "Error: You do not have access to model gpt-5.5\n",
+            "Error: unsupported model gpt-5.5\n",
+            "Error: unsupported model gpt-5.5.\n",
+            "unsupported_model: gpt-5.5\n",
+            "Error: model_id=gpt-5.5; model is overloaded\n",
+        ):
+            stderr_path.write_text(message, encoding="utf-8")
+            self.assertFalse(
+                module._codex_model_fallback_error(
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                    primary_model="gpt-5.6-sol",
+                ),
+                message,
+            )
+
+        stderr_path.write_text(
+            "Error: The model is not available: gpt-5.5\n",
+            encoding="utf-8",
+        )
+        self.assertFalse(
+            module._codex_model_fallback_error(
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                primary_model="gpt-5.6-sol",
+            )
+        )
+
+        stderr_path.write_text(
+            "Error: The model is unavailable: please retry later\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            module._codex_model_fallback_error(
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                primary_model="gpt-5.6-sol",
+            )
+        )
+
+        stderr_path.write_text(
+            "model_not_found: gpt-5.5\n",
+            encoding="utf-8",
+        )
+        self.assertFalse(
+            module._codex_model_fallback_error(
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                primary_model="gpt-5.6-sol",
+            )
+        )
+
+        stderr_path.write_text(
+            "2026-06-30T12:00:00Z model_not_found: "
+            "model is not available: gpt-5.6-sol\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            module._codex_model_fallback_error(
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                primary_model="gpt-5.6-sol",
+            )
+        )
+
+        stderr_path.write_text(
+            "Error: The model server is overloaded\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            module._codex_model_fallback_error(
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                primary_model="o3",
+                fallback_model="o4-mini",
+            )
+        )
+
+        stderr_path.write_text(
+            "Error: The model o4-mini is overloaded\n",
+            encoding="utf-8",
+        )
+        self.assertFalse(
+            module._codex_model_fallback_error(
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                primary_model="o3",
+                fallback_model="o4-mini",
+            )
+        )
+
+        stderr_path.write_text(
             "model_not_found appeared in reviewed source text\n",
             encoding="utf-8",
         )
@@ -8569,6 +8713,30 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
 
         stderr_path.write_text(
             "Error: The requested model is not available: gpt-5.6-sol\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            module._codex_model_fallback_error(
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                primary_model="gpt-5.6-sol",
+            )
+        )
+
+        stderr_path.write_text(
+            "Error: unsupported model gpt-5.6-sol.\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            module._codex_model_fallback_error(
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                primary_model="gpt-5.6-sol",
+            )
+        )
+
+        stderr_path.write_text(
+            "unsupported_model: gpt-5.6-sol\n",
             encoding="utf-8",
         )
         self.assertTrue(
@@ -8639,6 +8807,44 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
             json.dumps(
                 {
                     "type": "error",
+                    "model": "gpt-5.5",
+                    "message": "model is overloaded",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.assertFalse(
+            module._codex_model_fallback_error(
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                primary_model="gpt-5.6-sol",
+            )
+        )
+
+        stdout_path.write_text(
+            json.dumps(
+                {
+                    "type": "error",
+                    "model_id": "gpt-5.5",
+                    "message": "model is overloaded",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.assertFalse(
+            module._codex_model_fallback_error(
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                primary_model="gpt-5.6-sol",
+            )
+        )
+
+        stdout_path.write_text(
+            json.dumps(
+                {
+                    "type": "error",
                     "message": "model_not_found: model is not available: gpt-5.6-sol",
                 }
             )
@@ -8646,6 +8852,24 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
             encoding="utf-8",
         )
         self.assertTrue(
+            module._codex_model_fallback_error(
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                primary_model="gpt-5.6-sol",
+            )
+        )
+
+        stdout_path.write_text(
+            json.dumps(
+                {
+                    "type": "error",
+                    "message": "model is not available: gpt-5.5",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.assertFalse(
             module._codex_model_fallback_error(
                 stdout_path=stdout_path,
                 stderr_path=stderr_path,

@@ -152,6 +152,7 @@ CODEX_MODEL_FALLBACK_ERROR_FRAGMENTS = (
     "not have access to model",
     "not have access to the model",
     "unsupported model",
+    "unsupported_model",
     "you do not have access to this model",
 )
 CODEX_MODEL_FALLBACK_ERROR_PATTERNS = (
@@ -163,7 +164,37 @@ CODEX_MODEL_FALLBACK_ERROR_PATTERNS = (
 )
 CODEX_MODEL_FALLBACK_STDERR_PREFIX_PATTERN = re.compile(
     r"^(?:(?:\d{4}-\d{2}-\d{2}t\S+)\s+)?"
-    r"(?:error|fatal|model_not_found|unsupported_model|warn|warning)\b"
+    r"(?:(?:error|fatal|warn|warning)\b|(?:model_not_found|unsupported_model):)"
+)
+CODEX_EXPLICIT_MODEL_REFERENCE_PATTERNS = (
+    re.compile(r"\bmodel(?:[\s_]id)?\s+[\"'`](?P<model>[^\"'`\s]+)[\"'`]"),
+    re.compile(
+        r"\bmodel(?:[\s_]id)?\s+(?P<model>[a-z0-9][a-z0-9._/-]*)"
+        r"\s+(?=(?:cannot|does|has|is|not|was)\b)"
+    ),
+    re.compile(
+        r"\bmodel(?:[\s_]id)?\s+(?P<model>[a-z0-9][a-z0-9._/-]*)"
+        r"(?=\s*(?:[\"'`}\],.!?;:]|$))"
+    ),
+    re.compile(
+        r"\b(?P<model>[a-z0-9][a-z0-9._/-]*)\s+model"
+        r"\s+(?=(?:cannot|does|has|is|not|was)\b)"
+    ),
+    re.compile(
+        r"\bmodel(?:[\s_]id)?\s*[:=]\s*[\"'`]?"
+        r"(?P<model>[a-z0-9][a-z0-9._/-]*)"
+    ),
+    re.compile(r"[\"']model(?:_id)?[\"']\s*:\s*[\"'](?P<model>[^\"'\s]+)[\"']"),
+    re.compile(
+        r"\bmodel(?:[\s_]id)?\s+"
+        r"(?:(?:is\s+(?:at capacity|not available|not supported|overloaded|"
+        r"unavailable|unsupported))|does not exist|not found)\s*:\s*[\"'`]?"
+        r"(?P<model>[a-z0-9][a-z0-9._/-]*)"
+    ),
+    re.compile(
+        r"\b(?:model_not_found|unsupported_model):\s*[\"'`]?"
+        r"(?P<model>[a-z0-9][a-z0-9._/-]*)"
+    ),
 )
 CODEX_STREAMING_TERM_GRACE_SECONDS = 5.0
 CODEX_READONLY_FINAL_MESSAGE_DEFAULT = "LGTM\n"
@@ -5562,6 +5593,7 @@ def _codex_model_fallback_error(
     stdout_path: pathlib.Path,
     stderr_path: pathlib.Path,
     primary_model: str,
+    fallback_model: str = CODEX_FALLBACK_MODEL_DEFAULT,
 ) -> bool:
     return _codex_model_fallback_error_output(
         stdout_tail=_read_binary_tail(
@@ -5573,6 +5605,7 @@ def _codex_model_fallback_error(
             max_bytes=CODEX_MODEL_FALLBACK_SCAN_BYTES,
         ),
         primary_model=primary_model,
+        fallback_model=fallback_model,
     )
 
 
@@ -5581,10 +5614,12 @@ def _codex_model_fallback_error_output(
     stdout_tail: bytes,
     stderr_tail: bytes,
     primary_model: str,
+    fallback_model: str = CODEX_FALLBACK_MODEL_DEFAULT,
 ) -> bool:
     if _codex_model_fallback_error_text(
         stderr_tail=stderr_tail,
         primary_model=primary_model,
+        fallback_model=fallback_model,
     ):
         return True
     for raw_line in stdout_tail.splitlines():
@@ -5605,7 +5640,7 @@ def _codex_model_fallback_error_output(
         if _codex_model_fallback_error_text(
             stderr_tail=event_text,
             primary_model=primary_model,
-            require_primary_model=False,
+            fallback_model=fallback_model,
             require_error_prefix=False,
         ):
             return True
@@ -5616,17 +5651,39 @@ def _codex_model_fallback_error_text(
     *,
     stderr_tail: bytes,
     primary_model: str,
-    require_primary_model: bool = True,
+    fallback_model: str,
     require_error_prefix: bool = True,
 ) -> bool:
     text = stderr_tail.decode("utf-8", errors="replace").lower()
     primary_model_lower = primary_model.lower()
+    fallback_model_lower = fallback_model.lower()
+    primary_model_aliases = {
+        primary_model_lower,
+        primary_model_lower.rsplit("/", 1)[-1],
+    }
+    configured_model_aliases = {
+        *primary_model_aliases,
+        fallback_model_lower,
+        fallback_model_lower.rsplit("/", 1)[-1],
+    }
     for line in text.splitlines():
         if require_error_prefix and not CODEX_MODEL_FALLBACK_STDERR_PREFIX_PATTERN.match(
             line.lstrip()
         ):
             continue
-        if require_primary_model and primary_model_lower not in line:
+        mentioned_models = {
+            model_reference
+            for pattern in CODEX_EXPLICIT_MODEL_REFERENCE_PATTERNS
+            for match in pattern.finditer(line)
+            for model_reference in (match.group("model").rstrip(".,;:!?"),)
+            if model_reference in configured_model_aliases
+            or (
+                any(character.isalpha() for character in model_reference)
+                and any(character.isdigit() for character in model_reference)
+            )
+            or any(character in "-./_" for character in model_reference)
+        }
+        if mentioned_models and mentioned_models.isdisjoint(primary_model_aliases):
             continue
         if any(
             fragment in line
@@ -5842,6 +5899,7 @@ def _run_prepared_review(prepared: dict[str, object]) -> int:
                         stdout_tail=_stdout_tail,
                         stderr_tail=stderr_tail,
                         primary_model=primary_model,
+                        fallback_model=fallback_model,
                     )
                 )
             else:
@@ -5860,6 +5918,7 @@ def _run_prepared_review(prepared: dict[str, object]) -> int:
                         stdout_path=stdout_path,
                         stderr_path=stderr_path,
                         primary_model=primary_model,
+                        fallback_model=fallback_model,
                     )
                 )
                 if child_returncode != 0 and not should_fallback:
@@ -6182,6 +6241,7 @@ def _run_child_from_spec(spec_path: pathlib.Path, *, expected_sha256: str) -> in
                             spec.get("codex_model_fallback_enabled")
                         )
                         primary_model = str(spec.get("codex_primary_model") or "")
+                        fallback_model = str(spec.get("codex_fallback_model") or "")
                         if (
                             fallback_enabled
                             and exit_code != 0
@@ -6189,11 +6249,9 @@ def _run_child_from_spec(spec_path: pathlib.Path, *, expected_sha256: str) -> in
                                 stdout_path=stdout_path,
                                 stderr_path=stderr_path,
                                 primary_model=primary_model,
+                                fallback_model=fallback_model,
                             )
                         ):
-                            fallback_model = str(
-                                spec.get("codex_fallback_model") or ""
-                            )
                             reasoning_effort = str(
                                 spec.get("codex_reasoning_effort") or ""
                             )
