@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import json
 import os
 import pathlib
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -18,7 +18,6 @@ from .common import (
     is_relative_to,
     resolve_git,
     run,
-    write_json,
     write_text_atomic,
 )
 from .prompt import build_review_prompt
@@ -240,8 +239,48 @@ def resolve_commit(repo: pathlib.Path, ref: str, *, label: str) -> str:
 def _new_container(source_root: pathlib.Path) -> pathlib.Path:
     stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
     suffix = uuid.uuid4().hex[:10]
-    container = source_root / ".codex-tmp" / f"isolated-review-{stamp}-{suffix}"
-    container.mkdir(parents=True, exist_ok=False)
+    review_root = source_root / ".codex-tmp"
+    try:
+        os.mkdir(review_root, mode=0o700)
+    except FileExistsError:
+        pass
+    try:
+        root_status = os.lstat(review_root)
+    except OSError as error:
+        raise ReviewError(
+            f"cannot inspect review root {review_root}: {error}"
+        ) from error
+    if not stat.S_ISDIR(root_status.st_mode) or stat.S_ISLNK(root_status.st_mode):
+        raise ReviewError(
+            f"review root must be a real directory, not a symlink: {review_root}"
+        )
+    if review_root.resolve() != review_root.absolute():
+        raise ReviewError(
+            f"review root resolves outside the source repository: {review_root}"
+        )
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        root_fd = os.open(review_root, flags)
+    except OSError as error:
+        raise ReviewError(
+            f"cannot securely open review root {review_root}: {error}"
+        ) from error
+    name = f"isolated-review-{stamp}-{suffix}"
+    container = review_root / name
+    try:
+        os.mkdir(name, mode=0o700, dir_fd=root_fd)
+        descriptor_status = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+        path_status = os.lstat(container)
+        if (descriptor_status.st_dev, descriptor_status.st_ino) != (
+            path_status.st_dev,
+            path_status.st_ino,
+        ):
+            raise ReviewError(
+                "review root changed while creating the private container"
+            )
+    finally:
+        os.close(root_fd)
     return container
 
 
@@ -513,29 +552,37 @@ def _write_frozen_diff(
             )
 
 
-def _frozen_changed_paths(
+def _write_frozen_changed_paths(
     *,
     git_view: pathlib.Path,
     object_directory: pathlib.Path,
     base_sha: str,
     head_sha: str,
-) -> list[str]:
-    result = run(
-        _frozen_command(
-            git_view=git_view,
-            args=(
-                "diff",
-                "--name-only",
-                "-z",
-                "--no-renames",
-                base_sha,
-                head_sha,
+    destination: pathlib.Path,
+) -> None:
+    with destination.open("xb") as output, tempfile.TemporaryFile() as error_output:
+        completed = subprocess.run(
+            _frozen_command(
+                git_view=git_view,
+                args=(
+                    "diff",
+                    "--name-only",
+                    "-z",
+                    "--no-renames",
+                    base_sha,
+                    head_sha,
+                ),
             ),
-        ),
-        env=_git_environment(object_directory=object_directory),
-        check=True,
-    )
-    return [os.fsdecode(value) for value in result.stdout.split(b"\0") if value]
+            env=_git_environment(object_directory=object_directory),
+            stdin=subprocess.DEVNULL,
+            stdout=output,
+            stderr=error_output,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise ReviewError(
+                f"cannot generate frozen changed paths: {_process_stderr(error_output)}"
+            )
 
 
 def validate_workspace_layout(review: ReviewWorkspace) -> None:
@@ -580,36 +627,41 @@ def validate_external_workspace(review: ReviewWorkspace) -> None:
             )
 
     sensitive_findings: list[str] = []
-    changed_paths_file = review.workspace_root / ".codex-review/changed-paths.json"
+    sensitive_finding_count = 0
+
+    def record_finding(value: str) -> None:
+        nonlocal sensitive_finding_count
+        sensitive_finding_count += 1
+        if len(sensitive_findings) < 10:
+            sensitive_findings.append(value)
+
+    changed_paths_file = review.workspace_root / ".codex-review/changed-paths.z"
     try:
-        changed_paths_value = json.loads(changed_paths_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        with changed_paths_file.open("rb") as handle:
+            for raw_path in _iter_nul_records(handle):
+                changed_path = os.fsdecode(raw_path)
+                path_rule = _sensitive_path_rule(changed_path)
+                if path_rule:
+                    record_finding(f"{changed_path} ({path_rule}; changed-path)")
+    except OSError as error:
         raise ReviewError(
             f"cannot validate external review changed paths: {error}"
         ) from error
-    if not isinstance(changed_paths_value, list) or not all(
-        isinstance(value, str) for value in changed_paths_value
-    ):
-        raise ReviewError("external review changed paths are not a JSON string list")
-    for changed_path in changed_paths_value:
-        path_rule = _sensitive_path_rule(changed_path)
-        if path_rule:
-            sensitive_findings.append(f"{changed_path} ({path_rule}; changed-path)")
     for candidate in review.workspace_root.rglob("*"):
         if candidate.is_symlink() or not candidate.is_file():
             continue
         relative = candidate.relative_to(review.workspace_root).as_posix()
         path_rule = _sensitive_path_rule(relative)
         if path_rule:
-            sensitive_findings.append(f"{relative} ({path_rule})")
+            record_finding(f"{relative} ({path_rule})")
             continue
         secret_rule = _file_secret_rule(candidate)
         if secret_rule:
-            sensitive_findings.append(f"{relative} ({secret_rule})")
-    if sensitive_findings:
-        summary = ", ".join(sensitive_findings[:10])
-        if len(sensitive_findings) > 10:
-            summary += f", and {len(sensitive_findings) - 10} more"
+            record_finding(f"{relative} ({secret_rule})")
+    if sensitive_finding_count:
+        summary = ", ".join(sensitive_findings)
+        if sensitive_finding_count > len(sensitive_findings):
+            summary += f", and {sensitive_finding_count - len(sensitive_findings)} more"
         raise ReviewError(
             "sensitive content preflight blocked external review; remove or narrow "
             f"these paths before egress: {summary}"
@@ -700,15 +752,13 @@ def prepare_workspace(
                 "the frozen head uses the reserved top-level .codex-review path"
             )
         control_dir.mkdir()
-        changed_paths_file = control_dir / "changed-paths.json"
-        write_json(
-            changed_paths_file,
-            _frozen_changed_paths(
-                git_view=git_view,
-                object_directory=object_directory,
-                base_sha=base_sha,
-                head_sha=head_sha,
-            ),
+        changed_paths_file = control_dir / "changed-paths.z"
+        _write_frozen_changed_paths(
+            git_view=git_view,
+            object_directory=object_directory,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            destination=changed_paths_file,
         )
         diff_file = control_dir / "review.diff"
         _write_frozen_diff(

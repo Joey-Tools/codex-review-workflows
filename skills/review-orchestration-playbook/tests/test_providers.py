@@ -27,7 +27,7 @@ class ProviderPolicyTest(unittest.TestCase):
         control.mkdir(parents=True)
         diff_file = control / "review.diff"
         diff_file.write_text("diff --git a/a b/a\n", encoding="utf-8")
-        (control / "changed-paths.json").write_text("[]\n", encoding="utf-8")
+        (control / "changed-paths.z").write_bytes(b"")
         prompt_file = control / "review.prompt"
         prompt_file.write_text("Review this diff.\n", encoding="utf-8")
         self.review = ReviewWorkspace(
@@ -475,9 +475,8 @@ class ProviderPolicyTest(unittest.TestCase):
         self,
         resolve: mock.Mock,
     ) -> None:
-        (self.review.workspace_root / ".codex-review/changed-paths.json").write_text(
-            '["config/.env.production"]\n',
-            encoding="utf-8",
+        (self.review.workspace_root / ".codex-review/changed-paths.z").write_bytes(
+            b"config/.env.production\0"
         )
         outcome = providers.run_review(
             review=self.review,

@@ -81,6 +81,7 @@ class WorkspaceTest(unittest.TestCase):
         self.assertIn(f"{self.base}..{self.head}", prompt)
         self.assertNotIn("Source repository:", prompt)
         self.assertFalse((review.workspace_root / ".git").exists())
+        self.assertEqual(review.container_dir.stat().st_mode & 0o777, 0o700)
         self.assertEqual(
             (review.workspace_root / "example.txt").read_text(encoding="utf-8"),
             "one\ntwo\n",
@@ -116,6 +117,19 @@ class WorkspaceTest(unittest.TestCase):
             )
         review_root = self.repo / ".codex-tmp"
         self.assertFalse(review_root.exists())
+
+    def test_review_root_symlink_is_rejected_without_writing_outside_repo(self) -> None:
+        outside = pathlib.Path(self.temporary.name) / "outside"
+        outside.mkdir()
+        (self.repo / ".codex-tmp").symlink_to(outside, target_is_directory=True)
+
+        with self.assertRaisesRegex(ReviewError, "not a symlink"):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+        self.assertEqual(list(outside.iterdir()), [])
 
     def test_reserved_control_path_in_base_is_rejected(self) -> None:
         control = self.repo / ".codex-review"
