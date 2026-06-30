@@ -303,6 +303,19 @@ def _restore_orchestration_signal_mask(
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
+def _publish_state_dir(
+    state_dir: pathlib.Path,
+    *,
+    on_published: Callable[[], None],
+) -> None:
+    publish_signal_mask = _block_forwarded_orchestration_signals()
+    try:
+        print(state_dir, flush=True)
+        on_published()
+    finally:
+        _restore_orchestration_signal_mask(publish_signal_mask)
+
+
 def _consume_pending_orchestration_signal() -> signal.Signals | None:
     if not hasattr(signal, "sigpending") or not hasattr(signal, "sigwait"):
         return None
@@ -4774,7 +4787,7 @@ def _state_launch_pending(
     pid: int | None,
     exit_code: int | None,
 ) -> bool:
-    if exit_code is not None or pid is not None:
+    if exit_code is not None:
         return False
 
     runner_spec_path = pathlib.Path(
@@ -5184,6 +5197,24 @@ def _trusted_child_path(*extra_entries: str, codex_path: str | None = None) -> s
     return os.pathsep.join(entries)
 
 
+def _claim_or_reuse_state_dir(
+    state_dir: pathlib.Path,
+    *,
+    allowed_root: pathlib.Path,
+) -> bool:
+    try:
+        state_dir.mkdir(parents=True)
+    except FileExistsError:
+        if not state_dir.is_dir():
+            raise UserError(f"state_dir is not a directory: {state_dir}")
+        if not _is_relative_to(state_dir.resolve(), allowed_root.resolve()):
+            raise UserError(
+                "state_dir must stay under the source repo's .codex-tmp directory"
+            )
+        return False
+    return True
+
+
 def _prepare_workspace(
     args: argparse.Namespace,
 ) -> tuple[
@@ -5192,6 +5223,7 @@ def _prepare_workspace(
     str | None,
     pathlib.Path,
     pathlib.Path,
+    bool,
     bool,
     bool,
 ]:
@@ -5210,6 +5242,7 @@ def _prepare_workspace(
     temp_parent = source_root / ".codex-tmp"
     temp_parent.mkdir(parents=True, exist_ok=True)
     created_workspace = False
+    created_container_dir = False
     if args.reuse_workspace:
         workspace_root = _validate_reused_workspace(
             pathlib.Path(args.reuse_workspace),
@@ -5227,13 +5260,17 @@ def _prepare_workspace(
                 raise UserError(
                     "state_dir must live under the source repo's .codex-tmp directory"
                 )
-            container_dir.mkdir(parents=True, exist_ok=True)
+            created_container_dir = _claim_or_reuse_state_dir(
+                container_dir,
+                allowed_root=temp_parent,
+            )
         else:
             container_dir = workspace_root.parent
     else:
         container_dir = pathlib.Path(
             tempfile.mkdtemp(prefix="isolated-review-", dir=temp_parent)
         )
+        created_container_dir = True
         workspace_root = container_dir / "workspace"
         created_workspace = True
 
@@ -5296,6 +5333,7 @@ def _prepare_workspace(
         workspace_root,
         created_workspace,
         cleanup_submodule_worktrees,
+        created_container_dir,
     )
 
 
@@ -5547,20 +5585,33 @@ def _build_child_process(
 def _validate_codex_model_policy(args: argparse.Namespace) -> None:
     if args.entrypoint not in {"codex-review", "codex-readonly", "codex-parallel"}:
         return
+    codex_model = getattr(args, "codex_model", CODEX_MODEL_DEFAULT)
+    codex_fallback_model = getattr(
+        args,
+        "codex_fallback_model",
+        CODEX_FALLBACK_MODEL_DEFAULT,
+    )
+    codex_reasoning_effort = getattr(
+        args,
+        "codex_reasoning_effort",
+        CODEX_REASONING_EFFORT_DEFAULT,
+    )
     for flag, value in (
-        ("--codex-model", args.codex_model),
-        ("--codex-fallback-model", args.codex_fallback_model),
-        ("--codex-reasoning-effort", args.codex_reasoning_effort),
+        ("--codex-model", codex_model),
+        ("--codex-fallback-model", codex_fallback_model),
+        ("--codex-reasoning-effort", codex_reasoning_effort),
     ):
         if not isinstance(value, str) or not value.strip():
             raise UserError(f"{flag} must be a non-empty string")
-    fallback_policy_enabled = not args.no_codex_model_fallback
+    fallback_policy_enabled = not bool(
+        getattr(args, "no_codex_model_fallback", False)
+    )
     if args.entrypoint == "codex-review":
         fallback_policy_enabled = _codex_model_fallback_enabled(
             args,
             entrypoint_label="codex-review",
         )
-    if fallback_policy_enabled and args.codex_model == args.codex_fallback_model:
+    if fallback_policy_enabled and codex_model == codex_fallback_model:
         raise UserError(
             "--codex-fallback-model must differ from --codex-model, or pass "
             "--no-codex-model-fallback"
@@ -5588,7 +5639,9 @@ def _codex_model_fallback_enabled(
 def _prepare_review_execution(args: argparse.Namespace) -> dict[str, object]:
     source_root: pathlib.Path | None = None
     workspace_root: pathlib.Path | None = None
+    container_dir: pathlib.Path | None = None
     created_workspace = False
+    created_container_dir = False
     cleanup_submodule_worktrees = False
     try:
         _validate_codex_model_policy(args)
@@ -5616,6 +5669,7 @@ def _prepare_review_execution(args: argparse.Namespace) -> dict[str, object]:
             workspace_root,
             created_workspace,
             cleanup_submodule_worktrees,
+            created_container_dir,
         ) = _prepare_workspace(args)
 
         if args.entrypoint == "codex-review" and not args.prepare_only:
@@ -5641,6 +5695,7 @@ def _prepare_review_execution(args: argparse.Namespace) -> dict[str, object]:
             "container_dir": container_dir,
             "workspace_root": workspace_root,
             "created_workspace": created_workspace,
+            "created_container_dir": created_container_dir,
             "cleanup_submodule_worktrees": cleanup_submodule_worktrees,
             "placeholders": placeholders,
         }
@@ -5706,6 +5761,12 @@ def _prepare_review_execution(args: argparse.Namespace) -> dict[str, object]:
             cleanup_error=None,
             keep_prepare_only_workspace=False,
         )
+        if (
+            created_container_dir
+            and not created_workspace
+            and container_dir is not None
+        ):
+            shutil.rmtree(container_dir, ignore_errors=True)
         if cleanup_error is not None and isinstance(error, UserError):
             raise UserError(f"{error}\n{cleanup_error}") from error
         if cleanup_error is not None:
@@ -6432,8 +6493,40 @@ def _run_prepared_review(prepared: dict[str, object]) -> int:
     child_env = prepared["child_env"]
     entrypoint_label = str(prepared.get("entrypoint_label") or "")
     if args.prepare_only:
-        print(workspace_root)
-        return 0
+        child_returncode = 1
+        cleanup_error: UserError | None = None
+        workspace_published = False
+        signal_state = OrchestrationSignalState()
+        signal_state.install()
+        try:
+            def mark_workspace_published() -> None:
+                nonlocal workspace_published
+                workspace_published = True
+
+            _publish_state_dir(
+                pathlib.Path(str(workspace_root)),
+                on_published=mark_workspace_published,
+            )
+            child_returncode = 0
+        except ForwardedOrchestrationSignal as error:
+            signal_state.pending_signal = error.signum
+            child_returncode = 128 + int(error.signum)
+        finally:
+            signal_state.suppress_raise = True
+            cleanup_error = _cleanup_prepared_workspace(
+                prepared,
+                child_returncode=child_returncode,
+                cleanup_error=cleanup_error,
+                keep_prepare_only_workspace=workspace_published,
+            )
+            child_returncode = _finalize_orchestration_signal_state(
+                signal_state,
+                child_returncode,
+            )
+        if cleanup_error is not None:
+            print(str(cleanup_error), file=sys.stderr)
+            return child_returncode if child_returncode != 0 else 1
+        return child_returncode
     child_returncode = 1
     cleanup_error: UserError | None = None
     signal_state = OrchestrationSignalState()
@@ -6627,6 +6720,8 @@ def _start_prepared_review(prepared: dict[str, object]) -> int:
     try:
         return _start_prepared_review_inner(prepared)
     except BaseException:
+        if bool(prepared.get("state_dir_published")):
+            raise
         cleanup_error = _cleanup_prepared_workspace(
             prepared,
             child_returncode=1,
@@ -6634,7 +6729,9 @@ def _start_prepared_review(prepared: dict[str, object]) -> int:
             keep_prepare_only_workspace=False,
             force_cleanup=True,
         )
-        if args.state_dir and not bool(prepared["created_workspace"]):
+        if bool(prepared.get("created_container_dir")) and not bool(
+            prepared["created_workspace"]
+        ):
             shutil.rmtree(
                 pathlib.Path(str(prepared["container_dir"])),
                 ignore_errors=True,
@@ -6801,6 +6898,7 @@ def _start_prepared_review_inner(prepared: dict[str, object]) -> int:
                 stderr=launcher_log,
                 start_new_session=True,
             )
+        pid_path.write_text(f"{process.pid}\n", encoding="utf-8")
         if pending_spawn_signal is not None:
             signal_runner(pending_spawn_signal)
             raise ForwardedOrchestrationSignal(pending_spawn_signal)
@@ -6811,7 +6909,13 @@ def _start_prepared_review_inner(prepared: dict[str, object]) -> int:
                 exit_code=process.returncode,
                 pid_path=pid_path,
             )
-        print(state_dir, flush=True)
+        _publish_state_dir(
+            state_dir,
+            on_published=lambda: prepared.__setitem__(
+                "state_dir_published",
+                True,
+            ),
+        )
         return 0
     except BaseException as error:
         if process is not None and process.poll() is None:
@@ -6826,6 +6930,26 @@ def _start_prepared_review_inner(prepared: dict[str, object]) -> int:
             except subprocess.TimeoutExpired:
                 signal_runner(signal.SIGKILL)
                 process.wait()
+        if (
+            bool(prepared.get("state_dir_published"))
+            and _read_exit_code(exit_code_path) is None
+        ):
+            if isinstance(error, ForwardedOrchestrationSignal):
+                terminal_exit_code = 128 + int(error.signum)
+            elif process is not None and isinstance(process.returncode, int):
+                terminal_exit_code = (
+                    128 + abs(process.returncode)
+                    if process.returncode < 0
+                    else process.returncode or 1
+                )
+            else:
+                terminal_exit_code = 1
+            _write_runner_terminal_state(
+                lock_path,
+                exit_code_path,
+                exit_code=terminal_exit_code,
+                pid_path=pid_path,
+            )
         raise
     finally:
         for forwarded, previous_handler in previous_signal_handlers.items():
@@ -7822,6 +7946,7 @@ def _maybe_cleanup_parallel_workspace(
 
 
 def _start_parallel_review(args: argparse.Namespace) -> int:
+    _validate_codex_model_policy(args)
     _reject_codex_parallel_customizations(args)
     codex_model = getattr(args, "codex_model", CODEX_MODEL_DEFAULT)
     codex_fallback_model = getattr(
@@ -7845,6 +7970,7 @@ def _start_parallel_review(args: argparse.Namespace) -> int:
         shared_workspace_root,
         shared_created_workspace,
         shared_cleanup_submodule_worktrees,
+        _shared_created_container_dir,
     ) = _prepare_workspace(args)
     launch_state: dict[str, object] = {
         "state_dir": None,
@@ -7918,6 +8044,44 @@ def _start_parallel_review(args: argparse.Namespace) -> int:
                 if cleanup_error is not None:
                     print(str(cleanup_error), file=sys.stderr)
         raise
+
+
+def _run_parallel_child_start_command(
+    command: list[str],
+    *,
+    cwd: pathlib.Path,
+    state_dir: pathlib.Path,
+    entrypoint: str,
+) -> subprocess.CompletedProcess[str]:
+    stdout_path = state_dir / f"{entrypoint}-start.stdout"
+    stderr_path = state_dir / f"{entrypoint}-start.stderr"
+    try:
+        with stdout_path.open("wb") as stdout_handle, stderr_path.open(
+            "wb"
+        ) as stderr_handle:
+            completed = _run_captured_process(
+                command=command,
+                workspace_root=cwd,
+                child_env=os.environ.copy(),
+                stdin_bytes=None,
+                stdout_handle=stdout_handle,
+                stderr_handle=stderr_handle,
+            )
+        stdout_bytes = b""
+        stderr_bytes = b""
+        if stdout_path.stat().st_size:
+            stdout_bytes, _ = _read_bounded_file_diagnostic(stdout_path)
+        if stderr_path.stat().st_size:
+            stderr_bytes, _ = _read_bounded_file_diagnostic(stderr_path)
+        return subprocess.CompletedProcess(
+            command,
+            completed.returncode,
+            stdout_bytes.decode("utf-8", errors="replace"),
+            stderr_bytes.decode("utf-8", errors="replace"),
+        )
+    finally:
+        stdout_path.unlink(missing_ok=True)
+        stderr_path.unlink(missing_ok=True)
 
 
 def _start_parallel_review_prepared(
@@ -8004,12 +8168,11 @@ def _start_parallel_review_prepared(
             command.append("--keep-on-failure")
         if args.keep_workspace:
             command.append("--keep-workspace")
-        completed = subprocess.run(
+        completed = _run_parallel_child_start_command(
             command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
+            cwd=source_root,
+            state_dir=state_dir,
+            entrypoint=entrypoint,
         )
         if completed.returncode != 0:
             shutil.rmtree(child_state_dir, ignore_errors=True)
@@ -8082,8 +8245,10 @@ def _start_parallel_review_prepared(
         state["child_states"] = child_states
         _save_state(state_dir, state)
 
-    print(state_dir, flush=True)
-    launch_state["published"] = True
+    _publish_state_dir(
+        state_dir,
+        on_published=lambda: launch_state.__setitem__("published", True),
+    )
     return 0
 
 

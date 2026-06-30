@@ -5299,10 +5299,11 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                 shared_workspace,
                 True,
                 False,
+                True,
             ),
         ), mock.patch.object(
-            module.subprocess,
-            "run",
+            module,
+            "_run_parallel_child_start_command",
             return_value=subprocess.CompletedProcess(
                 args=["child"],
                 returncode=1,
@@ -5426,6 +5427,23 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                 )
             raise AssertionError(f"unexpected subprocess.run call: {cmd}")
 
+        def fake_parallel_child_start(
+            cmd: list[str],
+            **_: object,
+        ) -> subprocess.CompletedProcess[str]:
+            entrypoint = cmd[cmd.index("--entrypoint") + 1]
+            target_state_dir = (
+                readonly_state_dir
+                if entrypoint == "codex-readonly"
+                else agentic_state_dir
+            )
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout=f"{target_state_dir}\n",
+                stderr="",
+            )
+
         with mock.patch.object(
             module,
             "_prepare_workspace",
@@ -5437,6 +5455,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                 shared_workspace,
                 True,
                 False,
+                True,
             ),
         ), mock.patch.object(
             module.tempfile,
@@ -5450,6 +5469,10 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
             module.subprocess,
             "run",
             side_effect=fake_subprocess_run,
+        ), mock.patch.object(
+            module,
+            "_run_parallel_child_start_command",
+            side_effect=fake_parallel_child_start,
         ), mock.patch.object(
             module,
             "_resolve_real_git",
@@ -9756,22 +9779,92 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
             "placeholders": {},
             "command": [],
             "workspace_root": self.repo,
+            "source_root": self.repo,
+            "created_workspace": True,
+            "cleanup_submodule_worktrees": False,
             "child_env": {},
             "entrypoint_label": "prepare-only",
         }
         target_signal = module.signal.SIGQUIT
+        cleanup_mock = mock.Mock(return_value=None)
+        restore_calls = 0
 
-        def interrupt_print(*_args: object, **_kwargs: object) -> None:
+        def deliver_signal_after_publish(_mask: object) -> None:
+            nonlocal restore_calls
+            restore_calls += 1
+            if restore_calls != 1:
+                return
             handler = module.signal.getsignal(target_signal)
             assert callable(handler)
             handler(int(target_signal), None)
 
-        with mock.patch("builtins.print", side_effect=interrupt_print):
-            result = module._run_with_orchestration_signals(
-                lambda: module._run_prepared_review(prepared)
-            )
+        with mock.patch.object(
+            module,
+            "_block_forwarded_orchestration_signals",
+            return_value=set(),
+        ):
+            with mock.patch.object(
+                module,
+                "_restore_orchestration_signal_mask",
+                side_effect=deliver_signal_after_publish,
+            ):
+                with mock.patch.object(
+                    module,
+                    "_cleanup_prepared_workspace",
+                    cleanup_mock,
+                ):
+                    result = module._run_prepared_review(prepared)
 
         self.assertEqual(result, 128 + int(target_signal))
+        self.assertTrue(cleanup_mock.call_args.kwargs["keep_prepare_only_workspace"])
+
+    def test_state_dir_claim_atomically_distinguishes_owner(self) -> None:
+        module = self._load_script_module()
+        allowed_root = self.root / "state-root"
+        allowed_root.mkdir()
+        state_dir = allowed_root / "state-dir"
+
+        self.assertTrue(
+            module._claim_or_reuse_state_dir(
+                state_dir,
+                allowed_root=allowed_root,
+            )
+        )
+        marker_path = state_dir / "marker"
+        marker_path.write_text("preserve\n", encoding="utf-8")
+        self.assertFalse(
+            module._claim_or_reuse_state_dir(
+                state_dir,
+                allowed_root=allowed_root,
+            )
+        )
+        self.assertEqual(marker_path.read_text(encoding="utf-8"), "preserve\n")
+
+    def test_prepare_only_output_failure_cleans_unpublished_workspace(self) -> None:
+        module = self._load_script_module()
+        prepared = {
+            "args": argparse.Namespace(prepare_only=True),
+            "placeholders": {},
+            "command": [],
+            "workspace_root": self.repo,
+            "source_root": self.repo,
+            "created_workspace": True,
+            "cleanup_submodule_worktrees": False,
+            "child_env": {},
+            "entrypoint_label": "prepare-only",
+        }
+        cleanup_mock = mock.Mock(return_value=None)
+
+        with mock.patch("builtins.print", side_effect=BrokenPipeError):
+            with mock.patch.object(
+                module,
+                "_cleanup_prepared_workspace",
+                cleanup_mock,
+            ):
+                with self.assertRaises(BrokenPipeError):
+                    module._run_prepared_review(prepared)
+
+        self.assertFalse(cleanup_mock.call_args.kwargs["keep_prepare_only_workspace"])
 
     def test_stateful_start_defers_spawn_signal_and_cleans_unpublished_state(self) -> None:
         if os.name != "posix" or not hasattr(signal, "SIGQUIT"):
@@ -9793,6 +9886,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
             "workspace_root": self.repo,
             "source_root": self.repo,
             "created_workspace": False,
+            "created_container_dir": True,
             "cleanup_submodule_worktrees": False,
             "placeholders": {"{report_file}": None, "{review_range}": None},
             "final_path": None,
@@ -9851,6 +9945,266 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         killpg_mock.assert_any_call(process.pid, target_signal)
         self.assertFalse(state_dir.exists())
 
+    def test_stateful_start_publishes_runner_pid_before_state_dir(self) -> None:
+        module = self._load_script_module()
+        state_dir = self.root / "stateful-start-pid-handoff"
+        state_dir.mkdir()
+        args = argparse.Namespace(
+            prepare_only=False,
+            lane="custom",
+            state_dir=str(state_dir),
+            keep_on_failure=False,
+            keep_workspace=False,
+            reuse_workspace=str(self.repo),
+        )
+        prepared = {
+            "args": args,
+            "container_dir": state_dir,
+            "workspace_root": self.repo,
+            "source_root": self.repo,
+            "created_workspace": False,
+            "created_container_dir": True,
+            "cleanup_submodule_worktrees": False,
+            "placeholders": {"{report_file}": None, "{review_range}": None},
+            "final_path": None,
+            "stdin_bytes": None,
+            "child_env": os.environ.copy(),
+            "command": ["fake-review"],
+            "entrypoint_label": "agent",
+            "base_ref": None,
+            "head_ref": None,
+            "prompt_delivery": "none",
+            "codex_model_fallback_enabled": False,
+            "codex_primary_model": None,
+            "codex_fallback_model": None,
+            "codex_reasoning_effort": None,
+        }
+
+        class FakeProcess:
+            pid = 4262
+            returncode: int | None = None
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+        def observe_state_dir(*_args: object, **_kwargs: object) -> None:
+            self.assertEqual(
+                (state_dir / "pid").read_text(encoding="utf-8"),
+                f"{FakeProcess.pid}\n",
+            )
+
+        with mock.patch.object(
+            module.subprocess,
+            "Popen",
+            return_value=FakeProcess(),
+        ):
+            with mock.patch("builtins.print", side_effect=observe_state_dir):
+                result = module._start_prepared_review_inner(prepared)
+
+        self.assertEqual(result, 0)
+        self.assertTrue(prepared["state_dir_published"])
+
+    def test_prelock_runner_pid_remains_launch_pending(self) -> None:
+        module = self._load_script_module()
+        state_dir = self.root / "prelock-runner"
+        state_dir.mkdir()
+        runner_spec_path = state_dir / "runner-spec.json"
+        runner_spec_path.write_text("{}\n", encoding="utf-8")
+        state = {
+            "runner_spec_path": str(runner_spec_path),
+            "started_at": time.time(),
+        }
+
+        self.assertTrue(
+            module._state_launch_pending(
+                state_dir,
+                state,
+                pid=4266,
+                exit_code=None,
+            )
+        )
+        state["started_at"] = time.time() - module.STATEFUL_LAUNCH_GRACE_SECONDS - 1
+        self.assertFalse(
+            module._state_launch_pending(
+                state_dir,
+                state,
+                pid=4266,
+                exit_code=None,
+            )
+        )
+
+    def test_published_stateful_signal_writes_terminal_state(self) -> None:
+        if os.name != "posix":
+            self.skipTest("POSIX process-group signaling is required")
+        module = self._load_script_module()
+        state_dir = self.root / "published-stateful-signal"
+        state_dir.mkdir()
+        args = argparse.Namespace(
+            prepare_only=False,
+            lane="custom",
+            state_dir=str(state_dir),
+            keep_on_failure=False,
+            keep_workspace=False,
+            reuse_workspace=str(self.repo),
+        )
+        prepared = {
+            "args": args,
+            "container_dir": state_dir,
+            "workspace_root": self.repo,
+            "source_root": self.repo,
+            "created_workspace": False,
+            "created_container_dir": True,
+            "cleanup_submodule_worktrees": False,
+            "placeholders": {"{report_file}": None, "{review_range}": None},
+            "final_path": None,
+            "stdin_bytes": None,
+            "child_env": os.environ.copy(),
+            "command": ["fake-review"],
+            "entrypoint_label": "agent",
+            "base_ref": None,
+            "head_ref": None,
+            "prompt_delivery": "none",
+            "codex_model_fallback_enabled": False,
+            "codex_primary_model": None,
+            "codex_fallback_model": None,
+            "codex_reasoning_effort": None,
+        }
+        target_signal = module.signal.SIGTERM
+
+        class FakeProcess:
+            pid = 4267
+            returncode: int | None = None
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def wait(self, timeout: float | None = None) -> int:
+                self.returncode = -int(target_signal)
+                return self.returncode
+
+        def deliver_signal(_mask: object) -> None:
+            handler = module.signal.getsignal(target_signal)
+            assert callable(handler)
+            handler(int(target_signal), None)
+
+        with mock.patch.object(
+            module.subprocess,
+            "Popen",
+            return_value=FakeProcess(),
+        ):
+            with mock.patch.object(module.os, "killpg") as killpg_mock:
+                with mock.patch.object(
+                    module,
+                    "_block_forwarded_orchestration_signals",
+                    return_value=set(),
+                ):
+                    with mock.patch.object(
+                        module,
+                        "_restore_orchestration_signal_mask",
+                        side_effect=deliver_signal,
+                    ):
+                        with mock.patch("sys.stdout", new=io.StringIO()):
+                            with self.assertRaises(
+                                module.ForwardedOrchestrationSignal
+                            ):
+                                module._start_prepared_review(prepared)
+
+        killpg_mock.assert_any_call(FakeProcess.pid, target_signal)
+        self.assertEqual(
+            (state_dir / "exit_code").read_text(encoding="utf-8"),
+            f"{128 + int(target_signal)}\n",
+        )
+        self.assertFalse((state_dir / "pid").exists())
+
+    def test_stateful_start_failure_preserves_preexisting_state_dir(self) -> None:
+        module = self._load_script_module()
+        state_dir = self.root / "preexisting-state-dir"
+        state_dir.mkdir()
+        marker_path = state_dir / "existing-state.json"
+        marker_path.write_text("preserve\n", encoding="utf-8")
+        args = argparse.Namespace(
+            state_dir=str(state_dir),
+            reuse_workspace=str(self.repo),
+            keep_workspace=False,
+            keep_on_failure=False,
+            prepare_only=False,
+        )
+        prepared = {
+            "args": args,
+            "container_dir": state_dir,
+            "workspace_root": self.repo,
+            "source_root": self.repo,
+            "created_workspace": False,
+            "created_container_dir": False,
+            "cleanup_submodule_worktrees": False,
+        }
+
+        with mock.patch.object(
+            module,
+            "_start_prepared_review_inner",
+            side_effect=module.UserError("review state is already running"),
+        ):
+            with self.assertRaises(module.UserError):
+                module._start_prepared_review(prepared)
+
+        self.assertEqual(marker_path.read_text(encoding="utf-8"), "preserve\n")
+
+    def test_stateful_start_signal_preserves_published_state_dir(self) -> None:
+        module = self._load_script_module()
+        state_dir = self.root / "published-state-dir"
+        state_dir.mkdir()
+        marker_path = state_dir / "state.json"
+        marker_path.write_text("published\n", encoding="utf-8")
+        prepared = {
+            "args": argparse.Namespace(),
+            "container_dir": state_dir,
+            "workspace_root": self.repo,
+            "source_root": self.repo,
+            "created_workspace": False,
+            "created_container_dir": True,
+            "cleanup_submodule_worktrees": False,
+            "state_dir_published": True,
+        }
+        cleanup_mock = mock.Mock(return_value=None)
+
+        with mock.patch.object(
+            module,
+            "_start_prepared_review_inner",
+            side_effect=module.ForwardedOrchestrationSignal(module.signal.SIGTERM),
+        ):
+            with mock.patch.object(
+                module,
+                "_cleanup_prepared_workspace",
+                cleanup_mock,
+            ):
+                with self.assertRaises(module.ForwardedOrchestrationSignal):
+                    module._start_prepared_review(prepared)
+
+        cleanup_mock.assert_not_called()
+        self.assertEqual(marker_path.read_text(encoding="utf-8"), "published\n")
+
+    def test_parallel_validates_model_policy_before_workspace_setup(self) -> None:
+        module = self._load_script_module()
+        args = module._build_parser().parse_args(
+            [
+                "--repo",
+                str(self.repo),
+                "--entrypoint",
+                "codex-parallel",
+                "--codex-model",
+                "same-model",
+                "--codex-fallback-model",
+                "same-model",
+            ]
+        )
+
+        with mock.patch.object(module, "_prepare_workspace") as prepare_mock:
+            with self.assertRaises(module.UserError) as raised:
+                module._start_parallel_review(args)
+
+        self.assertIn("must differ", str(raised.exception))
+        prepare_mock.assert_not_called()
+
     def test_parallel_start_signal_cleans_partial_children_and_shared_workspace(self) -> None:
         if os.name != "posix" or not hasattr(signal, "SIGQUIT"):
             self.skipTest("POSIX SIGQUIT process-group signaling is required")
@@ -9898,6 +10252,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                 shared_workspace,
                 True,
                 False,
+                True,
             ),
         ):
             with mock.patch.object(
@@ -11497,6 +11852,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
 
         class _ImmediateExitProcess:
             def __init__(self, returncode: int) -> None:
+                self.pid = 4263
                 self.returncode = returncode
 
             def poll(self) -> int:
@@ -11565,6 +11921,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
 
         class _ImmediateExitProcess:
             def __init__(self, returncode: int) -> None:
+                self.pid = 4264
                 self.returncode = returncode
 
             def poll(self) -> int:
@@ -11641,6 +11998,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
 
         class _ImmediateExitProcess:
             def __init__(self, returncode: int) -> None:
+                self.pid = 4265
                 self.returncode = returncode
 
             def poll(self) -> int:
