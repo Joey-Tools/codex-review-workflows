@@ -8605,6 +8605,18 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         )
 
         stderr_path.write_text(
+            "Error: The 'gpt-5.6-sol' model is overloaded\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            module._codex_model_fallback_error(
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                primary_model="gpt-5.6-sol",
+            )
+        )
+
+        stderr_path.write_text(
             "Error: The model gpt-5.5 is overloaded\n",
             encoding="utf-8",
         )
@@ -8618,6 +8630,9 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
 
         for message in (
             "Error: The gpt-5.5 model is overloaded\n",
+            "Error: The 'gpt-5.5' model is overloaded\n",
+            'Error: The "gpt-5.5" model is overloaded\n',
+            "Error: The `gpt-5.5` model is overloaded\n",
             "Error: The model gpt-4o is unavailable\n",
             "Error: The model gpt-5.5 not found\n",
             "Error: The model other-model is overloaded\n",

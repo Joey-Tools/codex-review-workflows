@@ -187,7 +187,8 @@ CODEX_EXPLICIT_MODEL_REFERENCE_PATTERNS = (
         r"(?=\s*(?:[\"'`}\],.!?;:]|$))"
     ),
     re.compile(
-        r"\b(?P<model>[a-z0-9][a-z0-9._/-]*)\s+model"
+        r"(?<![a-z0-9._/-])(?P<model_quote>[\"'`]?)"
+        r"(?P<model>[a-z0-9][a-z0-9._/-]*)(?P=model_quote)\s+model"
         r"\s+(?=(?:cannot|does|has|is|not|was)\b)"
     ),
     re.compile(
