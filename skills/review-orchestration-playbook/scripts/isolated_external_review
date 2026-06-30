@@ -11,6 +11,7 @@ import json
 import os
 import pathlib
 import re
+import select
 import shutil
 import signal
 import subprocess
@@ -197,6 +198,9 @@ CODEX_EXPLICIT_MODEL_REFERENCE_PATTERNS = (
     ),
 )
 CODEX_STREAMING_TERM_GRACE_SECONDS = 5.0
+CODEX_STREAMING_PUMP_POLL_SECONDS = 0.1
+CODEX_STREAMING_PUMP_JOIN_SECONDS = 1.0
+CODEX_STREAMING_POST_EXIT_DRAIN_BYTES = 64 * 1024
 CODEX_READONLY_FINAL_MESSAGE_DEFAULT = "LGTM\n"
 CODEX_READONLY_FINAL_MESSAGE_ALIASES = frozenset(
     {
@@ -5761,38 +5765,93 @@ def _run_streaming_codex_attempt(
         stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        start_new_session=os.name == "posix",
     )
     stdout_tail = bytearray()
     stderr_tail = bytearray()
+
+    stop_pumps = threading.Event()
 
     def pump(
         source: BinaryIO,
         stream: object,
         tail: bytearray,
+        eof_reached: threading.Event,
     ) -> None:
         stream_failed = False
-        while True:
-            payload = source.read(8192)
-            if not payload:
-                break
+        post_exit_bytes = 0
+
+        def consume(payload: bytes) -> None:
+            nonlocal stream_failed
             _append_bounded_tail(tail, payload)
             if stream_failed:
-                continue
+                return
             try:
                 _emit_binary_bytes(payload, stream)
             except (BrokenPipeError, OSError, ValueError):
                 stream_failed = True
 
+        try:
+            source_fd = source.fileno()
+        except (AttributeError, OSError, ValueError):
+            while True:
+                payload = source.read(8192)
+                if not payload:
+                    eof_reached.set()
+                    return
+                consume(payload)
+
+        while True:
+            timeout = 0.0 if stop_pumps.is_set() else CODEX_STREAMING_PUMP_POLL_SECONDS
+            try:
+                readable, _, _ = select.select([source_fd], [], [], timeout)
+            except (OSError, ValueError):
+                return
+            if not readable:
+                if stop_pumps.is_set():
+                    return
+                continue
+            try:
+                payload = os.read(source_fd, 8192)
+            except OSError:
+                return
+            if not payload:
+                eof_reached.set()
+                return
+            consume(payload)
+            if stop_pumps.is_set():
+                post_exit_bytes += len(payload)
+                if post_exit_bytes >= CODEX_STREAMING_POST_EXIT_DRAIN_BYTES:
+                    return
+
+    def signal_process_group(sig: signal.Signals) -> None:
+        process_pid = getattr(process, "pid", None)
+        if os.name == "posix" and isinstance(process_pid, int):
+            try:
+                os.killpg(process_pid, sig)
+                return
+            except ProcessLookupError:
+                return
+        try:
+            if sig == signal.SIGTERM:
+                process.terminate()
+            else:
+                process.kill()
+        except ProcessLookupError:
+            pass
+
     assert process.stdout is not None
     assert process.stderr is not None
+    stdout_eof = threading.Event()
+    stderr_eof = threading.Event()
     stdout_thread = threading.Thread(
         target=pump,
-        args=(process.stdout, sys.stdout, stdout_tail),
+        args=(process.stdout, sys.stdout, stdout_tail, stdout_eof),
         daemon=True,
     )
     stderr_thread = threading.Thread(
         target=pump,
-        args=(process.stderr, sys.stderr, stderr_tail),
+        args=(process.stderr, sys.stderr, stderr_tail, stderr_eof),
         daemon=True,
     )
     stdout_thread.start()
@@ -5811,24 +5870,28 @@ def _run_streaming_codex_attempt(
         returncode = process.wait()
     except BaseException:
         if process.poll() is None:
-            try:
-                process.terminate()
-            except ProcessLookupError:
-                pass
+            signal_process_group(signal.SIGTERM)
             try:
                 process.wait(timeout=CODEX_STREAMING_TERM_GRACE_SECONDS)
             except subprocess.TimeoutExpired:
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
+                signal_process_group(signal.SIGKILL)
                 process.wait()
         raise
     finally:
-        stdout_thread.join()
-        stderr_thread.join()
-        process.stdout.close()
-        process.stderr.close()
+        stop_pumps.set()
+        stdout_thread.join(timeout=CODEX_STREAMING_PUMP_JOIN_SECONDS)
+        stderr_thread.join(timeout=CODEX_STREAMING_PUMP_JOIN_SECONDS)
+        if not stdout_eof.is_set() or not stderr_eof.is_set():
+            signal_process_group(signal.SIGTERM)
+        for source in (process.stdout, process.stderr):
+            try:
+                source.close()
+            except (OSError, ValueError):
+                pass
+        stdout_thread.join(timeout=CODEX_STREAMING_PUMP_JOIN_SECONDS)
+        stderr_thread.join(timeout=CODEX_STREAMING_PUMP_JOIN_SECONDS)
+    if stdout_thread.is_alive() or stderr_thread.is_alive():
+        raise UserError("streaming Codex output pump did not stop within the bounded timeout")
     return returncode, bytes(stdout_tail), bytes(stderr_tail)
 
 

@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 from unittest import mock
@@ -8930,6 +8931,86 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         )
         self.assertEqual(stdout_tail, b"x" * module.CODEX_MODEL_FALLBACK_SCAN_BYTES)
         self.assertEqual(stderr_tail, b"")
+
+    def test_streaming_codex_attempt_forwards_small_output_before_exit(self) -> None:
+        module = self._load_script_module()
+
+        class RecordingBuffer:
+            def __init__(self) -> None:
+                self.payload = bytearray()
+                self.first_write = threading.Event()
+
+            def write(self, payload: bytes) -> None:
+                self.payload.extend(payload)
+                self.first_write.set()
+
+            def flush(self) -> None:
+                return
+
+        class RecordingStream:
+            def __init__(self) -> None:
+                self.buffer = RecordingBuffer()
+
+        stream = RecordingStream()
+        completed = threading.Event()
+        result: list[tuple[int, bytes, bytes]] = []
+
+        def run_attempt() -> None:
+            try:
+                result.append(
+                    module._run_streaming_codex_attempt(
+                        command=[
+                            sys.executable,
+                            "-c",
+                            (
+                                "import sys, time; "
+                                "sys.stdout.write('first\\n'); sys.stdout.flush(); "
+                                "time.sleep(2); "
+                                "sys.stdout.write('second\\n'); sys.stdout.flush()"
+                            ),
+                        ],
+                        workspace_root=self.repo,
+                        child_env=os.environ.copy(),
+                        stdin_bytes=None,
+                    )
+                )
+            finally:
+                completed.set()
+
+        with mock.patch.object(module.sys, "stdout", stream):
+            thread = threading.Thread(target=run_attempt)
+            thread.start()
+            self.assertTrue(stream.buffer.first_write.wait(timeout=1.5))
+            self.assertFalse(completed.is_set())
+            thread.join(timeout=5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result, [(0, b"first\nsecond\n", b"")])
+        self.assertEqual(bytes(stream.buffer.payload), b"first\nsecond\n")
+
+    def test_streaming_codex_attempt_does_not_wait_for_inherited_pipe(self) -> None:
+        module = self._load_script_module()
+        started_at = time.monotonic()
+
+        returncode, stdout_tail, stderr_tail = module._run_streaming_codex_attempt(
+            command=[
+                sys.executable,
+                "-c",
+                (
+                    "import subprocess, sys; "
+                    "subprocess.Popen([sys.executable, '-c', "
+                    "'import time; time.sleep(30)'])"
+                ),
+            ],
+            workspace_root=self.repo,
+            child_env=os.environ.copy(),
+            stdin_bytes=None,
+        )
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(stdout_tail, b"")
+        self.assertEqual(stderr_tail, b"")
+        self.assertLess(time.monotonic() - started_at, 4.0)
 
     def test_streaming_codex_attempt_kills_and_reaps_child_after_exception(self) -> None:
         module = self._load_script_module()
