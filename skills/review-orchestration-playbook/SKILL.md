@@ -1,81 +1,91 @@
 ---
 name: review-orchestration-playbook
-description: Orchestrate the user's helper-backed internal Codex review, local double review, triple review, clean-context GPT/Codex subagent fallback, offline-frozen-diff-review baselines, explicit opt-in external reviewer lanes, and direct findings-only review-only child prompts when entrypoint choice, sandbox/runtime shape, frozen review scope, deterministic fallback behavior, or bounded evidence reads are part of the problem. Do not orchestrate review-only child prompts that forbid starting reviewers; those prompts should directly inspect and output findings.
+description: Orchestrate Joey's single, double, and triple code reviews plus PR readiness through one pinned review workflow. Use for helper-backed or clean-context Codex review, Claude-family review, GitHub `@codex review`, review-only child prompts, PR comment/CI fix loops, or merge-readiness. Local double review means one Codex lane plus one Claude-family lane; triple review adds the current-head GitHub Codex PR review. Review-only children that forbid orchestration should inspect directly and return findings only.
 ---
 
 # Review Orchestration Playbook
 
-## Overview
+## Review Shapes
 
-Use this skill when the hard part is not "what code changed" but "which review lane can produce a trustworthy final result in the current environment."
+Count independent reviewer families, not retries, helper implementations, or fallback attempts.
 
-For PR readiness, load `$pr-readiness-review-workflow` first. That workflow owns `independent-codex-pr-review` and also checks the separate best-effort-by-default GitHub `@codex review` / `codex/review-gate` lane when it exists or is required by branch protection. This playbook provides `offline-frozen-diff-review` and explicit external-review opt-ins; it must not silently replace either PR-level lane.
+- Single/local internal review: one clean-context Codex lane.
+- Local double review / `本地双重 review`: the Codex lane plus one Claude-family lane.
+- Triple review / `三重 review`: local double review plus GitHub Codex review on the current PR head, triggered automatically by the repository or with the exact `@codex review` comment.
+- PR readiness: the requested review shape plus required CI, PR comments/conversation resolution, and branch/base checks. Those delivery gates do not increase the review count.
+
+The explicit phrases `double review`, `双重 review`, `triple review`, and `三重 review` are contemporaneous user consent for the scoped Claude-family lane. That consent covers any necessary tracked code in the named repository at the frozen head, the generated diff, and the review prompt/result sent to Anthropic Claude Code and, only under the pinned fallback policy, GitHub Copilot. It never covers credentials, untracked files, unrelated repositories, broad workspace dumps, or home-directory content. Read [egress-consent.md](references/egress-consent.md) before starting that lane.
+
+## Pinned Local Review Policy
+
+The helper and the clean-context `reviewer` agent use explicit models; they do not inherit a possibly older parent or global default.
+
+- Codex CLI: `gpt-5.6-sol` with `xhigh`; fall back to `gpt-5.5` with `xhigh` only after an explicit account, plan, organization-policy, or model-entitlement denial.
+- Claude Code: `claude-opus-4-8` with `max`; fall back to `claude-opus-4-7` with `max` under the same entitlement-only rule.
+- Copilot CLI: use only after Claude Code is unavailable or both Claude Code models are entitlement-blocked; try `claude-opus-4.8` with `max`, then `claude-opus-4.7` with `max` under the same rule.
+
+Capacity, overload, rate limits, timeouts, network errors, 5xx responses, missing final artifacts, silent model substitution, or reviewer findings are not model-fallback reasons. Retry the same runtime/model only within a bounded transient retry policy; otherwise report `inconclusive`. Authentication, invalid configuration, or an unexpected effective model is `blocked`, not a reason to downgrade models.
 
 ## Workflow
 
-1. Classify the review job first.
-- Review-only child lane: if the prompt says `independent code reviewer`, `review-only`, `不要启动其他 reviewer`, `不要等待 CI`, or `不要执行 PR readiness orchestration`, perform direct findings-only code review and apply the evidence-budget rules in step 3 even when the prompt omits them or includes a shortened `Evidence-budget contract`. Do not call `$pr-readiness-review-workflow` and do not start another helper or external reviewer.
-- Parent PR readiness `independent-codex-pr-review` orchestration: do not handle it here as a helper lane. Use `$pr-readiness-review-workflow` and start a separate Codex CLI review-only thread for the PR.
-- Local double review / `本地双重 review`: when the user explicitly asks for this shape and non-Codex reviewer opt-in/consent is present, run one local external lane plus one local Codex lane. Keep existing external-lane priorities such as OpenCode, Cursor `agent`, Copilot, or Claude, but this phrase alone does not authorize non-Codex external egress for private or unverified code; if consent is missing, report the external lane as blocked unless the user explicitly accepts an exception.
-- Triple review / `三重 review`: use `$pr-readiness-review-workflow` because it adds PR `github-codex-review` evidence to the locally authorized double-review shape and owns PR egress consent, independent Codex PR review, CI, comments, and merge-readiness gates. Triple-review wording authorizes the Codex/GitHub lanes covered by PR readiness consent; if the local double-review half includes a non-Codex external reviewer, confirm that separate non-Codex opt-in/consent before launch. If that consent is missing, report the non-Codex half as blocked rather than silently downgrading the triple-review request to Codex-only.
-- `offline-frozen-diff-review` / internal Codex review: default to `codex-readonly` when the review needs an enforceable evidence budget, a large/generated diff is possible, or the child prompt must preserve exact bounded-read instructions. Use `codex-review` only for narrow scopes where its builtin `codex exec review` prompt is acceptable; fall back to `codex-readonly` as soon as `codex-review` cannot honor the required prompt contract. Use `codex-parallel` only when the caller explicitly wants dual-lane coverage and can consume an aggregate final artifact.
-- Non-Codex external review: choose among `opencode`, Cursor `agent`, `copilot`, `gh copilot`, Claude, or similar only when the user explicitly asks for that lane or the active workflow explicitly marks it opt-in.
-- Fresh-context GPT/Codex subagent review requests are still review-lane work. First decide whether the helper-backed `codex-review` / `codex-readonly` lane satisfies the request. If that Codex helper lane is unavailable, blocked, or inconclusive and a subagent fallback is still needed, use only a clean-context `reviewer` agent role with the latest configured model and highest configured reasoning effort. Do not prompt a `default` coding worker, inherited-context subagent, or parent-thread continuation as the reviewer; if the clean-context `reviewer` role cannot provide the requested model/reasoning shape, report the fallback as blocked instead of weakening it silently.
-- When `codex-readonly` is the chosen lane, default to the helper's `stateful start|status|wait|final` lifecycle instead of a plain one-shot run.
-- A helper-backed subagent/internal lane is not equivalent to `independent-codex-pr-review`, and GitHub `@codex review` / `codex/review-gate` is also a separate best-effort-by-default lane. Do not substitute any one of these for another in PR readiness gates.
+1. Classify the request.
+- Review-only child: if the prompt says `independent code reviewer`, `review-only`, `不要启动其他 reviewer`, `不要等待 CI`, or equivalent, inspect the supplied scope directly and return findings only. Do not start this workflow, another reviewer, PR actions, fixes, or CI waiting.
+- Local single/double review: freeze the exact `base_sha..head_sha`, then run the requested local lanes through the helper.
+- Triple review: establish the PR/current head, run the local double review, then require final current-head GitHub Codex evidence.
+- PR readiness/full workflow: follow [pr-readiness.md](references/pr-readiness.md) after the local delivery commit exists.
 
-2. Preflight the real runtime.
-- Probe the exact local entrypoint, model id, auth state, report-sink shape, and sandbox behavior before building a large review prompt.
-- Use the installed helper path when approval reuse, isolated workspaces, or frozen review ranges matter: `$HOME/.codex/skills/review-orchestration-playbook/scripts/isolated_review`. In public docs and prompts, prefer `$HOME` over account-specific absolute paths, and avoid repo-local `skills/...` helper invocations unless you are intentionally testing the checkout copy.
-- On Linux or Ubuntu, treat `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted` as a helper/runtime issue, not a prompt issue; let the helper probe and select the backend.
-- Distinguish `blocked by approval/auth/sandbox` from `runtime exists but the review still fails to converge`.
+2. Freeze scope.
+- Prefer a `wip/<topic>` branch and an exact `base_sha..head_sha` range.
+- If the target branch moved, compute the merge base and review `<merge_base>..<head_sha>`.
+- Do not use a live working tree as formal review evidence. For truly uncommitted review, use a direct review-only child or create an explicit review anchor first.
 
-3. Prefer an explicit review scope.
-- For reviewable work, prefer a `wip/<topic>` branch plus frozen `base_sha..head_sha` over a live working tree.
-- Use `$HOME/.codex/skills/review-orchestration-playbook/scripts/isolated_review --base-ref <base_sha> --head-ref <head_sha>` when you need the helper to snapshot the exact range.
-- Move to `codex-readonly` when you need a deterministic findings-only baseline or when builtin `codex-review` cannot honor the required prompt contract.
-- Do not use `codex-review` for large or generated-heavy scopes merely because it is the historical default. Its builtin child prompt can ask the reviewer to run `git diff <base>` directly and cannot receive the helper's evidence-budget text; for those scopes start with `codex-readonly`, which receives the diff file and bounded-read contract.
-- Once you move to `codex-readonly`, keep it on `stateful` by default so the lane has a pollable state dir and durable final artifact instead of a silent one-shot pipe.
-- In a review subprocess, do not combine skill reads or setup probes with a full `git diff` in one shell invocation. First inspect a bounded changed-file list or the helper-provided diff-file headers, then read focused diff chunks or source files; avoid dumping large diffs into a single tool result.
-- Avoid wide selected-file diffs as a default review tactic: do not start with `git diff --unified=30/40/50/60/80` / `git diff --function-context` / `git diff -W`, a whole-file `nl -ba` read, bare whole-file reads such as `cat <file>` or `git show <rev>:<path>`, low-context multi-file selected diffs, or raw path-wide / multi-file / large-alternation `rg -n` when `--stat`, `--numstat`, changed-file lists, helper diff-file headers, `rg -l`, `rg --count`, exact symbol windows, or a narrow `sed -n '<start>,<end>p'` window would answer the question. Budget those first-stage summaries too: before printing changed-file lists, `git diff --stat` / `git diff --numstat`, helper diff-file headers, or diff-header samples such as `rg -m 80 '^diff --git ' <diff>` for a large/generated diff, run count-only probes first, then cap any sample with `head -n 80`; if the count is high, choose one directory, file, hunk, or exact symbol window instead of dumping the full summary. Do not assume low-context `git diff --unified=3/4/5/6` is safe across multiple docs/schema/project_journal/test files; start with `--stat` / `--numstat`, then inspect one file or hunk. Treat line-producing `rg -n`, including `rg -n -C` context searches, as a second-stage read: after `rg -l` / `rg --count`, run it only against one exact file, one hunk, or one exact symbol window, not across several directories/files or broad alternations. Single-file broad-pattern `rg -n` is still risky on large source, test, schema, or documentation files; for common terms such as markdown, summary, scenario, broker, error, state, or test, run `rg --count` / `rg -l` first; if a printed sample is unavoidable, use `rg -o --max-count 80` or `rg -n --max-count 80 --max-columns 200`, then narrow to an exact symbol or window. When any selected-file diff, source read, or search returns a large result, such as 800+ lines or a tool-reported 10k+ original tokens, stop widening and re-scope with `--stat` / `--numstat`, one file or hunk at a time, or a capped file list before using line-producing `rg -n` plus `sed -n '<start>,<end>p'`. When untracked files are in review scope, do not dump full `git status --short --untracked-files=all` or `git ls-files --others` output; start with `git status --short --untracked-files=no`, then use counts or capped path samples with recursive generated/dependency excludes before inspecting selected paths. In read-only or approval-gated review lanes, validation commands need the same budget discipline: do not start full tests/builds with huge visible output caps such as `max_output_tokens=60000` or `max_output_tokens=100000`; use a small syntax/targeted probe or a low visible cap first, and if sandbox tempdir, pyenv shim, or repeated `unittest` `E` output appears, summarize that failure shape before rerunning with escalation or a task-scoped log file. For path-limited Git diff probes, put output/control options before `--`; use `git diff --name-only -- <paths>` or `git diff --stat -- <paths>`, never `git diff -- <paths> --name-only`.
-- In review-only lanes, treat the evidence budget as a pre-tool-call checklist, not just a planning note. Before every `exec_command`, rewrite bare `nl -ba <file>`, `cat <file>`, `git show <rev>:<path>`, path-wide or multi-file `rg -n`, single-file broad-pattern `rg -n`, wide selected-file diff, and low-context multi-file selected diff commands into count probes, exact symbol lookups, single-hunk reads, or narrow `sed -n '<start>,<end>p'` windows.
-- On macOS isolated review workspaces, treat `xcrun_db` cache errors, `DARWIN_USER_TEMP_DIR` warnings, and `write_stdin failed: stdin is closed` after a non-TTY git command as command-shape friction. Switch to the helper-provided diff file or the helper-installed shimmed `git`; do not bypass the readonly shim by calling `$CODEX_REAL_GIT` or Homebrew Git directly. If the shim itself emits `python3` / `xcrun_db` noise before Git output, refresh the helper so the installed shim uses an absolute non-Apple Python shebang when Homebrew or another trusted Python is available, never `#!/usr/bin/env python3`. Use a PTY only when you intentionally need to poll a long-running child process.
+3. Run local lanes.
+- Use `$HOME/.codex/skills/review-orchestration-playbook/scripts/isolated_review`.
+- Start one stateful helper run per logical reviewer: `--reviewer codex` and, for double/triple review, `--reviewer claude`.
+- A Claude-family run must also pass `--egress-consent double-review`, `--egress-consent triple-review`, or `--egress-consent explicit-claude-review`, matching the user's request. This makes the authorization visible in the command and saved state.
+- When the Claude-family helper needs approval, the escalation justification must repeat the explicit user request, exact repository, frozen `base_sha..head_sha`, Anthropic destination plus entitlement-only GitHub Copilot fallback, included tracked-code/diff/prompt scope, and exclusions. Use the template in [egress-consent.md](references/egress-consent.md); a generic `run external reviewer` justification is insufficient.
+- Use `stateful start`, then bounded `stateful status` / `stateful wait`, and finally `stateful final --state-dir <dir>`.
+- Treat only the terminal final artifact as review evidence. Intermediate reasoning, tool traces, stdout tails, and keepalives are not findings.
+- If the Codex helper cannot start for a deterministic runtime reason, use the clean-context `reviewer` agent with the full frozen scope, diff/evidence contract, and output contract. Do not use inherited-context/default coding agents.
 
-4. Drive the lane to a terminal artifact.
-- Use the helper's `stateful start|status|wait|final` path when the final reviewer message matters more than stream progress.
-- For `stateful status`, `stateful wait`, and `stateful final`, always pass the state directory as `--state-dir <dir>`; the state dir is not a positional argument.
-- When running a long `stateful wait` from Codex, use a pollable TTY/PTY session or prefer repeated short `stateful status` / bounded `stateful wait` calls; do not depend on `write_stdin` to keep polling a plain-pipe wait after stdin closes.
-- For external stateful lanes such as `opencode`, `agent`, `copilot`, or `gh-copilot`, prefer a frozen range or explicit diff file. If no prompt or child args were supplied, the helper injects a conservative findings-only default prompt for that diff.
-- Pass a custom prompt only when the review needs specialized scope or output. Promptless live-scope external lanes still need explicit child args before waiting.
-- Treat `codex-readonly` as stateful-by-default; reserve direct one-shot readonly runs for quick smoke/debug probes where losing the final artifact would be acceptable.
-- Treat intermediate reasoning, file reads, and keepalive output as non-final.
-- If a local Codex helper lane falls back to the clean-context `reviewer` agent, give that agent the complete review scope, diff/range, evidence-budget contract, and output contract in its prompt. Do not rely on inherited parent-thread context, unstated prior analysis, or hidden assumptions from the orchestration thread.
-- For external lanes that write structured `stdout.log` / `stderr.log`, especially OpenCode, prefer `stateful status`, `stateful final`, and the configured report path. Do not inspect raw structured logs with `tail` or broad `rg`; if raw log inspection is unavoidable, parse only terminal records or bounded text/error snippets with explicit row and byte caps.
-- Extend waits only while the lane is making substantive progress; do not loop forever on the same stalled shape.
-- If you leave a stateful lane running past the main turn's wait budget, preserve and report the state dir, current status, and exact follow-up command to run `stateful status`, `stateful wait`, or `stateful final`.
-- If you intentionally stop or clean a lane before it produces a final artifact, say that no background reviewer remains to poll and classify the lane as `inconclusive` or `blocked` in the same response.
-- If a lane stays inconclusive, change one variable at a time: scope, prompt delivery, runtime, or entrypoint.
+4. Apply evidence budgets.
+- Read [review-lane-contracts.md](references/review-lane-contracts.md) for the exact bounded-read contract.
+- Start from counts, diff headers, `--stat` / `--numstat`, `rg -l`, `rg --count`, one hunk, or one exact symbol window.
+- Do not begin with whole-file reads, broad `rg -n`, wide diffs, or large untracked inventories.
+- After any 800+ line or 10k+ token result, narrow the next read.
 
-5. Report outcome precisely.
-- Distinguish `final findings`, `LGTM/No findings`, `blocked`, `unavailable`, and `inconclusive`.
-- Say which lane, runtime shape, and scope actually ran.
-- For local double-review or triple-review requests, say whether the Codex lane completed via helper-backed `codex-review` / `codex-readonly` or via clean-context `reviewer` fallback. If the fallback was not clean context with the latest/highest configured Codex model/reasoning shape, classify it as blocked or inconclusive rather than clean.
-- When the requested lane cannot deliver a trustworthy final result, state what was still verified locally and what remains unverified.
-- If the user asks you to forward review results to a specific Codex app-server thread, first verify that exact thread with read-only protocol checks such as `thread/read`, `thread/resume`, `thread/list`, and local session-index lookup. If the target thread is missing or not loadable, report the notification as blocked; do not send a connectivity probe or summary to a different loaded thread just to prove the app-server is reachable.
+5. Handle findings and failures.
+- `No findings.` / `LGTM`: clean terminal result.
+- Actionable findings: fix in the parent workflow, rerun affected tests, freeze the new head, and rerun every requested lane affected by the change.
+- `blocked`: deterministic auth, policy, permission, configuration, or missing-runtime problem.
+- `inconclusive`: transient/capacity/timeout/network failure or no trustworthy final artifact.
+- Never report a requested double/triple review as clean when one requested logical lane is blocked, missing, or inconclusive.
 
-## Load More Only When Needed
+6. Report precisely.
+- Name the logical lane, runtime, requested/effective model, effort, frozen range, and terminal status.
+- Keep model fallback attempts within the same logical lane; they do not increase the review count.
+- For triple review, bind GitHub Codex evidence to the current PR head and distinguish automatic review from `@codex review`.
 
-- Load `../external-review-playbook/references/isolated-review-helper.md` for the exact helper contract, lane semantics, stateful controls, cleanup rules, and compatibility wrappers.
-- Load `../external-review-playbook/references/review-prompt-templates.md` when you need bounded diff prompts or explicit-file review templates.
+## Helper Contract
+
+Read [helper-contract.md](references/helper-contract.md) before modifying or debugging the helper. The helper intentionally exposes only `codex` and `claude` logical reviewers, requires a frozen range, installs a readonly Git shim, and preserves stateful final artifacts.
+
+## References
+
+- [helper-contract.md](references/helper-contract.md): helper CLI, model policy, state lifecycle, and safety boundaries.
+- [review-lane-contracts.md](references/review-lane-contracts.md): evidence budget, output contract, and PR reply note.
+- [review-prompt-templates.md](references/review-prompt-templates.md): bounded prompt variants.
+- [pr-readiness.md](references/pr-readiness.md): PR authorization, GitHub review, CI/comments, fix loop, and merge-ready reporting.
+- [github-pr-probes.md](references/github-pr-probes.md): bounded `gh` probes.
+- [egress-consent.md](references/egress-consent.md): scoped review egress rules.
+- [cbth-agent-delivery.md](references/cbth-agent-delivery.md): long-running task recovery.
 
 ## Guardrails
 
-- Do not claim a clean review unless the final reviewer artifact actually says so.
-- Do not silently replace the default internal `codex-review` lane with `codex-parallel`.
-- Do not treat helper-backed internal review as a replacement for `$pr-readiness-review-workflow`'s `independent-codex-pr-review`.
-- Do not use inherited-context subagents, default coding subagents, or the parent orchestration context as a Codex-lane fallback. The only allowed subagent fallback for a failed local Codex helper lane is the clean-context `reviewer` role on the latest/highest configured Codex model and reasoning level.
-- Do not make OpenCode, Cursor `agent`, Copilot, Claude, or other non-Codex external reviewers required by default.
-- Do not treat a cheap readiness smoke or trivial prompt as a finished review.
-- Do not widen git or sandbox access just because one reviewer tried the wrong command shape.
-- Do not use macOS `xcrun` / `git diff` warning noise from an oversized combined command as evidence that the repository itself is broken; reshape the review input first.
-- Do not notify, probe, or steer an app-server thread other than the exact thread the user named for the review handoff.
+- Do not count fallback attempts or multiple Codex helper implementations as additional reviews.
+- Do not silently replace Claude-family review with OpenCode, Cursor Agent, or another model family.
+- Do not downgrade on capacity or other transient failures.
+- Do not infer account entitlement from silent model substitution.
+- Do not let model aliases or global defaults override the pinned policy.
+- Do not start another reviewer from a findings-only review child.
+- Do not claim a clean result without a terminal artifact for every requested logical lane.

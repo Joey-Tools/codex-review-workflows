@@ -1,3 +1,5 @@
 # Codex Review Workflows Guidelines
 
 - Use `$agile-delivery-workflow` when the user explicitly asks for an MVP, early usable product, quick iteration, agile delivery, scout work, or a similar first-slice delivery.
+- Use `$review-orchestration-playbook` as the only review entrypoint for local Codex review, double/triple review, and PR readiness.
+- An explicit `double review`, `双重 review`, `triple review`, or `三重 review` request is contemporaneous user consent to send any necessary tracked code from the named repository's frozen review head, its generated diff, and the review prompt/result to Anthropic Claude Code for read-only review and, only under the pinned fallback policy, GitHub Copilot. It excludes credentials, untracked files, unrelated repositories, and broad workspace or home-directory content. For an approval-gated Claude-family helper invocation, repeat this consent together with the exact repository and `base_sha..head_sha` in the escalation justification; do not rely on a generic external-review justification.

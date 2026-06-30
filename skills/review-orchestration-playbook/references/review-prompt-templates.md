@@ -59,7 +59,7 @@ If there are no findings, reply exactly: No findings.
 
 ## Bounded Diff Review Without Agentic Git
 
-Use this variant when Cursor Agent keeps looping on rejected `git diff` / `git status` calls, or when local policy disables broad command-unblock flags such as `--force`.
+Use this variant when a reviewer should consume the supplied diff directly instead of probing Git metadata.
 
 ```text
 <context>

@@ -59,9 +59,9 @@ waiting, release automation, or merge-readiness unless the user asks to continue
 - Do not invoke the full local delivery gate by default. Use
   `$change-delivery-workflow` as a full workflow only when the user asks to
   continue past the MVP checkpoint or explicitly wants the complete local gate.
-- Use [$pr-readiness-review-workflow](../pr-readiness-review-workflow/SKILL.md)
-  only when the user asks to continue toward a PR, full gates, CI/review waiting,
-  or merge-ready status.
+- Use [$review-orchestration-playbook](../review-orchestration-playbook/SKILL.md)
+  for PR readiness after the MVP commit only when the user asks to continue
+  toward a PR, full gates, CI/review waiting, or merge-ready status.
 
 ## Guardrails
 

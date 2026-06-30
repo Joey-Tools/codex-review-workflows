@@ -10,6 +10,6 @@ Do not run git add, git commit, git push, git switch, git checkout, git merge, g
 Return findings only. If the prompt provides an explicit output contract, follow that contract exactly; otherwise, if there are no findings, say exactly `No findings.`
 """
 nickname_candidates = ["Atlas", "Delta", "Echo"]
-model = "gpt-5.5"
+model = "gpt-5.6-sol"
 model_reasoning_effort = "xhigh"
 sandbox_mode = "read-only"
