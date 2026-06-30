@@ -136,8 +136,11 @@ CODEX_FALLBACK_MODEL_DEFAULT = "gpt-5.5"
 CODEX_REASONING_EFFORT_DEFAULT = "xhigh"
 CODEX_MODEL_FALLBACK_SCAN_BYTES = 64 * 1024
 CODEX_MODEL_FALLBACK_ERROR_FRAGMENTS = (
+    "capacity for model",
     "capacity for the model",
     "capacity for this model",
+    "insufficient capacity for model",
+    "insufficient capacity for the model",
     "model_not_found",
     "model capacity",
     "model is at capacity",
@@ -150,6 +153,8 @@ CODEX_MODEL_FALLBACK_ERROR_FRAGMENTS = (
     "model not found",
     "no access to model",
     "no access to the model",
+    "no capacity for model",
+    "no capacity for the model",
     "not entitled to access model",
     "not entitled to access the model",
     "not entitled to use model",
