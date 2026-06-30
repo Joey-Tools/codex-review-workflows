@@ -99,6 +99,35 @@ class ChildEnvironmentTest(unittest.TestCase):
                 resolved = common.resolve_reviewer_executable("claude")
         self.assertEqual(resolved, executable.absolute())
 
+    def test_present_but_invalid_cli_is_not_treated_as_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = pathlib.Path(temporary)
+            executable = home / ".local/bin/claude"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            executable.chmod(0o755)
+            with (
+                mock.patch.dict(common.os.environ, {"HOME": str(home)}, clear=True),
+                mock.patch.object(common.shutil, "which", return_value=None),
+                mock.patch.object(
+                    common,
+                    "_user_executable_candidates",
+                    return_value=[executable],
+                ),
+                mock.patch.object(
+                    common,
+                    "_executable_identity_matches",
+                    return_value=False,
+                ),
+                mock.patch.object(
+                    common.os,
+                    "access",
+                    side_effect=lambda path, _mode: pathlib.Path(path) == executable,
+                ),
+            ):
+                with self.assertRaisesRegex(ReviewError, "validation failed"):
+                    common.resolve_reviewer_executable("claude")
+
 
 if __name__ == "__main__":
     unittest.main()

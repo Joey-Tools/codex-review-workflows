@@ -246,6 +246,7 @@ def resolve_reviewer_executable(name: str) -> pathlib.Path | None:
     if discovered:
         candidates.append(pathlib.Path(discovered))
     seen: set[str] = set()
+    rejected: list[pathlib.Path] = []
     for candidate in candidates:
         key = str(candidate)
         if key in seen:
@@ -255,6 +256,13 @@ def resolve_reviewer_executable(name: str) -> pathlib.Path | None:
             continue
         if _executable_identity_matches(candidate, markers):
             return candidate.absolute()
+        rejected.append(candidate.absolute())
+    if rejected:
+        paths = ", ".join(str(path) for path in rejected)
+        raise ReviewError(
+            f"found {name} CLI candidate(s), but executable identity validation "
+            f"failed or timed out: {paths}"
+        )
     return None
 
 

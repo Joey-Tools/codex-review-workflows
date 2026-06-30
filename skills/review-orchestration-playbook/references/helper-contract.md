@@ -64,10 +64,10 @@ Fallback classification uses stderr plus explicit structured CLI error events on
 ## Snapshot And Safety
 
 - The helper requires `--base-ref` and `--head-ref` and resolves both to commits before launch.
-- It creates a `.git`-free frozen archive snapshot at the head under source-repo `.codex-tmp/` and generates a binary `--submodule=diff` artifact for the exact range.
+- It creates a `.git`-free frozen snapshot by streaming raw tree blobs from the head under source-repo `.codex-tmp/`; Git archive attributes, checkout filters, hooks, and repository config cannot rewrite that snapshot. It also streams a binary `--submodule=diff` artifact for the exact range to disk.
 - Snapshot preparation runs Git with a cleaned environment, disabled hooks/fsmonitor/external diff, and explicit `--no-ext-diff --no-textconv`. It does not checkout files through repository filters.
 - Submodules remain uninitialized and unfetched; their gitlink changes are represented in the frozen diff.
-- Every reviewer receives the same bounded findings-only prompt and primary diff file inside a helper-owned `.codex-review/` directory in the detached worktree.
+- Every reviewer receives the same bounded findings-only prompt and primary diff file inside a helper-owned `.codex-review/` directory in the frozen snapshot.
 - The helper installs the fixed `git_readonly_shim`, passes the real Git path separately, and executes the reviewer inside the detached workspace.
 - Every child receives a runtime-specific minimal environment allowlist instead of the parent's complete environment. Claude and Copilot authentication variables are never present in each other's process. Codex may receive `OPENAI_API_KEY` for headless authentication, but model-proposed shell commands cannot inherit it.
 - Codex runs with a custom permission profile: only platform-minimal paths and the frozen workspace are readable; `.git`, `.codex`, `.agents`, and environment-file globs are denied; network and writes are unavailable. It ignores user config and execpolicy rules, uses `approval_policy=never`, and gives model-proposed shell commands a fresh environment with an empty helper-owned `HOME`.

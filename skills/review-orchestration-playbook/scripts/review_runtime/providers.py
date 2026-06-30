@@ -801,7 +801,7 @@ def run_review(
                 "reviewer": "claude-family",
                 "review_range": f"{review.base_ref}..{review.head_ref}",
                 "included": [
-                    "tracked files in the detached worktree at the frozen head",
+                    "tracked blobs materialized from the frozen head commit",
                     "the generated frozen diff",
                     "the review prompt and result",
                 ],
@@ -847,7 +847,16 @@ def run_review(
         )
         return Outcome(2, None, tuple())
 
-    claude_available = resolve_reviewer_executable("claude") is not None
+    try:
+        claude_available = resolve_reviewer_executable("claude") is not None
+    except ReviewError as error:
+        write_text_atomic(
+            review.container_dir / "runner-error.txt",
+            "Claude Code executable validation failed; refusing Copilot fallback: "
+            f"{error}\n",
+        )
+        write_json(review.container_dir / "attempts.json", [])
+        return Outcome(2, None, tuple(attempts))
     if claude_available:
         claude_env = _review_environment(
             review=review,
@@ -855,19 +864,42 @@ def run_review(
             passthrough_keys=CLAUDE_ENV_KEYS,
             extra={"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"},
         )
-        category, final_text = _run_model_chain(
-            review=review,
-            models=CLAUDE_MODELS,
-            runner=_claude_attempt,
-            env=claude_env,
-            attempts=attempts,
-        )
+        try:
+            category, final_text = _run_model_chain(
+                review=review,
+                models=CLAUDE_MODELS,
+                runner=_claude_attempt,
+                env=claude_env,
+                attempts=attempts,
+            )
+        except (FileNotFoundError, ReviewError) as error:
+            write_text_atomic(
+                review.container_dir / "runner-error.txt",
+                "Claude Code became unavailable or failed executable validation; "
+                f"refusing Copilot fallback: {error}\n",
+            )
+            write_json(
+                review.container_dir / "attempts.json",
+                [asdict(item) for item in attempts],
+            )
+            return Outcome(2, None, tuple(attempts))
         if final_text:
             return _finish(review, attempts, final_text)
         if category != "entitlement":
             return _finish(review, attempts, None)
 
-    copilot_available = resolve_reviewer_executable("copilot") is not None
+    try:
+        copilot_available = resolve_reviewer_executable("copilot") is not None
+    except ReviewError as error:
+        write_text_atomic(
+            review.container_dir / "runner-error.txt",
+            f"Copilot CLI executable validation failed: {error}\n",
+        )
+        write_json(
+            review.container_dir / "attempts.json",
+            [asdict(item) for item in attempts],
+        )
+        return Outcome(2, None, tuple(attempts))
     if not copilot_available:
         write_text_atomic(
             review.container_dir / "runner-error.txt",
@@ -879,11 +911,22 @@ def run_review(
         shim_source=shim_source,
         passthrough_keys=COPILOT_ENV_KEYS,
     )
-    _, final_text = _run_model_chain(
-        review=review,
-        models=COPILOT_MODELS,
-        runner=_copilot_attempt,
-        env=copilot_env,
-        attempts=attempts,
-    )
+    try:
+        _, final_text = _run_model_chain(
+            review=review,
+            models=COPILOT_MODELS,
+            runner=_copilot_attempt,
+            env=copilot_env,
+            attempts=attempts,
+        )
+    except (FileNotFoundError, ReviewError) as error:
+        write_text_atomic(
+            review.container_dir / "runner-error.txt",
+            f"Copilot CLI became unavailable or failed executable validation: {error}\n",
+        )
+        write_json(
+            review.container_dir / "attempts.json",
+            [asdict(item) for item in attempts],
+        )
+        return Outcome(2, None, tuple(attempts))
     return _finish(review, attempts, final_text)

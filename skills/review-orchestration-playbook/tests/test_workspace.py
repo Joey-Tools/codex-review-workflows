@@ -168,6 +168,45 @@ class WorkspaceTest(unittest.TestCase):
         self.assertFalse(filter_marker.exists())
         self.assertFalse(diff_marker.exists())
 
+    def test_snapshot_uses_raw_blobs_despite_archive_export_attributes(self) -> None:
+        attributes = self.repo / ".gitattributes"
+        attributes.write_text(
+            attributes.read_text(encoding="utf-8")
+            + "hidden.txt export-ignore\n"
+            + "substituted.txt export-subst\n",
+            encoding="utf-8",
+        )
+        (self.repo / "hidden.txt").write_text("still tracked\n", encoding="utf-8")
+        raw_substitution = "$Format:%H$\n"
+        (self.repo / "substituted.txt").write_text(
+            raw_substitution,
+            encoding="utf-8",
+        )
+        git(
+            self.repo,
+            "add",
+            ".gitattributes",
+            "hidden.txt",
+            "substituted.txt",
+        )
+        git(self.repo, "commit", "-m", "Add export attributes")
+        export_head = git(self.repo, "rev-parse", "HEAD")
+
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.head,
+            head_ref=export_head,
+        )
+        self.reviews.append(review)
+        self.assertEqual(
+            (review.workspace_root / "hidden.txt").read_text(encoding="utf-8"),
+            "still tracked\n",
+        )
+        self.assertEqual(
+            (review.workspace_root / "substituted.txt").read_text(encoding="utf-8"),
+            raw_substitution,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

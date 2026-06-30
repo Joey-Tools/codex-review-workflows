@@ -12,7 +12,7 @@ SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from review_runtime import providers  # noqa: E402
-from review_runtime.common import Completed  # noqa: E402
+from review_runtime.common import Completed, ReviewError  # noqa: E402
 from review_runtime.workspace import ReviewWorkspace  # noqa: E402
 
 
@@ -269,6 +269,32 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(outcome.returncode, 1)
         self.assertEqual(claude_attempt.call_count, 1)
         copilot_attempt.assert_not_called()
+
+    @mock.patch.object(providers, "_copilot_attempt")
+    @mock.patch.object(
+        providers,
+        "resolve_reviewer_executable",
+        side_effect=ReviewError("Claude Code --version timed out"),
+    )
+    def test_claude_cli_validation_failure_refuses_copilot_fallback(
+        self,
+        _resolve: mock.Mock,
+        copilot_attempt: mock.Mock,
+    ) -> None:
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            shim_source=SCRIPTS / "git_readonly_shim",
+            egress_consent="double-review",
+        )
+        self.assertEqual(outcome.returncode, 2)
+        copilot_attempt.assert_not_called()
+        self.assertIn(
+            "refusing Copilot fallback",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
 
     def test_effective_model_substitution_does_not_infer_entitlement(self) -> None:
         completed = Completed(
