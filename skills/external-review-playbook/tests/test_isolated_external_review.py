@@ -9063,6 +9063,67 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
             [module.CODEX_STREAMING_TERM_GRACE_SECONDS, None],
         )
 
+    def test_streaming_codex_attempt_forwards_termination_signal_and_reaps_child(self) -> None:
+        if os.name != "posix":
+            self.skipTest("POSIX process-group signaling is required")
+        module = self._load_script_module()
+        installed_handlers: dict[object, object] = {}
+
+        def set_signal(sig: object, handler: object) -> object:
+            if callable(handler):
+                installed_handlers[sig] = handler
+            return module.signal.SIG_DFL
+
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.pid = 4242
+                self.stdin = None
+                self.stdout = io.BytesIO()
+                self.stderr = io.BytesIO()
+                self.signal_sent = False
+                self.wait_calls: list[float | None] = []
+
+            def poll(self) -> None:
+                return None
+
+            def wait(self, timeout: float | None = None) -> int:
+                self.wait_calls.append(timeout)
+                if timeout is None and not self.signal_sent:
+                    self.signal_sent = True
+                    handler = installed_handlers[module.signal.SIGTERM]
+                    assert callable(handler)
+                    handler(int(module.signal.SIGTERM), None)
+                return -int(module.signal.SIGTERM)
+
+        process = FakeProcess()
+        with mock.patch.object(module.subprocess, "Popen", return_value=process):
+            with mock.patch.object(module.signal, "getsignal", return_value=module.signal.SIG_DFL):
+                with mock.patch.object(module.signal, "signal", side_effect=set_signal) as signal_mock:
+                    with mock.patch.object(module.os, "killpg") as killpg_mock:
+                        with self.assertRaises(SystemExit) as raised:
+                            module._run_streaming_codex_attempt(
+                                command=["fake-codex"],
+                                workspace_root=self.repo,
+                                child_env=os.environ.copy(),
+                                stdin_bytes=None,
+                            )
+
+        self.assertEqual(raised.exception.code, 128 + int(module.signal.SIGTERM))
+        killpg_mock.assert_any_call(process.pid, module.signal.SIGTERM)
+        self.assertEqual(
+            process.wait_calls,
+            [None, module.CODEX_STREAMING_TERM_GRACE_SECONDS],
+        )
+        self.assertIn(
+            mock.call(module.signal.SIGTERM, module.signal.SIG_DFL),
+            signal_mock.mock_calls,
+        )
+        if hasattr(module.signal, "SIGHUP"):
+            self.assertIn(
+                mock.call(module.signal.SIGHUP, module.signal.SIG_DFL),
+                signal_mock.mock_calls,
+            )
+
 
     def test_apply_codex_readonly_defaults_injects_linux_landlock_flags(self) -> None:
         module = self._load_script_module()

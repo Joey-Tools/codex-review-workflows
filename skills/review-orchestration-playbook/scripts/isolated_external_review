@@ -5758,18 +5758,8 @@ def _run_streaming_codex_attempt(
     child_env: dict[str, str],
     stdin_bytes: bytes | None,
 ) -> tuple[int, bytes, bytes]:
-    process = subprocess.Popen(
-        command,
-        cwd=str(workspace_root),
-        env=child_env,
-        stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=os.name == "posix",
-    )
     stdout_tail = bytearray()
     stderr_tail = bytearray()
-
     stop_pumps = threading.Event()
 
     def pump(
@@ -5824,6 +5814,8 @@ def _run_streaming_codex_attempt(
                 if post_exit_bytes >= CODEX_STREAMING_POST_EXIT_DRAIN_BYTES:
                     return
 
+    process: subprocess.Popen[bytes]
+
     def signal_process_group(sig: signal.Signals) -> None:
         process_pid = getattr(process, "pid", None)
         if os.name == "posix" and isinstance(process_pid, int):
@@ -5840,6 +5832,34 @@ def _run_streaming_codex_attempt(
         except ProcessLookupError:
             pass
 
+    class ForwardedSignal(BaseException):
+        def __init__(self, signum: signal.Signals) -> None:
+            super().__init__(int(signum))
+            self.signum = signum
+
+    def forward_signal(signum: int, _frame: object) -> None:
+        forwarded = signal.Signals(signum)
+        signal_process_group(forwarded)
+        raise ForwardedSignal(forwarded)
+
+    process = subprocess.Popen(
+        command,
+        cwd=str(workspace_root),
+        env=child_env,
+        stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=os.name == "posix",
+    )
+    previous_signal_handlers: dict[signal.Signals, object] = {}
+    if os.name == "posix" and threading.current_thread() is threading.main_thread():
+        forwarded_signals = [signal.SIGTERM]
+        if hasattr(signal, "SIGHUP"):
+            forwarded_signals.append(signal.SIGHUP)
+        for forwarded in forwarded_signals:
+            previous_signal_handlers[forwarded] = signal.getsignal(forwarded)
+            signal.signal(forwarded, forward_signal)
+
     assert process.stdout is not None
     assert process.stderr is not None
     stdout_eof = threading.Event()
@@ -5854,43 +5874,63 @@ def _run_streaming_codex_attempt(
         args=(process.stderr, sys.stderr, stderr_tail, stderr_eof),
         daemon=True,
     )
-    stdout_thread.start()
-    stderr_thread.start()
+    interrupted_by_signal: signal.Signals | None = None
+    stdout_thread_started = False
+    stderr_thread_started = False
     try:
-        if process.stdin is not None:
-            try:
-                process.stdin.write(stdin_bytes or b"")
-            except BrokenPipeError:
-                pass
-            finally:
+        try:
+            stdout_thread.start()
+            stdout_thread_started = True
+            stderr_thread.start()
+            stderr_thread_started = True
+            if process.stdin is not None:
                 try:
-                    process.stdin.close()
-                except (BrokenPipeError, OSError, ValueError):
+                    process.stdin.write(stdin_bytes or b"")
+                except BrokenPipeError:
                     pass
-        returncode = process.wait()
-    except BaseException:
-        if process.poll() is None:
-            signal_process_group(signal.SIGTERM)
-            try:
-                process.wait(timeout=CODEX_STREAMING_TERM_GRACE_SECONDS)
-            except subprocess.TimeoutExpired:
-                signal_process_group(signal.SIGKILL)
-                process.wait()
-        raise
+                finally:
+                    try:
+                        process.stdin.close()
+                    except (BrokenPipeError, OSError, ValueError):
+                        pass
+            returncode = process.wait()
+        except BaseException:
+            if process.poll() is None:
+                signal_process_group(signal.SIGTERM)
+                try:
+                    process.wait(timeout=CODEX_STREAMING_TERM_GRACE_SECONDS)
+                except subprocess.TimeoutExpired:
+                    signal_process_group(signal.SIGKILL)
+                    process.wait()
+            raise
+        finally:
+            stop_pumps.set()
+            if stdout_thread_started:
+                stdout_thread.join(timeout=CODEX_STREAMING_PUMP_JOIN_SECONDS)
+            if stderr_thread_started:
+                stderr_thread.join(timeout=CODEX_STREAMING_PUMP_JOIN_SECONDS)
+            if not stdout_eof.is_set() or not stderr_eof.is_set():
+                signal_process_group(signal.SIGTERM)
+            for source in (process.stdout, process.stderr):
+                try:
+                    source.close()
+                except (OSError, ValueError):
+                    pass
+            if stdout_thread_started:
+                stdout_thread.join(timeout=CODEX_STREAMING_PUMP_JOIN_SECONDS)
+            if stderr_thread_started:
+                stderr_thread.join(timeout=CODEX_STREAMING_PUMP_JOIN_SECONDS)
+    except ForwardedSignal as exc:
+        interrupted_by_signal = exc.signum
     finally:
-        stop_pumps.set()
-        stdout_thread.join(timeout=CODEX_STREAMING_PUMP_JOIN_SECONDS)
-        stderr_thread.join(timeout=CODEX_STREAMING_PUMP_JOIN_SECONDS)
-        if not stdout_eof.is_set() or not stderr_eof.is_set():
-            signal_process_group(signal.SIGTERM)
-        for source in (process.stdout, process.stderr):
-            try:
-                source.close()
-            except (OSError, ValueError):
-                pass
-        stdout_thread.join(timeout=CODEX_STREAMING_PUMP_JOIN_SECONDS)
-        stderr_thread.join(timeout=CODEX_STREAMING_PUMP_JOIN_SECONDS)
-    if stdout_thread.is_alive() or stderr_thread.is_alive():
+        for forwarded, previous_handler in previous_signal_handlers.items():
+            signal.signal(forwarded, previous_handler)
+    if interrupted_by_signal is not None:
+        raise SystemExit(128 + int(interrupted_by_signal))
+    if (
+        (stdout_thread_started and stdout_thread.is_alive())
+        or (stderr_thread_started and stderr_thread.is_alive())
+    ):
         raise UserError("streaming Codex output pump did not stop within the bounded timeout")
     return returncode, bytes(stdout_tail), bytes(stderr_tail)
 
