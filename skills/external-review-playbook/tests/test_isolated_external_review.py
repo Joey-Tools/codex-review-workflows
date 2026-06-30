@@ -9048,7 +9048,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         process = FakeProcess()
 
         def delayed_write() -> None:
-            time.sleep(0.1)
+            time.sleep(module.CODEX_STREAMING_PUMP_POLL_SECONDS * 2.5)
             os.write(write_fd, b"late\n")
             os.close(write_fd)
 
