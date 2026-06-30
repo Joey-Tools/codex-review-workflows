@@ -468,6 +468,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
 
                 args = sys.argv[1:]
                 output = None
+                model = None
                 fail = False
                 agent_models_failure = os.environ.get("FAKE_AGENT_MODELS_FAIL", "")
                 agent_models_fail_first = os.environ.get("FAKE_AGENT_MODELS_FAIL_FIRST", "")
@@ -909,6 +910,12 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                         output = pathlib.Path(review_args[pointer + 1])
                         pointer += 2
                         continue
+                    if arg in ("-m", "--model"):
+                        model = review_args[pointer + 1]
+                        pointer += 2
+                        continue
+                    if arg.startswith("-m=") or arg.startswith("--model="):
+                        model = arg.split("=", 1)[1]
                     if arg == "--probe-git-commit":
                         probe_git_commit = True
                     pointer += 1
@@ -929,6 +936,17 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                         file=sys.stderr,
                     )
                     raise SystemExit(9)
+                unavailable_models = {
+                    item.strip()
+                    for item in os.environ.get("FAKE_CODEX_UNAVAILABLE_MODELS", "").split(",")
+                    if item.strip()
+                }
+                if model in unavailable_models:
+                    print(
+                        f"model_not_found: model is not available: {model}",
+                        file=sys.stderr,
+                    )
+                    raise SystemExit(7)
 
                 payload = {
                     "tool": "codex",
@@ -942,6 +960,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                     "exec_args": exec_args,
                     "used_review_subcommand": used_review_subcommand,
                     "review_args": review_args,
+                    "model": model,
                     "codex_ci": os.environ.get("CODEX_CI"),
                     "codex_home": os.environ.get("CODEX_HOME"),
                     "codex_internal_originator_override": os.environ.get(
@@ -4094,6 +4113,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertEqual(waited.returncode, 0, waited.stderr)
         summary = json.loads(waited.stdout)
         self.assertEqual(summary["status"], "passed")
+        self.assertEqual(summary["codex_model"], "gpt-5.6-sol")
         self.assertFalse((state_dir / "workspace").exists())
 
         stdout_lines = (state_dir / "stdout.log").read_text(encoding="utf-8").splitlines()
@@ -4138,6 +4158,62 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         )
         self.assertEqual(final.returncode, 0, final.stderr)
         self.assertEqual(final.stdout, "No findings.\n")
+
+    def test_codex_review_falls_back_when_primary_model_is_unavailable(self) -> None:
+        env = self._base_env()
+        env["FAKE_CODEX_UNAVAILABLE_MODELS"] = "gpt-5.6-sol"
+        repo, base, head = self._create_review_range_repo("codex-review-model-fallback")
+        start = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "stateful",
+                "start",
+                "--repo",
+                str(repo),
+                "--entrypoint",
+                "codex-review",
+                "--base-ref",
+                base,
+                "--head-ref",
+                head,
+            ],
+            env=env,
+        )
+        self.assertEqual(start.returncode, 0, start.stderr)
+        state_dir = pathlib.Path(start.stdout.strip().splitlines()[-1])
+
+        waited = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "stateful",
+                "wait",
+                "--state-dir",
+                str(state_dir),
+            ],
+            env=env,
+        )
+        self.assertEqual(waited.returncode, 0, waited.stderr)
+        summary = json.loads(waited.stdout)
+        self.assertEqual(summary["status"], "passed")
+        self.assertEqual(summary["codex_model"], "gpt-5.5")
+        self.assertEqual(
+            summary["model_fallback"],
+            {
+                "fallback_model": "gpt-5.5",
+                "primary_model": "gpt-5.6-sol",
+                "reasoning_effort": "xhigh",
+            },
+        )
+        self.assertIn(
+            "codex model fallback: gpt-5.6-sol -> gpt-5.5 (reasoning xhigh)",
+            (state_dir / "stderr.log").read_text(encoding="utf-8"),
+        )
+        stdout_lines = (state_dir / "stdout.log").read_text(encoding="utf-8").splitlines()
+        payload = json.loads(stdout_lines[-1])["payload"]
+        self.assertEqual(payload["model"], "gpt-5.5")
+        self.assertIn('model_reasoning_effort="xhigh"', payload["exec_args"])
 
     def test_codex_review_rejects_large_builtin_prompt_scope(self) -> None:
         env = self._base_env()
@@ -4334,6 +4410,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertEqual(waited.returncode, 0, waited.stderr)
         summary = json.loads(waited.stdout)
         self.assertEqual(summary["status"], "passed")
+        self.assertEqual(summary["codex_model"], "gpt-5.6-sol")
 
         stdout_lines = (state_dir / "stdout.log").read_text(encoding="utf-8").splitlines()
         payload = json.loads(stdout_lines[-1])["payload"]
@@ -4395,6 +4472,62 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertEqual(final.returncode, 0, final.stderr)
         self.assertEqual(final.stdout, "Readonly findings.\n")
 
+    def test_codex_readonly_falls_back_when_primary_model_is_unavailable(self) -> None:
+        env = self._base_env()
+        env["FAKE_CODEX_UNAVAILABLE_MODELS"] = "gpt-5.6-sol"
+        repo, base, head = self._create_review_range_repo("codex-readonly-model-fallback")
+        start = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "stateful",
+                "start",
+                "--repo",
+                str(repo),
+                "--entrypoint",
+                "codex-readonly",
+                "--base-ref",
+                base,
+                "--head-ref",
+                head,
+            ],
+            env=env,
+        )
+        self.assertEqual(start.returncode, 0, start.stderr)
+        state_dir = pathlib.Path(start.stdout.strip().splitlines()[-1])
+
+        waited = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "stateful",
+                "wait",
+                "--state-dir",
+                str(state_dir),
+            ],
+            env=env,
+        )
+        self.assertEqual(waited.returncode, 0, waited.stderr)
+        summary = json.loads(waited.stdout)
+        self.assertEqual(summary["status"], "passed")
+        self.assertEqual(summary["codex_model"], "gpt-5.5")
+        self.assertEqual(
+            summary["model_fallback"],
+            {
+                "fallback_model": "gpt-5.5",
+                "primary_model": "gpt-5.6-sol",
+                "reasoning_effort": "xhigh",
+            },
+        )
+        self.assertIn(
+            "codex model fallback: gpt-5.6-sol -> gpt-5.5 (reasoning xhigh)",
+            (state_dir / "stderr.log").read_text(encoding="utf-8"),
+        )
+        stdout_lines = (state_dir / "stdout.log").read_text(encoding="utf-8").splitlines()
+        fallback_payload = json.loads(stdout_lines[-1])["payload"]
+        self.assertEqual(fallback_payload["model"], "gpt-5.5")
+        self.assertIn('model_reasoning_effort="xhigh"', fallback_payload["review_args"])
+
     def test_codex_readonly_one_shot_prints_normalized_final_before_cleanup(self) -> None:
         env = self._base_env()
         repo, base, head = self._create_review_range_repo("codex-readonly-one-shot")
@@ -4417,6 +4550,36 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(completed.stdout, "LGTM\n")
+
+    def test_codex_readonly_one_shot_fallback_keeps_stdout_final_only(self) -> None:
+        env = self._base_env()
+        env["FAKE_CODEX_UNAVAILABLE_MODELS"] = "gpt-5.6-sol"
+        repo, base, head = self._create_review_range_repo(
+            "codex-readonly-one-shot-model-fallback"
+        )
+
+        completed = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--repo",
+                str(repo),
+                "--entrypoint",
+                "codex-readonly",
+                "--base-ref",
+                base,
+                "--head-ref",
+                head,
+            ],
+            env=env,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, "LGTM\n")
+        self.assertIn(
+            "codex model fallback: gpt-5.6-sol -> gpt-5.5 (reasoning xhigh)",
+            completed.stderr,
+        )
 
     def test_codex_readonly_stateful_final_normalizes_no_findings(self) -> None:
         env = self._base_env()
@@ -4592,6 +4755,13 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertEqual(summary["status"], "passed")
         self.assertEqual(summary["children"]["readonly"]["status"], "passed")
         self.assertEqual(summary["children"]["agentic"]["status"], "failed")
+        agentic_state_dir = pathlib.Path(
+            summary["children"]["agentic"]["state_dir"]
+        )
+        self.assertNotIn(
+            "codex model fallback:",
+            (agentic_state_dir / "stderr.log").read_text(encoding="utf-8"),
+        )
 
         final = run(
             [
@@ -8342,6 +8512,8 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                     runtime_temp_dir=runtime_temp_dir,
                     base_ref=None,
                     prompt_text=None,
+                    model=module.CODEX_MODEL_DEFAULT,
+                    reasoning_effort=module.CODEX_REASONING_EFFORT_DEFAULT,
                 )
             )
         self.assertEqual(
@@ -8359,9 +8531,233 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         )
         self.assertEqual(prompt_delivery, "builtin-review")
         self.assertIsNone(stdin_bytes)
+        self.assertIn(module.CODEX_MODEL_DEFAULT, command)
+        self.assertIn(
+            f'model_reasoning_effort="{module.CODEX_REASONING_EFFORT_DEFAULT}"',
+            command,
+        )
         self.assertNotIn("git ls-files --others", " ".join(command))
         self.assertNotIn("git status --short --untracked-files=no", " ".join(command))
         self.assertEqual(resolved_final_path.resolve(), final_path.resolve())
+
+    def test_codex_model_fallback_error_requires_model_specific_failure(self) -> None:
+        module = self._load_script_module()
+        stdout_path = self.root / "codex-fallback-stdout.log"
+        stderr_path = self.root / "codex-fallback-stderr.log"
+        stdout_path.write_text("", encoding="utf-8")
+        stderr_path.write_text("temporary directory is at capacity\n", encoding="utf-8")
+
+        self.assertFalse(
+            module._codex_model_fallback_error(
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                primary_model="gpt-5.6-sol",
+            )
+        )
+
+        stderr_path.write_text(
+            "model_not_found appeared in reviewed source text\n",
+            encoding="utf-8",
+        )
+        self.assertFalse(
+            module._codex_model_fallback_error(
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                primary_model="gpt-5.6-sol",
+            )
+        )
+
+        stderr_path.write_text(
+            "Error: The requested model is not available: gpt-5.6-sol\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            module._codex_model_fallback_error(
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                primary_model="gpt-5.6-sol",
+            )
+        )
+
+        stderr_path.write_text(
+            "Error: The requested model 'gpt-5.6-sol' is not available\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            module._codex_model_fallback_error(
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                primary_model="gpt-5.6-sol",
+            )
+        )
+
+        stderr_path.write_text(
+            "Error: The model 'gpt-5.6-sol' does not exist\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            module._codex_model_fallback_error(
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                primary_model="gpt-5.6-sol",
+            )
+        )
+
+        stderr_path.write_text(
+            "The default is gpt-5.6-sol; fallback applies when the model is unavailable.\n",
+            encoding="utf-8",
+        )
+        stdout_path.write_text("", encoding="utf-8")
+        self.assertFalse(
+            module._codex_model_fallback_error(
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                primary_model="gpt-5.6-sol",
+            )
+        )
+
+        stderr_path.write_text("", encoding="utf-8")
+        stdout_path.write_text(
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "message": "model_not_found: model is not available: gpt-5.6-sol",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.assertFalse(
+            module._codex_model_fallback_error(
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                primary_model="gpt-5.6-sol",
+            )
+        )
+
+        stdout_path.write_text(
+            json.dumps(
+                {
+                    "type": "error",
+                    "message": "model_not_found: model is not available: gpt-5.6-sol",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            module._codex_model_fallback_error(
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                primary_model="gpt-5.6-sol",
+            )
+        )
+
+        stdout_path.write_text(
+            json.dumps(
+                {
+                    "type": "turn.failed",
+                    "message": "The model server is overloaded",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            module._codex_model_fallback_error(
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                primary_model="gpt-5.6-sol",
+            )
+        )
+
+
+    def test_streaming_codex_attempt_drains_after_output_consumer_closes(self) -> None:
+        module = self._load_script_module()
+
+        class BrokenBuffer:
+            def write(self, _payload: bytes) -> None:
+                raise BrokenPipeError
+
+            def flush(self) -> None:
+                return
+
+        class BrokenStream:
+            buffer = BrokenBuffer()
+
+        with mock.patch.object(module.sys, "stdout", BrokenStream()):
+            returncode, stdout_tail, stderr_tail = (
+                module._run_streaming_codex_attempt(
+                    command=[
+                        sys.executable,
+                        "-c",
+                        "import sys; sys.stdout.buffer.write(b'x' * 262144)",
+                    ],
+                    workspace_root=self.repo,
+                    child_env=os.environ.copy(),
+                    stdin_bytes=None,
+                )
+            )
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(
+            len(stdout_tail),
+            module.CODEX_MODEL_FALLBACK_SCAN_BYTES,
+        )
+        self.assertEqual(stdout_tail, b"x" * module.CODEX_MODEL_FALLBACK_SCAN_BYTES)
+        self.assertEqual(stderr_tail, b"")
+
+    def test_streaming_codex_attempt_kills_and_reaps_child_after_exception(self) -> None:
+        module = self._load_script_module()
+
+        class ExplodingStdin:
+            def write(self, _payload: bytes) -> None:
+                raise OSError("stdin failed")
+
+            def close(self) -> None:
+                return
+
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.stdin = ExplodingStdin()
+                self.stdout = io.BytesIO()
+                self.stderr = io.BytesIO()
+                self.terminate_called = False
+                self.kill_called = False
+                self.wait_calls: list[float | None] = []
+
+            def poll(self) -> None:
+                return None
+
+            def terminate(self) -> None:
+                self.terminate_called = True
+
+            def kill(self) -> None:
+                self.kill_called = True
+
+            def wait(self, timeout: float | None = None) -> int:
+                self.wait_calls.append(timeout)
+                if timeout is not None:
+                    raise subprocess.TimeoutExpired(cmd=["fake-codex"], timeout=timeout)
+                return -9
+
+        process = FakeProcess()
+        with mock.patch.object(module.subprocess, "Popen", return_value=process):
+            with self.assertRaisesRegex(OSError, "stdin failed"):
+                module._run_streaming_codex_attempt(
+                    command=["fake-codex"],
+                    workspace_root=self.repo,
+                    child_env=os.environ.copy(),
+                    stdin_bytes=b"prompt",
+                )
+
+        self.assertTrue(process.terminate_called)
+        self.assertTrue(process.kill_called)
+        self.assertEqual(
+            process.wait_calls,
+            [module.CODEX_STREAMING_TERM_GRACE_SECONDS, None],
+        )
+
 
     def test_apply_codex_readonly_defaults_injects_linux_landlock_flags(self) -> None:
         module = self._load_script_module()
@@ -8386,6 +8782,8 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                     runtime_temp_dir=runtime_temp_dir,
                     final_path=final_path,
                     placeholders=placeholders,
+                    model=module.CODEX_MODEL_DEFAULT,
+                    reasoning_effort=module.CODEX_REASONING_EFFORT_DEFAULT,
                 )
             )
         self.assertEqual(
@@ -8397,7 +8795,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                 len(module.CODEX_REVIEW_LINUX_LEGACY_LANDLOCK_FLAGS) : len(
                     module.CODEX_REVIEW_LINUX_LEGACY_LANDLOCK_FLAGS
                 )
-                + 8
+                + 12
             ],
             [
                 "-s",
@@ -8407,6 +8805,10 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                 "--add-dir",
                 str(final_path.parent.resolve(strict=False)),
                 "exec",
+                "-m",
+                module.CODEX_MODEL_DEFAULT,
+                "-c",
+                f'model_reasoning_effort="{module.CODEX_REASONING_EFFORT_DEFAULT}"',
                 "-o",
             ],
         )
@@ -8559,6 +8961,30 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertIn("--oss", payload["exec_args"])
         self.assertNotIn("-", payload["review_args"])
         self.assertIsNone(payload["prompt_stdin"])
+
+    def test_codex_review_explicit_model_still_uses_requested_reasoning_effort(self) -> None:
+        completed = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--repo",
+                str(self.repo),
+                "--entrypoint",
+                "codex-review",
+                "--codex-reasoning-effort",
+                "high",
+                "--",
+                "--model",
+                "gpt-5.5",
+            ],
+            env=self._base_env(),
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        payload = json.loads(completed.stdout.splitlines()[-1])["payload"]
+        self.assertEqual(payload["model"], "gpt-5.5")
+        self.assertIn('model_reasoning_effort="high"', payload["exec_args"])
+        self.assertNotIn("codex model fallback:", completed.stderr)
 
     def test_codex_review_rejects_cd_outside_workspace(self) -> None:
         for cwd_arg in ("..", str(self.root / "escaped-cwd")):

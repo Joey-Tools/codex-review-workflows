@@ -38,6 +38,8 @@ Use `$HOME/.codex/skills/review-orchestration-playbook/scripts/isolated_review` 
 
 `auto` continues to mean external-review lane selection only. The helper does not silently choose `codex-review` as part of external auto priorities.
 
+Helper-managed `codex-review`, `codex-readonly`, and both halves of `codex-parallel` pin `gpt-5.6-sol` with `xhigh` reasoning by default. When the primary attempt fails with bounded evidence that the model is unavailable, unsupported, not found, overloaded, capacity-limited, or not entitled, the helper retries the same scope once with `gpt-5.5` and `xhigh`. It does not retry on generic authentication, network, sandbox, timeout, validation, or reviewer-result failures. Override the policy with `--codex-model`, `--codex-fallback-model`, and `--codex-reasoning-effort`, or disable it with `--no-codex-model-fallback`. Passing an explicit `-m/--model` child argument to `codex-review` preserves that caller choice and disables helper-managed fallback for that run.
+
 ## Lanes
 
 - `--lane custom`: preserve the legacy helper behavior. `auto` still prefers `agent`, then `copilot`, then `gh copilot`.

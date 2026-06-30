@@ -16,6 +16,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import BinaryIO, Iterable
 
@@ -129,6 +130,42 @@ CODEX_REVIEW_LINUX_LEGACY_LANDLOCK_FLAGS = (
     "use_legacy_landlock",
 )
 CODEX_REVIEW_LINUX_SANDBOX_PROBE_TIMEOUT_SECONDS = 10
+CODEX_MODEL_DEFAULT = "gpt-5.6-sol"
+CODEX_FALLBACK_MODEL_DEFAULT = "gpt-5.5"
+CODEX_REASONING_EFFORT_DEFAULT = "xhigh"
+CODEX_MODEL_FALLBACK_SCAN_BYTES = 64 * 1024
+CODEX_MODEL_FALLBACK_ERROR_FRAGMENTS = (
+    "capacity for the model",
+    "capacity for this model",
+    "model_not_found",
+    "model capacity",
+    "model is at capacity",
+    "model is not available",
+    "model is unavailable",
+    "model is overloaded",
+    "model is not supported",
+    "model is unsupported",
+    "model does not exist",
+    "model not found",
+    "no access to model",
+    "no access to the model",
+    "not have access to model",
+    "not have access to the model",
+    "unsupported model",
+    "you do not have access to this model",
+)
+CODEX_MODEL_FALLBACK_ERROR_PATTERNS = (
+    re.compile(
+        r"\bmodel\b.{0,200}\b(?:is (?:at capacity|not available|not supported|"
+        r"overloaded|unavailable|unsupported)|does not exist|not found)\b"
+    ),
+    re.compile(r"\b(?:no access to|not have access to)\b.{0,200}\bmodel\b"),
+)
+CODEX_MODEL_FALLBACK_STDERR_PREFIX_PATTERN = re.compile(
+    r"^(?:(?:\d{4}-\d{2}-\d{2}t\S+)\s+)?"
+    r"(?:error|fatal|model_not_found|unsupported_model|warn|warning)\b"
+)
+CODEX_STREAMING_TERM_GRACE_SECONDS = 5.0
 CODEX_READONLY_FINAL_MESSAGE_DEFAULT = "LGTM\n"
 CODEX_READONLY_FINAL_MESSAGE_ALIASES = frozenset(
     {
@@ -3322,6 +3359,8 @@ def _apply_codex_review_defaults(
     runtime_temp_dir: pathlib.Path,
     base_ref: str | None,
     prompt_text: str | None,
+    model: str,
+    reasoning_effort: str,
 ) -> tuple[list[str], str, bytes | None, pathlib.Path]:
     result = list(rendered_args)
     stdin_bytes: bytes | None = None
@@ -3334,6 +3373,13 @@ def _apply_codex_review_defaults(
         final_path=final_path,
     )
     exec_args, review_args, has_prompt_arg = _split_codex_review_child_args(result)
+    exec_args = [
+        "-c",
+        f'model_reasoning_effort="{reasoning_effort}"',
+        *exec_args,
+    ]
+    if not _has_option(review_args, "-m", "--model"):
+        review_args = ["-m", model, *review_args]
     if "--json" not in review_args:
         review_args = ["--json", *review_args]
     if base_ref is not None:
@@ -3421,6 +3467,8 @@ def _apply_codex_readonly_defaults(
     runtime_temp_dir: pathlib.Path,
     final_path: pathlib.Path,
     placeholders: dict[str, str | None],
+    model: str,
+    reasoning_effort: str,
 ) -> tuple[list[str], str, bytes, pathlib.Path]:
     if rendered_args:
         raise UserError(
@@ -3464,6 +3512,10 @@ def _apply_codex_readonly_defaults(
             "read-only",
             *add_dir_args,
             "exec",
+            "-m",
+            model,
+            "-c",
+            f'model_reasoning_effort="{reasoning_effort}"',
             "-o",
             str(final_path),
             "-",
@@ -4623,6 +4675,7 @@ def _reset_stateful_artifacts(
         state_dir / "runner.lock",
         state_dir / "launcher.log",
         state_dir / "stdin.txt",
+        state_dir / "model-fallback.json",
         prior_state_path,
     }
     for artifact_path in artifact_paths:
@@ -4732,6 +4785,24 @@ def _state_summary(state_dir: pathlib.Path, state: dict[str, object]) -> dict[st
             )
             is not None
         )
+    model_fallback = None
+    model_fallback_path_raw = state.get("model_fallback_path")
+    if model_fallback_path_raw:
+        model_fallback_path = pathlib.Path(str(model_fallback_path_raw))
+        if model_fallback_path.is_file():
+            try:
+                model_fallback = _read_json(model_fallback_path)
+            except (OSError, UserError):
+                model_fallback = None
+    codex_model = None
+    if entrypoint in {"codex-review", "codex-readonly"}:
+        primary_model = state.get("codex_primary_model")
+        if isinstance(primary_model, str) and primary_model:
+            codex_model = primary_model
+        if isinstance(model_fallback, dict):
+            fallback_model = model_fallback.get("fallback_model")
+            if isinstance(fallback_model, str) and fallback_model:
+                codex_model = fallback_model
     return {
         "state_dir": str(state_dir),
         "workspace_root": _require_state_field(state, "workspace_root"),
@@ -4744,6 +4815,8 @@ def _state_summary(state_dir: pathlib.Path, state: dict[str, object]) -> dict[st
         "final_available": final_available,
         "report_available": report_available,
         "workspace_cleaned": bool(state.get("workspace_cleaned")),
+        "codex_model": codex_model,
+        "model_fallback": model_fallback,
         "stdout_tail": _tail_text(stdout_path),
         "stderr_tail": stderr_tail,
     }
@@ -5134,6 +5207,8 @@ def _build_child_process(
             runtime_temp_dir=runtime_temp_dir,
             base_ref=base_ref,
             prompt_text=placeholders["{prompt_text}"],
+            model=args.codex_model,
+            reasoning_effort=args.codex_reasoning_effort,
         )
     elif entrypoint_label == "codex-readonly":
         final_path = container_dir / "final.txt"
@@ -5150,6 +5225,8 @@ def _build_child_process(
             runtime_temp_dir=runtime_temp_dir,
             final_path=final_path,
             placeholders=placeholders,
+            model=args.codex_model,
+            reasoning_effort=args.codex_reasoning_effort,
         )
     else:
         rendered_args = _maybe_apply_default_external_prompt(
@@ -5280,12 +5357,51 @@ def _build_child_process(
     )
 
 
+def _validate_codex_model_policy(args: argparse.Namespace) -> None:
+    if args.entrypoint not in {"codex-review", "codex-readonly", "codex-parallel"}:
+        return
+    for flag, value in (
+        ("--codex-model", args.codex_model),
+        ("--codex-fallback-model", args.codex_fallback_model),
+        ("--codex-reasoning-effort", args.codex_reasoning_effort),
+    ):
+        if not isinstance(value, str) or not value.strip():
+            raise UserError(f"{flag} must be a non-empty string")
+    if (
+        not args.no_codex_model_fallback
+        and args.codex_model == args.codex_fallback_model
+    ):
+        raise UserError(
+            "--codex-fallback-model must differ from --codex-model, or pass "
+            "--no-codex-model-fallback"
+        )
+
+
+def _codex_model_fallback_enabled(
+    args: argparse.Namespace,
+    *,
+    entrypoint_label: str,
+) -> bool:
+    if entrypoint_label not in {"codex-review", "codex-readonly"}:
+        return False
+    if args.no_codex_model_fallback:
+        return False
+    if entrypoint_label == "codex-review":
+        raw_review_args = list(args.review_args)
+        if raw_review_args and raw_review_args[0] == "--":
+            raw_review_args = raw_review_args[1:]
+        if _has_option(raw_review_args, "-m", "--model"):
+            return False
+    return True
+
+
 def _prepare_review_execution(args: argparse.Namespace) -> dict[str, object]:
     source_root: pathlib.Path | None = None
     workspace_root: pathlib.Path | None = None
     created_workspace = False
     cleanup_submodule_worktrees = False
     try:
+        _validate_codex_model_policy(args)
         if args.entrypoint == "codex-review":
             frozen_range = args.base_ref is not None or args.head_ref is not None
             _reject_codex_review_report_path(args)
@@ -5368,6 +5484,16 @@ def _prepare_review_execution(args: argparse.Namespace) -> dict[str, object]:
                 "final_path": final_path,
                 "stdin_bytes": stdin_bytes,
                 "prompt_delivery": prompt_delivery,
+                "codex_model_fallback_enabled": _codex_model_fallback_enabled(
+                    args,
+                    entrypoint_label=entrypoint_label,
+                ),
+                "codex_primary_model": (
+                    _option_value(command, "-m", "--model")
+                    or args.codex_model
+                ),
+                "codex_fallback_model": args.codex_fallback_model,
+                "codex_reasoning_effort": args.codex_reasoning_effort,
             }
         )
         return prepared
@@ -5423,6 +5549,256 @@ def _cleanup_prepared_workspace(
     return cleanup_error
 
 
+def _read_binary_tail(path: pathlib.Path, *, max_bytes: int) -> bytes:
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        handle.seek(max(0, size - max_bytes), os.SEEK_SET)
+        return handle.read(max_bytes)
+
+
+def _codex_model_fallback_error(
+    *,
+    stdout_path: pathlib.Path,
+    stderr_path: pathlib.Path,
+    primary_model: str,
+) -> bool:
+    return _codex_model_fallback_error_output(
+        stdout_tail=_read_binary_tail(
+            stdout_path,
+            max_bytes=CODEX_MODEL_FALLBACK_SCAN_BYTES,
+        ),
+        stderr_tail=_read_binary_tail(
+            stderr_path,
+            max_bytes=CODEX_MODEL_FALLBACK_SCAN_BYTES,
+        ),
+        primary_model=primary_model,
+    )
+
+
+def _codex_model_fallback_error_output(
+    *,
+    stdout_tail: bytes,
+    stderr_tail: bytes,
+    primary_model: str,
+) -> bool:
+    if _codex_model_fallback_error_text(
+        stderr_tail=stderr_tail,
+        primary_model=primary_model,
+    ):
+        return True
+    for raw_line in stdout_tail.splitlines():
+        try:
+            event = json.loads(raw_line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        event_type = str(event.get("type") or "").lower()
+        if event_type != "error" and not event_type.endswith(".failed"):
+            continue
+        event_text = json.dumps(
+            event,
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+        if _codex_model_fallback_error_text(
+            stderr_tail=event_text,
+            primary_model=primary_model,
+            require_primary_model=False,
+            require_error_prefix=False,
+        ):
+            return True
+    return False
+
+
+def _codex_model_fallback_error_text(
+    *,
+    stderr_tail: bytes,
+    primary_model: str,
+    require_primary_model: bool = True,
+    require_error_prefix: bool = True,
+) -> bool:
+    text = stderr_tail.decode("utf-8", errors="replace").lower()
+    primary_model_lower = primary_model.lower()
+    for line in text.splitlines():
+        if require_error_prefix and not CODEX_MODEL_FALLBACK_STDERR_PREFIX_PATTERN.match(
+            line.lstrip()
+        ):
+            continue
+        if require_primary_model and primary_model_lower not in line:
+            continue
+        if any(
+            fragment in line
+            for fragment in CODEX_MODEL_FALLBACK_ERROR_FRAGMENTS
+        ):
+            return True
+        if any(pattern.search(line) for pattern in CODEX_MODEL_FALLBACK_ERROR_PATTERNS):
+            return True
+    return False
+
+
+def _replace_codex_model(
+    command: list[str],
+    *,
+    primary_model: str,
+    fallback_model: str,
+) -> list[str]:
+    result = list(command)
+    for index, arg in enumerate(result):
+        if arg in {"-m", "--model"} and index + 1 < len(result):
+            if result[index + 1] == primary_model:
+                result[index + 1] = fallback_model
+                return result
+        for option in ("-m", "--model"):
+            prefix = f"{option}="
+            if arg == f"{prefix}{primary_model}":
+                result[index] = f"{prefix}{fallback_model}"
+                return result
+    raise UserError(
+        "helper-managed Codex fallback could not locate the primary model in the child command"
+    )
+
+
+def _emit_binary_file(path: pathlib.Path, stream: object) -> None:
+    binary_stream = getattr(stream, "buffer", None)
+    if binary_stream is not None:
+        with path.open("rb") as source:
+            shutil.copyfileobj(source, binary_stream)
+        binary_stream.flush()
+        return
+    text_stream = stream
+    text_stream.write(path.read_text(encoding="utf-8", errors="replace"))
+    text_stream.flush()
+
+
+def _emit_binary_bytes(payload: bytes, stream: object) -> None:
+    binary_stream = getattr(stream, "buffer", None)
+    if binary_stream is not None:
+        binary_stream.write(payload)
+        binary_stream.flush()
+        return
+    text_stream = stream
+    text_stream.write(payload.decode("utf-8", errors="replace"))
+    text_stream.flush()
+
+
+def _append_bounded_tail(buffer: bytearray, payload: bytes) -> None:
+    buffer.extend(payload)
+    overflow = len(buffer) - CODEX_MODEL_FALLBACK_SCAN_BYTES
+    if overflow > 0:
+        del buffer[:overflow]
+
+
+def _run_streaming_codex_attempt(
+    *,
+    command: list[str],
+    workspace_root: pathlib.Path,
+    child_env: dict[str, str],
+    stdin_bytes: bytes | None,
+) -> tuple[int, bytes, bytes]:
+    process = subprocess.Popen(
+        command,
+        cwd=str(workspace_root),
+        env=child_env,
+        stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    stdout_tail = bytearray()
+    stderr_tail = bytearray()
+
+    def pump(
+        source: BinaryIO,
+        stream: object,
+        tail: bytearray,
+    ) -> None:
+        stream_failed = False
+        while True:
+            payload = source.read(8192)
+            if not payload:
+                break
+            _append_bounded_tail(tail, payload)
+            if stream_failed:
+                continue
+            try:
+                _emit_binary_bytes(payload, stream)
+            except (BrokenPipeError, OSError, ValueError):
+                stream_failed = True
+
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stdout_thread = threading.Thread(
+        target=pump,
+        args=(process.stdout, sys.stdout, stdout_tail),
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=pump,
+        args=(process.stderr, sys.stderr, stderr_tail),
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+    try:
+        if process.stdin is not None:
+            try:
+                process.stdin.write(stdin_bytes or b"")
+            except BrokenPipeError:
+                pass
+            finally:
+                try:
+                    process.stdin.close()
+                except (BrokenPipeError, OSError, ValueError):
+                    pass
+        returncode = process.wait()
+    except BaseException:
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=CODEX_STREAMING_TERM_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                process.wait()
+        raise
+    finally:
+        stdout_thread.join()
+        stderr_thread.join()
+        process.stdout.close()
+        process.stderr.close()
+    return returncode, bytes(stdout_tail), bytes(stderr_tail)
+
+
+def _run_captured_codex_attempt(
+    *,
+    command: list[str],
+    workspace_root: pathlib.Path,
+    child_env: dict[str, str],
+    stdin_bytes: bytes | None,
+    container_dir: pathlib.Path,
+    attempt: str,
+) -> tuple[subprocess.CompletedProcess[bytes], pathlib.Path, pathlib.Path]:
+    stdout_path = container_dir / f"codex-{attempt}.stdout"
+    stderr_path = container_dir / f"codex-{attempt}.stderr"
+    with stdout_path.open("wb") as stdout_handle, stderr_path.open("wb") as stderr_handle:
+        completed = subprocess.run(
+            command,
+            cwd=str(workspace_root),
+            env=child_env,
+            input=stdin_bytes,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+            check=False,
+        )
+    return completed, stdout_path, stderr_path
+
+
 def _run_prepared_review(prepared: dict[str, object]) -> int:
     args: argparse.Namespace = prepared["args"]  # type: ignore[assignment]
     placeholders = prepared["placeholders"]
@@ -5444,22 +5820,108 @@ def _run_prepared_review(prepared: dict[str, object]) -> int:
                 print(f"review_range={placeholders['{review_range}']}", file=sys.stderr)
             print(f"command={' '.join(command)}", file=sys.stderr)
 
-        capture_child_output = entrypoint_label == "codex-readonly"
-        completed = subprocess.run(
-            command,
-            cwd=str(workspace_root),
-            env=child_env,
-            input=prepared["stdin_bytes"],
-            stdout=subprocess.PIPE if capture_child_output else None,
-            stderr=subprocess.PIPE if capture_child_output else None,
-            check=False,
-        )
-        child_returncode = completed.returncode
-        if capture_child_output and child_returncode != 0:
-            if completed.stdout:
-                sys.stdout.write(completed.stdout.decode("utf-8", errors="replace"))
-            if completed.stderr:
-                sys.stderr.write(completed.stderr.decode("utf-8", errors="replace"))
+        fallback_enabled = bool(prepared.get("codex_model_fallback_enabled"))
+        if fallback_enabled:
+            primary_model = str(prepared["codex_primary_model"])
+            fallback_model = str(prepared["codex_fallback_model"])
+            reasoning_effort = str(prepared["codex_reasoning_effort"])
+            if entrypoint_label == "codex-review":
+                (
+                    child_returncode,
+                    _stdout_tail,
+                    stderr_tail,
+                ) = _run_streaming_codex_attempt(
+                    command=command,
+                    workspace_root=pathlib.Path(str(workspace_root)),
+                    child_env=child_env,
+                    stdin_bytes=prepared["stdin_bytes"],
+                )
+                should_fallback = (
+                    child_returncode != 0
+                    and _codex_model_fallback_error_output(
+                        stdout_tail=_stdout_tail,
+                        stderr_tail=stderr_tail,
+                        primary_model=primary_model,
+                    )
+                )
+            else:
+                completed, stdout_path, stderr_path = _run_captured_codex_attempt(
+                    command=command,
+                    workspace_root=pathlib.Path(str(workspace_root)),
+                    child_env=child_env,
+                    stdin_bytes=prepared["stdin_bytes"],
+                    container_dir=pathlib.Path(str(prepared["container_dir"])),
+                    attempt="primary",
+                )
+                child_returncode = completed.returncode
+                should_fallback = (
+                    child_returncode != 0
+                    and _codex_model_fallback_error(
+                        stdout_path=stdout_path,
+                        stderr_path=stderr_path,
+                        primary_model=primary_model,
+                    )
+                )
+                if child_returncode != 0 and not should_fallback:
+                    _emit_binary_file(stdout_path, sys.stdout)
+                if child_returncode != 0:
+                    _emit_binary_file(stderr_path, sys.stderr)
+            if should_fallback:
+                print(
+                    "codex model fallback: "
+                    f"{primary_model} -> {fallback_model} "
+                    f"(reasoning {reasoning_effort})",
+                    file=sys.stderr,
+                )
+                final_path_raw = prepared.get("final_path")
+                if final_path_raw is not None:
+                    pathlib.Path(str(final_path_raw)).unlink(missing_ok=True)
+                fallback_command = _replace_codex_model(
+                    command,
+                    primary_model=primary_model,
+                    fallback_model=fallback_model,
+                )
+                if entrypoint_label == "codex-review":
+                    (
+                        child_returncode,
+                        _stdout_tail,
+                        _stderr_tail,
+                    ) = _run_streaming_codex_attempt(
+                        command=fallback_command,
+                        workspace_root=pathlib.Path(str(workspace_root)),
+                        child_env=child_env,
+                        stdin_bytes=prepared["stdin_bytes"],
+                    )
+                else:
+                    completed, stdout_path, stderr_path = _run_captured_codex_attempt(
+                        command=fallback_command,
+                        workspace_root=pathlib.Path(str(workspace_root)),
+                        child_env=child_env,
+                        stdin_bytes=prepared["stdin_bytes"],
+                        container_dir=pathlib.Path(str(prepared["container_dir"])),
+                        attempt="fallback",
+                    )
+                    child_returncode = completed.returncode
+                    if child_returncode != 0:
+                        _emit_binary_file(stdout_path, sys.stdout)
+                        _emit_binary_file(stderr_path, sys.stderr)
+        else:
+            capture_child_output = entrypoint_label == "codex-readonly"
+            completed = subprocess.run(
+                command,
+                cwd=str(workspace_root),
+                env=child_env,
+                input=prepared["stdin_bytes"],
+                stdout=subprocess.PIPE if capture_child_output else None,
+                stderr=subprocess.PIPE if capture_child_output else None,
+                check=False,
+            )
+            child_returncode = completed.returncode
+            if capture_child_output and child_returncode != 0:
+                if completed.stdout:
+                    sys.stdout.write(completed.stdout.decode("utf-8", errors="replace"))
+                if completed.stderr:
+                    sys.stderr.write(completed.stderr.decode("utf-8", errors="replace"))
         if child_returncode == 0 and entrypoint_label == "codex-readonly":
             final_path = pathlib.Path(str(prepared["final_path"]))
             if not final_path.is_file():
@@ -5529,6 +5991,7 @@ def _start_prepared_review(prepared: dict[str, object]) -> int:
     lock_path = state_dir / "runner.lock"
     spec_path = state_dir / "runner-spec.json"
     launcher_log_path = state_dir / "launcher.log"
+    model_fallback_path = state_dir / "model-fallback.json"
     stdin_path: pathlib.Path | None = None
     stdin_bytes = prepared["stdin_bytes"]
     _reset_stateful_artifacts(
@@ -5563,6 +6026,18 @@ def _start_prepared_review(prepared: dict[str, object]) -> int:
         "exit_code_path": str(exit_code_path),
         "pid_path": str(pid_path),
         "stdin_path": str(stdin_path) if stdin_path is not None else None,
+        "codex_model_fallback_enabled": bool(
+            prepared.get("codex_model_fallback_enabled")
+        ),
+        "codex_primary_model": prepared.get("codex_primary_model"),
+        "codex_fallback_model": prepared.get("codex_fallback_model"),
+        "codex_reasoning_effort": prepared.get("codex_reasoning_effort"),
+        "final_path": (
+            str(prepared["final_path"])
+            if prepared.get("final_path") is not None
+            else None
+        ),
+        "model_fallback_path": str(model_fallback_path),
     }
     _write_json(spec_path, runner_spec)
     spec_sha256 = hashlib.sha256(spec_path.read_bytes()).hexdigest()
@@ -5590,6 +6065,10 @@ def _start_prepared_review(prepared: dict[str, object]) -> int:
         "pid_path": str(pid_path),
         "lock_path": str(lock_path),
         "runner_spec_path": str(spec_path),
+        "model_fallback_path": str(model_fallback_path),
+        "codex_primary_model": prepared.get("codex_primary_model"),
+        "codex_fallback_model": prepared.get("codex_fallback_model"),
+        "codex_reasoning_effort": prepared.get("codex_reasoning_effort"),
         "started_at": time.time(),
     }
     if prepared["entrypoint_label"] in {"codex-review", "codex-readonly"}:
@@ -5697,6 +6176,66 @@ def _run_child_from_spec(spec_path: pathlib.Path, *, expected_sha256: str) -> in
                             stderr=stderr_handle,
                             check=False,
                         ).returncode
+                        stdout_handle.flush()
+                        stderr_handle.flush()
+                        fallback_enabled = bool(
+                            spec.get("codex_model_fallback_enabled")
+                        )
+                        primary_model = str(spec.get("codex_primary_model") or "")
+                        if (
+                            fallback_enabled
+                            and exit_code != 0
+                            and _codex_model_fallback_error(
+                                stdout_path=stdout_path,
+                                stderr_path=stderr_path,
+                                primary_model=primary_model,
+                            )
+                        ):
+                            fallback_model = str(
+                                spec.get("codex_fallback_model") or ""
+                            )
+                            reasoning_effort = str(
+                                spec.get("codex_reasoning_effort") or ""
+                            )
+                            stderr_handle.write(
+                                (
+                                    "codex model fallback: "
+                                    f"{primary_model} -> {fallback_model} "
+                                    f"(reasoning {reasoning_effort})\n"
+                                ).encode("utf-8")
+                            )
+                            stderr_handle.flush()
+                            model_fallback_path_raw = spec.get(
+                                "model_fallback_path"
+                            )
+                            if model_fallback_path_raw:
+                                _write_json(
+                                    pathlib.Path(str(model_fallback_path_raw)),
+                                    {
+                                        "primary_model": primary_model,
+                                        "fallback_model": fallback_model,
+                                        "reasoning_effort": reasoning_effort,
+                                    },
+                                )
+                            final_path_raw = spec.get("final_path")
+                            if final_path_raw:
+                                pathlib.Path(str(final_path_raw)).unlink(
+                                    missing_ok=True
+                                )
+                            fallback_command = _replace_codex_model(
+                                list(spec["command"]),
+                                primary_model=primary_model,
+                                fallback_model=fallback_model,
+                            )
+                            exit_code = subprocess.run(
+                                fallback_command,
+                                cwd=str(spec["cwd"]),
+                                env=child_env,
+                                input=stdin_bytes,
+                                stdout=stdout_handle,
+                                stderr=stderr_handle,
+                                check=False,
+                            ).returncode
                     except Exception as error:  # pragma: no cover - defensive crash path
                         stderr_handle.write(
                             f"runner failed: {error}\n".encode("utf-8", errors="replace")
@@ -6515,6 +7054,20 @@ def _maybe_cleanup_parallel_workspace(
 
 def _start_parallel_review(args: argparse.Namespace) -> int:
     _reject_codex_parallel_customizations(args)
+    codex_model = getattr(args, "codex_model", CODEX_MODEL_DEFAULT)
+    codex_fallback_model = getattr(
+        args,
+        "codex_fallback_model",
+        CODEX_FALLBACK_MODEL_DEFAULT,
+    )
+    codex_reasoning_effort = getattr(
+        args,
+        "codex_reasoning_effort",
+        CODEX_REASONING_EFFORT_DEFAULT,
+    )
+    no_codex_model_fallback = bool(
+        getattr(args, "no_codex_model_fallback", False)
+    )
     (
         source_root,
         base_ref,
@@ -6573,7 +7126,15 @@ def _start_parallel_review(args: argparse.Namespace) -> int:
             entrypoint,
             "--lane",
             args.lane,
+            "--codex-model",
+            codex_model,
+            "--codex-fallback-model",
+            codex_fallback_model,
+            "--codex-reasoning-effort",
+            codex_reasoning_effort,
         ]
+        if no_codex_model_fallback:
+            command.append("--no-codex-model-fallback")
         if base_ref is not None and head_ref is not None:
             command.extend(["--base-ref", base_ref, "--head-ref", head_ref])
         if args.keep_on_failure:
@@ -6916,6 +7477,29 @@ def _build_parser() -> argparse.ArgumentParser:
             "`bounded-semantic`, `deep-semantic`, `baseline`, and `super-large` "
             "package the current recommended entrypoint priorities."
         ),
+    )
+    parser.add_argument(
+        "--codex-model",
+        default=CODEX_MODEL_DEFAULT,
+        help="Primary model for helper-managed Codex review lanes.",
+    )
+    parser.add_argument(
+        "--codex-fallback-model",
+        default=CODEX_FALLBACK_MODEL_DEFAULT,
+        help=(
+            "Fallback model for helper-managed Codex review lanes when the primary "
+            "model is unavailable, unsupported, or not entitled."
+        ),
+    )
+    parser.add_argument(
+        "--codex-reasoning-effort",
+        default=CODEX_REASONING_EFFORT_DEFAULT,
+        help="Reasoning effort shared by the primary and fallback Codex models.",
+    )
+    parser.add_argument(
+        "--no-codex-model-fallback",
+        action="store_true",
+        help="Disable helper-managed Codex model fallback for this review.",
     )
     parser.add_argument(
         "--base-ref",
