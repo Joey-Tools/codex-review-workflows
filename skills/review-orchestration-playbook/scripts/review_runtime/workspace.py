@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import re
@@ -17,6 +18,7 @@ from .common import (
     is_relative_to,
     resolve_git,
     run,
+    write_json,
     write_text_atomic,
 )
 from .prompt import build_review_prompt
@@ -66,13 +68,17 @@ PLACEHOLDER_SECRET_MARKERS = (
     b"placeholder",
     b"redacted",
 )
-SENSITIVE_EXACT_PATHS = {
-    ".aws/credentials",
+SENSITIVE_ANYWHERE_NAMES = {
     ".git-credentials",
     ".netrc",
     "service-account.json",
     "service_account.json",
 }
+SENSITIVE_PATH_SUFFIXES = (
+    (".aws", "credentials"),
+    (".docker", "config.json"),
+    (".kube", "config"),
+)
 SENSITIVE_FILE_NAMES = {
     "id_dsa",
     "id_ecdsa",
@@ -507,6 +513,31 @@ def _write_frozen_diff(
             )
 
 
+def _frozen_changed_paths(
+    *,
+    git_view: pathlib.Path,
+    object_directory: pathlib.Path,
+    base_sha: str,
+    head_sha: str,
+) -> list[str]:
+    result = run(
+        _frozen_command(
+            git_view=git_view,
+            args=(
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                base_sha,
+                head_sha,
+            ),
+        ),
+        env=_git_environment(object_directory=object_directory),
+        check=True,
+    )
+    return [os.fsdecode(value) for value in result.stdout.split(b"\0") if value]
+
+
 def validate_workspace_layout(review: ReviewWorkspace) -> None:
     source_root = review.source_root.resolve(strict=False)
     container_dir = review.container_dir.resolve(strict=False)
@@ -549,6 +580,21 @@ def validate_external_workspace(review: ReviewWorkspace) -> None:
             )
 
     sensitive_findings: list[str] = []
+    changed_paths_file = review.workspace_root / ".codex-review/changed-paths.json"
+    try:
+        changed_paths_value = json.loads(changed_paths_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ReviewError(
+            f"cannot validate external review changed paths: {error}"
+        ) from error
+    if not isinstance(changed_paths_value, list) or not all(
+        isinstance(value, str) for value in changed_paths_value
+    ):
+        raise ReviewError("external review changed paths are not a JSON string list")
+    for changed_path in changed_paths_value:
+        path_rule = _sensitive_path_rule(changed_path)
+        if path_rule:
+            sensitive_findings.append(f"{changed_path} ({path_rule}; changed-path)")
     for candidate in review.workspace_root.rglob("*"):
         if candidate.is_symlink() or not candidate.is_file():
             continue
@@ -572,8 +618,14 @@ def validate_external_workspace(review: ReviewWorkspace) -> None:
 
 def _sensitive_path_rule(relative: str) -> str | None:
     normalized = relative.casefold()
-    name = pathlib.PurePosixPath(normalized).name
-    if normalized in SENSITIVE_EXACT_PATHS or name in SENSITIVE_FILE_NAMES:
+    parts = pathlib.PurePosixPath(normalized).parts
+    name = parts[-1] if parts else ""
+    if name in SENSITIVE_ANYWHERE_NAMES or name in SENSITIVE_FILE_NAMES:
+        return "credential-path"
+    if any(
+        len(parts) >= len(suffix) and parts[-len(suffix) :] == suffix
+        for suffix in SENSITIVE_PATH_SUFFIXES
+    ):
         return "credential-path"
     if name == ".env" or (
         name.startswith(".env.")
@@ -648,6 +700,16 @@ def prepare_workspace(
                 "the frozen head uses the reserved top-level .codex-review path"
             )
         control_dir.mkdir()
+        changed_paths_file = control_dir / "changed-paths.json"
+        write_json(
+            changed_paths_file,
+            _frozen_changed_paths(
+                git_view=git_view,
+                object_directory=object_directory,
+                base_sha=base_sha,
+                head_sha=head_sha,
+            ),
+        )
         diff_file = control_dir / "review.diff"
         _write_frozen_diff(
             git_view=git_view,

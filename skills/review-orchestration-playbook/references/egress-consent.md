@@ -26,7 +26,7 @@ No consent covers secrets, credentials, untracked private files, unrelated repos
 
 Record the actual runtime/model used in the terminal review report so consent and retention expectations remain auditable.
 
-The helper enforces the intended scope with a frozen detached workspace, runtime-specific minimal environment, provider path/tool restrictions, an escaping-symlink preflight, and a conservative scan of the head snapshot, frozen diff, and prompt for credential-like paths and high-confidence secret patterns. A match blocks external launch and reports only its path/rule, never the matched value. This scan is a safety backstop, not proof that content is secret-free and not an expansion of consent: if a credential or unrelated private artifact is known to be present, stop and narrow the scope even when the scanner does not match it.
+The helper enforces the intended scope with a frozen detached workspace, runtime-specific minimal environment, provider path/tool restrictions, an escaping-symlink preflight, and a conservative scan of all base-to-head changed paths plus the head snapshot, frozen diff, and prompt for credential-like paths and high-confidence secret patterns. Changed-path scanning covers deleted credentials and nested credential filenames. A match blocks external launch and reports only its path/rule, never the matched value. This scan is a safety backstop, not proof that content is secret-free and not an expansion of consent: if a credential or unrelated private artifact is known to be present, stop and narrow the scope even when the scanner does not match it.
 
 ## Approval-Gated Invocation
 

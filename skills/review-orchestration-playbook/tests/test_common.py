@@ -15,6 +15,33 @@ from review_runtime.common import ReviewError  # noqa: E402
 
 
 class ChildEnvironmentTest(unittest.TestCase):
+    def test_streamed_command_logs_are_complete_and_memory_capture_is_bounded(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            stdout_path = root / "stdout.log"
+            stderr_path = root / "stderr.log"
+
+            def complete(_command, **kwargs):
+                kwargs["stdout"].write(b"H" * 100 + b"T" * 100)
+                kwargs["stderr"].write(b"E" * 200)
+                return mock.Mock(returncode=0)
+
+            with mock.patch.object(common.subprocess, "run", side_effect=complete):
+                completed = common.run(
+                    ("reviewer",),
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                    capture_limit_bytes=32,
+                )
+
+            self.assertEqual(stdout_path.read_bytes(), b"H" * 100 + b"T" * 100)
+            self.assertEqual(stderr_path.read_bytes(), b"E" * 200)
+            self.assertTrue(completed.stdout.startswith(b"H" * 16))
+            self.assertTrue(completed.stdout.endswith(b"T" * 16))
+            self.assertLess(len(completed.stdout), 128)
+
     def test_passes_only_review_runtime_and_auth_environment(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             container = pathlib.Path(temporary)

@@ -27,6 +27,7 @@ class ProviderPolicyTest(unittest.TestCase):
         control.mkdir(parents=True)
         diff_file = control / "review.diff"
         diff_file.write_text("diff --git a/a b/a\n", encoding="utf-8")
+        (control / "changed-paths.json").write_text("[]\n", encoding="utf-8")
         prompt_file = control / "review.prompt"
         prompt_file.write_text("Review this diff.\n", encoding="utf-8")
         self.review = ReviewWorkspace(
@@ -468,6 +469,49 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         self.assertIn("review.diff (generic-secret-assignment)", error)
         self.assertNotIn(token, error)
+
+    @mock.patch.object(providers, "resolve_reviewer_executable")
+    def test_deleted_sensitive_path_blocks_external_reviewer(
+        self,
+        resolve: mock.Mock,
+    ) -> None:
+        (self.review.workspace_root / ".codex-review/changed-paths.json").write_text(
+            '["config/.env.production"]\n',
+            encoding="utf-8",
+        )
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            shim_source=SCRIPTS / "git_readonly_shim",
+            egress_consent="double-review",
+        )
+        self.assertEqual(outcome.returncode, 2)
+        resolve.assert_not_called()
+        error = (self.review.container_dir / "runner-error.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(".env.production (environment-file; changed-path)", error)
+
+    @mock.patch.object(providers, "resolve_reviewer_executable")
+    def test_nested_credential_basename_blocks_external_reviewer(
+        self,
+        resolve: mock.Mock,
+    ) -> None:
+        credential = self.review.workspace_root / "fixtures/home/.netrc"
+        credential.parent.mkdir(parents=True)
+        credential.write_text("machine example.invalid\n", encoding="utf-8")
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            shim_source=SCRIPTS / "git_readonly_shim",
+            egress_consent="double-review",
+        )
+        self.assertEqual(outcome.returncode, 2)
+        resolve.assert_not_called()
+        error = (self.review.container_dir / "runner-error.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("fixtures/home/.netrc (credential-path)", error)
 
     @mock.patch.object(
         providers,

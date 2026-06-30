@@ -98,20 +98,48 @@ def run(
     env: dict[str, str] | None = None,
     stdin: bytes | None = None,
     check: bool = False,
+    stdout_path: pathlib.Path | None = None,
+    stderr_path: pathlib.Path | None = None,
+    capture_limit_bytes: int = 4 * 1024 * 1024,
 ) -> Completed:
     command = tuple(str(item) for item in argv)
-    completed = subprocess.run(
-        command,
-        cwd=cwd,
-        env=env,
-        input=stdin,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    result = Completed(
-        command, completed.returncode, completed.stdout, completed.stderr
-    )
+    if (stdout_path is None) != (stderr_path is None):
+        raise ReviewError("stdout_path and stderr_path must be provided together")
+    if stdout_path is None or stderr_path is None:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            env=env,
+            input=stdin,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        result = Completed(
+            command, completed.returncode, completed.stdout, completed.stderr
+        )
+    else:
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        stderr_path.parent.mkdir(parents=True, exist_ok=True)
+        with (
+            stdout_path.open("wb") as stdout_handle,
+            stderr_path.open("wb") as stderr_handle,
+        ):
+            completed = subprocess.run(
+                command,
+                cwd=cwd,
+                env=env,
+                input=stdin,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                check=False,
+            )
+        result = Completed(
+            command,
+            completed.returncode,
+            _read_bounded_bytes(stdout_path, capture_limit_bytes),
+            _read_bounded_bytes(stderr_path, capture_limit_bytes),
+        )
     if check and result.returncode != 0:
         detail = result.stderr.decode("utf-8", errors="replace").strip()
         if not detail:
@@ -120,6 +148,26 @@ def run(
             f"command failed ({result.returncode}): {' '.join(command)}\n{detail}"
         )
     return result
+
+
+def _read_bounded_bytes(path: pathlib.Path, limit: int) -> bytes:
+    if limit <= 0:
+        raise ReviewError("capture_limit_bytes must be positive")
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            if size <= limit:
+                return handle.read()
+            head_size = limit // 2
+            tail_size = limit - head_size
+            head = handle.read(head_size)
+            handle.seek(size - tail_size)
+            tail = handle.read(tail_size)
+    except OSError as error:
+        raise ReviewError(
+            f"cannot read bounded command output {path}: {error}"
+        ) from error
+    return head + b"\n... bounded capture omitted middle bytes ...\n" + tail
 
 
 def resolve_executable(

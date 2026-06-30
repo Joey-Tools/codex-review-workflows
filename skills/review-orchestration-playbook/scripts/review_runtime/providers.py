@@ -428,6 +428,13 @@ def _attempt_paths(
     return pathlib.Path(f"{prefix}.stdout.log"), pathlib.Path(f"{prefix}.stderr.log")
 
 
+def _append_attempt_diagnostic(path: pathlib.Path, message: str) -> None:
+    with path.open("ab") as handle:
+        if handle.tell():
+            handle.write(b"\n")
+        handle.write(message.rstrip().encode("utf-8", errors="replace") + b"\n")
+
+
 def _record_attempt(
     *,
     review: ReviewWorkspace,
@@ -443,8 +450,10 @@ def _record_attempt(
     require_verified_effort: bool = False,
 ) -> Attempt:
     stdout_path, stderr_path = _attempt_paths(review, index, runtime, model)
-    stdout_path.write_bytes(completed.stdout)
-    stderr_path.write_bytes(completed.stderr)
+    if not stdout_path.exists():
+        stdout_path.write_bytes(completed.stdout)
+    if not stderr_path.exists():
+        stderr_path.write_bytes(completed.stderr)
     category = (
         "success"
         if completed.returncode == 0 and final_text
@@ -470,10 +479,7 @@ def _record_attempt(
             "successful reviewer result did not expose required runtime verification "
             "metadata; refusing to mark the pinned lane successful"
         )
-        write_text_atomic(
-            stderr_path,
-            completed.stderr.decode("utf-8", errors="replace") + "\n" + detail + "\n",
-        )
+        _append_attempt_diagnostic(stderr_path, detail)
         return replace(
             attempt,
             returncode=65,
@@ -489,10 +495,7 @@ def _record_attempt(
             f"requested model {model!r} was replaced by {effective_model!r}; "
             "refusing to infer an entitlement failure from silent model substitution"
         )
-        write_text_atomic(
-            stderr_path,
-            completed.stderr.decode("utf-8", errors="replace") + "\n" + mismatch + "\n",
-        )
+        _append_attempt_diagnostic(stderr_path, mismatch)
         attempt = replace(
             attempt,
             returncode=65,
@@ -508,10 +511,7 @@ def _record_attempt(
             f"requested effort {requested_effort!r} was replaced by {effective_effort!r}; "
             "refusing to accept the pinned lane"
         )
-        write_text_atomic(
-            stderr_path,
-            completed.stderr.decode("utf-8", errors="replace") + "\n" + mismatch + "\n",
-        )
+        _append_attempt_diagnostic(stderr_path, mismatch)
         attempt = replace(
             attempt,
             returncode=65,
@@ -534,6 +534,7 @@ def _codex_attempt(
     env = _with_executable_path(env, executable)
     attempt_final = review.container_dir / "attempts" / f"{index:02d}-codex-final.txt"
     attempt_final.parent.mkdir(parents=True, exist_ok=True)
+    stdout_path, stderr_path = _attempt_paths(review, index, "codex", model)
     tool_home = review.container_dir / "tool-home"
     tool_home.mkdir(exist_ok=True)
     shell_values = {
@@ -591,6 +592,8 @@ def _codex_attempt(
         cwd=review.workspace_root,
         env=env,
         stdin=prompt,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
     )
     final_text = None
     if completed.returncode == 0 and attempt_final.is_file():
@@ -626,6 +629,7 @@ def _claude_attempt(
             "claude is not available in a validated executable path"
         )
     env = _with_executable_path(env, executable)
+    stdout_path, stderr_path = _attempt_paths(review, index, "claude", model)
     settings = json.dumps(
         {
             "permissions": {
@@ -676,6 +680,8 @@ def _claude_attempt(
         cwd=review.workspace_root,
         env=env,
         stdin=review.prompt_file.read_bytes(),
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
     )
     final_text, effective_model = _parse_structured_output(completed.stdout)
     return _record_attempt(
@@ -705,6 +711,7 @@ def _copilot_attempt(
             "copilot is not available in a validated executable path"
         )
     env = _with_executable_path(env, executable)
+    stdout_path, stderr_path = _attempt_paths(review, index, "copilot", model)
     command = [
         str(executable),
         "--prompt",
@@ -752,6 +759,8 @@ def _copilot_attempt(
         command,
         cwd=review.workspace_root,
         env=env,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
     )
     final_text, effective_model = _parse_structured_output(completed.stdout)
     return _record_attempt(
