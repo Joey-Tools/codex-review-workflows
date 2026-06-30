@@ -138,6 +138,126 @@ def resolve_executable(
     return path
 
 
+def _nvm_version_key(path: pathlib.Path) -> tuple[int, ...]:
+    try:
+        version = path.parents[1].name.removeprefix("v")
+    except IndexError:
+        return ()
+    parts: list[int] = []
+    for value in version.split("."):
+        if not value.isdigit():
+            return ()
+        parts.append(int(value))
+    return tuple(parts)
+
+
+def _user_executable_candidates(name: str) -> list[pathlib.Path]:
+    home_value = os.environ.get("HOME")
+    if not home_value:
+        return []
+    home = pathlib.Path(home_value).expanduser().absolute()
+    candidates: list[pathlib.Path] = []
+    nvm_bin = os.environ.get("NVM_BIN")
+    if nvm_bin:
+        nvm_path = pathlib.Path(nvm_bin).expanduser().absolute()
+        if is_relative_to(nvm_path, home):
+            candidates.append(nvm_path / name)
+    candidates.append(home / ".nvm/current/bin" / name)
+    nvm_candidates = list((home / ".nvm/versions/node").glob(f"*/bin/{name}"))
+    candidates.extend(sorted(nvm_candidates, key=_nvm_version_key, reverse=True))
+    candidates.extend(
+        (
+            home / ".local/bin" / name,
+            home / ".volta/bin" / name,
+            home / ".asdf/shims" / name,
+            home / ".bun/bin" / name,
+            home / ".npm-global/bin" / name,
+            home / "bin" / name,
+        )
+    )
+    return candidates
+
+
+def _executable_identity_matches(
+    path: pathlib.Path,
+    markers: Iterable[str],
+) -> bool:
+    env = {
+        "HOME": os.environ.get("HOME", str(pathlib.Path.home())),
+        "NO_COLOR": "1",
+        "PATH": f"{path.parent}{os.pathsep}{TRUSTED_PATH}",
+    }
+    try:
+        completed = subprocess.run(
+            (str(path), "--version"),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if completed.returncode != 0:
+        return False
+    output = f"{completed.stdout.decode(errors='replace')}\n{completed.stderr.decode(errors='replace')}".lower()
+    return all(marker.lower() in output for marker in markers)
+
+
+def resolve_reviewer_executable(name: str) -> pathlib.Path | None:
+    specs = {
+        "codex": (
+            "CODEX_REVIEW_CODEX_PATH",
+            ("/opt/homebrew/bin/codex", "/usr/local/bin/codex"),
+            ("codex-cli",),
+        ),
+        "claude": (
+            "CODEX_REVIEW_CLAUDE_PATH",
+            ("/opt/homebrew/bin/claude", "/usr/local/bin/claude"),
+            ("claude code",),
+        ),
+        "copilot": (
+            "CODEX_REVIEW_COPILOT_PATH",
+            ("/opt/homebrew/bin/copilot", "/usr/local/bin/copilot"),
+            ("github copilot cli",),
+        ),
+    }
+    if name not in specs:
+        raise ReviewError(f"unknown review executable: {name}")
+    override_key, system_paths, markers = specs[name]
+    override_value = os.environ.get(override_key)
+    if override_value:
+        override = pathlib.Path(override_value).expanduser()
+        if not override.is_absolute():
+            raise ReviewError(f"{override_key} must be an absolute executable path")
+        if not override.is_file() or not os.access(override, os.X_OK):
+            raise ReviewError(f"{override_key} is not executable: {override}")
+        if not _executable_identity_matches(override, markers):
+            raise ReviewError(
+                f"{override_key} did not identify as the expected {name} CLI: {override}"
+            )
+        return override.absolute()
+
+    candidates = [
+        *(pathlib.Path(value) for value in system_paths),
+        *_user_executable_candidates(name),
+    ]
+    discovered = shutil.which(name, path=TRUSTED_PATH)
+    if discovered:
+        candidates.append(pathlib.Path(discovered))
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+            continue
+        if _executable_identity_matches(candidate, markers):
+            return candidate.absolute()
+    return None
+
+
 def resolve_git() -> pathlib.Path:
     path = resolve_executable(
         "git",

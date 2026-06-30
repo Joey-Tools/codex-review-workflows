@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import re
 from dataclasses import asdict, dataclass, replace
@@ -10,7 +11,7 @@ from .common import (
     Completed,
     ReviewError,
     child_environment,
-    resolve_executable,
+    resolve_reviewer_executable,
     run,
     write_json,
     write_text_atomic,
@@ -149,6 +150,19 @@ def _review_environment(
     )
 
 
+def _with_executable_path(
+    env: dict[str, str],
+    executable: pathlib.Path,
+) -> dict[str, str]:
+    result = dict(env)
+    entries = [value for value in result.get("PATH", "").split(os.pathsep) if value]
+    executable_parent = str(executable.parent)
+    if executable_parent not in entries:
+        entries.insert(1 if entries else 0, executable_parent)
+    result["PATH"] = os.pathsep.join(entries)
+    return result
+
+
 def classify_failure(stdout: bytes | str, stderr: bytes | str) -> str:
     def decode(value: bytes | str) -> str:
         return (
@@ -175,7 +189,7 @@ def _normalize_model(value: str) -> str:
 def _model_matches(requested: str, effective: str) -> bool:
     requested_normalized = _normalize_model(requested)
     effective_normalized = _normalize_model(effective)
-    return effective_normalized.startswith(requested_normalized)
+    return effective_normalized == requested_normalized
 
 
 def _json_objects(stdout: bytes) -> list[dict[str, Any]]:
@@ -476,11 +490,10 @@ def _codex_attempt(
     index: int,
     env: dict[str, str],
 ) -> Attempt:
-    executable = resolve_executable(
-        "codex", ("/opt/homebrew/bin/codex", "/usr/local/bin/codex")
-    )
+    executable = resolve_reviewer_executable("codex")
     if executable is None:
-        raise FileNotFoundError("codex is not available in a trusted executable path")
+        raise FileNotFoundError("codex is not available in a validated executable path")
+    env = _with_executable_path(env, executable)
     attempt_final = review.container_dir / "attempts" / f"{index:02d}-codex-final.txt"
     attempt_final.parent.mkdir(parents=True, exist_ok=True)
     tool_home = review.container_dir / "tool-home"
@@ -569,11 +582,12 @@ def _claude_attempt(
     index: int,
     env: dict[str, str],
 ) -> Attempt:
-    executable = resolve_executable(
-        "claude", ("/opt/homebrew/bin/claude", "/usr/local/bin/claude")
-    )
+    executable = resolve_reviewer_executable("claude")
     if executable is None:
-        raise FileNotFoundError("claude is not available in a trusted executable path")
+        raise FileNotFoundError(
+            "claude is not available in a validated executable path"
+        )
+    env = _with_executable_path(env, executable)
     settings = json.dumps(
         {
             "permissions": {
@@ -647,11 +661,12 @@ def _copilot_attempt(
     index: int,
     env: dict[str, str],
 ) -> Attempt:
-    executable = resolve_executable(
-        "copilot", ("/opt/homebrew/bin/copilot", "/usr/local/bin/copilot")
-    )
+    executable = resolve_reviewer_executable("copilot")
     if executable is None:
-        raise FileNotFoundError("copilot is not available in a trusted executable path")
+        raise FileNotFoundError(
+            "copilot is not available in a validated executable path"
+        )
+    env = _with_executable_path(env, executable)
     command = [
         str(executable),
         "--prompt",
@@ -832,12 +847,7 @@ def run_review(
         )
         return Outcome(2, None, tuple())
 
-    claude_available = (
-        resolve_executable(
-            "claude", ("/opt/homebrew/bin/claude", "/usr/local/bin/claude")
-        )
-        is not None
-    )
+    claude_available = resolve_reviewer_executable("claude") is not None
     if claude_available:
         claude_env = _review_environment(
             review=review,
@@ -857,12 +867,7 @@ def run_review(
         if category != "entitlement":
             return _finish(review, attempts, None)
 
-    copilot_available = (
-        resolve_executable(
-            "copilot", ("/opt/homebrew/bin/copilot", "/usr/local/bin/copilot")
-        )
-        is not None
-    )
+    copilot_available = resolve_reviewer_executable("copilot") is not None
     if not copilot_available:
         write_text_atomic(
             review.container_dir / "runner-error.txt",

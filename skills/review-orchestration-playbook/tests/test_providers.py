@@ -71,6 +71,11 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         self.assertEqual(category, "transient")
 
+    def test_model_match_is_normalized_but_not_prefix_based(self) -> None:
+        self.assertTrue(providers._model_matches("claude-opus-4-8", "claude-opus-4.8"))
+        self.assertFalse(providers._model_matches("gpt-5.5", "gpt-5.5-mini"))
+        self.assertFalse(providers._model_matches("gpt-5.5", "gpt-5.5-codex"))
+
     def test_entitlement_is_fallback_eligible(self) -> None:
         self.assertEqual(
             providers.classify_failure("", "Model is not available for your account"),
@@ -166,7 +171,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(
-        providers, "resolve_executable", return_value=pathlib.Path("/bin/true")
+        providers, "resolve_reviewer_executable", return_value=pathlib.Path("/bin/true")
     )
     @mock.patch.object(providers, "_copilot_attempt")
     @mock.patch.object(providers, "_claude_attempt")
@@ -213,7 +218,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(
-        providers, "resolve_executable", return_value=pathlib.Path("/bin/true")
+        providers, "resolve_reviewer_executable", return_value=pathlib.Path("/bin/true")
     )
     @mock.patch.object(providers, "_copilot_attempt")
     @mock.patch.object(providers, "_claude_attempt")
@@ -239,7 +244,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(
-        providers, "resolve_executable", return_value=pathlib.Path("/bin/true")
+        providers, "resolve_reviewer_executable", return_value=pathlib.Path("/bin/true")
     )
     @mock.patch.object(providers, "_copilot_attempt")
     @mock.patch.object(providers, "_claude_attempt")
@@ -330,7 +335,9 @@ class ProviderPolicyTest(unittest.TestCase):
         )
 
     @mock.patch.object(
-        providers, "resolve_executable", return_value=pathlib.Path("/bin/codex")
+        providers,
+        "resolve_reviewer_executable",
+        return_value=pathlib.Path("/bin/codex"),
     )
     @mock.patch.object(providers, "run")
     def test_codex_command_pins_model_and_reasoning(
@@ -404,7 +411,9 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(attempt.category, "success")
 
     @mock.patch.object(
-        providers, "resolve_executable", return_value=pathlib.Path("/bin/claude")
+        providers,
+        "resolve_reviewer_executable",
+        return_value=pathlib.Path("/bin/claude"),
     )
     @mock.patch.object(providers, "run")
     def test_claude_command_pins_opus_and_max(
@@ -436,7 +445,9 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn("--strict-mcp-config", argv)
 
     @mock.patch.object(
-        providers, "resolve_executable", return_value=pathlib.Path("/bin/copilot")
+        providers,
+        "resolve_reviewer_executable",
+        return_value=pathlib.Path("/bin/copilot"),
     )
     @mock.patch.object(providers, "run")
     def test_copilot_command_pins_opus_and_max(

@@ -11,6 +11,7 @@ SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from review_runtime import common  # noqa: E402
+from review_runtime.common import ReviewError  # noqa: E402
 
 
 class ChildEnvironmentTest(unittest.TestCase):
@@ -46,6 +47,57 @@ class ChildEnvironmentTest(unittest.TestCase):
         self.assertEqual(env["GH_TOKEN"], "github-auth")
         self.assertNotIn("UNRELATED_PRIVATE_VALUE", env)
         self.assertNotIn("DATABASE_PASSWORD", env)
+
+    def test_explicit_reviewer_path_requires_expected_cli_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            executable = root / "custom-codex"
+            executable.write_text(
+                "#!/bin/sh\necho 'codex-cli 0.142.4'\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            with mock.patch.dict(
+                common.os.environ,
+                {
+                    "HOME": str(root),
+                    "CODEX_REVIEW_CODEX_PATH": str(executable),
+                },
+                clear=True,
+            ):
+                resolved = common.resolve_reviewer_executable("codex")
+        self.assertEqual(resolved, executable.absolute())
+
+    def test_reviewer_path_override_must_be_absolute(self) -> None:
+        with mock.patch.dict(
+            common.os.environ,
+            {"HOME": "/tmp", "CODEX_REVIEW_CODEX_PATH": "relative/codex"},
+            clear=True,
+        ):
+            with self.assertRaises(ReviewError):
+                common.resolve_reviewer_executable("codex")
+
+    def test_validated_user_local_install_is_discovered(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = pathlib.Path(temporary)
+            executable = home / ".local/bin/claude"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o755)
+
+            def matches(path: pathlib.Path, _markers) -> bool:
+                return path == executable
+
+            with (
+                mock.patch.dict(common.os.environ, {"HOME": str(home)}, clear=True),
+                mock.patch.object(
+                    common,
+                    "_executable_identity_matches",
+                    side_effect=matches,
+                ),
+            ):
+                resolved = common.resolve_reviewer_executable("claude")
+        self.assertEqual(resolved, executable.absolute())
 
 
 if __name__ == "__main__":

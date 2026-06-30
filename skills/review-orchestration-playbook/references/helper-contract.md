@@ -53,6 +53,8 @@ Always pass `--state-dir`; it is not positional. `stateful wait --timeout-second
 
 The Claude-family lane requires one of `--egress-consent explicit-claude-review`, `--egress-consent double-review`, or `--egress-consent triple-review`. The helper saves this value in state and writes `egress.json`; it refuses to start the external lane without it.
 
+Model verification normalizes punctuation only and then requires exact equality. A requested `gpt-5.5` never accepts `gpt-5.5-mini`, `gpt-5.5-codex`, or any other suffix as the same model.
+
 Capacity, overload, rate limits, timeouts, network/5xx errors, missing artifacts, silent model substitution, and review findings never trigger a model downgrade. The helper records every attempt and reports transient failures without switching models.
 
 Fallback classification uses stderr plus explicit structured CLI error events only. Reviewer tool output and repository text on stdout are never scanned for entitlement or transient substrings.
@@ -69,6 +71,7 @@ Fallback classification uses stderr plus explicit structured CLI error events on
 - Claude Code runs in safe mode with `dontAsk` permissions and only `Read`, `Grep`, and `Glob`; no additional directory is allowed, so its permission root is the frozen workspace. Explicit deny rules cover common credential/config homes. Slash commands, Chrome integration, inherited MCP configuration, repository/user setting sources, and nonessential traffic are disabled.
 - Copilot runs in plan mode with its built-in current-working-directory path boundary, explicit shell/write denial, temp-directory denial, and disabled custom instructions, built-in MCPs, bash environment loading, experimental features, and remote session export. Secret-like auth variables are withheld from its tools.
 - Before a Claude-family run, the helper rejects any symlink in the frozen workspace that resolves outside that workspace.
+- Executable discovery validates `--version` identity and never trusts arbitrary repository `PATH` entries. It checks Homebrew/system locations plus NVM, `NVM_BIN`, `~/.local/bin`, Volta, asdf, Bun, npm-global, and `~/bin`. Explicit absolute overrides are `CODEX_REVIEW_CODEX_PATH`, `CODEX_REVIEW_CLAUDE_PATH`, and `CODEX_REVIEW_COPILOT_PATH`; invalid paths or CLI identities block the lane.
 - Source files are never edited. The detached workspace is removed after `stateful wait` unless `--keep-workspace` is set.
 - Logs, attempts metadata, and `final.txt` remain in the state directory after workspace cleanup.
 
