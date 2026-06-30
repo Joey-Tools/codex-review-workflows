@@ -1,12 +1,22 @@
 from __future__ import annotations
 
+import io
+import os
 import pathlib
 import shutil
+import tarfile
 import time
 import uuid
 from dataclasses import asdict, dataclass
 
-from .common import ReviewError, is_relative_to, resolve_git, run, write_text_atomic
+from .common import (
+    TRUSTED_PATH,
+    ReviewError,
+    is_relative_to,
+    resolve_git,
+    run,
+    write_text_atomic,
+)
 from .prompt import build_review_prompt
 
 
@@ -36,8 +46,93 @@ class ReviewWorkspace:
         )
 
 
+def _git_environment(*, object_directory: pathlib.Path | None = None) -> dict[str, str]:
+    env = {
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_PAGER": "cat",
+        "LC_ALL": "C",
+        "PAGER": "cat",
+        "PATH": TRUSTED_PATH,
+    }
+    if object_directory is not None:
+        env["GIT_OBJECT_DIRECTORY"] = str(object_directory)
+    return env
+
+
 def _git(repo: pathlib.Path, *args: str, check: bool = True):
-    return run((str(resolve_git()), "-C", str(repo), *args), check=check)
+    return run(
+        (
+            str(resolve_git()),
+            "--no-pager",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            f"core.hooksPath={os.devnull}",
+            "-c",
+            "diff.external=",
+            "-C",
+            str(repo),
+            *args,
+        ),
+        env=_git_environment(),
+        check=check,
+    )
+
+
+def _create_sanitized_git_view(
+    *,
+    source_root: pathlib.Path,
+    container: pathlib.Path,
+) -> tuple[pathlib.Path, pathlib.Path]:
+    object_result = _git(source_root, "rev-parse", "--git-path", "objects")
+    object_value = pathlib.Path(object_result.stdout.decode("utf-8").strip())
+    object_directory = (
+        object_value if object_value.is_absolute() else source_root / object_value
+    ).resolve()
+    if not object_directory.is_dir():
+        raise ReviewError(f"Git object directory does not exist: {object_directory}")
+    format_result = _git(source_root, "rev-parse", "--show-object-format")
+    object_format = format_result.stdout.decode("utf-8").strip()
+    if object_format not in {"sha1", "sha256"}:
+        raise ReviewError(f"unsupported Git object format: {object_format!r}")
+
+    git_view = container / "git-view"
+    (git_view / "objects").mkdir(parents=True)
+    (git_view / "refs").mkdir()
+    write_text_atomic(git_view / "HEAD", "ref: refs/heads/unused\n")
+    config = "[core]\n\trepositoryformatversion = 0\n\tbare = true\n"
+    if object_format == "sha256":
+        config += "[extensions]\n\tobjectFormat = sha256\n"
+    write_text_atomic(git_view / "config", config)
+    return git_view, object_directory
+
+
+def _frozen_git(
+    *,
+    git_view: pathlib.Path,
+    object_directory: pathlib.Path,
+    args: tuple[str, ...],
+    check: bool = True,
+):
+    return run(
+        (
+            str(resolve_git()),
+            "--no-pager",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            f"core.hooksPath={os.devnull}",
+            "-c",
+            "diff.external=",
+            f"--git-dir={git_view}",
+            *args,
+        ),
+        env=_git_environment(object_directory=object_directory),
+        check=check,
+    )
 
 
 def resolve_repo_root(repo: pathlib.Path) -> pathlib.Path:
@@ -63,6 +158,36 @@ def _new_container(source_root: pathlib.Path) -> pathlib.Path:
     container = source_root / ".codex-tmp" / f"isolated-review-{stamp}-{suffix}"
     container.mkdir(parents=True, exist_ok=False)
     return container
+
+
+def _extract_frozen_archive(archive_bytes: bytes, workspace_root: pathlib.Path) -> None:
+    workspace_root.mkdir()
+    with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:") as archive:
+        members = archive.getmembers()
+        for member in members:
+            relative = pathlib.PurePosixPath(member.name)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ReviewError(f"unsafe path in frozen Git archive: {member.name}")
+            if member.isdev() or member.isfifo():
+                raise ReviewError(
+                    f"unsupported special file in frozen Git archive: {member.name}"
+                )
+            destination = workspace_root.joinpath(*relative.parts)
+            if member.issym():
+                target = (destination.parent / member.linkname).resolve(strict=False)
+                if not is_relative_to(target, workspace_root.resolve(strict=False)):
+                    raise ReviewError(
+                        f"frozen Git archive symlink escapes workspace: {member.name} -> {member.linkname}"
+                    )
+            if member.islnk():
+                target = workspace_root.joinpath(
+                    *pathlib.PurePosixPath(member.linkname).parts
+                ).resolve(strict=False)
+                if not is_relative_to(target, workspace_root.resolve(strict=False)):
+                    raise ReviewError(
+                        f"frozen Git archive hardlink escapes workspace: {member.name} -> {member.linkname}"
+                    )
+        archive.extractall(workspace_root, members=members, filter="data")
 
 
 def validate_workspace_layout(review: ReviewWorkspace) -> None:
@@ -119,60 +244,37 @@ def prepare_workspace(
     head_sha = resolve_commit(source_root, head_ref, label="head ref")
     container = _new_container(source_root)
     workspace_root = container / "workspace"
-    git = resolve_git()
 
-    added = False
     try:
-        run(
-            (
-                str(git),
-                "-C",
-                str(source_root),
-                "worktree",
-                "add",
-                "--detach",
-                str(workspace_root),
-                head_sha,
-            ),
-            check=True,
+        git_view, object_directory = _create_sanitized_git_view(
+            source_root=source_root,
+            container=container,
         )
-        added = True
+        archive_result = _frozen_git(
+            git_view=git_view,
+            object_directory=object_directory,
+            args=("archive", "--format=tar", head_sha),
+        )
+        _extract_frozen_archive(archive_result.stdout, workspace_root)
 
-        if (workspace_root / ".gitmodules").is_file():
-            result = run(
-                (
-                    str(git),
-                    "-C",
-                    str(workspace_root),
-                    "submodule",
-                    "update",
-                    "--init",
-                    "--recursive",
-                    "--no-fetch",
-                )
-            )
-            if result.returncode != 0:
-                detail = result.stderr.decode("utf-8", errors="replace").strip()
-                raise ReviewError(
-                    "cannot materialize frozen submodules without fetching; "
-                    f"initialize the required objects in the source repo first: {detail}"
-                )
-
-        diff_result = run(
-            (
-                str(git),
-                "-C",
-                str(workspace_root),
+        diff_result = _frozen_git(
+            git_view=git_view,
+            object_directory=object_directory,
+            args=(
                 "diff",
+                "--no-ext-diff",
+                "--no-textconv",
                 "--binary",
                 "--submodule=diff",
                 base_sha,
                 head_sha,
-            )
+            ),
+            check=False,
         )
         if diff_result.returncode != 0:
             detail = diff_result.stderr.decode("utf-8", errors="replace").strip()
             raise ReviewError(f"cannot generate frozen review diff: {detail}")
+        shutil.rmtree(git_view)
         control_dir = workspace_root / ".codex-review"
         control_dir.mkdir()
         diff_file = control_dir / "review.diff"
@@ -208,42 +310,17 @@ def prepare_workspace(
         validate_workspace_layout(review)
         return review
     except Exception:
-        if added:
-            run(
-                (
-                    str(git),
-                    "-C",
-                    str(source_root),
-                    "worktree",
-                    "remove",
-                    "--force",
-                    str(workspace_root),
-                )
-            )
         shutil.rmtree(container, ignore_errors=True)
         raise
 
 
 def cleanup_workspace(review: ReviewWorkspace, *, keep_container: bool) -> str | None:
     validate_workspace_layout(review)
-    git = resolve_git()
-    error_text: str | None = None
-    if review.workspace_root.exists():
-        result = run(
-            (
-                str(git),
-                "-C",
-                str(review.source_root),
-                "worktree",
-                "remove",
-                "--force",
-                str(review.workspace_root),
-            )
-        )
-        if result.returncode != 0:
-            error_text = result.stderr.decode("utf-8", errors="replace").strip()
-            shutil.rmtree(review.workspace_root, ignore_errors=True)
-            run((str(git), "-C", str(review.source_root), "worktree", "prune"))
-    if not keep_container and error_text is None:
-        shutil.rmtree(review.container_dir, ignore_errors=True)
-    return error_text
+    try:
+        if review.workspace_root.exists():
+            shutil.rmtree(review.workspace_root)
+        if not keep_container:
+            shutil.rmtree(review.container_dir)
+    except OSError as error:
+        return str(error)
+    return None

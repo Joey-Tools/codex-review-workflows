@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import fcntl
 import json
-import os
 import pathlib
 import subprocess
 import sys
 import time
 from typing import Any
 
-from .common import ReviewError, read_json, tail_text, write_json, write_text_atomic
+from .common import (
+    ReviewError,
+    read_json,
+    tail_text,
+    write_json,
+    write_text_atomic,
+)
 from .providers import run_review
 from .workspace import (
     ReviewWorkspace,
@@ -21,6 +27,7 @@ from .workspace import (
 STATE_FILE = "state.json"
 STATE_MARKER = ".isolated-review-state"
 EXIT_FILE = "exit-code"
+LOCK_FILE = "runner.lock"
 _STARTED_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
 
 
@@ -70,19 +77,22 @@ def _read_exit_code(state_dir: pathlib.Path) -> int | None:
         raise ReviewError(f"invalid exit code in {path}: {text!r}")
 
 
-def _pid_running(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    process = _STARTED_PROCESSES.get(pid)
-    if process is not None:
-        return process.poll() is None
+def _runner_lock_held(lock_path: pathlib.Path) -> bool:
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+        handle = lock_path.open("rb")
+    except OSError:
         return False
-    except PermissionError:
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
         return True
-    return True
+    except OSError:
+        handle.close()
+        return False
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    handle.close()
+    return False
 
 
 def _reap_started_process(pid: int) -> None:
@@ -130,6 +140,9 @@ def start(
         "started_at": time.time(),
     }
     write_json(state_dir / STATE_FILE, state)
+    lock_path = state_dir / LOCK_FILE
+    lock_handle = lock_path.open("wb")
+    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     try:
         with (
             stdout_path.open("wb") as stdout_handle,
@@ -142,6 +155,8 @@ def start(
                     "_run-state",
                     "--state-dir",
                     str(state_dir),
+                    "--lock-fd",
+                    str(lock_handle.fileno()),
                 ),
                 cwd=review.workspace_root,
                 stdin=subprocess.DEVNULL,
@@ -149,13 +164,24 @@ def start(
                 stderr=stderr_handle,
                 start_new_session=True,
                 close_fds=True,
+                pass_fds=(lock_handle.fileno(),),
             )
     except Exception:
+        lock_handle.close()
         cleanup_workspace(review, keep_container=False)
         raise
     state["pid"] = process.pid
     _STARTED_PROCESSES[process.pid] = process
-    write_json(state_dir / STATE_FILE, state)
+    try:
+        write_json(state_dir / STATE_FILE, state)
+    except Exception:
+        process.terminate()
+        process.wait(timeout=5)
+        _STARTED_PROCESSES.pop(process.pid, None)
+        cleanup_workspace(review, keep_container=False)
+        raise
+    finally:
+        lock_handle.close()
     return state_dir
 
 
@@ -191,7 +217,9 @@ def status(state_dir: pathlib.Path) -> dict[str, Any]:
     exit_code = _read_exit_code(state_dir)
     pid_value = state.get("pid")
     pid = pid_value if isinstance(pid_value, int) else 0
-    process_running = _pid_running(pid)
+    process_running = (
+        _runner_lock_held(state_dir / LOCK_FILE) if exit_code is None else False
+    )
     running = exit_code is None and process_running
     if exit_code is not None:
         _reap_started_process(pid)
@@ -216,6 +244,7 @@ def status(state_dir: pathlib.Path) -> dict[str, Any]:
         "reviewer": state.get("reviewer"),
         "egress_consent": state.get("egress_consent"),
         "pid": pid or None,
+        "runner_lock_held": process_running,
         "running": running,
         "exit_code": exit_code,
         "attempts": attempts,

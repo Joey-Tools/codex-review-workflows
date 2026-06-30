@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import pathlib
 import subprocess
 import sys
@@ -117,8 +118,10 @@ class StatefulLifecycleTest(unittest.TestCase):
         fake_runner.write_text(
             """from pathlib import Path
 import sys
+import time
 
 state_dir = Path(sys.argv[sys.argv.index("--state-dir") + 1])
+time.sleep(0.2)
 (state_dir / "final.txt").write_text("No findings.\\n", encoding="utf-8")
 (state_dir / "attempts.json").write_text("[]\\n", encoding="utf-8")
 (state_dir / "exit-code").write_text("0\\n", encoding="utf-8")
@@ -151,6 +154,19 @@ state_dir = Path(sys.argv[sys.argv.index("--state-dir") + 1])
             exit_code, text = state.final(self.review.container_dir)
         self.assertEqual(exit_code, 1)
         self.assertIn("cleanup failed", text)
+
+    def test_status_rejects_live_pid_without_runner_lock(self) -> None:
+        self.write_completed_state()
+        (self.review.container_dir / state.EXIT_FILE).unlink()
+        (self.review.container_dir / "final.txt").unlink()
+        value = state.load_state(self.review.container_dir)
+        value["pid"] = os.getpid()
+        write_json(self.review.container_dir / state.STATE_FILE, value)
+
+        summary = state.status(self.review.container_dir)
+        self.assertFalse(summary["running"])
+        self.assertEqual(summary["exit_code"], 1)
+        self.assertIn("without recording", summary["runner_error"])
 
 
 if __name__ == "__main__":

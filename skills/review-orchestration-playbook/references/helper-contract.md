@@ -37,6 +37,8 @@ isolated_review stateful final --state-dir <state_dir>
 
 Always pass `--state-dir`; it is not positional. `stateful wait --timeout-seconds` bounds the caller's wait but does not kill or downgrade a healthy reviewer.
 
+The parent acquires an exclusive runner lock before spawn and passes its file descriptor to the child for the child's full lifetime. Cross-process `status` / `wait` trusts that lock, not PID existence, so a reused PID cannot masquerade as the review runner.
+
 ## Logical Reviewers
 
 `--reviewer codex`:
@@ -62,8 +64,9 @@ Fallback classification uses stderr plus explicit structured CLI error events on
 ## Snapshot And Safety
 
 - The helper requires `--base-ref` and `--head-ref` and resolves both to commits before launch.
-- It creates a detached worktree at the frozen head under source-repo `.codex-tmp/` and generates a binary `--submodule=diff` artifact for the exact range.
-- Initialized submodules are materialized without fetching. Missing local objects block the lane instead of causing hidden network access.
+- It creates a `.git`-free frozen archive snapshot at the head under source-repo `.codex-tmp/` and generates a binary `--submodule=diff` artifact for the exact range.
+- Snapshot preparation runs Git with a cleaned environment, disabled hooks/fsmonitor/external diff, and explicit `--no-ext-diff --no-textconv`. It does not checkout files through repository filters.
+- Submodules remain uninitialized and unfetched; their gitlink changes are represented in the frozen diff.
 - Every reviewer receives the same bounded findings-only prompt and primary diff file inside a helper-owned `.codex-review/` directory in the detached worktree.
 - The helper installs the fixed `git_readonly_shim`, passes the real Git path separately, and executes the reviewer inside the detached workspace.
 - Every child receives a runtime-specific minimal environment allowlist instead of the parent's complete environment. Claude and Copilot authentication variables are never present in each other's process. Codex may receive `OPENAI_API_KEY` for headless authentication, but model-proposed shell commands cannot inherit it.

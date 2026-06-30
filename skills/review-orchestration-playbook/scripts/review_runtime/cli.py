@@ -164,6 +164,7 @@ def main(argv: list[str] | None = None) -> int:
             internal = argparse.ArgumentParser(add_help=False)
             internal.add_argument("action")
             internal.add_argument("--state-dir", required=True)
+            internal.add_argument("--lock-fd", required=True, type=int)
             parsed = internal.parse_args(arguments)
             return run_state(
                 state_dir=pathlib.Path(parsed.state_dir),

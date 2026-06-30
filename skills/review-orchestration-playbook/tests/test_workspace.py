@@ -44,8 +44,12 @@ class WorkspaceTest(unittest.TestCase):
         git(self.repo, "config", "user.email", "review@example.com")
         git(self.repo, "config", "commit.gpgsign", "false")
         (self.repo / ".gitignore").write_text(".codex-tmp/\n", encoding="utf-8")
+        (self.repo / ".gitattributes").write_text(
+            "example.txt filter=evil diff=evil\n",
+            encoding="utf-8",
+        )
         (self.repo / "example.txt").write_text("one\n", encoding="utf-8")
-        git(self.repo, "add", ".gitignore", "example.txt")
+        git(self.repo, "add", ".gitignore", ".gitattributes", "example.txt")
         git(self.repo, "commit", "-m", "Initial")
         self.base = git(self.repo, "rev-parse", "HEAD")
         (self.repo / "example.txt").write_text("one\ntwo\n", encoding="utf-8")
@@ -76,9 +80,10 @@ class WorkspaceTest(unittest.TestCase):
         prompt = review.prompt_file.read_text(encoding="utf-8")
         self.assertIn(f"{self.base}..{self.head}", prompt)
         self.assertNotIn("Source repository:", prompt)
+        self.assertFalse((review.workspace_root / ".git").exists())
         self.assertEqual(
-            git(review.workspace_root, "rev-parse", "HEAD"),
-            self.head,
+            (review.workspace_root / "example.txt").read_text(encoding="utf-8"),
+            "one\ntwo\n",
         )
 
         cleanup_workspace(review, keep_container=False)
@@ -122,6 +127,46 @@ class WorkspaceTest(unittest.TestCase):
         (review.workspace_root / "escape").symlink_to(self.repo / "example.txt")
         with self.assertRaises(ReviewError):
             validate_external_workspace(review)
+
+    def test_snapshot_does_not_execute_repo_hooks_filters_or_external_diff(
+        self,
+    ) -> None:
+        marker_root = pathlib.Path(self.temporary.name) / "markers"
+        marker_root.mkdir()
+        hooks_dir = pathlib.Path(self.temporary.name) / "hooks"
+        hooks_dir.mkdir()
+        hook_marker = marker_root / "hook"
+        filter_marker = marker_root / "filter"
+        diff_marker = marker_root / "diff"
+
+        hook = hooks_dir / "post-checkout"
+        hook.write_text(f"#!/bin/sh\ntouch '{hook_marker}'\n", encoding="utf-8")
+        hook.chmod(0o755)
+        filter_script = pathlib.Path(self.temporary.name) / "filter.sh"
+        filter_script.write_text(
+            f"#!/bin/sh\ntouch '{filter_marker}'\ncat\n",
+            encoding="utf-8",
+        )
+        filter_script.chmod(0o755)
+        diff_script = pathlib.Path(self.temporary.name) / "diff.sh"
+        diff_script.write_text(
+            f"#!/bin/sh\ntouch '{diff_marker}'\n",
+            encoding="utf-8",
+        )
+        diff_script.chmod(0o755)
+
+        git(self.repo, "config", "core.hooksPath", str(hooks_dir))
+        git(self.repo, "config", "filter.evil.smudge", str(filter_script))
+        git(self.repo, "config", "diff.external", str(diff_script))
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(review)
+        self.assertFalse(hook_marker.exists())
+        self.assertFalse(filter_marker.exists())
+        self.assertFalse(diff_marker.exists())
 
 
 if __name__ == "__main__":
