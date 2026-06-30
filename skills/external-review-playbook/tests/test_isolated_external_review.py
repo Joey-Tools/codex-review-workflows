@@ -9034,6 +9034,8 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
             self.skipTest("POSIX pipe select semantics are required")
         module = self._load_script_module()
         read_fd, write_fd = os.pipe()
+        process_exited = threading.Event()
+        first_empty_post_exit_poll = threading.Event()
 
         class FakeProcess:
             def __init__(self) -> None:
@@ -9043,12 +9045,26 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                 self.stderr = io.BytesIO()
 
             def wait(self, timeout: float | None = None) -> int:
+                process_exited.set()
                 return 0
 
         process = FakeProcess()
+        real_select = module.select.select
+
+        def observed_select(
+            readers: list[int],
+            writers: list[int],
+            errors: list[int],
+            timeout: float,
+        ) -> tuple[list[int], list[int], list[int]]:
+            result = real_select(readers, writers, errors, timeout)
+            if process_exited.is_set() and not result[0]:
+                first_empty_post_exit_poll.set()
+            return result
 
         def delayed_write() -> None:
-            time.sleep(module.CODEX_STREAMING_PUMP_POLL_SECONDS * 2.5)
+            if not first_empty_post_exit_poll.wait(timeout=1):
+                return
             os.write(write_fd, b"late\n")
             os.close(write_fd)
 
@@ -9060,17 +9076,19 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         writer = threading.Thread(target=delayed_write)
         writer.start()
         with mock.patch.object(module.subprocess, "Popen", return_value=process):
-            with mock.patch.object(module.sys, "stdout", stream):
-                returncode, stdout_tail, stderr_tail = (
-                    module._run_streaming_codex_attempt(
-                        command=["fake-codex"],
-                        workspace_root=self.repo,
-                        child_env=os.environ.copy(),
-                        stdin_bytes=None,
+            with mock.patch.object(module.select, "select", side_effect=observed_select):
+                with mock.patch.object(module.sys, "stdout", stream):
+                    returncode, stdout_tail, stderr_tail = (
+                        module._run_streaming_codex_attempt(
+                            command=["fake-codex"],
+                            workspace_root=self.repo,
+                            child_env=os.environ.copy(),
+                            stdin_bytes=None,
+                        )
                     )
-                )
         writer.join(timeout=1)
 
+        self.assertTrue(first_empty_post_exit_poll.is_set())
         self.assertFalse(writer.is_alive())
         self.assertEqual(returncode, 0)
         self.assertEqual((stdout_tail, stderr_tail), (b"late\n", b""))
