@@ -19,7 +19,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import BinaryIO, Iterable
+from typing import BinaryIO, Callable, Iterable
 
 
 PLACEHOLDERS = (
@@ -135,6 +135,7 @@ CODEX_MODEL_DEFAULT = "gpt-5.6-sol"
 CODEX_FALLBACK_MODEL_DEFAULT = "gpt-5.5"
 CODEX_REASONING_EFFORT_DEFAULT = "xhigh"
 CODEX_MODEL_FALLBACK_SCAN_BYTES = 64 * 1024
+CODEX_MODEL_FALLBACK_DIAGNOSTIC_BYTES = 64 * 1024
 CODEX_MODEL_FALLBACK_ERROR_FRAGMENTS = (
     "capacity for model",
     "capacity for the model",
@@ -175,6 +176,24 @@ CODEX_MODEL_FALLBACK_ERROR_PATTERNS = (
 CODEX_MODEL_FALLBACK_STDERR_PREFIX_PATTERN = re.compile(
     r"^(?:(?:\d{4}-\d{2}-\d{2}t\S+)\s+)?"
     r"(?:(?:error|fatal|warn|warning)\b|(?:model_not_found|unsupported_model):)"
+)
+CODEX_MODEL_FALLBACK_UNPREFIXED_PATTERNS = (
+    re.compile(
+        r"^[^\w{]*(?:(?:the\s+)?(?:selected|requested|configured|specified)\s+)?"
+        r"model\b.{0,200}\b(?:is (?:at capacity|not available|not supported|"
+        r"overloaded|unavailable|unsupported)|does not exist|not found)\b"
+    ),
+    re.compile(
+        r"^[^\w{]*(?:you\s+)?(?:do not have|have no|are not entitled to)\b"
+        r".{0,200}\b(?:access|use)\b.{0,200}\bmodel\b"
+    ),
+    re.compile(
+        r"^[^\w{]*(?:model_not_found|unsupported_model)\s*:"
+    ),
+    re.compile(r"^[^\w{]*unsupported model(?:\s*[:=]\s*|\s+)[a-z0-9]"),
+    re.compile(
+        r"^[^\w{]*(?:insufficient|no) capacity for (?:the )?model\b"
+    ),
 )
 CODEX_EXPLICIT_MODEL_REFERENCE_PATTERNS = (
     re.compile(r"\bmodel(?:[\s_]id)?\s+[\"'`](?P<model>[^\"'`\s]+)[\"'`]"),
@@ -245,12 +264,7 @@ class OrchestrationSignalState:
     def install(self) -> None:
         if os.name != "posix" or threading.current_thread() is not threading.main_thread():
             return
-        forwarded_signals = [signal.SIGTERM, signal.SIGINT]
-        for optional_signal_name in ("SIGHUP", "SIGQUIT"):
-            optional_signal = getattr(signal, optional_signal_name, None)
-            if optional_signal is not None and optional_signal not in forwarded_signals:
-                forwarded_signals.append(optional_signal)
-        for forwarded in forwarded_signals:
+        for forwarded in _forwarded_orchestration_signals():
             self.previous_handlers[forwarded] = signal.getsignal(forwarded)
             signal.signal(forwarded, self._handle)
 
@@ -258,6 +272,88 @@ class OrchestrationSignalState:
         for forwarded, previous_handler in self.previous_handlers.items():
             signal.signal(forwarded, previous_handler)
         self.previous_handlers.clear()
+
+
+def _forwarded_orchestration_signals() -> tuple[signal.Signals, ...]:
+    forwarded_signals = [signal.SIGTERM, signal.SIGINT]
+    for optional_signal_name in ("SIGHUP", "SIGQUIT"):
+        optional_signal = getattr(signal, optional_signal_name, None)
+        if optional_signal is not None and optional_signal not in forwarded_signals:
+            forwarded_signals.append(optional_signal)
+    return tuple(forwarded_signals)
+
+
+def _block_forwarded_orchestration_signals() -> set[signal.Signals] | None:
+    if (
+        os.name != "posix"
+        or threading.current_thread() is not threading.main_thread()
+        or not hasattr(signal, "pthread_sigmask")
+    ):
+        return None
+    return signal.pthread_sigmask(
+        signal.SIG_BLOCK,
+        _forwarded_orchestration_signals(),
+    )
+
+
+def _restore_orchestration_signal_mask(
+    previous_mask: set[signal.Signals] | None,
+) -> None:
+    if previous_mask is not None:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+
+def _consume_pending_orchestration_signal() -> signal.Signals | None:
+    if not hasattr(signal, "sigpending") or not hasattr(signal, "sigwait"):
+        return None
+    pending = set(signal.sigpending()).intersection(
+        _forwarded_orchestration_signals()
+    )
+    if not pending:
+        return None
+    ordered = sorted(pending, key=int)
+    for pending_signal in ordered:
+        signal.sigwait({pending_signal})
+    return ordered[0]
+
+
+def _finalize_orchestration_signal_state(
+    signal_state: OrchestrationSignalState,
+    result: int,
+    *,
+    persist_result: Callable[[int], None] | None = None,
+) -> int:
+    previous_mask = _block_forwarded_orchestration_signals()
+    try:
+        signal_state.suppress_raise = True
+        pending_signal = signal_state.pending_signal
+        signal_state.restore()
+        if previous_mask is not None:
+            masked_pending_signal = _consume_pending_orchestration_signal()
+            if pending_signal is None:
+                pending_signal = masked_pending_signal
+        if pending_signal is not None:
+            result = 128 + int(pending_signal)
+        if persist_result is not None:
+            persist_result(result)
+        return result
+    finally:
+        signal_state.restore()
+        _restore_orchestration_signal_mask(previous_mask)
+
+
+def _run_with_orchestration_signals(operation: Callable[[], int]) -> int:
+    signal_state = OrchestrationSignalState()
+    signal_state.install()
+    result = 1
+    try:
+        result = operation()
+    except ForwardedOrchestrationSignal as error:
+        signal_state.pending_signal = error.signum
+        result = 128 + int(error.signum)
+    finally:
+        result = _finalize_orchestration_signal_state(signal_state, result)
+    return result
 CODEX_PARALLEL_AGENTIC_TIMEOUT_SECONDS = 20.0 * 60.0
 CODEX_PARALLEL_AGENTIC_MAX_TIMEOUT_SECONDS = 60.0 * 60.0
 CODEX_PARALLEL_AGENTIC_INITIAL_QUIET_SECONDS = 3.0 * 60.0
@@ -5173,7 +5269,7 @@ def _prepare_workspace(
                 _prepare_submodule_worktrees(source_root, workspace_root)
                 cleanup_submodule_worktrees = True
                 _materialize_repo_snapshot(source_root, workspace_root)
-    except UserError as error:
+    except (UserError, ForwardedOrchestrationSignal) as error:
         cleanup_error = _cleanup_failed_workspace_setup(
             source_root,
             workspace_root,
@@ -5181,8 +5277,10 @@ def _prepare_workspace(
             created_workspace=created_workspace,
             cleanup_submodule_worktrees=cleanup_submodule_worktrees,
         )
-        if cleanup_error is not None:
+        if cleanup_error is not None and isinstance(error, UserError):
             raise UserError(f"{error}\n{cleanup_error}") from error
+        if cleanup_error is not None:
+            print(str(cleanup_error), file=sys.stderr)
         raise
 
     return (
@@ -5581,7 +5679,7 @@ def _prepare_review_execution(args: argparse.Namespace) -> dict[str, object]:
             }
         )
         return prepared
-    except UserError as error:
+    except (UserError, ForwardedOrchestrationSignal) as error:
         if source_root is None or workspace_root is None:
             raise
         cleanup_error = _cleanup_prepared_workspace(
@@ -5592,12 +5690,18 @@ def _prepare_review_execution(args: argparse.Namespace) -> dict[str, object]:
                 "created_workspace": created_workspace,
                 "cleanup_submodule_worktrees": cleanup_submodule_worktrees,
             },
-            child_returncode=1,
+            child_returncode=(
+                128 + int(error.signum)
+                if isinstance(error, ForwardedOrchestrationSignal)
+                else 1
+            ),
             cleanup_error=None,
             keep_prepare_only_workspace=False,
         )
-        if cleanup_error is not None:
+        if cleanup_error is not None and isinstance(error, UserError):
             raise UserError(f"{error}\n{cleanup_error}") from error
+        if cleanup_error is not None:
+            print(str(cleanup_error), file=sys.stderr)
         raise
 
 
@@ -5720,9 +5824,11 @@ def _codex_model_fallback_error_text(
         fallback_model_lower.rsplit("/", 1)[-1],
     }
     for line in text.splitlines():
-        if require_error_prefix and not CODEX_MODEL_FALLBACK_STDERR_PREFIX_PATTERN.match(
+        has_error_prefix = CODEX_MODEL_FALLBACK_STDERR_PREFIX_PATTERN.match(
             line.lstrip()
-        ):
+        )
+        has_unprefixed_model_error = _codex_unprefixed_model_error_line(line)
+        if require_error_prefix and not has_error_prefix and not has_unprefixed_model_error:
             continue
         mentioned_models = {
             model_reference
@@ -5746,6 +5852,25 @@ def _codex_model_fallback_error_text(
         if any(pattern.search(line) for pattern in CODEX_MODEL_FALLBACK_ERROR_PATTERNS):
             return True
     return False
+
+
+def _codex_unprefixed_model_error_line(line: str) -> bool:
+    stripped = line.lstrip()
+    if any(pattern.search(stripped) for pattern in CODEX_MODEL_FALLBACK_UNPREFIXED_PATTERNS):
+        return True
+    try:
+        event = json.loads(stripped)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(event, dict):
+        return False
+    event_type = str(event.get("type") or "").lower()
+    if event_type != "error" and not event_type.endswith(".failed"):
+        return False
+    event_text = json.dumps(event, ensure_ascii=False, sort_keys=True).lower()
+    return any(
+        fragment in event_text for fragment in CODEX_MODEL_FALLBACK_ERROR_FRAGMENTS
+    ) or any(pattern.search(event_text) for pattern in CODEX_MODEL_FALLBACK_ERROR_PATTERNS)
 
 
 def _replace_codex_model(
@@ -5780,6 +5905,54 @@ def _emit_binary_file(path: pathlib.Path, stream: object) -> None:
     text_stream = stream
     text_stream.write(path.read_text(encoding="utf-8", errors="replace"))
     text_stream.flush()
+
+
+def _read_bounded_file_diagnostic(
+    source_path: pathlib.Path,
+    *,
+    max_bytes: int = CODEX_MODEL_FALLBACK_DIAGNOSTIC_BYTES,
+) -> tuple[bytes, bytes]:
+    source_size = source_path.stat().st_size
+    with source_path.open("rb") as source:
+        if source_size <= max_bytes:
+            payload = source.read()
+        else:
+            head_bytes = max_bytes // 2
+            tail_bytes = max_bytes - head_bytes
+            head = source.read(head_bytes)
+            omitted_bytes = source_size - head_bytes - tail_bytes
+            separator = (
+                b"" if not head or head.endswith(b"\n") else b"\n"
+            ) + (
+                f"... {omitted_bytes} bytes omitted from fallback diagnostic ...\n".encode(
+                    "utf-8"
+                )
+            )
+            source.seek(-tail_bytes, os.SEEK_END)
+            payload = head + separator + source.read(tail_bytes)
+        source.seek(-1, os.SEEK_END)
+        return payload, source.read(1)
+
+
+def _copy_bounded_file_diagnostic(
+    source_path: pathlib.Path,
+    destination: BinaryIO,
+    *,
+    max_bytes: int = CODEX_MODEL_FALLBACK_DIAGNOSTIC_BYTES,
+) -> bytes:
+    payload, last_byte = _read_bounded_file_diagnostic(
+        source_path,
+        max_bytes=max_bytes,
+    )
+    destination.write(payload)
+    return last_byte
+
+
+def _emit_bounded_file_diagnostic(path: pathlib.Path, stream: object) -> None:
+    payload, last_byte = _read_bounded_file_diagnostic(path)
+    if last_byte != b"\n":
+        payload += b"\n"
+    _emit_binary_bytes(payload, stream)
 
 
 def _emit_binary_bytes(payload: bytes, stream: object) -> None:
@@ -5929,9 +6102,12 @@ def _run_streaming_codex_attempt(
                     now + CODEX_STREAMING_POST_EXIT_QUIET_SECONDS,
                 )
 
-    process: subprocess.Popen[bytes]
+    process: subprocess.Popen[bytes] | None = None
+    pending_spawn_signal: signal.Signals | None = None
 
     def signal_process_group(sig: signal.Signals) -> None:
+        if process is None:
+            return
         process_pid = getattr(process, "pid", None)
         if os.name == "posix" and isinstance(process_pid, int):
             try:
@@ -5948,48 +6124,57 @@ def _run_streaming_codex_attempt(
             pass
 
     def forward_signal(signum: int, _frame: object) -> None:
+        nonlocal pending_spawn_signal
         forwarded = signal.Signals(signum)
+        if process is None:
+            pending_spawn_signal = forwarded
+            return
         signal_process_group(forwarded)
         raise ForwardedOrchestrationSignal(forwarded)
 
-    process = subprocess.Popen(
-        command,
-        cwd=str(workspace_root),
-        env=child_env,
-        stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=os.name == "posix",
-    )
     previous_signal_handlers: dict[signal.Signals, object] = {}
     if os.name == "posix" and threading.current_thread() is threading.main_thread():
-        forwarded_signals = [signal.SIGTERM, signal.SIGINT]
-        for optional_signal_name in ("SIGHUP", "SIGQUIT"):
-            optional_signal = getattr(signal, optional_signal_name, None)
-            if optional_signal is not None and optional_signal not in forwarded_signals:
-                forwarded_signals.append(optional_signal)
-        for forwarded in forwarded_signals:
+        for forwarded in _forwarded_orchestration_signals():
             previous_signal_handlers[forwarded] = signal.getsignal(forwarded)
             signal.signal(forwarded, forward_signal)
 
-    assert process.stdout is not None
-    assert process.stderr is not None
     stdout_eof = threading.Event()
     stderr_eof = threading.Event()
-    stdout_thread = threading.Thread(
-        target=pump,
-        args=(process.stdout, sys.stdout, stdout_tail, stdout_eof),
-        daemon=True,
-    )
-    stderr_thread = threading.Thread(
-        target=pump,
-        args=(process.stderr, sys.stderr, stderr_tail, stderr_eof),
-        daemon=True,
-    )
+    stdout_thread: threading.Thread | None = None
+    stderr_thread: threading.Thread | None = None
     interrupted_by_signal: signal.Signals | None = None
     stdout_thread_started = False
     stderr_thread_started = False
+    pump_cleanup_ran = False
+    process_cleanup_ran = False
+    returncode = 1
     try:
+        if pending_spawn_signal is not None:
+            raise ForwardedOrchestrationSignal(pending_spawn_signal)
+        process = subprocess.Popen(
+            command,
+            cwd=str(workspace_root),
+            env=child_env,
+            stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=os.name == "posix",
+        )
+        if pending_spawn_signal is not None:
+            signal_process_group(pending_spawn_signal)
+            raise ForwardedOrchestrationSignal(pending_spawn_signal)
+        assert process.stdout is not None
+        assert process.stderr is not None
+        stdout_thread = threading.Thread(
+            target=pump,
+            args=(process.stdout, sys.stdout, stdout_tail, stdout_eof),
+            daemon=True,
+        )
+        stderr_thread = threading.Thread(
+            target=pump,
+            args=(process.stderr, sys.stderr, stderr_tail, stderr_eof),
+            daemon=True,
+        )
         try:
             stdout_thread.start()
             stdout_thread_started = True
@@ -6019,6 +6204,7 @@ def _run_streaming_codex_attempt(
                 except subprocess.TimeoutExpired:
                     signal_process_group(signal.SIGKILL)
                     process.wait()
+            process_cleanup_ran = True
             raise
         finally:
             stop_pumps.set()
@@ -6040,16 +6226,56 @@ def _run_streaming_codex_attempt(
                 stdout_thread.join(timeout=CODEX_STREAMING_PUMP_JOIN_SECONDS)
             if stderr_thread_started:
                 stderr_thread.join(timeout=CODEX_STREAMING_PUMP_JOIN_SECONDS)
+            pump_cleanup_ran = True
     except ForwardedOrchestrationSignal as exc:
         interrupted_by_signal = exc.signum
+        if (
+            process is not None
+            and not process_cleanup_ran
+            and process.poll() is None
+        ):
+            signal_process_group(exc.signum)
+            try:
+                process.wait(timeout=CODEX_STREAMING_TERM_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                signal_process_group(signal.SIGKILL)
+                process.wait()
+    except BaseException:
+        if (
+            process is not None
+            and not process_cleanup_ran
+            and process.poll() is None
+        ):
+            signal_process_group(signal.SIGTERM)
+            try:
+                process.wait(timeout=CODEX_STREAMING_TERM_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                signal_process_group(signal.SIGKILL)
+                process.wait()
+        raise
     finally:
+        if process is not None and not pump_cleanup_ran:
+            process_pid = getattr(process, "pid", None)
+            if os.name == "posix" and isinstance(process_pid, int):
+                _terminate_remaining_process_group(process_pid)
+            for source in (process.stdout, process.stderr):
+                if source is None:
+                    continue
+                try:
+                    source.close()
+                except (OSError, ValueError):
+                    pass
         for forwarded, previous_handler in previous_signal_handlers.items():
             signal.signal(forwarded, previous_handler)
     if interrupted_by_signal is not None:
         raise ForwardedOrchestrationSignal(interrupted_by_signal)
     if (
-        (stdout_thread_started and stdout_thread.is_alive())
-        or (stderr_thread_started and stderr_thread.is_alive())
+        (stdout_thread_started and stdout_thread is not None and stdout_thread.is_alive())
+        or (
+            stderr_thread_started
+            and stderr_thread is not None
+            and stderr_thread.is_alive()
+        )
     ):
         raise UserError("streaming Codex output pump did not stop within the bounded timeout")
     return returncode, bytes(stdout_tail), bytes(stderr_tail)
@@ -6063,18 +6289,14 @@ def _run_captured_process(
     stdin_bytes: bytes | None,
     stdout_handle: BinaryIO,
     stderr_handle: BinaryIO,
+    on_started: Callable[[], None] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
-    process = subprocess.Popen(
-        command,
-        cwd=str(workspace_root),
-        env=child_env,
-        stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
-        stdout=stdout_handle,
-        stderr=stderr_handle,
-        start_new_session=os.name == "posix",
-    )
+    process: subprocess.Popen[bytes] | None = None
+    pending_spawn_signal: signal.Signals | None = None
 
     def signal_process_group(sig: signal.Signals) -> None:
+        if process is None:
+            return
         process_pid = getattr(process, "pid", None)
         if os.name == "posix" and isinstance(process_pid, int):
             try:
@@ -6091,23 +6313,38 @@ def _run_captured_process(
             pass
 
     def forward_signal(signum: int, _frame: object) -> None:
+        nonlocal pending_spawn_signal
         forwarded = signal.Signals(signum)
+        if process is None:
+            pending_spawn_signal = forwarded
+            return
         signal_process_group(forwarded)
         raise ForwardedOrchestrationSignal(forwarded)
 
     previous_signal_handlers: dict[signal.Signals, object] = {}
     if os.name == "posix" and threading.current_thread() is threading.main_thread():
-        forwarded_signals = [signal.SIGTERM, signal.SIGINT]
-        for optional_signal_name in ("SIGHUP", "SIGQUIT"):
-            optional_signal = getattr(signal, optional_signal_name, None)
-            if optional_signal is not None and optional_signal not in forwarded_signals:
-                forwarded_signals.append(optional_signal)
-        for forwarded in forwarded_signals:
+        for forwarded in _forwarded_orchestration_signals():
             previous_signal_handlers[forwarded] = signal.getsignal(forwarded)
             signal.signal(forwarded, forward_signal)
 
     interrupted_by_signal: signal.Signals | None = None
     try:
+        if pending_spawn_signal is not None:
+            raise ForwardedOrchestrationSignal(pending_spawn_signal)
+        process = subprocess.Popen(
+            command,
+            cwd=str(workspace_root),
+            env=child_env,
+            stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+            start_new_session=os.name == "posix",
+        )
+        if pending_spawn_signal is not None:
+            signal_process_group(pending_spawn_signal)
+            raise ForwardedOrchestrationSignal(pending_spawn_signal)
+        if on_started is not None:
+            on_started()
         try:
             process.communicate(input=stdin_bytes)
         except ForwardedOrchestrationSignal as error:
@@ -6119,15 +6356,36 @@ def _run_captured_process(
                 except subprocess.TimeoutExpired:
                     signal_process_group(signal.SIGKILL)
                     process.wait()
+    except ForwardedOrchestrationSignal as error:
+        interrupted_by_signal = error.signum
+        if process is not None and process.poll() is None:
+            signal_process_group(error.signum)
+            try:
+                process.wait(timeout=CODEX_STREAMING_TERM_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                signal_process_group(signal.SIGKILL)
+                process.wait()
+    except BaseException:
+        if process is not None and process.poll() is None:
+            signal_process_group(signal.SIGTERM)
+            try:
+                process.wait(timeout=CODEX_STREAMING_TERM_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                signal_process_group(signal.SIGKILL)
+                process.wait()
+        raise
     finally:
         for forwarded, previous_handler in previous_signal_handlers.items():
             signal.signal(forwarded, previous_handler)
 
-    process_pid = getattr(process, "pid", None)
-    if os.name == "posix" and isinstance(process_pid, int):
-        _terminate_remaining_process_group(process_pid)
+    if process is not None:
+        process_pid = getattr(process, "pid", None)
+        if os.name == "posix" and isinstance(process_pid, int):
+            _terminate_remaining_process_group(process_pid)
     if interrupted_by_signal is not None:
         raise ForwardedOrchestrationSignal(interrupted_by_signal)
+    if process is None:  # pragma: no cover - guarded by the spawn path above
+        raise UserError("captured Codex process did not start")
     return subprocess.CompletedProcess(command, int(process.returncode))
 
 
@@ -6192,7 +6450,7 @@ def _run_prepared_review(prepared: dict[str, object]) -> int:
             )
             child_returncode = completed.returncode
             should_fallback = (
-                child_returncode != 0
+                child_returncode > 0
                 and _codex_model_fallback_error(
                     stdout_path=stdout_path,
                     stderr_path=stderr_path,
@@ -6207,7 +6465,7 @@ def _run_prepared_review(prepared: dict[str, object]) -> int:
                             "codex primary attempt stdout (fallback diagnostic):",
                             file=sys.stderr,
                         )
-                        _emit_binary_file(stdout_path, sys.stderr)
+                        _emit_bounded_file_diagnostic(stdout_path, sys.stderr)
                 else:
                     _emit_binary_file(stdout_path, sys.stdout)
                 _emit_binary_file(stderr_path, sys.stderr)
@@ -6256,7 +6514,18 @@ def _run_prepared_review(prepared: dict[str, object]) -> int:
                         _emit_binary_file(stdout_path, sys.stdout)
                         _emit_binary_file(stderr_path, sys.stderr)
         else:
-            if entrypoint_label in {"codex-review", "codex-readonly"}:
+            if entrypoint_label == "codex-review":
+                (
+                    child_returncode,
+                    _stdout_tail,
+                    _stderr_tail,
+                ) = _run_streaming_codex_attempt(
+                    command=command,
+                    workspace_root=pathlib.Path(str(workspace_root)),
+                    child_env=child_env,
+                    stdin_bytes=prepared["stdin_bytes"],
+                )
+            elif entrypoint_label == "codex-readonly":
                 completed, stdout_path, stderr_path = _run_captured_codex_attempt(
                     command=command,
                     workspace_root=pathlib.Path(str(workspace_root)),
@@ -6266,7 +6535,7 @@ def _run_prepared_review(prepared: dict[str, object]) -> int:
                     attempt="primary",
                 )
                 child_returncode = completed.returncode
-                if entrypoint_label == "codex-review" or child_returncode != 0:
+                if child_returncode != 0:
                     _emit_binary_file(stdout_path, sys.stdout)
                     _emit_binary_file(stderr_path, sys.stderr)
             else:
@@ -6302,9 +6571,10 @@ def _run_prepared_review(prepared: dict[str, object]) -> int:
             child_returncode=child_returncode,
             cleanup_error=cleanup_error,
         )
-        if signal_state.pending_signal is not None:
-            child_returncode = 128 + int(signal_state.pending_signal)
-        signal_state.restore()
+        child_returncode = _finalize_orchestration_signal_state(
+            signal_state,
+            child_returncode,
+        )
 
     if cleanup_error is not None:
         print(str(cleanup_error), file=sys.stderr)
@@ -6549,7 +6819,7 @@ def _run_child_from_spec(spec_path: pathlib.Path, *, expected_sha256: str) -> in
                         fallback_model = str(spec.get("codex_fallback_model") or "")
                         if (
                             fallback_enabled
-                            and exit_code != 0
+                            and exit_code > 0
                             and _codex_model_fallback_error(
                                 stdout_path=stdout_path,
                                 stderr_path=stderr_path,
@@ -6565,14 +6835,10 @@ def _run_child_from_spec(spec_path: pathlib.Path, *, expected_sha256: str) -> in
                                 stderr_handle.write(
                                     b"codex primary attempt stdout (fallback diagnostic):\n"
                                 )
-                                with stdout_path.open("rb") as primary_stdout_handle:
-                                    shutil.copyfileobj(
-                                        primary_stdout_handle,
-                                        stderr_handle,
-                                        length=64 * 1024,
-                                    )
-                                    primary_stdout_handle.seek(-1, os.SEEK_END)
-                                    primary_stdout_last_byte = primary_stdout_handle.read(1)
+                                primary_stdout_last_byte = _copy_bounded_file_diagnostic(
+                                    stdout_path,
+                                    stderr_handle,
+                                )
                                 if primary_stdout_last_byte != b"\n":
                                     stderr_handle.write(b"\n")
                             stdout_handle.seek(0)
@@ -6586,18 +6852,6 @@ def _run_child_from_spec(spec_path: pathlib.Path, *, expected_sha256: str) -> in
                                 ).encode("utf-8")
                             )
                             stderr_handle.flush()
-                            model_fallback_path_raw = spec.get(
-                                "model_fallback_path"
-                            )
-                            if model_fallback_path_raw:
-                                _write_json(
-                                    pathlib.Path(str(model_fallback_path_raw)),
-                                    {
-                                        "primary_model": primary_model,
-                                        "fallback_model": fallback_model,
-                                        "reasoning_effort": reasoning_effort,
-                                    },
-                                )
                             final_path_raw = spec.get("final_path")
                             if final_path_raw:
                                 pathlib.Path(str(final_path_raw)).unlink(
@@ -6608,6 +6862,21 @@ def _run_child_from_spec(spec_path: pathlib.Path, *, expected_sha256: str) -> in
                                 primary_model=primary_model,
                                 fallback_model=fallback_model,
                             )
+                            model_fallback_path_raw = spec.get(
+                                "model_fallback_path"
+                            )
+
+                            def record_fallback_started() -> None:
+                                if model_fallback_path_raw:
+                                    _write_json(
+                                        pathlib.Path(str(model_fallback_path_raw)),
+                                        {
+                                            "primary_model": primary_model,
+                                            "fallback_model": fallback_model,
+                                            "reasoning_effort": reasoning_effort,
+                                        },
+                                    )
+
                             exit_code = _run_captured_process(
                                 command=fallback_command,
                                 workspace_root=pathlib.Path(str(spec["cwd"])),
@@ -6615,6 +6884,7 @@ def _run_child_from_spec(spec_path: pathlib.Path, *, expected_sha256: str) -> in
                                 stdin_bytes=stdin_bytes,
                                 stdout_handle=stdout_handle,
                                 stderr_handle=stderr_handle,
+                                on_started=record_fallback_started,
                             ).returncode
                     except Exception as error:  # pragma: no cover - defensive crash path
                         stderr_handle.write(
@@ -6668,8 +6938,16 @@ def _run_child_from_spec(spec_path: pathlib.Path, *, expected_sha256: str) -> in
             pid_path=pid_path,
         )
     finally:
-        signal_state.suppress_raise = True
-        signal_state.restore()
+        exit_code = _finalize_orchestration_signal_state(
+            signal_state,
+            exit_code,
+            persist_result=lambda final_exit_code: _write_runner_terminal_state(
+                lock_path,
+                exit_code_path,
+                exit_code=final_exit_code,
+                pid_path=pid_path,
+            ),
+        )
     return exit_code
 
 
@@ -7586,8 +7864,10 @@ def _start_parallel_review(args: argparse.Namespace) -> int:
             cleanup_submodule_worktrees=shared_cleanup_submodule_worktrees,
         )
         shutil.rmtree(state_dir, ignore_errors=True)
-        if cleanup_error is not None:
+        if cleanup_error is not None and isinstance(error, UserError):
             raise UserError(f"{error}\n{cleanup_error}") from error
+        if cleanup_error is not None:
+            print(str(cleanup_error), file=sys.stderr)
         raise
     state = _load_state(state_dir)
     child_states = dict(state.get("child_states", {}))
@@ -8028,9 +8308,11 @@ def _dispatch_action(argv: list[str]) -> int:
     if action == "__run-child":
         if len(action_argv) != 3:
             raise UserError("__run-child requires a runner spec path and sha256")
-        return _run_child_from_spec(
-            pathlib.Path(action_argv[1]).resolve(),
-            expected_sha256=action_argv[2],
+        return _run_with_orchestration_signals(
+            lambda: _run_child_from_spec(
+                pathlib.Path(action_argv[1]).resolve(),
+                expected_sha256=action_argv[2],
+            )
         )
 
     if action == "status":
@@ -8050,9 +8332,13 @@ def _dispatch_action(argv: list[str]) -> int:
 
     if action == "start":
         args = _build_parser().parse_args(action_argv[1:])
-        if args.entrypoint == "codex-parallel":
-            return _start_parallel_review(args)
-        return _start_prepared_review(_prepare_review_execution(args))
+        return _run_with_orchestration_signals(
+            lambda: (
+                _start_parallel_review(args)
+                if args.entrypoint == "codex-parallel"
+                else _start_prepared_review(_prepare_review_execution(args))
+            )
+        )
 
     raise UserError(f"unsupported action: {action}")
 
@@ -8068,7 +8354,9 @@ def main() -> int:
             raise UserError(
                 "codex-parallel currently requires `stateful start|status|wait|final`"
             )
-        return _run_prepared_review(_prepare_review_execution(args))
+        return _run_with_orchestration_signals(
+            lambda: _run_prepared_review(_prepare_review_execution(args))
+        )
     except UserError as error:
         print(str(error), file=sys.stderr)
         return 1

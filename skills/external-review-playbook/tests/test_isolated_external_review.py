@@ -8,6 +8,7 @@ import io
 import json
 import os
 import pathlib
+import select
 import signal
 import shutil
 import subprocess
@@ -838,6 +839,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                 import os
                 import pathlib
                 import shutil
+                import signal
                 import subprocess
                 import sys
                 import time
@@ -949,6 +951,11 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                     if item.strip()
                 }
                 if model in unavailable_models:
+                    unavailable_stdout_bytes = int(
+                        os.environ.get("FAKE_CODEX_UNAVAILABLE_STDOUT_BYTES", "0")
+                    )
+                    if unavailable_stdout_bytes:
+                        sys.stdout.write("x" * unavailable_stdout_bytes)
                     if os.environ.get("FAKE_CODEX_UNAVAILABLE_JSON_STDOUT") == "1":
                         print(
                             json.dumps(
@@ -977,6 +984,13 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                     )
                     if unavailable_delay:
                         time.sleep(unavailable_delay)
+                    unavailable_signal_name = os.environ.get(
+                        "FAKE_CODEX_UNAVAILABLE_SIGNAL"
+                    )
+                    if unavailable_signal_name:
+                        os.kill(os.getpid(), getattr(signal, unavailable_signal_name))
+                    if os.environ.get("FAKE_CODEX_DELETE_SELF_ON_UNAVAILABLE") == "1":
+                        pathlib.Path(sys.argv[0]).unlink()
                     raise SystemExit(7)
 
                 payload = {
@@ -1071,6 +1085,9 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                 )
                 if final_message is None:
                     final_message = os.environ.get("FAKE_CODEX_FINAL_MESSAGE", "No findings.\\n")
+                early_stdout = os.environ.get("FAKE_CODEX_EARLY_STDOUT")
+                if early_stdout is not None:
+                    print(early_stdout, flush=True)
                 if delay:
                     time.sleep(delay)
 
@@ -4194,6 +4211,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         env = self._base_env()
         env["FAKE_CODEX_UNAVAILABLE_MODELS"] = "gpt-5.6-sol"
         env["FAKE_CODEX_UNAVAILABLE_JSON_STDOUT"] = "1"
+        env["FAKE_CODEX_UNAVAILABLE_STDOUT_BYTES"] = str(256 * 1024)
         repo, base, head = self._create_review_range_repo("codex-review-model-fallback")
         start = run(
             [
@@ -4238,10 +4256,13 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                 "reasoning_effort": "xhigh",
             },
         )
+        stderr_text = (state_dir / "stderr.log").read_text(encoding="utf-8")
         self.assertIn(
             "codex model fallback: gpt-5.6-sol -> gpt-5.5 (reasoning xhigh)",
-            (state_dir / "stderr.log").read_text(encoding="utf-8"),
+            stderr_text,
         )
+        self.assertIn("bytes omitted from fallback diagnostic", stderr_text)
+        self.assertLess((state_dir / "stderr.log").stat().st_size, 96 * 1024)
         stdout_lines = (state_dir / "stdout.log").read_text(encoding="utf-8").splitlines()
         self.assertEqual(len(stdout_lines), 1, stdout_lines)
         payload = json.loads(stdout_lines[-1])["payload"]
@@ -4249,13 +4270,14 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertIn('model_reasoning_effort="xhigh"', payload["exec_args"])
         self.assertIn(
             '"type": "error"',
-            (state_dir / "stderr.log").read_text(encoding="utf-8"),
+            stderr_text,
         )
 
     def test_codex_review_one_shot_fallback_keeps_stdout_to_fallback_json(self) -> None:
         env = self._base_env()
         env["FAKE_CODEX_UNAVAILABLE_MODELS"] = "gpt-5.6-sol"
         env["FAKE_CODEX_UNAVAILABLE_JSON_STDOUT"] = "1"
+        env["FAKE_CODEX_UNAVAILABLE_STDOUT_BYTES"] = str(256 * 1024)
         repo, base, head = self._create_review_range_repo(
             "codex-review-one-shot-model-fallback"
         )
@@ -4282,6 +4304,8 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         payload = json.loads(stdout_lines[0])["payload"]
         self.assertEqual(payload["model"], "gpt-5.5")
         self.assertIn('"type": "error"', completed.stderr)
+        self.assertIn("bytes omitted from fallback diagnostic", completed.stderr)
+        self.assertLess(len(completed.stderr.encode("utf-8")), 96 * 1024)
         self.assertIn(
             "codex model fallback: gpt-5.6-sol -> gpt-5.5 (reasoning xhigh)",
             completed.stderr,
@@ -4340,6 +4364,50 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
             os.kill(child_pid, 0)
         self.assertFalse(list((repo / ".codex-tmp").glob("isolated-review-*")))
 
+    def test_codex_review_one_shot_without_fallback_streams_stdout(self) -> None:
+        if os.name != "posix" or not hasattr(signal, "SIGQUIT"):
+            self.skipTest("POSIX streaming and process-group signaling are required")
+        env = self._base_env()
+        env["FAKE_CODEX_EARLY_STDOUT"] = "early-review-event"
+        env["FAKE_CODEX_REVIEW_DELAY_SECS"] = "30"
+        repo, base, head = self._create_review_range_repo(
+            "codex-review-one-shot-streaming"
+        )
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--repo",
+                str(repo),
+                "--entrypoint",
+                "codex-review",
+                "--base-ref",
+                base,
+                "--head-ref",
+                head,
+                "--no-codex-model-fallback",
+            ],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            assert process.stdout is not None
+            readable, _, _ = select.select([process.stdout], [], [], 5)
+            self.assertTrue(readable)
+            self.assertEqual(process.stdout.readline().strip(), "early-review-event")
+            self.assertIsNone(process.poll())
+            os.kill(process.pid, signal.SIGQUIT)
+            _stdout, stderr = process.communicate(timeout=5)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
+        self.assertEqual(process.returncode, 128 + int(signal.SIGQUIT), stderr)
+
     def test_codex_review_signal_after_model_error_does_not_start_fallback(self) -> None:
         if os.name != "posix" or not hasattr(signal, "SIGQUIT"):
             self.skipTest("POSIX SIGQUIT process-group signaling is required")
@@ -4390,6 +4458,85 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertEqual(process.returncode, 128 + int(signal.SIGQUIT), stderr)
         self.assertEqual(stdout, "")
         self.assertNotIn("codex model fallback:", stderr)
+
+    def test_codex_review_signaled_primary_does_not_start_fallback(self) -> None:
+        if os.name != "posix":
+            self.skipTest("POSIX child signal exit status is required")
+        env = self._base_env()
+        env["FAKE_CODEX_UNAVAILABLE_MODELS"] = "gpt-5.6-sol"
+        env["FAKE_CODEX_UNAVAILABLE_JSON_STDOUT"] = "1"
+        env["FAKE_CODEX_UNAVAILABLE_SIGNAL"] = "SIGTERM"
+        repo, base, head = self._create_review_range_repo(
+            "codex-review-signaled-primary"
+        )
+
+        completed = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--repo",
+                str(repo),
+                "--entrypoint",
+                "codex-review",
+                "--base-ref",
+                base,
+                "--head-ref",
+                head,
+            ],
+            env=env,
+        )
+
+        self.assertNotEqual(
+            completed.returncode,
+            0,
+            (completed.stdout, completed.stderr),
+        )
+        self.assertNotIn("codex model fallback:", completed.stderr)
+
+    def test_codex_review_does_not_record_fallback_before_it_starts(self) -> None:
+        env = self._base_env()
+        env["FAKE_CODEX_UNAVAILABLE_MODELS"] = "gpt-5.6-sol"
+        env["FAKE_CODEX_DELETE_SELF_ON_UNAVAILABLE"] = "1"
+        repo, base, head = self._create_review_range_repo(
+            "codex-review-fallback-start-failure"
+        )
+        start = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "stateful",
+                "start",
+                "--repo",
+                str(repo),
+                "--entrypoint",
+                "codex-review",
+                "--base-ref",
+                base,
+                "--head-ref",
+                head,
+            ],
+            env=env,
+        )
+        self.assertEqual(start.returncode, 0, start.stderr)
+        state_dir = pathlib.Path(start.stdout.strip().splitlines()[-1])
+
+        waited = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "stateful",
+                "wait",
+                "--state-dir",
+                str(state_dir),
+            ],
+            env=env,
+        )
+
+        self.assertNotEqual(waited.returncode, 0)
+        summary = json.loads(waited.stdout)
+        self.assertEqual(summary["codex_model"], "gpt-5.6-sol")
+        self.assertIsNone(summary["model_fallback"])
+        self.assertFalse((state_dir / "model-fallback.json").exists())
 
     def test_codex_review_stateful_forwards_quit_and_writes_terminal_state(self) -> None:
         if os.name != "posix" or not hasattr(signal, "SIGQUIT"):
@@ -8816,6 +8963,20 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
             )
         )
 
+        for message in (
+            "⚠ Selected model is at capacity. Please try a different model.\n",
+            '{"type":"error","message":"model is at capacity"}\n',
+        ):
+            stderr_path.write_text(message, encoding="utf-8")
+            self.assertTrue(
+                module._codex_model_fallback_error(
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                    primary_model="gpt-5.6-sol",
+                ),
+                message,
+            )
+
         stderr_path.write_text(
             "Error: The model service is overloaded\n",
             encoding="utf-8",
@@ -9535,6 +9696,165 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
             process.wait_calls,
             [None, module.CODEX_STREAMING_TERM_GRACE_SECONDS],
         )
+
+    def test_orchestration_signal_wrapper_preserves_signal_exit_code(self) -> None:
+        if os.name != "posix" or not hasattr(signal, "SIGQUIT"):
+            self.skipTest("POSIX SIGQUIT handling is required")
+        module = self._load_script_module()
+        target_signal = module.signal.SIGQUIT
+
+        def operation() -> int:
+            handler = module.signal.getsignal(target_signal)
+            assert callable(handler)
+            handler(int(target_signal), None)
+            return 0
+
+        self.assertEqual(
+            module._run_with_orchestration_signals(operation),
+            128 + int(target_signal),
+        )
+
+    def test_signal_finalize_consumes_masked_pending_signal_before_persist(self) -> None:
+        if os.name != "posix" or not hasattr(signal, "SIGQUIT"):
+            self.skipTest("POSIX pending signal inspection is required")
+        module = self._load_script_module()
+        target_signal = module.signal.SIGQUIT
+        persisted: list[int] = []
+        signal_state = module.OrchestrationSignalState()
+
+        with mock.patch.object(
+            module,
+            "_block_forwarded_orchestration_signals",
+            return_value=set(),
+        ):
+            with mock.patch.object(
+                module,
+                "_restore_orchestration_signal_mask",
+            ):
+                with mock.patch.object(
+                    module.signal,
+                    "sigpending",
+                    return_value={target_signal},
+                ):
+                    with mock.patch.object(module.signal, "sigwait") as sigwait_mock:
+                        result = module._finalize_orchestration_signal_state(
+                            signal_state,
+                            0,
+                            persist_result=persisted.append,
+                        )
+
+        self.assertEqual(result, 128 + int(target_signal))
+        self.assertEqual(persisted, [128 + int(target_signal)])
+        sigwait_mock.assert_called_once_with({target_signal})
+
+    def test_prepare_workspace_cleans_up_forwarded_signal(self) -> None:
+        if os.name != "posix" or not hasattr(signal, "SIGQUIT"):
+            self.skipTest("POSIX SIGQUIT handling is required")
+        module = self._load_script_module()
+        args = module._build_parser().parse_args(
+            ["--repo", str(self.repo), "--entrypoint", "agent"]
+        )
+        cleanup_mock = mock.Mock(return_value=None)
+        original_run = module._run
+
+        def interrupt_worktree_add(
+            command: list[str],
+            **_kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            if "worktree" not in command or "add" not in command:
+                return original_run(command, **_kwargs)
+            pathlib.Path(command[-2]).mkdir(parents=True, exist_ok=True)
+            raise module.ForwardedOrchestrationSignal(module.signal.SIGQUIT)
+
+        with mock.patch.object(module, "_run", side_effect=interrupt_worktree_add):
+            with mock.patch.object(
+                module,
+                "_cleanup_failed_workspace_setup",
+                cleanup_mock,
+            ):
+                with self.assertRaises(module.ForwardedOrchestrationSignal):
+                    module._prepare_workspace(args)
+
+        cleanup_mock.assert_called_once()
+        self.assertTrue(cleanup_mock.call_args.kwargs["created_workspace"])
+
+    def test_codex_attempts_defer_signal_during_spawn_handoff(self) -> None:
+        if os.name != "posix" or not hasattr(signal, "SIGQUIT"):
+            self.skipTest("POSIX SIGQUIT process-group signaling is required")
+        module = self._load_script_module()
+        target_signal = module.signal.SIGQUIT
+
+        for runner_kind in ("captured", "streaming"):
+            with self.subTest(runner=runner_kind):
+                installed_handlers: dict[object, object] = {}
+
+                def set_signal(sig: object, handler: object) -> object:
+                    if callable(handler):
+                        installed_handlers[sig] = handler
+                    return module.signal.SIG_DFL
+
+                class FakeProcess:
+                    def __init__(self) -> None:
+                        self.pid = 4250
+                        self.stdin = None
+                        self.stdout = io.BytesIO()
+                        self.stderr = io.BytesIO()
+                        self.returncode: int | None = None
+
+                    def poll(self) -> int | None:
+                        return self.returncode
+
+                    def wait(self, timeout: float | None = None) -> int:
+                        self.returncode = -int(target_signal)
+                        return self.returncode
+
+                    def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
+                        raise AssertionError("pending spawn signal must preempt communicate")
+
+                process = FakeProcess()
+
+                def popen(*_args: object, **_kwargs: object) -> FakeProcess:
+                    handler = installed_handlers[target_signal]
+                    assert callable(handler)
+                    handler(int(target_signal), None)
+                    return process
+
+                def killpg(_pid: int, sig: int | signal.Signals) -> None:
+                    if sig == 0:
+                        raise ProcessLookupError
+
+                with mock.patch.object(module.subprocess, "Popen", side_effect=popen):
+                    with mock.patch.object(
+                        module.signal,
+                        "getsignal",
+                        return_value=module.signal.SIG_DFL,
+                    ):
+                        with mock.patch.object(module.signal, "signal", side_effect=set_signal):
+                            with mock.patch.object(module.os, "killpg", side_effect=killpg) as killpg_mock:
+                                with self.assertRaises(SystemExit) as raised:
+                                    if runner_kind == "captured":
+                                        module._run_captured_process(
+                                            command=["fake-codex"],
+                                            workspace_root=self.repo,
+                                            child_env=os.environ.copy(),
+                                            stdin_bytes=None,
+                                            stdout_handle=io.BytesIO(),
+                                            stderr_handle=io.BytesIO(),
+                                        )
+                                    else:
+                                        module._run_streaming_codex_attempt(
+                                            command=["fake-codex"],
+                                            workspace_root=self.repo,
+                                            child_env=os.environ.copy(),
+                                            stdin_bytes=None,
+                                        )
+
+                self.assertEqual(
+                    raised.exception.code,
+                    128 + int(target_signal),
+                )
+                killpg_mock.assert_any_call(process.pid, target_signal)
+                self.assertEqual(process.returncode, -int(target_signal))
 
     def test_remaining_process_group_escalates_when_term_is_ignored(self) -> None:
         if os.name != "posix":
