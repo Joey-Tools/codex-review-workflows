@@ -222,6 +222,42 @@ CODEX_READONLY_FINAL_MESSAGE_ALIASES = frozenset(
         "no findings.",
     }
 )
+
+
+class ForwardedOrchestrationSignal(SystemExit):
+    def __init__(self, signum: signal.Signals) -> None:
+        self.signum = signum
+        super().__init__(128 + int(signum))
+
+
+class OrchestrationSignalState:
+    def __init__(self) -> None:
+        self.pending_signal: signal.Signals | None = None
+        self.suppress_raise = False
+        self.previous_handlers: dict[signal.Signals, object] = {}
+
+    def _handle(self, signum: int, _frame: object) -> None:
+        forwarded = signal.Signals(signum)
+        self.pending_signal = forwarded
+        if not self.suppress_raise:
+            raise ForwardedOrchestrationSignal(forwarded)
+
+    def install(self) -> None:
+        if os.name != "posix" or threading.current_thread() is not threading.main_thread():
+            return
+        forwarded_signals = [signal.SIGTERM, signal.SIGINT]
+        for optional_signal_name in ("SIGHUP", "SIGQUIT"):
+            optional_signal = getattr(signal, optional_signal_name, None)
+            if optional_signal is not None and optional_signal not in forwarded_signals:
+                forwarded_signals.append(optional_signal)
+        for forwarded in forwarded_signals:
+            self.previous_handlers[forwarded] = signal.getsignal(forwarded)
+            signal.signal(forwarded, self._handle)
+
+    def restore(self) -> None:
+        for forwarded, previous_handler in self.previous_handlers.items():
+            signal.signal(forwarded, previous_handler)
+        self.previous_handlers.clear()
 CODEX_PARALLEL_AGENTIC_TIMEOUT_SECONDS = 20.0 * 60.0
 CODEX_PARALLEL_AGENTIC_MAX_TIMEOUT_SECONDS = 60.0 * 60.0
 CODEX_PARALLEL_AGENTIC_INITIAL_QUIET_SECONDS = 3.0 * 60.0
@@ -5911,15 +5947,10 @@ def _run_streaming_codex_attempt(
         except ProcessLookupError:
             pass
 
-    class ForwardedSignal(BaseException):
-        def __init__(self, signum: signal.Signals) -> None:
-            super().__init__(int(signum))
-            self.signum = signum
-
     def forward_signal(signum: int, _frame: object) -> None:
         forwarded = signal.Signals(signum)
         signal_process_group(forwarded)
-        raise ForwardedSignal(forwarded)
+        raise ForwardedOrchestrationSignal(forwarded)
 
     process = subprocess.Popen(
         command,
@@ -5979,7 +6010,7 @@ def _run_streaming_codex_attempt(
             if process.poll() is None:
                 cleanup_signal = (
                     error.signum
-                    if isinstance(error, ForwardedSignal)
+                    if isinstance(error, ForwardedOrchestrationSignal)
                     else signal.SIGTERM
                 )
                 signal_process_group(cleanup_signal)
@@ -6009,13 +6040,13 @@ def _run_streaming_codex_attempt(
                 stdout_thread.join(timeout=CODEX_STREAMING_PUMP_JOIN_SECONDS)
             if stderr_thread_started:
                 stderr_thread.join(timeout=CODEX_STREAMING_PUMP_JOIN_SECONDS)
-    except ForwardedSignal as exc:
+    except ForwardedOrchestrationSignal as exc:
         interrupted_by_signal = exc.signum
     finally:
         for forwarded, previous_handler in previous_signal_handlers.items():
             signal.signal(forwarded, previous_handler)
     if interrupted_by_signal is not None:
-        raise SystemExit(128 + int(interrupted_by_signal))
+        raise ForwardedOrchestrationSignal(interrupted_by_signal)
     if (
         (stdout_thread_started and stdout_thread.is_alive())
         or (stderr_thread_started and stderr_thread.is_alive())
@@ -6043,11 +6074,6 @@ def _run_captured_process(
         start_new_session=os.name == "posix",
     )
 
-    class ForwardedSignal(BaseException):
-        def __init__(self, signum: signal.Signals) -> None:
-            super().__init__(int(signum))
-            self.signum = signum
-
     def signal_process_group(sig: signal.Signals) -> None:
         process_pid = getattr(process, "pid", None)
         if os.name == "posix" and isinstance(process_pid, int):
@@ -6067,7 +6093,7 @@ def _run_captured_process(
     def forward_signal(signum: int, _frame: object) -> None:
         forwarded = signal.Signals(signum)
         signal_process_group(forwarded)
-        raise ForwardedSignal(forwarded)
+        raise ForwardedOrchestrationSignal(forwarded)
 
     previous_signal_handlers: dict[signal.Signals, object] = {}
     if os.name == "posix" and threading.current_thread() is threading.main_thread():
@@ -6084,7 +6110,7 @@ def _run_captured_process(
     try:
         try:
             process.communicate(input=stdin_bytes)
-        except ForwardedSignal as error:
+        except ForwardedOrchestrationSignal as error:
             interrupted_by_signal = error.signum
             if process.poll() is None:
                 signal_process_group(error.signum)
@@ -6100,12 +6126,9 @@ def _run_captured_process(
     process_pid = getattr(process, "pid", None)
     if os.name == "posix" and isinstance(process_pid, int):
         _terminate_remaining_process_group(process_pid)
-    returncode = (
-        128 + int(interrupted_by_signal)
-        if interrupted_by_signal is not None
-        else int(process.returncode)
-    )
-    return subprocess.CompletedProcess(command, returncode)
+    if interrupted_by_signal is not None:
+        raise ForwardedOrchestrationSignal(interrupted_by_signal)
+    return subprocess.CompletedProcess(command, int(process.returncode))
 
 
 def _run_captured_codex_attempt(
@@ -6140,6 +6163,8 @@ def _run_prepared_review(prepared: dict[str, object]) -> int:
     entrypoint_label = str(prepared.get("entrypoint_label") or "")
     child_returncode = 1
     cleanup_error: UserError | None = None
+    signal_state = OrchestrationSignalState()
+    signal_state.install()
     try:
         if args.prepare_only:
             print(workspace_root)
@@ -6231,22 +6256,28 @@ def _run_prepared_review(prepared: dict[str, object]) -> int:
                         _emit_binary_file(stdout_path, sys.stdout)
                         _emit_binary_file(stderr_path, sys.stderr)
         else:
-            capture_child_output = entrypoint_label == "codex-readonly"
-            completed = subprocess.run(
-                command,
-                cwd=str(workspace_root),
-                env=child_env,
-                input=prepared["stdin_bytes"],
-                stdout=subprocess.PIPE if capture_child_output else None,
-                stderr=subprocess.PIPE if capture_child_output else None,
-                check=False,
-            )
-            child_returncode = completed.returncode
-            if capture_child_output and child_returncode != 0:
-                if completed.stdout:
-                    sys.stdout.write(completed.stdout.decode("utf-8", errors="replace"))
-                if completed.stderr:
-                    sys.stderr.write(completed.stderr.decode("utf-8", errors="replace"))
+            if entrypoint_label in {"codex-review", "codex-readonly"}:
+                completed, stdout_path, stderr_path = _run_captured_codex_attempt(
+                    command=command,
+                    workspace_root=pathlib.Path(str(workspace_root)),
+                    child_env=child_env,
+                    stdin_bytes=prepared["stdin_bytes"],
+                    container_dir=pathlib.Path(str(prepared["container_dir"])),
+                    attempt="primary",
+                )
+                child_returncode = completed.returncode
+                if entrypoint_label == "codex-review" or child_returncode != 0:
+                    _emit_binary_file(stdout_path, sys.stdout)
+                    _emit_binary_file(stderr_path, sys.stderr)
+            else:
+                completed = subprocess.run(
+                    command,
+                    cwd=str(workspace_root),
+                    env=child_env,
+                    input=prepared["stdin_bytes"],
+                    check=False,
+                )
+                child_returncode = completed.returncode
         if child_returncode == 0 and entrypoint_label == "codex-readonly":
             final_path = pathlib.Path(str(prepared["final_path"]))
             if not final_path.is_file():
@@ -6258,15 +6289,22 @@ def _run_prepared_review(prepared: dict[str, object]) -> int:
                     final_path.read_text(encoding="utf-8")
                 )
             )
+    except ForwardedOrchestrationSignal as error:
+        signal_state.pending_signal = error.signum
+        child_returncode = 128 + int(error.signum)
     except UserError as error:
         print(str(error), file=sys.stderr)
         child_returncode = 1
     finally:
+        signal_state.suppress_raise = True
         cleanup_error = _cleanup_prepared_workspace(
             prepared,
             child_returncode=child_returncode,
             cleanup_error=cleanup_error,
         )
+        if signal_state.pending_signal is not None:
+            child_returncode = 128 + int(signal_state.pending_signal)
+        signal_state.restore()
 
     if cleanup_error is not None:
         print(str(cleanup_error), file=sys.stderr)
@@ -6449,6 +6487,8 @@ def _run_child_from_spec(spec_path: pathlib.Path, *, expected_sha256: str) -> in
     stderr_path = spec_path.parent / "stderr.log"
     pid_path = spec_path.parent / "pid"
     lock_path = spec_path.parent / "runner.lock"
+    signal_state = OrchestrationSignalState()
+    signal_state.install()
     try:
         spec_bytes = spec_path.read_bytes()
         actual_sha256 = hashlib.sha256(spec_bytes).hexdigest()
@@ -6581,13 +6621,40 @@ def _run_child_from_spec(spec_path: pathlib.Path, *, expected_sha256: str) -> in
                             f"runner failed: {error}\n".encode("utf-8", errors="replace")
                         )
                         exit_code = 1
+            except ForwardedOrchestrationSignal as error:
+                signal_state.pending_signal = error.signum
+                exit_code = 128 + int(error.signum)
             finally:
+                signal_state.suppress_raise = True
+                if signal_state.pending_signal is not None:
+                    exit_code = 128 + int(signal_state.pending_signal)
                 _write_runner_terminal_state_unlocked(
                     exit_code_path,
                     exit_code=exit_code,
                     pid_path=pid_path,
                 )
+                if (
+                    signal_state.pending_signal is not None
+                    and exit_code != 128 + int(signal_state.pending_signal)
+                ):
+                    exit_code = 128 + int(signal_state.pending_signal)
+                    _write_runner_terminal_state_unlocked(
+                        exit_code_path,
+                        exit_code=exit_code,
+                        pid_path=pid_path,
+                    )
+    except ForwardedOrchestrationSignal as error:
+        signal_state.pending_signal = error.signum
+        signal_state.suppress_raise = True
+        exit_code = 128 + int(error.signum)
+        _write_runner_terminal_state(
+            lock_path,
+            exit_code_path,
+            exit_code=exit_code,
+            pid_path=pid_path,
+        )
     except Exception as error:  # pragma: no cover - defensive crash path
+        signal_state.suppress_raise = True
         stderr_path.parent.mkdir(parents=True, exist_ok=True)
         with stderr_path.open("ab") as stderr_handle:
             stderr_handle.write(
@@ -6600,6 +6667,9 @@ def _run_child_from_spec(spec_path: pathlib.Path, *, expected_sha256: str) -> in
             exit_code=exit_code,
             pid_path=pid_path,
         )
+    finally:
+        signal_state.suppress_raise = True
+        signal_state.restore()
     return exit_code
 
 

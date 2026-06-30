@@ -962,6 +962,21 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                         f"model_not_found: model is not available: {model}",
                         file=sys.stderr,
                     )
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                    unavailable_ready_path = os.environ.get(
+                        "FAKE_CODEX_UNAVAILABLE_READY_PATH"
+                    )
+                    if unavailable_ready_path:
+                        pathlib.Path(unavailable_ready_path).write_text(
+                            "ready\\n",
+                            encoding="utf-8",
+                        )
+                    unavailable_delay = float(
+                        os.environ.get("FAKE_CODEX_UNAVAILABLE_DELAY_SECS", "0")
+                    )
+                    if unavailable_delay:
+                        time.sleep(unavailable_delay)
                     raise SystemExit(7)
 
                 payload = {
@@ -4294,6 +4309,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                 base,
                 "--head-ref",
                 head,
+                "--no-codex-model-fallback",
             ],
             env=env,
             stdout=subprocess.PIPE,
@@ -4323,6 +4339,57 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         with self.assertRaises(ProcessLookupError):
             os.kill(child_pid, 0)
         self.assertFalse(list((repo / ".codex-tmp").glob("isolated-review-*")))
+
+    def test_codex_review_signal_after_model_error_does_not_start_fallback(self) -> None:
+        if os.name != "posix" or not hasattr(signal, "SIGQUIT"):
+            self.skipTest("POSIX SIGQUIT process-group signaling is required")
+        env = self._base_env()
+        env["FAKE_CODEX_UNAVAILABLE_MODELS"] = "gpt-5.6-sol"
+        env["FAKE_CODEX_UNAVAILABLE_JSON_STDOUT"] = "1"
+        env["FAKE_CODEX_UNAVAILABLE_DELAY_SECS"] = "30"
+        ready_path = self.root / "fake-codex-unavailable.ready"
+        env["FAKE_CODEX_UNAVAILABLE_READY_PATH"] = str(ready_path)
+        repo, base, head = self._create_review_range_repo(
+            "codex-review-signal-after-model-error"
+        )
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--repo",
+                str(repo),
+                "--entrypoint",
+                "codex-review",
+                "--base-ref",
+                base,
+                "--head-ref",
+                head,
+            ],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while (
+                not ready_path.is_file()
+                and process.poll() is None
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.02)
+            self.assertTrue(ready_path.is_file())
+            os.kill(process.pid, signal.SIGQUIT)
+            stdout, stderr = process.communicate(timeout=5)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
+        self.assertEqual(process.returncode, 128 + int(signal.SIGQUIT), stderr)
+        self.assertEqual(stdout, "")
+        self.assertNotIn("codex model fallback:", stderr)
 
     def test_codex_review_stateful_forwards_quit_and_writes_terminal_state(self) -> None:
         if os.name != "posix" or not hasattr(signal, "SIGQUIT"):
