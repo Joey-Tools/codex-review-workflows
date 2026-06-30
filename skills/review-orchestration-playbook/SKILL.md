@@ -43,6 +43,7 @@ Capacity, overload, rate limits, timeouts, network errors, 5xx responses, missin
 - Use `$HOME/.codex/skills/review-orchestration-playbook/scripts/isolated_review`.
 - Start one stateful helper run per logical reviewer: `--reviewer codex` and, for double/triple review, `--reviewer claude`.
 - A Claude-family run must also pass `--egress-consent double-review`, `--egress-consent triple-review`, or `--egress-consent explicit-claude-review`, matching the user's request. This makes the authorization visible in the command and saved state.
+- `explicit-claude-review` authorizes only Anthropic Claude Code. Only `double-review` and `triple-review` authorize the entitlement-only GitHub Copilot fallback.
 - When the Claude-family helper needs approval, the escalation justification must repeat the explicit user request, exact repository, frozen `base_sha..head_sha`, Anthropic destination plus entitlement-only GitHub Copilot fallback, included tracked-code/diff/prompt scope, and exclusions. Use the template in [egress-consent.md](references/egress-consent.md); a generic `run external reviewer` justification is insufficient.
 - Use `stateful start`, then bounded `stateful status` / `stateful wait`, and finally `stateful final --state-dir <dir>`.
 - Treat only the terminal final artifact as review evidence. Intermediate reasoning, tool traces, stdout tails, and keepalives are not findings.

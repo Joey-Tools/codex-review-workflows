@@ -22,6 +22,8 @@ No consent covers secrets, credentials, untracked private files, unrelated repos
 - Copilot fallback sends the same bounded scope through GitHub Copilot only when the Claude Code backend is absent or its pinned Opus models are entitlement-blocked.
 - GitHub Codex review uses the PR diff and repository guidance on GitHub.
 
+`explicit-claude-review` authorizes only the Anthropic destination. The helper may use GitHub Copilot fallback only with `double-review` or `triple-review`, whose consent language explicitly names that fallback.
+
 Record the actual runtime/model used in the terminal review report so consent and retention expectations remain auditable.
 
 The helper enforces the intended scope with a frozen detached workspace, runtime-specific minimal environment, provider path/tool restrictions, and an escaping-symlink preflight. These controls do not broaden consent: if a credential or unrelated private artifact is present in tracked review content, stop and narrow the scope instead of treating repository membership as authorization.

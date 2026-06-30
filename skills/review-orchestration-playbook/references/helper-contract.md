@@ -53,7 +53,7 @@ The parent acquires an exclusive runner lock before spawn and passes its file de
 3. Copilot CLI `claude-opus-4.8`, `max`, only when Claude Code is absent or both Claude Code models are entitlement-blocked
 4. Copilot CLI `claude-opus-4.7`, `max`, entitlement-only fallback
 
-The Claude-family lane requires one of `--egress-consent explicit-claude-review`, `--egress-consent double-review`, or `--egress-consent triple-review`. The helper saves this value in state and writes `egress.json`; it refuses to start the external lane without it.
+The Claude-family lane requires one of `--egress-consent explicit-claude-review`, `--egress-consent double-review`, or `--egress-consent triple-review`. The helper saves this value in state and writes `egress.json`; it refuses to start the external lane without it. `explicit-claude-review` authorizes Anthropic only, while `double-review` and `triple-review` also authorize the entitlement-only GitHub Copilot fallback.
 
 Model verification normalizes punctuation only and then requires exact equality. A requested `gpt-5.5` never accepts `gpt-5.5-mini`, `gpt-5.5-codex`, or any other suffix as the same model.
 

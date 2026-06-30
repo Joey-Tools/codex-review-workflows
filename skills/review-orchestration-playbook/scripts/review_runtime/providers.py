@@ -30,6 +30,7 @@ CLAUDE_EGRESS_CONSENTS = (
     "double-review",
     "triple-review",
 )
+COPILOT_EGRESS_CONSENTS = ("double-review", "triple-review")
 CODEX_ENV_KEYS = ("CODEX_HOME", "OPENAI_API_KEY")
 CLAUDE_ENV_KEYS = (
     "ANTHROPIC_API_KEY",
@@ -887,6 +888,18 @@ def run_review(
             return _finish(review, attempts, final_text)
         if category != "entitlement":
             return _finish(review, attempts, None)
+
+    if egress_consent not in COPILOT_EGRESS_CONSENTS:
+        write_text_atomic(
+            review.container_dir / "runner-error.txt",
+            "Claude Code was unavailable or lacked model entitlement, but "
+            "explicit-claude-review does not authorize GitHub Copilot fallback.\n",
+        )
+        write_json(
+            review.container_dir / "attempts.json",
+            [asdict(item) for item in attempts],
+        )
+        return Outcome(2, None, tuple(attempts))
 
     try:
         copilot_available = resolve_reviewer_executable("copilot") is not None

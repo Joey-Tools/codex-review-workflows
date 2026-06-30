@@ -296,6 +296,33 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
         )
 
+    @mock.patch.object(providers, "_copilot_attempt")
+    @mock.patch.object(
+        providers,
+        "resolve_reviewer_executable",
+        return_value=None,
+    )
+    def test_explicit_claude_consent_does_not_authorize_copilot_fallback(
+        self,
+        resolve: mock.Mock,
+        copilot_attempt: mock.Mock,
+    ) -> None:
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            shim_source=SCRIPTS / "git_readonly_shim",
+            egress_consent="explicit-claude-review",
+        )
+        self.assertEqual(outcome.returncode, 2)
+        resolve.assert_called_once_with("claude")
+        copilot_attempt.assert_not_called()
+        self.assertIn(
+            "does not authorize GitHub Copilot",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
     def test_effective_model_substitution_does_not_infer_entitlement(self) -> None:
         completed = Completed(
             argv=("claude",),

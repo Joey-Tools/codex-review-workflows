@@ -104,7 +104,8 @@ def _create_sanitized_git_view(
     (git_view / "objects").mkdir(parents=True)
     (git_view / "refs").mkdir()
     write_text_atomic(git_view / "HEAD", "ref: refs/heads/unused\n")
-    config = "[core]\n\trepositoryformatversion = 0\n\tbare = true\n"
+    format_version = 1 if object_format == "sha256" else 0
+    config = f"[core]\n\trepositoryformatversion = {format_version}\n\tbare = true\n"
     if object_format == "sha256":
         config += "[extensions]\n\tobjectFormat = sha256\n"
     write_text_atomic(git_view / "config", config)

@@ -207,6 +207,52 @@ class WorkspaceTest(unittest.TestCase):
             raw_substitution,
         )
 
+    def test_prepare_supports_sha256_repositories(self) -> None:
+        sha256_repo = pathlib.Path(self.temporary.name) / "sha256-repo"
+        subprocess.run(
+            (
+                "git",
+                "init",
+                "--object-format=sha256",
+                "-b",
+                "master",
+                str(sha256_repo),
+            ),
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        git(sha256_repo, "config", "user.name", "Review Test")
+        git(sha256_repo, "config", "user.email", "review@example.com")
+        git(sha256_repo, "config", "commit.gpgsign", "false")
+        (sha256_repo / ".gitignore").write_text(
+            ".codex-tmp/\n",
+            encoding="utf-8",
+        )
+        content = sha256_repo / "content.txt"
+        content.write_text("base\n", encoding="utf-8")
+        git(sha256_repo, "add", ".gitignore", "content.txt")
+        git(sha256_repo, "commit", "-m", "Initial")
+        base = git(sha256_repo, "rev-parse", "HEAD")
+        content.write_text("base\nhead\n", encoding="utf-8")
+        git(sha256_repo, "add", "content.txt")
+        git(sha256_repo, "commit", "-m", "Update")
+        head = git(sha256_repo, "rev-parse", "HEAD")
+        self.assertEqual(len(head), 64)
+
+        review = prepare_workspace(
+            repo=sha256_repo,
+            base_ref=base,
+            head_ref=head,
+        )
+        self.reviews.append(review)
+        self.assertEqual(review.head_ref, head)
+        self.assertEqual(
+            (review.workspace_root / "content.txt").read_text(encoding="utf-8"),
+            "base\nhead\n",
+        )
+        self.assertIn("+head", review.diff_file.read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()
