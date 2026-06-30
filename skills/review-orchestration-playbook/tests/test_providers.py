@@ -28,6 +28,7 @@ class ProviderPolicyTest(unittest.TestCase):
         diff_file = control / "review.diff"
         diff_file.write_text("diff --git a/a b/a\n", encoding="utf-8")
         (control / "changed-paths.z").write_bytes(b"")
+        (control / "changed-blob-findings.z").write_bytes(b"")
         prompt_file = control / "review.prompt"
         prompt_file.write_text("Review this diff.\n", encoding="utf-8")
         self.review = ReviewWorkspace(
@@ -160,6 +161,20 @@ class ProviderPolicyTest(unittest.TestCase):
             }
         )
         self.assertEqual(providers.classify_failure(stdout, ""), "entitlement")
+
+    def test_structured_error_result_cannot_be_accepted_as_final_text(self) -> None:
+        stdout = json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "result": "partial findings",
+                "modelUsage": {"claude-opus-4-8": {}},
+            }
+        ).encode()
+        final_text, effective_model = providers._parse_structured_output(stdout)
+        self.assertIsNone(final_text)
+        self.assertEqual(effective_model, "claude-opus-4-8")
 
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(providers, "_codex_attempt")

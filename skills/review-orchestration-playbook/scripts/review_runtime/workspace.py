@@ -48,11 +48,17 @@ SECRET_PATTERNS = (
     ("slack-token", re.compile(rb"\bxox[baprs]-[A-Za-z0-9-]{20,}\b")),
     ("stripe-live-key", re.compile(rb"\bsk_live_[A-Za-z0-9]{16,}\b")),
 )
-GENERIC_SECRET_ASSIGNMENT = re.compile(
+SECRET_KEY_PATTERN = (
     rb"(?i)(?:api[_-]?(?:key|token)|access[_-]?token|auth[_-]?token|"
     rb"bearer[_-]?token|client[_-]?secret|password|passwd|private[_-]?token|"
     rb"secret[_-]?(?:key|token))['\"]?\s*[:=]\s*"
-    rb"['\"]?([^\s'\"#;,]{16,512})"
+)
+QUOTED_SECRET_ASSIGNMENT = re.compile(
+    SECRET_KEY_PATTERN + rb"(['\"])([^\r\n'\"]{16,512})\1"
+)
+UNQUOTED_SECRET_ASSIGNMENT = re.compile(
+    SECRET_KEY_PATTERN + rb"([A-Za-z0-9_./+=-]{20,512})(?=[ \t]*(?:[#;]|\r?$))",
+    re.MULTILINE,
 )
 PLACEHOLDER_SECRET_MARKERS = (
     b"${",
@@ -585,6 +591,135 @@ def _write_frozen_changed_paths(
             )
 
 
+def _scan_batch_blob(
+    *,
+    cat_input: BinaryIO,
+    cat_output: BinaryIO,
+    object_id: str,
+) -> str | None:
+    cat_input.write(object_id.encode("ascii") + b"\n")
+    cat_input.flush()
+    header = cat_output.readline()
+    fields = header.rstrip(b"\n").split(b" ")
+    if len(fields) != 3 or fields[1] != b"blob":
+        raise ReviewError(f"unexpected git cat-file scan header: {header!r}")
+    try:
+        actual_object = fields[0].decode("ascii")
+        size = int(fields[2])
+    except (UnicodeDecodeError, ValueError) as error:
+        raise ReviewError(f"invalid git cat-file scan header: {header!r}") from error
+    if actual_object != object_id:
+        raise ReviewError(f"unexpected git cat-file scan object: {header!r}")
+    rule = _stream_secret_rule(cat_output, size=size)
+    if cat_output.read(1) != b"\n":
+        raise ReviewError("missing delimiter after scanned git cat-file blob")
+    return rule
+
+
+def _write_changed_blob_findings(
+    *,
+    git_view: pathlib.Path,
+    object_directory: pathlib.Path,
+    base_sha: str,
+    head_sha: str,
+    destination: pathlib.Path,
+) -> None:
+    environment = _git_environment(object_directory=object_directory)
+    with (
+        tempfile.TemporaryFile() as raw_output,
+        tempfile.TemporaryFile() as raw_error,
+        tempfile.TemporaryFile() as cat_error,
+        destination.open("xb") as findings_output,
+    ):
+        completed = subprocess.run(
+            _frozen_command(
+                git_view=git_view,
+                args=(
+                    "diff",
+                    "--raw",
+                    "-z",
+                    "--no-abbrev",
+                    "--no-renames",
+                    base_sha,
+                    head_sha,
+                ),
+            ),
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=raw_output,
+            stderr=raw_error,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise ReviewError(
+                f"cannot enumerate changed blobs: {_process_stderr(raw_error)}"
+            )
+        raw_output.seek(0)
+        cat_process = subprocess.Popen(
+            _frozen_command(git_view=git_view, args=("cat-file", "--batch")),
+            env=environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=cat_error,
+        )
+        if cat_process.stdin is None or cat_process.stdout is None:
+            _stop_process(cat_process)
+            raise ReviewError("failed to create pipes for changed Git blob scanning")
+        try:
+            records = iter(_iter_nul_records(raw_output))
+            for metadata in records:
+                if not metadata.startswith(b":"):
+                    raise ReviewError(f"invalid raw Git diff record: {metadata!r}")
+                fields = metadata[1:].split()
+                if len(fields) != 5:
+                    raise ReviewError(f"invalid raw Git diff metadata: {metadata!r}")
+                old_mode, new_mode, old_object, new_object, _status = fields
+                try:
+                    raw_path = next(records)
+                except StopIteration as error:
+                    raise ReviewError(
+                        "raw Git diff is missing a changed path"
+                    ) from error
+                for side, mode, raw_object in (
+                    ("base", old_mode, old_object),
+                    ("head", new_mode, new_object),
+                ):
+                    if mode in {b"000000", b"160000"}:
+                        continue
+                    try:
+                        object_id = raw_object.decode("ascii")
+                    except UnicodeDecodeError as error:
+                        raise ReviewError(
+                            f"invalid changed Git object id: {raw_object!r}"
+                        ) from error
+                    rule = _scan_batch_blob(
+                        cat_input=cat_process.stdin,
+                        cat_output=cat_process.stdout,
+                        object_id=object_id,
+                    )
+                    if rule:
+                        findings_output.write(
+                            side.encode("ascii")
+                            + b"\0"
+                            + raw_path
+                            + b"\0"
+                            + rule.encode("ascii")
+                            + b"\0"
+                        )
+            _close_pipe(cat_process.stdin)
+            _close_pipe(cat_process.stdout)
+            cat_returncode = cat_process.wait()
+        except BaseException:
+            _close_pipe(cat_process.stdin)
+            _close_pipe(cat_process.stdout)
+            _stop_process(cat_process)
+            raise
+        if cat_returncode != 0:
+            raise ReviewError(
+                f"cannot scan changed Git blobs: {_process_stderr(cat_error)}"
+            )
+
+
 def validate_workspace_layout(review: ReviewWorkspace) -> None:
     source_root = review.source_root.resolve(strict=False)
     container_dir = review.container_dir.resolve(strict=False)
@@ -647,6 +782,27 @@ def validate_external_workspace(review: ReviewWorkspace) -> None:
         raise ReviewError(
             f"cannot validate external review changed paths: {error}"
         ) from error
+    changed_blob_findings = (
+        review.workspace_root / ".codex-review/changed-blob-findings.z"
+    )
+    try:
+        with changed_blob_findings.open("rb") as handle:
+            records = iter(_iter_nul_records(handle))
+            for raw_side in records:
+                try:
+                    raw_path = next(records)
+                    raw_rule = next(records)
+                    side = raw_side.decode("ascii")
+                    rule = raw_rule.decode("ascii")
+                except (StopIteration, UnicodeDecodeError) as error:
+                    raise ReviewError(
+                        "external review changed-blob findings are malformed"
+                    ) from error
+                record_finding(f"{os.fsdecode(raw_path)} ({rule}; {side}-blob)")
+    except OSError as error:
+        raise ReviewError(
+            f"cannot validate external review changed blobs: {error}"
+        ) from error
     for candidate in review.workspace_root.rglob("*"):
         if candidate.is_symlink() or not candidate.is_file():
             continue
@@ -690,27 +846,66 @@ def _sensitive_path_rule(relative: str) -> str | None:
 
 
 def _file_secret_rule(path: pathlib.Path) -> str | None:
-    overlap = 4096
-    pending = b""
     try:
         with path.open("rb") as handle:
-            while chunk := handle.read(1024 * 1024):
-                value = pending + chunk
-                for rule, pattern in SECRET_PATTERNS:
-                    if pattern.search(value):
-                        return rule
-                for match in GENERIC_SECRET_ASSIGNMENT.finditer(value):
-                    candidate = match.group(1).lower()
-                    if not any(
-                        marker in candidate for marker in PLACEHOLDER_SECRET_MARKERS
-                    ):
-                        return "generic-secret-assignment"
-                pending = value[-overlap:]
+            return _stream_secret_rule(handle)
     except OSError as error:
         raise ReviewError(
             f"cannot scan external review content {path}: {error}"
         ) from error
+
+
+def _stream_secret_rule(stream: BinaryIO, *, size: int | None = None) -> str | None:
+    overlap = 4096
+    pending = b""
+    remaining = size
+    finding: str | None = None
+    while remaining is None or remaining > 0:
+        read_size = 1024 * 1024 if remaining is None else min(1024 * 1024, remaining)
+        chunk = stream.read(read_size)
+        if not chunk:
+            if remaining not in (None, 0):
+                raise ReviewError("unexpected end of Git blob during sensitive scan")
+            break
+        if remaining is not None:
+            remaining -= len(chunk)
+        if finding is None:
+            finding = _value_secret_rule(pending + chunk)
+        pending = (pending + chunk)[-overlap:]
+    return finding
+
+
+def _value_secret_rule(value: bytes) -> str | None:
+    for rule, pattern in SECRET_PATTERNS:
+        if pattern.search(value):
+            return rule
+    for match in QUOTED_SECRET_ASSIGNMENT.finditer(value):
+        candidate = match.group(2).lower()
+        if not _is_placeholder_secret(candidate):
+            return "generic-secret-assignment"
+    for match in UNQUOTED_SECRET_ASSIGNMENT.finditer(value):
+        candidate = match.group(1)
+        if not _is_placeholder_secret(
+            candidate.lower()
+        ) and _looks_like_unquoted_secret(candidate):
+            return "generic-secret-assignment"
     return None
+
+
+def _is_placeholder_secret(candidate: bytes) -> bool:
+    return any(marker in candidate for marker in PLACEHOLDER_SECRET_MARKERS)
+
+
+def _looks_like_unquoted_secret(candidate: bytes) -> bool:
+    character_classes = sum(
+        (
+            any(97 <= value <= 122 for value in candidate),
+            any(65 <= value <= 90 for value in candidate),
+            any(48 <= value <= 57 for value in candidate),
+            any(value in b"_./+=-" for value in candidate),
+        )
+    )
+    return character_classes >= 3 and any(48 <= value <= 57 for value in candidate)
 
 
 def prepare_workspace(
@@ -759,6 +954,14 @@ def prepare_workspace(
             base_sha=base_sha,
             head_sha=head_sha,
             destination=changed_paths_file,
+        )
+        changed_blob_findings = control_dir / "changed-blob-findings.z"
+        _write_changed_blob_findings(
+            git_view=git_view,
+            object_directory=object_directory,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            destination=changed_blob_findings,
         )
         diff_file = control_dir / "review.diff"
         _write_frozen_diff(

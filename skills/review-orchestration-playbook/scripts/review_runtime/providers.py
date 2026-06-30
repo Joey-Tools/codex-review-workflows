@@ -278,10 +278,13 @@ def _structured_error_text(stdout: bytes) -> str:
             return
         if not isinstance(value, dict):
             return
-        node_type = value.get("type")
-        type_text = node_type.lower() if isinstance(node_type, str) else ""
+        state_text = " ".join(
+            item.lower()
+            for key in ("type", "subtype", "status")
+            if isinstance((item := value.get(key)), str)
+        )
         explicit_error = value.get("is_error") is True or any(
-            marker in type_text for marker in ("error", "failed", "failure")
+            marker in state_text for marker in ("error", "failed", "failure")
         )
         if "error" in value:
             messages.extend(_error_payload_text(value["error"]))
@@ -358,6 +361,8 @@ def _parse_structured_output(stdout: bytes) -> tuple[str | None, str | None]:
             effective_model = _find_model(item)
         if final_text is not None and effective_model is not None:
             break
+    if _structured_error_text(stdout).strip():
+        final_text = None
     return final_text, effective_model
 
 

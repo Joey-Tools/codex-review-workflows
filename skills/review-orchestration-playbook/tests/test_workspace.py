@@ -12,6 +12,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 from review_runtime.common import ReviewError  # noqa: E402
 from review_runtime.workspace import (  # noqa: E402
+    _file_secret_rule,
     cleanup_workspace,
     prepare_workspace,
     validate_external_workspace,
@@ -159,6 +160,38 @@ class WorkspaceTest(unittest.TestCase):
         (review.workspace_root / "escape").symlink_to(self.repo / "example.txt")
         with self.assertRaises(ReviewError):
             validate_external_workspace(review)
+
+    def test_deleted_binary_secret_is_detected_from_base_blob(self) -> None:
+        secret = ("sk-" + "A" * 40).encode()
+        binary = self.repo / "opaque.bin"
+        binary.write_bytes(b"\0binary\0" + secret + b"\0")
+        git(self.repo, "add", "opaque.bin")
+        git(self.repo, "commit", "-m", "Add binary credential")
+        secret_base = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "rm", "opaque.bin")
+        git(self.repo, "commit", "-m", "Remove binary credential")
+        clean_head = git(self.repo, "rev-parse", "HEAD")
+
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=secret_base,
+            head_ref=clean_head,
+        )
+        self.reviews.append(review)
+        findings = (
+            review.workspace_root / ".codex-review/changed-blob-findings.z"
+        ).read_bytes()
+        self.assertNotIn(secret, findings)
+        with self.assertRaisesRegex(ReviewError, "opaque.bin.*base-blob"):
+            validate_external_workspace(review)
+
+    def test_function_call_assignment_is_not_treated_as_literal_secret(self) -> None:
+        source = pathlib.Path(self.temporary.name) / "source.py"
+        source.write_text(
+            "password = load_password_from_keyring()\n",
+            encoding="utf-8",
+        )
+        self.assertIsNone(_file_secret_rule(source))
 
     def test_snapshot_does_not_execute_repo_hooks_filters_or_external_diff(
         self,
