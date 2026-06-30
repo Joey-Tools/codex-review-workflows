@@ -65,6 +65,7 @@ Fallback classification uses stderr plus explicit structured CLI error events on
 
 - The helper requires `--base-ref` and `--head-ref` and resolves both to commits before launch.
 - It creates a `.git`-free frozen snapshot by streaming raw tree blobs from the head under source-repo `.codex-tmp/`; Git archive attributes, checkout filters, hooks, and repository config cannot rewrite that snapshot. It also streams a binary `--submodule=diff` artifact for the exact range to disk.
+- The helper rejects a range when either base or head uses its reserved top-level `.codex-review` control path.
 - Snapshot preparation runs Git with a cleaned environment, disabled hooks/fsmonitor/external diff, and explicit `--no-ext-diff --no-textconv`. It does not checkout files through repository filters.
 - Submodules remain uninitialized and unfetched; their gitlink changes are represented in the frozen diff.
 - Every reviewer receives the same bounded findings-only prompt and primary diff file inside a helper-owned `.codex-review/` directory in the frozen snapshot.
@@ -73,7 +74,7 @@ Fallback classification uses stderr plus explicit structured CLI error events on
 - Codex runs with a custom permission profile: only platform-minimal paths and the frozen workspace are readable; `.git`, `.codex`, `.agents`, and environment-file globs are denied; network and writes are unavailable. It ignores user config and execpolicy rules, uses `approval_policy=never`, and gives model-proposed shell commands a fresh environment with an empty helper-owned `HOME`.
 - Claude Code runs in safe mode with `dontAsk` permissions and only `Read`, `Grep`, and `Glob`; no additional directory is allowed, so its permission root is the frozen workspace. Explicit deny rules cover common credential/config homes. Slash commands, Chrome integration, inherited MCP configuration, repository/user setting sources, and nonessential traffic are disabled.
 - Copilot runs in plan mode with its built-in current-working-directory path boundary, explicit shell/write denial, temp-directory denial, and disabled custom instructions, built-in MCPs, bash environment loading, experimental features, and remote session export. Secret-like auth variables are withheld from its tools.
-- Before a Claude-family run, the helper rejects any symlink in the frozen workspace that resolves outside that workspace.
+- Before a Claude-family run, the helper rejects any symlink in the frozen workspace that resolves outside that workspace and blocks credential-like paths or high-confidence secret patterns found in the head snapshot, frozen diff, or prompt. Findings record only path/rule metadata, never matched secret values.
 - Executable discovery validates `--version` identity and never trusts arbitrary repository `PATH` entries. It checks Homebrew/system locations plus NVM, `NVM_BIN`, `~/.local/bin`, Volta, asdf, Bun, npm-global, and `~/bin`. Explicit absolute overrides are `CODEX_REVIEW_CODEX_PATH`, `CODEX_REVIEW_CLAUDE_PATH`, and `CODEX_REVIEW_COPILOT_PATH`; invalid paths or CLI identities block the lane.
 - Source files are never edited. The detached workspace is removed after `stateful wait` unless `--keep-workspace` is set.
 - Logs, attempts metadata, and `final.txt` remain in the state directory after workspace cleanup.

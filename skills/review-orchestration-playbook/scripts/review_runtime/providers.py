@@ -79,11 +79,20 @@ ENTITLEMENT_FAILURE_FRAGMENTS = (
     "not entitled",
     "user is not entitled",
     "does not have access to the model",
+    "does not have access to this model",
     "don't have access to the model",
+    "don't have access to this model",
     "do not have access to the model",
+    "do not have access to this model",
+    "account has no access to this model",
+    "organization has no access to this model",
+    "organisation has no access to this model",
     "model access is disabled",
+    "model access has been disabled",
     "model is disabled by your organization",
+    "model is disabled for your organization",
     "model is not allowed by your organization",
+    "model is not enabled for your organization",
     "not in your organization's allowed models",
     "not in your organisation's allowed models",
     "model is not available to this account",
@@ -94,6 +103,14 @@ ENTITLEMENT_FAILURE_FRAGMENTS = (
     "model_not_enabled",
     "model_not_entitled",
 )
+
+STRUCTURED_ENTITLEMENT_CODES = (
+    "model_access_denied",
+    "model_not_enabled",
+    "model_not_entitled",
+    "model_permission_denied",
+)
+STRUCTURED_AMBIGUOUS_MODEL_CODES = ("model_not_found", "not_found_error")
 
 AUTH_FAILURE_FRAGMENTS = (
     "authentication failed",
@@ -173,12 +190,32 @@ def classify_failure(stdout: bytes | str, stderr: bytes | str) -> str:
         )
 
     stdout_bytes = stdout.encode() if isinstance(stdout, str) else stdout
-    message = f"{decode(stderr)}\n{_structured_error_text(stdout_bytes)}".lower()
+    structured_error = _structured_error_text(stdout_bytes).lower()
+    message = f"{decode(stderr)}\n{structured_error}".lower()
     if any(fragment in message for fragment in TRANSIENT_FAILURE_FRAGMENTS):
         return "transient"
     if any(fragment in message for fragment in AUTH_FAILURE_FRAGMENTS):
         return "auth"
     if any(fragment in message for fragment in ENTITLEMENT_FAILURE_FRAGMENTS):
+        return "entitlement"
+    if any(code in structured_error for code in STRUCTURED_ENTITLEMENT_CODES):
+        return "entitlement"
+    if (
+        any(code in structured_error for code in STRUCTURED_AMBIGUOUS_MODEL_CODES)
+        and "model" in structured_error
+        and any(
+            marker in structured_error
+            for marker in (
+                "access",
+                "account",
+                "organization",
+                "organisation",
+                "plan",
+                "entitled",
+                "available",
+            )
+        )
+    ):
         return "entitlement"
     return "other"
 
@@ -807,11 +844,12 @@ def run_review(
                     "the review prompt and result",
                 ],
                 "excluded": [
-                    "credentials or secrets",
+                    "credential paths and high-confidence secrets blocked by preflight",
                     "untracked files",
                     "unrelated repositories",
                     "broad workspace or home-directory content",
                 ],
+                "preflight": "sensitive-content and escaping-symlink checks passed",
             },
         )
     elif egress_consent is not None:

@@ -117,6 +117,24 @@ class WorkspaceTest(unittest.TestCase):
         review_root = self.repo / ".codex-tmp"
         self.assertFalse(review_root.exists())
 
+    def test_reserved_control_path_in_base_is_rejected(self) -> None:
+        control = self.repo / ".codex-review"
+        control.mkdir()
+        (control / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+        git(self.repo, "add", ".codex-review/tracked.txt")
+        git(self.repo, "commit", "-m", "Add reserved path")
+        reserved_base = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "rm", "-r", ".codex-review")
+        git(self.repo, "commit", "-m", "Remove reserved path")
+        clean_head = git(self.repo, "rev-parse", "HEAD")
+
+        with self.assertRaisesRegex(ReviewError, "frozen base uses the reserved"):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=reserved_base,
+                head_ref=clean_head,
+            )
+
     def test_external_workspace_rejects_symlinks_that_escape_frozen_root(self) -> None:
         review = prepare_workspace(
             repo=self.repo,

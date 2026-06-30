@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import tempfile
@@ -19,6 +20,67 @@ from .common import (
     write_text_atomic,
 )
 from .prompt import build_review_prompt
+
+
+SECRET_PATTERNS = (
+    (
+        "private-key",
+        re.compile(
+            rb"-----BEGIN (?:ENCRYPTED |RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"
+        ),
+    ),
+    ("aws-access-key", re.compile(rb"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    (
+        "aws-secret-key",
+        re.compile(rb"(?i)aws_secret_access_key\s*[:=]\s*['\"]?[A-Za-z0-9/+=]{40}\b"),
+    ),
+    ("anthropic-key", re.compile(rb"\bsk-ant-[A-Za-z0-9_-]{32,}\b")),
+    ("openai-key", re.compile(rb"\bsk-(?:proj-)?[A-Za-z0-9_-]{32,}\b")),
+    (
+        "github-token",
+        re.compile(rb"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{20,})\b"),
+    ),
+    ("gitlab-token", re.compile(rb"\bglpat-[A-Za-z0-9_-]{20,}\b")),
+    ("google-api-key", re.compile(rb"\bAIza[0-9A-Za-z_-]{35}\b")),
+    ("npm-token", re.compile(rb"\bnpm_[A-Za-z0-9]{36}\b")),
+    ("pypi-token", re.compile(rb"\bpypi-[A-Za-z0-9_-]{50,}\b")),
+    ("slack-token", re.compile(rb"\bxox[baprs]-[A-Za-z0-9-]{20,}\b")),
+    ("stripe-live-key", re.compile(rb"\bsk_live_[A-Za-z0-9]{16,}\b")),
+)
+GENERIC_SECRET_ASSIGNMENT = re.compile(
+    rb"(?i)(?:api[_-]?(?:key|token)|access[_-]?token|auth[_-]?token|"
+    rb"bearer[_-]?token|client[_-]?secret|password|passwd|private[_-]?token|"
+    rb"secret[_-]?(?:key|token))['\"]?\s*[:=]\s*"
+    rb"['\"]?([^\s'\"#;,]{16,512})"
+)
+PLACEHOLDER_SECRET_MARKERS = (
+    b"${",
+    b"<",
+    b"changeme",
+    b"dummy",
+    b"example",
+    b"fake",
+    b"must-not-pass",
+    b"not-a-real",
+    b"parent-only",
+    b"placeholder",
+    b"redacted",
+)
+SENSITIVE_EXACT_PATHS = {
+    ".aws/credentials",
+    ".git-credentials",
+    ".netrc",
+    "service-account.json",
+    "service_account.json",
+}
+SENSITIVE_FILE_NAMES = {
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "id_rsa",
+}
+SENSITIVE_SUFFIXES = (".jks", ".keystore", ".p12", ".pfx")
+SAFE_ENV_SUFFIXES = (".example", ".sample", ".template")
 
 
 @dataclass(frozen=True)
@@ -128,6 +190,27 @@ def _frozen_command(
         "diff.external=",
         f"--git-dir={git_view}",
         *args,
+    )
+
+
+def _commit_uses_reserved_control_path(
+    *,
+    git_view: pathlib.Path,
+    object_directory: pathlib.Path,
+    commit: str,
+) -> bool:
+    result = run(
+        _frozen_command(
+            git_view=git_view,
+            args=("ls-tree", "-z", "--name-only", commit),
+        ),
+        env=_git_environment(object_directory=object_directory),
+        check=True,
+    )
+    return any(
+        os.fsdecode(name).casefold() == ".codex-review"
+        for name in result.stdout.split(b"\0")
+        if name
     )
 
 
@@ -465,6 +548,66 @@ def validate_external_workspace(review: ReviewWorkspace) -> None:
                 f"external review symlink escapes the frozen workspace: {candidate} -> {target}"
             )
 
+    sensitive_findings: list[str] = []
+    for candidate in review.workspace_root.rglob("*"):
+        if candidate.is_symlink() or not candidate.is_file():
+            continue
+        relative = candidate.relative_to(review.workspace_root).as_posix()
+        path_rule = _sensitive_path_rule(relative)
+        if path_rule:
+            sensitive_findings.append(f"{relative} ({path_rule})")
+            continue
+        secret_rule = _file_secret_rule(candidate)
+        if secret_rule:
+            sensitive_findings.append(f"{relative} ({secret_rule})")
+    if sensitive_findings:
+        summary = ", ".join(sensitive_findings[:10])
+        if len(sensitive_findings) > 10:
+            summary += f", and {len(sensitive_findings) - 10} more"
+        raise ReviewError(
+            "sensitive content preflight blocked external review; remove or narrow "
+            f"these paths before egress: {summary}"
+        )
+
+
+def _sensitive_path_rule(relative: str) -> str | None:
+    normalized = relative.casefold()
+    name = pathlib.PurePosixPath(normalized).name
+    if normalized in SENSITIVE_EXACT_PATHS or name in SENSITIVE_FILE_NAMES:
+        return "credential-path"
+    if name == ".env" or (
+        name.startswith(".env.")
+        and not any(name.endswith(suffix) for suffix in SAFE_ENV_SUFFIXES)
+    ):
+        return "environment-file"
+    if name.endswith(SENSITIVE_SUFFIXES):
+        return "credential-container"
+    return None
+
+
+def _file_secret_rule(path: pathlib.Path) -> str | None:
+    overlap = 4096
+    pending = b""
+    try:
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                value = pending + chunk
+                for rule, pattern in SECRET_PATTERNS:
+                    if pattern.search(value):
+                        return rule
+                for match in GENERIC_SECRET_ASSIGNMENT.finditer(value):
+                    candidate = match.group(1).lower()
+                    if not any(
+                        marker in candidate for marker in PLACEHOLDER_SECRET_MARKERS
+                    ):
+                        return "generic-secret-assignment"
+                pending = value[-overlap:]
+    except OSError as error:
+        raise ReviewError(
+            f"cannot scan external review content {path}: {error}"
+        ) from error
+    return None
+
 
 def prepare_workspace(
     *,
@@ -484,6 +627,15 @@ def prepare_workspace(
             source_root=source_root,
             container=container,
         )
+        for label, commit in (("base", base_sha), ("head", head_sha)):
+            if _commit_uses_reserved_control_path(
+                git_view=git_view,
+                object_directory=object_directory,
+                commit=commit,
+            ):
+                raise ReviewError(
+                    f"the frozen {label} uses the reserved top-level .codex-review path"
+                )
         _materialize_frozen_tree(
             git_view=git_view,
             object_directory=object_directory,

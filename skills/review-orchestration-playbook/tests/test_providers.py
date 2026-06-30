@@ -84,6 +84,39 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(
             providers.classify_failure(
                 "",
+                "Your account does not have access to this model",
+            ),
+            "entitlement",
+        )
+
+    def test_structured_model_access_code_is_fallback_eligible(self) -> None:
+        stdout = json.dumps(
+            {
+                "type": "error",
+                "error": {
+                    "code": "model_access_denied",
+                    "message": "request rejected",
+                },
+            }
+        )
+        self.assertEqual(providers.classify_failure(stdout, ""), "entitlement")
+
+    def test_ambiguous_model_not_found_without_access_context_does_not_fallback(
+        self,
+    ) -> None:
+        stdout = json.dumps(
+            {
+                "type": "error",
+                "error": {
+                    "type": "model_not_found",
+                    "message": "requested model identifier does not exist",
+                },
+            }
+        )
+        self.assertEqual(providers.classify_failure(stdout, ""), "other")
+        self.assertEqual(
+            providers.classify_failure(
+                "",
                 "This model is not supported with your ChatGPT account",
             ),
             "entitlement",
@@ -386,6 +419,55 @@ class ProviderPolicyTest(unittest.TestCase):
                 encoding="utf-8"
             ),
         )
+
+    @mock.patch.object(providers, "resolve_reviewer_executable")
+    def test_sensitive_content_blocks_external_reviewer_before_launch(
+        self,
+        resolve: mock.Mock,
+    ) -> None:
+        secret = "AKIA" + "A" * 16
+        (self.review.workspace_root / "secret.txt").write_text(
+            secret + "\n",
+            encoding="utf-8",
+        )
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            shim_source=SCRIPTS / "git_readonly_shim",
+            egress_consent="double-review",
+        )
+        self.assertEqual(outcome.returncode, 2)
+        resolve.assert_not_called()
+        self.assertFalse((self.review.container_dir / "egress.json").exists())
+        error = (self.review.container_dir / "runner-error.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("sensitive content preflight", error)
+        self.assertNotIn(secret, error)
+
+    @mock.patch.object(providers, "resolve_reviewer_executable")
+    def test_deleted_generic_token_in_diff_blocks_external_reviewer(
+        self,
+        resolve: mock.Mock,
+    ) -> None:
+        token = "z9Y8x7W6v5U4t3S2r1Q0p9O8n7M6"
+        self.review.diff_file.write_text(
+            "diff --git a/config b/config\n-AUTH_TOKEN=" + token + "\n",
+            encoding="utf-8",
+        )
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            shim_source=SCRIPTS / "git_readonly_shim",
+            egress_consent="double-review",
+        )
+        self.assertEqual(outcome.returncode, 2)
+        resolve.assert_not_called()
+        error = (self.review.container_dir / "runner-error.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("review.diff (generic-secret-assignment)", error)
+        self.assertNotIn(token, error)
 
     @mock.patch.object(
         providers,
