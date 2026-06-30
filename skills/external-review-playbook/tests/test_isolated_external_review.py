@@ -943,6 +943,15 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                     if item.strip()
                 }
                 if model in unavailable_models:
+                    if os.environ.get("FAKE_CODEX_UNAVAILABLE_JSON_STDOUT") == "1":
+                        print(
+                            json.dumps(
+                                {
+                                    "type": "error",
+                                    "message": f"model is not available: {model}",
+                                }
+                            )
+                        )
                     print(
                         f"model_not_found: model is not available: {model}",
                         file=sys.stderr,
@@ -4163,6 +4172,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
     def test_codex_review_falls_back_when_primary_model_is_unavailable(self) -> None:
         env = self._base_env()
         env["FAKE_CODEX_UNAVAILABLE_MODELS"] = "gpt-5.6-sol"
+        env["FAKE_CODEX_UNAVAILABLE_JSON_STDOUT"] = "1"
         repo, base, head = self._create_review_range_repo("codex-review-model-fallback")
         start = run(
             [
@@ -4212,9 +4222,49 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
             (state_dir / "stderr.log").read_text(encoding="utf-8"),
         )
         stdout_lines = (state_dir / "stdout.log").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(stdout_lines), 1, stdout_lines)
         payload = json.loads(stdout_lines[-1])["payload"]
         self.assertEqual(payload["model"], "gpt-5.5")
         self.assertIn('model_reasoning_effort="xhigh"', payload["exec_args"])
+        self.assertIn(
+            '"type": "error"',
+            (state_dir / "stderr.log").read_text(encoding="utf-8"),
+        )
+
+    def test_codex_review_one_shot_fallback_keeps_stdout_to_fallback_json(self) -> None:
+        env = self._base_env()
+        env["FAKE_CODEX_UNAVAILABLE_MODELS"] = "gpt-5.6-sol"
+        env["FAKE_CODEX_UNAVAILABLE_JSON_STDOUT"] = "1"
+        repo, base, head = self._create_review_range_repo(
+            "codex-review-one-shot-model-fallback"
+        )
+
+        completed = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--repo",
+                str(repo),
+                "--entrypoint",
+                "codex-review",
+                "--base-ref",
+                base,
+                "--head-ref",
+                head,
+            ],
+            env=env,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        stdout_lines = completed.stdout.splitlines()
+        self.assertEqual(len(stdout_lines), 1, stdout_lines)
+        payload = json.loads(stdout_lines[0])["payload"]
+        self.assertEqual(payload["model"], "gpt-5.5")
+        self.assertIn('"type": "error"', completed.stderr)
+        self.assertIn(
+            "codex model fallback: gpt-5.6-sol -> gpt-5.5 (reasoning xhigh)",
+            completed.stderr,
+        )
 
     def test_codex_review_rejects_large_builtin_prompt_scope(self) -> None:
         env = self._base_env()
@@ -9229,6 +9279,65 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                 mock.call(module.signal.SIGHUP, module.signal.SIG_DFL),
                 signal_mock.mock_calls,
             )
+
+    def test_streaming_codex_attempt_preserves_forwarded_quit_signal(self) -> None:
+        if os.name != "posix" or not hasattr(signal, "SIGQUIT"):
+            self.skipTest("POSIX SIGQUIT process-group signaling is required")
+        module = self._load_script_module()
+        installed_handlers: dict[object, object] = {}
+        target_signal = module.signal.SIGQUIT
+
+        def set_signal(sig: object, handler: object) -> object:
+            if callable(handler):
+                installed_handlers[sig] = handler
+            return module.signal.SIG_DFL
+
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.pid = 4243
+                self.stdin = None
+                self.stdout = io.BytesIO()
+                self.stderr = io.BytesIO()
+                self.signal_sent = False
+                self.wait_calls: list[float | None] = []
+
+            def poll(self) -> None:
+                return None
+
+            def wait(self, timeout: float | None = None) -> int:
+                self.wait_calls.append(timeout)
+                if timeout is None and not self.signal_sent:
+                    self.signal_sent = True
+                    handler = installed_handlers[target_signal]
+                    assert callable(handler)
+                    handler(int(target_signal), None)
+                return -int(target_signal)
+
+        process = FakeProcess()
+        with mock.patch.object(module.subprocess, "Popen", return_value=process):
+            with mock.patch.object(module.signal, "getsignal", return_value=module.signal.SIG_DFL):
+                with mock.patch.object(module.signal, "signal", side_effect=set_signal):
+                    with mock.patch.object(module.os, "killpg") as killpg_mock:
+                        with self.assertRaises(SystemExit) as raised:
+                            module._run_streaming_codex_attempt(
+                                command=["fake-codex"],
+                                workspace_root=self.repo,
+                                child_env=os.environ.copy(),
+                                stdin_bytes=None,
+                            )
+
+        self.assertEqual(raised.exception.code, 128 + int(target_signal))
+        self.assertEqual(
+            killpg_mock.mock_calls,
+            [
+                mock.call(process.pid, target_signal),
+                mock.call(process.pid, target_signal),
+            ],
+        )
+        self.assertEqual(
+            process.wait_calls,
+            [None, module.CODEX_STREAMING_TERM_GRACE_SECONDS],
+        )
 
 
     def test_apply_codex_readonly_defaults_injects_linux_landlock_flags(self) -> None:

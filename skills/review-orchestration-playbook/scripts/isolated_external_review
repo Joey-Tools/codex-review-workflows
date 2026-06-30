@@ -5897,9 +5897,11 @@ def _run_streaming_codex_attempt(
     )
     previous_signal_handlers: dict[signal.Signals, object] = {}
     if os.name == "posix" and threading.current_thread() is threading.main_thread():
-        forwarded_signals = [signal.SIGTERM]
-        if hasattr(signal, "SIGHUP"):
-            forwarded_signals.append(signal.SIGHUP)
+        forwarded_signals = [signal.SIGTERM, signal.SIGINT]
+        for optional_signal_name in ("SIGHUP", "SIGQUIT"):
+            optional_signal = getattr(signal, optional_signal_name, None)
+            if optional_signal is not None and optional_signal not in forwarded_signals:
+                forwarded_signals.append(optional_signal)
         for forwarded in forwarded_signals:
             previous_signal_handlers[forwarded] = signal.getsignal(forwarded)
             signal.signal(forwarded, forward_signal)
@@ -5938,9 +5940,14 @@ def _run_streaming_codex_attempt(
                     except (BrokenPipeError, OSError, ValueError):
                         pass
             returncode = process.wait()
-        except BaseException:
+        except BaseException as error:
             if process.poll() is None:
-                signal_process_group(signal.SIGTERM)
+                cleanup_signal = (
+                    error.signum
+                    if isinstance(error, ForwardedSignal)
+                    else signal.SIGTERM
+                )
+                signal_process_group(cleanup_signal)
                 try:
                     process.wait(timeout=CODEX_STREAMING_TERM_GRACE_SECONDS)
                 except subprocess.TimeoutExpired:
@@ -6029,45 +6036,36 @@ def _run_prepared_review(prepared: dict[str, object]) -> int:
             primary_model = str(prepared["codex_primary_model"])
             fallback_model = str(prepared["codex_fallback_model"])
             reasoning_effort = str(prepared["codex_reasoning_effort"])
+            completed, stdout_path, stderr_path = _run_captured_codex_attempt(
+                command=command,
+                workspace_root=pathlib.Path(str(workspace_root)),
+                child_env=child_env,
+                stdin_bytes=prepared["stdin_bytes"],
+                container_dir=pathlib.Path(str(prepared["container_dir"])),
+                attempt="primary",
+            )
+            child_returncode = completed.returncode
+            should_fallback = (
+                child_returncode != 0
+                and _codex_model_fallback_error(
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                    primary_model=primary_model,
+                    fallback_model=fallback_model,
+                )
+            )
             if entrypoint_label == "codex-review":
-                (
-                    child_returncode,
-                    _stdout_tail,
-                    stderr_tail,
-                ) = _run_streaming_codex_attempt(
-                    command=command,
-                    workspace_root=pathlib.Path(str(workspace_root)),
-                    child_env=child_env,
-                    stdin_bytes=prepared["stdin_bytes"],
-                )
-                should_fallback = (
-                    child_returncode != 0
-                    and _codex_model_fallback_error_output(
-                        stdout_tail=_stdout_tail,
-                        stderr_tail=stderr_tail,
-                        primary_model=primary_model,
-                        fallback_model=fallback_model,
-                    )
-                )
+                if should_fallback:
+                    if stdout_path.stat().st_size:
+                        print(
+                            "codex primary attempt stdout (fallback diagnostic):",
+                            file=sys.stderr,
+                        )
+                        _emit_binary_file(stdout_path, sys.stderr)
+                else:
+                    _emit_binary_file(stdout_path, sys.stdout)
+                _emit_binary_file(stderr_path, sys.stderr)
             else:
-                completed, stdout_path, stderr_path = _run_captured_codex_attempt(
-                    command=command,
-                    workspace_root=pathlib.Path(str(workspace_root)),
-                    child_env=child_env,
-                    stdin_bytes=prepared["stdin_bytes"],
-                    container_dir=pathlib.Path(str(prepared["container_dir"])),
-                    attempt="primary",
-                )
-                child_returncode = completed.returncode
-                should_fallback = (
-                    child_returncode != 0
-                    and _codex_model_fallback_error(
-                        stdout_path=stdout_path,
-                        stderr_path=stderr_path,
-                        primary_model=primary_model,
-                        fallback_model=fallback_model,
-                    )
-                )
                 if child_returncode != 0 and not should_fallback:
                     _emit_binary_file(stdout_path, sys.stdout)
                 if child_returncode != 0:
@@ -6402,6 +6400,17 @@ def _run_child_from_spec(spec_path: pathlib.Path, *, expected_sha256: str) -> in
                             reasoning_effort = str(
                                 spec.get("codex_reasoning_effort") or ""
                             )
+                            primary_stdout = stdout_path.read_bytes()
+                            if primary_stdout:
+                                stderr_handle.write(
+                                    b"codex primary attempt stdout (fallback diagnostic):\n"
+                                )
+                                stderr_handle.write(primary_stdout)
+                                if not primary_stdout.endswith(b"\n"):
+                                    stderr_handle.write(b"\n")
+                            stdout_handle.seek(0)
+                            stdout_handle.truncate(0)
+                            stdout_handle.flush()
                             stderr_handle.write(
                                 (
                                     "codex model fallback: "
