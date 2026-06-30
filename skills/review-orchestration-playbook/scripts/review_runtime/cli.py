@@ -87,6 +87,8 @@ def _run_foreground(args: argparse.Namespace, *, script_path: pathlib.Path) -> i
         head_ref=args.head_ref,
         prompt_override=pathlib.Path(args.prompt_file) if args.prompt_file else None,
     )
+    returncode = 1
+    cleanup_error: str | None = None
     try:
         outcome = run_review(
             review=review,
@@ -108,14 +110,21 @@ def _run_foreground(args: argparse.Namespace, *, script_path: pathlib.Path) -> i
                 f"review failed; evidence retained at {review.container_dir}",
                 file=sys.stderr,
             )
-        return outcome.returncode
+        returncode = outcome.returncode
     finally:
         if args.keep_workspace:
             print(f"kept review workspace: {review.container_dir}", file=sys.stderr)
         elif (review.container_dir / "final.txt").is_file():
-            cleanup_workspace(review, keep_container=False)
+            cleanup_error = cleanup_workspace(review, keep_container=False)
         else:
-            cleanup_workspace(review, keep_container=True)
+            cleanup_error = cleanup_workspace(review, keep_container=True)
+        if cleanup_error:
+            print(
+                f"review cleanup failed; evidence retained at {review.container_dir}: "
+                f"{cleanup_error}",
+                file=sys.stderr,
+            )
+    return 1 if cleanup_error and returncode == 0 else returncode
 
 
 def _run_stateful(argv: list[str], *, script_path: pathlib.Path) -> int:

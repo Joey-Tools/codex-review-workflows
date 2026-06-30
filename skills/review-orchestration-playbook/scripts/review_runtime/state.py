@@ -222,6 +222,7 @@ def status(state_dir: pathlib.Path) -> dict[str, Any]:
         "stdout_tail": tail_text(state_dir / "runner.stdout.log"),
         "stderr_tail": tail_text(state_dir / "runner.stderr.log"),
         "runner_error": tail_text(state_dir / "runner-error.txt"),
+        "cleanup_error": tail_text(state_dir / "cleanup-error.txt"),
     }
 
 
@@ -245,6 +246,9 @@ def wait(
         cleanup_error = cleanup_workspace(review, keep_container=True)
         if cleanup_error:
             write_text_atomic(state_dir / "cleanup-error.txt", cleanup_error + "\n")
+            return 1
+    if (state_dir / "cleanup-error.txt").is_file():
+        return 1
     exit_code = _read_exit_code(state_dir)
     return 1 if exit_code is None else exit_code
 
@@ -253,7 +257,10 @@ def final(state_dir: pathlib.Path) -> tuple[int, str]:
     summary = status(state_dir)
     if summary["running"]:
         return 3, "review is still running"
-    wait(state_dir, timeout_seconds=0)
+    wait_code = wait(state_dir, timeout_seconds=0)
+    cleanup_error = tail_text(state_dir.expanduser().resolve() / "cleanup-error.txt")
+    if cleanup_error:
+        return 1, f"review completed but workspace cleanup failed: {cleanup_error}"
     exit_code = summary["exit_code"]
     final_path = state_dir.expanduser().resolve() / "final.txt"
     if exit_code == 0 and final_path.is_file():
@@ -265,4 +272,4 @@ def final(state_dir: pathlib.Path) -> tuple[int, str]:
         or summary.get("stderr_tail")
         or "review failed without a final artifact"
     )
-    return int(exit_code or 1), str(details)
+    return int(wait_code or exit_code or 1), str(details)

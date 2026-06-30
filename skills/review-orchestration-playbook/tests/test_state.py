@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
@@ -139,6 +140,17 @@ state_dir = Path(sys.argv[sys.argv.index("--state-dir") + 1])
         self.assertEqual(exit_code, 0)
         self.assertEqual(text, "No findings.")
         self.assertFalse((state_dir / "workspace").exists())
+
+    def test_final_reports_cleanup_failure_instead_of_clean_result(self) -> None:
+        self.write_completed_state()
+        with mock.patch.object(
+            state,
+            "cleanup_workspace",
+            return_value="cannot remove worktree",
+        ):
+            exit_code, text = state.final(self.review.container_dir)
+        self.assertEqual(exit_code, 1)
+        self.assertIn("cleanup failed", text)
 
 
 if __name__ == "__main__":

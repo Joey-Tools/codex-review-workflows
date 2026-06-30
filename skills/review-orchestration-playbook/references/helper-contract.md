@@ -55,6 +55,8 @@ The Claude-family lane requires one of `--egress-consent explicit-claude-review`
 
 Capacity, overload, rate limits, timeouts, network/5xx errors, missing artifacts, silent model substitution, and review findings never trigger a model downgrade. The helper records every attempt and reports transient failures without switching models.
 
+Fallback classification uses stderr plus explicit structured CLI error events only. Reviewer tool output and repository text on stdout are never scanned for entitlement or transient substrings.
+
 ## Snapshot And Safety
 
 - The helper requires `--base-ref` and `--head-ref` and resolves both to commits before launch.
@@ -62,7 +64,7 @@ Capacity, overload, rate limits, timeouts, network/5xx errors, missing artifacts
 - Initialized submodules are materialized without fetching. Missing local objects block the lane instead of causing hidden network access.
 - Every reviewer receives the same bounded findings-only prompt and primary diff file inside a helper-owned `.codex-review/` directory in the detached worktree.
 - The helper installs the fixed `git_readonly_shim`, passes the real Git path separately, and executes the reviewer inside the detached workspace.
-- Every child receives a runtime-specific minimal environment allowlist instead of the parent's complete environment.
+- Every child receives a runtime-specific minimal environment allowlist instead of the parent's complete environment. Claude and Copilot authentication variables are never present in each other's process. Codex may receive `OPENAI_API_KEY` for headless authentication, but model-proposed shell commands cannot inherit it.
 - Codex runs with a custom permission profile: only platform-minimal paths and the frozen workspace are readable; `.git`, `.codex`, `.agents`, and environment-file globs are denied; network and writes are unavailable. It ignores user config and execpolicy rules, uses `approval_policy=never`, and gives model-proposed shell commands a fresh environment with an empty helper-owned `HOME`.
 - Claude Code runs in safe mode with `dontAsk` permissions and only `Read`, `Grep`, and `Glob`; no additional directory is allowed, so its permission root is the frozen workspace. Explicit deny rules cover common credential/config homes. Slash commands, Chrome integration, inherited MCP configuration, repository/user setting sources, and nonessential traffic are disabled.
 - Copilot runs in plan mode with its built-in current-working-directory path boundary, explicit shell/write denial, temp-directory denial, and disabled custom instructions, built-in MCPs, bash environment loading, experimental features, and remote session export. Secret-like auth variables are withheld from its tools.
@@ -76,6 +78,7 @@ Capacity, overload, rate limits, timeouts, network/5xx errors, missing artifacts
 - exit `75`: transient/capacity failure; retry only the same runtime/model if the parent policy permits
 - other nonzero: blocked or failed; inspect `stateful status`, `attempts.json`, and bounded logs
 - `stateful final` prints only the saved terminal artifact on success
+- workspace cleanup failure is terminal nonzero even when the reviewer produced a clean artifact; the error and retained state directory remain visible for recovery
 
 Each attempt records runtime, requested/effective model, requested/effective effort when observable, category, exit status, and log paths. For Codex, the helper resolves the emitted thread ID to its persisted rollout and requires matching `turn_context` model and effort before accepting the final artifact. Missing verification is `runtime-unverified`; mismatches stop the lane. Neither condition is entitlement evidence, so neither enters the fallback path.
 

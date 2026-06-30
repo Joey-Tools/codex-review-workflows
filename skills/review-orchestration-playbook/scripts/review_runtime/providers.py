@@ -29,12 +29,14 @@ CLAUDE_EGRESS_CONSENTS = (
     "double-review",
     "triple-review",
 )
-CODEX_ENV_KEYS = ("CODEX_HOME",)
-CLAUDE_FAMILY_ENV_KEYS = (
+CODEX_ENV_KEYS = ("CODEX_HOME", "OPENAI_API_KEY")
+CLAUDE_ENV_KEYS = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CLAUDE_CONFIG_DIR",
+)
+COPILOT_ENV_KEYS = (
     "COPILOT_GITHUB_TOKEN",
     "COPILOT_HOME",
     "GH_TOKEN",
@@ -124,6 +126,29 @@ class Outcome:
     attempts: tuple[Attempt, ...]
 
 
+def _review_environment(
+    *,
+    review: ReviewWorkspace,
+    shim_source: pathlib.Path,
+    passthrough_keys: Iterable[str],
+    extra: dict[str, str] | None = None,
+) -> dict[str, str]:
+    review_values = {
+        "CODEX_ISOLATED_REVIEW_ROOT": str(review.workspace_root),
+        "CODEX_ISOLATED_REVIEW_DIFF_FILE": str(review.diff_file),
+        "CODEX_ISOLATED_REVIEW_PROMPT_FILE": str(review.prompt_file),
+        "CODEX_ISOLATED_REVIEW_RANGE": f"{review.base_ref}..{review.head_ref}",
+    }
+    if extra:
+        review_values.update(extra)
+    return child_environment(
+        container_dir=review.container_dir,
+        shim_source=shim_source,
+        passthrough_keys=passthrough_keys,
+        extra=review_values,
+    )
+
+
 def classify_failure(stdout: bytes | str, stderr: bytes | str) -> str:
     def decode(value: bytes | str) -> str:
         return (
@@ -132,7 +157,8 @@ def classify_failure(stdout: bytes | str, stderr: bytes | str) -> str:
             else value
         )
 
-    message = f"{decode(stderr)}\n{decode(stdout)}".lower()
+    stdout_bytes = stdout.encode() if isinstance(stdout, str) else stdout
+    message = f"{decode(stderr)}\n{_structured_error_text(stdout_bytes)}".lower()
     if any(fragment in message for fragment in TRANSIENT_FAILURE_FRAGMENTS):
         return "transient"
     if any(fragment in message for fragment in AUTH_FAILURE_FRAGMENTS):
@@ -172,6 +198,52 @@ def _json_objects(stdout: bytes) -> list[dict[str, Any]]:
         if isinstance(parsed_line, dict):
             values.append(parsed_line)
     return values
+
+
+def _error_payload_text(value: Any) -> list[str]:
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    if isinstance(value, dict):
+        result: list[str] = []
+        for item in value.values():
+            result.extend(_error_payload_text(item))
+        return result
+    if isinstance(value, list):
+        result = []
+        for item in value:
+            result.extend(_error_payload_text(item))
+        return result
+    return []
+
+
+def _structured_error_text(stdout: bytes) -> str:
+    messages: list[str] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, list):
+            for item in value:
+                visit(item)
+            return
+        if not isinstance(value, dict):
+            return
+        node_type = value.get("type")
+        type_text = node_type.lower() if isinstance(node_type, str) else ""
+        explicit_error = value.get("is_error") is True or any(
+            marker in type_text for marker in ("error", "failed", "failure")
+        )
+        if "error" in value:
+            messages.extend(_error_payload_text(value["error"]))
+        if explicit_error:
+            for key in ("message", "result", "reason", "detail", "data"):
+                if key in value:
+                    messages.extend(_error_payload_text(value[key]))
+        for key in ("item", "data", "result"):
+            if key in value and isinstance(value[key], (dict, list)):
+                visit(value[key])
+
+    for item in _json_objects(stdout):
+        visit(item)
+    return "\n".join(messages)
 
 
 def _find_text(value: Any) -> str | None:
@@ -733,27 +805,14 @@ def run_review(
         )
         return Outcome(2, None, tuple())
 
-    env = child_environment(
-        container_dir=review.container_dir,
-        shim_source=shim_source,
-        passthrough_keys=(
-            CODEX_ENV_KEYS if reviewer == "codex" else CLAUDE_FAMILY_ENV_KEYS
-        ),
-        extra={
-            "CODEX_ISOLATED_REVIEW_ROOT": str(review.workspace_root),
-            "CODEX_ISOLATED_REVIEW_DIFF_FILE": str(review.diff_file),
-            "CODEX_ISOLATED_REVIEW_PROMPT_FILE": str(review.prompt_file),
-            "CODEX_ISOLATED_REVIEW_RANGE": f"{review.base_ref}..{review.head_ref}",
-            **(
-                {"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}
-                if reviewer == "claude"
-                else {}
-            ),
-        },
-    )
     attempts: list[Attempt] = []
 
     if reviewer == "codex":
+        env = _review_environment(
+            review=review,
+            shim_source=shim_source,
+            passthrough_keys=CODEX_ENV_KEYS,
+        )
         try:
             _, final_text = _run_model_chain(
                 review=review,
@@ -780,11 +839,17 @@ def run_review(
         is not None
     )
     if claude_available:
+        claude_env = _review_environment(
+            review=review,
+            shim_source=shim_source,
+            passthrough_keys=CLAUDE_ENV_KEYS,
+            extra={"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"},
+        )
         category, final_text = _run_model_chain(
             review=review,
             models=CLAUDE_MODELS,
             runner=_claude_attempt,
-            env=env,
+            env=claude_env,
             attempts=attempts,
         )
         if final_text:
@@ -804,11 +869,16 @@ def run_review(
             "Claude Code was unavailable or lacked model entitlement, and Copilot CLI is unavailable.\n",
         )
         return _finish(review, attempts, None)
+    copilot_env = _review_environment(
+        review=review,
+        shim_source=shim_source,
+        passthrough_keys=COPILOT_ENV_KEYS,
+    )
     _, final_text = _run_model_chain(
         review=review,
         models=COPILOT_MODELS,
         runner=_copilot_attempt,
-        env=env,
+        env=copilot_env,
         attempts=attempts,
     )
     return _finish(review, attempts, final_text)

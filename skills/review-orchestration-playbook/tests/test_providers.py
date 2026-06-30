@@ -99,6 +99,29 @@ class ProviderPolicyTest(unittest.TestCase):
             "auth",
         )
 
+    def test_repository_text_in_structured_tool_output_cannot_trigger_fallback(
+        self,
+    ) -> None:
+        stdout = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "aggregated_output": "not available for your account; timeout",
+                },
+            }
+        )
+        self.assertEqual(providers.classify_failure(stdout, "review failed"), "other")
+
+    def test_structured_error_event_can_trigger_entitlement_fallback(self) -> None:
+        stdout = json.dumps(
+            {
+                "type": "turn.failed",
+                "error": {"message": "Model is not available for your account"},
+            }
+        )
+        self.assertEqual(providers.classify_failure(stdout, ""), "entitlement")
+
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(providers, "_codex_attempt")
     def test_codex_falls_back_from_56_to_55_only_on_entitlement(
@@ -119,6 +142,10 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(
             [item.requested_model for item in outcome.attempts],
             list(providers.CODEX_MODELS),
+        )
+        self.assertEqual(
+            _environment.call_args.kwargs["passthrough_keys"],
+            providers.CODEX_ENV_KEYS,
         )
 
     @mock.patch.object(providers, "child_environment", return_value={})
@@ -178,6 +205,10 @@ class ProviderPolicyTest(unittest.TestCase):
                 ("copilot", "claude-opus-4.8"),
                 ("copilot", "claude-opus-4.7"),
             ],
+        )
+        self.assertEqual(
+            [call.kwargs["passthrough_keys"] for call in _environment.call_args_list],
+            [providers.CLAUDE_ENV_KEYS, providers.COPILOT_ENV_KEYS],
         )
 
     @mock.patch.object(providers, "child_environment", return_value={})
@@ -341,7 +372,10 @@ class ProviderPolicyTest(unittest.TestCase):
             review=self.review,
             model="gpt-5.6-sol",
             index=1,
-            env={"CODEX_HOME": str(codex_home)},
+            env={
+                "CODEX_HOME": str(codex_home),
+                "OPENAI_API_KEY": "parent-only-secret",
+            },
         )
         argv = run_command.call_args.args[0]
         self.assertIn("gpt-5.6-sol", argv)
@@ -358,6 +392,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertTrue(
             any("shell_environment_policy.set" in value for value in configs)
         )
+        self.assertNotIn("parent-only-secret", "\n".join(configs))
         self.assertIn("--ignore-user-config", argv)
         self.assertIn("--ignore-rules", argv)
         self.assertIn("--strict-config", argv)
