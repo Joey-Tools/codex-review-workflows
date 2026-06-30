@@ -6,7 +6,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass
 
-from .common import ReviewError, resolve_git, run, write_text_atomic
+from .common import ReviewError, is_relative_to, resolve_git, run, write_text_atomic
 from .prompt import build_review_prompt
 
 
@@ -89,6 +89,22 @@ def validate_workspace_layout(review: ReviewWorkspace) -> None:
         raise ReviewError(
             f"review prompt escapes its control directory: {review.prompt_file}"
         )
+
+
+def validate_external_workspace(review: ReviewWorkspace) -> None:
+    validate_workspace_layout(review)
+    workspace_root = review.workspace_root.resolve(strict=True)
+    for candidate in review.workspace_root.rglob("*"):
+        if not candidate.is_symlink():
+            continue
+        try:
+            target = candidate.resolve(strict=False)
+        except RuntimeError as error:
+            raise ReviewError(f"external review symlink loop: {candidate}") from error
+        if not is_relative_to(target, workspace_root):
+            raise ReviewError(
+                f"external review symlink escapes the frozen workspace: {candidate} -> {target}"
+            )
 
 
 def prepare_workspace(

@@ -20,15 +20,18 @@ class ProviderPolicyTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         root = pathlib.Path(self.temporary.name)
-        workspace = root / "workspace"
-        workspace.mkdir()
-        diff_file = root / "review.diff"
+        source_root = root / "source"
+        container = source_root / ".codex-tmp" / "isolated-review-test"
+        workspace = container / "workspace"
+        control = workspace / ".codex-review"
+        control.mkdir(parents=True)
+        diff_file = control / "review.diff"
         diff_file.write_text("diff --git a/a b/a\n", encoding="utf-8")
-        prompt_file = root / "review.prompt"
+        prompt_file = control / "review.prompt"
         prompt_file.write_text("Review this diff.\n", encoding="utf-8")
         self.review = ReviewWorkspace(
-            source_root=root,
-            container_dir=root,
+            source_root=source_root,
+            container_dir=container,
             workspace_root=workspace,
             base_ref="a" * 40,
             head_ref="b" * 40,
@@ -47,10 +50,13 @@ class ProviderPolicyTest(unittest.TestCase):
         *,
         final_text: str | None = None,
     ) -> providers.Attempt:
+        effort = "xhigh" if runtime == "codex" else "max"
         return providers.Attempt(
             runtime=runtime,
             requested_model=model,
             effective_model=model if final_text else None,
+            requested_effort=effort,
+            effective_effort=effort if final_text else None,
             returncode=0 if final_text else 1,
             category=category,
             final_text=final_text,
@@ -245,8 +251,33 @@ class ProviderPolicyTest(unittest.TestCase):
             completed=completed,
             final_text="No findings.",
             effective_model="claude-opus-4-7",
+            requested_effort="max",
+            effective_effort=None,
         )
         self.assertEqual(attempt.category, "model-mismatch")
+        self.assertIsNone(attempt.final_text)
+
+    def test_success_without_verified_runtime_metadata_is_not_accepted(self) -> None:
+        completed = Completed(
+            argv=("codex",),
+            returncode=0,
+            stdout=b'{"type":"thread.started","thread_id":"missing"}\n',
+            stderr=b"",
+        )
+        attempt = providers._record_attempt(
+            review=self.review,
+            index=1,
+            runtime="codex",
+            model="gpt-5.6-sol",
+            completed=completed,
+            final_text="No findings.",
+            effective_model=None,
+            requested_effort="xhigh",
+            effective_effort=None,
+            require_verified_model=True,
+            require_verified_effort=True,
+        )
+        self.assertEqual(attempt.category, "runtime-unverified")
         self.assertIsNone(attempt.final_text)
 
     @mock.patch.object(providers, "child_environment", return_value={})
@@ -276,20 +307,66 @@ class ProviderPolicyTest(unittest.TestCase):
         run_command: mock.Mock,
         _resolve: mock.Mock,
     ) -> None:
+        thread_id = "019f18a6-ed56-7ff3-af51-08703a6d225a"
+        codex_home = pathlib.Path(self.temporary.name) / "codex-home"
+        rollout = (
+            codex_home
+            / "sessions/2026/06/30"
+            / f"rollout-2026-06-30T21-10-20-{thread_id}.jsonl"
+        )
+        rollout.parent.mkdir(parents=True)
+        rollout.write_text(
+            json.dumps(
+                {
+                    "type": "turn_context",
+                    "payload": {"model": "gpt-5.6-sol", "effort": "xhigh"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
         def complete(argv, **_kwargs):
             argv = tuple(argv)
             final_path = pathlib.Path(argv[argv.index("-o") + 1])
             final_path.parent.mkdir(parents=True, exist_ok=True)
             final_path.write_text("No findings.\n", encoding="utf-8")
-            return Completed(argv=argv, returncode=0, stdout=b"", stderr=b"")
+            stdout = json.dumps(
+                {"type": "thread.started", "thread_id": thread_id}
+            ).encode()
+            return Completed(argv=argv, returncode=0, stdout=stdout, stderr=b"")
 
         run_command.side_effect = complete
-        providers._codex_attempt(
-            review=self.review, model="gpt-5.6-sol", index=1, env={}
+        attempt = providers._codex_attempt(
+            review=self.review,
+            model="gpt-5.6-sol",
+            index=1,
+            env={"CODEX_HOME": str(codex_home)},
         )
         argv = run_command.call_args.args[0]
         self.assertIn("gpt-5.6-sol", argv)
         self.assertIn('model_reasoning_effort="xhigh"', argv)
+        configs = [argv[index + 1] for index, value in enumerate(argv) if value == "-c"]
+        self.assertIn('approval_policy="never"', configs)
+        self.assertIn('default_permissions="isolated_review"', configs)
+        self.assertTrue(
+            any("permissions.isolated_review.filesystem" in value for value in configs)
+        )
+        self.assertTrue(
+            any("shell_environment_policy.inherit" in value for value in configs)
+        )
+        self.assertTrue(
+            any("shell_environment_policy.set" in value for value in configs)
+        )
+        self.assertIn("--ignore-user-config", argv)
+        self.assertIn("--ignore-rules", argv)
+        self.assertIn("--strict-config", argv)
+        self.assertNotIn("-s", argv)
+        final_path = pathlib.Path(argv[argv.index("-o") + 1])
+        self.assertTrue(final_path.parent.is_dir())
+        self.assertEqual(attempt.effective_model, "gpt-5.6-sol")
+        self.assertEqual(attempt.effective_effort, "xhigh")
+        self.assertEqual(attempt.category, "success")
 
     @mock.patch.object(
         providers, "resolve_executable", return_value=pathlib.Path("/bin/claude")
@@ -316,7 +393,11 @@ class ProviderPolicyTest(unittest.TestCase):
         argv = run_command.call_args.args[0]
         self.assertIn("claude-opus-4-8", argv)
         self.assertEqual(argv[argv.index("--effort") + 1], "max")
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "dontAsk")
         self.assertEqual(argv[argv.index("--tools") + 1], "Read,Grep,Glob")
+        settings = json.loads(argv[argv.index("--settings") + 1])
+        self.assertIn("Read(~/.ssh/**)", settings["permissions"]["deny"])
+        self.assertIn("--safe-mode", argv)
         self.assertIn("--strict-mcp-config", argv)
 
     @mock.patch.object(
@@ -347,6 +428,10 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("--mode") + 1], "plan")
         self.assertIn("--disable-builtin-mcps", argv)
         self.assertIn("--no-custom-instructions", argv)
+        self.assertIn("--deny-tool=write", argv)
+        self.assertIn("--deny-tool=shell", argv)
+        self.assertIn("--disallow-temp-dir", argv)
+        self.assertIn("--no-auto-update", argv)
         self.assertIn("--secret-env-vars=GH_TOKEN", argv)
 
 

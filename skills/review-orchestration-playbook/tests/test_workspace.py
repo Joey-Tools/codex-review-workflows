@@ -11,7 +11,11 @@ SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from review_runtime.common import ReviewError  # noqa: E402
-from review_runtime.workspace import cleanup_workspace, prepare_workspace  # noqa: E402
+from review_runtime.workspace import (  # noqa: E402
+    cleanup_workspace,
+    prepare_workspace,
+    validate_external_workspace,
+)
 
 
 def git(repo: pathlib.Path, *args: str) -> str:
@@ -107,6 +111,17 @@ class WorkspaceTest(unittest.TestCase):
             )
         review_root = self.repo / ".codex-tmp"
         self.assertFalse(review_root.exists())
+
+    def test_external_workspace_rejects_symlinks_that_escape_frozen_root(self) -> None:
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(review)
+        (review.workspace_root / "escape").symlink_to(self.repo / "example.txt")
+        with self.assertRaises(ReviewError):
+            validate_external_workspace(review)
 
 
 if __name__ == "__main__":

@@ -8,13 +8,14 @@ from typing import Any, Callable, Iterable
 
 from .common import (
     Completed,
+    ReviewError,
     child_environment,
     resolve_executable,
     run,
     write_json,
     write_text_atomic,
 )
-from .workspace import ReviewWorkspace
+from .workspace import ReviewWorkspace, validate_external_workspace
 
 
 CODEX_MODELS = ("gpt-5.6-sol", "gpt-5.5")
@@ -27,6 +28,17 @@ CLAUDE_EGRESS_CONSENTS = (
     "explicit-claude-review",
     "double-review",
     "triple-review",
+)
+CODEX_ENV_KEYS = ("CODEX_HOME",)
+CLAUDE_FAMILY_ENV_KEYS = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CONFIG_DIR",
+    "COPILOT_GITHUB_TOKEN",
+    "COPILOT_HOME",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
 )
 
 TRANSIENT_FAILURE_FRAGMENTS = (
@@ -96,6 +108,8 @@ class Attempt:
     runtime: str
     requested_model: str
     effective_model: str | None
+    requested_effort: str
+    effective_effort: str | None
     returncode: int
     category: str
     final_text: str | None
@@ -223,6 +237,64 @@ def _parse_structured_output(stdout: bytes) -> tuple[str | None, str | None]:
     return final_text, effective_model
 
 
+def _codex_thread_id(stdout: bytes) -> str | None:
+    for item in _json_objects(stdout):
+        if item.get("type") != "thread.started":
+            continue
+        thread_id = item.get("thread_id")
+        if isinstance(thread_id, str) and thread_id:
+            return thread_id
+    return None
+
+
+def _codex_session_metadata(
+    stdout: bytes,
+    env: dict[str, str],
+) -> tuple[str | None, str | None]:
+    thread_id = _codex_thread_id(stdout)
+    if thread_id is None:
+        return None, None
+    codex_home_value = env.get("CODEX_HOME")
+    if codex_home_value:
+        codex_home = pathlib.Path(codex_home_value).expanduser()
+    else:
+        home_value = env.get("HOME")
+        if not home_value:
+            return None, None
+        codex_home = pathlib.Path(home_value).expanduser() / ".codex"
+    sessions_root = codex_home / "sessions"
+    try:
+        candidates = sorted(
+            sessions_root.glob(f"*/*/*/rollout-*-{thread_id}.jsonl"),
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True,
+        )
+    except OSError:
+        return None, None
+    for candidate in candidates:
+        try:
+            with candidate.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(item, dict) or item.get("type") != "turn_context":
+                        continue
+                    payload = item.get("payload")
+                    if not isinstance(payload, dict):
+                        continue
+                    model = payload.get("model")
+                    effort = payload.get("effort")
+                    return (
+                        model if isinstance(model, str) and model else None,
+                        effort if isinstance(effort, str) and effort else None,
+                    )
+        except OSError:
+            continue
+    return None, None
+
+
 def _attempt_paths(
     review: ReviewWorkspace, index: int, runtime: str, model: str
 ) -> tuple[pathlib.Path, pathlib.Path]:
@@ -241,6 +313,10 @@ def _record_attempt(
     completed: Completed,
     final_text: str | None,
     effective_model: str | None,
+    requested_effort: str,
+    effective_effort: str | None,
+    require_verified_model: bool = False,
+    require_verified_effort: bool = False,
 ) -> Attempt:
     stdout_path, stderr_path = _attempt_paths(review, index, runtime, model)
     stdout_path.write_bytes(completed.stdout)
@@ -254,12 +330,32 @@ def _record_attempt(
         runtime=runtime,
         requested_model=model,
         effective_model=effective_model,
+        requested_effort=requested_effort,
+        effective_effort=effective_effort,
         returncode=completed.returncode,
         category=category,
         final_text=final_text,
         stdout_path=str(stdout_path),
         stderr_path=str(stderr_path),
     )
+    if attempt.category == "success" and (
+        (require_verified_model and effective_model is None)
+        or (require_verified_effort and effective_effort is None)
+    ):
+        detail = (
+            "successful reviewer result did not expose required runtime verification "
+            "metadata; refusing to mark the pinned lane successful"
+        )
+        write_text_atomic(
+            stderr_path,
+            completed.stderr.decode("utf-8", errors="replace") + "\n" + detail + "\n",
+        )
+        return replace(
+            attempt,
+            returncode=65,
+            category="runtime-unverified",
+            final_text=None,
+        )
     if (
         attempt.category == "success"
         and effective_model
@@ -279,6 +375,25 @@ def _record_attempt(
             category="model-mismatch",
             final_text=None,
         )
+    if (
+        attempt.category == "success"
+        and effective_effort
+        and effective_effort.lower() != requested_effort.lower()
+    ):
+        mismatch = (
+            f"requested effort {requested_effort!r} was replaced by {effective_effort!r}; "
+            "refusing to accept the pinned lane"
+        )
+        write_text_atomic(
+            stderr_path,
+            completed.stderr.decode("utf-8", errors="replace") + "\n" + mismatch + "\n",
+        )
+        attempt = replace(
+            attempt,
+            returncode=65,
+            category="effort-mismatch",
+            final_text=None,
+        )
     return attempt
 
 
@@ -295,17 +410,56 @@ def _codex_attempt(
     if executable is None:
         raise FileNotFoundError("codex is not available in a trusted executable path")
     attempt_final = review.container_dir / "attempts" / f"{index:02d}-codex-final.txt"
+    attempt_final.parent.mkdir(parents=True, exist_ok=True)
+    tool_home = review.container_dir / "tool-home"
+    tool_home.mkdir(exist_ok=True)
+    shell_values = {
+        key: env[key]
+        for key in (
+            "CODEX_ISOLATED_REVIEW_DIFF_FILE",
+            "CODEX_ISOLATED_REVIEW_GIT_POLICY",
+            "CODEX_ISOLATED_REVIEW_GIT_SHIM",
+            "CODEX_ISOLATED_REVIEW_PROMPT_FILE",
+            "CODEX_ISOLATED_REVIEW_RANGE",
+            "CODEX_ISOLATED_REVIEW_ROOT",
+            "CODEX_REAL_GIT",
+            "PATH",
+            "TEMP",
+            "TMP",
+            "TMPDIR",
+        )
+        if key in env
+    }
+    shell_values["HOME"] = str(tool_home)
+    shell_environment = (
+        "shell_environment_policy.set={"
+        + ",".join(
+            f"{key}={json.dumps(value)}" for key, value in sorted(shell_values.items())
+        )
+        + "}"
+    )
     prompt = review.prompt_file.read_bytes()
     completed = run(
         (
             str(executable),
-            "-s",
-            "read-only",
+            "-c",
+            'approval_policy="never"',
+            "-c",
+            'default_permissions="isolated_review"',
+            "-c",
+            'permissions.isolated_review.filesystem={"glob_scan_max_depth"=8,":minimal"="read",":workspace_roots"={"."="read",".git"="deny",".codex"="deny",".agents"="deny","*.env"="deny","**/*.env"="deny"}}',
+            "-c",
+            'shell_environment_policy.inherit="none"',
+            "-c",
+            shell_environment,
             "-m",
             model,
             "-c",
             f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"',
             "exec",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--strict-config",
             "--json",
             "-o",
             str(attempt_final),
@@ -320,6 +474,7 @@ def _codex_attempt(
         final_text = (
             attempt_final.read_text(encoding="utf-8", errors="replace").strip() or None
         )
+    effective_model, effective_effort = _codex_session_metadata(completed.stdout, env)
     return _record_attempt(
         review=review,
         index=index,
@@ -327,7 +482,11 @@ def _codex_attempt(
         model=model,
         completed=completed,
         final_text=final_text,
-        effective_model=model if final_text else None,
+        effective_model=effective_model,
+        requested_effort=CODEX_REASONING_EFFORT,
+        effective_effort=effective_effort,
+        require_verified_model=True,
+        require_verified_effort=True,
     )
 
 
@@ -343,6 +502,25 @@ def _claude_attempt(
     )
     if executable is None:
         raise FileNotFoundError("claude is not available in a trusted executable path")
+    settings = json.dumps(
+        {
+            "permissions": {
+                "deny": [
+                    "Read(~/.aws/**)",
+                    "Read(~/.claude/**)",
+                    "Read(~/.codex/**)",
+                    "Read(~/.config/**)",
+                    "Read(~/.copilot/**)",
+                    "Read(~/.gnupg/**)",
+                    "Read(~/.kube/**)",
+                    "Read(~/.ssh/**)",
+                    "Read(~/.git-credentials)",
+                    "Read(~/.netrc)",
+                ]
+            }
+        },
+        separators=(",", ":"),
+    )
     completed = run(
         (
             str(executable),
@@ -352,10 +530,11 @@ def _claude_attempt(
             "--effort",
             CLAUDE_REASONING_EFFORT,
             "--permission-mode",
-            "plan",
+            "dontAsk",
             "--output-format",
             "json",
             "--no-session-persistence",
+            "--safe-mode",
             "--no-chrome",
             "--disable-slash-commands",
             "--strict-mcp-config",
@@ -363,8 +542,12 @@ def _claude_attempt(
             "{}",
             "--setting-sources",
             "",
+            "--settings",
+            settings,
             "--tools",
             "Read,Grep,Glob",
+            "--disallowedTools",
+            "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Task",
         ),
         cwd=review.workspace_root,
         env=env,
@@ -379,6 +562,9 @@ def _claude_attempt(
         completed=completed,
         final_text=final_text if completed.returncode == 0 else None,
         effective_model=effective_model,
+        requested_effort=CLAUDE_REASONING_EFFORT,
+        effective_effort=None,
+        require_verified_model=True,
     )
 
 
@@ -407,6 +593,9 @@ def _copilot_attempt(
         "--mode",
         "plan",
         "--allow-all-tools",
+        "--deny-tool=write",
+        "--deny-tool=shell",
+        "--disallow-temp-dir",
         "--disable-builtin-mcps",
         "--no-bash-env",
         "--no-custom-instructions",
@@ -415,6 +604,7 @@ def _copilot_attempt(
         "--no-remote-export",
         "--no-color",
         "--no-ask-user",
+        "--no-auto-update",
     ]
     sensitive_names = sorted(
         name
@@ -447,6 +637,9 @@ def _copilot_attempt(
         completed=completed,
         final_text=final_text if completed.returncode == 0 else None,
         effective_model=effective_model,
+        requested_effort=COPILOT_REASONING_EFFORT,
+        effective_effort=None,
+        require_verified_model=True,
     )
 
 
@@ -506,6 +699,14 @@ def run_review(
                 "Claude-family review requires an explicit egress-consent reason.\n",
             )
             return Outcome(2, None, tuple())
+        try:
+            validate_external_workspace(review)
+        except ReviewError as error:
+            write_text_atomic(
+                review.container_dir / "runner-error.txt",
+                f"external review workspace preflight failed: {error}\n",
+            )
+            return Outcome(2, None, tuple())
         write_json(
             review.container_dir / "egress.json",
             {
@@ -535,11 +736,19 @@ def run_review(
     env = child_environment(
         container_dir=review.container_dir,
         shim_source=shim_source,
+        passthrough_keys=(
+            CODEX_ENV_KEYS if reviewer == "codex" else CLAUDE_FAMILY_ENV_KEYS
+        ),
         extra={
             "CODEX_ISOLATED_REVIEW_ROOT": str(review.workspace_root),
             "CODEX_ISOLATED_REVIEW_DIFF_FILE": str(review.diff_file),
             "CODEX_ISOLATED_REVIEW_PROMPT_FILE": str(review.prompt_file),
             "CODEX_ISOLATED_REVIEW_RANGE": f"{review.base_ref}..{review.head_ref}",
+            **(
+                {"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}
+                if reviewer == "claude"
+                else {}
+            ),
         },
     )
     attempts: list[Attempt] = []

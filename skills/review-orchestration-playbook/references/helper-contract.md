@@ -62,7 +62,11 @@ Capacity, overload, rate limits, timeouts, network/5xx errors, missing artifacts
 - Initialized submodules are materialized without fetching. Missing local objects block the lane instead of causing hidden network access.
 - Every reviewer receives the same bounded findings-only prompt and primary diff file inside a helper-owned `.codex-review/` directory in the detached worktree.
 - The helper installs the fixed `git_readonly_shim`, passes the real Git path separately, and executes the reviewer inside the detached workspace.
-- The reviewer prompt and environment do not name the live source checkout as an additional context root. Claude Code receives only read/search tools, with slash commands, Chrome integration, inherited MCP configuration, and repository/user setting sources disabled. Copilot runs in plan mode and disables custom instructions, built-in MCPs, bash environment loading, experimental features, and remote session export; secret-like environment variables are withheld from its shell and MCP tools.
+- Every child receives a runtime-specific minimal environment allowlist instead of the parent's complete environment.
+- Codex runs with a custom permission profile: only platform-minimal paths and the frozen workspace are readable; `.git`, `.codex`, `.agents`, and environment-file globs are denied; network and writes are unavailable. It ignores user config and execpolicy rules, uses `approval_policy=never`, and gives model-proposed shell commands a fresh environment with an empty helper-owned `HOME`.
+- Claude Code runs in safe mode with `dontAsk` permissions and only `Read`, `Grep`, and `Glob`; no additional directory is allowed, so its permission root is the frozen workspace. Explicit deny rules cover common credential/config homes. Slash commands, Chrome integration, inherited MCP configuration, repository/user setting sources, and nonessential traffic are disabled.
+- Copilot runs in plan mode with its built-in current-working-directory path boundary, explicit shell/write denial, temp-directory denial, and disabled custom instructions, built-in MCPs, bash environment loading, experimental features, and remote session export. Secret-like auth variables are withheld from its tools.
+- Before a Claude-family run, the helper rejects any symlink in the frozen workspace that resolves outside that workspace.
 - Source files are never edited. The detached workspace is removed after `stateful wait` unless `--keep-workspace` is set.
 - Logs, attempts metadata, and `final.txt` remain in the state directory after workspace cleanup.
 
@@ -73,7 +77,7 @@ Capacity, overload, rate limits, timeouts, network/5xx errors, missing artifacts
 - other nonzero: blocked or failed; inspect `stateful status`, `attempts.json`, and bounded logs
 - `stateful final` prints only the saved terminal artifact on success
 
-Each attempt records runtime, requested model, effective model when observable, category, exit status, and log paths. A successful CLI response that silently substituted another model is `model-mismatch` and stops the lane; it is not evidence of account entitlement and never enters the fallback path.
+Each attempt records runtime, requested/effective model, requested/effective effort when observable, category, exit status, and log paths. For Codex, the helper resolves the emitted thread ID to its persisted rollout and requires matching `turn_context` model and effort before accepting the final artifact. Missing verification is `runtime-unverified`; mismatches stop the lane. Neither condition is entitlement evidence, so neither enters the fallback path.
 
 ## Deliberate Omissions
 

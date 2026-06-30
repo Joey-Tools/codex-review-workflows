@@ -34,6 +34,26 @@ TRUSTED_PATH = os.pathsep.join(
     )
 )
 
+BASE_ENV_KEYS = (
+    "ALL_PROXY",
+    "COLORTERM",
+    "HOME",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOGNAME",
+    "NO_COLOR",
+    "NO_PROXY",
+    "SHELL",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "TERM",
+    "USER",
+    "XDG_CONFIG_HOME",
+)
+
 
 def write_text_atomic(path: pathlib.Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -168,13 +188,15 @@ def child_environment(
     *,
     container_dir: pathlib.Path,
     shim_source: pathlib.Path,
+    passthrough_keys: Iterable[str] = (),
     extra: dict[str, str] | None = None,
 ) -> dict[str, str]:
     real_git = resolve_git()
     shim_dir = install_readonly_git_shim(
         container_dir=container_dir, source=shim_source
     )
-    env = os.environ.copy()
+    allowed_keys = {*BASE_ENV_KEYS, *passthrough_keys}
+    env = {key: os.environ[key] for key in allowed_keys if key in os.environ}
     env.update(
         {
             "PATH": f"{shim_dir}{os.pathsep}{TRUSTED_PATH}",

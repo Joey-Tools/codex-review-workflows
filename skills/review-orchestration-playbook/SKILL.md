@@ -24,7 +24,7 @@ The helper and the clean-context `reviewer` agent use explicit models; they do n
 - Claude Code: `claude-opus-4-8` with `max`; fall back to `claude-opus-4-7` with `max` under the same entitlement-only rule.
 - Copilot CLI: use only after Claude Code is unavailable or both Claude Code models are entitlement-blocked; try `claude-opus-4.8` with `max`, then `claude-opus-4.7` with `max` under the same rule.
 
-Capacity, overload, rate limits, timeouts, network errors, 5xx responses, missing final artifacts, silent model substitution, or reviewer findings are not model-fallback reasons. Retry the same runtime/model only within a bounded transient retry policy; otherwise report `inconclusive`. Authentication, invalid configuration, or an unexpected effective model is `blocked`, not a reason to downgrade models.
+Capacity, overload, rate limits, timeouts, network errors, 5xx responses, missing final artifacts, silent model substitution, or reviewer findings are not model-fallback reasons. Retry the same runtime/model only within a bounded transient retry policy; otherwise report `inconclusive`. Authentication, invalid configuration, an unexpected effective model/effort, or missing runtime-verification metadata is `blocked`, not a reason to downgrade models.
 
 ## Workflow
 
@@ -86,6 +86,7 @@ Read [helper-contract.md](references/helper-contract.md) before modifying or deb
 - Do not silently replace Claude-family review with OpenCode, Cursor Agent, or another model family.
 - Do not downgrade on capacity or other transient failures.
 - Do not infer account entitlement from silent model substitution.
+- Do not accept a Codex result unless the persisted rollout verifies both the effective model and effort.
 - Do not let model aliases or global defaults override the pinned policy.
 - Do not start another reviewer from a findings-only review child.
 - Do not claim a clean result without a terminal artifact for every requested logical lane.
