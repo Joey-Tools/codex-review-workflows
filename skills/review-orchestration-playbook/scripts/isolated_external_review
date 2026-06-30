@@ -209,8 +209,9 @@ CODEX_EXPLICIT_MODEL_REFERENCE_PATTERNS = (
 )
 CODEX_STREAMING_TERM_GRACE_SECONDS = 5.0
 CODEX_STREAMING_PUMP_POLL_SECONDS = 0.1
-CODEX_STREAMING_PUMP_JOIN_SECONDS = 1.0
-CODEX_STREAMING_POST_EXIT_DRAIN_BYTES = 64 * 1024
+CODEX_STREAMING_PUMP_JOIN_SECONDS = 3.0
+CODEX_STREAMING_POST_EXIT_DRAIN_SECONDS = 2.0
+CODEX_STREAMING_POST_EXIT_QUIET_SECONDS = 0.25
 CODEX_READONLY_FINAL_MESSAGE_DEFAULT = "LGTM\n"
 CODEX_READONLY_FINAL_MESSAGE_ALIASES = frozenset(
     {
@@ -5779,7 +5780,8 @@ def _run_streaming_codex_attempt(
         eof_reached: threading.Event,
     ) -> None:
         stream_failed = False
-        post_exit_bytes = 0
+        post_exit_deadline: float | None = None
+        post_exit_quiet_deadline: float | None = None
 
         def consume(payload: bytes) -> None:
             nonlocal stream_failed
@@ -5802,14 +5804,42 @@ def _run_streaming_codex_attempt(
                 consume(payload)
 
         while True:
-            timeout = 0.0 if stop_pumps.is_set() else CODEX_STREAMING_PUMP_POLL_SECONDS
+            timeout = CODEX_STREAMING_PUMP_POLL_SECONDS
+            if stop_pumps.is_set():
+                now = time.monotonic()
+                if post_exit_deadline is None:
+                    post_exit_deadline = now + CODEX_STREAMING_POST_EXIT_DRAIN_SECONDS
+                    post_exit_quiet_deadline = (
+                        now + CODEX_STREAMING_POST_EXIT_QUIET_SECONDS
+                    )
+                assert post_exit_quiet_deadline is not None
+                remaining = min(
+                    post_exit_deadline - now,
+                    post_exit_quiet_deadline - now,
+                )
+                if remaining <= 0:
+                    return
+                timeout = min(timeout, remaining)
             try:
                 readable, _, _ = select.select([source_fd], [], [], timeout)
             except (OSError, ValueError):
                 return
             if not readable:
                 if stop_pumps.is_set():
-                    return
+                    now = time.monotonic()
+                    if post_exit_deadline is None:
+                        post_exit_deadline = (
+                            now + CODEX_STREAMING_POST_EXIT_DRAIN_SECONDS
+                        )
+                        post_exit_quiet_deadline = (
+                            now + CODEX_STREAMING_POST_EXIT_QUIET_SECONDS
+                        )
+                    assert post_exit_quiet_deadline is not None
+                    if (
+                        now >= post_exit_deadline
+                        or now >= post_exit_quiet_deadline
+                    ):
+                        return
                 continue
             try:
                 payload = os.read(source_fd, 8192)
@@ -5820,9 +5850,13 @@ def _run_streaming_codex_attempt(
                 return
             consume(payload)
             if stop_pumps.is_set():
-                post_exit_bytes += len(payload)
-                if post_exit_bytes >= CODEX_STREAMING_POST_EXIT_DRAIN_BYTES:
-                    return
+                now = time.monotonic()
+                if post_exit_deadline is None:
+                    post_exit_deadline = now + CODEX_STREAMING_POST_EXIT_DRAIN_SECONDS
+                post_exit_quiet_deadline = min(
+                    post_exit_deadline,
+                    now + CODEX_STREAMING_POST_EXIT_QUIET_SECONDS,
+                )
 
     process: subprocess.Popen[bytes]
 

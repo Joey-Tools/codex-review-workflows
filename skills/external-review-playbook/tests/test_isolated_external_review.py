@@ -9029,6 +9029,53 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertEqual(result, [(0, b"first\nsecond\n", b"")])
         self.assertEqual(bytes(stream.buffer.payload), b"first\nsecond\n")
 
+    def test_streaming_codex_attempt_drains_delayed_output_after_parent_exit(self) -> None:
+        if os.name != "posix":
+            self.skipTest("POSIX pipe select semantics are required")
+        module = self._load_script_module()
+        read_fd, write_fd = os.pipe()
+
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.pid = 4242
+                self.stdin = None
+                self.stdout = os.fdopen(read_fd, "rb", buffering=0)
+                self.stderr = io.BytesIO()
+
+            def wait(self, timeout: float | None = None) -> int:
+                return 0
+
+        process = FakeProcess()
+
+        def delayed_write() -> None:
+            time.sleep(0.1)
+            os.write(write_fd, b"late\n")
+            os.close(write_fd)
+
+        class RecordingStream:
+            def __init__(self) -> None:
+                self.buffer = io.BytesIO()
+
+        stream = RecordingStream()
+        writer = threading.Thread(target=delayed_write)
+        writer.start()
+        with mock.patch.object(module.subprocess, "Popen", return_value=process):
+            with mock.patch.object(module.sys, "stdout", stream):
+                returncode, stdout_tail, stderr_tail = (
+                    module._run_streaming_codex_attempt(
+                        command=["fake-codex"],
+                        workspace_root=self.repo,
+                        child_env=os.environ.copy(),
+                        stdin_bytes=None,
+                    )
+                )
+        writer.join(timeout=1)
+
+        self.assertFalse(writer.is_alive())
+        self.assertEqual(returncode, 0)
+        self.assertEqual((stdout_tail, stderr_tail), (b"late\n", b""))
+        self.assertEqual(stream.buffer.getvalue(), b"late\n")
+
     def test_streaming_codex_attempt_does_not_wait_for_inherited_pipe(self) -> None:
         module = self._load_script_module()
         started_at = time.monotonic()
