@@ -328,15 +328,20 @@ def _finalize_orchestration_signal_state(
         signal_state.suppress_raise = True
         pending_signal = signal_state.pending_signal
         signal_state.restore()
-        if previous_mask is not None:
-            masked_pending_signal = _consume_pending_orchestration_signal()
+        while True:
+            if previous_mask is not None:
+                masked_pending_signal = _consume_pending_orchestration_signal()
+                if pending_signal is None:
+                    pending_signal = masked_pending_signal
+            if pending_signal is not None:
+                result = 128 + int(pending_signal)
+            if persist_result is not None:
+                persist_result(result)
+            if previous_mask is None:
+                return result
+            pending_signal = _consume_pending_orchestration_signal()
             if pending_signal is None:
-                pending_signal = masked_pending_signal
-        if pending_signal is not None:
-            result = 128 + int(pending_signal)
-        if persist_result is not None:
-            persist_result(result)
-        return result
+                return result
     finally:
         signal_state.restore()
         _restore_orchestration_signal_mask(previous_mask)
@@ -5549,10 +5554,13 @@ def _validate_codex_model_policy(args: argparse.Namespace) -> None:
     ):
         if not isinstance(value, str) or not value.strip():
             raise UserError(f"{flag} must be a non-empty string")
-    if (
-        not args.no_codex_model_fallback
-        and args.codex_model == args.codex_fallback_model
-    ):
+    fallback_policy_enabled = not args.no_codex_model_fallback
+    if args.entrypoint == "codex-review":
+        fallback_policy_enabled = _codex_model_fallback_enabled(
+            args,
+            entrypoint_label="codex-review",
+        )
+    if fallback_policy_enabled and args.codex_model == args.codex_fallback_model:
         raise UserError(
             "--codex-fallback-model must differ from --codex-model, or pass "
             "--no-codex-model-fallback"
@@ -5712,9 +5720,10 @@ def _cleanup_prepared_workspace(
     cleanup_error: UserError | None,
     preserve_container_dir: bool = False,
     keep_prepare_only_workspace: bool = True,
+    force_cleanup: bool = False,
 ) -> UserError | None:
     args: argparse.Namespace = prepared["args"]  # type: ignore[assignment]
-    keep_workspace = (
+    keep_workspace = not force_cleanup and (
         (args.prepare_only and keep_prepare_only_workspace)
         or args.reuse_workspace is not None
         or args.keep_workspace
@@ -6375,13 +6384,16 @@ def _run_captured_process(
                 process.wait()
         raise
     finally:
-        for forwarded, previous_handler in previous_signal_handlers.items():
-            signal.signal(forwarded, previous_handler)
-
-    if process is not None:
-        process_pid = getattr(process, "pid", None)
-        if os.name == "posix" and isinstance(process_pid, int):
-            _terminate_remaining_process_group(process_pid)
+        cleanup_signal_mask = _block_forwarded_orchestration_signals()
+        try:
+            if process is not None:
+                process_pid = getattr(process, "pid", None)
+                if os.name == "posix" and isinstance(process_pid, int):
+                    _terminate_remaining_process_group(process_pid)
+            for forwarded, previous_handler in previous_signal_handlers.items():
+                signal.signal(forwarded, previous_handler)
+        finally:
+            _restore_orchestration_signal_mask(cleanup_signal_mask)
     if interrupted_by_signal is not None:
         raise ForwardedOrchestrationSignal(interrupted_by_signal)
     if process is None:  # pragma: no cover - guarded by the spawn path above
@@ -6419,15 +6431,14 @@ def _run_prepared_review(prepared: dict[str, object]) -> int:
     workspace_root = prepared["workspace_root"]
     child_env = prepared["child_env"]
     entrypoint_label = str(prepared.get("entrypoint_label") or "")
+    if args.prepare_only:
+        print(workspace_root)
+        return 0
     child_returncode = 1
     cleanup_error: UserError | None = None
     signal_state = OrchestrationSignalState()
     signal_state.install()
     try:
-        if args.prepare_only:
-            print(workspace_root)
-            return 0
-
         if args.verbose:
             print(f"workspace={workspace_root}", file=sys.stderr)
             print(f"entrypoint={prepared['entrypoint_label']}", file=sys.stderr)
@@ -6613,6 +6624,28 @@ def _write_runner_terminal_state(
 
 def _start_prepared_review(prepared: dict[str, object]) -> int:
     args: argparse.Namespace = prepared["args"]  # type: ignore[assignment]
+    try:
+        return _start_prepared_review_inner(prepared)
+    except BaseException:
+        cleanup_error = _cleanup_prepared_workspace(
+            prepared,
+            child_returncode=1,
+            cleanup_error=None,
+            keep_prepare_only_workspace=False,
+            force_cleanup=True,
+        )
+        if args.state_dir and not bool(prepared["created_workspace"]):
+            shutil.rmtree(
+                pathlib.Path(str(prepared["container_dir"])),
+                ignore_errors=True,
+            )
+        if cleanup_error is not None:
+            print(str(cleanup_error), file=sys.stderr)
+        raise
+
+
+def _start_prepared_review_inner(prepared: dict[str, object]) -> int:
+    args: argparse.Namespace = prepared["args"]  # type: ignore[assignment]
     if args.prepare_only:
         raise UserError("`start` does not support --prepare-only")
 
@@ -6730,25 +6763,73 @@ def _start_prepared_review(prepared: dict[str, object]) -> int:
         if prepared["entrypoint_label"] in {"codex-review", "codex-readonly"}
         else dict(prepared["child_env"])
     )
-    with launcher_log_path.open("wb") as launcher_log:
-        process = subprocess.Popen(
-            runner_cmd,
-            cwd=str(state_dir),
-            env=runner_env,
-            stdin=subprocess.DEVNULL,
-            stdout=launcher_log,
-            stderr=launcher_log,
-            start_new_session=True,
-        )
-    if process.poll() is not None:
-        _write_runner_terminal_state(
-            lock_path,
-            exit_code_path,
-            exit_code=process.returncode,
-            pid_path=pid_path,
-        )
-    print(state_dir)
-    return 0
+    process: subprocess.Popen[bytes] | None = None
+    pending_spawn_signal: signal.Signals | None = None
+
+    def signal_runner(sig: signal.Signals) -> None:
+        if process is None:
+            return
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            pass
+
+    def forward_signal(signum: int, _frame: object) -> None:
+        nonlocal pending_spawn_signal
+        forwarded = signal.Signals(signum)
+        if process is None:
+            pending_spawn_signal = forwarded
+            return
+        signal_runner(forwarded)
+        raise ForwardedOrchestrationSignal(forwarded)
+
+    previous_signal_handlers: dict[signal.Signals, object] = {}
+    if os.name == "posix" and threading.current_thread() is threading.main_thread():
+        for forwarded in _forwarded_orchestration_signals():
+            previous_signal_handlers[forwarded] = signal.getsignal(forwarded)
+            signal.signal(forwarded, forward_signal)
+    try:
+        if pending_spawn_signal is not None:
+            raise ForwardedOrchestrationSignal(pending_spawn_signal)
+        with launcher_log_path.open("wb") as launcher_log:
+            process = subprocess.Popen(
+                runner_cmd,
+                cwd=str(state_dir),
+                env=runner_env,
+                stdin=subprocess.DEVNULL,
+                stdout=launcher_log,
+                stderr=launcher_log,
+                start_new_session=True,
+            )
+        if pending_spawn_signal is not None:
+            signal_runner(pending_spawn_signal)
+            raise ForwardedOrchestrationSignal(pending_spawn_signal)
+        if process.poll() is not None:
+            _write_runner_terminal_state(
+                lock_path,
+                exit_code_path,
+                exit_code=process.returncode,
+                pid_path=pid_path,
+            )
+        print(state_dir, flush=True)
+        return 0
+    except BaseException as error:
+        if process is not None and process.poll() is None:
+            cleanup_signal = (
+                error.signum
+                if isinstance(error, ForwardedOrchestrationSignal)
+                else signal.SIGTERM
+            )
+            signal_runner(cleanup_signal)
+            try:
+                process.wait(timeout=CODEX_STREAMING_TERM_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                signal_runner(signal.SIGKILL)
+                process.wait()
+        raise
+    finally:
+        for forwarded, previous_handler in previous_signal_handlers.items():
+            signal.signal(forwarded, previous_handler)
 
 
 def _run_child_from_spec(spec_path: pathlib.Path, *, expected_sha256: str) -> int:
@@ -7765,11 +7846,102 @@ def _start_parallel_review(args: argparse.Namespace) -> int:
         shared_created_workspace,
         shared_cleanup_submodule_worktrees,
     ) = _prepare_workspace(args)
+    launch_state: dict[str, object] = {
+        "state_dir": None,
+        "child_state_dirs": [],
+        "published": False,
+        "cleanup_attempted": False,
+    }
+    try:
+        return _start_parallel_review_prepared(
+            args,
+            source_root=source_root,
+            base_ref=base_ref,
+            head_ref=head_ref,
+            shared_container_dir=shared_container_dir,
+            shared_workspace_root=shared_workspace_root,
+            shared_created_workspace=shared_created_workspace,
+            shared_cleanup_submodule_worktrees=shared_cleanup_submodule_worktrees,
+            codex_model=codex_model,
+            codex_fallback_model=codex_fallback_model,
+            codex_reasoning_effort=codex_reasoning_effort,
+            no_codex_model_fallback=no_codex_model_fallback,
+            launch_state=launch_state,
+        )
+    except BaseException:
+        if not bool(launch_state["published"]):
+            child_state_dirs = launch_state["child_state_dirs"]
+            assert isinstance(child_state_dirs, list)
+            for child_state_dir_raw in child_state_dirs:
+                child_state_dir = pathlib.Path(str(child_state_dir_raw))
+                try:
+                    child_state = _load_state(child_state_dir)
+                    child_pid_path = pathlib.Path(
+                        str(
+                            child_state.get(
+                                "pid_path",
+                                child_state_dir / "pid",
+                            )
+                        )
+                    )
+                    child_pid = _read_pid(child_pid_path)
+                    if child_pid is not None:
+                        try:
+                            os.killpg(child_pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+                        deadline = time.monotonic() + CODEX_STREAMING_TERM_GRACE_SECONDS
+                        while (
+                            _process_group_exists(child_pid)
+                            and time.monotonic() < deadline
+                        ):
+                            time.sleep(CODEX_PROCESS_GROUP_POLL_SECONDS)
+                        if _process_group_exists(child_pid):
+                            try:
+                                os.killpg(child_pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                except (OSError, UserError):
+                    pass
+                shutil.rmtree(child_state_dir, ignore_errors=True)
+            state_dir_raw = launch_state["state_dir"]
+            if state_dir_raw is not None:
+                shutil.rmtree(pathlib.Path(str(state_dir_raw)), ignore_errors=True)
+            if not bool(launch_state["cleanup_attempted"]):
+                cleanup_error = _cleanup_failed_workspace_setup(
+                    source_root,
+                    shared_workspace_root,
+                    container_dir=shared_container_dir,
+                    created_workspace=shared_created_workspace,
+                    cleanup_submodule_worktrees=shared_cleanup_submodule_worktrees,
+                )
+                if cleanup_error is not None:
+                    print(str(cleanup_error), file=sys.stderr)
+        raise
+
+
+def _start_parallel_review_prepared(
+    args: argparse.Namespace,
+    *,
+    source_root: pathlib.Path,
+    base_ref: str | None,
+    head_ref: str | None,
+    shared_container_dir: pathlib.Path,
+    shared_workspace_root: pathlib.Path,
+    shared_created_workspace: bool,
+    shared_cleanup_submodule_worktrees: bool,
+    codex_model: str,
+    codex_fallback_model: str,
+    codex_reasoning_effort: str,
+    no_codex_model_fallback: bool,
+    launch_state: dict[str, object],
+) -> int:
     temp_parent = source_root / ".codex-tmp"
     temp_parent.mkdir(parents=True, exist_ok=True)
     state_dir = pathlib.Path(
         tempfile.mkdtemp(prefix="isolated-review-parallel-", dir=temp_parent)
     )
+    launch_state["state_dir"] = str(state_dir)
     state: dict[str, object] = {
         "state_kind": "parallel",
         "workspace_root": str(shared_workspace_root),
@@ -7799,6 +7971,9 @@ def _start_parallel_review(args: argparse.Namespace) -> int:
         child_state_dir = pathlib.Path(
             tempfile.mkdtemp(prefix="isolated-review-", dir=temp_parent)
         )
+        child_state_dirs = launch_state["child_state_dirs"]
+        assert isinstance(child_state_dirs, list)
+        child_state_dirs.append(str(child_state_dir))
         command = [
             sys.executable,
             str(script_path),
@@ -7856,6 +8031,7 @@ def _start_parallel_review(args: argparse.Namespace) -> int:
     try:
         readonly_state_dir = start_child("codex-readonly")
     except UserError as error:
+        launch_state["cleanup_attempted"] = True
         cleanup_error = _cleanup_failed_workspace_setup(
             source_root,
             shared_workspace_root,
@@ -7906,7 +8082,8 @@ def _start_parallel_review(args: argparse.Namespace) -> int:
         state["child_states"] = child_states
         _save_state(state_dir, state)
 
-    print(state_dir)
+    print(state_dir, flush=True)
+    launch_state["published"] = True
     return 0
 
 

@@ -9734,7 +9734,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                 with mock.patch.object(
                     module.signal,
                     "sigpending",
-                    return_value={target_signal},
+                    side_effect=[set(), {target_signal}, set(), set()],
                 ):
                     with mock.patch.object(module.signal, "sigwait") as sigwait_mock:
                         result = module._finalize_orchestration_signal_state(
@@ -9744,8 +9744,185 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                         )
 
         self.assertEqual(result, 128 + int(target_signal))
-        self.assertEqual(persisted, [128 + int(target_signal)])
+        self.assertEqual(persisted, [0, 128 + int(target_signal)])
         sigwait_mock.assert_called_once_with({target_signal})
+
+    def test_prepare_only_preserves_signal_exit_code_during_output(self) -> None:
+        if os.name != "posix" or not hasattr(signal, "SIGQUIT"):
+            self.skipTest("POSIX SIGQUIT handling is required")
+        module = self._load_script_module()
+        prepared = {
+            "args": argparse.Namespace(prepare_only=True),
+            "placeholders": {},
+            "command": [],
+            "workspace_root": self.repo,
+            "child_env": {},
+            "entrypoint_label": "prepare-only",
+        }
+        target_signal = module.signal.SIGQUIT
+
+        def interrupt_print(*_args: object, **_kwargs: object) -> None:
+            handler = module.signal.getsignal(target_signal)
+            assert callable(handler)
+            handler(int(target_signal), None)
+
+        with mock.patch("builtins.print", side_effect=interrupt_print):
+            result = module._run_with_orchestration_signals(
+                lambda: module._run_prepared_review(prepared)
+            )
+
+        self.assertEqual(result, 128 + int(target_signal))
+
+    def test_stateful_start_defers_spawn_signal_and_cleans_unpublished_state(self) -> None:
+        if os.name != "posix" or not hasattr(signal, "SIGQUIT"):
+            self.skipTest("POSIX SIGQUIT process-group signaling is required")
+        module = self._load_script_module()
+        state_dir = self.root / "stateful-start-signal"
+        state_dir.mkdir()
+        args = argparse.Namespace(
+            prepare_only=False,
+            lane="custom",
+            state_dir=str(state_dir),
+            keep_on_failure=False,
+            keep_workspace=False,
+            reuse_workspace=str(self.repo),
+        )
+        prepared = {
+            "args": args,
+            "container_dir": state_dir,
+            "workspace_root": self.repo,
+            "source_root": self.repo,
+            "created_workspace": False,
+            "cleanup_submodule_worktrees": False,
+            "placeholders": {"{report_file}": None, "{review_range}": None},
+            "final_path": None,
+            "stdin_bytes": None,
+            "child_env": os.environ.copy(),
+            "command": ["fake-review"],
+            "entrypoint_label": "agent",
+            "base_ref": None,
+            "head_ref": None,
+            "prompt_delivery": "none",
+            "codex_model_fallback_enabled": False,
+            "codex_primary_model": None,
+            "codex_fallback_model": None,
+            "codex_reasoning_effort": None,
+        }
+        target_signal = module.signal.SIGQUIT
+        installed_handlers: dict[object, object] = {}
+
+        def set_signal(sig: object, handler: object) -> object:
+            if callable(handler):
+                installed_handlers[sig] = handler
+            return module.signal.SIG_DFL
+
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.pid = 4260
+                self.returncode: int | None = None
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def wait(self, timeout: float | None = None) -> int:
+                self.returncode = -int(target_signal)
+                return self.returncode
+
+        process = FakeProcess()
+
+        def popen(*_args: object, **_kwargs: object) -> FakeProcess:
+            handler = installed_handlers[target_signal]
+            assert callable(handler)
+            handler(int(target_signal), None)
+            return process
+
+        with mock.patch.object(module.subprocess, "Popen", side_effect=popen):
+            with mock.patch.object(
+                module.signal,
+                "getsignal",
+                return_value=module.signal.SIG_DFL,
+            ):
+                with mock.patch.object(module.signal, "signal", side_effect=set_signal):
+                    with mock.patch.object(module.os, "killpg") as killpg_mock:
+                        with self.assertRaises(SystemExit) as raised:
+                            module._start_prepared_review(prepared)
+
+        self.assertEqual(raised.exception.code, 128 + int(target_signal))
+        killpg_mock.assert_any_call(process.pid, target_signal)
+        self.assertFalse(state_dir.exists())
+
+    def test_parallel_start_signal_cleans_partial_children_and_shared_workspace(self) -> None:
+        if os.name != "posix" or not hasattr(signal, "SIGQUIT"):
+            self.skipTest("POSIX SIGQUIT process-group signaling is required")
+        module = self._load_script_module()
+        args = module._build_parser().parse_args(
+            ["--repo", str(self.repo), "--entrypoint", "codex-parallel"]
+        )
+        shared_container = self.root / "parallel-shared"
+        shared_workspace = shared_container / "workspace"
+        shared_workspace.mkdir(parents=True)
+        cleanup_mock = mock.Mock(return_value=None)
+        child_pid = 4261
+
+        def interrupt_parallel_start(
+            _args: argparse.Namespace,
+            **kwargs: object,
+        ) -> int:
+            launch_state = kwargs["launch_state"]
+            assert isinstance(launch_state, dict)
+            state_dir = self.root / "parallel-state"
+            child_state_dir = self.root / "parallel-child"
+            state_dir.mkdir()
+            child_state_dir.mkdir()
+            pid_path = child_state_dir / "pid"
+            pid_path.write_text(f"{child_pid}\n", encoding="utf-8")
+            module._save_state(
+                child_state_dir,
+                {
+                    "workspace_root": str(child_state_dir / "workspace"),
+                    "pid_path": str(pid_path),
+                },
+            )
+            launch_state["state_dir"] = str(state_dir)
+            launch_state["child_state_dirs"].append(str(child_state_dir))
+            raise module.ForwardedOrchestrationSignal(module.signal.SIGQUIT)
+
+        with mock.patch.object(
+            module,
+            "_prepare_workspace",
+            return_value=(
+                self.repo,
+                None,
+                None,
+                shared_container,
+                shared_workspace,
+                True,
+                False,
+            ),
+        ):
+            with mock.patch.object(
+                module,
+                "_start_parallel_review_prepared",
+                side_effect=interrupt_parallel_start,
+            ):
+                with mock.patch.object(
+                    module,
+                    "_cleanup_failed_workspace_setup",
+                    cleanup_mock,
+                ):
+                    with mock.patch.object(
+                        module,
+                        "_process_group_exists",
+                        return_value=False,
+                    ):
+                        with mock.patch.object(module.os, "killpg") as killpg_mock:
+                            with self.assertRaises(SystemExit):
+                                module._start_parallel_review(args)
+
+        killpg_mock.assert_called_once_with(child_pid, signal.SIGTERM)
+        cleanup_mock.assert_called_once()
+        self.assertFalse((self.root / "parallel-state").exists())
+        self.assertFalse((self.root / "parallel-child").exists())
 
     def test_prepare_workspace_cleans_up_forwarded_signal(self) -> None:
         if os.name != "posix" or not hasattr(signal, "SIGQUIT"):
@@ -9855,6 +10032,53 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                 )
                 killpg_mock.assert_any_call(process.pid, target_signal)
                 self.assertEqual(process.returncode, -int(target_signal))
+
+    def test_captured_process_cleans_group_before_restoring_handlers(self) -> None:
+        if os.name != "posix":
+            self.skipTest("POSIX process-group cleanup is required")
+        module = self._load_script_module()
+        events: list[str] = []
+
+        class FakeProcess:
+            pid = 4262
+            returncode = 0
+
+            def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
+                return b"", b""
+
+            def poll(self) -> int:
+                return self.returncode
+
+        def set_signal(_sig: object, handler: object) -> object:
+            events.append("install" if callable(handler) else "restore")
+            return module.signal.SIG_DFL
+
+        def record_cleanup(_pid: int) -> None:
+            events.append("cleanup")
+
+        with mock.patch.object(module.subprocess, "Popen", return_value=FakeProcess()):
+            with mock.patch.object(
+                module.signal,
+                "getsignal",
+                return_value=module.signal.SIG_DFL,
+            ):
+                with mock.patch.object(module.signal, "signal", side_effect=set_signal):
+                    with mock.patch.object(
+                        module,
+                        "_terminate_remaining_process_group",
+                        side_effect=record_cleanup,
+                    ):
+                        completed = module._run_captured_process(
+                            command=["fake-codex"],
+                            workspace_root=self.repo,
+                            child_env=os.environ.copy(),
+                            stdin_bytes=None,
+                            stdout_handle=io.BytesIO(),
+                            stderr_handle=io.BytesIO(),
+                        )
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertLess(events.index("cleanup"), events.index("restore"))
 
     def test_remaining_process_group_escalates_when_term_is_ignored(self) -> None:
         if os.name != "posix":
@@ -10100,6 +10324,10 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                 "codex-review",
                 "--codex-reasoning-effort",
                 "high",
+                "--codex-model",
+                "gpt-5.6-sol",
+                "--codex-fallback-model",
+                "gpt-5.6-sol",
                 "--",
                 "--model",
                 "gpt-5.5",
