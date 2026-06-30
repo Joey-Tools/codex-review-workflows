@@ -150,6 +150,7 @@ CODEX_MODEL_FALLBACK_ERROR_FRAGMENTS = (
     "model is overloaded",
     "model is not supported",
     "model is unsupported",
+    "model requires a newer version of codex",
     "model does not exist",
     "model not found",
     "no access to model",
@@ -208,7 +209,7 @@ CODEX_EXPLICIT_MODEL_REFERENCE_PATTERNS = (
     re.compile(
         r"(?<![a-z0-9._/-])(?P<model_quote>[\"'`]?)"
         r"(?P<model>[a-z0-9][a-z0-9._/-]*)(?P=model_quote)\s+model"
-        r"\s+(?=(?:cannot|does|has|is|not|was)\b)"
+        r"\s+(?=(?:cannot|does|has|is|not|requires|was)\b)"
     ),
     re.compile(
         r"\bmodel(?:[\s_]id)?\s*[:=]\s*[\"'`]?"
