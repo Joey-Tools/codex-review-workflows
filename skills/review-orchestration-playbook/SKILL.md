@@ -27,6 +27,7 @@ For PR readiness, load `$pr-readiness-review-workflow` first. That workflow owns
 2. Preflight the real runtime.
 - Probe the exact local entrypoint, model id, auth state, report-sink shape, and sandbox behavior before building a large review prompt.
 - Use the installed helper path when approval reuse, isolated workspaces, or frozen review ranges matter: `$HOME/.codex/skills/review-orchestration-playbook/scripts/isolated_review`. In public docs and prompts, prefer `$HOME` over account-specific absolute paths, and avoid repo-local `skills/...` helper invocations unless you are intentionally testing the checkout copy.
+- Helper-managed Codex lanes default to `gpt-5.6-sol` with `xhigh` reasoning. If that primary model is explicitly unavailable, unsupported, or not entitled, the helper automatically retries the same review once with `gpt-5.5` and `xhigh`. It must not downgrade on generic auth, network, sandbox, timeout, validation, or review-result failures. An explicit child `-m/--model` opts out of the helper-managed model fallback; callers can also pass `--no-codex-model-fallback`.
 - On Linux or Ubuntu, treat `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted` as a helper/runtime issue, not a prompt issue; let the helper probe and select the backend.
 - Distinguish `blocked by approval/auth/sandbox` from `runtime exists but the review still fails to converge`.
 
@@ -58,7 +59,7 @@ For PR readiness, load `$pr-readiness-review-workflow` first. That workflow owns
 
 5. Report outcome precisely.
 - Distinguish `final findings`, `LGTM/No findings`, `blocked`, `unavailable`, and `inconclusive`.
-- Say which lane, runtime shape, and scope actually ran.
+- Say which lane, runtime shape, scope, and final Codex model actually ran; if helper-managed model fallback occurred, report both the failed primary and successful fallback model.
 - For local double-review or triple-review requests, say whether the Codex lane completed via helper-backed `codex-review` / `codex-readonly` or via clean-context `reviewer` fallback. If the fallback was not clean context with the latest/highest configured Codex model/reasoning shape, classify it as blocked or inconclusive rather than clean.
 - When the requested lane cannot deliver a trustworthy final result, state what was still verified locally and what remains unverified.
 - If the user asks you to forward review results to a specific Codex app-server thread, first verify that exact thread with read-only protocol checks such as `thread/read`, `thread/resume`, `thread/list`, and local session-index lookup. If the target thread is missing or not loadable, report the notification as blocked; do not send a connectivity probe or summary to a different loaded thread just to prove the app-server is reachable.
