@@ -227,7 +227,6 @@ class SkillDocumentationTest(unittest.TestCase):
             "rg -n -C context search",
             "low-context multi-file selected diffs, even with `--unified=3/4/5/6`",
             "--max-columns 200",
-            "rg -o --max-count 80",
             "800+ 行或 10k+ original tokens",
             "git status --short --untracked-files=no",
             "rg -l",
@@ -283,6 +282,7 @@ class SkillDocumentationTest(unittest.TestCase):
             "小文件集合上再用 line-producing rg -n",
             reference_text,
         )
+        self.assertNotIn("rg -o --max-count 80", reference_text)
 
     def test_review_orchestration_prefers_readonly_for_enforceable_evidence_budget(self) -> None:
         skill_path = (
@@ -323,7 +323,6 @@ class SkillDocumentationTest(unittest.TestCase):
             "low-context `git diff --unified=3/4/5/6`",
             "single-file broad-pattern `rg -n`",
             "--max-columns 200",
-            "rg -o --max-count 80",
             "max_output_tokens=60000",
             "pyenv shim",
             "repeated `unittest` `E` output",
@@ -331,6 +330,7 @@ class SkillDocumentationTest(unittest.TestCase):
             "Before every `exec_command`, rewrite bare `nl -ba <file>`",
         ):
             self.assertIn(needle, text)
+        self.assertNotIn("rg -o --max-count 80", text)
 
     def test_review_prompt_templates_budget_validation_output(self) -> None:
         reference_path = (
@@ -363,9 +363,9 @@ class SkillDocumentationTest(unittest.TestCase):
                 "single-file broad-pattern `rg -n`",
                 "low-context multi-file selected diffs",
                 "--max-columns 200",
-                "rg -o --max-count 80",
             ):
                 self.assertIn(needle, block, name)
+            self.assertNotIn("rg -o --max-count 80", block, name)
         for name in ("bounded", "without_git"):
             self.assertIn("First-stage summaries are budgeted too", template_blocks[name], name)
             self.assertIn("rg -m 80 '^diff --git ' <diff>", template_blocks[name], name)
@@ -4743,7 +4743,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertIn("Single-file broad-pattern rg -n", prompt_text)
         self.assertIn("low-context multi-file selected diffs", prompt_text)
         self.assertIn("--max-columns 200", prompt_text)
-        self.assertIn("rg -o --max-count 80", prompt_text)
+        self.assertNotIn("rg -o --max-count 80", prompt_text)
         self.assertIn("Before every tool call, self-check the command", prompt_text)
         self.assertIn("Rewrite bare nl -ba <file>", prompt_text)
         self.assertIn("git ls-files --others", prompt_text)
@@ -4827,7 +4827,7 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
         self.assertIn("Single-file broad-pattern rg -n", payload["prompt_stdin"])
         self.assertIn("low-context multi-file selected diffs", payload["prompt_stdin"])
         self.assertIn("--max-columns 200", payload["prompt_stdin"])
-        self.assertIn("rg -o --max-count 80", payload["prompt_stdin"])
+        self.assertNotIn("rg -o --max-count 80", payload["prompt_stdin"])
         self.assertIn("Before every tool call, self-check the command", payload["prompt_stdin"])
         self.assertIn("Rewrite bare nl -ba <file>", payload["prompt_stdin"])
         self.assertIn("git ls-files --others", payload["prompt_stdin"])
