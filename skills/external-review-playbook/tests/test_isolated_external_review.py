@@ -865,6 +865,12 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                     if completed.stderr:
                         sys.stderr.write(completed.stderr)
                     raise SystemExit(completed.returncode)
+                fake_pid_path = os.environ.get("FAKE_CODEX_PID_PATH")
+                if fake_pid_path:
+                    pathlib.Path(fake_pid_path).write_text(
+                        f"{os.getpid()}\\n",
+                        encoding="utf-8",
+                    )
                 sandbox = None
                 enabled_features = []
                 disabled_features = []
@@ -4265,6 +4271,119 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
             "codex model fallback: gpt-5.6-sol -> gpt-5.5 (reasoning xhigh)",
             completed.stderr,
         )
+
+    def test_codex_review_one_shot_forwards_quit_to_primary_and_cleans_up(self) -> None:
+        if os.name != "posix" or not hasattr(signal, "SIGQUIT"):
+            self.skipTest("POSIX SIGQUIT process-group signaling is required")
+        env = self._base_env()
+        env["FAKE_CODEX_REVIEW_DELAY_SECS"] = "30"
+        fake_pid_path = self.root / "fake-codex-primary.pid"
+        env["FAKE_CODEX_PID_PATH"] = str(fake_pid_path)
+        repo, base, head = self._create_review_range_repo(
+            "codex-review-one-shot-signal-forwarding"
+        )
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--repo",
+                str(repo),
+                "--entrypoint",
+                "codex-review",
+                "--base-ref",
+                base,
+                "--head-ref",
+                head,
+            ],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while (
+                not fake_pid_path.is_file()
+                and process.poll() is None
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.02)
+            self.assertTrue(fake_pid_path.is_file())
+            child_pid = int(fake_pid_path.read_text(encoding="utf-8").strip())
+            os.kill(process.pid, signal.SIGQUIT)
+            stdout, stderr = process.communicate(timeout=5)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
+        self.assertEqual(process.returncode, 128 + int(signal.SIGQUIT), stderr)
+        self.assertEqual(stdout, "")
+        with self.assertRaises(ProcessLookupError):
+            os.kill(child_pid, 0)
+        self.assertFalse(list((repo / ".codex-tmp").glob("isolated-review-*")))
+
+    def test_codex_review_stateful_forwards_quit_and_writes_terminal_state(self) -> None:
+        if os.name != "posix" or not hasattr(signal, "SIGQUIT"):
+            self.skipTest("POSIX SIGQUIT process-group signaling is required")
+        env = self._base_env()
+        env["FAKE_CODEX_REVIEW_DELAY_SECS"] = "30"
+        fake_pid_path = self.root / "fake-codex-stateful.pid"
+        env["FAKE_CODEX_PID_PATH"] = str(fake_pid_path)
+        repo, base, head = self._create_review_range_repo(
+            "codex-review-stateful-signal-forwarding"
+        )
+        start = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "stateful",
+                "start",
+                "--repo",
+                str(repo),
+                "--entrypoint",
+                "codex-review",
+                "--base-ref",
+                base,
+                "--head-ref",
+                head,
+            ],
+            env=env,
+        )
+        self.assertEqual(start.returncode, 0, start.stderr)
+        state_dir = pathlib.Path(start.stdout.strip().splitlines()[-1])
+        deadline = time.monotonic() + 5
+        while (
+            (not fake_pid_path.is_file() or not (state_dir / "pid").is_file())
+            and not (state_dir / "exit_code").is_file()
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.02)
+        self.assertTrue(fake_pid_path.is_file())
+        self.assertTrue((state_dir / "pid").is_file())
+        child_pid = int(fake_pid_path.read_text(encoding="utf-8").strip())
+        runner_pid = int((state_dir / "pid").read_text(encoding="utf-8").strip())
+        os.kill(runner_pid, signal.SIGQUIT)
+
+        waited = run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "stateful",
+                "wait",
+                "--state-dir",
+                str(state_dir),
+            ],
+            env=env,
+        )
+        self.assertEqual(waited.returncode, 128 + int(signal.SIGQUIT), waited.stderr)
+        summary = json.loads(waited.stdout)
+        self.assertEqual(summary["status"], "failed")
+        self.assertEqual(summary["exit_code"], 128 + int(signal.SIGQUIT))
+        self.assertTrue(summary["workspace_cleaned"])
+        with self.assertRaises(ProcessLookupError):
+            os.kill(child_pid, 0)
 
     def test_codex_review_rejects_large_builtin_prompt_scope(self) -> None:
         env = self._base_env()
@@ -9252,10 +9371,15 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                 return -int(module.signal.SIGTERM)
 
         process = FakeProcess()
+
+        def killpg(_pid: int, sig: int | signal.Signals) -> None:
+            if sig == 0:
+                raise ProcessLookupError
+
         with mock.patch.object(module.subprocess, "Popen", return_value=process):
             with mock.patch.object(module.signal, "getsignal", return_value=module.signal.SIG_DFL):
                 with mock.patch.object(module.signal, "signal", side_effect=set_signal) as signal_mock:
-                    with mock.patch.object(module.os, "killpg") as killpg_mock:
+                    with mock.patch.object(module.os, "killpg", side_effect=killpg) as killpg_mock:
                         with self.assertRaises(SystemExit) as raised:
                             module._run_streaming_codex_attempt(
                                 command=["fake-codex"],
@@ -9314,10 +9438,15 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
                 return -int(target_signal)
 
         process = FakeProcess()
+
+        def killpg(_pid: int, sig: int | signal.Signals) -> None:
+            if sig == 0:
+                raise ProcessLookupError
+
         with mock.patch.object(module.subprocess, "Popen", return_value=process):
             with mock.patch.object(module.signal, "getsignal", return_value=module.signal.SIG_DFL):
                 with mock.patch.object(module.signal, "signal", side_effect=set_signal):
-                    with mock.patch.object(module.os, "killpg") as killpg_mock:
+                    with mock.patch.object(module.os, "killpg", side_effect=killpg) as killpg_mock:
                         with self.assertRaises(SystemExit) as raised:
                             module._run_streaming_codex_attempt(
                                 command=["fake-codex"],
@@ -9332,12 +9461,42 @@ class IsolatedCopilotReviewTest(unittest.TestCase):
             [
                 mock.call(process.pid, target_signal),
                 mock.call(process.pid, target_signal),
+                mock.call(process.pid, 0),
             ],
         )
         self.assertEqual(
             process.wait_calls,
             [None, module.CODEX_STREAMING_TERM_GRACE_SECONDS],
         )
+
+    def test_remaining_process_group_escalates_when_term_is_ignored(self) -> None:
+        if os.name != "posix":
+            self.skipTest("POSIX process-group signaling is required")
+        module = self._load_script_module()
+        process_pid = 4244
+        alive = True
+
+        def killpg(_pid: int, sig: int | signal.Signals) -> None:
+            nonlocal alive
+            if sig == module.signal.SIGKILL:
+                alive = False
+            if sig == 0 and not alive:
+                raise ProcessLookupError
+
+        with mock.patch.object(module.os, "killpg", side_effect=killpg) as killpg_mock:
+            with mock.patch.object(module.time, "monotonic", side_effect=[0.0, 0.0, 1.0]):
+                with mock.patch.object(module.time, "sleep"):
+                    module._terminate_remaining_process_group(process_pid)
+
+        self.assertIn(
+            mock.call(process_pid, module.signal.SIGTERM),
+            killpg_mock.mock_calls,
+        )
+        self.assertIn(
+            mock.call(process_pid, module.signal.SIGKILL),
+            killpg_mock.mock_calls,
+        )
+        self.assertFalse(alive)
 
 
     def test_apply_codex_readonly_defaults_injects_linux_landlock_flags(self) -> None:

@@ -212,6 +212,8 @@ CODEX_STREAMING_PUMP_POLL_SECONDS = 0.1
 CODEX_STREAMING_PUMP_JOIN_SECONDS = 3.0
 CODEX_STREAMING_POST_EXIT_DRAIN_SECONDS = 2.0
 CODEX_STREAMING_POST_EXIT_QUIET_SECONDS = 1.0
+CODEX_PROCESS_GROUP_TERM_GRACE_SECONDS = 0.5
+CODEX_PROCESS_GROUP_POLL_SECONDS = 0.05
 CODEX_READONLY_FINAL_MESSAGE_DEFAULT = "LGTM\n"
 CODEX_READONLY_FINAL_MESSAGE_ALIASES = frozenset(
     {
@@ -5762,6 +5764,39 @@ def _append_bounded_tail(buffer: bytearray, payload: bytes) -> None:
         del buffer[:overflow]
 
 
+def _process_group_exists(process_pid: int) -> bool:
+    if os.name != "posix":
+        return False
+    try:
+        os.killpg(process_pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _terminate_remaining_process_group(
+    process_pid: int,
+    *,
+    initial_signal: signal.Signals = signal.SIGTERM,
+) -> None:
+    if not _process_group_exists(process_pid):
+        return
+    try:
+        os.killpg(process_pid, initial_signal)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + CODEX_PROCESS_GROUP_TERM_GRACE_SECONDS
+    while _process_group_exists(process_pid) and time.monotonic() < deadline:
+        time.sleep(CODEX_PROCESS_GROUP_POLL_SECONDS)
+    if _process_group_exists(process_pid):
+        try:
+            os.killpg(process_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
 def _run_streaming_codex_attempt(
     *,
     command: list[str],
@@ -5960,7 +5995,10 @@ def _run_streaming_codex_attempt(
                 stdout_thread.join(timeout=CODEX_STREAMING_PUMP_JOIN_SECONDS)
             if stderr_thread_started:
                 stderr_thread.join(timeout=CODEX_STREAMING_PUMP_JOIN_SECONDS)
-            if not stdout_eof.is_set() or not stderr_eof.is_set():
+            process_pid = getattr(process, "pid", None)
+            if os.name == "posix" and isinstance(process_pid, int):
+                _terminate_remaining_process_group(process_pid)
+            elif not stdout_eof.is_set() or not stderr_eof.is_set():
                 signal_process_group(signal.SIGTERM)
             for source in (process.stdout, process.stderr):
                 try:
@@ -5986,6 +6024,90 @@ def _run_streaming_codex_attempt(
     return returncode, bytes(stdout_tail), bytes(stderr_tail)
 
 
+def _run_captured_process(
+    *,
+    command: list[str],
+    workspace_root: pathlib.Path,
+    child_env: dict[str, str],
+    stdin_bytes: bytes | None,
+    stdout_handle: BinaryIO,
+    stderr_handle: BinaryIO,
+) -> subprocess.CompletedProcess[bytes]:
+    process = subprocess.Popen(
+        command,
+        cwd=str(workspace_root),
+        env=child_env,
+        stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
+        stdout=stdout_handle,
+        stderr=stderr_handle,
+        start_new_session=os.name == "posix",
+    )
+
+    class ForwardedSignal(BaseException):
+        def __init__(self, signum: signal.Signals) -> None:
+            super().__init__(int(signum))
+            self.signum = signum
+
+    def signal_process_group(sig: signal.Signals) -> None:
+        process_pid = getattr(process, "pid", None)
+        if os.name == "posix" and isinstance(process_pid, int):
+            try:
+                os.killpg(process_pid, sig)
+                return
+            except ProcessLookupError:
+                return
+        try:
+            if sig == signal.SIGTERM:
+                process.terminate()
+            else:
+                process.kill()
+        except ProcessLookupError:
+            pass
+
+    def forward_signal(signum: int, _frame: object) -> None:
+        forwarded = signal.Signals(signum)
+        signal_process_group(forwarded)
+        raise ForwardedSignal(forwarded)
+
+    previous_signal_handlers: dict[signal.Signals, object] = {}
+    if os.name == "posix" and threading.current_thread() is threading.main_thread():
+        forwarded_signals = [signal.SIGTERM, signal.SIGINT]
+        for optional_signal_name in ("SIGHUP", "SIGQUIT"):
+            optional_signal = getattr(signal, optional_signal_name, None)
+            if optional_signal is not None and optional_signal not in forwarded_signals:
+                forwarded_signals.append(optional_signal)
+        for forwarded in forwarded_signals:
+            previous_signal_handlers[forwarded] = signal.getsignal(forwarded)
+            signal.signal(forwarded, forward_signal)
+
+    interrupted_by_signal: signal.Signals | None = None
+    try:
+        try:
+            process.communicate(input=stdin_bytes)
+        except ForwardedSignal as error:
+            interrupted_by_signal = error.signum
+            if process.poll() is None:
+                signal_process_group(error.signum)
+                try:
+                    process.wait(timeout=CODEX_STREAMING_TERM_GRACE_SECONDS)
+                except subprocess.TimeoutExpired:
+                    signal_process_group(signal.SIGKILL)
+                    process.wait()
+    finally:
+        for forwarded, previous_handler in previous_signal_handlers.items():
+            signal.signal(forwarded, previous_handler)
+
+    process_pid = getattr(process, "pid", None)
+    if os.name == "posix" and isinstance(process_pid, int):
+        _terminate_remaining_process_group(process_pid)
+    returncode = (
+        128 + int(interrupted_by_signal)
+        if interrupted_by_signal is not None
+        else int(process.returncode)
+    )
+    return subprocess.CompletedProcess(command, returncode)
+
+
 def _run_captured_codex_attempt(
     *,
     command: list[str],
@@ -5998,14 +6120,13 @@ def _run_captured_codex_attempt(
     stdout_path = container_dir / f"codex-{attempt}.stdout"
     stderr_path = container_dir / f"codex-{attempt}.stderr"
     with stdout_path.open("wb") as stdout_handle, stderr_path.open("wb") as stderr_handle:
-        completed = subprocess.run(
-            command,
-            cwd=str(workspace_root),
-            env=child_env,
-            input=stdin_bytes,
-            stdout=stdout_handle,
-            stderr=stderr_handle,
-            check=False,
+        completed = _run_captured_process(
+            command=command,
+            workspace_root=workspace_root,
+            child_env=child_env,
+            stdin_bytes=stdin_bytes,
+            stdout_handle=stdout_handle,
+            stderr_handle=stderr_handle,
         )
     return completed, stdout_path, stderr_path
 
@@ -6371,14 +6492,13 @@ def _run_child_from_spec(spec_path: pathlib.Path, *, expected_sha256: str) -> in
 
                 with stdout_path.open("wb") as stdout_handle, stderr_path.open("wb") as stderr_handle:
                     try:
-                        exit_code = subprocess.run(
-                            list(spec["command"]),
-                            cwd=str(spec["cwd"]),
-                            env=child_env,
-                            input=stdin_bytes,
-                            stdout=stdout_handle,
-                            stderr=stderr_handle,
-                            check=False,
+                        exit_code = _run_captured_process(
+                            command=list(spec["command"]),
+                            workspace_root=pathlib.Path(str(spec["cwd"])),
+                            child_env=child_env,
+                            stdin_bytes=stdin_bytes,
+                            stdout_handle=stdout_handle,
+                            stderr_handle=stderr_handle,
                         ).returncode
                         stdout_handle.flush()
                         stderr_handle.flush()
@@ -6400,13 +6520,20 @@ def _run_child_from_spec(spec_path: pathlib.Path, *, expected_sha256: str) -> in
                             reasoning_effort = str(
                                 spec.get("codex_reasoning_effort") or ""
                             )
-                            primary_stdout = stdout_path.read_bytes()
-                            if primary_stdout:
+                            primary_stdout_size = stdout_path.stat().st_size
+                            if primary_stdout_size:
                                 stderr_handle.write(
                                     b"codex primary attempt stdout (fallback diagnostic):\n"
                                 )
-                                stderr_handle.write(primary_stdout)
-                                if not primary_stdout.endswith(b"\n"):
+                                with stdout_path.open("rb") as primary_stdout_handle:
+                                    shutil.copyfileobj(
+                                        primary_stdout_handle,
+                                        stderr_handle,
+                                        length=64 * 1024,
+                                    )
+                                    primary_stdout_handle.seek(-1, os.SEEK_END)
+                                    primary_stdout_last_byte = primary_stdout_handle.read(1)
+                                if primary_stdout_last_byte != b"\n":
                                     stderr_handle.write(b"\n")
                             stdout_handle.seek(0)
                             stdout_handle.truncate(0)
@@ -6441,14 +6568,13 @@ def _run_child_from_spec(spec_path: pathlib.Path, *, expected_sha256: str) -> in
                                 primary_model=primary_model,
                                 fallback_model=fallback_model,
                             )
-                            exit_code = subprocess.run(
-                                fallback_command,
-                                cwd=str(spec["cwd"]),
-                                env=child_env,
-                                input=stdin_bytes,
-                                stdout=stdout_handle,
-                                stderr=stderr_handle,
-                                check=False,
+                            exit_code = _run_captured_process(
+                                command=fallback_command,
+                                workspace_root=pathlib.Path(str(spec["cwd"])),
+                                child_env=child_env,
+                                stdin_bytes=stdin_bytes,
+                                stdout_handle=stdout_handle,
+                                stderr_handle=stderr_handle,
                             ).returncode
                     except Exception as error:  # pragma: no cover - defensive crash path
                         stderr_handle.write(
