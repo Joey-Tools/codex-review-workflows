@@ -740,24 +740,18 @@ class ProviderPolicyTest(unittest.TestCase):
         configs = [argv[index + 1] for index, value in enumerate(argv) if value == "-c"]
         self.assertIn('approval_policy="never"', configs)
         self.assertIn('default_permissions="isolated_review"', configs)
+        permission_configs = [
+            value for value in configs if value.startswith("permissions.isolated_review=")
+        ]
+        self.assertEqual(len(permission_configs), 1)
+        permission_config = permission_configs[0]
+        self.assertIn('"glob_scan_max_depth"=8', permission_config)
+        self.assertIn('":minimal"="read"', permission_config)
+        self.assertIn('":workspace_roots"={"."="read"', permission_config)
+        self.assertIn('".git"="deny"', permission_config)
         self.assertIn(
-            "permissions.isolated_review.filesystem.glob_scan_max_depth=8", configs
-        )
-        self.assertIn(
-            'permissions.isolated_review.filesystem.":minimal"="read"', configs
-        )
-        self.assertIn(
-            'permissions.isolated_review.filesystem.":workspace_roots"."."="read"',
-            configs,
-        )
-        self.assertIn(
-            'permissions.isolated_review.filesystem.":workspace_roots".".git"="deny"',
-            configs,
-        )
-        self.assertIn(
-            "permissions.isolated_review.filesystem."
             f'{json.dumps(str(pathlib.Path(sys.base_prefix).resolve()))}="read"',
-            configs,
+            permission_config,
         )
         self.assertTrue(
             any("shell_environment_policy.inherit" in value for value in configs)

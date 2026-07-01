@@ -676,17 +676,12 @@ def _codex_attempt(
         )
         + "}"
     )
-    permission_configs = (
-        "permissions.isolated_review.filesystem.glob_scan_max_depth=8",
-        'permissions.isolated_review.filesystem.":minimal"="read"',
-        'permissions.isolated_review.filesystem.":workspace_roots"."."="read"',
-        'permissions.isolated_review.filesystem.":workspace_roots".".git"="deny"',
-        'permissions.isolated_review.filesystem.":workspace_roots".".codex"="deny"',
-        'permissions.isolated_review.filesystem.":workspace_roots".".agents"="deny"',
-        'permissions.isolated_review.filesystem.":workspace_roots"."*.env"="deny"',
-        'permissions.isolated_review.filesystem.":workspace_roots"."**/*.env"="deny"',
-        "permissions.isolated_review.filesystem."
-        f"{json.dumps(str(python_runtime_root))}=\"read\"",
+    permission_profile = (
+        '{"filesystem"={"glob_scan_max_depth"=8,":minimal"="read",'
+        '":workspace_roots"={"."="read",".git"="deny",'
+        '".codex"="deny",".agents"="deny","*.env"="deny",'
+        '"**/*.env"="deny"},'
+        f'{json.dumps(str(python_runtime_root))}="read"}}'
     )
     prompt = review.prompt_file.read_bytes()
     completed = run(
@@ -696,11 +691,8 @@ def _codex_attempt(
             'approval_policy="never"',
             "-c",
             'default_permissions="isolated_review"',
-            *(
-                item
-                for permission_config in permission_configs
-                for item in ("-c", permission_config)
-            ),
+            "-c",
+            f"permissions.isolated_review={permission_profile}",
             "-c",
             'shell_environment_policy.inherit="none"',
             "-c",
