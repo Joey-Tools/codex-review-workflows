@@ -96,7 +96,7 @@ class ChildEnvironmentTest(unittest.TestCase):
                 ),
                 mock.patch.object(
                     common,
-                    "_consume_pending_forwarded_signal",
+                    "consume_pending_forwarded_signal",
                     return_value=signal.SIGQUIT,
                 ),
                 mock.patch.object(common, "restore_signal_mask") as restore,

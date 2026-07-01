@@ -14,8 +14,11 @@ from typing import Any, Callable
 from .common import (
     ForwardedSignal,
     ReviewError,
+    block_forwarded_signals,
+    consume_pending_forwarded_signal,
     forwarded_signals,
     read_json,
+    restore_signal_mask,
     signal_process_group,
     tail_text,
     terminate_process_group,
@@ -209,9 +212,9 @@ def start(
         state["pid"] = process.pid
         _STARTED_PROCESSES[process.pid] = process
         write_json(state_dir / STATE_FILE, state)
-        published = True
         if publisher is not None:
             publisher(state_dir)
+        published = True
         return state_dir
     except BaseException:
         if process is not None:
@@ -232,12 +235,29 @@ def start(
 
 def run_state(*, state_dir: pathlib.Path, shim_source: pathlib.Path) -> int:
     unblock_forwarded_signals()
-    state, review = load_review_state(state_dir)
-    reviewer = state.get("reviewer")
-    if not isinstance(reviewer, str):
-        raise ReviewError("review state does not contain a reviewer")
     exit_code = 1
+    pending_signal: signal.Signals | None = None
+    suppress_signal_raise = False
+    state_loaded = False
+
+    def record_signal(signum: int, _frame: object) -> None:
+        nonlocal pending_signal
+        pending_signal = signal.Signals(signum)
+        if not suppress_signal_raise:
+            raise ForwardedSignal(pending_signal)
+
+    previous_handlers: dict[signal.Signals, object] = {}
+    if os.name == "posix" and threading.current_thread() is threading.main_thread():
+        for forwarded in forwarded_signals():
+            previous_handlers[forwarded] = signal.getsignal(forwarded)
+            signal.signal(forwarded, record_signal)
+
     try:
+        state, review = load_review_state(state_dir)
+        state_loaded = True
+        reviewer = state.get("reviewer")
+        if not isinstance(reviewer, str):
+            raise ReviewError("review state does not contain a reviewer")
         consent_value = state.get("egress_consent")
         egress_consent = consent_value if isinstance(consent_value, str) else None
         outcome = run_review(
@@ -250,12 +270,36 @@ def run_state(*, state_dir: pathlib.Path, shim_source: pathlib.Path) -> int:
     except ForwardedSignal as error:
         exit_code = 128 + int(error.signum)
     except Exception as error:
-        write_text_atomic(
-            state_dir / "runner-error.txt", f"{type(error).__name__}: {error}\n"
-        )
+        if state_loaded:
+            write_text_atomic(
+                state_dir / "runner-error.txt", f"{type(error).__name__}: {error}\n"
+            )
         exit_code = 1
     finally:
-        write_text_atomic(state_dir / EXIT_FILE, f"{exit_code}\n")
+        previous_mask = block_forwarded_signals()
+        try:
+            suppress_signal_raise = True
+            for forwarded, previous in previous_handlers.items():
+                signal.signal(forwarded, previous)
+            while True:
+                masked_signal = (
+                    consume_pending_forwarded_signal()
+                    if previous_mask is not None
+                    else None
+                )
+                if pending_signal is None:
+                    pending_signal = masked_signal
+                if pending_signal is not None:
+                    exit_code = 128 + int(pending_signal)
+                if state_loaded:
+                    write_text_atomic(state_dir / EXIT_FILE, f"{exit_code}\n")
+                if previous_mask is None:
+                    break
+                pending_signal = consume_pending_forwarded_signal()
+                if pending_signal is None:
+                    break
+        finally:
+            restore_signal_mask(previous_mask)
     return exit_code
 
 

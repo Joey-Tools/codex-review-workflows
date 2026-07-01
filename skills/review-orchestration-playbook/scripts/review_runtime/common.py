@@ -192,7 +192,7 @@ def unblock_forwarded_signals() -> None:
         signal.pthread_sigmask(signal.SIG_UNBLOCK, forwarded_signals())
 
 
-def _consume_pending_forwarded_signal() -> signal.Signals | None:
+def consume_pending_forwarded_signal() -> signal.Signals | None:
     if not hasattr(signal, "sigpending") or not hasattr(signal, "sigwait"):
         return None
     pending = set(signal.sigpending()).intersection(forwarded_signals())
@@ -322,7 +322,7 @@ def _run_logged_process(
             for forwarded, previous in previous_handlers.items():
                 signal.signal(forwarded, previous)
             if previous_mask is not None:
-                pending_cleanup_signal = _consume_pending_forwarded_signal()
+                pending_cleanup_signal = consume_pending_forwarded_signal()
         finally:
             restore_signal_mask(previous_mask)
         if pending_cleanup_signal is not None:

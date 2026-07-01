@@ -835,7 +835,7 @@ def _sensitive_path_rule(relative: str) -> str | None:
         for suffix in SENSITIVE_PATH_SUFFIXES
     ):
         return "credential-path"
-    if name == ".env" or (
+    if name == ".env" or name.endswith(".env") or (
         name.startswith(".env.")
         and not any(name.endswith(suffix) for suffix in SAFE_ENV_SUFFIXES)
     ):

@@ -260,6 +260,80 @@ time.sleep(0.2)
             initial_signal=signal.SIGTERM,
         )
 
+    def test_start_publisher_failure_cleans_unpublished_runner(self) -> None:
+        process = mock.Mock(pid=12345)
+        publisher = mock.Mock(side_effect=BrokenPipeError("closed output"))
+        with (
+            mock.patch.object(
+                state,
+                "prepare_workspace",
+                return_value=self.review,
+            ),
+            mock.patch.object(state.subprocess, "Popen", return_value=process),
+            mock.patch.object(state, "terminate_process_group") as terminate,
+            mock.patch.object(state, "cleanup_workspace") as cleanup,
+        ):
+            with self.assertRaises(BrokenPipeError):
+                state.start(
+                    script_path=pathlib.Path("runner.py"),
+                    repo=self.repo,
+                    reviewer="codex",
+                    base_ref=self.base,
+                    head_ref=self.head,
+                    prompt_file=None,
+                    keep_workspace=False,
+                    egress_consent=None,
+                    publisher=publisher,
+                )
+
+        publisher.assert_called_once_with(self.review.container_dir)
+        terminate.assert_called_once_with(
+            process,
+            initial_signal=signal.SIGTERM,
+        )
+        cleanup.assert_called_once_with(self.review, keep_container=False)
+
+    def test_runner_records_signal_between_reviewer_attempts(self) -> None:
+        state_dir = self.review.container_dir
+        (state_dir / state.STATE_MARKER).write_text(
+            "isolated-review-state-v1\n",
+            encoding="utf-8",
+        )
+        write_json(
+            state_dir / state.STATE_FILE,
+            {
+                "version": 1,
+                "reviewer": "codex",
+                "workspace": self.review.to_json(),
+            },
+        )
+        installed: dict[signal.Signals, object] = {}
+
+        def install_handler(signum, handler):
+            previous = installed.get(signum, signal.SIG_DFL)
+            installed[signum] = handler
+            return previous
+
+        def interrupt_review(**_kwargs):
+            handler = installed[signal.SIGTERM]
+            assert callable(handler)
+            handler(signal.SIGTERM, None)
+
+        with (
+            mock.patch.object(state.signal, "signal", side_effect=install_handler),
+            mock.patch.object(state, "run_review", side_effect=interrupt_review),
+        ):
+            exit_code = state.run_state(
+                state_dir=state_dir,
+                shim_source=SCRIPTS / "git_readonly_shim",
+            )
+
+        self.assertEqual(exit_code, 128 + signal.SIGTERM)
+        self.assertEqual(
+            (state_dir / state.EXIT_FILE).read_text(encoding="utf-8").strip(),
+            str(128 + signal.SIGTERM),
+        )
+
     def test_final_reports_cleanup_failure_instead_of_clean_result(self) -> None:
         self.write_completed_state()
         with mock.patch.object(

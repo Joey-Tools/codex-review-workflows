@@ -13,6 +13,7 @@ sys.path.insert(0, str(SCRIPTS))
 from review_runtime.common import ReviewError  # noqa: E402
 from review_runtime.workspace import (  # noqa: E402
     _file_secret_rule,
+    _sensitive_path_rule,
     cleanup_workspace,
     prepare_workspace,
     validate_external_workspace,
@@ -192,6 +193,11 @@ class WorkspaceTest(unittest.TestCase):
             encoding="utf-8",
         )
         self.assertIsNone(_file_secret_rule(source))
+
+    def test_all_env_suffix_files_are_sensitive_paths(self) -> None:
+        self.assertEqual(_sensitive_path_rule("config.env"), "environment-file")
+        self.assertEqual(_sensitive_path_rule("deploy/prod.env"), "environment-file")
+        self.assertIsNone(_sensitive_path_rule(".env.example"))
 
     def test_snapshot_does_not_execute_repo_hooks_filters_or_external_diff(
         self,
