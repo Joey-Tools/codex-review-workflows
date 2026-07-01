@@ -137,11 +137,14 @@ def start(
     pending_signal: signal.Signals | None = None
     spawning = False
     published = False
+    cleaning = False
 
     def forward_signal(signum: int, _frame: object) -> None:
         nonlocal pending_signal
         forwarded = signal.Signals(signum)
         pending_signal = forwarded
+        if cleaning:
+            return
         if process is None:
             if spawning:
                 return
@@ -230,14 +233,23 @@ def start(
             raise ForwardedSignal(publication_signal)
         return state_dir
     except BaseException:
-        if process is not None:
-            terminate_process_group(
-                process,
-                initial_signal=pending_signal or signal.SIGTERM,
-            )
-            _STARTED_PROCESSES.pop(process.pid, None)
-        if review is not None and not published:
-            cleanup_workspace(review, keep_container=False)
+        cleaning = True
+        cleanup_mask = block_forwarded_signals()
+        try:
+            if process is not None:
+                terminate_process_group(
+                    process,
+                    initial_signal=pending_signal or signal.SIGTERM,
+                )
+                _STARTED_PROCESSES.pop(process.pid, None)
+            if review is not None and not published:
+                cleanup_workspace(review, keep_container=False)
+            if cleanup_mask is not None:
+                cleanup_signal = consume_pending_forwarded_signal()
+                if pending_signal is None:
+                    pending_signal = cleanup_signal
+        finally:
+            restore_signal_mask(cleanup_mask)
         raise
     finally:
         if lock_handle is not None:
@@ -246,8 +258,12 @@ def start(
             signal.signal(forwarded, previous)
 
 
-def run_state(*, state_dir: pathlib.Path, shim_source: pathlib.Path) -> int:
-    unblock_forwarded_signals()
+def run_state(
+    *,
+    state_dir: pathlib.Path,
+    shim_source: pathlib.Path,
+    terminal_process: bool = False,
+) -> int:
     exit_code = 1
     pending_signal: signal.Signals | None = None
     suppress_signal_raise = False
@@ -268,6 +284,7 @@ def run_state(*, state_dir: pathlib.Path, shim_source: pathlib.Path) -> int:
     try:
         state, review = load_review_state(state_dir)
         state_loaded = True
+        unblock_forwarded_signals()
         reviewer = state.get("reviewer")
         if not isinstance(reviewer, str):
             raise ReviewError("review state does not contain a reviewer")
@@ -292,8 +309,6 @@ def run_state(*, state_dir: pathlib.Path, shim_source: pathlib.Path) -> int:
         previous_mask = block_forwarded_signals()
         try:
             suppress_signal_raise = True
-            for forwarded, previous in previous_handlers.items():
-                signal.signal(forwarded, previous)
             while True:
                 masked_signal = (
                     consume_pending_forwarded_signal()
@@ -311,8 +326,12 @@ def run_state(*, state_dir: pathlib.Path, shim_source: pathlib.Path) -> int:
                 pending_signal = consume_pending_forwarded_signal()
                 if pending_signal is None:
                     break
+            if not terminal_process:
+                for forwarded, previous in previous_handlers.items():
+                    signal.signal(forwarded, previous)
         finally:
-            restore_signal_mask(previous_mask)
+            if not terminal_process:
+                restore_signal_mask(previous_mask)
     return exit_code
 
 

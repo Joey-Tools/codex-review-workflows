@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import signal
 import sys
@@ -199,10 +200,12 @@ def main(argv: list[str] | None = None) -> int:
             internal.add_argument("--state-dir", required=True)
             internal.add_argument("--lock-fd", required=True, type=int)
             parsed = internal.parse_args(arguments)
-            return run_state(
+            exit_code = run_state(
                 state_dir=pathlib.Path(parsed.state_dir),
                 shim_source=_shim_source(script_path),
+                terminal_process=True,
             )
+            os._exit(exit_code)
         if arguments and arguments[0] == "stateful":
             return _run_stateful(arguments[1:], script_path=script_path)
         return _run_foreground(

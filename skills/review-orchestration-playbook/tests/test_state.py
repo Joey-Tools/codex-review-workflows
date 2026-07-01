@@ -238,6 +238,55 @@ time.sleep(0.2)
         unblock.assert_called_once_with()
         self.assertEqual((state_dir / state.EXIT_FILE).read_text().strip(), "0")
 
+    def test_runner_installs_signal_handler_before_unblocking_inherited_mask(
+        self,
+    ) -> None:
+        state_dir = self.review.container_dir
+        (state_dir / state.STATE_MARKER).write_text(
+            "isolated-review-state-v1\n",
+            encoding="utf-8",
+        )
+        write_json(
+            state_dir / state.STATE_FILE,
+            {
+                "version": 1,
+                "reviewer": "codex",
+                "workspace": self.review.to_json(),
+            },
+        )
+        installed: dict[signal.Signals, object] = {}
+
+        def install_handler(signum, handler):
+            previous = installed.get(signum, signal.SIG_DFL)
+            installed[signum] = handler
+            return previous
+
+        def deliver_pending_signal():
+            handler = installed[signal.SIGINT]
+            assert callable(handler)
+            handler(signal.SIGINT, None)
+
+        with (
+            mock.patch.object(state.signal, "signal", side_effect=install_handler),
+            mock.patch.object(
+                state,
+                "unblock_forwarded_signals",
+                side_effect=deliver_pending_signal,
+            ),
+            mock.patch.object(state, "run_review") as run_review,
+        ):
+            exit_code = state.run_state(
+                state_dir=state_dir,
+                shim_source=SCRIPTS / "git_readonly_shim",
+            )
+
+        self.assertEqual(exit_code, 128 + signal.SIGINT)
+        run_review.assert_not_called()
+        self.assertEqual(
+            (state_dir / state.EXIT_FILE).read_text(encoding="utf-8").strip(),
+            str(128 + signal.SIGINT),
+        )
+
     def test_start_cancellation_during_prepare_does_not_spawn_runner(self) -> None:
         installed: dict[signal.Signals, object] = {}
 
@@ -355,6 +404,55 @@ time.sleep(0.2)
         )
         cleanup.assert_called_once_with(self.review, keep_container=False)
 
+    def test_start_failure_cleanup_defers_a_second_signal(self) -> None:
+        installed: dict[signal.Signals, object] = {}
+        process = mock.Mock(pid=12345)
+        publisher = mock.Mock(side_effect=BrokenPipeError("closed output"))
+
+        def install_handler(signum, handler):
+            previous = installed.get(signum, signal.SIG_DFL)
+            installed[signum] = handler
+            return previous
+
+        def signal_during_cleanup(*_args, **_kwargs):
+            handler = installed[signal.SIGQUIT]
+            assert callable(handler)
+            handler(signal.SIGQUIT, None)
+
+        with (
+            mock.patch.object(state.signal, "signal", side_effect=install_handler),
+            mock.patch.object(
+                state,
+                "prepare_workspace",
+                return_value=self.review,
+            ),
+            mock.patch.object(state.subprocess, "Popen", return_value=process),
+            mock.patch.object(
+                state,
+                "terminate_process_group",
+                side_effect=signal_during_cleanup,
+            ) as terminate,
+            mock.patch.object(state, "cleanup_workspace") as cleanup,
+        ):
+            with self.assertRaises(BrokenPipeError):
+                state.start(
+                    script_path=pathlib.Path("runner.py"),
+                    repo=self.repo,
+                    reviewer="codex",
+                    base_ref=self.base,
+                    head_ref=self.head,
+                    prompt_file=None,
+                    keep_workspace=False,
+                    egress_consent=None,
+                    publisher=publisher,
+                )
+
+        terminate.assert_called_once_with(
+            process,
+            initial_signal=signal.SIGTERM,
+        )
+        cleanup.assert_called_once_with(self.review, keep_container=False)
+
     def test_start_keeps_published_state_when_signal_arrives_during_publication(
         self,
     ) -> None:
@@ -397,9 +495,12 @@ time.sleep(0.2)
 
         self.assertEqual(raised.exception.signum, signal.SIGINT)
         publisher.assert_called_once_with(self.review.container_dir)
-        block.assert_called_once_with()
-        consume.assert_called_once_with()
-        restore.assert_called_once_with({signal.SIGTERM})
+        self.assertEqual(block.call_count, 2)
+        self.assertEqual(consume.call_count, 2)
+        self.assertEqual(
+            restore.call_args_list,
+            [mock.call({signal.SIGTERM}), mock.call({signal.SIGTERM})],
+        )
         forward.assert_called_once_with(process, signal.SIGINT)
         terminate.assert_called_once_with(
             process,
@@ -446,6 +547,52 @@ time.sleep(0.2)
         self.assertEqual(
             (state_dir / state.EXIT_FILE).read_text(encoding="utf-8").strip(),
             str(128 + signal.SIGTERM),
+        )
+
+    def test_terminal_runner_keeps_signals_blocked_through_process_exit(self) -> None:
+        state_dir = self.review.container_dir
+        (state_dir / state.STATE_MARKER).write_text(
+            "isolated-review-state-v1\n",
+            encoding="utf-8",
+        )
+        write_json(
+            state_dir / state.STATE_FILE,
+            {
+                "version": 1,
+                "reviewer": "codex",
+                "workspace": self.review.to_json(),
+            },
+        )
+        with (
+            mock.patch.object(
+                state,
+                "run_review",
+                return_value=mock.Mock(returncode=0),
+            ),
+            mock.patch.object(
+                state,
+                "block_forwarded_signals",
+                return_value={signal.SIGTERM},
+            ) as block,
+            mock.patch.object(
+                state,
+                "consume_pending_forwarded_signal",
+                return_value=None,
+            ),
+            mock.patch.object(state, "restore_signal_mask") as restore,
+        ):
+            exit_code = state.run_state(
+                state_dir=state_dir,
+                shim_source=SCRIPTS / "git_readonly_shim",
+                terminal_process=True,
+            )
+
+        self.assertEqual(exit_code, 0)
+        block.assert_called_once_with()
+        restore.assert_not_called()
+        self.assertEqual(
+            (state_dir / state.EXIT_FILE).read_text(encoding="utf-8").strip(),
+            "0",
         )
 
     def test_final_reports_cleanup_failure_instead_of_clean_result(self) -> None:
