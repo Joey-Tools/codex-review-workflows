@@ -95,19 +95,30 @@ def _read_exit_code(state_dir: pathlib.Path) -> int | None:
 def _runner_lock_held(lock_path: pathlib.Path) -> bool:
     try:
         handle = lock_path.open("rb")
-    except OSError:
+    except FileNotFoundError:
         return False
+    except OSError as error:
+        raise ReviewError(
+            f"cannot open review runner lock {lock_path}: {error}"
+        ) from error
     try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        handle.close()
-        return True
-    except OSError:
-        handle.close()
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError as error:
+            raise ReviewError(
+                f"cannot probe review runner lock {lock_path}: {error}"
+            ) from error
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError as error:
+            raise ReviewError(
+                f"cannot release review runner lock probe {lock_path}: {error}"
+            ) from error
         return False
-    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    handle.close()
-    return False
+    finally:
+        handle.close()
 
 
 def _reap_started_process(pid: int) -> None:
@@ -193,6 +204,7 @@ def start(
             stderr_path.open("wb") as stderr_handle,
         ):
             spawning = True
+            spawn_mask = block_forwarded_signals()
             try:
                 process = subprocess.Popen(
                     (
@@ -214,6 +226,7 @@ def start(
                 )
             finally:
                 spawning = False
+                restore_signal_mask(spawn_mask)
         if pending_signal is not None:
             signal_process_group(process, pending_signal)
             raise ForwardedSignal(pending_signal)

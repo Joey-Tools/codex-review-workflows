@@ -389,6 +389,58 @@ time.sleep(0.2)
             grace_seconds=state.RUNNER_SHUTDOWN_GRACE_SECONDS,
         )
 
+    def test_start_blocks_signals_until_child_inherits_the_mask(self) -> None:
+        process = mock.Mock(pid=12345)
+        events: list[str] = []
+
+        def block_signals():
+            events.append("block")
+            return {signal.SIGTERM}
+
+        def spawn(*_args, **_kwargs):
+            events.append("spawn")
+            return process
+
+        def restore_mask(_mask):
+            events.append("restore")
+
+        with (
+            mock.patch.object(
+                state,
+                "prepare_workspace",
+                return_value=self.review,
+            ),
+            mock.patch.object(state.subprocess, "Popen", side_effect=spawn),
+            mock.patch.object(
+                state,
+                "block_forwarded_signals",
+                side_effect=block_signals,
+            ),
+            mock.patch.object(state, "restore_signal_mask", side_effect=restore_mask),
+            mock.patch.object(
+                state,
+                "consume_pending_forwarded_signal",
+                return_value=None,
+            ),
+            mock.patch.object(state, "terminate_process_group"),
+            mock.patch.object(state, "cleanup_workspace"),
+        ):
+            state_dir = state.start(
+                script_path=pathlib.Path("runner.py"),
+                repo=self.repo,
+                reviewer="codex",
+                base_ref=self.base,
+                head_ref=self.head,
+                prompt_file=None,
+                keep_workspace=False,
+                egress_consent=None,
+            )
+
+        self.assertEqual(state_dir, self.review.container_dir)
+        self.assertEqual(events[:3], ["block", "spawn", "restore"])
+        self.assertEqual(events[3:], ["block", "restore"])
+        state._STARTED_PROCESSES.pop(process.pid, None)
+
     def test_start_publisher_failure_cleans_unpublished_runner(self) -> None:
         process = mock.Mock(pid=12345)
         publisher = mock.Mock(side_effect=BrokenPipeError("closed output"))
@@ -518,11 +570,15 @@ time.sleep(0.2)
 
         self.assertEqual(raised.exception.signum, signal.SIGINT)
         publisher.assert_called_once_with(self.review.container_dir)
-        self.assertEqual(block.call_count, 2)
+        self.assertEqual(block.call_count, 3)
         self.assertEqual(consume.call_count, 2)
         self.assertEqual(
             restore.call_args_list,
-            [mock.call({signal.SIGTERM}), mock.call({signal.SIGTERM})],
+            [
+                mock.call({signal.SIGTERM}),
+                mock.call({signal.SIGTERM}),
+                mock.call({signal.SIGTERM}),
+            ],
         )
         forward.assert_called_once_with(process, signal.SIGINT)
         terminate.assert_called_once_with(
@@ -737,6 +793,37 @@ time.sleep(0.2)
         self.assertEqual(calls, ["lock", "exit"])
         self.assertFalse(summary["running"])
         self.assertEqual(summary["exit_code"], 0)
+
+    def test_runner_lock_probe_fails_closed_on_io_error(self) -> None:
+        lock_path = self.review.container_dir / state.LOCK_FILE
+        lock_path.write_bytes(b"")
+
+        with (
+            mock.patch.object(
+                state.fcntl,
+                "flock",
+                side_effect=OSError("lock service unavailable"),
+            ),
+            self.assertRaisesRegex(ReviewError, "cannot probe review runner lock"),
+        ):
+            state._runner_lock_held(lock_path)
+
+    def test_status_does_not_terminalize_runner_lock_probe_error(self) -> None:
+        self.write_completed_state()
+        (self.review.container_dir / state.EXIT_FILE).unlink()
+
+        with (
+            mock.patch.object(
+                state,
+                "_runner_lock_held",
+                side_effect=ReviewError("lock probe failed"),
+            ),
+            self.assertRaisesRegex(ReviewError, "lock probe failed"),
+        ):
+            state.status(self.review.container_dir)
+
+        self.assertFalse((self.review.container_dir / state.EXIT_FILE).exists())
+        self.assertFalse((self.review.container_dir / "runner-error.txt").exists())
 
 
 if __name__ == "__main__":
