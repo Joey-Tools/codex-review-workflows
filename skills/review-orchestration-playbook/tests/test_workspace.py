@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import json
+import os
 import pathlib
 import signal
 import subprocess
@@ -92,6 +93,69 @@ class WorkspaceTest(unittest.TestCase):
         self.assertEqual(environment["GIT_TERMINAL_PROMPT"], "0")
         self.assertEqual(environment["GIT_ASKPASS"], "/usr/bin/false")
         self.assertEqual(environment["SSH_ASKPASS"], "/usr/bin/false")
+
+    def test_partial_clone_missing_blob_fails_without_transport(self) -> None:
+        git(self.repo, "config", "uploadpack.allowFilter", "true")
+        partial = pathlib.Path(self.temporary.name) / "partial"
+        subprocess.run(
+            (
+                "git",
+                "-c",
+                "protocol.file.allow=always",
+                "clone",
+                "--filter=blob:none",
+                "--no-checkout",
+                self.repo.as_uri(),
+                str(partial),
+            ),
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        blob = git(self.repo, "rev-parse", f"{self.head}:example.txt")
+        missing = subprocess.run(
+            ("git", "-C", str(partial), "cat-file", "-e", blob),
+            check=False,
+            env=workspace_runtime._git_environment(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertNotEqual(missing.returncode, 0)
+
+        marker = pathlib.Path(self.temporary.name) / "transport-called"
+        upload_pack = pathlib.Path(self.temporary.name) / "upload-pack"
+        upload_pack.write_text(
+            f"#!/bin/sh\ntouch '{marker}'\nexit 1\n",
+            encoding="utf-8",
+        )
+        upload_pack.chmod(0o755)
+        git(partial, "config", "remote.origin.uploadpack", str(upload_pack))
+
+        transport_environment = dict(os.environ)
+        transport_environment.pop("GIT_NO_LAZY_FETCH", None)
+        transport_attempt = subprocess.run(
+            ("git", "-C", str(partial), "cat-file", "-e", blob),
+            check=False,
+            env=transport_environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertNotEqual(transport_attempt.returncode, 0)
+        self.assertTrue(marker.exists())
+        marker.unlink()
+
+        with self.assertRaisesRegex(ReviewError, "unexpected git cat-file"):
+            prepare_workspace(
+                repo=partial,
+                base_ref=self.base,
+                head_ref=self.head,
+        )
+
+        self.assertFalse(marker.exists())
+        self.assertEqual(
+            list((partial / ".codex-tmp").glob("isolated-review-*")),
+            [],
+        )
 
     def test_prepare_materializes_frozen_range_and_local_control_files(self) -> None:
         review = prepare_workspace(
