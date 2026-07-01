@@ -64,7 +64,7 @@ class ChildEnvironmentTest(unittest.TestCase):
             with (
                 mock.patch.object(common.subprocess, "Popen", return_value=process),
                 mock.patch.object(common.signal, "signal", side_effect=install_handler),
-                mock.patch.object(common, "_signal_process") as forward,
+                mock.patch.object(common, "signal_process_group") as forward,
                 mock.patch.object(common, "terminate_process_group") as terminate,
                 mock.patch.object(common, "block_forwarded_signals", return_value=None),
             ):
@@ -131,7 +131,7 @@ class ChildEnvironmentTest(unittest.TestCase):
             with (
                 mock.patch.object(common.subprocess, "Popen", side_effect=spawn),
                 mock.patch.object(common.signal, "signal", side_effect=install_handler),
-                mock.patch.object(common, "_signal_process") as forward,
+                mock.patch.object(common, "signal_process_group") as forward,
                 mock.patch.object(common, "terminate_process_group") as terminate,
                 mock.patch.object(common, "block_forwarded_signals", return_value=None),
             ):

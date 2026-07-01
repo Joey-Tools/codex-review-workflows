@@ -843,6 +843,12 @@ def run_review(
     shim_source: pathlib.Path,
     egress_consent: str | None = None,
 ) -> Outcome:
+    if reviewer not in ("codex", "claude"):
+        write_text_atomic(
+            review.container_dir / "runner-error.txt", f"unknown reviewer: {reviewer}\n"
+        )
+        return Outcome(2, None, tuple())
+
     if reviewer == "claude":
         if egress_consent not in CLAUDE_EGRESS_CONSENTS:
             write_text_atomic(
@@ -850,14 +856,23 @@ def run_review(
                 "Claude-family review requires an explicit egress-consent reason.\n",
             )
             return Outcome(2, None, tuple())
-        try:
-            validate_external_workspace(review)
-        except ReviewError as error:
-            write_text_atomic(
-                review.container_dir / "runner-error.txt",
-                f"external review workspace preflight failed: {error}\n",
-            )
-            return Outcome(2, None, tuple())
+    elif egress_consent is not None:
+        write_text_atomic(
+            review.container_dir / "runner-error.txt",
+            "egress-consent is valid only for the Claude-family reviewer.\n",
+        )
+        return Outcome(2, None, tuple())
+
+    try:
+        validate_external_workspace(review)
+    except ReviewError as error:
+        write_text_atomic(
+            review.container_dir / "runner-error.txt",
+            f"review egress workspace preflight failed: {error}\n",
+        )
+        return Outcome(2, None, tuple())
+
+    if reviewer == "claude":
         write_json(
             review.container_dir / "egress.json",
             {
@@ -878,12 +893,6 @@ def run_review(
                 "preflight": "sensitive-content and escaping-symlink checks passed",
             },
         )
-    elif egress_consent is not None:
-        write_text_atomic(
-            review.container_dir / "runner-error.txt",
-            "egress-consent is valid only for the Claude-family reviewer.\n",
-        )
-        return Outcome(2, None, tuple())
 
     attempts: list[Attempt] = []
 
@@ -905,12 +914,6 @@ def run_review(
             write_text_atomic(review.container_dir / "runner-error.txt", f"{error}\n")
             return Outcome(127, None, tuple())
         return _finish(review, attempts, final_text)
-
-    if reviewer != "claude":
-        write_text_atomic(
-            review.container_dir / "runner-error.txt", f"unknown reviewer: {reviewer}\n"
-        )
-        return Outcome(2, None, tuple())
 
     try:
         claude_available = resolve_reviewer_executable("claude") is not None

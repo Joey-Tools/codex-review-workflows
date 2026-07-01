@@ -8,8 +8,6 @@ import sys
 from .common import (
     ForwardedSignal,
     ReviewError,
-    block_forwarded_signals,
-    restore_signal_mask,
 )
 from .providers import CLAUDE_EGRESS_CONSENTS, run_review
 from .state import final, run_state, start, status, wait
@@ -137,23 +135,17 @@ def _run_stateful(argv: list[str], *, script_path: pathlib.Path) -> int:
     state_dir = pathlib.Path(getattr(args, "state_dir", "."))
     if args.action == "start":
         _validate_review_arguments(args)
-        previous_mask = block_forwarded_signals()
-        try:
-            created = start(
-                script_path=script_path,
-                repo=pathlib.Path(args.repo),
-                reviewer=args.reviewer,
-                base_ref=args.base_ref,
-                head_ref=args.head_ref,
-                prompt_file=(
-                    pathlib.Path(args.prompt_file) if args.prompt_file else None
-                ),
-                keep_workspace=args.keep_workspace,
-                egress_consent=args.egress_consent,
-            )
-            print(created, flush=True)
-        finally:
-            restore_signal_mask(previous_mask)
+        start(
+            script_path=script_path,
+            repo=pathlib.Path(args.repo),
+            reviewer=args.reviewer,
+            base_ref=args.base_ref,
+            head_ref=args.head_ref,
+            prompt_file=pathlib.Path(args.prompt_file) if args.prompt_file else None,
+            keep_workspace=args.keep_workspace,
+            egress_consent=args.egress_consent,
+            publisher=lambda created: print(created, flush=True),
+        )
         return 0
     if args.action == "status":
         print(json.dumps(status(state_dir), indent=2, sort_keys=True))

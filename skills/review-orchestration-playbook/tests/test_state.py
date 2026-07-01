@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import signal
 import subprocess
 import sys
 import tempfile
@@ -174,6 +175,90 @@ time.sleep(0.2)
         self.assertEqual(exit_code, 0)
         unblock.assert_called_once_with()
         self.assertEqual((state_dir / state.EXIT_FILE).read_text().strip(), "0")
+
+    def test_start_cancellation_during_prepare_does_not_spawn_runner(self) -> None:
+        installed: dict[signal.Signals, object] = {}
+
+        def install_handler(signum, handler):
+            previous = installed.get(signum, signal.SIG_DFL)
+            installed[signum] = handler
+            return previous
+
+        def cancel_prepare(**_kwargs):
+            handler = installed[signal.SIGTERM]
+            assert callable(handler)
+            handler(signal.SIGTERM, None)
+
+        with (
+            mock.patch.object(state.signal, "signal", side_effect=install_handler),
+            mock.patch.object(
+                state,
+                "prepare_workspace",
+                side_effect=cancel_prepare,
+            ),
+            mock.patch.object(state.subprocess, "Popen") as popen,
+        ):
+            with self.assertRaises(state.ForwardedSignal):
+                state.start(
+                    script_path=pathlib.Path("runner.py"),
+                    repo=self.repo,
+                    reviewer="codex",
+                    base_ref=self.base,
+                    head_ref=self.head,
+                    prompt_file=None,
+                    keep_workspace=False,
+                    egress_consent=None,
+                )
+
+        popen.assert_not_called()
+
+    def test_start_defers_spawn_signal_and_never_publishes_runner(self) -> None:
+        installed: dict[signal.Signals, object] = {}
+        process = mock.Mock(pid=12345)
+        publisher = mock.Mock()
+
+        def install_handler(signum, handler):
+            previous = installed.get(signum, signal.SIG_DFL)
+            installed[signum] = handler
+            return previous
+
+        def spawn(*_args, **_kwargs):
+            handler = installed[signal.SIGTERM]
+            assert callable(handler)
+            handler(signal.SIGTERM, None)
+            return process
+
+        with (
+            mock.patch.object(state.signal, "signal", side_effect=install_handler),
+            mock.patch.object(
+                state,
+                "prepare_workspace",
+                return_value=self.review,
+            ),
+            mock.patch.object(state.subprocess, "Popen", side_effect=spawn),
+            mock.patch.object(state, "signal_process_group") as forward,
+            mock.patch.object(state, "terminate_process_group") as terminate,
+            mock.patch.object(state, "cleanup_workspace"),
+        ):
+            with self.assertRaises(state.ForwardedSignal):
+                state.start(
+                    script_path=pathlib.Path("runner.py"),
+                    repo=self.repo,
+                    reviewer="codex",
+                    base_ref=self.base,
+                    head_ref=self.head,
+                    prompt_file=None,
+                    keep_workspace=False,
+                    egress_consent=None,
+                    publisher=publisher,
+                )
+
+        publisher.assert_not_called()
+        forward.assert_called_once_with(process, signal.SIGTERM)
+        terminate.assert_called_once_with(
+            process,
+            initial_signal=signal.SIGTERM,
+        )
 
     def test_final_reports_cleanup_failure_instead_of_clean_result(self) -> None:
         self.write_completed_state()

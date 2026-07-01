@@ -478,6 +478,29 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn("sensitive content preflight", error)
         self.assertNotIn(secret, error)
 
+    @mock.patch.object(providers, "_codex_attempt")
+    def test_sensitive_content_blocks_codex_before_launch(
+        self,
+        codex_attempt: mock.Mock,
+    ) -> None:
+        secret = "AKIA" + "B" * 16
+        self.review.diff_file.write_text(
+            "diff --git a/config b/config\n-AWS_KEY=" + secret + "\n",
+            encoding="utf-8",
+        )
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="codex",
+            shim_source=SCRIPTS / "git_readonly_shim",
+        )
+        self.assertEqual(outcome.returncode, 2)
+        codex_attempt.assert_not_called()
+        error = (self.review.container_dir / "runner-error.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("sensitive content preflight", error)
+        self.assertNotIn(secret, error)
+
     @mock.patch.object(providers, "resolve_reviewer_executable")
     def test_deleted_generic_token_in_diff_blocks_external_reviewer(
         self,

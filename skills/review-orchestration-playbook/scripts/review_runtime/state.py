@@ -2,16 +2,21 @@ from __future__ import annotations
 
 import fcntl
 import json
+import os
 import pathlib
+import signal
 import subprocess
 import sys
+import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 from .common import (
     ForwardedSignal,
     ReviewError,
+    forwarded_signals,
     read_json,
+    signal_process_group,
     tail_text,
     terminate_process_group,
     unblock_forwarded_signals,
@@ -119,72 +124,110 @@ def start(
     prompt_file: pathlib.Path | None,
     keep_workspace: bool,
     egress_consent: str | None,
+    publisher: Callable[[pathlib.Path], None] | None = None,
 ) -> pathlib.Path:
-    review = prepare_workspace(
-        repo=repo,
-        base_ref=base_ref,
-        head_ref=head_ref,
-        prompt_override=prompt_file,
-    )
-    state_dir = review.container_dir
-    write_text_atomic(state_dir / STATE_MARKER, "isolated-review-state-v1\n")
-    stdout_path = state_dir / "runner.stdout.log"
-    stderr_path = state_dir / "runner.stderr.log"
-    state: dict[str, Any] = {
-        "version": 1,
-        "reviewer": reviewer,
-        "workspace": review.to_json(),
-        "keep_workspace": keep_workspace,
-        "egress_consent": egress_consent,
-        "stdout_path": str(stdout_path),
-        "stderr_path": str(stderr_path),
-        "final_path": str(state_dir / "final.txt"),
-        "attempts_path": str(state_dir / "attempts.json"),
-        "started_at": time.time(),
-    }
-    write_json(state_dir / STATE_FILE, state)
-    lock_path = state_dir / LOCK_FILE
-    lock_handle = lock_path.open("wb")
-    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    process: subprocess.Popen[bytes] | None = None
+    review: ReviewWorkspace | None = None
+    lock_handle = None
+    pending_signal: signal.Signals | None = None
+    spawning = False
+    published = False
+
+    def forward_signal(signum: int, _frame: object) -> None:
+        nonlocal pending_signal
+        forwarded = signal.Signals(signum)
+        pending_signal = forwarded
+        if process is None:
+            if spawning:
+                return
+            raise ForwardedSignal(forwarded)
+        signal_process_group(process, forwarded)
+        raise ForwardedSignal(forwarded)
+
+    previous_handlers: dict[signal.Signals, object] = {}
+    if os.name == "posix" and threading.current_thread() is threading.main_thread():
+        for forwarded in forwarded_signals():
+            previous_handlers[forwarded] = signal.getsignal(forwarded)
+            signal.signal(forwarded, forward_signal)
+
     try:
+        review = prepare_workspace(
+            repo=repo,
+            base_ref=base_ref,
+            head_ref=head_ref,
+            prompt_override=prompt_file,
+        )
+        state_dir = review.container_dir
+        write_text_atomic(state_dir / STATE_MARKER, "isolated-review-state-v1\n")
+        stdout_path = state_dir / "runner.stdout.log"
+        stderr_path = state_dir / "runner.stderr.log"
+        state: dict[str, Any] = {
+            "version": 1,
+            "reviewer": reviewer,
+            "workspace": review.to_json(),
+            "keep_workspace": keep_workspace,
+            "egress_consent": egress_consent,
+            "stdout_path": str(stdout_path),
+            "stderr_path": str(stderr_path),
+            "final_path": str(state_dir / "final.txt"),
+            "attempts_path": str(state_dir / "attempts.json"),
+            "started_at": time.time(),
+        }
+        write_json(state_dir / STATE_FILE, state)
+        lock_path = state_dir / LOCK_FILE
+        lock_handle = lock_path.open("wb")
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         with (
             stdout_path.open("wb") as stdout_handle,
             stderr_path.open("wb") as stderr_handle,
         ):
-            process = subprocess.Popen(
-                (
-                    sys.executable,
-                    str(script_path),
-                    "_run-state",
-                    "--state-dir",
-                    str(state_dir),
-                    "--lock-fd",
-                    str(lock_handle.fileno()),
-                ),
-                cwd=review.workspace_root,
-                stdin=subprocess.DEVNULL,
-                stdout=stdout_handle,
-                stderr=stderr_handle,
-                start_new_session=True,
-                close_fds=True,
-                pass_fds=(lock_handle.fileno(),),
-            )
-    except BaseException:
-        lock_handle.close()
-        cleanup_workspace(review, keep_container=False)
-        raise
-    state["pid"] = process.pid
-    _STARTED_PROCESSES[process.pid] = process
-    try:
+            spawning = True
+            try:
+                process = subprocess.Popen(
+                    (
+                        sys.executable,
+                        str(script_path),
+                        "_run-state",
+                        "--state-dir",
+                        str(state_dir),
+                        "--lock-fd",
+                        str(lock_handle.fileno()),
+                    ),
+                    cwd=review.workspace_root,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout_handle,
+                    stderr=stderr_handle,
+                    start_new_session=True,
+                    close_fds=True,
+                    pass_fds=(lock_handle.fileno(),),
+                )
+            finally:
+                spawning = False
+        if pending_signal is not None:
+            signal_process_group(process, pending_signal)
+            raise ForwardedSignal(pending_signal)
+        state["pid"] = process.pid
+        _STARTED_PROCESSES[process.pid] = process
         write_json(state_dir / STATE_FILE, state)
+        published = True
+        if publisher is not None:
+            publisher(state_dir)
+        return state_dir
     except BaseException:
-        terminate_process_group(process)
-        _STARTED_PROCESSES.pop(process.pid, None)
-        cleanup_workspace(review, keep_container=False)
+        if process is not None:
+            terminate_process_group(
+                process,
+                initial_signal=pending_signal or signal.SIGTERM,
+            )
+            _STARTED_PROCESSES.pop(process.pid, None)
+        if review is not None and not published:
+            cleanup_workspace(review, keep_container=False)
         raise
     finally:
-        lock_handle.close()
-    return state_dir
+        if lock_handle is not None:
+            lock_handle.close()
+        for forwarded, previous in previous_handlers.items():
+            signal.signal(forwarded, previous)
 
 
 def run_state(*, state_dir: pathlib.Path, shim_source: pathlib.Path) -> int:

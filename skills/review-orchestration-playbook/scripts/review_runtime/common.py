@@ -163,7 +163,7 @@ def run(
     return result
 
 
-def _forwarded_signals() -> tuple[signal.Signals, ...]:
+def forwarded_signals() -> tuple[signal.Signals, ...]:
     forwarded = [signal.SIGTERM, signal.SIGINT]
     for name in ("SIGHUP", "SIGQUIT"):
         candidate = getattr(signal, name, None)
@@ -179,7 +179,7 @@ def block_forwarded_signals() -> set[signal.Signals] | None:
         or not hasattr(signal, "pthread_sigmask")
     ):
         return None
-    return signal.pthread_sigmask(signal.SIG_BLOCK, _forwarded_signals())
+    return signal.pthread_sigmask(signal.SIG_BLOCK, forwarded_signals())
 
 
 def restore_signal_mask(previous: set[signal.Signals] | None) -> None:
@@ -189,13 +189,13 @@ def restore_signal_mask(previous: set[signal.Signals] | None) -> None:
 
 def unblock_forwarded_signals() -> None:
     if os.name == "posix" and hasattr(signal, "pthread_sigmask"):
-        signal.pthread_sigmask(signal.SIG_UNBLOCK, _forwarded_signals())
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, forwarded_signals())
 
 
 def _consume_pending_forwarded_signal() -> signal.Signals | None:
     if not hasattr(signal, "sigpending") or not hasattr(signal, "sigwait"):
         return None
-    pending = set(signal.sigpending()).intersection(_forwarded_signals())
+    pending = set(signal.sigpending()).intersection(forwarded_signals())
     if not pending:
         return None
     ordered = sorted(pending, key=int)
@@ -216,7 +216,9 @@ def _process_group_exists(process_pid: int) -> bool:
     return True
 
 
-def _signal_process(process: subprocess.Popen[bytes], signum: signal.Signals) -> None:
+def signal_process_group(
+    process: subprocess.Popen[bytes], signum: signal.Signals
+) -> None:
     if os.name == "posix":
         try:
             os.killpg(process.pid, signum)
@@ -239,7 +241,7 @@ def terminate_process_group(
 ) -> None:
     if os.name != "posix":
         if process.poll() is None:
-            _signal_process(process, initial_signal)
+            signal_process_group(process, initial_signal)
             try:
                 process.wait(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
             except subprocess.TimeoutExpired:
@@ -248,7 +250,7 @@ def terminate_process_group(
         return
     if not _process_group_exists(process.pid):
         return
-    _signal_process(process, initial_signal)
+    signal_process_group(process, initial_signal)
     deadline = time.monotonic() + PROCESS_GROUP_TERM_GRACE_SECONDS
     while _process_group_exists(process.pid) and time.monotonic() < deadline:
         time.sleep(PROCESS_GROUP_POLL_SECONDS)
@@ -281,12 +283,12 @@ def _run_logged_process(
         pending_signal = forwarded
         if process is None:
             return
-        _signal_process(process, forwarded)
+        signal_process_group(process, forwarded)
         raise ForwardedSignal(forwarded)
 
     previous_handlers: dict[signal.Signals, object] = {}
     if os.name == "posix" and threading.current_thread() is threading.main_thread():
-        for forwarded in _forwarded_signals():
+        for forwarded in forwarded_signals():
             previous_handlers[forwarded] = signal.getsignal(forwarded)
             signal.signal(forwarded, forward_signal)
 
@@ -304,7 +306,7 @@ def _run_logged_process(
             start_new_session=os.name == "posix",
         )
         if pending_signal is not None:
-            _signal_process(process, pending_signal)
+            signal_process_group(process, pending_signal)
             raise ForwardedSignal(pending_signal)
         process.communicate(input=stdin)
         return int(process.returncode)
