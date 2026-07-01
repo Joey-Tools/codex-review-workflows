@@ -163,6 +163,22 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.assertEqual(exit_code, 3)
         self.assertIn("cleanup did not finish before timeout", text)
 
+    def test_final_rereads_exit_code_after_wait(self) -> None:
+        self.write_completed_state()
+
+        def finish_with_signal(*_args, **_kwargs):
+            (self.review.container_dir / state.EXIT_FILE).write_text(
+                str(128 + signal.SIGINT) + "\n",
+                encoding="utf-8",
+            )
+            return 128 + signal.SIGINT
+
+        with mock.patch.object(state, "wait", side_effect=finish_with_signal):
+            exit_code, text = state.final(self.review.container_dir)
+
+        self.assertEqual(exit_code, 128 + signal.SIGINT)
+        self.assertNotEqual(text, "No findings.")
+
     def test_forged_workspace_escape_is_rejected_before_cleanup(self) -> None:
         self.write_completed_state()
         value = self.review.to_json()
@@ -369,6 +385,8 @@ time.sleep(0.2)
         terminate.assert_called_once_with(
             process,
             initial_signal=signal.SIGTERM,
+            signal_already_sent=True,
+            grace_seconds=state.RUNNER_SHUTDOWN_GRACE_SECONDS,
         )
 
     def test_start_publisher_failure_cleans_unpublished_runner(self) -> None:
@@ -401,6 +419,8 @@ time.sleep(0.2)
         terminate.assert_called_once_with(
             process,
             initial_signal=signal.SIGTERM,
+            signal_already_sent=False,
+            grace_seconds=state.RUNNER_SHUTDOWN_GRACE_SECONDS,
         )
         cleanup.assert_called_once_with(self.review, keep_container=False)
 
@@ -450,6 +470,8 @@ time.sleep(0.2)
         terminate.assert_called_once_with(
             process,
             initial_signal=signal.SIGTERM,
+            signal_already_sent=False,
+            grace_seconds=state.RUNNER_SHUTDOWN_GRACE_SECONDS,
         )
         cleanup.assert_called_once_with(self.review, keep_container=False)
 
@@ -505,6 +527,8 @@ time.sleep(0.2)
         terminate.assert_called_once_with(
             process,
             initial_signal=signal.SIGINT,
+            signal_already_sent=True,
+            grace_seconds=state.RUNNER_SHUTDOWN_GRACE_SECONDS,
         )
         cleanup.assert_not_called()
 
@@ -620,6 +644,19 @@ time.sleep(0.2)
         self.assertFalse(summary["running"])
         self.assertEqual(summary["exit_code"], 1)
         self.assertIn("without recording", summary["runner_error"])
+
+    def test_status_treats_exit_code_as_provisional_while_runner_lock_is_held(
+        self,
+    ) -> None:
+        self.write_completed_state()
+        lock_path = self.review.container_dir / state.LOCK_FILE
+        with lock_path.open("a+b") as runner_lock:
+            state.fcntl.flock(runner_lock.fileno(), state.fcntl.LOCK_EX)
+            summary = state.status(self.review.container_dir)
+
+        self.assertTrue(summary["running"])
+        self.assertTrue(summary["runner_lock_held"])
+        self.assertIsNone(summary["exit_code"])
 
 
 if __name__ == "__main__":

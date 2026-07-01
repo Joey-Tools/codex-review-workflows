@@ -93,6 +93,26 @@ class ChildEnvironmentTest(unittest.TestCase):
                 process, initial_signal=signal.SIGTERM
             )
 
+    def test_outer_cleanup_waits_without_resending_forwarded_signal(self) -> None:
+        process = mock.Mock(pid=12345)
+        with (
+            mock.patch.object(
+                common,
+                "_process_group_exists",
+                side_effect=(True, False, False),
+            ),
+            mock.patch.object(common, "signal_process_group") as forward,
+        ):
+            common.terminate_process_group(
+                process,
+                initial_signal=signal.SIGINT,
+                signal_already_sent=True,
+                grace_seconds=2.0,
+            )
+
+        forward.assert_not_called()
+        process.wait.assert_called_once_with(timeout=2.0)
+
     def test_logged_command_preserves_signal_arriving_during_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)

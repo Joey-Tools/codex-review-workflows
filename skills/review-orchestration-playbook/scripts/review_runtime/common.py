@@ -253,20 +253,24 @@ def terminate_process_group(
     process: subprocess.Popen[bytes],
     *,
     initial_signal: signal.Signals = signal.SIGTERM,
+    signal_already_sent: bool = False,
+    grace_seconds: float = PROCESS_GROUP_TERM_GRACE_SECONDS,
 ) -> None:
     if os.name != "posix":
         if process.poll() is None:
-            signal_process_group(process, initial_signal)
+            if not signal_already_sent:
+                signal_process_group(process, initial_signal)
             try:
-                process.wait(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
+                process.wait(timeout=grace_seconds)
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
         return
     if not _process_group_exists(process.pid):
         return
-    signal_process_group(process, initial_signal)
-    deadline = time.monotonic() + PROCESS_GROUP_TERM_GRACE_SECONDS
+    if not signal_already_sent:
+        signal_process_group(process, initial_signal)
+    deadline = time.monotonic() + grace_seconds
     while _process_group_exists(process.pid) and time.monotonic() < deadline:
         time.sleep(PROCESS_GROUP_POLL_SECONDS)
     if _process_group_exists(process.pid):
@@ -275,7 +279,7 @@ def terminate_process_group(
         except ProcessLookupError:
             pass
     try:
-        process.wait(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
+        process.wait(timeout=grace_seconds)
     except subprocess.TimeoutExpired:
         pass
 

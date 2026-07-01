@@ -12,6 +12,7 @@ import time
 from typing import Any, Callable
 
 from .common import (
+    PROCESS_GROUP_TERM_GRACE_SECONDS,
     ForwardedSignal,
     ReviewError,
     block_forwarded_signals,
@@ -41,6 +42,7 @@ EXIT_FILE = "exit-code"
 LOCK_FILE = "runner.lock"
 CLEANUP_LOCK_FILE = "cleanup.lock"
 FINAL_CLEANUP_TIMEOUT_SECONDS = 30.0
+RUNNER_SHUTDOWN_GRACE_SECONDS = PROCESS_GROUP_TERM_GRACE_SECONDS * 4
 _STARTED_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
 
 
@@ -240,6 +242,8 @@ def start(
                 terminate_process_group(
                     process,
                     initial_signal=pending_signal or signal.SIGTERM,
+                    signal_already_sent=pending_signal is not None,
+                    grace_seconds=RUNNER_SHUTDOWN_GRACE_SECONDS,
                 )
                 _STARTED_PROCESSES.pop(process.pid, None)
             if review is not None and not published:
@@ -341,11 +345,11 @@ def status(state_dir: pathlib.Path) -> dict[str, Any]:
     exit_code = _read_exit_code(state_dir)
     pid_value = state.get("pid")
     pid = pid_value if isinstance(pid_value, int) else 0
-    process_running = (
-        _runner_lock_held(state_dir / LOCK_FILE) if exit_code is None else False
-    )
-    running = exit_code is None and process_running
-    if exit_code is not None:
+    process_running = _runner_lock_held(state_dir / LOCK_FILE)
+    running = process_running
+    if running:
+        exit_code = None
+    elif exit_code is not None:
         _reap_started_process(pid)
     if exit_code is None and not running:
         exit_code = 1
@@ -505,6 +509,7 @@ def final(state_dir: pathlib.Path) -> tuple[int, str]:
     cleanup_error = tail_text(state_dir.expanduser().resolve() / "cleanup-error.txt")
     if cleanup_error:
         return 1, f"review completed but workspace cleanup failed: {cleanup_error}"
+    summary = status(state_dir)
     exit_code = summary["exit_code"]
     final_path = state_dir.expanduser().resolve() / "final.txt"
     if exit_code == 0 and final_path.is_file():
