@@ -217,6 +217,8 @@ class WorkspaceTest(unittest.TestCase):
             "".join(("Pass1234", ";Word5678")),
             "".join(("0123456789abcdef", "0123456789abcdef")),
             "".join(("12345678", "90123456")),
+            "".join(("deadbeef", "deadbeef", "deadbeef", "deadbeef")),
+            "".join(("alphabetagamma", "deltaepsilonzeta")),
         )
         for credential in credentials:
             with self.subTest(credential=credential):
@@ -263,6 +265,82 @@ class WorkspaceTest(unittest.TestCase):
         with (
             mock.patch.object(workspace_runtime, "MAX_DIFF_BYTES", 1),
             self.assertRaisesRegex(ReviewError, "frozen review diff exceeds"),
+        ):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+        self.assertEqual(
+            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            [],
+        )
+
+    def test_snapshot_rejects_oversized_changed_path_metadata(self) -> None:
+        with (
+            mock.patch.object(workspace_runtime, "MAX_CHANGED_METADATA_BYTES", 1),
+            self.assertRaisesRegex(ReviewError, "frozen changed paths exceeds"),
+        ):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+        self.assertEqual(
+            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            [],
+        )
+
+    def test_snapshot_rejects_excessive_changed_path_entries(self) -> None:
+        with (
+            mock.patch.object(workspace_runtime, "MAX_CHANGED_ENTRIES", 0),
+            self.assertRaisesRegex(ReviewError, "frozen changed paths exceeds"),
+        ):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+        self.assertEqual(
+            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            [],
+        )
+
+    def test_snapshot_rejects_oversized_changed_blob_metadata(self) -> None:
+        def write_empty_changed_paths(**kwargs) -> None:
+            kwargs["destination"].touch()
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "_write_frozen_changed_paths",
+                side_effect=write_empty_changed_paths,
+            ),
+            mock.patch.object(workspace_runtime, "MAX_CHANGED_METADATA_BYTES", 1),
+            self.assertRaisesRegex(ReviewError, "changed blob metadata exceeds"),
+        ):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+        self.assertEqual(
+            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            [],
+        )
+
+    def test_snapshot_rejects_excessive_changed_blob_entries(self) -> None:
+        def write_empty_changed_paths(**kwargs) -> None:
+            kwargs["destination"].touch()
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "_write_frozen_changed_paths",
+                side_effect=write_empty_changed_paths,
+            ),
+            mock.patch.object(workspace_runtime, "MAX_CHANGED_ENTRIES", 0),
+            self.assertRaisesRegex(ReviewError, "changed blob metadata exceeds"),
         ):
             prepare_workspace(
                 repo=self.repo,

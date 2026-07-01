@@ -105,6 +105,8 @@ MAX_SNAPSHOT_BLOB_BYTES = 64 * 1024 * 1024
 MAX_SNAPSHOT_BYTES = 512 * 1024 * 1024
 MAX_SNAPSHOT_ENTRIES = 100_000
 MAX_DIFF_BYTES = 128 * 1024 * 1024
+MAX_CHANGED_METADATA_BYTES = 128 * 1024 * 1024
+MAX_CHANGED_ENTRIES = 100_000
 MAX_CHANGED_BLOB_SCAN_BYTES = 512 * 1024 * 1024
 LONG_ALPHANUMERIC_SECRET = re.compile(rb"[A-Za-z0-9]{24,512}")
 LONG_NUMERIC_SECRET = re.compile(rb"[0-9]{16,512}")
@@ -441,12 +443,20 @@ def _copy_limited(
     *,
     limit: int,
     label: str,
+    record_limit: int | None = None,
 ) -> int:
     copied = 0
+    records = 0
     while chunk := stream.read(1024 * 1024):
         copied += len(chunk)
         if copied > limit:
             raise ReviewError(f"{label} exceeds the {limit}-byte review limit")
+        if record_limit is not None:
+            records += chunk.count(b"\0")
+            if records > record_limit:
+                raise ReviewError(
+                    f"{label} exceeds the {record_limit}-entry review limit"
+                )
         destination.write(chunk)
     return copied
 
@@ -728,6 +738,44 @@ def _write_frozen_diff(
             )
 
 
+def _write_limited_diff_metadata(
+    *,
+    git_view: pathlib.Path,
+    object_directory: pathlib.Path,
+    args: tuple[str, ...],
+    output: BinaryIO,
+    error_output: BinaryIO,
+    label: str,
+    record_limit: int,
+) -> None:
+    process = subprocess.Popen(
+        _frozen_command(git_view=git_view, args=args),
+        env=_git_environment(object_directory=object_directory),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=error_output,
+    )
+    if process.stdout is None:
+        _stop_process(process)
+        raise ReviewError(f"failed to create {label} pipe")
+    try:
+        _copy_limited(
+            process.stdout,
+            output,
+            limit=MAX_CHANGED_METADATA_BYTES,
+            label=label,
+            record_limit=record_limit,
+        )
+        _close_pipe(process.stdout)
+        returncode = process.wait()
+    except BaseException:
+        _close_pipe(process.stdout)
+        _stop_process(process)
+        raise
+    if returncode != 0:
+        raise ReviewError(f"cannot generate {label}: {_process_stderr(error_output)}")
+
+
 def _write_frozen_changed_paths(
     *,
     git_view: pathlib.Path,
@@ -737,28 +785,22 @@ def _write_frozen_changed_paths(
     destination: pathlib.Path,
 ) -> None:
     with destination.open("xb") as output, tempfile.TemporaryFile() as error_output:
-        completed = subprocess.run(
-            _frozen_command(
-                git_view=git_view,
-                args=(
-                    "diff",
-                    "--name-only",
-                    "-z",
-                    "--no-renames",
-                    base_sha,
-                    head_sha,
-                ),
+        _write_limited_diff_metadata(
+            git_view=git_view,
+            object_directory=object_directory,
+            args=(
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                base_sha,
+                head_sha,
             ),
-            env=_git_environment(object_directory=object_directory),
-            stdin=subprocess.DEVNULL,
-            stdout=output,
-            stderr=error_output,
-            check=False,
+            output=output,
+            error_output=error_output,
+            label="frozen changed paths",
+            record_limit=MAX_CHANGED_ENTRIES,
         )
-        if completed.returncode != 0:
-            raise ReviewError(
-                f"cannot generate frozen changed paths: {_process_stderr(error_output)}"
-            )
 
 
 def _scan_batch_blob(
@@ -806,29 +848,23 @@ def _write_changed_blob_findings(
         tempfile.TemporaryFile() as cat_error,
         destination.open("xb") as findings_output,
     ):
-        completed = subprocess.run(
-            _frozen_command(
-                git_view=git_view,
-                args=(
-                    "diff",
-                    "--raw",
-                    "-z",
-                    "--no-abbrev",
-                    "--no-renames",
-                    base_sha,
-                    head_sha,
-                ),
+        _write_limited_diff_metadata(
+            git_view=git_view,
+            object_directory=object_directory,
+            args=(
+                "diff",
+                "--raw",
+                "-z",
+                "--no-abbrev",
+                "--no-renames",
+                base_sha,
+                head_sha,
             ),
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=raw_output,
-            stderr=raw_error,
-            check=False,
+            output=raw_output,
+            error_output=raw_error,
+            label="changed blob metadata",
+            record_limit=MAX_CHANGED_ENTRIES * 2,
         )
-        if completed.returncode != 0:
-            raise ReviewError(
-                f"cannot enumerate changed blobs: {_process_stderr(raw_error)}"
-            )
         raw_output.seek(0)
         cat_process = subprocess.Popen(
             _frozen_command(git_view=git_view, args=("cat-file", "--batch")),
@@ -1142,9 +1178,7 @@ def _is_placeholder_secret(candidate: bytes) -> bool:
 def _looks_like_unquoted_secret(candidate: bytes) -> bool:
     if LONG_NUMERIC_SECRET.fullmatch(candidate):
         return True
-    if LONG_ALPHANUMERIC_SECRET.fullmatch(candidate) and any(
-        48 <= value <= 57 for value in candidate
-    ):
+    if LONG_ALPHANUMERIC_SECRET.fullmatch(candidate):
         return True
     character_classes = sum(
         (
