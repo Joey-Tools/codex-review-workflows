@@ -510,6 +510,24 @@ class WorkspaceTest(unittest.TestCase):
         review_root = self.repo / ".codex-tmp"
         self.assertFalse(review_root.exists())
 
+    def test_diverged_range_reports_merge_base_before_creating_container(self) -> None:
+        git(self.repo, "switch", "-c", "diverged", self.base)
+        (self.repo / "side.txt").write_text("side\n", encoding="utf-8")
+        git(self.repo, "add", "side.txt")
+        git(self.repo, "commit", "-m", "Diverge")
+        diverged = git(self.repo, "rev-parse", "HEAD")
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            rf"not an ancestor.*merge base {self.base}",
+        ):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=diverged,
+                head_ref=self.head,
+            )
+        self.assertFalse((self.repo / ".codex-tmp").exists())
+
     def test_keyboard_interrupt_cleans_partial_review_container(self) -> None:
         with (
             mock.patch(

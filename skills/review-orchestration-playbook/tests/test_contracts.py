@@ -35,11 +35,11 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(providers.CODEX_REASONING_EFFORT, "xhigh")
         self.assertEqual(
             providers.CLAUDE_MODELS,
-            ("claude-opus-4-8", "claude-opus-4-7"),
+            ("claude-sonnet-5", "claude-opus-4-8", "claude-opus-4-7"),
         )
         self.assertEqual(
             providers.COPILOT_MODELS,
-            ("claude-opus-4.8", "claude-opus-4.7"),
+            ("claude-sonnet-5", "claude-opus-4.8", "claude-opus-4.7"),
         )
         with (REPO_ROOT / "agents/reviewer.toml").open("rb") as handle:
             reviewer = tomllib.load(handle)
@@ -106,7 +106,7 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertIn("if Claude Code is unavailable", consent)
         self.assertIn(
-            "both pinned Claude models are entitlement-blocked",
+            "all pinned Claude models are entitlement-blocked",
             consent,
         )
 

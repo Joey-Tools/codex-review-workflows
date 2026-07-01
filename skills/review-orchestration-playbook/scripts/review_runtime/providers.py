@@ -22,8 +22,10 @@ from .workspace import ReviewWorkspace, validate_external_workspace
 
 CODEX_MODELS = ("gpt-5.6-sol", "gpt-5.5")
 CODEX_REASONING_EFFORT = "xhigh"
-CLAUDE_MODELS = ("claude-opus-4-8", "claude-opus-4-7")
-COPILOT_MODELS = ("claude-opus-4.8", "claude-opus-4.7")
+CLAUDE_MODELS = ("claude-sonnet-5", "claude-opus-4-8", "claude-opus-4-7")
+# GitHub's supported-models matrix lists all pinned IDs for Copilot CLI. The
+# shorter command-reference examples can lag product availability.
+COPILOT_MODELS = ("claude-sonnet-5", "claude-opus-4.8", "claude-opus-4.7")
 CLAUDE_REASONING_EFFORT = "max"
 COPILOT_REASONING_EFFORT = "max"
 COPILOT_PERMISSION_HELP_FRAGMENTS = (
@@ -38,7 +40,8 @@ CLAUDE_SAFE_MODE_HELP_FRAGMENTS = (
     "all customizations",
     "claude.md",
     "disabled",
-    "auth, model selection, built-in tools, and permissions work normally",
+    "model selection, built-in tools, and permissions work normally",
+    "claude_code_safe_mode=1",
 )
 CLAUDE_EGRESS_CONSENTS = (
     "explicit-claude-review",
@@ -55,7 +58,6 @@ CLAUDE_ENV_KEYS = (
 )
 COPILOT_ENV_KEYS = (
     "COPILOT_GITHUB_TOKEN",
-    "COPILOT_HOME",
     "GH_TOKEN",
     "GITHUB_TOKEN",
 )
@@ -326,6 +328,11 @@ def _structured_error_text(stdout: bytes) -> str:
         if "error" in value:
             messages.extend(_error_payload_text(value["error"]))
         if explicit_error:
+            if "errors" in value:
+                messages.extend(_error_payload_text(value["errors"]))
+            api_error_status = value.get("api_error_status")
+            if isinstance(api_error_status, (int, str)):
+                messages.append(f"status {api_error_status}")
             for key in ("message", "result", "reason", "detail", "data"):
                 if key in value:
                     messages.extend(_error_payload_text(value[key]))
@@ -841,6 +848,8 @@ def _claude_attempt(
             settings,
             "--tools",
             "Read,Grep,Glob",
+            "--allowedTools",
+            "Read,Grep,Glob",
             "--disallowedTools",
             "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Task",
         ),
@@ -880,6 +889,15 @@ def _copilot_attempt(
             "copilot is not available in a validated executable path"
         )
     env = _with_executable_path(env, executable)
+    copilot_home = review.container_dir / "copilot-home"
+    try:
+        copilot_home.mkdir(mode=0o700, exist_ok=True)
+    except OSError as error:
+        raise ReviewError(f"cannot create isolated Copilot home: {error}") from error
+    if copilot_home.is_symlink() or not copilot_home.is_dir():
+        raise ReviewError("isolated Copilot home is not a real directory")
+    env = dict(env)
+    env["COPILOT_HOME"] = str(copilot_home)
     permission_help = run((str(executable), "help", "permissions"), env=env)
     normalized_permission_help = " ".join(
         (permission_help.stdout + b"\n" + permission_help.stderr)

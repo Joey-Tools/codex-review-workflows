@@ -163,6 +163,28 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         self.assertEqual(providers.classify_failure(stdout, ""), "entitlement")
 
+    def test_claude_errors_field_can_trigger_entitlement_fallback(self) -> None:
+        stdout = json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "errors": ["Model is not available for your account"],
+            }
+        )
+        self.assertEqual(providers.classify_failure(stdout, ""), "entitlement")
+
+    def test_claude_api_error_status_can_trigger_transient_classification(self) -> None:
+        stdout = json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "api_error_status": 429,
+            }
+        )
+        self.assertEqual(providers.classify_failure(stdout, ""), "transient")
+
     def test_structured_error_result_cannot_be_accepted_as_final_text(self) -> None:
         stdout = json.dumps(
             {
@@ -294,7 +316,7 @@ class ProviderPolicyTest(unittest.TestCase):
     )
     @mock.patch.object(providers, "_copilot_attempt")
     @mock.patch.object(providers, "_claude_attempt")
-    def test_claude_family_order_is_claude_48_47_then_copilot_48_47(
+    def test_claude_family_order_is_sonnet_5_then_opus_on_both_runtimes(
         self,
         claude_attempt: mock.Mock,
         copilot_attempt: mock.Mock,
@@ -305,11 +327,13 @@ class ProviderPolicyTest(unittest.TestCase):
             self.attempt("claude", model, "entitlement")
             for model in providers.CLAUDE_MODELS
         )
-        copilot_attempt.side_effect = (
-            self.attempt("copilot", providers.COPILOT_MODELS[0], "entitlement"),
+        copilot_attempt.side_effect = tuple(
+            self.attempt("copilot", model, "entitlement")
+            for model in providers.COPILOT_MODELS[:-1]
+        ) + (
             self.attempt(
                 "copilot",
-                providers.COPILOT_MODELS[1],
+                providers.COPILOT_MODELS[-1],
                 "success",
                 final_text="No findings.",
             ),
@@ -323,8 +347,10 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(
             [(item.runtime, item.requested_model) for item in outcome.attempts],
             [
+                ("claude", "claude-sonnet-5"),
                 ("claude", "claude-opus-4-8"),
                 ("claude", "claude-opus-4-7"),
+                ("copilot", "claude-sonnet-5"),
                 ("copilot", "claude-opus-4.8"),
                 ("copilot", "claude-opus-4.7"),
             ],
@@ -348,7 +374,7 @@ class ProviderPolicyTest(unittest.TestCase):
         _environment: mock.Mock,
     ) -> None:
         claude_attempt.return_value = self.attempt(
-            "claude", "claude-opus-4-8", "transient"
+            "claude", providers.CLAUDE_MODELS[0], "transient"
         )
         outcome = providers.run_review(
             review=self.review,
@@ -1106,6 +1132,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("--permission-mode") + 1], "dontAsk")
         self.assertNotIn("--prompt-suggestions", argv)
         self.assertEqual(argv[argv.index("--tools") + 1], "Read,Grep,Glob")
+        self.assertEqual(argv[argv.index("--allowedTools") + 1], "Read,Grep,Glob")
         settings = json.loads(argv[argv.index("--settings") + 1])
         self.assertIn("Read(~/.ssh/**)", settings["permissions"]["deny"])
         self.assertIn("--safe-mode", argv)
@@ -1139,6 +1166,24 @@ class ProviderPolicyTest(unittest.TestCase):
             )
 
         self.assertEqual(run_command.call_count, 1)
+
+    @mock.patch.object(providers, "run")
+    def test_claude_accepts_documented_safe_mode_wording(
+        self,
+        run_command: mock.Mock,
+    ) -> None:
+        run_command.return_value = Completed(
+            argv=("claude", "--help"),
+            returncode=0,
+            stdout=(
+                b"--safe-mode all customizations including CLAUDE.md are disabled; "
+                b"Authentication, model selection, built-in tools, and permissions "
+                b"work normally. Sets CLAUDE_CODE_SAFE_MODE=1."
+            ),
+            stderr=b"",
+        )
+
+        providers._require_claude_safe_mode(pathlib.Path("/bin/claude"), {})
 
     @mock.patch.object(
         providers,
@@ -1193,6 +1238,11 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertNotIn("--add-dir", argv)
         self.assertIn("--no-auto-update", argv)
         self.assertIn("--secret-env-vars=GH_TOKEN", argv)
+        self.assertEqual(
+            run_command.call_args_list[1].kwargs["env"]["COPILOT_HOME"],
+            str(self.review.container_dir / "copilot-home"),
+        )
+        self.assertTrue((self.review.container_dir / "copilot-home").is_dir())
 
     @mock.patch.object(
         providers,

@@ -301,6 +301,35 @@ def resolve_commit(repo: pathlib.Path, ref: str, *, label: str) -> str:
     return result.stdout.decode("utf-8").strip()
 
 
+def _require_ancestor_range(
+    repo: pathlib.Path,
+    *,
+    base_sha: str,
+    head_sha: str,
+) -> None:
+    ancestor = _git(
+        repo,
+        "merge-base",
+        "--is-ancestor",
+        base_sha,
+        head_sha,
+        check=False,
+    )
+    if ancestor.returncode == 0:
+        return
+    if ancestor.returncode != 1:
+        raise ReviewError("cannot verify that the frozen base is an ancestor of head")
+    merge_base = _git(repo, "merge-base", base_sha, head_sha, check=False)
+    if merge_base.returncode == 0 and merge_base.stdout.strip():
+        suggestion = merge_base.stdout.decode("ascii").strip()
+        detail = f"; use merge base {suggestion} as --base-ref"
+    else:
+        detail = "; the commits have no merge base"
+    raise ReviewError(
+        f"frozen base {base_sha} is not an ancestor of head {head_sha}{detail}"
+    )
+
+
 def _remove_partial_container(container: pathlib.Path) -> str | None:
     try:
         shutil.rmtree(container)
@@ -1287,6 +1316,11 @@ def prepare_workspace(
     source_root = resolve_repo_root(repo)
     base_sha = resolve_commit(source_root, base_ref, label="base ref")
     head_sha = resolve_commit(source_root, head_ref, label="head ref")
+    _require_ancestor_range(
+        source_root,
+        base_sha=base_sha,
+        head_sha=head_sha,
+    )
     container, handoff_mask = _new_container(source_root)
     ownership_transferred = False
 
