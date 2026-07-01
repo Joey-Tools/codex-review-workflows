@@ -528,6 +528,42 @@ class WorkspaceTest(unittest.TestCase):
             )
         self.assertFalse((self.repo / ".codex-tmp").exists())
 
+    def test_ancestor_check_ignores_local_replace_refs(self) -> None:
+        git(self.repo, "switch", "-c", "replace-diverged", self.base)
+        (self.repo / "replace-side.txt").write_text("side\n", encoding="utf-8")
+        git(self.repo, "add", "replace-side.txt")
+        git(self.repo, "commit", "-m", "Replace diverge")
+        diverged = git(self.repo, "rev-parse", "HEAD")
+        head_tree = git(self.repo, "rev-parse", f"{self.head}^{{tree}}")
+        replacement = git(
+            self.repo,
+            "commit-tree",
+            head_tree,
+            "-p",
+            diverged,
+            "-m",
+            "Replacement head",
+        )
+        git(self.repo, "replace", self.head, replacement)
+
+        self.assertEqual(
+            git(
+                self.repo,
+                "merge-base",
+                "--is-ancestor",
+                diverged,
+                self.head,
+            ),
+            "",
+        )
+        with self.assertRaisesRegex(ReviewError, "not an ancestor"):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=diverged,
+                head_ref=self.head,
+            )
+        self.assertFalse((self.repo / ".codex-tmp").exists())
+
     def test_keyboard_interrupt_cleans_partial_review_container(self) -> None:
         with (
             mock.patch(
