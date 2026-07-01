@@ -899,11 +899,20 @@ class ProviderPolicyTest(unittest.TestCase):
         _resolve: mock.Mock,
     ) -> None:
         payload = {"result": "No findings.", "model": "claude-opus-4.8"}
-        run_command.return_value = Completed(
-            argv=("copilot",),
-            returncode=0,
-            stdout=json.dumps(payload).encode(),
-            stderr=b"",
+        permission_help = " ".join(providers.COPILOT_PERMISSION_HELP_FRAGMENTS)
+        run_command.side_effect = (
+            Completed(
+                argv=("copilot", "help", "permissions"),
+                returncode=0,
+                stdout=permission_help.encode(),
+                stderr=b"",
+            ),
+            Completed(
+                argv=("copilot",),
+                returncode=0,
+                stdout=json.dumps(payload).encode(),
+                stderr=b"",
+            ),
         )
         providers._copilot_attempt(
             review=self.review,
@@ -911,7 +920,8 @@ class ProviderPolicyTest(unittest.TestCase):
             index=1,
             env={"GH_TOKEN": "secret"},
         )
-        argv = run_command.call_args.args[0]
+        argv = run_command.call_args_list[1].args[0]
+        self.assertEqual(argv[argv.index("-C") + 1], str(self.review.workspace_root))
         self.assertIn("claude-opus-4.8", argv)
         self.assertEqual(argv[argv.index("--reasoning-effort") + 1], "max")
         self.assertEqual(argv[argv.index("--mode") + 1], "plan")
@@ -919,9 +929,38 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn("--no-custom-instructions", argv)
         self.assertIn("--deny-tool=write", argv)
         self.assertIn("--deny-tool=shell", argv)
+        self.assertIn("--deny-tool=url", argv)
         self.assertIn("--disallow-temp-dir", argv)
+        self.assertNotIn("--allow-all-paths", argv)
+        self.assertNotIn("--add-dir", argv)
         self.assertIn("--no-auto-update", argv)
         self.assertIn("--secret-env-vars=GH_TOKEN", argv)
+
+    @mock.patch.object(
+        providers,
+        "resolve_reviewer_executable",
+        return_value=pathlib.Path("/bin/copilot"),
+    )
+    @mock.patch.object(providers, "run")
+    def test_copilot_refuses_unverified_path_permission_semantics(
+        self,
+        run_command: mock.Mock,
+        _resolve: mock.Mock,
+    ) -> None:
+        run_command.return_value = Completed(
+            argv=("copilot", "help", "permissions"),
+            returncode=0,
+            stdout=b"generic help",
+            stderr=b"",
+        )
+        with self.assertRaisesRegex(ReviewError, "cwd-only path verifier"):
+            providers._copilot_attempt(
+                review=self.review,
+                model="claude-opus-4.8",
+                index=1,
+                env={"GH_TOKEN": "secret"},
+            )
+        self.assertEqual(run_command.call_count, 1)
 
 
 if __name__ == "__main__":

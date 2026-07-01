@@ -26,6 +26,11 @@ CLAUDE_MODELS = ("claude-opus-4-8", "claude-opus-4-7")
 COPILOT_MODELS = ("claude-opus-4.8", "claude-opus-4.7")
 CLAUDE_REASONING_EFFORT = "max"
 COPILOT_REASONING_EFFORT = "max"
+COPILOT_PERMISSION_HELP_FRAGMENTS = (
+    "by default, file access is restricted to paths within the current working directory",
+    "--disallow-temp-dir flag prevents automatic access",
+    "denial rules always take precedence over allow rules, even --allow-all-tools",
+)
 CLAUDE_EGRESS_CONSENTS = (
     "explicit-claude-review",
     "double-review",
@@ -858,9 +863,26 @@ def _copilot_attempt(
             "copilot is not available in a validated executable path"
         )
     env = _with_executable_path(env, executable)
+    permission_help = run((str(executable), "help", "permissions"), env=env)
+    normalized_permission_help = " ".join(
+        (permission_help.stdout + b"\n" + permission_help.stderr)
+        .decode("utf-8", errors="replace")
+        .lower()
+        .split()
+    )
+    if permission_help.returncode != 0 or any(
+        fragment not in normalized_permission_help
+        for fragment in COPILOT_PERMISSION_HELP_FRAGMENTS
+    ):
+        raise ReviewError(
+            "Copilot CLI did not expose the required cwd-only path verifier, "
+            "temporary-directory denial, and deny-over-allow permission semantics"
+        )
     stdout_path, stderr_path = _attempt_paths(review, index, "copilot", model)
     command = [
         str(executable),
+        "-C",
+        str(review.workspace_root),
         "--prompt",
         review.prompt_file.read_text(encoding="utf-8"),
         "--model",
@@ -874,6 +896,7 @@ def _copilot_attempt(
         "--allow-all-tools",
         "--deny-tool=write",
         "--deny-tool=shell",
+        "--deny-tool=url",
         "--disallow-temp-dir",
         "--disable-builtin-mcps",
         "--no-bash-env",
