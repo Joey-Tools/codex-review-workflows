@@ -592,6 +592,7 @@ def _codex_attempt(
             "-c",
             f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"',
             "exec",
+            "--skip-git-repo-check",
             "--ignore-user-config",
             "--ignore-rules",
             "--strict-config",

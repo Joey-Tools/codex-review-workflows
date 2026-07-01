@@ -687,6 +687,7 @@ class ProviderPolicyTest(unittest.TestCase):
             any("shell_environment_policy.set" in value for value in configs)
         )
         self.assertNotIn("parent-only-secret", "\n".join(configs))
+        self.assertIn("--skip-git-repo-check", argv)
         self.assertIn("--ignore-user-config", argv)
         self.assertIn("--ignore-rules", argv)
         self.assertIn("--strict-config", argv)
