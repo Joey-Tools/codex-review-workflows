@@ -27,6 +27,8 @@ COPILOT_MODELS = ("claude-opus-4.8", "claude-opus-4.7")
 CLAUDE_REASONING_EFFORT = "max"
 COPILOT_REASONING_EFFORT = "max"
 COPILOT_PERMISSION_HELP_FRAGMENTS = (
+    "tool availability is controlled via the --available-tools and --excluded-tools options",
+    "these filters decide which tools the model can see",
     "by default, file access is restricted to paths within the current working directory",
     "--disallow-temp-dir flag prevents automatic access",
     "denial rules always take precedence over allow rules, even --allow-all-tools",
@@ -842,8 +844,6 @@ def _claude_attempt(
             "dontAsk",
             "--output-format",
             "json",
-            "--prompt-suggestions",
-            "false",
             "--no-session-persistence",
             "--safe-mode",
             "--no-chrome",
@@ -926,6 +926,7 @@ def _copilot_attempt(
         "json",
         "--mode",
         "plan",
+        "--available-tools=view,glob,grep",
         "--allow-all-tools",
         "--deny-tool=write",
         "--deny-tool=shell",
@@ -1080,6 +1081,15 @@ def run_review(
             f"review egress workspace preflight failed: {error}\n",
         )
         return Outcome(2, None, tuple())
+
+    write_json(
+        review.container_dir / "preflight.json",
+        {
+            "review_range": f"{review.base_ref}..{review.head_ref}",
+            "scope": "frozen tracked workspace, diff, and review prompt",
+            "status": "sensitive-content and escaping-symlink checks passed",
+        },
+    )
 
     if reviewer == "claude":
         write_json(

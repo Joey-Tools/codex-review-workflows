@@ -527,6 +527,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(outcome.returncode, 2)
         resolve.assert_not_called()
         self.assertFalse((self.review.container_dir / "egress.json").exists())
+        self.assertFalse((self.review.container_dir / "preflight.json").exists())
         error = (self.review.container_dir / "runner-error.txt").read_text(
             encoding="utf-8"
         )
@@ -550,11 +551,42 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         self.assertEqual(outcome.returncode, 2)
         codex_attempt.assert_not_called()
+        self.assertFalse((self.review.container_dir / "preflight.json").exists())
         error = (self.review.container_dir / "runner-error.txt").read_text(
             encoding="utf-8"
         )
         self.assertIn("sensitive content preflight", error)
         self.assertNotIn(secret, error)
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_codex_preflight_evidence_precedes_model_launch(
+        self,
+        run_model_chain: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        def inspect_preflight(**_kwargs):
+            evidence = json.loads(
+                (self.review.container_dir / "preflight.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                evidence["review_range"],
+                f"{self.review.base_ref}..{self.review.head_ref}",
+            )
+            return "success", "No findings."
+
+        run_model_chain.side_effect = inspect_preflight
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="codex",
+            shim_source=SCRIPTS / "git_readonly_shim",
+        )
+
+        self.assertEqual(outcome.returncode, 0)
+        self.assertEqual(outcome.final_text, "No findings.")
 
     @mock.patch.object(providers, "resolve_reviewer_executable")
     def test_deleted_generic_token_in_diff_blocks_external_reviewer(
@@ -889,7 +921,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn("claude-opus-4-8", argv)
         self.assertEqual(argv[argv.index("--effort") + 1], "max")
         self.assertEqual(argv[argv.index("--permission-mode") + 1], "dontAsk")
-        self.assertEqual(argv[argv.index("--prompt-suggestions") + 1], "false")
+        self.assertNotIn("--prompt-suggestions", argv)
         self.assertEqual(argv[argv.index("--tools") + 1], "Read,Grep,Glob")
         settings = json.loads(argv[argv.index("--settings") + 1])
         self.assertIn("Read(~/.ssh/**)", settings["permissions"]["deny"])
@@ -963,6 +995,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn("claude-opus-4.8", argv)
         self.assertEqual(argv[argv.index("--reasoning-effort") + 1], "max")
         self.assertEqual(argv[argv.index("--mode") + 1], "plan")
+        self.assertIn("--available-tools=view,glob,grep", argv)
         self.assertIn("--disable-builtin-mcps", argv)
         self.assertIn("--no-custom-instructions", argv)
         self.assertIn("--deny-tool=write", argv)

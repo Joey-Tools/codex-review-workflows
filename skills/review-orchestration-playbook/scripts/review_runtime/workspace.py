@@ -38,7 +38,10 @@ SECRET_PATTERNS = (
     ("aws-access-key", re.compile(rb"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
     (
         "aws-secret-key",
-        re.compile(rb"(?i)aws_secret_access_key\s*[:=]\s*['\"]?[A-Za-z0-9/+=]{40}\b"),
+        re.compile(
+            rb"(?i)aws_secret_access_key\s*[:=]\s*['\"]?"
+            rb"[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])"
+        ),
     ),
     ("anthropic-key", re.compile(rb"\bsk-ant-[A-Za-z0-9_-]{32,}\b")),
     ("openai-key", re.compile(rb"\bsk-(?:proj-)?[A-Za-z0-9_-]{32,}\b")),
@@ -905,7 +908,8 @@ def validate_external_workspace(review: ReviewWorkspace) -> None:
                 changed_path = os.fsdecode(raw_path)
                 path_rule = _sensitive_path_rule(changed_path)
                 if path_rule:
-                    record_finding(f"{changed_path} ({path_rule}; changed-path)")
+                    path_display = _redact_secret_path(changed_path, "changed path")
+                    record_finding(f"{path_display} ({path_rule}; changed-path)")
     except OSError as error:
         raise ReviewError(
             f"cannot validate external review changed paths: {error}"
@@ -945,7 +949,8 @@ def validate_external_workspace(review: ReviewWorkspace) -> None:
             continue
         path_rule = _sensitive_path_rule(relative)
         if path_rule:
-            record_finding(f"{relative} ({path_rule})")
+            path_display = _redact_secret_path(relative, "snapshot path")
+            record_finding(f"{path_display} ({path_rule})")
             continue
         if candidate.is_symlink():
             try:
@@ -979,7 +984,20 @@ def validate_external_workspace(review: ReviewWorkspace) -> None:
 def _redact_secret_path(value: str, label: str) -> str:
     if _value_secret_rule(os.fsencode(value)):
         return f"<redacted {label}>"
-    return value
+    escaped: list[str] = []
+    for character in value:
+        codepoint = ord(character)
+        if character == "\\":
+            escaped.append("\\\\")
+        elif character.isprintable() and not 0xD800 <= codepoint <= 0xDFFF:
+            escaped.append(character)
+        elif codepoint <= 0xFF:
+            escaped.append(f"\\x{codepoint:02x}")
+        elif codepoint <= 0xFFFF:
+            escaped.append(f"\\u{codepoint:04x}")
+        else:
+            escaped.append(f"\\U{codepoint:08x}")
+    return "".join(escaped)
 
 
 def _sensitive_path_rule(relative: str) -> str | None:
@@ -1008,8 +1026,10 @@ def _file_secret_rule(path: pathlib.Path) -> str | None:
         with path.open("rb") as handle:
             return _stream_secret_rule(handle)
     except OSError as error:
+        path_display = _redact_secret_path(os.fspath(path), "snapshot path")
+        error_code = f" (errno {error.errno})" if error.errno is not None else ""
         raise ReviewError(
-            f"cannot scan external review content {path}: {error}"
+            f"cannot scan external review content {path_display}{error_code}"
         ) from error
 
 

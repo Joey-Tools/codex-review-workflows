@@ -20,6 +20,7 @@ from review_runtime.workspace import (  # noqa: E402
     _file_secret_rule,
     _parse_tree_record,
     _sensitive_path_rule,
+    _value_secret_rule,
     cleanup_workspace,
     prepare_workspace as _prepare_workspace,
     validate_external_workspace,
@@ -163,6 +164,29 @@ class WorkspaceTest(unittest.TestCase):
             _parse_tree_record(reserved)
         self.assertIn("<redacted snapshot path>", str(reserved_error.exception))
         self.assertNotIn(secret, str(reserved_error.exception))
+
+        unsafe = b"100644 blob " + b"b" * 40 + b"\tline\n\x1b\xff/.."
+        with self.assertRaises(ReviewError) as unsafe_error:
+            _parse_tree_record(unsafe)
+        diagnostic = str(unsafe_error.exception)
+        self.assertNotIn("\n", diagnostic)
+        self.assertNotIn("\x1b", diagnostic)
+        self.assertIn("\\x0a", diagnostic)
+        self.assertIn("\\x1b", diagnostic)
+        self.assertIn("\\udcff", diagnostic)
+        diagnostic.encode("utf-8")
+
+    def test_aws_secret_key_matches_nonword_terminal_characters(self) -> None:
+        for terminal in b"/+=":
+            with self.subTest(terminal=chr(terminal)):
+                value = b"A" * 39 + bytes([terminal])
+                self.assertEqual(
+                    _value_secret_rule(b"aws_secret_access_key=" + value),
+                    "aws-secret-key",
+                )
+                self.assertIsNone(
+                    _value_secret_rule(b"aws_secret_access_key=" + value + b"A")
+                )
 
     def test_materialization_os_error_redacts_secret_path(self) -> None:
         secret = "AKIA" + "B" * 16

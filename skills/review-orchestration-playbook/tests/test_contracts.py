@@ -60,6 +60,11 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("independent-codex-pr-review", value)
             self.assertIn("offline-frozen-diff-review", value)
         self.assertIn("standalone double/triple-review", readiness)
+        self.assertLess(
+            readiness.index("3. Run `offline-frozen-diff-review` first"),
+            readiness.index("4. After the helper preflight passes"),
+        )
+        self.assertIn("Require its retained `preflight.json`", readiness)
 
     def test_review_prompts_do_not_use_unbounded_only_matching_samples(self) -> None:
         forbidden = "rg -o --max-count 80"
