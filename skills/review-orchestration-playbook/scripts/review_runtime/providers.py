@@ -849,7 +849,7 @@ def _claude_attempt(
             "--tools",
             "Read,Grep,Glob",
             "--allowedTools",
-            "Read,Grep,Glob",
+            "Read(./**)",
             "--disallowedTools",
             "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Task",
         ),
