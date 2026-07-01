@@ -66,7 +66,7 @@ QUOTED_SECRET_ASSIGNMENT = re.compile(
 )
 UNQUOTED_SECRET_ASSIGNMENT = re.compile(
     SECRET_KEY_PATTERN
-    + rb"([-A-Za-z0-9_./+=!@$%^&*?~:]{16,512})(?=[ \t]*(?:[#;]|\r?$))",
+    + rb"([-A-Za-z0-9_./+=!@#$%^&*?~:;]{16,512})(?=[ \t]*(?:[#;]|\r?$))",
     re.MULTILINE,
 )
 PLACEHOLDER_SECRET_PATTERN = re.compile(
@@ -101,6 +101,13 @@ SENSITIVE_FILE_NAMES = {
 SENSITIVE_SUFFIXES = (".jks", ".keystore", ".p12", ".pfx")
 SAFE_ENV_SUFFIXES = (".example", ".sample", ".template")
 PROTECTED_REVIEW_PATHS = (".codex", ".agents")
+MAX_SNAPSHOT_BLOB_BYTES = 64 * 1024 * 1024
+MAX_SNAPSHOT_BYTES = 512 * 1024 * 1024
+MAX_SNAPSHOT_ENTRIES = 100_000
+MAX_DIFF_BYTES = 128 * 1024 * 1024
+MAX_CHANGED_BLOB_SCAN_BYTES = 512 * 1024 * 1024
+LONG_ALPHANUMERIC_SECRET = re.compile(rb"[A-Za-z0-9]{24,512}")
+LONG_NUMERIC_SECRET = re.compile(rb"[0-9]{16,512}")
 
 
 @dataclass(frozen=True)
@@ -428,6 +435,22 @@ def _copy_exact(stream: BinaryIO, destination: BinaryIO, size: int) -> None:
         remaining -= len(chunk)
 
 
+def _copy_limited(
+    stream: BinaryIO,
+    destination: BinaryIO,
+    *,
+    limit: int,
+    label: str,
+) -> int:
+    copied = 0
+    while chunk := stream.read(1024 * 1024):
+        copied += len(chunk)
+        if copied > limit:
+            raise ReviewError(f"{label} exceeds the {limit}-byte review limit")
+        destination.write(chunk)
+    return copied
+
+
 def _materialize_blob(
     *,
     cat_input: BinaryIO,
@@ -436,7 +459,8 @@ def _materialize_blob(
     destination: pathlib.Path,
     object_id: str,
     mode: str,
-) -> None:
+    materialized_bytes: int,
+) -> int:
     destination_display = _redact_secret_path(
         os.fspath(destination),
         "snapshot path",
@@ -458,6 +482,14 @@ def _materialize_blob(
         raise ReviewError(f"invalid git cat-file object id: {header!r}") from error
     if actual_object_id != object_id or object_type != b"blob":
         raise ReviewError(f"unexpected git cat-file object: {header!r}")
+
+    if mode != "120000" and size > MAX_SNAPSHOT_BLOB_BYTES:
+        raise ReviewError(
+            "frozen Git tree blob exceeds the per-file review limit: "
+            f"{destination_display}"
+        )
+    if size > MAX_SNAPSHOT_BYTES - materialized_bytes:
+        raise ReviewError("frozen Git tree exceeds the total review snapshot limit")
 
     resolved_parent = destination.parent.resolve(strict=False)
     if not is_relative_to(resolved_parent, workspace_root.resolve(strict=False)):
@@ -500,6 +532,7 @@ def _materialize_blob(
         )
     if cat_output.read(1) != b"\n":
         raise ReviewError("missing delimiter after git cat-file blob")
+    return materialized_bytes + size
 
 
 def _stop_process(process: subprocess.Popen[bytes]) -> None:
@@ -575,8 +608,15 @@ def _materialize_frozen_tree(
             raise ReviewError(
                 "failed to create pipes for frozen Git tree materialization"
             )
+        materialized_bytes = 0
+        materialized_entries = 0
         try:
             for record in _iter_nul_records(tree_process.stdout):
+                materialized_entries += 1
+                if materialized_entries > MAX_SNAPSHOT_ENTRIES:
+                    raise ReviewError(
+                        "frozen Git tree exceeds the review entry-count limit"
+                    )
                 mode, object_type, object_id, relative = _parse_tree_record(record)
                 destination = workspace_root.joinpath(*relative.parts)
                 path_display = _redact_secret_path(
@@ -600,13 +640,14 @@ def _materialize_frozen_tree(
                             "unsupported object in frozen Git tree: "
                             f"{object_type} {path_display}"
                         )
-                    _materialize_blob(
+                    materialized_bytes = _materialize_blob(
                         cat_input=cat_process.stdin,
                         cat_output=cat_process.stdout,
                         workspace_root=workspace_root,
                         destination=destination,
                         object_id=object_id,
                         mode=mode,
+                        materialized_bytes=materialized_bytes,
                     )
                 except OSError as error:
                     error_code = (
@@ -647,7 +688,7 @@ def _write_frozen_diff(
     destination: pathlib.Path,
 ) -> None:
     with destination.open("xb") as output, tempfile.TemporaryFile() as error_output:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             _frozen_command(
                 git_view=git_view,
                 args=(
@@ -662,11 +703,26 @@ def _write_frozen_diff(
             ),
             env=_git_environment(object_directory=object_directory),
             stdin=subprocess.DEVNULL,
-            stdout=output,
+            stdout=subprocess.PIPE,
             stderr=error_output,
-            check=False,
         )
-        if completed.returncode != 0:
+        if process.stdout is None:
+            _stop_process(process)
+            raise ReviewError("failed to create frozen review diff pipe")
+        try:
+            _copy_limited(
+                process.stdout,
+                output,
+                limit=MAX_DIFF_BYTES,
+                label="frozen review diff",
+            )
+            _close_pipe(process.stdout)
+            returncode = process.wait()
+        except BaseException:
+            _close_pipe(process.stdout)
+            _stop_process(process)
+            raise
+        if returncode != 0:
             raise ReviewError(
                 f"cannot generate frozen review diff: {_process_stderr(error_output)}"
             )
@@ -710,7 +766,8 @@ def _scan_batch_blob(
     cat_input: BinaryIO,
     cat_output: BinaryIO,
     object_id: str,
-) -> str | None:
+    scanned_bytes: int,
+) -> tuple[str | None, int]:
     cat_input.write(object_id.encode("ascii") + b"\n")
     cat_input.flush()
     header = cat_output.readline()
@@ -724,10 +781,14 @@ def _scan_batch_blob(
         raise ReviewError(f"invalid git cat-file scan header: {header!r}") from error
     if actual_object != object_id:
         raise ReviewError(f"unexpected git cat-file scan object: {header!r}")
+    if size > MAX_SNAPSHOT_BLOB_BYTES:
+        raise ReviewError("changed Git blob exceeds the per-file review scan limit")
+    if size > MAX_CHANGED_BLOB_SCAN_BYTES - scanned_bytes:
+        raise ReviewError("changed Git blobs exceed the total review scan limit")
     rule = _stream_secret_rule(cat_output, size=size)
     if cat_output.read(1) != b"\n":
         raise ReviewError("missing delimiter after scanned git cat-file blob")
-    return rule
+    return rule, scanned_bytes + size
 
 
 def _write_changed_blob_findings(
@@ -781,6 +842,7 @@ def _write_changed_blob_findings(
             raise ReviewError("failed to create pipes for changed Git blob scanning")
         try:
             records = iter(_iter_nul_records(raw_output))
+            scanned_bytes = 0
             for metadata in records:
                 if not metadata.startswith(b":"):
                     raise ReviewError(f"invalid raw Git diff record: {metadata!r}")
@@ -806,10 +868,11 @@ def _write_changed_blob_findings(
                         raise ReviewError(
                             f"invalid changed Git object id: {raw_object!r}"
                         ) from error
-                    rule = _scan_batch_blob(
+                    rule, scanned_bytes = _scan_batch_blob(
                         cat_input=cat_process.stdin,
                         cat_output=cat_process.stdout,
                         object_id=object_id,
+                        scanned_bytes=scanned_bytes,
                     )
                     if rule:
                         findings_output.write(
@@ -1077,6 +1140,12 @@ def _is_placeholder_secret(candidate: bytes) -> bool:
 
 
 def _looks_like_unquoted_secret(candidate: bytes) -> bool:
+    if LONG_NUMERIC_SECRET.fullmatch(candidate):
+        return True
+    if LONG_ALPHANUMERIC_SECRET.fullmatch(candidate) and any(
+        48 <= value <= 57 for value in candidate
+    ):
+        return True
     character_classes = sum(
         (
             any(97 <= value <= 122 for value in candidate),

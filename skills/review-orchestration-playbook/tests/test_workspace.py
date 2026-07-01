@@ -213,6 +213,10 @@ class WorkspaceTest(unittest.TestCase):
             "".join(("StrongPass", "123456")),
             "".join(("StrongProductionPass", "123456!")),
             "".join(("StrongProductionPass", "123456@corp")),
+            "".join(("Pass1234", "#Word5678")),
+            "".join(("Pass1234", ";Word5678")),
+            "".join(("0123456789abcdef", "0123456789abcdef")),
+            "".join(("12345678", "90123456")),
         )
         for credential in credentials:
             with self.subTest(credential=credential):
@@ -221,6 +225,69 @@ class WorkspaceTest(unittest.TestCase):
                     _value_secret_rule(payload),
                     "generic-secret-assignment",
                 )
+        self.assertIsNone(
+            _value_secret_rule(b"password: example-test-secret # placeholder")
+        )
+
+    def test_snapshot_rejects_oversized_single_blob_before_materializing(self) -> None:
+        with (
+            mock.patch.object(workspace_runtime, "MAX_SNAPSHOT_BLOB_BYTES", 1),
+            self.assertRaisesRegex(ReviewError, "per-file review limit"),
+        ):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+        self.assertEqual(
+            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            [],
+        )
+
+    def test_snapshot_rejects_oversized_total_before_materializing(self) -> None:
+        with (
+            mock.patch.object(workspace_runtime, "MAX_SNAPSHOT_BYTES", 1),
+            self.assertRaisesRegex(ReviewError, "total review snapshot limit"),
+        ):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+        self.assertEqual(
+            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            [],
+        )
+
+    def test_snapshot_rejects_oversized_generated_diff(self) -> None:
+        with (
+            mock.patch.object(workspace_runtime, "MAX_DIFF_BYTES", 1),
+            self.assertRaisesRegex(ReviewError, "frozen review diff exceeds"),
+        ):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+        self.assertEqual(
+            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            [],
+        )
+
+    def test_snapshot_rejects_oversized_changed_blob_scan(self) -> None:
+        with (
+            mock.patch.object(workspace_runtime, "MAX_CHANGED_BLOB_SCAN_BYTES", 1),
+            self.assertRaisesRegex(ReviewError, "total review scan limit"),
+        ):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+        self.assertEqual(
+            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            [],
+        )
 
     def test_materialization_os_error_redacts_secret_path(self) -> None:
         secret = "AKIA" + "B" * 16
