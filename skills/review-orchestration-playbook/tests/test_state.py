@@ -128,6 +128,27 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.assertFalse(self.review.workspace_root.exists())
         self.assertFalse((self.review.container_dir / "cleanup-error.txt").exists())
 
+    def test_wait_clears_stale_cleanup_error_after_successful_retry(self) -> None:
+        self.write_completed_state()
+        cleanup_error_path = self.review.container_dir / "cleanup-error.txt"
+        with mock.patch.object(
+            state,
+            "cleanup_workspace",
+            return_value="cannot remove workspace",
+        ):
+            self.assertEqual(
+                state.wait(self.review.container_dir, timeout_seconds=None),
+                1,
+            )
+
+        self.assertTrue(cleanup_error_path.is_file())
+        self.assertEqual(
+            state.wait(self.review.container_dir, timeout_seconds=None),
+            0,
+        )
+        self.assertFalse(self.review.workspace_root.exists())
+        self.assertFalse(cleanup_error_path.exists())
+
     def test_wait_timeout_includes_cleanup_lock(self) -> None:
         self.write_completed_state()
         lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE

@@ -443,6 +443,7 @@ def wait(
         time.sleep(0.25 if remaining is None else min(0.25, max(0.0, remaining)))
 
     cleanup_lock_path = state_dir / CLEANUP_LOCK_FILE
+    cleanup_error_path = state_dir / "cleanup-error.txt"
     with cleanup_lock_path.open("a+b") as cleanup_lock:
         if not _acquire_cleanup_lock(cleanup_lock, deadline=deadline):
             return 124
@@ -463,9 +464,17 @@ def wait(
                 if not cleanup_completed:
                     return 124
                 if cleanup_error:
-                    write_text_atomic(state_dir / "cleanup-error.txt", cleanup_error + "\n")
+                    write_text_atomic(cleanup_error_path, cleanup_error + "\n")
                     return 1
-            if (state_dir / "cleanup-error.txt").is_file():
+            if not keep_workspace and not review.workspace_root.exists():
+                try:
+                    cleanup_error_path.unlink(missing_ok=True)
+                except OSError as error:
+                    raise ReviewError(
+                        f"cannot clear resolved cleanup error {cleanup_error_path}: "
+                        f"{error}"
+                    ) from error
+            if cleanup_error_path.is_file():
                 return 1
             exit_code = _read_exit_code(state_dir)
             return 1 if exit_code is None else exit_code
