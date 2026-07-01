@@ -126,6 +126,7 @@ class ReadonlyGitShimTest(unittest.TestCase):
     def test_blocks_repository_routing_options(self) -> None:
         for args in (
             ("-C", str(self.repo), "status"),
+            ("--bare", "status"),
             (f"--git-dir={self.repo / '.git'}", "status"),
             ("--work-tree", str(self.repo), "status"),
         ):
@@ -133,6 +134,20 @@ class ReadonlyGitShimTest(unittest.TestCase):
                 completed = self.run_shim(*args)
                 self.assertEqual(completed.returncode, 126)
                 self.assertIn("blocked global option", completed.stderr)
+
+    def test_symbolic_ref_is_limited_to_readonly_queries(self) -> None:
+        readonly = self.run_shim("symbolic-ref", "--short", "HEAD")
+        self.assertEqual(readonly.returncode, 0, readonly.stderr)
+        self.assertEqual(readonly.stdout.strip(), "master")
+
+        for args in (
+            ("symbolic-ref", "HEAD", "refs/heads/other"),
+            ("symbolic-ref", "--delete", "HEAD"),
+        ):
+            with self.subTest(args=args):
+                blocked = self.run_shim(*args)
+                self.assertEqual(blocked.returncode, 126)
+                self.assertIn("blocked subcommand: symbolic-ref", blocked.stderr)
 
     def test_does_not_discover_parent_repository(self) -> None:
         snapshot = self.repo / "snapshot"

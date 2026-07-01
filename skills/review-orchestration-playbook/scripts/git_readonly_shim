@@ -44,6 +44,8 @@ BLOCKED_FLAGS_WITH_VALUE = BLOCKED_REPOSITORY_SELECTOR_FLAGS | {
     "--exec-path",
 }
 
+BLOCKED_GLOBAL_FLAGS = {"--bare"}
+
 META_FLAGS = {"--help", "--version"}
 
 BLOCKED_LONG_FLAGS_WITH_VALUE = {
@@ -199,6 +201,8 @@ def _parse_argv(argv: list[str]) -> tuple[str, str | None, int | None]:
         arg = argv[index]
         if arg in META_FLAGS:
             return "meta", arg, index
+        if arg in BLOCKED_GLOBAL_FLAGS:
+            return "blocked-option", arg, index
         if arg in BLOCKED_FLAGS_WITH_VALUE:
             return "blocked-option", arg, index
         if arg == "-c":
@@ -414,6 +418,25 @@ def _is_readonly_apply(
     return any(readonly_modes.values())
 
 
+def _is_readonly_symbolic_ref(
+    forwarded_args: list[str],
+    *,
+    subcommand_index: int | None,
+) -> bool:
+    if subcommand_index is None:
+        return False
+    positional_count = 0
+    for arg in forwarded_args[subcommand_index + 1:]:
+        if arg == "--":
+            continue
+        if arg in {"-q", "--quiet", "--short", "--no-recurse"}:
+            continue
+        if arg.startswith("-"):
+            return False
+        positional_count += 1
+    return positional_count == 1
+
+
 def _exec_argv(
     real_git: str,
     review_root: str,
@@ -491,6 +514,15 @@ def main() -> int:
         )
     ):
         print("readonly git shim blocked subcommand: apply", file=sys.stderr)
+        return 126
+    if (
+        value == "symbolic-ref"
+        and not _is_readonly_symbolic_ref(
+            forwarded_args,
+            subcommand_index=subcommand_index,
+        )
+    ):
+        print("readonly git shim blocked subcommand: symbolic-ref", file=sys.stderr)
         return 126
     if (
         action == "meta"
