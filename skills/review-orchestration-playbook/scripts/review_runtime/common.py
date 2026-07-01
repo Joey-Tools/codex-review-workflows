@@ -553,10 +553,14 @@ def require_path_within(
 
 def install_readonly_git_shim(
     *,
-    container_dir: pathlib.Path,
+    workspace_root: pathlib.Path,
     source: pathlib.Path,
 ) -> pathlib.Path:
-    shim_dir = container_dir / "tool-shims"
+    shim_dir = require_path_within(
+        workspace_root / ".codex-review/tool-shims",
+        workspace_root,
+        label="readonly Git shim directory",
+    )
     shim_dir.mkdir(parents=True, exist_ok=True)
     target = shim_dir / "git"
     text = source.read_text(encoding="utf-8")
@@ -572,13 +576,15 @@ def install_readonly_git_shim(
 def child_environment(
     *,
     container_dir: pathlib.Path,
+    workspace_root: pathlib.Path,
     shim_source: pathlib.Path,
     passthrough_keys: Iterable[str] = (),
     extra: dict[str, str] | None = None,
 ) -> dict[str, str]:
     real_git = resolve_git()
     shim_dir = install_readonly_git_shim(
-        container_dir=container_dir, source=shim_source
+        workspace_root=workspace_root,
+        source=shim_source,
     )
     allowed_keys = {*BASE_ENV_KEYS, *passthrough_keys}
     env = {key: os.environ[key] for key in allowed_keys if key in os.environ}

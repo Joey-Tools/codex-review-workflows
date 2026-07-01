@@ -188,6 +188,7 @@ class ChildEnvironmentTest(unittest.TestCase):
     def test_passes_only_review_runtime_and_auth_environment(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             container = pathlib.Path(temporary)
+            workspace_root = container / "workspace"
             with (
                 mock.patch.dict(
                     common.os.environ,
@@ -208,11 +209,12 @@ class ChildEnvironmentTest(unittest.TestCase):
                 mock.patch.object(
                     common,
                     "install_readonly_git_shim",
-                    return_value=container / "tool-shims",
+                    return_value=workspace_root / ".codex-review/tool-shims",
                 ),
             ):
                 env = common.child_environment(
                     container_dir=container,
+                    workspace_root=workspace_root,
                     shim_source=SCRIPTS / "git_readonly_shim",
                     passthrough_keys=("GH_TOKEN",),
                 )
@@ -223,6 +225,24 @@ class ChildEnvironmentTest(unittest.TestCase):
         self.assertEqual(env["GIT_SSL_CAINFO"], "/etc/git-ca.pem")
         self.assertNotIn("UNRELATED_PRIVATE_VALUE", env)
         self.assertNotIn("DATABASE_PASSWORD", env)
+
+    def test_installs_git_shim_inside_workspace_control_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            container = pathlib.Path(temporary)
+            workspace_root = container / "workspace"
+            (workspace_root / ".codex-review").mkdir(parents=True)
+
+            shim_dir = common.install_readonly_git_shim(
+                workspace_root=workspace_root,
+                source=SCRIPTS / "git_readonly_shim",
+            )
+
+            self.assertEqual(
+                shim_dir,
+                (workspace_root / ".codex-review/tool-shims").resolve(),
+            )
+            self.assertTrue((shim_dir / "git").is_file())
+            self.assertTrue((shim_dir / "git").stat().st_mode & 0o100)
 
     def test_explicit_reviewer_path_requires_expected_cli_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

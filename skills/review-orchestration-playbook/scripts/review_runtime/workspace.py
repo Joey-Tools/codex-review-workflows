@@ -434,6 +434,10 @@ def _materialize_blob(
     object_id: str,
     mode: str,
 ) -> None:
+    destination_display = _redact_secret_path(
+        os.fspath(destination),
+        "snapshot path",
+    )
     cat_input.write(object_id.encode("ascii") + b"\n")
     cat_input.flush()
     header = cat_output.readline()
@@ -454,27 +458,33 @@ def _materialize_blob(
 
     resolved_parent = destination.parent.resolve(strict=False)
     if not is_relative_to(resolved_parent, workspace_root.resolve(strict=False)):
-        raise ReviewError(f"frozen Git tree path escapes workspace: {destination}")
+        raise ReviewError(
+            f"frozen Git tree path escapes workspace: {destination_display}"
+        )
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     if mode == "120000":
         if size > 16 * 1024:
             raise ReviewError(
-                f"oversized symlink target in frozen Git tree: {destination}"
+                f"oversized symlink target in frozen Git tree: {destination_display}"
             )
         target_bytes = _read_exact(cat_output, size)
         if b"\0" in target_bytes:
-            raise ReviewError(f"NUL in frozen Git tree symlink target: {destination}")
+            raise ReviewError(
+                f"NUL in frozen Git tree symlink target: {destination_display}"
+            )
         target_text = os.fsdecode(target_bytes)
         try:
             target = (destination.parent / target_text).resolve(strict=False)
         except RuntimeError as error:
             raise ReviewError(
-                f"symlink loop in frozen Git tree: {destination}"
+                f"symlink loop in frozen Git tree: {destination_display}"
             ) from error
         if not is_relative_to(target, workspace_root.resolve(strict=False)):
+            target_display = _redact_secret_path(target_text, "symlink target")
             raise ReviewError(
-                f"frozen Git tree symlink escapes workspace: {destination} -> {target_text}"
+                "frozen Git tree symlink escapes workspace: "
+                f"{destination_display} -> {target_display}"
             )
         destination.symlink_to(target_text)
     elif mode in {"100644", "100755"}:
@@ -482,7 +492,9 @@ def _materialize_blob(
             _copy_exact(cat_output, handle, size)
         destination.chmod(0o755 if mode == "100755" else 0o644)
     else:
-        raise ReviewError(f"unsupported mode in frozen Git tree: {mode} {destination}")
+        raise ReviewError(
+            f"unsupported mode in frozen Git tree: {mode} {destination_display}"
+        )
     if cat_output.read(1) != b"\n":
         raise ReviewError("missing delimiter after git cat-file blob")
 
@@ -836,13 +848,22 @@ def validate_external_workspace(review: ReviewWorkspace) -> None:
     for candidate in review.workspace_root.rglob("*"):
         if not candidate.is_symlink():
             continue
+        relative = candidate.relative_to(review.workspace_root).as_posix()
+        candidate_display = _redact_secret_path(relative, "snapshot path")
         try:
             target = candidate.resolve(strict=False)
         except RuntimeError as error:
-            raise ReviewError(f"external review symlink loop: {candidate}") from error
-        if not is_relative_to(target, workspace_root):
             raise ReviewError(
-                f"external review symlink escapes the frozen workspace: {candidate} -> {target}"
+                f"external review symlink loop: {candidate_display}"
+            ) from error
+        if not is_relative_to(target, workspace_root):
+            target_display = _redact_secret_path(
+                os.fspath(target),
+                "symlink target",
+            )
+            raise ReviewError(
+                "external review symlink escapes the frozen workspace: "
+                f"{candidate_display} -> {target_display}"
             )
 
     sensitive_findings: list[str] = []
@@ -858,6 +879,13 @@ def validate_external_workspace(review: ReviewWorkspace) -> None:
     try:
         with changed_paths_file.open("rb") as handle:
             for raw_path in _iter_nul_records(handle):
+                path_secret_rule = _value_secret_rule(raw_path)
+                if path_secret_rule:
+                    record_finding(
+                        f"<redacted changed path> "
+                        f"({path_secret_rule}; changed-path-name)"
+                    )
+                    continue
                 changed_path = os.fsdecode(raw_path)
                 path_rule = _sensitive_path_rule(changed_path)
                 if path_rule:
@@ -882,29 +910,33 @@ def validate_external_workspace(review: ReviewWorkspace) -> None:
                     raise ReviewError(
                         "external review changed-blob findings are malformed"
                     ) from error
-                record_finding(f"{os.fsdecode(raw_path)} ({rule}; {side}-blob)")
+                path_display = _redact_secret_path(
+                    os.fsdecode(raw_path),
+                    "changed blob path",
+                )
+                record_finding(f"{path_display} ({rule}; {side}-blob)")
     except OSError as error:
         raise ReviewError(
             f"cannot validate external review changed blobs: {error}"
         ) from error
     for candidate in review.workspace_root.rglob("*"):
         relative = candidate.relative_to(review.workspace_root).as_posix()
-        path_rule = _sensitive_path_rule(relative)
-        if path_rule:
-            record_finding(f"{relative} ({path_rule})")
-            continue
         path_secret_rule = _value_secret_rule(os.fsencode(relative))
         if path_secret_rule:
             record_finding(
                 f"<redacted snapshot path> ({path_secret_rule}; path-name)"
             )
             continue
+        path_rule = _sensitive_path_rule(relative)
+        if path_rule:
+            record_finding(f"{relative} ({path_rule})")
+            continue
         if candidate.is_symlink():
             try:
                 target = os.readlink(candidate)
             except OSError as error:
                 raise ReviewError(
-                    f"cannot inspect external review symlink {candidate}: {error}"
+                    f"cannot inspect external review symlink {relative}: {error}"
                 ) from error
             target_secret_rule = _value_secret_rule(os.fsencode(target))
             if target_secret_rule:
@@ -926,6 +958,12 @@ def validate_external_workspace(review: ReviewWorkspace) -> None:
             "sensitive content preflight blocked external review; remove or narrow "
             f"these paths before egress: {summary}"
         )
+
+
+def _redact_secret_path(value: str, label: str) -> str:
+    if _value_secret_rule(os.fsencode(value)):
+        return f"<redacted {label}>"
+    return value
 
 
 def _sensitive_path_rule(relative: str) -> str | None:

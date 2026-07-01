@@ -292,6 +292,24 @@ class WorkspaceTest(unittest.TestCase):
         with self.assertRaises(ReviewError):
             validate_external_workspace(review)
 
+    def test_escaping_secret_symlink_target_is_redacted(self) -> None:
+        secret = "sk-" + "A" * 40
+        (self.repo / "artifact").symlink_to(pathlib.Path("../..") / secret)
+        git(self.repo, "add", "artifact")
+        git(self.repo, "commit", "-m", "Add escaping secret-shaped symlink")
+        secret_head = git(self.repo, "rev-parse", "HEAD")
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            r"artifact -> <redacted symlink target>",
+        ) as raised:
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.head,
+                head_ref=secret_head,
+            )
+        self.assertNotIn(secret, str(raised.exception))
+
     def test_unchanged_sensitive_path_symlink_blocks_external_review(self) -> None:
         (self.repo / "public.txt").write_text("ordinary content\n", encoding="utf-8")
         credentials = self.repo / "fixtures"
@@ -336,6 +354,28 @@ class WorkspaceTest(unittest.TestCase):
         with self.assertRaisesRegex(
             ReviewError,
             r"<redacted snapshot path>.*openai-key.*path-name",
+        ) as raised:
+            validate_external_workspace(review)
+        self.assertNotIn(secret, str(raised.exception))
+
+    def test_secret_in_sensitive_changed_path_is_redacted(self) -> None:
+        secret = "sk-" + "A" * 40
+        secret_path = self.repo / secret / ".netrc"
+        secret_path.parent.mkdir()
+        secret_path.write_text("ordinary content\n", encoding="utf-8")
+        git(self.repo, "add", str(secret_path.relative_to(self.repo)))
+        git(self.repo, "commit", "-m", "Add secret-bearing credential path")
+        secret_head = git(self.repo, "rev-parse", "HEAD")
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.head,
+            head_ref=secret_head,
+        )
+        self.reviews.append(review)
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            r"<redacted changed path>.*openai-key.*changed-path-name",
         ) as raised:
             validate_external_workspace(review)
         self.assertNotIn(secret, str(raised.exception))

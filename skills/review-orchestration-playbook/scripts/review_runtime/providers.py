@@ -175,6 +175,7 @@ def _review_environment(
         review_values.update(extra)
     return child_environment(
         container_dir=review.container_dir,
+        workspace_root=review.workspace_root,
         shim_source=shim_source,
         passthrough_keys=passthrough_keys,
         extra=review_values,
