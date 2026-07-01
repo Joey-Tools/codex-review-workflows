@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import pathlib
 import subprocess
 import sys
@@ -30,6 +31,10 @@ def git(repo: pathlib.Path, *args: str) -> str:
         text=True,
     )
     return completed.stdout.strip()
+
+
+def oauth_refresh_credential() -> str:
+    return "1//" + "".join(("oauth", "-refresh", "-credential", "-value"))
 
 
 class WorkspaceTest(unittest.TestCase):
@@ -206,7 +211,7 @@ class WorkspaceTest(unittest.TestCase):
     def test_oauth_refresh_token_is_detected_in_head_content(self) -> None:
         credential = pathlib.Path(self.temporary.name) / "oauth.json"
         credential.write_text(
-            '{"refresh_token": "1//oauth-refresh-credential-value"}\n',
+            json.dumps({"refresh_token": oauth_refresh_credential()}) + "\n",
             encoding="utf-8",
         )
         self.assertEqual(_file_secret_rule(credential), "generic-secret-assignment")
@@ -214,7 +219,7 @@ class WorkspaceTest(unittest.TestCase):
     def test_deleted_oauth_refresh_token_is_detected_from_base_blob(self) -> None:
         credential = self.repo / "oauth.json"
         credential.write_text(
-            '{"refresh_token": "1//oauth-refresh-credential-value"}\n',
+            json.dumps({"refresh_token": oauth_refresh_credential()}) + "\n",
             encoding="utf-8",
         )
         git(self.repo, "add", "oauth.json")
