@@ -460,18 +460,20 @@ def wait(
         if not _acquire_cleanup_lock(cleanup_lock, deadline=deadline):
             return 124
         cleanup_lock_transferred = False
+
+        def transfer_cleanup_lock() -> None:
+            nonlocal cleanup_lock_transferred
+            cleanup_lock_transferred = True
+
         try:
             state, review = load_review_state(state_dir)
             keep_workspace = bool(state.get("keep_workspace"))
             if review.workspace_root.exists() and not keep_workspace:
-                (
-                    cleanup_completed,
-                    cleanup_error,
-                    cleanup_lock_transferred,
-                ) = _cleanup_before_deadline(
+                cleanup_completed, cleanup_error = _cleanup_before_deadline(
                     review,
                     deadline=deadline,
                     cleanup_lock_fd=cleanup_lock.fileno(),
+                    lock_handoff=transfer_cleanup_lock,
                 )
                 if not cleanup_completed:
                     return 124
@@ -512,47 +514,52 @@ def _cleanup_before_deadline(
     *,
     deadline: float | None,
     cleanup_lock_fd: int,
-) -> tuple[bool, str | None, bool]:
+    lock_handoff: Callable[[], None],
+) -> tuple[bool, str | None]:
     if deadline is None:
-        return True, cleanup_workspace(review, keep_container=True), False
+        return True, cleanup_workspace(review, keep_container=True)
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        return False, None, False
+        return False, None
     worker_path = pathlib.Path(__file__).resolve().with_name("cleanup_worker.py")
+    handoff_mask = block_forwarded_signals()
     try:
-        worker = subprocess.Popen(
-            (
-                sys.executable,
-                str(worker_path),
-                str(review.container_dir),
-                str(cleanup_lock_fd),
-            ),
-            close_fds=True,
-            pass_fds=(cleanup_lock_fd,),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except OSError as error:
-        return True, f"cannot start bounded cleanup worker: {error}", False
+        try:
+            worker = subprocess.Popen(
+                (
+                    sys.executable,
+                    str(worker_path),
+                    str(review.container_dir),
+                    str(cleanup_lock_fd),
+                ),
+                close_fds=True,
+                pass_fds=(cleanup_lock_fd,),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as error:
+            return True, f"cannot start bounded cleanup worker: {error}"
+        lock_handoff()
+    finally:
+        restore_signal_mask(handoff_mask)
 
     while True:
         returncode = worker.poll()
         if returncode is not None:
             if returncode == 0:
-                return True, None, False
+                return True, None
             cleanup_error = tail_text(review.container_dir / "cleanup-error.txt")
             return (
                 True,
                 cleanup_error or "cleanup worker exited without completing",
-                False,
             )
         if time.monotonic() >= deadline:
             threading.Thread(
                 target=worker.wait,
                 daemon=True,
             ).start()
-            return False, None, True
+            return False, None
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
 

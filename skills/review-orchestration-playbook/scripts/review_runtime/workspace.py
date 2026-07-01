@@ -65,7 +65,8 @@ QUOTED_SECRET_ASSIGNMENT = re.compile(
     SECRET_KEY_PATTERN + rb"(['\"])([^\r\n'\"]{16,512})\1"
 )
 UNQUOTED_SECRET_ASSIGNMENT = re.compile(
-    SECRET_KEY_PATTERN + rb"([A-Za-z0-9_./+=-]{20,512})(?=[ \t]*(?:[#;]|\r?$))",
+    SECRET_KEY_PATTERN
+    + rb"([-A-Za-z0-9_./+=!@$%^&*?~:]{16,512})(?=[ \t]*(?:[#;]|\r?$))",
     re.MULTILINE,
 )
 PLACEHOLDER_SECRET_PATTERN = re.compile(
@@ -1081,7 +1082,13 @@ def _looks_like_unquoted_secret(candidate: bytes) -> bool:
             any(97 <= value <= 122 for value in candidate),
             any(65 <= value <= 90 for value in candidate),
             any(48 <= value <= 57 for value in candidate),
-            any(value in b"_./+=-" for value in candidate),
+            any(
+                33 <= value <= 126
+                and not 48 <= value <= 57
+                and not 65 <= value <= 90
+                and not 97 <= value <= 122
+                for value in candidate
+            ),
         )
     )
     return character_classes >= 3 and any(48 <= value <= 57 for value in candidate)

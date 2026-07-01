@@ -208,6 +208,20 @@ class WorkspaceTest(unittest.TestCase):
             "generic-secret-assignment",
         )
 
+    def test_unquoted_secret_accepts_common_password_punctuation(self) -> None:
+        credentials = (
+            "".join(("StrongPass", "123456")),
+            "".join(("StrongProductionPass", "123456!")),
+            "".join(("StrongProductionPass", "123456@corp")),
+        )
+        for credential in credentials:
+            with self.subTest(credential=credential):
+                payload = b"password: " + credential.encode()
+                self.assertEqual(
+                    _value_secret_rule(payload),
+                    "generic-secret-assignment",
+                )
+
     def test_materialization_os_error_redacts_secret_path(self) -> None:
         secret = "AKIA" + "B" * 16
         (self.repo / secret).write_text("secret-shaped path\n", encoding="utf-8")

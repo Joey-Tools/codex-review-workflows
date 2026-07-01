@@ -209,6 +209,21 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.assertLess(elapsed, 0.5)
         worker.wait.assert_called_once_with()
 
+    def test_wait_interruption_keeps_cleanup_worker_lock_owned(self) -> None:
+        self.write_completed_state()
+        worker = mock.Mock()
+        worker.poll.side_effect = KeyboardInterrupt
+
+        with (
+            mock.patch.object(state.subprocess, "Popen", return_value=worker),
+            mock.patch.object(state, "_acquire_cleanup_lock", return_value=True),
+            mock.patch.object(state.fcntl, "flock") as flock,
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            state.wait(self.review.container_dir, timeout_seconds=1)
+
+        flock.assert_not_called()
+
     def test_final_reports_bounded_cleanup_timeout(self) -> None:
         self.write_completed_state()
         with mock.patch.object(state, "wait", return_value=124):
