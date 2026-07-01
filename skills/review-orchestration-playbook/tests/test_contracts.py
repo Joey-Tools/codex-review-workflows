@@ -49,6 +49,18 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("external-review-playbook", workflow)
         self.assertNotIn("copilot-review-playbook", workflow)
 
+    def test_full_pr_readiness_retains_both_local_codex_gates(self) -> None:
+        readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        for value in (readiness, contracts):
+            self.assertIn("independent-codex-pr-review", value)
+            self.assertIn("offline-frozen-diff-review", value)
+        self.assertIn("standalone double/triple-review", readiness)
+
     def test_review_prompts_do_not_use_unbounded_only_matching_samples(self) -> None:
         forbidden = "rg -o --max-count 80"
         candidates = [SKILL_ROOT / "SKILL.md", SKILL_ROOT / "scripts/review_runtime/prompt.py"]

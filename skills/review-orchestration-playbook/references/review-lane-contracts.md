@@ -25,6 +25,14 @@ Use this contract for helper-backed review, a clean-context `reviewer` fallback,
 
 If the helper-backed Codex runtime is deterministically unavailable, use only the `reviewer` agent with the complete frozen scope, diff/evidence contract, and output contract. Its pinned configuration is `gpt-5.6-sol` with `xhigh`. Do not use an inherited-context/default coding agent. A `gpt-5.5` fallback is allowed only after explicit model entitlement/policy denial.
 
+## PR Readiness Codex Gates
+
+`independent-codex-pr-review` is a fresh Codex CLI review-only session, separate from the helper. Its prompt must identify the parent PR readiness workflow, bind the exact PR and frozen range, include every rule in **Scope And Evidence Budget**, disable project-instruction injection, and forbid PR actions, fixes, other reviewers, and CI waiting. Only its final `LGTM` or no-findings artifact is evidence.
+
+`offline-frozen-diff-review` is the stateful helper-backed pinned Codex lane over the same range. Its terminal artifact, or the **Clean-Context Codex Fallback** artifact when the helper is deterministically unavailable, is separate required evidence. GitHub Codex cannot replace either local PR-readiness gate.
+
+These two gates apply to full PR readiness / merge-ready workflows. They do not add lanes to a standalone request whose only requested shape is double review or triple review.
+
 ## PR Thread Replies
 
 When replying to GitHub review threads, use the actual runtime/model from the review artifact when practical:

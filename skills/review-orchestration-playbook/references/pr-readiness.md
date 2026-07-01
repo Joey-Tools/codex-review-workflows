@@ -13,23 +13,26 @@ Use this reference after the local delivery gate has produced a reviewable commi
 
 1. Establish or reuse the PR and read metadata, review threads, required checks, rulesets, and branch/base state with the bounded probes in [github-pr-probes.md](github-pr-probes.md).
 2. Record the current PR head and freeze the local scope as `<merge_base>..<head_sha>`.
-3. Run the requested logical local review shape through `$review-orchestration-playbook`:
-   - ordinary PR readiness requires the pinned Codex lane;
+3. Run `independent-codex-pr-review` in a fresh Codex CLI review-only session. Disable project-instruction injection, preserve the complete bounded-read contract from [review-lane-contracts.md](review-lane-contracts.md), forbid PR orchestration/fixes/other reviewers/CI waiting, and require a terminal `LGTM` or no-findings artifact. GitHub Codex and the helper-backed frozen-diff lane cannot replace this gate.
+4. Run `offline-frozen-diff-review` through the stateful pinned Codex helper on the exact frozen range. If the helper is deterministically unavailable, only the configured clean-context `reviewer` fallback with the same frozen scope and evidence contract may replace it. Require a terminal clean artifact.
+5. Add the requested logical review shape without removing either PR-readiness Codex gate:
    - explicit double review adds the Claude-family lane;
-   - explicit triple review requires both local lanes and GitHub Codex review.
-4. GitHub Codex review:
+   - explicit triple review adds the Claude-family lane and requires GitHub Codex review;
+   - a request for double/triple review alone remains exactly the named two/three logical lanes; the extra independent/offline gates apply only when the parent also requests PR readiness, full workflow, or merge-ready.
+6. GitHub Codex review:
    - default PR readiness treats an absent, non-required review as best-effort skipped;
    - an already-triggered or required review must finish clean on the current head;
    - explicit triple review requires current-head evidence, using repository automatic review or the exact `@codex review` trigger when needed.
-5. Process actionable findings, requested changes, unresolved conversations, and required CI. Fix in the parent thread, rerun affected tests, freeze the new head, and rerun every invalidated requested review lane.
-6. Recheck that the PR is current with its base and that all required checks/conversations and requested logical review lanes are terminal and clean.
+7. Process actionable findings, requested changes, unresolved conversations, and required CI. Fix in the parent thread, rerun affected tests, freeze the new head, and rerun every invalidated requested or PR-readiness review lane.
+8. Recheck that the PR is current with its base and that both required Codex gates, all requested logical review lanes, required checks, and required conversations are terminal and clean.
 
 ## Review Counting
 
 - The pinned Codex helper or clean-context `reviewer` fallback is one logical Codex lane.
 - Claude Code and its Copilot runtime/model fallbacks are one logical Claude-family lane.
 - GitHub Codex review is the third logical lane only for triple review.
-- CI, comments, branch status, model retries, and helper fallback implementations do not increase the count.
+- `independent-codex-pr-review` and `offline-frozen-diff-review` are separate full-PR-readiness evidence gates. They do not redefine what a standalone double/triple-review request means.
+- CI, comments, branch status, model retries, and helper fallback implementations do not increase the named review shape.
 
 ## Terminal Report
 
@@ -37,7 +40,8 @@ Report:
 
 - PR URL and current head
 - frozen local review range
-- Codex lane runtime/model/effort/status
+- independent Codex PR review runtime/model/effort/status
+- offline frozen-diff Codex runtime/model/effort/status
 - Claude-family lane runtime/model/effort/status when requested
 - GitHub Codex trigger/head/status when requested, already present, or required
 - required CI and conversation-resolution status

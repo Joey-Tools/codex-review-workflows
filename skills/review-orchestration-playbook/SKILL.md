@@ -33,6 +33,7 @@ Capacity, overload, rate limits, timeouts, network errors, 5xx responses, missin
 - Local single/double review: freeze the exact `base_sha..head_sha`, then run the requested local lanes through the helper.
 - Triple review: establish the PR/current head, run the local double review, then require final current-head GitHub Codex evidence.
 - PR readiness/full workflow: follow [pr-readiness.md](references/pr-readiness.md) after the local delivery commit exists.
+  Full PR readiness retains separate required `independent-codex-pr-review` and helper-backed `offline-frozen-diff-review` evidence; those delivery gates do not alter the standalone double/triple definitions above.
 
 2. Freeze scope.
 - Prefer a `wip/<topic>` branch and an exact `base_sha..head_sha` range.
@@ -94,3 +95,4 @@ Read [helper-contract.md](references/helper-contract.md) before modifying or deb
 - Do not let model aliases or global defaults override the pinned policy.
 - Do not start another reviewer from a findings-only review child.
 - Do not claim a clean result without a terminal artifact for every requested logical lane.
+- Do not restore compatibility skill aliases. This migration intentionally removes the old skill entrypoints; update repository and release call sites to `review-orchestration-playbook` instead of relying on discovery-time redirection.
