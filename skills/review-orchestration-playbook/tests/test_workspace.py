@@ -225,6 +225,25 @@ class WorkspaceTest(unittest.TestCase):
                 head_ref=clean_head,
             )
 
+    def test_protected_review_path_symlink_is_rejected(self) -> None:
+        (self.repo / ".agents").symlink_to(".codex-review")
+        git(self.repo, "add", ".agents")
+        git(self.repo, "commit", "-m", "Add protected path alias")
+        alias_head = git(self.repo, "rev-parse", "HEAD")
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "symlink for protected top-level path .agents",
+        ):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.head,
+                head_ref=alias_head,
+            )
+
+        review_root = self.repo / ".codex-tmp"
+        self.assertEqual(list(review_root.glob("isolated-review-*")), [])
+
     def test_external_workspace_rejects_symlinks_that_escape_frozen_root(self) -> None:
         review = prepare_workspace(
             repo=self.repo,

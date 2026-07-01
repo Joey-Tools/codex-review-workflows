@@ -574,6 +574,63 @@ time.sleep(0.2)
             str(128 + signal.SIGTERM),
         )
 
+    def test_runner_defers_signal_while_blocking_for_terminal_publish(self) -> None:
+        state_dir = self.review.container_dir
+        (state_dir / state.STATE_MARKER).write_text(
+            "isolated-review-state-v1\n",
+            encoding="utf-8",
+        )
+        write_json(
+            state_dir / state.STATE_FILE,
+            {
+                "version": 1,
+                "reviewer": "codex",
+                "workspace": self.review.to_json(),
+            },
+        )
+        installed: dict[signal.Signals, object] = {}
+
+        def install_handler(signum, handler):
+            previous = installed.get(signum, signal.SIG_DFL)
+            installed[signum] = handler
+            return previous
+
+        def interrupt_mask_handoff():
+            handler = installed[signal.SIGQUIT]
+            assert callable(handler)
+            handler(signal.SIGQUIT, None)
+            return set()
+
+        with (
+            mock.patch.object(state.signal, "signal", side_effect=install_handler),
+            mock.patch.object(
+                state,
+                "run_review",
+                return_value=mock.Mock(returncode=0),
+            ),
+            mock.patch.object(
+                state,
+                "block_forwarded_signals",
+                side_effect=interrupt_mask_handoff,
+            ),
+            mock.patch.object(
+                state,
+                "consume_pending_forwarded_signal",
+                return_value=None,
+            ),
+            mock.patch.object(state, "restore_signal_mask"),
+        ):
+            exit_code = state.run_state(
+                state_dir=state_dir,
+                shim_source=SCRIPTS / "git_readonly_shim",
+            )
+
+        self.assertEqual(exit_code, 128 + signal.SIGQUIT)
+        self.assertEqual(
+            (state_dir / state.EXIT_FILE).read_text(encoding="utf-8").strip(),
+            str(128 + signal.SIGQUIT),
+        )
+
     def test_terminal_runner_keeps_signals_blocked_through_process_exit(self) -> None:
         state_dir = self.review.container_dir
         (state_dir / state.STATE_MARKER).write_text(
@@ -658,6 +715,28 @@ time.sleep(0.2)
         self.assertTrue(summary["running"])
         self.assertTrue(summary["runner_lock_held"])
         self.assertIsNone(summary["exit_code"])
+
+    def test_status_reads_terminal_exit_after_observing_released_lock(self) -> None:
+        self.write_completed_state()
+        calls: list[str] = []
+
+        def read_lock(_path):
+            calls.append("lock")
+            return False
+
+        def read_exit(_state_dir):
+            calls.append("exit")
+            return 0
+
+        with (
+            mock.patch.object(state, "_runner_lock_held", side_effect=read_lock),
+            mock.patch.object(state, "_read_exit_code", side_effect=read_exit),
+        ):
+            summary = state.status(self.review.container_dir)
+
+        self.assertEqual(calls, ["lock", "exit"])
+        self.assertFalse(summary["running"])
+        self.assertEqual(summary["exit_code"], 0)
 
 
 if __name__ == "__main__":

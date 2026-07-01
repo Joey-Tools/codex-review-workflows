@@ -90,7 +90,9 @@ class ChildEnvironmentTest(unittest.TestCase):
 
             forward.assert_called_once_with(process, signal.SIGTERM)
             terminate.assert_called_once_with(
-                process, initial_signal=signal.SIGTERM
+                process,
+                initial_signal=signal.SIGTERM,
+                signal_already_sent=True,
             )
 
     def test_outer_cleanup_waits_without_resending_forwarded_signal(self) -> None:
@@ -178,7 +180,9 @@ class ChildEnvironmentTest(unittest.TestCase):
             self.assertEqual(raised.exception.signum, signal.SIGTERM)
             forward.assert_called_once_with(process, signal.SIGTERM)
             terminate.assert_called_once_with(
-                process, initial_signal=signal.SIGTERM
+                process,
+                initial_signal=signal.SIGTERM,
+                signal_already_sent=True,
             )
 
     def test_passes_only_review_runtime_and_auth_environment(self) -> None:

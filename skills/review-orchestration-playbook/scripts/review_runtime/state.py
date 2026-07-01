@@ -318,9 +318,9 @@ def run_state(
             )
         exit_code = 1
     finally:
+        suppress_signal_raise = True
         previous_mask = block_forwarded_signals()
         try:
-            suppress_signal_raise = True
             while True:
                 masked_signal = (
                     consume_pending_forwarded_signal()
@@ -350,15 +350,16 @@ def run_state(
 def status(state_dir: pathlib.Path) -> dict[str, Any]:
     state_dir = state_dir.expanduser().resolve()
     state, _review = load_review_state(state_dir)
-    exit_code = _read_exit_code(state_dir)
     pid_value = state.get("pid")
     pid = pid_value if isinstance(pid_value, int) else 0
     process_running = _runner_lock_held(state_dir / LOCK_FILE)
     running = process_running
     if running:
         exit_code = None
-    elif exit_code is not None:
-        _reap_started_process(pid)
+    else:
+        exit_code = _read_exit_code(state_dir)
+        if exit_code is not None:
+            _reap_started_process(pid)
     if exit_code is None and not running:
         exit_code = 1
         write_text_atomic(state_dir / EXIT_FILE, "1\n")

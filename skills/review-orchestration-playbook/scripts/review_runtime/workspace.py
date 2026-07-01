@@ -98,6 +98,7 @@ SENSITIVE_FILE_NAMES = {
 }
 SENSITIVE_SUFFIXES = (".jks", ".keystore", ".p12", ".pfx")
 SAFE_ENV_SUFFIXES = (".example", ".sample", ".template")
+PROTECTED_REVIEW_PATHS = (".codex", ".agents")
 
 
 @dataclass(frozen=True)
@@ -229,6 +230,15 @@ def _commit_uses_reserved_control_path(
         for name in result.stdout.split(b"\0")
         if name
     )
+
+
+def _reject_protected_review_path_aliases(workspace_root: pathlib.Path) -> None:
+    for name in PROTECTED_REVIEW_PATHS:
+        candidate = workspace_root / name
+        if candidate.is_symlink():
+            raise ReviewError(
+                f"the frozen head uses a symlink for protected top-level path {name}"
+            )
 
 
 def resolve_repo_root(repo: pathlib.Path) -> pathlib.Path:
@@ -970,6 +980,7 @@ def prepare_workspace(
             head_sha=head_sha,
             workspace_root=workspace_root,
         )
+        _reject_protected_review_path_aliases(workspace_root)
         control_dir = workspace_root / ".codex-review"
         if control_dir.exists() or control_dir.is_symlink():
             raise ReviewError(

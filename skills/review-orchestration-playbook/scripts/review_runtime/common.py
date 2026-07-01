@@ -337,7 +337,11 @@ def _run_logged_process(
         pending_cleanup_signal: signal.Signals | None = None
         try:
             if process is not None:
-                terminate_process_group(process, initial_signal=cleanup_signal)
+                terminate_process_group(
+                    process,
+                    initial_signal=cleanup_signal,
+                    signal_already_sent=pending_signal is not None,
+                )
             for forwarded, previous in previous_handlers.items():
                 signal.signal(forwarded, previous)
             if previous_mask is not None:
