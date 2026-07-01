@@ -64,10 +64,16 @@ SECRET_KEY_PATTERN = (
 QUOTED_SECRET_ASSIGNMENT = re.compile(
     SECRET_KEY_PATTERN + rb"(['\"])([^\r\n'\"]{16,512})\1"
 )
+OVERSIZED_QUOTED_SECRET_ASSIGNMENT = re.compile(
+    SECRET_KEY_PATTERN + rb"(['\"])[^\r\n'\"]{513}"
+)
 UNQUOTED_SECRET_ASSIGNMENT = re.compile(
     SECRET_KEY_PATTERN
     + rb"([-A-Za-z0-9_./+=!@#$%^&*?~:;]{16,512})(?=[ \t]*(?:[#;]|\r?$))",
     re.MULTILINE,
+)
+OVERSIZED_UNQUOTED_SECRET_ASSIGNMENT = re.compile(
+    SECRET_KEY_PATTERN + rb"[-A-Za-z0-9_./+=!@#$%^&*?~:;]{513}"
 )
 PLACEHOLDER_SECRET_PATTERN = re.compile(
     rb"(?:"
@@ -1158,6 +1164,10 @@ def _value_secret_rule(value: bytes) -> str | None:
     for rule, pattern in SECRET_PATTERNS:
         if pattern.search(value):
             return rule
+    if OVERSIZED_QUOTED_SECRET_ASSIGNMENT.search(
+        value
+    ) or OVERSIZED_UNQUOTED_SECRET_ASSIGNMENT.search(value):
+        return "generic-secret-assignment"
     for match in QUOTED_SECRET_ASSIGNMENT.finditer(value):
         candidate = match.group(2).lower()
         if not _is_placeholder_secret(candidate):

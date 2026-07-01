@@ -231,6 +231,23 @@ class WorkspaceTest(unittest.TestCase):
             _value_secret_rule(b"password: example-test-secret # placeholder")
         )
 
+    def test_oversized_secret_assignments_fail_closed(self) -> None:
+        alpha_secret = b"A" * 513
+        hex_secret = b"deadbeef" * 65
+        numeric_secret = b"1" * 513
+        payloads = (
+            b'password="' + alpha_secret + b'"',
+            b"password=" + alpha_secret,
+            b"password=" + hex_secret,
+            b"password=" + numeric_secret,
+        )
+        for payload in payloads:
+            with self.subTest(payload_length=len(payload)):
+                self.assertEqual(
+                    _value_secret_rule(payload),
+                    "generic-secret-assignment",
+                )
+
     def test_snapshot_rejects_oversized_single_blob_before_materializing(self) -> None:
         with (
             mock.patch.object(workspace_runtime, "MAX_SNAPSHOT_BLOB_BYTES", 1),
