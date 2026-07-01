@@ -238,6 +238,40 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(len(persisted), 1)
         self.assertEqual(persisted[0]["requested_model"], "gpt-5.6-sol")
         self.assertEqual(persisted[0]["category"], "entitlement")
+        self.assertNotIn("final_text", persisted[0])
+        self.assertFalse(persisted[0]["final_available"])
+
+    def test_model_chain_does_not_persist_successful_final_text(self) -> None:
+        final_text = "sensitive terminal artifact"
+        runner = mock.Mock(
+            return_value=self.attempt(
+                "codex",
+                "gpt-5.6-sol",
+                "success",
+                final_text=final_text,
+            )
+        )
+        attempts: list[providers.Attempt] = []
+
+        category, returned_text = providers._run_model_chain(
+            review=self.review,
+            models=("gpt-5.6-sol",),
+            runner=runner,
+            env={},
+            attempts=attempts,
+        )
+
+        self.assertEqual(category, "success")
+        self.assertEqual(returned_text, final_text)
+        persisted = json.loads(
+            (self.review.container_dir / "attempts.json").read_text(encoding="utf-8")
+        )
+        self.assertNotIn("final_text", persisted[0])
+        self.assertTrue(persisted[0]["final_available"])
+        self.assertNotIn(
+            final_text,
+            (self.review.container_dir / "attempts.json").read_text(encoding="utf-8"),
+        )
 
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(providers, "_codex_attempt")

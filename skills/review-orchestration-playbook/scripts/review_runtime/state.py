@@ -331,7 +331,14 @@ def status(state_dir: pathlib.Path) -> dict[str, Any]:
         except (OSError, json.JSONDecodeError):
             parsed_attempts = []
         if isinstance(parsed_attempts, list):
-            attempts = parsed_attempts
+            for item in parsed_attempts:
+                if not isinstance(item, dict):
+                    continue
+                summary = dict(item)
+                legacy_final = summary.pop("final_text", None)
+                if legacy_final is not None:
+                    summary["final_available"] = bool(legacy_final)
+                attempts.append(summary)
     return {
         "state_dir": str(state_dir),
         "reviewer": state.get("reviewer"),

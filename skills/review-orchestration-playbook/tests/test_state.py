@@ -104,6 +104,20 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.assertFalse(self.review.workspace_root.exists())
         self.assertTrue(self.review.container_dir.exists())
 
+    def test_status_redacts_legacy_attempt_final_text(self) -> None:
+        self.write_completed_state()
+        artifact = "legacy terminal artifact"
+        write_json(
+            self.review.container_dir / "attempts.json",
+            [{"runtime": "codex", "final_text": artifact}],
+        )
+
+        summary = state.status(self.review.container_dir)
+
+        self.assertNotIn("final_text", summary["attempts"][0])
+        self.assertTrue(summary["attempts"][0]["final_available"])
+        self.assertNotIn(artifact, str(summary))
+
     def test_concurrent_wait_serializes_workspace_cleanup(self) -> None:
         self.write_completed_state()
         cleanup_started = threading.Event()

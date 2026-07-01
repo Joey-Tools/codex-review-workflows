@@ -4,7 +4,7 @@ import json
 import os
 import pathlib
 import re
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Iterable
 
 from .common import (
@@ -797,12 +797,32 @@ def _copilot_attempt(
 AttemptRunner = Callable[..., Attempt]
 
 
+def _attempt_summary(attempt: Attempt) -> dict[str, Any]:
+    return {
+        "runtime": attempt.runtime,
+        "requested_model": attempt.requested_model,
+        "effective_model": attempt.effective_model,
+        "requested_effort": attempt.requested_effort,
+        "effective_effort": attempt.effective_effort,
+        "returncode": attempt.returncode,
+        "category": attempt.category,
+        "final_available": bool(attempt.final_text),
+        "stdout_path": attempt.stdout_path,
+        "stderr_path": attempt.stderr_path,
+    }
+
+
+def _write_attempts(review: ReviewWorkspace, attempts: Iterable[Attempt]) -> None:
+    write_json(
+        review.container_dir / "attempts.json",
+        [_attempt_summary(item) for item in attempts],
+    )
+
+
 def _finish(
     review: ReviewWorkspace, attempts: list[Attempt], final_text: str | None
 ) -> Outcome:
-    write_json(
-        review.container_dir / "attempts.json", [asdict(item) for item in attempts]
-    )
+    _write_attempts(review, attempts)
     if final_text:
         write_text_atomic(
             review.container_dir / "final.txt", final_text.rstrip() + "\n"
@@ -829,10 +849,7 @@ def _run_model_chain(
             env=env,
         )
         attempts.append(attempt)
-        write_json(
-            review.container_dir / "attempts.json",
-            [asdict(item) for item in attempts],
-        )
+        _write_attempts(review, attempts)
         if attempt.category == "success":
             return "success", attempt.final_text
         if attempt.category != "entitlement":
@@ -950,10 +967,7 @@ def run_review(
                 "Claude Code became unavailable or failed executable validation; "
                 f"refusing Copilot fallback: {error}\n",
             )
-            write_json(
-                review.container_dir / "attempts.json",
-                [asdict(item) for item in attempts],
-            )
+            _write_attempts(review, attempts)
             return Outcome(2, None, tuple(attempts))
         if final_text:
             return _finish(review, attempts, final_text)
@@ -966,10 +980,7 @@ def run_review(
             "Claude Code was unavailable or lacked model entitlement, but "
             "explicit-claude-review does not authorize GitHub Copilot fallback.\n",
         )
-        write_json(
-            review.container_dir / "attempts.json",
-            [asdict(item) for item in attempts],
-        )
+        _write_attempts(review, attempts)
         return Outcome(2, None, tuple(attempts))
 
     try:
@@ -979,10 +990,7 @@ def run_review(
             review.container_dir / "runner-error.txt",
             f"Copilot CLI executable validation failed: {error}\n",
         )
-        write_json(
-            review.container_dir / "attempts.json",
-            [asdict(item) for item in attempts],
-        )
+        _write_attempts(review, attempts)
         return Outcome(2, None, tuple(attempts))
     if not copilot_available:
         write_text_atomic(
@@ -1008,9 +1016,6 @@ def run_review(
             review.container_dir / "runner-error.txt",
             f"Copilot CLI became unavailable or failed executable validation: {error}\n",
         )
-        write_json(
-            review.container_dir / "attempts.json",
-            [asdict(item) for item in attempts],
-        )
+        _write_attempts(review, attempts)
         return Outcome(2, None, tuple(attempts))
     return _finish(review, attempts, final_text)

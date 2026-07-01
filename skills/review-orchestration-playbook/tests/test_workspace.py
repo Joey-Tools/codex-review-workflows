@@ -203,6 +203,36 @@ class WorkspaceTest(unittest.TestCase):
         with self.assertRaisesRegex(ReviewError, "opaque.bin.*base-blob"):
             validate_external_workspace(review)
 
+    def test_oauth_refresh_token_is_detected_in_head_content(self) -> None:
+        credential = pathlib.Path(self.temporary.name) / "oauth.json"
+        credential.write_text(
+            '{"refresh_token": "1//oauth-refresh-credential-value"}\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(_file_secret_rule(credential), "generic-secret-assignment")
+
+    def test_deleted_oauth_refresh_token_is_detected_from_base_blob(self) -> None:
+        credential = self.repo / "oauth.json"
+        credential.write_text(
+            '{"refresh_token": "1//oauth-refresh-credential-value"}\n',
+            encoding="utf-8",
+        )
+        git(self.repo, "add", "oauth.json")
+        git(self.repo, "commit", "-m", "Add OAuth credential")
+        credential_base = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "rm", "oauth.json")
+        git(self.repo, "commit", "-m", "Remove OAuth credential")
+        clean_head = git(self.repo, "rev-parse", "HEAD")
+
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=credential_base,
+            head_ref=clean_head,
+        )
+        self.reviews.append(review)
+        with self.assertRaisesRegex(ReviewError, "oauth.json.*base-blob"):
+            validate_external_workspace(review)
+
     def test_function_call_assignment_is_not_treated_as_literal_secret(self) -> None:
         source = pathlib.Path(self.temporary.name) / "source.py"
         source.write_text(
@@ -215,6 +245,12 @@ class WorkspaceTest(unittest.TestCase):
         self.assertEqual(_sensitive_path_rule("config.env"), "environment-file")
         self.assertEqual(_sensitive_path_rule("deploy/prod.env"), "environment-file")
         self.assertIsNone(_sensitive_path_rule(".env.example"))
+
+    def test_nested_oauth_token_file_is_a_sensitive_path(self) -> None:
+        self.assertEqual(
+            _sensitive_path_rule("fixtures/google/token.json"),
+            "credential-path",
+        )
 
     def test_snapshot_does_not_execute_repo_hooks_filters_or_external_diff(
         self,

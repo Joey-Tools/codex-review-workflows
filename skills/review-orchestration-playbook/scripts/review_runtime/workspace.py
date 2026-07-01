@@ -51,7 +51,7 @@ SECRET_PATTERNS = (
 SECRET_KEY_PATTERN = (
     rb"(?i)(?:api[_-]?(?:key|token)|access[_-]?token|auth[_-]?token|"
     rb"bearer[_-]?token|client[_-]?secret|password|passwd|private[_-]?token|"
-    rb"secret[_-]?(?:key|token))['\"]?\s*[:=]\s*"
+    rb"refresh[_-]?token|secret[_-]?(?:key|token))['\"]?\s*[:=]\s*"
 )
 QUOTED_SECRET_ASSIGNMENT = re.compile(
     SECRET_KEY_PATTERN + rb"(['\"])([^\r\n'\"]{16,512})\1"
@@ -78,6 +78,7 @@ SENSITIVE_ANYWHERE_NAMES = {
     ".netrc",
     "service-account.json",
     "service_account.json",
+    "token.json",
 }
 SENSITIVE_PATH_SUFFIXES = (
     (".aws", "credentials"),
