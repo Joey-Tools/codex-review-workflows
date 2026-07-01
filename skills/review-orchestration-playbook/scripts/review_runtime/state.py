@@ -9,9 +9,12 @@ import time
 from typing import Any
 
 from .common import (
+    ForwardedSignal,
     ReviewError,
     read_json,
     tail_text,
+    terminate_process_group,
+    unblock_forwarded_signals,
     write_json,
     write_text_atomic,
 )
@@ -166,7 +169,7 @@ def start(
                 close_fds=True,
                 pass_fds=(lock_handle.fileno(),),
             )
-    except Exception:
+    except BaseException:
         lock_handle.close()
         cleanup_workspace(review, keep_container=False)
         raise
@@ -174,9 +177,8 @@ def start(
     _STARTED_PROCESSES[process.pid] = process
     try:
         write_json(state_dir / STATE_FILE, state)
-    except Exception:
-        process.terminate()
-        process.wait(timeout=5)
+    except BaseException:
+        terminate_process_group(process)
         _STARTED_PROCESSES.pop(process.pid, None)
         cleanup_workspace(review, keep_container=False)
         raise
@@ -186,6 +188,7 @@ def start(
 
 
 def run_state(*, state_dir: pathlib.Path, shim_source: pathlib.Path) -> int:
+    unblock_forwarded_signals()
     state, review = load_review_state(state_dir)
     reviewer = state.get("reviewer")
     if not isinstance(reviewer, str):
@@ -201,6 +204,8 @@ def run_state(*, state_dir: pathlib.Path, shim_source: pathlib.Path) -> int:
             egress_consent=egress_consent,
         )
         exit_code = outcome.returncode
+    except ForwardedSignal as error:
+        exit_code = 128 + int(error.signum)
     except Exception as error:
         write_text_atomic(
             state_dir / "runner-error.txt", f"{type(error).__name__}: {error}\n"

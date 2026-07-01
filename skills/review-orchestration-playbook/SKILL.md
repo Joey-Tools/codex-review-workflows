@@ -54,6 +54,7 @@ Capacity, overload, rate limits, timeouts, network errors, 5xx responses, missin
 - Read [review-lane-contracts.md](references/review-lane-contracts.md) for the exact bounded-read contract.
 - Start from counts, diff headers, `--stat` / `--numstat`, `rg -l`, `rg --count`, one hunk, or one exact symbol window.
 - Do not begin with whole-file reads, broad `rg -n`, wide diffs, or large untracked inventories.
+- If a broad single-file sample is unavoidable, use `rg -n --max-count 80 --max-columns 200 <exact-file>` and then narrow further. Do not combine ripgrep's only-matching mode with a per-line match cap; one matching line can still emit an unbounded number of matches.
 - After any 800+ line or 10k+ token result, narrow the next read.
 
 5. Handle findings and failures.
@@ -67,6 +68,7 @@ Capacity, overload, rate limits, timeouts, network errors, 5xx responses, missin
 - Name the logical lane, runtime, requested/effective model, effort, frozen range, and terminal status.
 - Keep model fallback attempts within the same logical lane; they do not increase the review count.
 - For triple review, bind GitHub Codex evidence to the current PR head and distinguish automatic review from `@codex review`.
+- If the user names a Codex app-server thread for review handoff, verify that exact thread with read-only thread checks before sending anything; never probe or notify a different thread as a substitute.
 
 ## Helper Contract
 

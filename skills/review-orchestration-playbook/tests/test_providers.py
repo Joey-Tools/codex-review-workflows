@@ -176,6 +176,23 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIsNone(final_text)
         self.assertEqual(effective_model, "claude-opus-4-8")
 
+    def test_requested_model_wins_over_auxiliary_claude_model_usage(self) -> None:
+        stdout = json.dumps(
+            {
+                "type": "result",
+                "result": "No findings.",
+                "modelUsage": {
+                    "claude-haiku-4-5-20251001": {},
+                    "claude-opus-4-8": {},
+                },
+            }
+        ).encode()
+        final_text, effective_model = providers._parse_structured_output(
+            stdout, requested_model="claude-opus-4-8"
+        )
+        self.assertEqual(final_text, "No findings.")
+        self.assertEqual(effective_model, "claude-opus-4-8")
+
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(providers, "_codex_attempt")
     def test_codex_falls_back_from_56_to_55_only_on_entitlement(
@@ -631,6 +648,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn("claude-opus-4-8", argv)
         self.assertEqual(argv[argv.index("--effort") + 1], "max")
         self.assertEqual(argv[argv.index("--permission-mode") + 1], "dontAsk")
+        self.assertEqual(argv[argv.index("--prompt-suggestions") + 1], "false")
         self.assertEqual(argv[argv.index("--tools") + 1], "Read,Grep,Glob")
         settings = json.loads(argv[argv.index("--settings") + 1])
         self.assertIn("Read(~/.ssh/**)", settings["permissions"]["deny"])

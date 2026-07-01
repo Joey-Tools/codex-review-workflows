@@ -49,6 +49,17 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("external-review-playbook", workflow)
         self.assertNotIn("copilot-review-playbook", workflow)
 
+    def test_review_prompts_do_not_use_unbounded_only_matching_samples(self) -> None:
+        forbidden = "rg -o --max-count 80"
+        candidates = [SKILL_ROOT / "SKILL.md", SKILL_ROOT / "scripts/review_runtime/prompt.py"]
+        candidates.extend((SKILL_ROOT / "references").glob("*.md"))
+        for candidate in candidates:
+            self.assertNotIn(
+                forbidden,
+                candidate.read_text(encoding="utf-8"),
+                str(candidate),
+            )
+
     def test_cli_rejects_claude_lane_without_visible_consent(self) -> None:
         completed = subprocess.run(
             (

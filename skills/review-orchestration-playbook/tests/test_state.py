@@ -144,6 +144,37 @@ time.sleep(0.2)
         self.assertEqual(text, "No findings.")
         self.assertFalse((state_dir / "workspace").exists())
 
+    def test_runner_unblocks_signals_inherited_from_stateful_start(self) -> None:
+        state_dir = self.review.container_dir
+        (state_dir / state.STATE_MARKER).write_text(
+            "isolated-review-state-v1\n",
+            encoding="utf-8",
+        )
+        write_json(
+            state_dir / state.STATE_FILE,
+            {
+                "version": 1,
+                "reviewer": "codex",
+                "workspace": self.review.to_json(),
+            },
+        )
+        with (
+            mock.patch.object(state, "unblock_forwarded_signals") as unblock,
+            mock.patch.object(
+                state,
+                "run_review",
+                return_value=mock.Mock(returncode=0),
+            ),
+        ):
+            exit_code = state.run_state(
+                state_dir=state_dir,
+                shim_source=SCRIPTS / "git_readonly_shim",
+            )
+
+        self.assertEqual(exit_code, 0)
+        unblock.assert_called_once_with()
+        self.assertEqual((state_dir / state.EXIT_FILE).read_text().strip(), "0")
+
     def test_final_reports_cleanup_failure_instead_of_clean_result(self) -> None:
         self.write_completed_state()
         with mock.patch.object(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pathlib
+import signal
 import sys
 import tempfile
 import unittest
@@ -23,24 +24,129 @@ class ChildEnvironmentTest(unittest.TestCase):
             stdout_path = root / "stdout.log"
             stderr_path = root / "stderr.log"
 
-            def complete(_command, **kwargs):
-                kwargs["stdout"].write(b"H" * 100 + b"T" * 100)
-                kwargs["stderr"].write(b"E" * 200)
-                return mock.Mock(returncode=0)
-
-            with mock.patch.object(common.subprocess, "run", side_effect=complete):
-                completed = common.run(
-                    ("reviewer",),
-                    stdout_path=stdout_path,
-                    stderr_path=stderr_path,
-                    capture_limit_bytes=32,
-                )
+            completed = common.run(
+                (
+                    sys.executable,
+                    "-c",
+                    "import sys; "
+                    "sys.stdout.buffer.write(b'H' * 100 + b'T' * 100); "
+                    "sys.stderr.buffer.write(b'E' * 200)",
+                ),
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                capture_limit_bytes=32,
+            )
 
             self.assertEqual(stdout_path.read_bytes(), b"H" * 100 + b"T" * 100)
             self.assertEqual(stderr_path.read_bytes(), b"E" * 200)
             self.assertTrue(completed.stdout.startswith(b"H" * 16))
             self.assertTrue(completed.stdout.endswith(b"T" * 16))
             self.assertLess(len(completed.stdout), 128)
+
+    def test_logged_command_forwards_termination_and_reaps_child(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            installed: dict[signal.Signals, object] = {}
+            process = mock.Mock(pid=12345, returncode=None)
+
+            def install_handler(signum, handler):
+                previous = installed.get(signum, signal.SIG_DFL)
+                installed[signum] = handler
+                return previous
+
+            def communicate(*, input=None):
+                self.assertIsNone(input)
+                handler = installed[signal.SIGTERM]
+                assert callable(handler)
+                handler(signal.SIGTERM, None)
+
+            process.communicate.side_effect = communicate
+            with (
+                mock.patch.object(common.subprocess, "Popen", return_value=process),
+                mock.patch.object(common.signal, "signal", side_effect=install_handler),
+                mock.patch.object(common, "_signal_process") as forward,
+                mock.patch.object(common, "terminate_process_group") as terminate,
+                mock.patch.object(common, "block_forwarded_signals", return_value=None),
+            ):
+                with self.assertRaises(common.ForwardedSignal):
+                    common.run(
+                        ("reviewer",),
+                        stdout_path=root / "stdout.log",
+                        stderr_path=root / "stderr.log",
+                    )
+
+            forward.assert_called_once_with(process, signal.SIGTERM)
+            terminate.assert_called_once_with(
+                process, initial_signal=signal.SIGTERM
+            )
+
+    def test_logged_command_preserves_signal_arriving_during_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            process = mock.Mock(pid=12345, returncode=0)
+            process.communicate.return_value = (None, None)
+            with (
+                mock.patch.object(common.subprocess, "Popen", return_value=process),
+                mock.patch.object(common.signal, "signal", return_value=signal.SIG_DFL),
+                mock.patch.object(common, "terminate_process_group"),
+                mock.patch.object(
+                    common,
+                    "block_forwarded_signals",
+                    return_value=set(),
+                ),
+                mock.patch.object(
+                    common,
+                    "_consume_pending_forwarded_signal",
+                    return_value=signal.SIGQUIT,
+                ),
+                mock.patch.object(common, "restore_signal_mask") as restore,
+            ):
+                with self.assertRaises(common.ForwardedSignal) as raised:
+                    common.run(
+                        ("reviewer",),
+                        stdout_path=root / "stdout.log",
+                        stderr_path=root / "stderr.log",
+                    )
+
+            self.assertEqual(raised.exception.signum, signal.SIGQUIT)
+            restore.assert_called_once_with(set())
+
+    def test_logged_command_defers_signal_during_spawn_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            installed: dict[signal.Signals, object] = {}
+            process = mock.Mock(pid=12345, returncode=None)
+
+            def install_handler(signum, handler):
+                previous = installed.get(signum, signal.SIG_DFL)
+                installed[signum] = handler
+                return previous
+
+            def spawn(*args, **kwargs):
+                handler = installed[signal.SIGTERM]
+                assert callable(handler)
+                handler(signal.SIGTERM, None)
+                return process
+
+            with (
+                mock.patch.object(common.subprocess, "Popen", side_effect=spawn),
+                mock.patch.object(common.signal, "signal", side_effect=install_handler),
+                mock.patch.object(common, "_signal_process") as forward,
+                mock.patch.object(common, "terminate_process_group") as terminate,
+                mock.patch.object(common, "block_forwarded_signals", return_value=None),
+            ):
+                with self.assertRaises(common.ForwardedSignal) as raised:
+                    common.run(
+                        ("reviewer",),
+                        stdout_path=root / "stdout.log",
+                        stderr_path=root / "stderr.log",
+                    )
+
+            self.assertEqual(raised.exception.signum, signal.SIGTERM)
+            forward.assert_called_once_with(process, signal.SIGTERM)
+            terminate.assert_called_once_with(
+                process, initial_signal=signal.SIGTERM
+            )
 
     def test_passes_only_review_runtime_and_auth_environment(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

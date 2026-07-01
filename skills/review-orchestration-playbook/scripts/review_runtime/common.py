@@ -3,16 +3,27 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import signal
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, BinaryIO, Iterable
 
 
 class ReviewError(RuntimeError):
     """A user-facing review helper failure."""
+
+
+class ForwardedSignal(RuntimeError):
+    """A termination signal forwarded to the active reviewer process group."""
+
+    def __init__(self, signum: signal.Signals) -> None:
+        self.signum = signum
+        super().__init__(f"review orchestration received signal {int(signum)}")
 
 
 @dataclass(frozen=True)
@@ -53,6 +64,9 @@ BASE_ENV_KEYS = (
     "USER",
     "XDG_CONFIG_HOME",
 )
+
+PROCESS_GROUP_TERM_GRACE_SECONDS = 0.5
+PROCESS_GROUP_POLL_SECONDS = 0.05
 
 
 def write_text_atomic(path: pathlib.Path, text: str) -> None:
@@ -125,18 +139,17 @@ def run(
             stdout_path.open("wb") as stdout_handle,
             stderr_path.open("wb") as stderr_handle,
         ):
-            completed = subprocess.run(
+            returncode = _run_logged_process(
                 command,
                 cwd=cwd,
                 env=env,
-                input=stdin,
-                stdout=stdout_handle,
-                stderr=stderr_handle,
-                check=False,
+                stdin=stdin,
+                stdout_handle=stdout_handle,
+                stderr_handle=stderr_handle,
             )
         result = Completed(
             command,
-            completed.returncode,
+            returncode,
             _read_bounded_bytes(stdout_path, capture_limit_bytes),
             _read_bounded_bytes(stderr_path, capture_limit_bytes),
         )
@@ -148,6 +161,170 @@ def run(
             f"command failed ({result.returncode}): {' '.join(command)}\n{detail}"
         )
     return result
+
+
+def _forwarded_signals() -> tuple[signal.Signals, ...]:
+    forwarded = [signal.SIGTERM, signal.SIGINT]
+    for name in ("SIGHUP", "SIGQUIT"):
+        candidate = getattr(signal, name, None)
+        if candidate is not None and candidate not in forwarded:
+            forwarded.append(candidate)
+    return tuple(forwarded)
+
+
+def block_forwarded_signals() -> set[signal.Signals] | None:
+    if (
+        os.name != "posix"
+        or threading.current_thread() is not threading.main_thread()
+        or not hasattr(signal, "pthread_sigmask")
+    ):
+        return None
+    return signal.pthread_sigmask(signal.SIG_BLOCK, _forwarded_signals())
+
+
+def restore_signal_mask(previous: set[signal.Signals] | None) -> None:
+    if previous is not None:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def unblock_forwarded_signals() -> None:
+    if os.name == "posix" and hasattr(signal, "pthread_sigmask"):
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, _forwarded_signals())
+
+
+def _consume_pending_forwarded_signal() -> signal.Signals | None:
+    if not hasattr(signal, "sigpending") or not hasattr(signal, "sigwait"):
+        return None
+    pending = set(signal.sigpending()).intersection(_forwarded_signals())
+    if not pending:
+        return None
+    ordered = sorted(pending, key=int)
+    for pending_signal in ordered:
+        signal.sigwait({pending_signal})
+    return ordered[0]
+
+
+def _process_group_exists(process_pid: int) -> bool:
+    if os.name != "posix":
+        return False
+    try:
+        os.killpg(process_pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _signal_process(process: subprocess.Popen[bytes], signum: signal.Signals) -> None:
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signum)
+            return
+        except ProcessLookupError:
+            return
+    try:
+        if signum == signal.SIGTERM:
+            process.terminate()
+        else:
+            process.kill()
+    except ProcessLookupError:
+        pass
+
+
+def terminate_process_group(
+    process: subprocess.Popen[bytes],
+    *,
+    initial_signal: signal.Signals = signal.SIGTERM,
+) -> None:
+    if os.name != "posix":
+        if process.poll() is None:
+            _signal_process(process, initial_signal)
+            try:
+                process.wait(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        return
+    if not _process_group_exists(process.pid):
+        return
+    _signal_process(process, initial_signal)
+    deadline = time.monotonic() + PROCESS_GROUP_TERM_GRACE_SECONDS
+    while _process_group_exists(process.pid) and time.monotonic() < deadline:
+        time.sleep(PROCESS_GROUP_POLL_SECONDS)
+    if _process_group_exists(process.pid):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        process.wait(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _run_logged_process(
+    command: tuple[str, ...],
+    *,
+    cwd: pathlib.Path | None,
+    env: dict[str, str] | None,
+    stdin: bytes | None,
+    stdout_handle: BinaryIO,
+    stderr_handle: BinaryIO,
+) -> int:
+    process: subprocess.Popen[bytes] | None = None
+    pending_signal: signal.Signals | None = None
+
+    def forward_signal(signum: int, _frame: object) -> None:
+        nonlocal pending_signal
+        forwarded = signal.Signals(signum)
+        pending_signal = forwarded
+        if process is None:
+            return
+        _signal_process(process, forwarded)
+        raise ForwardedSignal(forwarded)
+
+    previous_handlers: dict[signal.Signals, object] = {}
+    if os.name == "posix" and threading.current_thread() is threading.main_thread():
+        for forwarded in _forwarded_signals():
+            previous_handlers[forwarded] = signal.getsignal(forwarded)
+            signal.signal(forwarded, forward_signal)
+
+    cleanup_signal = signal.SIGTERM
+    try:
+        if pending_signal is not None:
+            raise ForwardedSignal(pending_signal)
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+            start_new_session=os.name == "posix",
+        )
+        if pending_signal is not None:
+            _signal_process(process, pending_signal)
+            raise ForwardedSignal(pending_signal)
+        process.communicate(input=stdin)
+        return int(process.returncode)
+    except ForwardedSignal as error:
+        cleanup_signal = error.signum
+        raise
+    finally:
+        previous_mask = block_forwarded_signals()
+        pending_cleanup_signal: signal.Signals | None = None
+        try:
+            if process is not None:
+                terminate_process_group(process, initial_signal=cleanup_signal)
+            for forwarded, previous in previous_handlers.items():
+                signal.signal(forwarded, previous)
+            if previous_mask is not None:
+                pending_cleanup_signal = _consume_pending_forwarded_signal()
+        finally:
+            restore_signal_mask(previous_mask)
+        if pending_cleanup_signal is not None:
+            raise ForwardedSignal(pending_cleanup_signal)
 
 
 def _read_bounded_bytes(path: pathlib.Path, limit: int) -> bytes:

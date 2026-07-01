@@ -326,31 +326,37 @@ def _find_text(value: Any) -> str | None:
     return None
 
 
-def _find_model(value: Any) -> str | None:
+def _find_model(value: Any, *, requested_model: str | None = None) -> str | None:
     if isinstance(value, dict):
         model_usage = value.get("modelUsage")
         if isinstance(model_usage, dict) and model_usage:
-            first = next(iter(model_usage))
-            if isinstance(first, str):
-                return first
+            candidates = [key for key in model_usage if isinstance(key, str) and key]
+            if requested_model is not None:
+                for candidate in candidates:
+                    if _model_matches(requested_model, candidate):
+                        return candidate
+            if candidates:
+                return candidates[-1]
         for key in ("model", "modelName", "model_id", "modelId"):
             candidate = value.get(key)
             if isinstance(candidate, str) and candidate:
                 return candidate
         for key in ("data", "metadata", "result", "usage"):
             if key in value:
-                found = _find_model(value[key])
+                found = _find_model(value[key], requested_model=requested_model)
                 if found:
                     return found
     if isinstance(value, list):
         for item in reversed(value):
-            found = _find_model(item)
+            found = _find_model(item, requested_model=requested_model)
             if found:
                 return found
     return None
 
 
-def _parse_structured_output(stdout: bytes) -> tuple[str | None, str | None]:
+def _parse_structured_output(
+    stdout: bytes, *, requested_model: str | None = None
+) -> tuple[str | None, str | None]:
     objects = _json_objects(stdout)
     final_text: str | None = None
     effective_model: str | None = None
@@ -358,7 +364,7 @@ def _parse_structured_output(stdout: bytes) -> tuple[str | None, str | None]:
         if final_text is None:
             final_text = _find_text(item)
         if effective_model is None:
-            effective_model = _find_model(item)
+            effective_model = _find_model(item, requested_model=requested_model)
         if final_text is not None and effective_model is not None:
             break
     if _structured_error_text(stdout).strip():
@@ -666,6 +672,8 @@ def _claude_attempt(
             "dontAsk",
             "--output-format",
             "json",
+            "--prompt-suggestions",
+            "false",
             "--no-session-persistence",
             "--safe-mode",
             "--no-chrome",
@@ -688,7 +696,9 @@ def _claude_attempt(
         stdout_path=stdout_path,
         stderr_path=stderr_path,
     )
-    final_text, effective_model = _parse_structured_output(completed.stdout)
+    final_text, effective_model = _parse_structured_output(
+        completed.stdout, requested_model=model
+    )
     return _record_attempt(
         review=review,
         index=index,
@@ -767,7 +777,9 @@ def _copilot_attempt(
         stdout_path=stdout_path,
         stderr_path=stderr_path,
     )
-    final_text, effective_model = _parse_structured_output(completed.stdout)
+    final_text, effective_model = _parse_structured_output(
+        completed.stdout, requested_model=model
+    )
     return _record_attempt(
         review=review,
         index=index,
