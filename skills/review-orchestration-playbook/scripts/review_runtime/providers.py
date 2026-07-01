@@ -587,6 +587,8 @@ def _codex_attempt(
             'shell_environment_policy.inherit="none"',
             "-c",
             shell_environment,
+            "-c",
+            "project_doc_max_bytes=0",
             "-m",
             model,
             "-c",
