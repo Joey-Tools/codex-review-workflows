@@ -137,6 +137,7 @@ AUTH_FAILURE_FRAGMENTS = (
     "unauthorized",
     "status 401",
 )
+CODEX_ARG_TRANSPORT_NAME = re.compile(r"codex-arg0[A-Za-z0-9]+")
 
 
 @dataclass(frozen=True)
@@ -514,6 +515,7 @@ def _codex_permissions_match(
     remaining_paths = dict(expected_paths)
     remaining_globs = dict(expected_globs)
     minimal_seen = False
+    arg_transport_seen = False
     codex_arg_root = (
         (codex_home.expanduser().resolve() / "tmp/arg0")
         if codex_home is not None
@@ -550,13 +552,16 @@ def _codex_permissions_match(
         expected_access = remaining_paths.pop(value, None)
         if expected_access == access:
             continue
-        candidate = pathlib.Path(value).expanduser().resolve()
+        candidate = pathlib.Path(value).expanduser()
         if (
             codex_arg_root is not None
             and access == "read"
-            and candidate != codex_arg_root
-            and candidate.is_relative_to(codex_arg_root)
+            and not arg_transport_seen
+            and candidate.is_absolute()
+            and candidate.parent == codex_arg_root
+            and CODEX_ARG_TRANSPORT_NAME.fullmatch(candidate.name) is not None
         ):
+            arg_transport_seen = True
             continue
         return False
     return minimal_seen and not remaining_paths and not remaining_globs

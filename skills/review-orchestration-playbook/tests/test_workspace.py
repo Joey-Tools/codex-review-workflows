@@ -188,6 +188,26 @@ class WorkspaceTest(unittest.TestCase):
                     _value_secret_rule(b"aws_secret_access_key=" + value + b"A")
                 )
 
+    def test_placeholder_secret_requires_a_complete_placeholder_value(self) -> None:
+        self.assertIsNone(
+            _value_secret_rule(b'password = "example-test-secret"')
+        )
+        self.assertIsNone(
+            _value_secret_rule(b'password = "${DATABASE_PASSWORD}"')
+        )
+        self.assertIsNone(
+            _value_secret_rule(b'password = "<DATABASE_PASSWORD>"')
+        )
+        self.assertIsNone(
+            _value_secret_rule(b'OPENAI_API_KEY = "parent-only-secret"')
+        )
+
+        credential = "".join(("example-", "ProdSecret", "ABC123!"))
+        self.assertEqual(
+            _value_secret_rule(f'password = "{credential}"'.encode()),
+            "generic-secret-assignment",
+        )
+
     def test_materialization_os_error_redacts_secret_path(self) -> None:
         secret = "AKIA" + "B" * 16
         (self.repo / secret).write_text("secret-shaped path\n", encoding="utf-8")

@@ -68,18 +68,16 @@ UNQUOTED_SECRET_ASSIGNMENT = re.compile(
     SECRET_KEY_PATTERN + rb"([A-Za-z0-9_./+=-]{20,512})(?=[ \t]*(?:[#;]|\r?$))",
     re.MULTILINE,
 )
-PLACEHOLDER_SECRET_MARKERS = (
-    b"${",
-    b"<",
-    b"changeme",
-    b"dummy",
-    b"example",
-    b"fake",
-    b"must-not-pass",
-    b"not-a-real",
-    b"parent-only",
-    b"placeholder",
-    b"redacted",
+PLACEHOLDER_SECRET_PATTERN = re.compile(
+    rb"(?:"
+    rb"\$\{[A-Za-z_][A-Za-z0-9_]*\}"
+    rb"|<[A-Za-z_][A-Za-z0-9_.-]*>"
+    rb"|(?:changeme|dummy|example|fake|placeholder|redacted)"
+    rb"(?:[-_ ](?:credential|key|password|sample|secret|test|token|value)){0,2}"
+    rb"|(?:must[-_ ]not[-_ ]pass|not[-_ ]a[-_ ]real|parent[-_ ]only)"
+    rb"(?:[-_ ](?:credential|key|password|secret|token|value))?"
+    rb")",
+    re.IGNORECASE,
 )
 SENSITIVE_ANYWHERE_NAMES = {
     ".git-credentials",
@@ -1074,7 +1072,7 @@ def _value_secret_rule(value: bytes) -> str | None:
 
 
 def _is_placeholder_secret(candidate: bytes) -> bool:
-    return any(marker in candidate for marker in PLACEHOLDER_SECRET_MARKERS)
+    return PLACEHOLDER_SECRET_PATTERN.fullmatch(candidate.strip()) is not None
 
 
 def _looks_like_unquoted_secret(candidate: bytes) -> bool:

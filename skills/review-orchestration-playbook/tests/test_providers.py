@@ -925,6 +925,82 @@ class ProviderPolicyTest(unittest.TestCase):
             )
         )
 
+    def test_codex_allows_only_one_direct_arg_transport_file(self) -> None:
+        root = self.review.workspace_root.resolve()
+        codex_home = pathlib.Path(self.temporary.name) / "codex-home"
+        arg_root = codex_home.resolve() / "tmp/arg0"
+
+        def payload(extra_entries):
+            return {
+                "approval_policy": "never",
+                "sandbox_policy": {"type": "read-only"},
+                "permission_profile": {
+                    "type": "managed",
+                    "network": "restricted",
+                    "file_system": {
+                        "type": "restricted",
+                        "glob_scan_max_depth": 8,
+                        "entries": [
+                            {
+                                "path": {
+                                    "type": "special",
+                                    "value": {"kind": "minimal"},
+                                },
+                                "access": "read",
+                            },
+                            {"path": {"type": "path", "path": str(root)}, "access": "read"},
+                            *[
+                                {
+                                    "path": {
+                                        "type": "path",
+                                        "path": str((root / name).resolve()),
+                                    },
+                                    "access": "deny",
+                                }
+                                for name in (".git", ".codex", ".agents")
+                            ],
+                            *[
+                                {
+                                    "path": {
+                                        "type": "glob_pattern",
+                                        "pattern": str(root / pattern),
+                                    },
+                                    "access": "deny",
+                                }
+                                for pattern in ("*.env", "**/*.env")
+                            ],
+                            *extra_entries,
+                        ],
+                    },
+                },
+            }
+
+        def read_entry(path: pathlib.Path):
+            return {
+                "path": {"type": "path", "path": str(path)},
+                "access": "read",
+            }
+
+        direct = read_entry(arg_root / "codex-arg0AbE73u")
+        nested = read_entry(arg_root / "private/codex-arg0AbE73u")
+        second = read_entry(arg_root / "codex-arg0Second")
+        self.assertTrue(
+            providers._codex_permissions_match(
+                payload([direct]),
+                review_root=root,
+                codex_home=codex_home,
+            )
+        )
+        for extras in ([nested], [direct, second]):
+            with self.subTest(extras=extras):
+                self.assertFalse(
+                    providers._codex_permissions_match(
+                        payload(extras),
+                        review_root=root,
+                        codex_home=codex_home,
+                    )
+                )
+
     @mock.patch.object(
         providers,
         "resolve_reviewer_executable",

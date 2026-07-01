@@ -18,6 +18,8 @@ from review_runtime import providers  # noqa: E402
 class RepositoryContractTest(unittest.TestCase):
     def test_only_canonical_review_skill_entrypoint_remains(self) -> None:
         self.assertTrue((SKILL_ROOT / "SKILL.md").is_file())
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        self.assertNotIn("installs a readonly Git shim", skill)
         for relative in (
             "skills/external-review-playbook/SKILL.md",
             "skills/pr-readiness-review-workflow/SKILL.md",

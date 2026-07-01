@@ -73,7 +73,7 @@ Capacity, overload, rate limits, timeouts, network errors, 5xx responses, missin
 
 ## Helper Contract
 
-Read [helper-contract.md](references/helper-contract.md) before modifying or debugging the helper. The helper intentionally exposes only `codex` and `claude` logical reviewers, requires a frozen range, installs a readonly Git shim, and preserves stateful final artifacts.
+Read [helper-contract.md](references/helper-contract.md) before modifying or debugging the helper. The helper intentionally exposes only `codex` and `claude` logical reviewers, requires a `.git`-free frozen range, avoids reviewer-visible helper shims, and preserves stateful final artifacts.
 
 ## References
 
