@@ -276,13 +276,20 @@ def start(
                     pending_signal = cleanup_signal
             restore_signal_mask(cleanup_mask)
         if pending_signal is not None:
-            detail = None
+            details: list[str] = []
+            if isinstance(error, ForwardedSignal) and error.detail:
+                details.append(error.detail)
+            elif isinstance(error, ReviewError):
+                details.append(str(error))
             if cleanup_error and review is not None:
-                detail = (
+                details.append(
                     "review startup failed and cleanup failed; evidence retained at "
                     f"{review.container_dir}: {cleanup_error}"
                 )
-            raise ForwardedSignal(pending_signal, detail=detail) from error
+            raise ForwardedSignal(
+                pending_signal,
+                detail="; ".join(details) or None,
+            ) from error
         if cleanup_error and review is not None:
             raise ReviewError(
                 "review startup failed and cleanup failed; evidence retained at "

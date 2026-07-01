@@ -360,6 +360,54 @@ time.sleep(0.2)
 
         popen.assert_not_called()
 
+    def test_start_preserves_prepare_cleanup_failure_detail(self) -> None:
+        installed: dict[signal.Signals, object] = {}
+        retained_detail = (
+            "snapshot preparation failed and cleanup failed; evidence retained at "
+            "/tmp/isolated-review-retained: permission denied"
+        )
+
+        def install_handler(signum, handler):
+            previous = installed.get(signum, signal.SIG_DFL)
+            installed[signum] = handler
+            return previous
+
+        def cancel_prepare(**_kwargs):
+            handler = installed[signal.SIGTERM]
+            assert callable(handler)
+            try:
+                handler(signal.SIGTERM, None)
+            except state.ForwardedSignal as error:
+                raise state.ForwardedSignal(
+                    error.signum,
+                    detail=retained_detail,
+                ) from error
+
+        with (
+            mock.patch.object(state.signal, "signal", side_effect=install_handler),
+            mock.patch.object(
+                state,
+                "prepare_workspace",
+                side_effect=cancel_prepare,
+            ),
+            mock.patch.object(state.subprocess, "Popen") as popen,
+            self.assertRaises(state.ForwardedSignal) as raised,
+        ):
+            state.start(
+                script_path=pathlib.Path("runner.py"),
+                repo=self.repo,
+                reviewer="codex",
+                base_ref=self.base,
+                head_ref=self.head,
+                prompt_file=None,
+                keep_workspace=False,
+                egress_consent=None,
+            )
+
+        self.assertEqual(raised.exception.signum, signal.SIGTERM)
+        self.assertEqual(raised.exception.detail, retained_detail)
+        popen.assert_not_called()
+
     def test_start_defers_spawn_signal_and_never_publishes_runner(self) -> None:
         installed: dict[signal.Signals, object] = {}
         process = mock.Mock(pid=12345)
