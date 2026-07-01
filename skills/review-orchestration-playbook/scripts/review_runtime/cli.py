@@ -84,11 +84,7 @@ def _build_stateful_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _shim_source(script_path: pathlib.Path) -> pathlib.Path:
-    return script_path.resolve().with_name("git_readonly_shim")
-
-
-def _run_foreground(args: argparse.Namespace, *, script_path: pathlib.Path) -> int:
+def _run_foreground(args: argparse.Namespace) -> int:
     _validate_review_arguments(args)
     review = None
     returncode = 1
@@ -121,7 +117,6 @@ def _run_foreground(args: argparse.Namespace, *, script_path: pathlib.Path) -> i
         outcome = run_review(
             review=review,
             reviewer=args.reviewer,
-            shim_source=_shim_source(script_path),
             egress_consent=args.egress_consent,
         )
         if outcome.final_text:
@@ -210,15 +205,12 @@ def main(argv: list[str] | None = None) -> int:
             parsed = internal.parse_args(arguments)
             exit_code = run_state(
                 state_dir=pathlib.Path(parsed.state_dir),
-                shim_source=_shim_source(script_path),
                 terminal_process=True,
             )
             os._exit(exit_code)
         if arguments and arguments[0] == "stateful":
             return _run_stateful(arguments[1:], script_path=script_path)
-        return _run_foreground(
-            _build_parser().parse_args(arguments), script_path=script_path
-        )
+        return _run_foreground(_build_parser().parse_args(arguments))
     except ForwardedSignal as error:
         if error.detail:
             print(f"error: {error.detail}", file=sys.stderr)

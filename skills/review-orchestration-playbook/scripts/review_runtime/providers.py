@@ -4,7 +4,6 @@ import json
 import os
 import pathlib
 import re
-import sys
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Iterable
 
@@ -12,6 +11,7 @@ from .common import (
     Completed,
     ReviewError,
     child_environment,
+    reviewer_executable_path,
     resolve_reviewer_executable,
     run,
     write_json,
@@ -163,7 +163,6 @@ class Outcome:
 def _review_environment(
     *,
     review: ReviewWorkspace,
-    shim_source: pathlib.Path | None,
     passthrough_keys: Iterable[str],
     extra: dict[str, str] | None = None,
 ) -> dict[str, str]:
@@ -177,8 +176,6 @@ def _review_environment(
         review_values.update(extra)
     return child_environment(
         container_dir=review.container_dir,
-        workspace_root=review.workspace_root,
-        shim_source=shim_source,
         passthrough_keys=passthrough_keys,
         extra=review_values,
     )
@@ -189,11 +186,10 @@ def _with_executable_path(
     executable: pathlib.Path,
 ) -> dict[str, str]:
     result = dict(env)
-    entries = [value for value in result.get("PATH", "").split(os.pathsep) if value]
-    executable_parent = str(executable.parent)
-    if executable_parent not in entries:
-        entries.insert(1 if entries else 0, executable_parent)
-    result["PATH"] = os.pathsep.join(entries)
+    result["PATH"] = reviewer_executable_path(
+        executable,
+        base_path=result.get("PATH", ""),
+    )
     return result
 
 
@@ -427,18 +423,17 @@ def _codex_session_metadata(
     env: dict[str, str],
     *,
     review_root: pathlib.Path,
-    python_runtime_root: pathlib.Path,
-) -> tuple[str | None, str | None, bool]:
+) -> tuple[str | None, str | None, bool | None]:
     thread_id = _codex_thread_id(stdout)
     if thread_id is None:
-        return None, None, False
+        return None, None, None
     codex_home_value = env.get("CODEX_HOME")
     if codex_home_value:
         codex_home = pathlib.Path(codex_home_value).expanduser()
     else:
         home_value = env.get("HOME")
         if not home_value:
-            return None, None, False
+            return None, None, None
         codex_home = pathlib.Path(home_value).expanduser() / ".codex"
     sessions_root = codex_home / "sessions"
     try:
@@ -448,7 +443,7 @@ def _codex_session_metadata(
             reverse=True,
         )
     except OSError:
-        return None, None, False
+        return None, None, None
     for candidate in candidates:
         try:
             with candidate.open("r", encoding="utf-8") as handle:
@@ -471,12 +466,11 @@ def _codex_session_metadata(
                             payload,
                             review_root=review_root,
                             codex_home=codex_home,
-                            python_runtime_root=python_runtime_root,
                         ),
                     )
         except OSError:
             continue
-    return None, None, False
+    return None, None, None
 
 
 def _codex_permissions_match(
@@ -484,7 +478,6 @@ def _codex_permissions_match(
     *,
     review_root: pathlib.Path,
     codex_home: pathlib.Path | None = None,
-    python_runtime_root: pathlib.Path | None = None,
 ) -> bool:
     sandbox_policy = payload.get("sandbox_policy")
     permission_profile = payload.get("permission_profile")
@@ -514,8 +507,6 @@ def _codex_permissions_match(
         str((review_root / ".codex").resolve()): "deny",
         str((review_root / ".agents").resolve()): "deny",
     }
-    if python_runtime_root is not None:
-        expected_paths[str(python_runtime_root.resolve())] = "read"
     expected_globs = {
         str(review_root.resolve() / "*.env"): "deny",
         str(review_root.resolve() / "**/*.env"): "deny",
@@ -638,11 +629,7 @@ def _record_attempt(
             category="runtime-unverified",
             final_text=None,
         )
-    if (
-        attempt.category == "success"
-        and effective_model
-        and not _model_matches(model, effective_model)
-    ):
+    if effective_model and not _model_matches(model, effective_model):
         mismatch = (
             f"requested model {model!r} was replaced by {effective_model!r}; "
             "refusing to infer an entitlement failure from silent model substitution"
@@ -654,11 +641,7 @@ def _record_attempt(
             category="model-mismatch",
             final_text=None,
         )
-    if (
-        attempt.category == "success"
-        and effective_effort
-        and effective_effort.lower() != requested_effort.lower()
-    ):
+    if effective_effort and effective_effort.lower() != requested_effort.lower():
         mismatch = (
             f"requested effort {requested_effort!r} was replaced by {effective_effort!r}; "
             "refusing to accept the pinned lane"
@@ -689,17 +672,13 @@ def _codex_attempt(
     stdout_path, stderr_path = _attempt_paths(review, index, "codex", model)
     tool_home = review.container_dir / "tool-home"
     tool_home.mkdir(exist_ok=True)
-    python_runtime_root = pathlib.Path(sys.base_prefix).resolve()
     shell_values = {
         key: env[key]
         for key in (
             "CODEX_ISOLATED_REVIEW_DIFF_FILE",
-            "CODEX_ISOLATED_REVIEW_GIT_POLICY",
-            "CODEX_ISOLATED_REVIEW_GIT_SHIM",
             "CODEX_ISOLATED_REVIEW_PROMPT_FILE",
             "CODEX_ISOLATED_REVIEW_RANGE",
             "CODEX_ISOLATED_REVIEW_ROOT",
-            "CODEX_REAL_GIT",
             "PATH",
             "TEMP",
             "TMP",
@@ -719,8 +698,7 @@ def _codex_attempt(
         '{"filesystem"={"glob_scan_max_depth"=8,":minimal"="read",'
         '":workspace_roots"={"."="read",".git"="deny",'
         '".codex"="deny",".agents"="deny","*.env"="deny",'
-        '"**/*.env"="deny"},'
-        f'{json.dumps(str(python_runtime_root))}="read"'
+        '"**/*.env"="deny"}'
         "}}"
     )
     prompt = review.prompt_file.read_bytes()
@@ -768,7 +746,6 @@ def _codex_attempt(
         completed.stdout,
         env,
         review_root=review.workspace_root,
-        python_runtime_root=python_runtime_root,
     )
     attempt = _record_attempt(
         review=review,
@@ -783,7 +760,9 @@ def _codex_attempt(
         require_verified_model=True,
         require_verified_effort=True,
     )
-    if attempt.category == "success" and not permissions_verified:
+    if permissions_verified is False or (
+        attempt.category == "success" and permissions_verified is None
+    ):
         detail = (
             "effective Codex sandbox did not preserve the isolated review permission "
             "profile; refusing to accept a result from a legacy or managed sandbox override"
@@ -1050,7 +1029,6 @@ def run_review(
     *,
     review: ReviewWorkspace,
     reviewer: str,
-    shim_source: pathlib.Path,
     egress_consent: str | None = None,
 ) -> Outcome:
     if reviewer not in ("codex", "claude"):
@@ -1118,7 +1096,6 @@ def run_review(
     if reviewer == "codex":
         env = _review_environment(
             review=review,
-            shim_source=shim_source,
             passthrough_keys=CODEX_ENV_KEYS,
         )
         try:
@@ -1147,7 +1124,6 @@ def run_review(
     if claude_available:
         claude_env = _review_environment(
             review=review,
-            shim_source=None,
             passthrough_keys=CLAUDE_ENV_KEYS,
             extra={"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"},
         )
@@ -1198,7 +1174,6 @@ def run_review(
         return _finish(review, attempts, None)
     copilot_env = _review_environment(
         review=review,
-        shim_source=None,
         passthrough_keys=COPILOT_ENV_KEYS,
     )
     try:

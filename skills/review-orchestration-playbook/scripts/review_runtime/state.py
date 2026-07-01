@@ -314,7 +314,6 @@ def start(
 def run_state(
     *,
     state_dir: pathlib.Path,
-    shim_source: pathlib.Path,
     terminal_process: bool = False,
 ) -> int:
     exit_code = 1
@@ -346,7 +345,6 @@ def run_state(
         outcome = run_review(
             review=review,
             reviewer=reviewer,
-            shim_source=shim_source,
             egress_consent=egress_consent,
         )
         exit_code = outcome.returncode

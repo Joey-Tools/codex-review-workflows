@@ -7,6 +7,6 @@ Public review orchestration and local delivery gate skills.
 ## Test
 
 ```bash
-python3 -m py_compile skills/review-orchestration-playbook/scripts/isolated_review skills/review-orchestration-playbook/scripts/git_readonly_shim skills/review-orchestration-playbook/scripts/review_runtime/*.py
+python3 -m py_compile skills/review-orchestration-playbook/scripts/isolated_review skills/review-orchestration-playbook/scripts/review_runtime/*.py
 python3 -m unittest discover -s skills/review-orchestration-playbook/tests
 ```

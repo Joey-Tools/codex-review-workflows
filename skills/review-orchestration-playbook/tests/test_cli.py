@@ -86,7 +86,7 @@ class ForegroundCleanupTest(unittest.TestCase):
             mock.patch.object(cli, "restore_signal_mask"),
             self.assertRaises(cli.ForwardedSignal) as raised,
         ):
-            cli._run_foreground(args, script_path=SCRIPTS / "isolated_review")
+            cli._run_foreground(args)
 
         self.assertEqual(raised.exception.signum, signal.SIGTERM)
         run_review.assert_not_called()
@@ -132,7 +132,7 @@ class ForegroundCleanupTest(unittest.TestCase):
             ) as cleanup,
             self.assertRaises(cli.ForwardedSignal) as raised,
         ):
-            cli._run_foreground(args, script_path=SCRIPTS / "isolated_review")
+            cli._run_foreground(args)
 
         self.assertEqual(raised.exception.signum, signal.SIGTERM)
         run_review.assert_not_called()
@@ -179,10 +179,7 @@ class ForegroundCleanupTest(unittest.TestCase):
                 contextlib.redirect_stderr(stderr),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
-                returncode = cli._run_foreground(
-                    args,
-                    script_path=SCRIPTS / "isolated_review",
-                )
+                returncode = cli._run_foreground(args)
         self.assertEqual(returncode, 1)
         self.assertIn("cleanup failed", stderr.getvalue())
         self.assertIn("isolated-review-test", stderr.getvalue())

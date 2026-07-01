@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import signal
 import shutil
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -435,6 +435,46 @@ def _user_executable_candidates(name: str) -> list[pathlib.Path]:
     return candidates
 
 
+ENV_SHEBANG = re.compile(
+    rb"^#![ \t]*/usr/bin/env(?:[ \t]+-S)?[ \t]+([A-Za-z0-9_.+-]+)(?:[ \t]|$)"
+)
+
+
+def _env_shebang_runtime(path: pathlib.Path) -> pathlib.Path | None:
+    try:
+        with path.open("rb") as handle:
+            first_line = handle.readline(512)
+    except OSError:
+        return None
+    match = ENV_SHEBANG.match(first_line.rstrip(b"\r\n"))
+    if match is None:
+        return None
+    interpreter = match.group(1).decode("ascii")
+    candidates = _user_executable_candidates(interpreter)
+    discovered = shutil.which(interpreter, path=TRUSTED_PATH)
+    if discovered:
+        candidates.append(pathlib.Path(discovered))
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate.absolute()
+    return None
+
+
+def reviewer_executable_path(
+    path: pathlib.Path,
+    *,
+    base_path: str = TRUSTED_PATH,
+) -> str:
+    entries = [str(path.parent)]
+    runtime = _env_shebang_runtime(path)
+    if runtime is not None and str(runtime.parent) not in entries:
+        entries.append(str(runtime.parent))
+    for entry in base_path.split(os.pathsep):
+        if entry and entry not in entries:
+            entries.append(entry)
+    return os.pathsep.join(entries)
+
+
 def _executable_identity_matches(
     path: pathlib.Path,
     markers: Iterable[str],
@@ -442,7 +482,7 @@ def _executable_identity_matches(
     env = {
         "HOME": os.environ.get("HOME", str(pathlib.Path.home())),
         "NO_COLOR": "1",
-        "PATH": f"{path.parent}{os.pathsep}{TRUSTED_PATH}",
+        "PATH": reviewer_executable_path(path),
     }
     try:
         completed = subprocess.run(
@@ -541,43 +581,9 @@ def is_relative_to(path: pathlib.Path, parent: pathlib.Path) -> bool:
     return True
 
 
-def require_path_within(
-    path: pathlib.Path, parent: pathlib.Path, *, label: str
-) -> pathlib.Path:
-    resolved_path = path.resolve(strict=False)
-    resolved_parent = parent.resolve(strict=False)
-    if not is_relative_to(resolved_path, resolved_parent):
-        raise ReviewError(f"{label} escapes its review container: {resolved_path}")
-    return resolved_path
-
-
-def install_readonly_git_shim(
-    *,
-    workspace_root: pathlib.Path,
-    source: pathlib.Path,
-) -> pathlib.Path:
-    shim_dir = require_path_within(
-        workspace_root / ".codex-review/tool-shims",
-        workspace_root,
-        label="readonly Git shim directory",
-    )
-    shim_dir.mkdir(parents=True, exist_ok=True)
-    target = shim_dir / "git"
-    text = source.read_text(encoding="utf-8")
-    lines = text.splitlines()
-    if not lines:
-        raise ReviewError(f"readonly git shim is empty: {source}")
-    lines[0] = f"#!{pathlib.Path(sys.executable).resolve()}"
-    write_text_atomic(target, "\n".join(lines) + "\n")
-    target.chmod(0o755)
-    return shim_dir
-
-
 def child_environment(
     *,
     container_dir: pathlib.Path,
-    workspace_root: pathlib.Path,
-    shim_source: pathlib.Path | None = None,
     passthrough_keys: Iterable[str] = (),
     extra: dict[str, str] | None = None,
 ) -> dict[str, str]:
@@ -591,20 +597,6 @@ def child_environment(
             "TEMP": str(container_dir / "tmp"),
         }
     )
-    if shim_source is not None:
-        real_git = resolve_git()
-        shim_dir = install_readonly_git_shim(
-            workspace_root=workspace_root,
-            source=shim_source,
-        )
-        env.update(
-            {
-                "PATH": f"{shim_dir}{os.pathsep}{TRUSTED_PATH}",
-                "CODEX_REAL_GIT": str(real_git),
-                "CODEX_ISOLATED_REVIEW_GIT_POLICY": "readonly-shim",
-                "CODEX_ISOLATED_REVIEW_GIT_SHIM": str(shim_dir / "git"),
-            }
-        )
     (container_dir / "tmp").mkdir(parents=True, exist_ok=True)
     if extra:
         env.update(extra)

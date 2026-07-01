@@ -188,7 +188,6 @@ class ChildEnvironmentTest(unittest.TestCase):
     def test_passes_only_review_runtime_and_auth_environment(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             container = pathlib.Path(temporary)
-            workspace_root = container / "workspace"
             with (
                 mock.patch.dict(
                     common.os.environ,
@@ -203,19 +202,9 @@ class ChildEnvironmentTest(unittest.TestCase):
                     },
                     clear=True,
                 ),
-                mock.patch.object(
-                    common, "resolve_git", return_value=pathlib.Path("/usr/bin/git")
-                ),
-                mock.patch.object(
-                    common,
-                    "install_readonly_git_shim",
-                    return_value=workspace_root / ".codex-review/tool-shims",
-                ),
             ):
                 env = common.child_environment(
                     container_dir=container,
-                    workspace_root=workspace_root,
-                    shim_source=SCRIPTS / "git_readonly_shim",
                     passthrough_keys=("GH_TOKEN",),
                 )
         self.assertEqual(env["HOME"], "/home/reviewer")
@@ -226,51 +215,15 @@ class ChildEnvironmentTest(unittest.TestCase):
         self.assertNotIn("UNRELATED_PRIVATE_VALUE", env)
         self.assertNotIn("DATABASE_PASSWORD", env)
 
-    def test_external_environment_does_not_install_or_expose_git_shim(self) -> None:
+    def test_review_environment_does_not_expose_git_runtime_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             container = pathlib.Path(temporary)
-            workspace_root = container / "workspace"
-            workspace_root.mkdir()
-            with (
-                mock.patch.object(common, "resolve_git") as resolve_git,
-                mock.patch.object(
-                    common,
-                    "install_readonly_git_shim",
-                ) as install_shim,
-            ):
-                env = common.child_environment(
-                    container_dir=container,
-                    workspace_root=workspace_root,
-                    shim_source=None,
-                )
-                self.assertFalse(
-                    (workspace_root / ".codex-review/tool-shims").exists()
-                )
+            env = common.child_environment(container_dir=container)
 
-        resolve_git.assert_not_called()
-        install_shim.assert_not_called()
         self.assertEqual(env["PATH"], common.TRUSTED_PATH)
         self.assertNotIn("CODEX_REAL_GIT", env)
         self.assertNotIn("CODEX_ISOLATED_REVIEW_GIT_POLICY", env)
         self.assertNotIn("CODEX_ISOLATED_REVIEW_GIT_SHIM", env)
-
-    def test_installs_git_shim_inside_workspace_control_directory(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            container = pathlib.Path(temporary)
-            workspace_root = container / "workspace"
-            (workspace_root / ".codex-review").mkdir(parents=True)
-
-            shim_dir = common.install_readonly_git_shim(
-                workspace_root=workspace_root,
-                source=SCRIPTS / "git_readonly_shim",
-            )
-
-            self.assertEqual(
-                shim_dir,
-                (workspace_root / ".codex-review/tool-shims").resolve(),
-            )
-            self.assertTrue((shim_dir / "git").is_file())
-            self.assertTrue((shim_dir / "git").stat().st_mode & 0o100)
 
     def test_explicit_reviewer_path_requires_expected_cli_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -291,6 +244,38 @@ class ChildEnvironmentTest(unittest.TestCase):
             ):
                 resolved = common.resolve_reviewer_executable("codex")
         self.assertEqual(resolved, executable.absolute())
+
+    def test_env_shebang_identity_uses_validated_nvm_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = pathlib.Path(temporary)
+            node = home / ".nvm/versions/node/v24.1.0/bin/node"
+            node.parent.mkdir(parents=True)
+            node.write_text(
+                "#!/bin/sh\necho 'claude code 2.1.0'\n",
+                encoding="utf-8",
+            )
+            node.chmod(0o755)
+            executable = home / ".local/bin/claude"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+            executable.chmod(0o755)
+
+            with mock.patch.dict(
+                common.os.environ,
+                {
+                    "HOME": str(home),
+                    "CODEX_REVIEW_CLAUDE_PATH": str(executable),
+                },
+                clear=True,
+            ):
+                resolved = common.resolve_reviewer_executable("claude")
+                reviewer_path = common.reviewer_executable_path(executable)
+
+        self.assertEqual(resolved, executable.absolute())
+        self.assertEqual(
+            reviewer_path.split(common.os.pathsep)[:2],
+            [str(executable.parent), str(node.parent)],
+        )
 
     def test_reviewer_path_override_must_be_absolute(self) -> None:
         with mock.patch.dict(

@@ -208,7 +208,6 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="codex",
-            shim_source=SCRIPTS / "git_readonly_shim",
         )
         self.assertEqual(outcome.returncode, 0)
         self.assertEqual(
@@ -285,7 +284,6 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="codex",
-            shim_source=SCRIPTS / "git_readonly_shim",
         )
         self.assertEqual(outcome.returncode, 75)
         self.assertEqual(codex_attempt.call_count, 1)
@@ -319,7 +317,6 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            shim_source=SCRIPTS / "git_readonly_shim",
             egress_consent="double-review",
         )
         self.assertEqual(outcome.returncode, 0)
@@ -356,7 +353,6 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            shim_source=SCRIPTS / "git_readonly_shim",
             egress_consent="triple-review",
         )
         self.assertEqual(outcome.returncode, 75)
@@ -384,7 +380,6 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            shim_source=SCRIPTS / "git_readonly_shim",
             egress_consent="double-review",
         )
         self.assertEqual(outcome.returncode, 1)
@@ -405,7 +400,6 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            shim_source=SCRIPTS / "git_readonly_shim",
             egress_consent="double-review",
         )
         self.assertEqual(outcome.returncode, 2)
@@ -431,7 +425,6 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            shim_source=SCRIPTS / "git_readonly_shim",
             egress_consent="explicit-claude-review",
         )
         self.assertEqual(outcome.returncode, 2)
@@ -467,6 +460,74 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(attempt.category, "model-mismatch")
         self.assertIsNone(attempt.final_text)
 
+    def test_failed_attempt_metadata_mismatch_blocks_fallback(self) -> None:
+        completed = Completed(
+            argv=("codex",),
+            returncode=1,
+            stdout=json.dumps(
+                {
+                    "type": "turn.failed",
+                    "error": {"message": "Model is not available for your account"},
+                }
+            ).encode(),
+            stderr=b"",
+        )
+        cases = (
+            (1, "gpt-5.5", "xhigh", "model-mismatch"),
+            (2, "gpt-5.6-sol", "high", "effort-mismatch"),
+        )
+        for index, effective_model, effective_effort, expected_category in cases:
+            with self.subTest(expected_category=expected_category):
+                attempt = providers._record_attempt(
+                    review=self.review,
+                    index=index,
+                    runtime="codex",
+                    model="gpt-5.6-sol",
+                    completed=completed,
+                    final_text=None,
+                    effective_model=effective_model,
+                    requested_effort="xhigh",
+                    effective_effort=effective_effort,
+                )
+                self.assertEqual(attempt.category, expected_category)
+                self.assertIsNone(attempt.final_text)
+
+    @mock.patch.object(
+        providers,
+        "resolve_reviewer_executable",
+        return_value=pathlib.Path("/bin/codex"),
+    )
+    @mock.patch.object(providers, "_codex_session_metadata")
+    @mock.patch.object(providers, "run")
+    def test_failed_codex_permission_mismatch_blocks_fallback(
+        self,
+        run_command: mock.Mock,
+        session_metadata: mock.Mock,
+        _resolve: mock.Mock,
+    ) -> None:
+        run_command.return_value = Completed(
+            argv=("codex",),
+            returncode=1,
+            stdout=json.dumps(
+                {
+                    "type": "turn.failed",
+                    "error": {"message": "Model is not available for your account"},
+                }
+            ).encode(),
+            stderr=b"",
+        )
+        session_metadata.return_value = ("gpt-5.6-sol", "xhigh", False)
+
+        attempt = providers._codex_attempt(
+            review=self.review,
+            model="gpt-5.6-sol",
+            index=1,
+            env={},
+        )
+
+        self.assertEqual(attempt.category, "permission-mismatch")
+        self.assertIsNone(attempt.final_text)
+
     def test_success_without_verified_runtime_metadata_is_not_accepted(self) -> None:
         completed = Completed(
             argv=("codex",),
@@ -498,7 +559,6 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            shim_source=SCRIPTS / "git_readonly_shim",
         )
         self.assertEqual(outcome.returncode, 2)
         self.assertIn(
@@ -521,7 +581,6 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            shim_source=SCRIPTS / "git_readonly_shim",
             egress_consent="double-review",
         )
         self.assertEqual(outcome.returncode, 2)
@@ -547,7 +606,6 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="codex",
-            shim_source=SCRIPTS / "git_readonly_shim",
         )
         self.assertEqual(outcome.returncode, 2)
         codex_attempt.assert_not_called()
@@ -582,7 +640,6 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="codex",
-            shim_source=SCRIPTS / "git_readonly_shim",
         )
 
         self.assertEqual(outcome.returncode, 0)
@@ -601,7 +658,6 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            shim_source=SCRIPTS / "git_readonly_shim",
             egress_consent="double-review",
         )
         self.assertEqual(outcome.returncode, 2)
@@ -623,7 +679,6 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            shim_source=SCRIPTS / "git_readonly_shim",
             egress_consent="double-review",
         )
         self.assertEqual(outcome.returncode, 2)
@@ -644,7 +699,6 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            shim_source=SCRIPTS / "git_readonly_shim",
             egress_consent="double-review",
         )
         self.assertEqual(outcome.returncode, 2)
@@ -700,15 +754,6 @@ class ProviderPolicyTest(unittest.TestCase):
                                         "path": {
                                             "type": "path",
                                             "path": str(self.review.workspace_root.resolve()),
-                                        },
-                                        "access": "read",
-                                    },
-                                    {
-                                        "path": {
-                                            "type": "path",
-                                            "path": str(
-                                                pathlib.Path(sys.base_prefix).resolve()
-                                            ),
                                         },
                                         "access": "read",
                                     },
@@ -782,17 +827,13 @@ class ProviderPolicyTest(unittest.TestCase):
             f"profile = {permission_config.partition('=')[2]}"
         )["profile"]
         self.assertEqual(
-            parsed_permissions["filesystem"][str(pathlib.Path(sys.base_prefix).resolve())],
-            "read",
+            set(parsed_permissions["filesystem"]),
+            {"glob_scan_max_depth", ":minimal", ":workspace_roots"},
         )
         self.assertIn('"glob_scan_max_depth"=8', permission_config)
         self.assertIn('":minimal"="read"', permission_config)
         self.assertIn('":workspace_roots"={"."="read"', permission_config)
         self.assertIn('".git"="deny"', permission_config)
-        self.assertIn(
-            f'{json.dumps(str(pathlib.Path(sys.base_prefix).resolve()))}="read"',
-            permission_config,
-        )
         self.assertTrue(
             any("shell_environment_policy.inherit" in value for value in configs)
         )

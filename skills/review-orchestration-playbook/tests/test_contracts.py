@@ -24,6 +24,7 @@ class RepositoryContractTest(unittest.TestCase):
             "skills/copilot-review-playbook/SKILL.md",
             "skills/review-orchestration-playbook/scripts/isolated_external_review",
             "skills/review-orchestration-playbook/scripts/isolated_copilot_review",
+            "skills/review-orchestration-playbook/scripts/git_readonly_shim",
         ):
             self.assertFalse((REPO_ROOT / relative).exists(), relative)
 

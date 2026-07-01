@@ -301,7 +301,6 @@ time.sleep(0.2)
         ):
             exit_code = state.run_state(
                 state_dir=state_dir,
-                shim_source=SCRIPTS / "git_readonly_shim",
             )
 
         self.assertEqual(exit_code, 0)
@@ -347,7 +346,6 @@ time.sleep(0.2)
         ):
             exit_code = state.run_state(
                 state_dir=state_dir,
-                shim_source=SCRIPTS / "git_readonly_shim",
             )
 
         self.assertEqual(exit_code, 128 + signal.SIGINT)
@@ -796,7 +794,6 @@ time.sleep(0.2)
         ):
             exit_code = state.run_state(
                 state_dir=state_dir,
-                shim_source=SCRIPTS / "git_readonly_shim",
             )
 
         self.assertEqual(exit_code, 128 + signal.SIGTERM)
@@ -853,7 +850,6 @@ time.sleep(0.2)
         ):
             exit_code = state.run_state(
                 state_dir=state_dir,
-                shim_source=SCRIPTS / "git_readonly_shim",
             )
 
         self.assertEqual(exit_code, 128 + signal.SIGQUIT)
@@ -896,7 +892,6 @@ time.sleep(0.2)
         ):
             exit_code = state.run_state(
                 state_dir=state_dir,
-                shim_source=SCRIPTS / "git_readonly_shim",
                 terminal_process=True,
             )
 
