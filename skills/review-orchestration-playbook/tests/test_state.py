@@ -454,7 +454,7 @@ time.sleep(0.2)
             ) as terminate,
             mock.patch.object(state, "cleanup_workspace") as cleanup,
         ):
-            with self.assertRaises(BrokenPipeError):
+            with self.assertRaises(state.ForwardedSignal) as raised:
                 state.start(
                     script_path=pathlib.Path("runner.py"),
                     repo=self.repo,
@@ -467,6 +467,7 @@ time.sleep(0.2)
                     publisher=publisher,
                 )
 
+        self.assertEqual(raised.exception.signum, signal.SIGQUIT)
         terminate.assert_called_once_with(
             process,
             initial_signal=signal.SIGTERM,

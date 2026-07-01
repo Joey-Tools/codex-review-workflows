@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import signal
 import subprocess
 import sys
 import tempfile
@@ -12,7 +13,7 @@ from unittest import mock
 SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from review_runtime.common import ReviewError  # noqa: E402
+from review_runtime.common import ForwardedSignal, ReviewError  # noqa: E402
 from review_runtime.workspace import (  # noqa: E402
     _file_secret_rule,
     _sensitive_path_rule,
@@ -139,6 +140,57 @@ class WorkspaceTest(unittest.TestCase):
                 base_ref=self.base,
                 head_ref=self.head,
             )
+        review_root = self.repo / ".codex-tmp"
+        self.assertEqual(list(review_root.glob("isolated-review-*")), [])
+
+    def test_container_handoff_signal_cleans_private_snapshot(self) -> None:
+        restore_calls = 0
+
+        def interrupt_first_restore(_mask):
+            nonlocal restore_calls
+            restore_calls += 1
+            if restore_calls == 1:
+                raise ForwardedSignal(signal.SIGTERM)
+
+        with (
+            mock.patch(
+                "review_runtime.workspace.restore_signal_mask",
+                side_effect=interrupt_first_restore,
+            ),
+            self.assertRaises(ForwardedSignal),
+        ):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+
+        review_root = self.repo / ".codex-tmp"
+        self.assertEqual(list(review_root.glob("isolated-review-*")), [])
+
+    def test_partial_snapshot_cleanup_reports_second_signal(self) -> None:
+        with (
+            mock.patch(
+                "review_runtime.workspace._create_sanitized_git_view",
+                side_effect=KeyboardInterrupt,
+            ),
+            mock.patch(
+                "review_runtime.workspace.block_forwarded_signals",
+                side_effect=({signal.SIGTERM}, {signal.SIGTERM}),
+            ),
+            mock.patch(
+                "review_runtime.workspace.consume_pending_forwarded_signal",
+                return_value=signal.SIGQUIT,
+            ),
+            self.assertRaises(ForwardedSignal) as raised,
+        ):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+
+        self.assertEqual(raised.exception.signum, signal.SIGQUIT)
         review_root = self.repo / ".codex-tmp"
         self.assertEqual(list(review_root.glob("isolated-review-*")), [])
 

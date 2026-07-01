@@ -4,6 +4,7 @@ import os
 import pathlib
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
@@ -14,9 +15,13 @@ from typing import BinaryIO, Iterator
 
 from .common import (
     TRUSTED_PATH,
+    ForwardedSignal,
     ReviewError,
+    block_forwarded_signals,
+    consume_pending_forwarded_signal,
     is_relative_to,
     resolve_git,
+    restore_signal_mask,
     run,
     write_text_atomic,
 )
@@ -243,52 +248,73 @@ def resolve_commit(repo: pathlib.Path, ref: str, *, label: str) -> str:
     return result.stdout.decode("utf-8").strip()
 
 
-def _new_container(source_root: pathlib.Path) -> pathlib.Path:
+def _new_container(
+    source_root: pathlib.Path,
+) -> tuple[pathlib.Path, set[signal.Signals] | None]:
+    handoff_mask = block_forwarded_signals()
     stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
     suffix = uuid.uuid4().hex[:10]
     review_root = source_root / ".codex-tmp"
+    container: pathlib.Path | None = None
     try:
-        os.mkdir(review_root, mode=0o700)
-    except FileExistsError:
-        pass
-    try:
-        root_status = os.lstat(review_root)
-    except OSError as error:
-        raise ReviewError(
-            f"cannot inspect review root {review_root}: {error}"
-        ) from error
-    if not stat.S_ISDIR(root_status.st_mode) or stat.S_ISLNK(root_status.st_mode):
-        raise ReviewError(
-            f"review root must be a real directory, not a symlink: {review_root}"
-        )
-    if review_root.resolve() != review_root.absolute():
-        raise ReviewError(
-            f"review root resolves outside the source repository: {review_root}"
-        )
-
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        root_fd = os.open(review_root, flags)
-    except OSError as error:
-        raise ReviewError(
-            f"cannot securely open review root {review_root}: {error}"
-        ) from error
-    name = f"isolated-review-{stamp}-{suffix}"
-    container = review_root / name
-    try:
-        os.mkdir(name, mode=0o700, dir_fd=root_fd)
-        descriptor_status = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
-        path_status = os.lstat(container)
-        if (descriptor_status.st_dev, descriptor_status.st_ino) != (
-            path_status.st_dev,
-            path_status.st_ino,
-        ):
+        try:
+            os.mkdir(review_root, mode=0o700)
+        except FileExistsError:
+            pass
+        try:
+            root_status = os.lstat(review_root)
+        except OSError as error:
             raise ReviewError(
-                "review root changed while creating the private container"
+                f"cannot inspect review root {review_root}: {error}"
+            ) from error
+        if not stat.S_ISDIR(root_status.st_mode) or stat.S_ISLNK(root_status.st_mode):
+            raise ReviewError(
+                f"review root must be a real directory, not a symlink: {review_root}"
             )
-    finally:
-        os.close(root_fd)
-    return container
+        if review_root.resolve() != review_root.absolute():
+            raise ReviewError(
+                f"review root resolves outside the source repository: {review_root}"
+            )
+
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            root_fd = os.open(review_root, flags)
+        except OSError as error:
+            raise ReviewError(
+                f"cannot securely open review root {review_root}: {error}"
+            ) from error
+        name = f"isolated-review-{stamp}-{suffix}"
+        container = review_root / name
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=root_fd)
+            descriptor_status = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+            path_status = os.lstat(container)
+            if (descriptor_status.st_dev, descriptor_status.st_ino) != (
+                path_status.st_dev,
+                path_status.st_ino,
+            ):
+                raise ReviewError(
+                    "review root changed while creating the private container"
+                )
+        finally:
+            os.close(root_fd)
+        return container, handoff_mask
+    except BaseException as error:
+        if container is not None:
+            shutil.rmtree(container, ignore_errors=True)
+        cleanup_signal = (
+            consume_pending_forwarded_signal()
+            if handoff_mask is not None
+            else None
+        )
+        restore_signal_mask(handoff_mask)
+        if cleanup_signal is not None:
+            raise ForwardedSignal(cleanup_signal) from error
+        raise
 
 
 def _iter_nul_records(stream: BinaryIO) -> Iterator[bytes]:
@@ -919,10 +945,12 @@ def prepare_workspace(
     source_root = resolve_repo_root(repo)
     base_sha = resolve_commit(source_root, base_ref, label="base ref")
     head_sha = resolve_commit(source_root, head_ref, label="head ref")
-    container = _new_container(source_root)
-    workspace_root = container / "workspace"
+    container, handoff_mask = _new_container(source_root)
 
     try:
+        restore_signal_mask(handoff_mask)
+        handoff_mask = None
+        workspace_root = container / "workspace"
         git_view, object_directory = _create_sanitized_git_view(
             source_root=source_root,
             container=container,
@@ -1003,9 +1031,21 @@ def prepare_workspace(
         )
         validate_workspace_layout(review)
         return review
-    except BaseException:
-        shutil.rmtree(container, ignore_errors=True)
+    except BaseException as error:
+        cleanup_mask = block_forwarded_signals()
+        cleanup_signal: signal.Signals | None = None
+        try:
+            shutil.rmtree(container, ignore_errors=True)
+            if cleanup_mask is not None:
+                cleanup_signal = consume_pending_forwarded_signal()
+        finally:
+            restore_signal_mask(cleanup_mask)
+        if cleanup_signal is not None:
+            raise ForwardedSignal(cleanup_signal) from error
         raise
+    finally:
+        if handoff_mask is not None:
+            restore_signal_mask(handoff_mask)
 
 
 def cleanup_workspace(review: ReviewWorkspace, *, keep_container: bool) -> str | None:

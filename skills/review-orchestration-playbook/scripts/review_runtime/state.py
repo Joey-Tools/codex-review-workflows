@@ -140,6 +140,7 @@ def start(
     spawning = False
     published = False
     cleaning = False
+    handlers_restored = False
 
     def forward_signal(signum: int, _frame: object) -> None:
         nonlocal pending_signal
@@ -234,9 +235,10 @@ def start(
             signal_process_group(process, publication_signal)
             raise ForwardedSignal(publication_signal)
         return state_dir
-    except BaseException:
+    except BaseException as error:
         cleaning = True
         cleanup_mask = block_forwarded_signals()
+        cleanup_signal: signal.Signals | None = None
         try:
             if process is not None:
                 terminate_process_group(
@@ -248,18 +250,24 @@ def start(
                 _STARTED_PROCESSES.pop(process.pid, None)
             if review is not None and not published:
                 cleanup_workspace(review, keep_container=False)
+        finally:
+            for forwarded, previous in previous_handlers.items():
+                signal.signal(forwarded, previous)
+            handlers_restored = True
             if cleanup_mask is not None:
                 cleanup_signal = consume_pending_forwarded_signal()
-                if pending_signal is None:
+                if cleanup_signal is not None:
                     pending_signal = cleanup_signal
-        finally:
             restore_signal_mask(cleanup_mask)
+        if pending_signal is not None:
+            raise ForwardedSignal(pending_signal) from error
         raise
     finally:
         if lock_handle is not None:
             lock_handle.close()
-        for forwarded, previous in previous_handlers.items():
-            signal.signal(forwarded, previous)
+        if not handlers_restored:
+            for forwarded, previous in previous_handlers.items():
+                signal.signal(forwarded, previous)
 
 
 def run_state(
