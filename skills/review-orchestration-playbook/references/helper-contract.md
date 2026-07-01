@@ -35,7 +35,7 @@ isolated_review stateful wait --state-dir <state_dir>
 isolated_review stateful final --state-dir <state_dir>
 ```
 
-Always pass `--state-dir`; it is not positional. `stateful wait --timeout-seconds` bounds the caller's wait but does not kill or downgrade a healthy reviewer.
+Always pass `--state-dir`; it is not positional. `stateful wait --timeout-seconds` accepts only a non-negative finite value, bounds the caller's wait, and does not kill or downgrade a healthy reviewer.
 
 The parent acquires an exclusive runner lock before spawn and passes its file descriptor to the child for the child's full lifetime. Cross-process `status` / `wait` trusts that lock, not PID existence, so a reused PID cannot masquerade as the review runner.
 

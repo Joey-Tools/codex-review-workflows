@@ -27,6 +27,23 @@ def prepared_workspace(review):
 
 
 class ForegroundCleanupTest(unittest.TestCase):
+    def test_stateful_wait_rejects_nan_timeout(self) -> None:
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            returncode = cli.main(
+                [
+                    "stateful",
+                    "wait",
+                    "--state-dir",
+                    "/does-not-need-to-exist",
+                    "--timeout-seconds",
+                    "nan",
+                ]
+            )
+
+        self.assertEqual(returncode, 2)
+        self.assertIn("non-negative finite number", stderr.getvalue())
+
     def test_main_reports_signal_cleanup_detail(self) -> None:
         stderr = io.StringIO()
         with (

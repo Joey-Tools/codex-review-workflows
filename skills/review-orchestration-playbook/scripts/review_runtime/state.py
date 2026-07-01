@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import pathlib
 import signal
@@ -443,6 +444,10 @@ def wait(
     *,
     timeout_seconds: float | None,
 ) -> int:
+    if timeout_seconds is not None and (
+        not math.isfinite(timeout_seconds) or timeout_seconds < 0
+    ):
+        raise ReviewError("wait timeout must be a non-negative finite number")
     state_dir = state_dir.expanduser().resolve()
     deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
     while True:

@@ -194,6 +194,17 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.assertEqual(exit_code, 124)
         self.assertLess(elapsed, 0.5)
 
+    def test_wait_rejects_negative_and_non_finite_timeouts(self) -> None:
+        for timeout in (-0.1, float("nan"), float("inf"), float("-inf")):
+            with (
+                self.subTest(timeout=timeout),
+                self.assertRaisesRegex(
+                    ReviewError,
+                    "non-negative finite number",
+                ),
+            ):
+                state.wait(self.review.container_dir, timeout_seconds=timeout)
+
     def test_wait_timeout_includes_workspace_cleanup(self) -> None:
         self.write_completed_state()
         worker = mock.Mock()
