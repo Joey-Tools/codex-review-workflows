@@ -80,6 +80,16 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 2)
         self.assertIn("--egress-consent", completed.stderr)
 
+    def test_approval_template_covers_both_copilot_fallback_reasons(self) -> None:
+        consent = (SKILL_ROOT / "references/egress-consent.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("if Claude Code is unavailable", consent)
+        self.assertIn(
+            "both pinned Claude models are entitlement-blocked",
+            consent,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
