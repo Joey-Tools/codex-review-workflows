@@ -82,8 +82,10 @@ def _read_exit_code(state_dir: pathlib.Path) -> int | None:
     path = state_dir / EXIT_FILE
     try:
         text = path.read_text(encoding="utf-8").strip()
-    except OSError:
+    except FileNotFoundError:
         return None
+    except OSError as error:
+        raise ReviewError(f"cannot read review exit code {path}: {error}") from error
     if not text:
         return None
     try:
@@ -252,6 +254,7 @@ def start(
         cleaning = True
         cleanup_mask = block_forwarded_signals()
         cleanup_signal: signal.Signals | None = None
+        cleanup_error: str | None = None
         try:
             if process is not None:
                 terminate_process_group(
@@ -262,7 +265,7 @@ def start(
                 )
                 _STARTED_PROCESSES.pop(process.pid, None)
             if review is not None and not published:
-                cleanup_workspace(review, keep_container=False)
+                cleanup_error = cleanup_workspace(review, keep_container=False)
         finally:
             for forwarded, previous in previous_handlers.items():
                 signal.signal(forwarded, previous)
@@ -273,7 +276,18 @@ def start(
                     pending_signal = cleanup_signal
             restore_signal_mask(cleanup_mask)
         if pending_signal is not None:
-            raise ForwardedSignal(pending_signal) from error
+            detail = None
+            if cleanup_error and review is not None:
+                detail = (
+                    "review startup failed and cleanup failed; evidence retained at "
+                    f"{review.container_dir}: {cleanup_error}"
+                )
+            raise ForwardedSignal(pending_signal, detail=detail) from error
+        if cleanup_error and review is not None:
+            raise ReviewError(
+                "review startup failed and cleanup failed; evidence retained at "
+                f"{review.container_dir}: {cleanup_error}"
+            ) from error
         raise
     finally:
         if lock_handle is not None:

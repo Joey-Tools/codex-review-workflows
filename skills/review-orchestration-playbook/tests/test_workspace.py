@@ -143,6 +143,30 @@ class WorkspaceTest(unittest.TestCase):
         review_root = self.repo / ".codex-tmp"
         self.assertEqual(list(review_root.glob("isolated-review-*")), [])
 
+    def test_prepare_cleanup_failure_reports_retained_container(self) -> None:
+        with (
+            mock.patch(
+                "review_runtime.workspace._create_sanitized_git_view",
+                side_effect=RuntimeError("prepare failed"),
+            ),
+            mock.patch(
+                "review_runtime.workspace.shutil.rmtree",
+                side_effect=PermissionError("permission denied"),
+            ),
+            self.assertRaisesRegex(
+                ReviewError,
+                r"evidence retained at .*isolated-review.*permission denied",
+            ),
+        ):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+
+        review_root = self.repo / ".codex-tmp"
+        self.assertEqual(len(list(review_root.glob("isolated-review-*"))), 1)
+
     def test_container_handoff_signal_cleans_private_snapshot(self) -> None:
         restore_calls = 0
 

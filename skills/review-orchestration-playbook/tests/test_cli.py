@@ -19,6 +19,26 @@ from review_runtime.workspace import ReviewWorkspace  # noqa: E402
 
 
 class ForegroundCleanupTest(unittest.TestCase):
+    def test_main_reports_signal_cleanup_detail(self) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                cli,
+                "_run_foreground",
+                side_effect=cli.ForwardedSignal(
+                    signal.SIGTERM,
+                    detail="evidence retained at /tmp/review: permission denied",
+                ),
+            ),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = cli.main(
+                ["--base-ref", "a" * 40, "--head-ref", "b" * 40]
+            )
+
+        self.assertEqual(returncode, 128 + signal.SIGTERM)
+        self.assertIn("evidence retained at /tmp/review", stderr.getvalue())
+
     def test_signal_handler_covers_workspace_preparation(self) -> None:
         args = argparse.Namespace(
             repo=".",

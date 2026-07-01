@@ -258,6 +258,23 @@ def resolve_commit(repo: pathlib.Path, ref: str, *, label: str) -> str:
     return result.stdout.decode("utf-8").strip()
 
 
+def _remove_partial_container(container: pathlib.Path) -> str | None:
+    try:
+        shutil.rmtree(container)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        return str(error)
+    return None
+
+
+def _retained_container_detail(container: pathlib.Path, cleanup_error: str) -> str:
+    return (
+        "review workspace preparation failed and cleanup failed; evidence retained at "
+        f"{container}: {cleanup_error}"
+    )
+
+
 def _new_container(
     source_root: pathlib.Path,
 ) -> tuple[pathlib.Path, set[signal.Signals] | None]:
@@ -314,16 +331,32 @@ def _new_container(
             os.close(root_fd)
         return container, handoff_mask
     except BaseException as error:
+        cleanup_error: str | None = None
         if container is not None:
-            shutil.rmtree(container, ignore_errors=True)
+            cleanup_error = _remove_partial_container(container)
         cleanup_signal = (
             consume_pending_forwarded_signal()
             if handoff_mask is not None
             else None
         )
-        restore_signal_mask(handoff_mask)
+        try:
+            restore_signal_mask(handoff_mask)
+        except ForwardedSignal as forwarded:
+            detail = forwarded.detail
+            if detail is None and container is not None and cleanup_error:
+                detail = _retained_container_detail(container, cleanup_error)
+            raise ForwardedSignal(forwarded.signum, detail=detail) from error
         if cleanup_signal is not None:
-            raise ForwardedSignal(cleanup_signal) from error
+            detail = (
+                _retained_container_detail(container, cleanup_error)
+                if container is not None and cleanup_error
+                else None
+            )
+            raise ForwardedSignal(cleanup_signal, detail=detail) from error
+        if container is not None and cleanup_error:
+            raise ReviewError(
+                _retained_container_detail(container, cleanup_error)
+            ) from error
         raise
 
 
@@ -1045,14 +1078,30 @@ def prepare_workspace(
     except BaseException as error:
         cleanup_mask = block_forwarded_signals()
         cleanup_signal: signal.Signals | None = None
+        cleanup_error: str | None = None
         try:
-            shutil.rmtree(container, ignore_errors=True)
+            cleanup_error = _remove_partial_container(container)
             if cleanup_mask is not None:
                 cleanup_signal = consume_pending_forwarded_signal()
         finally:
-            restore_signal_mask(cleanup_mask)
+            try:
+                restore_signal_mask(cleanup_mask)
+            except ForwardedSignal as forwarded:
+                detail = forwarded.detail
+                if detail is None and cleanup_error:
+                    detail = _retained_container_detail(container, cleanup_error)
+                raise ForwardedSignal(forwarded.signum, detail=detail) from error
         if cleanup_signal is not None:
-            raise ForwardedSignal(cleanup_signal) from error
+            detail = (
+                _retained_container_detail(container, cleanup_error)
+                if cleanup_error
+                else None
+            )
+            raise ForwardedSignal(cleanup_signal, detail=detail) from error
+        if cleanup_error:
+            raise ReviewError(
+                _retained_container_detail(container, cleanup_error)
+            ) from error
         raise
     finally:
         if handoff_mask is not None:

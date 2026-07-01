@@ -212,6 +212,8 @@ def main(argv: list[str] | None = None) -> int:
             _build_parser().parse_args(arguments), script_path=script_path
         )
     except ForwardedSignal as error:
+        if error.detail:
+            print(f"error: {error.detail}", file=sys.stderr)
         return 128 + int(error.signum)
     except ReviewError as error:
         print(f"error: {error}", file=sys.stderr)

@@ -31,6 +31,13 @@ COPILOT_PERMISSION_HELP_FRAGMENTS = (
     "--disallow-temp-dir flag prevents automatic access",
     "denial rules always take precedence over allow rules, even --allow-all-tools",
 )
+CLAUDE_SAFE_MODE_HELP_FRAGMENTS = (
+    "--safe-mode",
+    "all customizations",
+    "claude.md",
+    "disabled",
+    "auth, model selection, built-in tools, and permissions work normally",
+)
 CLAUDE_EGRESS_CONSENTS = (
     "explicit-claude-review",
     "double-review",
@@ -185,6 +192,30 @@ def _with_executable_path(
         entries.insert(1 if entries else 0, executable_parent)
     result["PATH"] = os.pathsep.join(entries)
     return result
+
+
+def _require_claude_safe_mode(
+    executable: pathlib.Path,
+    env: dict[str, str],
+) -> None:
+    completed = run(
+        (str(executable), "--help"),
+        cwd=pathlib.Path(os.path.abspath(os.sep)),
+        env=env,
+    )
+    help_text = " ".join(
+        (completed.stdout + b"\n" + completed.stderr)
+        .decode("utf-8", errors="replace")
+        .lower()
+        .split()
+    )
+    if completed.returncode != 0 or not all(
+        fragment in help_text for fragment in CLAUDE_SAFE_MODE_HELP_FRAGMENTS
+    ):
+        raise ReviewError(
+            "Claude Code does not expose verifiable --safe-mode semantics that "
+            "disable CLAUDE.md and other project customizations"
+        )
 
 
 def classify_failure(stdout: bytes | str, stderr: bytes | str) -> str:
@@ -777,6 +808,7 @@ def _claude_attempt(
             "claude is not available in a validated executable path"
         )
     env = _with_executable_path(env, executable)
+    _require_claude_safe_mode(executable, env)
     stdout_path, stderr_path = _attempt_paths(review, index, "claude", model)
     settings = json.dumps(
         {

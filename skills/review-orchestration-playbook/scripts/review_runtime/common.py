@@ -21,9 +21,13 @@ class ReviewError(RuntimeError):
 class ForwardedSignal(RuntimeError):
     """A termination signal forwarded to the active reviewer process group."""
 
-    def __init__(self, signum: signal.Signals) -> None:
+    def __init__(self, signum: signal.Signals, *, detail: str | None = None) -> None:
         self.signum = signum
-        super().__init__(f"review orchestration received signal {int(signum)}")
+        self.detail = detail
+        message = f"review orchestration received signal {int(signum)}"
+        if detail:
+            message += f"; {detail}"
+        super().__init__(message)
 
 
 @dataclass(frozen=True)

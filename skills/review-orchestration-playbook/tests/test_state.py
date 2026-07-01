@@ -365,7 +365,7 @@ time.sleep(0.2)
             mock.patch.object(state.subprocess, "Popen", side_effect=spawn),
             mock.patch.object(state, "signal_process_group") as forward,
             mock.patch.object(state, "terminate_process_group") as terminate,
-            mock.patch.object(state, "cleanup_workspace"),
+            mock.patch.object(state, "cleanup_workspace", return_value=None),
         ):
             with self.assertRaises(state.ForwardedSignal):
                 state.start(
@@ -423,7 +423,7 @@ time.sleep(0.2)
                 return_value=None,
             ),
             mock.patch.object(state, "terminate_process_group"),
-            mock.patch.object(state, "cleanup_workspace"),
+            mock.patch.object(state, "cleanup_workspace", return_value=None),
         ):
             state_dir = state.start(
                 script_path=pathlib.Path("runner.py"),
@@ -452,7 +452,9 @@ time.sleep(0.2)
             ),
             mock.patch.object(state.subprocess, "Popen", return_value=process),
             mock.patch.object(state, "terminate_process_group") as terminate,
-            mock.patch.object(state, "cleanup_workspace") as cleanup,
+            mock.patch.object(
+                state, "cleanup_workspace", return_value=None
+            ) as cleanup,
         ):
             with self.assertRaises(BrokenPipeError):
                 state.start(
@@ -474,6 +476,41 @@ time.sleep(0.2)
             signal_already_sent=False,
             grace_seconds=state.RUNNER_SHUTDOWN_GRACE_SECONDS,
         )
+        cleanup.assert_called_once_with(self.review, keep_container=False)
+
+    def test_start_cleanup_failure_reports_retained_container(self) -> None:
+        process = mock.Mock(pid=12345)
+        publisher = mock.Mock(side_effect=BrokenPipeError("closed output"))
+        with (
+            mock.patch.object(
+                state,
+                "prepare_workspace",
+                return_value=self.review,
+            ),
+            mock.patch.object(state.subprocess, "Popen", return_value=process),
+            mock.patch.object(state, "terminate_process_group"),
+            mock.patch.object(
+                state,
+                "cleanup_workspace",
+                return_value="permission denied",
+            ) as cleanup,
+            self.assertRaisesRegex(
+                ReviewError,
+                r"evidence retained at .*isolated-review.*permission denied",
+            ),
+        ):
+            state.start(
+                script_path=pathlib.Path("runner.py"),
+                repo=self.repo,
+                reviewer="codex",
+                base_ref=self.base,
+                head_ref=self.head,
+                prompt_file=None,
+                keep_workspace=False,
+                egress_consent=None,
+                publisher=publisher,
+            )
+
         cleanup.assert_called_once_with(self.review, keep_container=False)
 
     def test_start_failure_cleanup_defers_a_second_signal(self) -> None:
@@ -504,7 +541,9 @@ time.sleep(0.2)
                 "terminate_process_group",
                 side_effect=signal_during_cleanup,
             ) as terminate,
-            mock.patch.object(state, "cleanup_workspace") as cleanup,
+            mock.patch.object(
+                state, "cleanup_workspace", return_value=None
+            ) as cleanup,
         ):
             with self.assertRaises(state.ForwardedSignal) as raised:
                 state.start(
@@ -824,6 +863,17 @@ time.sleep(0.2)
 
         self.assertFalse((self.review.container_dir / state.EXIT_FILE).exists())
         self.assertFalse((self.review.container_dir / "runner-error.txt").exists())
+
+    def test_exit_code_read_fails_closed_on_io_error(self) -> None:
+        with (
+            mock.patch.object(
+                pathlib.Path,
+                "read_text",
+                side_effect=PermissionError("permission denied"),
+            ),
+            self.assertRaisesRegex(ReviewError, "cannot read review exit code"),
+        ):
+            state._read_exit_code(self.review.container_dir)
 
 
 if __name__ == "__main__":

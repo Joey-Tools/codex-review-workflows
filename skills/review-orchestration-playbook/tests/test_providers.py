@@ -864,11 +864,20 @@ class ProviderPolicyTest(unittest.TestCase):
         _resolve: mock.Mock,
     ) -> None:
         payload = {"result": "No findings.", "modelUsage": {"claude-opus-4-8": {}}}
-        run_command.return_value = Completed(
-            argv=("claude",),
-            returncode=0,
-            stdout=json.dumps(payload).encode(),
-            stderr=b"",
+        safe_mode_help = " ".join(providers.CLAUDE_SAFE_MODE_HELP_FRAGMENTS)
+        run_command.side_effect = (
+            Completed(
+                argv=("claude", "--help"),
+                returncode=0,
+                stdout=safe_mode_help.encode(),
+                stderr=b"",
+            ),
+            Completed(
+                argv=("claude",),
+                returncode=0,
+                stdout=json.dumps(payload).encode(),
+                stderr=b"",
+            ),
         )
         providers._claude_attempt(
             review=self.review,
@@ -886,6 +895,35 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn("Read(~/.ssh/**)", settings["permissions"]["deny"])
         self.assertIn("--safe-mode", argv)
         self.assertIn("--strict-mcp-config", argv)
+        self.assertEqual(run_command.call_args_list[0].args[0][-1], "--help")
+
+    @mock.patch.object(
+        providers,
+        "resolve_reviewer_executable",
+        return_value=pathlib.Path("/bin/claude"),
+    )
+    @mock.patch.object(providers, "run")
+    def test_claude_refuses_unverified_safe_mode_semantics(
+        self,
+        run_command: mock.Mock,
+        _resolve: mock.Mock,
+    ) -> None:
+        run_command.return_value = Completed(
+            argv=("claude", "--help"),
+            returncode=0,
+            stdout=b"generic help",
+            stderr=b"",
+        )
+
+        with self.assertRaisesRegex(ReviewError, "disable CLAUDE.md"):
+            providers._claude_attempt(
+                review=self.review,
+                model="claude-opus-4-8",
+                index=1,
+                env={},
+            )
+
+        self.assertEqual(run_command.call_count, 1)
 
     @mock.patch.object(
         providers,
