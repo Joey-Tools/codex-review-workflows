@@ -115,6 +115,7 @@ MAX_DIFF_BYTES = 128 * 1024 * 1024
 MAX_CHANGED_METADATA_BYTES = 128 * 1024 * 1024
 MAX_CHANGED_ENTRIES = 100_000
 MAX_CHANGED_BLOB_SCAN_BYTES = 512 * 1024 * 1024
+MAX_REVIEW_PROMPT_BYTES = 64 * 1024
 LONG_ALPHANUMERIC_SECRET = re.compile(rb"[A-Za-z0-9]{24,512}")
 LONG_NUMERIC_SECRET = re.compile(rb"[0-9]{16,512}")
 
@@ -1252,6 +1253,29 @@ def _looks_like_unquoted_secret(candidate: bytes) -> bool:
     return character_classes >= 3 and any(48 <= value <= 57 for value in candidate)
 
 
+def _read_prompt_template(path: pathlib.Path) -> str:
+    try:
+        with path.open("rb") as handle:
+            encoded = handle.read(MAX_REVIEW_PROMPT_BYTES + 1)
+    except OSError as error:
+        raise ReviewError(f"cannot read review prompt override: {error}") from error
+    if len(encoded) > MAX_REVIEW_PROMPT_BYTES:
+        raise ReviewError(
+            f"review prompt exceeds the {MAX_REVIEW_PROMPT_BYTES}-byte limit"
+        )
+    try:
+        return encoded.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ReviewError("review prompt override is not valid UTF-8") from error
+
+
+def _validate_prompt_size(prompt: str) -> None:
+    if len(prompt.encode("utf-8")) > MAX_REVIEW_PROMPT_BYTES:
+        raise ReviewError(
+            f"review prompt exceeds the {MAX_REVIEW_PROMPT_BYTES}-byte limit"
+        )
+
+
 def prepare_workspace(
     *,
     repo: pathlib.Path,
@@ -1332,9 +1356,7 @@ def prepare_workspace(
                 head_ref=head_sha,
             )
         else:
-            template = prompt_override.expanduser().resolve().read_text(
-                encoding="utf-8"
-            )
+            template = _read_prompt_template(prompt_override.expanduser().resolve())
             replacements = {
                 "workspace": str(workspace_root),
                 "diff_file": str(diff_file),
@@ -1347,6 +1369,7 @@ def prepare_workspace(
                 lambda match: replacements[match.group(1)],
                 template,
             )
+        _validate_prompt_size(prompt)
         write_text_atomic(prompt_file, prompt)
         review = ReviewWorkspace(
             source_root=source_root,

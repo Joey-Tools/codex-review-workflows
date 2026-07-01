@@ -152,6 +152,42 @@ class WorkspaceTest(unittest.TestCase):
             f"Workspace={review.workspace_root}\nDiff={review.diff_file}\n",
         )
 
+    def test_prompt_override_rejects_oversized_template(self) -> None:
+        template = pathlib.Path(self.temporary.name) / "oversized-prompt.txt"
+        template.write_bytes(b"x" * 9)
+        with (
+            mock.patch.object(workspace_runtime, "MAX_REVIEW_PROMPT_BYTES", 8),
+            self.assertRaisesRegex(ReviewError, "review prompt exceeds"),
+        ):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+                prompt_override=template,
+            )
+        self.assertEqual(
+            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            [],
+        )
+
+    def test_prompt_override_rejects_oversized_rendered_prompt(self) -> None:
+        template = pathlib.Path(self.temporary.name) / "expanded-prompt.txt"
+        template.write_text("{workspace}", encoding="utf-8")
+        with (
+            mock.patch.object(workspace_runtime, "MAX_REVIEW_PROMPT_BYTES", 32),
+            self.assertRaisesRegex(ReviewError, "review prompt exceeds"),
+        ):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+                prompt_override=template,
+            )
+        self.assertEqual(
+            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            [],
+        )
+
     def test_tree_record_diagnostics_redact_secret_paths_and_payloads(self) -> None:
         secret = "AKIA" + "A" * 16
         malformed = f"malformed-{secret}".encode()

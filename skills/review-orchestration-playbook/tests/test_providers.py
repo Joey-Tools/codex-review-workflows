@@ -411,6 +411,72 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
         )
 
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "resolve_reviewer_executable",
+        side_effect=(pathlib.Path("/bin/claude"), pathlib.Path("/bin/copilot")),
+    )
+    @mock.patch.object(providers, "_copilot_attempt")
+    @mock.patch.object(providers, "_claude_attempt")
+    def test_claude_disappearance_uses_authorized_copilot_fallback(
+        self,
+        claude_attempt: mock.Mock,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        claude_attempt.side_effect = FileNotFoundError("claude disappeared")
+        copilot_attempt.return_value = self.attempt(
+            "copilot",
+            providers.COPILOT_MODELS[0],
+            "success",
+            final_text="No findings.",
+        )
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
+
+        self.assertEqual(outcome.returncode, 0)
+        claude_attempt.assert_called_once()
+        copilot_attempt.assert_called_once()
+        self.assertEqual(resolve.call_count, 2)
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "resolve_reviewer_executable",
+        return_value=pathlib.Path("/bin/true"),
+    )
+    @mock.patch.object(providers, "_copilot_attempt")
+    @mock.patch.object(providers, "_claude_attempt")
+    def test_claude_attempt_validation_failure_still_blocks_copilot(
+        self,
+        claude_attempt: mock.Mock,
+        copilot_attempt: mock.Mock,
+        _resolve: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        claude_attempt.side_effect = ReviewError("unsafe executable identity")
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="triple-review",
+        )
+
+        self.assertEqual(outcome.returncode, 2)
+        copilot_attempt.assert_not_called()
+        self.assertIn(
+            "refusing Copilot fallback",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
     @mock.patch.object(providers, "_copilot_attempt")
     @mock.patch.object(
         providers,
@@ -1109,6 +1175,10 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         argv = run_command.call_args_list[1].args[0]
         self.assertEqual(argv[argv.index("-C") + 1], str(self.review.workspace_root))
+        self.assertEqual(
+            argv[argv.index("--prompt") + 1],
+            "Review this diff.\n",
+        )
         self.assertIn("claude-opus-4.8", argv)
         self.assertEqual(argv[argv.index("--reasoning-effort") + 1], "max")
         self.assertEqual(argv[argv.index("--mode") + 1], "plan")

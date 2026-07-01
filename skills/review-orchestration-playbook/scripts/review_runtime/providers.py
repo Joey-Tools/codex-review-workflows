@@ -1140,17 +1140,20 @@ def run_review(
                 env=claude_env,
                 attempts=attempts,
             )
-        except (FileNotFoundError, ReviewError) as error:
+        except FileNotFoundError:
+            category = "unavailable"
+            final_text = None
+        except ReviewError as error:
             write_text_atomic(
                 review.container_dir / "runner-error.txt",
-                "Claude Code became unavailable or failed executable validation; "
+                "Claude Code failed executable validation; "
                 f"refusing Copilot fallback: {error}\n",
             )
             _write_attempts(review, attempts)
             return Outcome(2, None, tuple(attempts))
         if final_text:
             return _finish(review, attempts, final_text)
-        if category != "entitlement":
+        if category not in {"entitlement", "unavailable"}:
             return _finish(review, attempts, None)
 
     if egress_consent not in COPILOT_EGRESS_CONSENTS:
