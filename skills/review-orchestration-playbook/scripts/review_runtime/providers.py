@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import re
+import sys
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Iterable
 
@@ -387,6 +388,7 @@ def _codex_session_metadata(
     env: dict[str, str],
     *,
     review_root: pathlib.Path,
+    python_runtime_root: pathlib.Path,
 ) -> tuple[str | None, str | None, bool]:
     thread_id = _codex_thread_id(stdout)
     if thread_id is None:
@@ -430,6 +432,7 @@ def _codex_session_metadata(
                             payload,
                             review_root=review_root,
                             codex_home=codex_home,
+                            python_runtime_root=python_runtime_root,
                         ),
                     )
         except OSError:
@@ -442,6 +445,7 @@ def _codex_permissions_match(
     *,
     review_root: pathlib.Path,
     codex_home: pathlib.Path | None = None,
+    python_runtime_root: pathlib.Path | None = None,
 ) -> bool:
     sandbox_policy = payload.get("sandbox_policy")
     permission_profile = payload.get("permission_profile")
@@ -471,6 +475,8 @@ def _codex_permissions_match(
         str((review_root / ".codex").resolve()): "deny",
         str((review_root / ".agents").resolve()): "deny",
     }
+    if python_runtime_root is not None:
+        expected_paths[str(python_runtime_root.resolve())] = "read"
     expected_globs = {
         str(review_root.resolve() / "*.env"): "deny",
         str(review_root.resolve() / "**/*.env"): "deny",
@@ -644,6 +650,7 @@ def _codex_attempt(
     stdout_path, stderr_path = _attempt_paths(review, index, "codex", model)
     tool_home = review.container_dir / "tool-home"
     tool_home.mkdir(exist_ok=True)
+    python_runtime_root = pathlib.Path(sys.base_prefix).resolve()
     shell_values = {
         key: env[key]
         for key in (
@@ -669,6 +676,12 @@ def _codex_attempt(
         )
         + "}"
     )
+    permission_filesystem = (
+        '{"glob_scan_max_depth"=8,":minimal"="read",":workspace_roots"={'
+        '"."="read",".git"="deny",".codex"="deny",".agents"="deny",'
+        '"*.env"="deny","**/*.env"="deny",'
+        f'{json.dumps(str(python_runtime_root))}="read"}}'
+    )
     prompt = review.prompt_file.read_bytes()
     completed = run(
         (
@@ -678,7 +691,7 @@ def _codex_attempt(
             "-c",
             'default_permissions="isolated_review"',
             "-c",
-            'permissions.isolated_review.filesystem={"glob_scan_max_depth"=8,":minimal"="read",":workspace_roots"={"."="read",".git"="deny",".codex"="deny",".agents"="deny","*.env"="deny","**/*.env"="deny"}}',
+            f"permissions.isolated_review.filesystem={permission_filesystem}",
             "-c",
             'shell_environment_policy.inherit="none"',
             "-c",
@@ -714,6 +727,7 @@ def _codex_attempt(
         completed.stdout,
         env,
         review_root=review.workspace_root,
+        python_runtime_root=python_runtime_root,
     )
     attempt = _record_attempt(
         review=review,

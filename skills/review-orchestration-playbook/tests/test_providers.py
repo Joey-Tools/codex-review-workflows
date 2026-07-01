@@ -670,6 +670,15 @@ class ProviderPolicyTest(unittest.TestCase):
                                         },
                                         "access": "read",
                                     },
+                                    {
+                                        "path": {
+                                            "type": "path",
+                                            "path": str(
+                                                pathlib.Path(sys.base_prefix).resolve()
+                                            ),
+                                        },
+                                        "access": "read",
+                                    },
                                     *[
                                         {
                                             "path": {
@@ -733,6 +742,9 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn('default_permissions="isolated_review"', configs)
         self.assertTrue(
             any("permissions.isolated_review.filesystem" in value for value in configs)
+        )
+        self.assertTrue(
+            any(str(pathlib.Path(sys.base_prefix).resolve()) in value for value in configs)
         )
         self.assertTrue(
             any("shell_environment_policy.inherit" in value for value in configs)

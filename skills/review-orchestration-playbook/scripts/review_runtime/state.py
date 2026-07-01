@@ -376,13 +376,19 @@ def wait(
     with cleanup_lock_path.open("a+b") as cleanup_lock:
         if not _acquire_cleanup_lock(cleanup_lock, deadline=deadline):
             return 124
+        cleanup_lock_transferred = False
         try:
             state, review = load_review_state(state_dir)
             keep_workspace = bool(state.get("keep_workspace"))
             if review.workspace_root.exists() and not keep_workspace:
-                cleanup_completed, cleanup_error = _cleanup_before_deadline(
+                (
+                    cleanup_completed,
+                    cleanup_error,
+                    cleanup_lock_transferred,
+                ) = _cleanup_before_deadline(
                     review,
                     deadline=deadline,
+                    cleanup_lock_fd=cleanup_lock.fileno(),
                 )
                 if not cleanup_completed:
                     return 124
@@ -394,7 +400,8 @@ def wait(
             exit_code = _read_exit_code(state_dir)
             return 1 if exit_code is None else exit_code
         finally:
-            fcntl.flock(cleanup_lock.fileno(), fcntl.LOCK_UN)
+            if not cleanup_lock_transferred:
+                fcntl.flock(cleanup_lock.fileno(), fcntl.LOCK_UN)
 
 
 def _acquire_cleanup_lock(handle, *, deadline: float | None) -> bool:
@@ -413,26 +420,49 @@ def _cleanup_before_deadline(
     review: ReviewWorkspace,
     *,
     deadline: float | None,
-) -> tuple[bool, str | None]:
+    cleanup_lock_fd: int,
+) -> tuple[bool, str | None, bool]:
     if deadline is None:
-        return True, cleanup_workspace(review, keep_container=True)
+        return True, cleanup_workspace(review, keep_container=True), False
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        return False, None
-    completed = threading.Event()
-    result: list[str | None] = []
+        return False, None, False
+    worker_path = pathlib.Path(__file__).resolve().with_name("cleanup_worker.py")
+    try:
+        worker = subprocess.Popen(
+            (
+                sys.executable,
+                str(worker_path),
+                str(review.container_dir),
+                str(cleanup_lock_fd),
+            ),
+            close_fds=True,
+            pass_fds=(cleanup_lock_fd,),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as error:
+        return True, f"cannot start bounded cleanup worker: {error}", False
 
-    def cleanup() -> None:
-        try:
-            result.append(cleanup_workspace(review, keep_container=True))
-        finally:
-            completed.set()
-
-    worker = threading.Thread(target=cleanup, daemon=True)
-    worker.start()
-    if not completed.wait(timeout=remaining):
-        return False, None
-    return True, result[0]
+    while True:
+        returncode = worker.poll()
+        if returncode is not None:
+            if returncode == 0:
+                return True, None, False
+            cleanup_error = tail_text(review.container_dir / "cleanup-error.txt")
+            return (
+                True,
+                cleanup_error or "cleanup worker exited without completing",
+                False,
+            )
+        if time.monotonic() >= deadline:
+            threading.Thread(
+                target=worker.wait,
+                daemon=True,
+            ).start()
+            return False, None, True
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
 
 def final(state_dir: pathlib.Path) -> tuple[int, str]:
