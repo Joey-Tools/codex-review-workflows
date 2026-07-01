@@ -375,7 +375,7 @@ time.sleep(0.2)
             mock.patch.object(
                 state,
                 "consume_pending_forwarded_signal",
-                return_value=signal.SIGTERM,
+                return_value=signal.SIGINT,
             ) as consume,
             mock.patch.object(state, "restore_signal_mask") as restore,
             mock.patch.object(state, "signal_process_group") as forward,
@@ -395,15 +395,15 @@ time.sleep(0.2)
                     publisher=publisher,
                 )
 
-        self.assertEqual(raised.exception.signum, signal.SIGTERM)
+        self.assertEqual(raised.exception.signum, signal.SIGINT)
         publisher.assert_called_once_with(self.review.container_dir)
         block.assert_called_once_with()
         consume.assert_called_once_with()
         restore.assert_called_once_with({signal.SIGTERM})
-        forward.assert_called_once_with(process, signal.SIGTERM)
+        forward.assert_called_once_with(process, signal.SIGINT)
         terminate.assert_called_once_with(
             process,
-            initial_signal=signal.SIGTERM,
+            initial_signal=signal.SIGINT,
         )
         cleanup.assert_not_called()
 

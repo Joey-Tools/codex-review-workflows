@@ -225,6 +225,7 @@ def start(
         finally:
             restore_signal_mask(publication_mask)
         if publication_signal is not None:
+            pending_signal = publication_signal
             signal_process_group(process, publication_signal)
             raise ForwardedSignal(publication_signal)
         return state_dir
