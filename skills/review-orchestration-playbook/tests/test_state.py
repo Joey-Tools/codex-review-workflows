@@ -355,6 +355,58 @@ time.sleep(0.2)
         )
         cleanup.assert_called_once_with(self.review, keep_container=False)
 
+    def test_start_keeps_published_state_when_signal_arrives_during_publication(
+        self,
+    ) -> None:
+        process = mock.Mock(pid=12345)
+        publisher = mock.Mock()
+        with (
+            mock.patch.object(
+                state,
+                "prepare_workspace",
+                return_value=self.review,
+            ),
+            mock.patch.object(state.subprocess, "Popen", return_value=process),
+            mock.patch.object(
+                state,
+                "block_forwarded_signals",
+                return_value={signal.SIGTERM},
+            ) as block,
+            mock.patch.object(
+                state,
+                "consume_pending_forwarded_signal",
+                return_value=signal.SIGTERM,
+            ) as consume,
+            mock.patch.object(state, "restore_signal_mask") as restore,
+            mock.patch.object(state, "signal_process_group") as forward,
+            mock.patch.object(state, "terminate_process_group") as terminate,
+            mock.patch.object(state, "cleanup_workspace") as cleanup,
+        ):
+            with self.assertRaises(state.ForwardedSignal) as raised:
+                state.start(
+                    script_path=pathlib.Path("runner.py"),
+                    repo=self.repo,
+                    reviewer="codex",
+                    base_ref=self.base,
+                    head_ref=self.head,
+                    prompt_file=None,
+                    keep_workspace=False,
+                    egress_consent=None,
+                    publisher=publisher,
+                )
+
+        self.assertEqual(raised.exception.signum, signal.SIGTERM)
+        publisher.assert_called_once_with(self.review.container_dir)
+        block.assert_called_once_with()
+        consume.assert_called_once_with()
+        restore.assert_called_once_with({signal.SIGTERM})
+        forward.assert_called_once_with(process, signal.SIGTERM)
+        terminate.assert_called_once_with(
+            process,
+            initial_signal=signal.SIGTERM,
+        )
+        cleanup.assert_not_called()
+
     def test_runner_records_signal_between_reviewer_attempts(self) -> None:
         state_dir = self.review.container_dir
         (state_dir / state.STATE_MARKER).write_text(

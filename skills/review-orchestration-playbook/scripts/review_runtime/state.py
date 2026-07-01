@@ -214,9 +214,19 @@ def start(
         state["pid"] = process.pid
         _STARTED_PROCESSES[process.pid] = process
         write_json(state_dir / STATE_FILE, state)
-        if publisher is not None:
-            publisher(state_dir)
-        published = True
+        publication_mask = block_forwarded_signals()
+        publication_signal: signal.Signals | None = None
+        try:
+            if publisher is not None:
+                publisher(state_dir)
+            published = True
+            if publication_mask is not None:
+                publication_signal = consume_pending_forwarded_signal()
+        finally:
+            restore_signal_mask(publication_mask)
+        if publication_signal is not None:
+            signal_process_group(process, publication_signal)
+            raise ForwardedSignal(publication_signal)
         return state_dir
     except BaseException:
         if process is not None:
