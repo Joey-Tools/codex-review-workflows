@@ -681,7 +681,8 @@ def _codex_attempt(
         '":workspace_roots"={"."="read",".git"="deny",'
         '".codex"="deny",".agents"="deny","*.env"="deny",'
         '"**/*.env"="deny"},'
-        f'{json.dumps(str(python_runtime_root))}="read"}}'
+        f'{json.dumps(str(python_runtime_root))}="read"'
+        "}}"
     )
     prompt = review.prompt_file.read_bytes()
     completed = run(

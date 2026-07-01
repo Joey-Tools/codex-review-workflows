@@ -4,6 +4,7 @@ import json
 import pathlib
 import sys
 import tempfile
+import tomllib
 import unittest
 from unittest import mock
 
@@ -745,6 +746,13 @@ class ProviderPolicyTest(unittest.TestCase):
         ]
         self.assertEqual(len(permission_configs), 1)
         permission_config = permission_configs[0]
+        parsed_permissions = tomllib.loads(
+            f"profile = {permission_config.partition('=')[2]}"
+        )["profile"]
+        self.assertEqual(
+            parsed_permissions["filesystem"][str(pathlib.Path(sys.base_prefix).resolve())],
+            "read",
+        )
         self.assertIn('"glob_scan_max_depth"=8', permission_config)
         self.assertIn('":minimal"="read"', permission_config)
         self.assertIn('":workspace_roots"={"."="read"', permission_config)
