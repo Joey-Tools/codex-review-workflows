@@ -389,7 +389,7 @@ def run_state(
 
 def status(state_dir: pathlib.Path) -> dict[str, Any]:
     state_dir = state_dir.expanduser().resolve()
-    state, _review = load_review_state(state_dir)
+    state, review = load_review_state(state_dir)
     pid_value = state.get("pid")
     pid = pid_value if isinstance(pid_value, int) else 0
     process_running = _runner_lock_held(state_dir / LOCK_FILE)
@@ -407,6 +407,15 @@ def status(state_dir: pathlib.Path) -> dict[str, Any]:
             state_dir / "runner-error.txt",
             "review runner exited without recording a terminal result\n",
         )
+    fallback_workspace_retained = (
+        not running
+        and _should_retain_fallback_workspace(
+            state_dir=state_dir,
+            state=state,
+            review=review,
+            exit_code=exit_code,
+        )
+    )
     attempts: list[Any] = []
     attempts_path = state_dir / "attempts.json"
     if attempts_path.is_file():
@@ -431,6 +440,10 @@ def status(state_dir: pathlib.Path) -> dict[str, Any]:
         "runner_lock_held": process_running,
         "running": running,
         "exit_code": exit_code,
+        "fallback_workspace_retained": fallback_workspace_retained,
+        "fallback_workspace": (
+            str(review.workspace_root) if fallback_workspace_retained else ""
+        ),
         "attempts": attempts,
         "stdout_tail": tail_text(state_dir / "runner.stdout.log"),
         "stderr_tail": tail_text(state_dir / "runner.stderr.log"),
@@ -439,15 +452,43 @@ def status(state_dir: pathlib.Path) -> dict[str, Any]:
     }
 
 
+def _should_retain_fallback_workspace(
+    *,
+    state_dir: pathlib.Path,
+    state: dict[str, Any],
+    review: ReviewWorkspace,
+    exit_code: int | None,
+) -> bool:
+    if (
+        state.get("reviewer") != "codex"
+        or exit_code != 127
+        or not review.workspace_root.is_dir()
+    ):
+        return False
+    try:
+        preflight = read_json(state_dir / "preflight.json")
+    except ReviewError:
+        return False
+    return (
+        preflight.get("review_range") == f"{review.base_ref}..{review.head_ref}"
+        and preflight.get("status")
+        == "sensitive-content and escaping-symlink checks passed"
+    )
+
+
+def _validate_timeout(timeout_seconds: float | None) -> None:
+    if timeout_seconds is not None and (
+        not math.isfinite(timeout_seconds) or timeout_seconds < 0
+    ):
+        raise ReviewError("wait timeout must be a non-negative finite number")
+
+
 def wait(
     state_dir: pathlib.Path,
     *,
     timeout_seconds: float | None,
 ) -> int:
-    if timeout_seconds is not None and (
-        not math.isfinite(timeout_seconds) or timeout_seconds < 0
-    ):
-        raise ReviewError("wait timeout must be a non-negative finite number")
+    _validate_timeout(timeout_seconds)
     state_dir = state_dir.expanduser().resolve()
     deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
     while True:
@@ -459,6 +500,32 @@ def wait(
         remaining = None if deadline is None else deadline - time.monotonic()
         time.sleep(0.25 if remaining is None else min(0.25, max(0.0, remaining)))
 
+    cleanup_code = _cleanup_terminal_workspace(
+        state_dir,
+        deadline=deadline,
+        force=False,
+    )
+    if cleanup_code != 0:
+        return cleanup_code
+    exit_code = _read_exit_code(state_dir)
+    return 1 if exit_code is None else exit_code
+
+
+def cleanup(state_dir: pathlib.Path, *, timeout_seconds: float | None) -> int:
+    _validate_timeout(timeout_seconds)
+    state_dir = state_dir.expanduser().resolve()
+    if status(state_dir)["running"]:
+        return 3
+    deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
+    return _cleanup_terminal_workspace(state_dir, deadline=deadline, force=True)
+
+
+def _cleanup_terminal_workspace(
+    state_dir: pathlib.Path,
+    *,
+    deadline: float | None,
+    force: bool,
+) -> int:
     cleanup_lock_path = state_dir / CLEANUP_LOCK_FILE
     cleanup_error_path = state_dir / "cleanup-error.txt"
     with cleanup_lock_path.open("a+b") as cleanup_lock:
@@ -473,7 +540,15 @@ def wait(
         try:
             state, review = load_review_state(state_dir)
             keep_workspace = bool(state.get("keep_workspace"))
-            if review.workspace_root.exists() and not keep_workspace:
+            exit_code = _read_exit_code(state_dir)
+            retain_for_fallback = _should_retain_fallback_workspace(
+                state_dir=state_dir,
+                state=state,
+                review=review,
+                exit_code=exit_code,
+            )
+            should_keep = not force and (keep_workspace or retain_for_fallback)
+            if review.workspace_root.exists() and not should_keep:
                 cleanup_completed, cleanup_error = _cleanup_before_deadline(
                     review,
                     deadline=deadline,
@@ -485,7 +560,7 @@ def wait(
                 if cleanup_error:
                     write_text_atomic(cleanup_error_path, cleanup_error + "\n")
                     return 1
-            if not keep_workspace and not review.workspace_root.exists():
+            if not should_keep and not review.workspace_root.exists():
                 try:
                     cleanup_error_path.unlink(missing_ok=True)
                 except OSError as error:
@@ -495,8 +570,7 @@ def wait(
                     ) from error
             if cleanup_error_path.is_file():
                 return 1
-            exit_code = _read_exit_code(state_dir)
-            return 1 if exit_code is None else exit_code
+            return 0
         finally:
             if not cleanup_lock_transferred:
                 fcntl.flock(cleanup_lock.fileno(), fcntl.LOCK_UN)
@@ -590,4 +664,9 @@ def final(state_dir: pathlib.Path) -> tuple[int, str]:
         or summary.get("stderr_tail")
         or "review failed without a final artifact"
     )
+    if summary.get("fallback_workspace_retained"):
+        details = (
+            f"{details}\nfrozen workspace retained for clean-context fallback: "
+            f"{summary['fallback_workspace']}"
+        )
     return int(wait_code or exit_code or 1), str(details)

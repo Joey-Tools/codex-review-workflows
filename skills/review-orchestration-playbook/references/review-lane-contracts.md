@@ -23,7 +23,7 @@ Use this contract for helper-backed review, a clean-context `reviewer` fallback,
 
 ## Clean-Context Codex Fallback
 
-If the helper-backed Codex reviewer runtime is deterministically unavailable after the helper has written a successful `preflight.json`, use only the `reviewer` agent with the complete frozen scope, diff/evidence contract, and output contract. If the helper cannot complete that preflight, stop instead of bypassing it. The fallback's pinned configuration is `gpt-5.6-sol` with `xhigh`. Do not use an inherited-context/default coding agent. A `gpt-5.5` fallback is allowed only after explicit model entitlement/policy denial.
+If the helper-backed Codex reviewer runtime is deterministically unavailable after the helper has written a matching successful `preflight.json`, `stateful final` retains the immutable frozen workspace and reports it through `fallback_workspace_retained`. Use only that retained scope with the `reviewer` agent and the complete diff/evidence and output contracts, then run `stateful cleanup --state-dir <dir>`. If the helper cannot complete that preflight, stop instead of bypassing it. The fallback's pinned configuration is `gpt-5.6-sol` with `xhigh`. Do not use an inherited-context/default coding agent. A `gpt-5.5` fallback is allowed only after explicit model entitlement/policy denial.
 
 ## PR Readiness Codex Gates
 

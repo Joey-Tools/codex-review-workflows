@@ -49,7 +49,7 @@ Capacity, overload, rate limits, timeouts, network errors, 5xx responses, missin
 - When the Claude-family helper needs approval, the escalation justification must repeat the explicit user request, exact repository, frozen `base_sha..head_sha`, Anthropic destination plus GitHub Copilot fallback when Claude Code is unavailable or all pinned models are entitlement-blocked, included tracked-code/diff/prompt scope, and exclusions. Use the template in [egress-consent.md](references/egress-consent.md); a generic `run external reviewer` justification is insufficient.
 - Use `stateful start`, then bounded `stateful status` / `stateful wait`, and finally `stateful final --state-dir <dir>`.
 - Treat only the terminal final artifact as review evidence. Intermediate reasoning, tool traces, stdout tails, and keepalives are not findings.
-- If the Codex helper cannot start for a deterministic runtime reason, use the clean-context `reviewer` agent with the full frozen scope, diff/evidence contract, and output contract. Do not use inherited-context/default coding agents.
+- If the Codex runtime is deterministically unavailable after successful preflight, use the helper-retained frozen workspace with the clean-context `reviewer` agent and the same diff/evidence and output contracts. After collecting that fallback artifact, run `stateful cleanup --state-dir <dir>`. Do not use inherited-context/default coding agents or bypass a failed preflight.
 
 4. Apply evidence budgets.
 - Read [review-lane-contracts.md](references/review-lane-contracts.md) for the exact bounded-read contract.

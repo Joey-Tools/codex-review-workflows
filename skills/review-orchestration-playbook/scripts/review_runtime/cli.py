@@ -16,6 +16,8 @@ from .common import (
     restore_signal_mask,
 )
 from .providers import CLAUDE_EGRESS_CONSENTS, run_review
+from .state import FINAL_CLEANUP_TIMEOUT_SECONDS
+from .state import cleanup as cleanup_state
 from .state import final, run_state, start, status, wait
 from .workspace import ReviewWorkspace, cleanup_workspace, prepare_workspace
 
@@ -75,7 +77,7 @@ def _build_stateful_parser() -> argparse.ArgumentParser:
     actions = parser.add_subparsers(dest="action", required=True)
     start_parser = actions.add_parser("start")
     _add_review_arguments(start_parser)
-    for action in ("status", "final"):
+    for action in ("status", "final", "cleanup"):
         action_parser = actions.add_parser(action)
         action_parser.add_argument("--state-dir", required=True)
     wait_parser = actions.add_parser("wait")
@@ -190,6 +192,11 @@ def _run_stateful(argv: list[str], *, script_path: pathlib.Path) -> int:
         exit_code, text = final(state_dir)
         print(text, file=sys.stdout if exit_code == 0 else sys.stderr)
         return exit_code
+    if args.action == "cleanup":
+        return cleanup_state(
+            state_dir,
+            timeout_seconds=FINAL_CLEANUP_TIMEOUT_SECONDS,
+        )
     raise ReviewError(f"unknown stateful action: {args.action}")
 
 

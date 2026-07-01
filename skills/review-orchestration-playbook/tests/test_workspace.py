@@ -85,6 +85,14 @@ class WorkspaceTest(unittest.TestCase):
                 cleanup_workspace(review, keep_container=False)
         self.temporary.cleanup()
 
+    def test_git_environment_disables_lazy_fetch_and_prompts(self) -> None:
+        environment = workspace_runtime._git_environment()
+
+        self.assertEqual(environment["GIT_NO_LAZY_FETCH"], "1")
+        self.assertEqual(environment["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(environment["GIT_ASKPASS"], "/usr/bin/false")
+        self.assertEqual(environment["SSH_ASKPASS"], "/usr/bin/false")
+
     def test_prepare_materializes_frozen_range_and_local_control_files(self) -> None:
         review = prepare_workspace(
             repo=self.repo,

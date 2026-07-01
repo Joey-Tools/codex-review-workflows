@@ -149,14 +149,18 @@ class ReviewWorkspace:
 def _git_environment(*, object_directory: pathlib.Path | None = None) -> dict[str, str]:
     env = {
         "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_ASKPASS": "/usr/bin/false",
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_NO_LAZY_FETCH": "1",
         "GIT_NO_REPLACE_OBJECTS": "1",
         "GIT_OPTIONAL_LOCKS": "0",
         "GIT_PAGER": "cat",
+        "GIT_TERMINAL_PROMPT": "0",
         "LC_ALL": "C",
         "PAGER": "cat",
         "PATH": TRUSTED_PATH,
+        "SSH_ASKPASS": "/usr/bin/false",
     }
     if object_directory is not None:
         env["GIT_OBJECT_DIRECTORY"] = str(object_directory)

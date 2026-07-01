@@ -27,6 +27,19 @@ def prepared_workspace(review):
 
 
 class ForegroundCleanupTest(unittest.TestCase):
+    def test_stateful_cleanup_dispatches_bounded_cleanup(self) -> None:
+        state_dir = pathlib.Path("/tmp/isolated-review-state")
+        with mock.patch.object(cli, "cleanup_state", return_value=0) as cleanup:
+            returncode = cli.main(
+                ["stateful", "cleanup", "--state-dir", str(state_dir)]
+            )
+
+        self.assertEqual(returncode, 0)
+        cleanup.assert_called_once_with(
+            state_dir,
+            timeout_seconds=cli.FINAL_CLEANUP_TIMEOUT_SECONDS,
+        )
+
     def test_stateful_wait_rejects_nan_timeout(self) -> None:
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):

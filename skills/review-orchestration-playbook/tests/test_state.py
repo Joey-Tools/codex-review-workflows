@@ -122,6 +122,72 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.assertFalse(self.review.workspace_root.exists())
         self.assertTrue(self.review.container_dir.exists())
 
+    def test_codex_unavailable_retains_preflight_workspace_until_cleanup(self) -> None:
+        self.write_completed_state()
+        current = state.load_state(self.review.container_dir)
+        current["reviewer"] = "codex"
+        current["egress_consent"] = None
+        write_json(self.review.container_dir / state.STATE_FILE, current)
+        (self.review.container_dir / state.EXIT_FILE).write_text(
+            "127\n",
+            encoding="utf-8",
+        )
+        (self.review.container_dir / "final.txt").unlink()
+        (self.review.container_dir / "runner-error.txt").write_text(
+            "codex is not available in a validated executable path\n",
+            encoding="utf-8",
+        )
+        write_json(
+            self.review.container_dir / "preflight.json",
+            {
+                "review_range": f"{self.base}..{self.head}",
+                "status": "sensitive-content and escaping-symlink checks passed",
+            },
+        )
+
+        exit_code, text = state.final(self.review.container_dir)
+
+        self.assertEqual(exit_code, 127)
+        self.assertIn("retained for clean-context fallback", text)
+        self.assertTrue(self.review.workspace_root.exists())
+        summary = state.status(self.review.container_dir)
+        self.assertTrue(summary["fallback_workspace_retained"])
+        self.assertEqual(
+            summary["fallback_workspace"],
+            str(self.review.workspace_root),
+        )
+
+        self.assertEqual(
+            state.cleanup(
+                self.review.container_dir,
+                timeout_seconds=state.FINAL_CLEANUP_TIMEOUT_SECONDS,
+            ),
+            0,
+        )
+        self.assertFalse(self.review.workspace_root.exists())
+        self.assertFalse(
+            state.status(self.review.container_dir)["fallback_workspace_retained"]
+        )
+
+    def test_codex_unavailable_without_preflight_does_not_retain_workspace(
+        self,
+    ) -> None:
+        self.write_completed_state()
+        current = state.load_state(self.review.container_dir)
+        current["reviewer"] = "codex"
+        current["egress_consent"] = None
+        write_json(self.review.container_dir / state.STATE_FILE, current)
+        (self.review.container_dir / state.EXIT_FILE).write_text(
+            "127\n",
+            encoding="utf-8",
+        )
+        (self.review.container_dir / "final.txt").unlink()
+
+        exit_code, _text = state.final(self.review.container_dir)
+
+        self.assertEqual(exit_code, 127)
+        self.assertFalse(self.review.workspace_root.exists())
+
     def test_status_redacts_legacy_attempt_final_text(self) -> None:
         self.write_completed_state()
         artifact = "legacy terminal artifact"
@@ -204,6 +270,17 @@ class StatefulLifecycleTest(unittest.TestCase):
                 ),
             ):
                 state.wait(self.review.container_dir, timeout_seconds=timeout)
+
+    def test_cleanup_rejects_negative_and_non_finite_timeouts(self) -> None:
+        for timeout in (-0.1, float("nan"), float("inf"), float("-inf")):
+            with (
+                self.subTest(timeout=timeout),
+                self.assertRaisesRegex(
+                    ReviewError,
+                    "non-negative finite number",
+                ),
+            ):
+                state.cleanup(self.review.container_dir, timeout_seconds=timeout)
 
     def test_wait_timeout_includes_workspace_cleanup(self) -> None:
         self.write_completed_state()
