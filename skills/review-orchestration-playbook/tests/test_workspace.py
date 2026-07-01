@@ -340,6 +340,30 @@ class WorkspaceTest(unittest.TestCase):
             validate_external_workspace(review)
         self.assertNotIn(secret, str(raised.exception))
 
+    def test_unchanged_secret_in_symlink_target_blocks_external_review(self) -> None:
+        secret = "sk-" + "A" * 40
+        (self.repo / "artifact").symlink_to(secret)
+        git(self.repo, "add", "artifact")
+        git(self.repo, "commit", "-m", "Add secret-shaped symlink target")
+        sensitive_base = git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "example.txt").write_text("three\n", encoding="utf-8")
+        git(self.repo, "add", "example.txt")
+        git(self.repo, "commit", "-m", "Change unrelated content")
+        unrelated_head = git(self.repo, "rev-parse", "HEAD")
+
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=sensitive_base,
+            head_ref=unrelated_head,
+        )
+        self.reviews.append(review)
+        with self.assertRaisesRegex(
+            ReviewError,
+            r"artifact -> <redacted symlink target>.*openai-key.*symlink-target",
+        ) as raised:
+            validate_external_workspace(review)
+        self.assertNotIn(secret, str(raised.exception))
+
     def test_deleted_binary_secret_is_detected_from_base_blob(self) -> None:
         secret = ("sk-" + "A" * 40).encode()
         binary = self.repo / "opaque.bin"

@@ -15,7 +15,7 @@ from unittest import mock
 SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from review_runtime import state  # noqa: E402
+from review_runtime import cleanup_worker, state  # noqa: E402
 from review_runtime.common import ReviewError, write_json  # noqa: E402
 from review_runtime.workspace import cleanup_workspace, prepare_workspace  # noqa: E402
 
@@ -146,6 +146,20 @@ class StatefulLifecycleTest(unittest.TestCase):
             state.wait(self.review.container_dir, timeout_seconds=None),
             0,
         )
+        self.assertFalse(self.review.workspace_root.exists())
+        self.assertFalse(cleanup_error_path.exists())
+
+    def test_cleanup_worker_clears_stale_error_after_success(self) -> None:
+        self.write_completed_state()
+        cleanup_error_path = self.review.container_dir / "cleanup-error.txt"
+        cleanup_error_path.write_text("previous cleanup failed\n", encoding="utf-8")
+        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+        with lock_path.open("a+b") as cleanup_lock:
+            exit_code = cleanup_worker.main(
+                [str(self.review.container_dir), str(cleanup_lock.fileno())]
+            )
+
+        self.assertEqual(exit_code, 0)
         self.assertFalse(self.review.workspace_root.exists())
         self.assertFalse(cleanup_error_path.exists())
 

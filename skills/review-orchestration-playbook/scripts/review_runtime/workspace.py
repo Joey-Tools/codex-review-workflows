@@ -899,7 +899,21 @@ def validate_external_workspace(review: ReviewWorkspace) -> None:
                 f"<redacted snapshot path> ({path_secret_rule}; path-name)"
             )
             continue
-        if candidate.is_symlink() or not candidate.is_file():
+        if candidate.is_symlink():
+            try:
+                target = os.readlink(candidate)
+            except OSError as error:
+                raise ReviewError(
+                    f"cannot inspect external review symlink {candidate}: {error}"
+                ) from error
+            target_secret_rule = _value_secret_rule(os.fsencode(target))
+            if target_secret_rule:
+                record_finding(
+                    f"{relative} -> <redacted symlink target> "
+                    f"({target_secret_rule}; symlink-target)"
+                )
+            continue
+        if not candidate.is_file():
             continue
         secret_rule = _file_secret_rule(candidate)
         if secret_rule:
