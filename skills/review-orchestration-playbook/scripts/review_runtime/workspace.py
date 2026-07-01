@@ -947,22 +947,25 @@ def validate_external_workspace(review: ReviewWorkspace) -> None:
                 f"<redacted snapshot path> ({path_secret_rule}; path-name)"
             )
             continue
+        path_display = _redact_secret_path(relative, "snapshot path")
         path_rule = _sensitive_path_rule(relative)
         if path_rule:
-            path_display = _redact_secret_path(relative, "snapshot path")
             record_finding(f"{path_display} ({path_rule})")
             continue
         if candidate.is_symlink():
             try:
                 target = os.readlink(candidate)
             except OSError as error:
+                error_code = (
+                    f" (errno {error.errno})" if error.errno is not None else ""
+                )
                 raise ReviewError(
-                    f"cannot inspect external review symlink {relative}: {error}"
+                    f"cannot inspect external review symlink {path_display}{error_code}"
                 ) from error
             target_secret_rule = _value_secret_rule(os.fsencode(target))
             if target_secret_rule:
                 record_finding(
-                    f"{relative} -> <redacted symlink target> "
+                    f"{path_display} -> <redacted symlink target> "
                     f"({target_secret_rule}; symlink-target)"
                 )
             continue
@@ -970,7 +973,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> None:
             continue
         secret_rule = _file_secret_rule(candidate)
         if secret_rule:
-            record_finding(f"{relative} ({secret_rule})")
+            record_finding(f"{path_display} ({secret_rule})")
     if sensitive_finding_count:
         summary = ", ".join(sensitive_findings)
         if sensitive_finding_count > len(sensitive_findings):

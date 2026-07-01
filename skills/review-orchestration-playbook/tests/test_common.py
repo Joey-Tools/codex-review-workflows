@@ -226,6 +226,34 @@ class ChildEnvironmentTest(unittest.TestCase):
         self.assertNotIn("UNRELATED_PRIVATE_VALUE", env)
         self.assertNotIn("DATABASE_PASSWORD", env)
 
+    def test_external_environment_does_not_install_or_expose_git_shim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            container = pathlib.Path(temporary)
+            workspace_root = container / "workspace"
+            workspace_root.mkdir()
+            with (
+                mock.patch.object(common, "resolve_git") as resolve_git,
+                mock.patch.object(
+                    common,
+                    "install_readonly_git_shim",
+                ) as install_shim,
+            ):
+                env = common.child_environment(
+                    container_dir=container,
+                    workspace_root=workspace_root,
+                    shim_source=None,
+                )
+                self.assertFalse(
+                    (workspace_root / ".codex-review/tool-shims").exists()
+                )
+
+        resolve_git.assert_not_called()
+        install_shim.assert_not_called()
+        self.assertEqual(env["PATH"], common.TRUSTED_PATH)
+        self.assertNotIn("CODEX_REAL_GIT", env)
+        self.assertNotIn("CODEX_ISOLATED_REVIEW_GIT_POLICY", env)
+        self.assertNotIn("CODEX_ISOLATED_REVIEW_GIT_SHIM", env)
+
     def test_installs_git_shim_inside_workspace_control_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             container = pathlib.Path(temporary)

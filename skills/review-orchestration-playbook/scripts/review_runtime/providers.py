@@ -163,7 +163,7 @@ class Outcome:
 def _review_environment(
     *,
     review: ReviewWorkspace,
-    shim_source: pathlib.Path,
+    shim_source: pathlib.Path | None,
     passthrough_keys: Iterable[str],
     extra: dict[str, str] | None = None,
 ) -> dict[str, str]:
@@ -1147,7 +1147,7 @@ def run_review(
     if claude_available:
         claude_env = _review_environment(
             review=review,
-            shim_source=shim_source,
+            shim_source=None,
             passthrough_keys=CLAUDE_ENV_KEYS,
             extra={"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"},
         )
@@ -1198,7 +1198,7 @@ def run_review(
         return _finish(review, attempts, None)
     copilot_env = _review_environment(
         review=review,
-        shim_source=shim_source,
+        shim_source=None,
         passthrough_keys=COPILOT_ENV_KEYS,
     )
     try:

@@ -577,28 +577,34 @@ def child_environment(
     *,
     container_dir: pathlib.Path,
     workspace_root: pathlib.Path,
-    shim_source: pathlib.Path,
+    shim_source: pathlib.Path | None = None,
     passthrough_keys: Iterable[str] = (),
     extra: dict[str, str] | None = None,
 ) -> dict[str, str]:
-    real_git = resolve_git()
-    shim_dir = install_readonly_git_shim(
-        workspace_root=workspace_root,
-        source=shim_source,
-    )
     allowed_keys = {*BASE_ENV_KEYS, *passthrough_keys}
     env = {key: os.environ[key] for key in allowed_keys if key in os.environ}
     env.update(
         {
-            "PATH": f"{shim_dir}{os.pathsep}{TRUSTED_PATH}",
-            "CODEX_REAL_GIT": str(real_git),
-            "CODEX_ISOLATED_REVIEW_GIT_POLICY": "readonly-shim",
-            "CODEX_ISOLATED_REVIEW_GIT_SHIM": str(shim_dir / "git"),
+            "PATH": TRUSTED_PATH,
             "TMPDIR": str(container_dir / "tmp"),
             "TMP": str(container_dir / "tmp"),
             "TEMP": str(container_dir / "tmp"),
         }
     )
+    if shim_source is not None:
+        real_git = resolve_git()
+        shim_dir = install_readonly_git_shim(
+            workspace_root=workspace_root,
+            source=shim_source,
+        )
+        env.update(
+            {
+                "PATH": f"{shim_dir}{os.pathsep}{TRUSTED_PATH}",
+                "CODEX_REAL_GIT": str(real_git),
+                "CODEX_ISOLATED_REVIEW_GIT_POLICY": "readonly-shim",
+                "CODEX_ISOLATED_REVIEW_GIT_SHIM": str(shim_dir / "git"),
+            }
+        )
     (container_dir / "tmp").mkdir(parents=True, exist_ok=True)
     if extra:
         env.update(extra)

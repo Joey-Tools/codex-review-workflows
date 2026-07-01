@@ -534,6 +534,35 @@ class WorkspaceTest(unittest.TestCase):
             validate_external_workspace(review)
         self.assertNotIn(secret, str(raised.exception))
 
+    def test_secret_findings_escape_control_characters_in_snapshot_paths(self) -> None:
+        secret = "AKIA" + "C" * 16
+        file_name = "file\n\x1bname"
+        symlink_name = "link\n\x1bname"
+        (self.repo / file_name).write_text(secret + "\n", encoding="utf-8")
+        (self.repo / symlink_name).symlink_to("sk-" + "D" * 40)
+        git(self.repo, "add", file_name, symlink_name)
+        git(self.repo, "commit", "-m", "Add control-character secret paths")
+        secret_head = git(self.repo, "rev-parse", "HEAD")
+
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.head,
+            head_ref=secret_head,
+        )
+        self.reviews.append(review)
+
+        with self.assertRaises(ReviewError) as raised:
+            validate_external_workspace(review)
+
+        diagnostic = str(raised.exception)
+        self.assertNotIn("\n", diagnostic)
+        self.assertNotIn("\x1b", diagnostic)
+        self.assertIn("file\\x0a\\x1bname (aws-access-key)", diagnostic)
+        self.assertIn(
+            "link\\x0a\\x1bname -> <redacted symlink target>",
+            diagnostic,
+        )
+
     def test_deleted_binary_secret_is_detected_from_base_blob(self) -> None:
         secret = ("sk-" + "A" * 40).encode()
         binary = self.repo / "opaque.bin"
