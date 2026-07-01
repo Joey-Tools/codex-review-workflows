@@ -71,6 +71,7 @@ class ReadonlyGitShimTest(unittest.TestCase):
         )
         self.env = os.environ.copy()
         self.env["CODEX_REAL_GIT"] = str(self.real_git)
+        self.env["CODEX_ISOLATED_REVIEW_ROOT"] = str(self.repo)
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -110,6 +111,34 @@ class ReadonlyGitShimTest(unittest.TestCase):
         self.assertEqual(configured.returncode, 126)
         external = self.run_shim("diff", "--ext-diff")
         self.assertEqual(external.returncode, 126)
+
+    def test_blocks_repository_routing_options(self) -> None:
+        for args in (
+            ("-C", str(self.repo), "status"),
+            (f"--git-dir={self.repo / '.git'}", "status"),
+            ("--work-tree", str(self.repo), "status"),
+        ):
+            with self.subTest(args=args):
+                completed = self.run_shim(*args)
+                self.assertEqual(completed.returncode, 126)
+                self.assertIn("blocked global option", completed.stderr)
+
+    def test_does_not_discover_parent_repository(self) -> None:
+        snapshot = self.repo / "snapshot"
+        snapshot.mkdir()
+        env = dict(self.env)
+        env["CODEX_ISOLATED_REVIEW_ROOT"] = str(snapshot)
+        completed = subprocess.run(
+            (sys.executable, str(SHIM), "status", "--short"),
+            cwd=snapshot,
+            env=env,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("not a git repository", completed.stderr)
 
     def test_apply_is_allowed_only_in_readonly_summary_mode(self) -> None:
         blocked = self.run_shim("apply", "-")

@@ -30,7 +30,7 @@ ALLOWED_SUBCOMMANDS = {
     "symbolic-ref",
 }
 
-SAFE_FLAGS_WITH_VALUE = {
+BLOCKED_REPOSITORY_SELECTOR_FLAGS = {
     "-C",
     "--git-common-dir",
     "--git-dir",
@@ -39,25 +39,25 @@ SAFE_FLAGS_WITH_VALUE = {
     "--work-tree",
 }
 
-BLOCKED_FLAGS_WITH_VALUE = {
+BLOCKED_FLAGS_WITH_VALUE = BLOCKED_REPOSITORY_SELECTOR_FLAGS | {
     "--config-env",
     "--exec-path",
 }
 
 META_FLAGS = {"--help", "--version"}
 
-SAFE_LONG_FLAGS_WITH_VALUE = {
+BLOCKED_LONG_FLAGS_WITH_VALUE = {
     "--git-common-dir",
     "--git-dir",
     "--namespace",
     "--super-prefix",
     "--work-tree",
-}
-
-BLOCKED_LONG_FLAGS_WITH_VALUE = {
     "--config-env",
     "--exec-path",
 }
+
+SAFE_FLAGS_WITH_VALUE: set[str] = set()
+SAFE_LONG_FLAGS_WITH_VALUE: set[str] = set()
 
 STRIPPED_ENV_KEYS = {
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
@@ -228,7 +228,7 @@ def _parse_argv(argv: list[str]) -> tuple[str, str | None, int | None]:
     return "blocked-subcommand", None, None
 
 
-def _sanitized_exec_env(real_git: str) -> dict[str, str]:
+def _sanitized_exec_env(real_git: str, review_root: str) -> dict[str, str]:
     env = dict(os.environ)
     for key in STRIPPED_ENV_KEYS:
         env.pop(key, None)
@@ -238,6 +238,7 @@ def _sanitized_exec_env(real_git: str) -> dict[str, str]:
 
     env["CODEX_REAL_GIT"] = real_git
     env["GIT_ATTR_NOSYSTEM"] = "1"
+    env["GIT_CEILING_DIRECTORIES"] = os.path.dirname(review_root)
     env["GIT_CONFIG_GLOBAL"] = os.devnull
     env["GIT_CONFIG_NOSYSTEM"] = "1"
     env["GIT_PAGER"] = "cat"
@@ -274,6 +275,7 @@ def _selector_args(
 
 def _discover_filter_drivers(
     real_git: str,
+    review_root: str,
     forwarded_args: list[str],
     *,
     subcommand: str | None,
@@ -295,7 +297,7 @@ def _discover_filter_drivers(
         ],
         capture_output=True,
         check=False,
-        env=_sanitized_exec_env(real_git),
+        env=_sanitized_exec_env(real_git, review_root),
         text=True,
     )
     if completed.returncode == 1:
@@ -414,16 +416,18 @@ def _is_readonly_apply(
 
 def _exec_argv(
     real_git: str,
+    review_root: str,
     forwarded_args: list[str],
     *,
     subcommand: str | None,
     subcommand_index: int | None,
 ) -> tuple[list[str], dict[str, str]]:
-    env = _sanitized_exec_env(real_git)
+    env = _sanitized_exec_env(real_git, review_root)
     env = _apply_filter_override_env(
         env,
         _discover_filter_drivers(
             real_git,
+            review_root,
             forwarded_args,
             subcommand=subcommand,
             subcommand_index=subcommand_index,
@@ -446,6 +450,22 @@ def main() -> int:
     if not real_git:
         print("readonly git shim missing CODEX_REAL_GIT", file=sys.stderr)
         return 127
+
+    review_root_value = os.environ.get("CODEX_ISOLATED_REVIEW_ROOT")
+    if not review_root_value:
+        print("readonly git shim missing CODEX_ISOLATED_REVIEW_ROOT", file=sys.stderr)
+        return 127
+    review_root = os.path.realpath(review_root_value)
+    current_directory = os.path.realpath(os.getcwd())
+    try:
+        inside_review_root = os.path.commonpath(
+            (review_root, current_directory)
+        ) == review_root
+    except ValueError:
+        inside_review_root = False
+    if not inside_review_root:
+        print("readonly git shim cwd escapes isolated review root", file=sys.stderr)
+        return 126
 
     forwarded_args = sys.argv[1:]
     action, value, subcommand_index = _parse_argv(forwarded_args)
@@ -480,6 +500,7 @@ def main() -> int:
         try:
             exec_argv, exec_env = _exec_argv(
                 real_git,
+                review_root,
                 forwarded_args,
                 subcommand=value,
                 subcommand_index=subcommand_index,

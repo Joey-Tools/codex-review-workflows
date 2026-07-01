@@ -829,6 +829,10 @@ def _run_model_chain(
             env=env,
         )
         attempts.append(attempt)
+        write_json(
+            review.container_dir / "attempts.json",
+            [asdict(item) for item in attempts],
+        )
         if attempt.category == "success":
             return "success", attempt.final_text
         if attempt.category != "entitlement":

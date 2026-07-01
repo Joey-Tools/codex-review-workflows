@@ -1002,7 +1002,7 @@ def prepare_workspace(
         )
         validate_workspace_layout(review)
         return review
-    except Exception:
+    except BaseException:
         shutil.rmtree(container, ignore_errors=True)
         raise
 

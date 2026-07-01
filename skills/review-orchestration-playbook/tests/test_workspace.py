@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
@@ -119,6 +120,22 @@ class WorkspaceTest(unittest.TestCase):
             )
         review_root = self.repo / ".codex-tmp"
         self.assertFalse(review_root.exists())
+
+    def test_keyboard_interrupt_cleans_partial_review_container(self) -> None:
+        with (
+            mock.patch(
+                "review_runtime.workspace._create_sanitized_git_view",
+                side_effect=KeyboardInterrupt,
+            ),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+        review_root = self.repo / ".codex-tmp"
+        self.assertEqual(list(review_root.glob("isolated-review-*")), [])
 
     def test_review_root_symlink_is_rejected_without_writing_outside_repo(self) -> None:
         outside = pathlib.Path(self.temporary.name) / "outside"

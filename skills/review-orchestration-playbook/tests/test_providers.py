@@ -219,6 +219,26 @@ class ProviderPolicyTest(unittest.TestCase):
             providers.CODEX_ENV_KEYS,
         )
 
+    def test_model_chain_persists_each_completed_attempt(self) -> None:
+        first = self.attempt("codex", "gpt-5.6-sol", "entitlement")
+        runner = mock.Mock(side_effect=(first, RuntimeError("interrupted fallback")))
+        attempts: list[providers.Attempt] = []
+        with self.assertRaisesRegex(RuntimeError, "interrupted fallback"):
+            providers._run_model_chain(
+                review=self.review,
+                models=providers.CODEX_MODELS,
+                runner=runner,
+                env={},
+                attempts=attempts,
+            )
+
+        persisted = json.loads(
+            (self.review.container_dir / "attempts.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(len(persisted), 1)
+        self.assertEqual(persisted[0]["requested_model"], "gpt-5.6-sol")
+        self.assertEqual(persisted[0]["category"], "entitlement")
+
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(providers, "_codex_attempt")
     def test_codex_capacity_does_not_downgrade(
