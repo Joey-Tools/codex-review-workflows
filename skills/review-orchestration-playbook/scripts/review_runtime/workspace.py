@@ -805,12 +805,12 @@ def validate_external_workspace(review: ReviewWorkspace) -> None:
             f"cannot validate external review changed blobs: {error}"
         ) from error
     for candidate in review.workspace_root.rglob("*"):
-        if candidate.is_symlink() or not candidate.is_file():
-            continue
         relative = candidate.relative_to(review.workspace_root).as_posix()
         path_rule = _sensitive_path_rule(relative)
         if path_rule:
             record_finding(f"{relative} ({path_rule})")
+            continue
+        if candidate.is_symlink() or not candidate.is_file():
             continue
         secret_rule = _file_secret_rule(candidate)
         if secret_rule:

@@ -184,6 +184,28 @@ class WorkspaceTest(unittest.TestCase):
         with self.assertRaises(ReviewError):
             validate_external_workspace(review)
 
+    def test_unchanged_sensitive_path_symlink_blocks_external_review(self) -> None:
+        (self.repo / "public.txt").write_text("ordinary content\n", encoding="utf-8")
+        credentials = self.repo / "fixtures"
+        credentials.mkdir()
+        (credentials / ".netrc").symlink_to("../public.txt")
+        git(self.repo, "add", "public.txt", "fixtures/.netrc")
+        git(self.repo, "commit", "-m", "Add credential-shaped symlink")
+        sensitive_base = git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "example.txt").write_text("three\n", encoding="utf-8")
+        git(self.repo, "add", "example.txt")
+        git(self.repo, "commit", "-m", "Change unrelated content")
+        unrelated_head = git(self.repo, "rev-parse", "HEAD")
+
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=sensitive_base,
+            head_ref=unrelated_head,
+        )
+        self.reviews.append(review)
+        with self.assertRaisesRegex(ReviewError, r"fixtures/\.netrc.*credential-path"):
+            validate_external_workspace(review)
+
     def test_deleted_binary_secret_is_detected_from_base_blob(self) -> None:
         secret = ("sk-" + "A" * 40).encode()
         binary = self.repo / "opaque.bin"
