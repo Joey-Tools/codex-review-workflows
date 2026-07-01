@@ -125,15 +125,15 @@ DIFFISH_HARDENING_ARGS = [
 ]
 
 BLOCKED_SUBCOMMAND_FLAGS = {
-    "blame": {"--textconv"},
+    "blame": {"--output", "--textconv"},
     "cat-file": {"--filters", "--textconv"},
-    "diff": {"--ext-diff", "--textconv"},
-    "diff-files": {"--ext-diff", "--textconv"},
-    "diff-index": {"--ext-diff", "--textconv"},
-    "diff-tree": {"--ext-diff", "--textconv"},
+    "diff": {"--ext-diff", "--output", "--textconv"},
+    "diff-files": {"--ext-diff", "--output", "--textconv"},
+    "diff-index": {"--ext-diff", "--output", "--textconv"},
+    "diff-tree": {"--ext-diff", "--output", "--textconv"},
     "grep": {"--open-files-in-pager", "--textconv"},
-    "log": {"--ext-diff", "--textconv"},
-    "show": {"--ext-diff", "--textconv"},
+    "log": {"--ext-diff", "--output", "--textconv"},
+    "show": {"--ext-diff", "--output", "--textconv"},
 }
 
 BLOCKED_SUBCOMMAND_SHORT_FLAG_ALIASES = {

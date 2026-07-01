@@ -16,6 +16,19 @@ from review_runtime.common import ReviewError  # noqa: E402
 
 
 class ChildEnvironmentTest(unittest.TestCase):
+    def test_tail_text_reads_only_a_bounded_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / "review.log"
+            path.write_bytes(
+                b"discarded-line\n" * 10_000
+                + b"keep-one\nkeep-two\nkeep-three\n"
+            )
+
+            result = common.tail_text(path, line_count=2, byte_count=128)
+
+        self.assertEqual(result, "keep-two\nkeep-three")
+        self.assertNotIn("discarded-line", result)
+
     def test_streamed_command_logs_are_complete_and_memory_capture_is_bounded(
         self,
     ) -> None:

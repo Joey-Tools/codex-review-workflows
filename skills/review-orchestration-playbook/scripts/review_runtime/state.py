@@ -40,6 +40,7 @@ STATE_MARKER = ".isolated-review-state"
 EXIT_FILE = "exit-code"
 LOCK_FILE = "runner.lock"
 CLEANUP_LOCK_FILE = "cleanup.lock"
+FINAL_CLEANUP_TIMEOUT_SECONDS = 30.0
 _STARTED_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
 
 
@@ -368,16 +369,23 @@ def wait(
             break
         if deadline is not None and time.monotonic() >= deadline:
             return 124
-        time.sleep(0.25)
+        remaining = None if deadline is None else deadline - time.monotonic()
+        time.sleep(0.25 if remaining is None else min(0.25, max(0.0, remaining)))
 
     cleanup_lock_path = state_dir / CLEANUP_LOCK_FILE
     with cleanup_lock_path.open("a+b") as cleanup_lock:
-        fcntl.flock(cleanup_lock.fileno(), fcntl.LOCK_EX)
+        if not _acquire_cleanup_lock(cleanup_lock, deadline=deadline):
+            return 124
         try:
             state, review = load_review_state(state_dir)
             keep_workspace = bool(state.get("keep_workspace"))
             if review.workspace_root.exists() and not keep_workspace:
-                cleanup_error = cleanup_workspace(review, keep_container=True)
+                cleanup_completed, cleanup_error = _cleanup_before_deadline(
+                    review,
+                    deadline=deadline,
+                )
+                if not cleanup_completed:
+                    return 124
                 if cleanup_error:
                     write_text_atomic(state_dir / "cleanup-error.txt", cleanup_error + "\n")
                     return 1
@@ -389,11 +397,51 @@ def wait(
             fcntl.flock(cleanup_lock.fileno(), fcntl.LOCK_UN)
 
 
+def _acquire_cleanup_lock(handle, *, deadline: float | None) -> bool:
+    while True:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+            remaining = None if deadline is None else deadline - time.monotonic()
+            time.sleep(0.05 if remaining is None else min(0.05, max(0.0, remaining)))
+
+
+def _cleanup_before_deadline(
+    review: ReviewWorkspace,
+    *,
+    deadline: float | None,
+) -> tuple[bool, str | None]:
+    if deadline is None:
+        return True, cleanup_workspace(review, keep_container=True)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return False, None
+    completed = threading.Event()
+    result: list[str | None] = []
+
+    def cleanup() -> None:
+        try:
+            result.append(cleanup_workspace(review, keep_container=True))
+        finally:
+            completed.set()
+
+    worker = threading.Thread(target=cleanup, daemon=True)
+    worker.start()
+    if not completed.wait(timeout=remaining):
+        return False, None
+    return True, result[0]
+
+
 def final(state_dir: pathlib.Path) -> tuple[int, str]:
     summary = status(state_dir)
     if summary["running"]:
         return 3, "review is still running"
-    wait_code = wait(state_dir, timeout_seconds=0)
+    wait_code = wait(state_dir, timeout_seconds=FINAL_CLEANUP_TIMEOUT_SECONDS)
+    if wait_code == 124:
+        return 3, "review completed but workspace cleanup did not finish before timeout"
     cleanup_error = tail_text(state_dir.expanduser().resolve() / "cleanup-error.txt")
     if cleanup_error:
         return 1, f"review completed but workspace cleanup failed: {cleanup_error}"

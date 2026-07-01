@@ -644,7 +644,40 @@ class ProviderPolicyTest(unittest.TestCase):
             json.dumps(
                 {
                     "type": "turn_context",
-                    "payload": {"model": "gpt-5.6-sol", "effort": "xhigh"},
+                    "payload": {
+                        "model": "gpt-5.6-sol",
+                        "effort": "xhigh",
+                        "approval_policy": "never",
+                        "sandbox_policy": {"type": "read-only"},
+                        "permission_profile": {
+                            "type": "managed",
+                            "network": "restricted",
+                            "file_system": {
+                                "type": "restricted",
+                                "entries": [
+                                    {
+                                        "path": {
+                                            "type": "path",
+                                            "path": str(self.review.workspace_root.resolve()),
+                                        },
+                                        "access": "read",
+                                    },
+                                    *[
+                                        {
+                                            "path": {
+                                                "type": "path",
+                                                "path": str(
+                                                    (self.review.workspace_root / name).resolve()
+                                                ),
+                                            },
+                                            "access": "deny",
+                                        }
+                                        for name in (".git", ".codex", ".agents")
+                                    ],
+                                ],
+                            },
+                        },
+                    },
                 }
             )
             + "\n",
@@ -698,6 +731,23 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(attempt.effective_model, "gpt-5.6-sol")
         self.assertEqual(attempt.effective_effort, "xhigh")
         self.assertEqual(attempt.category, "success")
+
+    def test_codex_rejects_legacy_sandbox_override(self) -> None:
+        payload = {
+            "approval_policy": "never",
+            "sandbox_policy": {"type": "workspace-write"},
+            "permission_profile": {
+                "type": "managed",
+                "network": "restricted",
+                "file_system": {"type": "restricted", "entries": []},
+            },
+        }
+        self.assertFalse(
+            providers._codex_permissions_match(
+                payload,
+                review_root=self.review.workspace_root,
+            )
+        )
 
     @mock.patch.object(
         providers,

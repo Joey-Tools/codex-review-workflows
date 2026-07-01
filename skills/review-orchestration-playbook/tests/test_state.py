@@ -135,9 +135,9 @@ class StatefulLifecycleTest(unittest.TestCase):
             mock.patch.object(state, "cleanup_workspace", side_effect=delayed_cleanup),
             ThreadPoolExecutor(max_workers=2) as executor,
         ):
-            first = executor.submit(state.wait, self.review.container_dir, timeout_seconds=0)
+            first = executor.submit(state.wait, self.review.container_dir, timeout_seconds=2)
             self.assertTrue(cleanup_started.wait(timeout=2))
-            second = executor.submit(state.wait, self.review.container_dir, timeout_seconds=0)
+            second = executor.submit(state.wait, self.review.container_dir, timeout_seconds=2)
             time.sleep(0.05)
             self.assertEqual(cleanup_calls, 1)
             allow_cleanup.set()
@@ -146,6 +146,48 @@ class StatefulLifecycleTest(unittest.TestCase):
 
         self.assertEqual(cleanup_calls, 1)
         self.assertFalse((self.review.container_dir / "cleanup-error.txt").exists())
+
+    def test_wait_timeout_includes_cleanup_lock(self) -> None:
+        self.write_completed_state()
+        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+        with lock_path.open("a+b") as cleanup_lock:
+            state.fcntl.flock(cleanup_lock.fileno(), state.fcntl.LOCK_EX)
+            started = time.monotonic()
+            exit_code = state.wait(self.review.container_dir, timeout_seconds=0.05)
+            elapsed = time.monotonic() - started
+
+        self.assertEqual(exit_code, 124)
+        self.assertLess(elapsed, 0.5)
+
+    def test_wait_timeout_includes_workspace_cleanup(self) -> None:
+        self.write_completed_state()
+        release_cleanup = threading.Event()
+
+        def delayed_cleanup(*_args, **_kwargs):
+            release_cleanup.wait(timeout=2)
+            return None
+
+        with mock.patch.object(
+            state,
+            "cleanup_workspace",
+            side_effect=delayed_cleanup,
+        ):
+            started = time.monotonic()
+            exit_code = state.wait(self.review.container_dir, timeout_seconds=0.05)
+            elapsed = time.monotonic() - started
+            release_cleanup.set()
+            time.sleep(0.05)
+
+        self.assertEqual(exit_code, 124)
+        self.assertLess(elapsed, 0.5)
+
+    def test_final_reports_bounded_cleanup_timeout(self) -> None:
+        self.write_completed_state()
+        with mock.patch.object(state, "wait", return_value=124):
+            exit_code, text = state.final(self.review.container_dir)
+
+        self.assertEqual(exit_code, 3)
+        self.assertIn("cleanup did not finish before timeout", text)
 
     def test_forged_workspace_escape_is_rejected_before_cleanup(self) -> None:
         self.write_completed_state()

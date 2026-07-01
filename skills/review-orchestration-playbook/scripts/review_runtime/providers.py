@@ -385,17 +385,19 @@ def _codex_thread_id(stdout: bytes) -> str | None:
 def _codex_session_metadata(
     stdout: bytes,
     env: dict[str, str],
-) -> tuple[str | None, str | None]:
+    *,
+    review_root: pathlib.Path,
+) -> tuple[str | None, str | None, bool]:
     thread_id = _codex_thread_id(stdout)
     if thread_id is None:
-        return None, None
+        return None, None, False
     codex_home_value = env.get("CODEX_HOME")
     if codex_home_value:
         codex_home = pathlib.Path(codex_home_value).expanduser()
     else:
         home_value = env.get("HOME")
         if not home_value:
-            return None, None
+            return None, None, False
         codex_home = pathlib.Path(home_value).expanduser() / ".codex"
     sessions_root = codex_home / "sessions"
     try:
@@ -405,7 +407,7 @@ def _codex_session_metadata(
             reverse=True,
         )
     except OSError:
-        return None, None
+        return None, None, False
     for candidate in candidates:
         try:
             with candidate.open("r", encoding="utf-8") as handle:
@@ -424,10 +426,53 @@ def _codex_session_metadata(
                     return (
                         model if isinstance(model, str) and model else None,
                         effort if isinstance(effort, str) and effort else None,
+                        _codex_permissions_match(payload, review_root=review_root),
                     )
         except OSError:
             continue
-    return None, None
+    return None, None, False
+
+
+def _codex_permissions_match(
+    payload: dict[str, Any],
+    *,
+    review_root: pathlib.Path,
+) -> bool:
+    sandbox_policy = payload.get("sandbox_policy")
+    permission_profile = payload.get("permission_profile")
+    if (
+        payload.get("approval_policy") != "never"
+        or not isinstance(sandbox_policy, dict)
+        or sandbox_policy.get("type") != "read-only"
+        or not isinstance(permission_profile, dict)
+        or permission_profile.get("type") != "managed"
+        or permission_profile.get("network") != "restricted"
+    ):
+        return False
+    filesystem = permission_profile.get("file_system")
+    if not isinstance(filesystem, dict) or filesystem.get("type") != "restricted":
+        return False
+    entries = filesystem.get("entries")
+    if not isinstance(entries, list):
+        return False
+
+    expected_paths = {
+        str(review_root.resolve()): "read",
+        str((review_root / ".git").resolve()): "deny",
+        str((review_root / ".codex").resolve()): "deny",
+        str((review_root / ".agents").resolve()): "deny",
+    }
+    observed_paths: dict[str, str] = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("access"), str):
+            continue
+        path_value = entry.get("path")
+        if not isinstance(path_value, dict) or path_value.get("type") != "path":
+            continue
+        value = path_value.get("path")
+        if isinstance(value, str):
+            observed_paths[value] = entry["access"]
+    return all(observed_paths.get(path) == access for path, access in expected_paths.items())
 
 
 def _attempt_paths(
@@ -614,8 +659,12 @@ def _codex_attempt(
         final_text = (
             attempt_final.read_text(encoding="utf-8", errors="replace").strip() or None
         )
-    effective_model, effective_effort = _codex_session_metadata(completed.stdout, env)
-    return _record_attempt(
+    effective_model, effective_effort, permissions_verified = _codex_session_metadata(
+        completed.stdout,
+        env,
+        review_root=review.workspace_root,
+    )
+    attempt = _record_attempt(
         review=review,
         index=index,
         runtime="codex",
@@ -628,6 +677,19 @@ def _codex_attempt(
         require_verified_model=True,
         require_verified_effort=True,
     )
+    if attempt.category == "success" and not permissions_verified:
+        detail = (
+            "effective Codex sandbox did not preserve the isolated review permission "
+            "profile; refusing to accept a result from a legacy or managed sandbox override"
+        )
+        _append_attempt_diagnostic(stderr_path, detail)
+        return replace(
+            attempt,
+            returncode=65,
+            category="permission-mismatch",
+            final_text=None,
+        )
+    return attempt
 
 
 def _claude_attempt(

@@ -97,11 +97,26 @@ def read_json(path: pathlib.Path) -> dict[str, Any]:
     return value
 
 
-def tail_text(path: pathlib.Path, *, line_count: int = 40) -> str:
+def tail_text(
+    path: pathlib.Path,
+    *,
+    line_count: int = 40,
+    byte_count: int = 64 * 1024,
+) -> str:
     try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            start = max(0, size - byte_count)
+            handle.seek(start)
+            data = handle.read(byte_count)
     except OSError:
         return ""
+    if start:
+        _partial, separator, remainder = data.partition(b"\n")
+        if separator:
+            data = remainder
+    lines = data.decode("utf-8", errors="replace").splitlines()
     return "\n".join(lines[-line_count:])
 
 

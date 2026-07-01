@@ -112,6 +112,17 @@ class ReadonlyGitShimTest(unittest.TestCase):
         external = self.run_shim("diff", "--ext-diff")
         self.assertEqual(external.returncode, 126)
 
+    def test_blocks_diff_output_redirection(self) -> None:
+        for args in (
+            ("diff", "--output", str(self.repo / "leak.diff")),
+            ("diff", f"--output={self.repo / 'leak.diff'}"),
+        ):
+            with self.subTest(args=args):
+                completed = self.run_shim(*args)
+                self.assertEqual(completed.returncode, 126)
+                self.assertIn("blocked subcommand option: --output", completed.stderr)
+                self.assertFalse((self.repo / "leak.diff").exists())
+
     def test_blocks_repository_routing_options(self) -> None:
         for args in (
             ("-C", str(self.repo), "status"),
