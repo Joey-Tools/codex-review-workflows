@@ -296,8 +296,19 @@ def _error_payload_text(value: Any) -> list[str]:
         return [value.strip()]
     if isinstance(value, dict):
         result: list[str] = []
-        for item in value.values():
-            result.extend(_error_payload_text(item))
+        for key in (
+            "code",
+            "type",
+            "subtype",
+            "status",
+            "message",
+            "reason",
+            "detail",
+            "error",
+            "errors",
+        ):
+            if key in value:
+                result.extend(_error_payload_text(value[key]))
         return result
     if isinstance(value, list):
         result = []
@@ -310,38 +321,37 @@ def _error_payload_text(value: Any) -> list[str]:
 def _structured_error_text(stdout: bytes) -> str:
     messages: list[str] = []
 
-    def visit(value: Any) -> None:
-        if isinstance(value, list):
-            for item in value:
-                visit(item)
-            return
+    def error_state(value: Any) -> tuple[bool, str]:
         if not isinstance(value, dict):
-            return
-        state_text = " ".join(
+            return False, ""
+        tokens = [
             item.lower()
             for key in ("type", "subtype", "status")
             if isinstance((item := value.get(key)), str)
+        ]
+        explicit = value.get("is_error") is True or any(
+            token == "error"
+            or token in {"failed", "failure", "error_during_execution"}
+            or token.endswith(".failed")
+            or token.endswith(".failure")
+            or token.endswith(".error")
+            or token.endswith("_error")
+            or token.startswith("error_")
+            for token in tokens
         )
-        explicit_error = value.get("is_error") is True or any(
-            marker in state_text for marker in ("error", "failed", "failure")
-        )
-        if "error" in value:
-            messages.extend(_error_payload_text(value["error"]))
-        if explicit_error:
-            if "errors" in value:
-                messages.extend(_error_payload_text(value["errors"]))
-            api_error_status = value.get("api_error_status")
-            if isinstance(api_error_status, (int, str)):
-                messages.append(f"status {api_error_status}")
-            for key in ("message", "result", "reason", "detail", "data"):
-                if key in value:
-                    messages.extend(_error_payload_text(value[key]))
-        for key in ("item", "data", "result"):
-            if key in value and isinstance(value[key], (dict, list)):
-                visit(value[key])
+        return explicit, " ".join(tokens)
 
     for item in _json_objects(stdout):
-        visit(item)
+        explicit_error, state_text = error_state(item)
+        if not explicit_error:
+            continue
+        messages.append(f"event {state_text or 'explicit error'}")
+        for key in ("error", "errors", "message", "reason", "detail", "code"):
+            if key in item:
+                messages.extend(_error_payload_text(item[key]))
+        api_error_status = item.get("api_error_status")
+        if isinstance(api_error_status, (int, str)):
+            messages.append(f"status {api_error_status}")
     return "\n".join(messages)
 
 

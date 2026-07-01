@@ -154,11 +154,33 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         self.assertEqual(providers.classify_failure(stdout, "review failed"), "other")
 
+    def test_nested_tool_error_data_cannot_trigger_fallback(self) -> None:
+        stdout = json.dumps(
+            {
+                "type": "item.completed",
+                "data": {
+                    "error": {
+                        "message": "Model is not available for your account; timeout"
+                    }
+                },
+            }
+        )
+        self.assertEqual(providers.classify_failure(stdout, "review failed"), "other")
+
     def test_structured_error_event_can_trigger_entitlement_fallback(self) -> None:
         stdout = json.dumps(
             {
                 "type": "turn.failed",
                 "error": {"message": "Model is not available for your account"},
+            }
+        )
+        self.assertEqual(providers.classify_failure(stdout, ""), "entitlement")
+
+    def test_structured_api_error_event_can_trigger_entitlement_fallback(self) -> None:
+        stdout = json.dumps(
+            {
+                "type": "api_error",
+                "message": "Model is not available for your account",
             }
         )
         self.assertEqual(providers.classify_failure(stdout, ""), "entitlement")
@@ -181,6 +203,30 @@ class ProviderPolicyTest(unittest.TestCase):
                 "subtype": "error_during_execution",
                 "is_error": True,
                 "api_error_status": 429,
+            }
+        )
+        self.assertEqual(providers.classify_failure(stdout, ""), "transient")
+
+    def test_claude_partial_result_cannot_override_entitlement_error(self) -> None:
+        stdout = json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "errors": ["Model is not available for your account"],
+                "result": "partial review text mentioning timeout",
+            }
+        )
+        self.assertEqual(providers.classify_failure(stdout, ""), "entitlement")
+
+    def test_claude_partial_result_cannot_override_transient_error(self) -> None:
+        stdout = json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "api_error_status": 429,
+                "result": "model is not available for your account",
             }
         )
         self.assertEqual(providers.classify_failure(stdout, ""), "transient")

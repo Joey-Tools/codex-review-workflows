@@ -64,7 +64,7 @@ Model verification normalizes punctuation only and then requires exact equality.
 
 Capacity, overload, rate limits, timeouts, network/5xx errors, missing artifacts, silent model substitution, and review findings never trigger a model downgrade. The helper records every attempt and reports transient failures without switching models.
 
-Fallback classification uses stderr plus explicit structured CLI error events only. Reviewer tool output and repository text on stdout are never scanned for entitlement or transient substrings.
+Fallback classification uses stderr plus explicit structured CLI error events and error-schema fields only. Partial `result`/`data` payloads, reviewer tool output, and repository text on stdout are never scanned for entitlement or transient substrings.
 
 ## Snapshot And Safety
 
