@@ -263,6 +263,56 @@ class WorkspaceTest(unittest.TestCase):
             [],
         )
 
+    def test_reserved_path_preflight_rejects_oversized_tree_metadata(self) -> None:
+        with (
+            mock.patch.object(workspace_runtime, "MAX_TREE_METADATA_BYTES", 1),
+            self.assertRaisesRegex(ReviewError, "frozen base tree metadata exceeds"),
+        ):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+        self.assertEqual(
+            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            [],
+        )
+
+    def test_reserved_path_preflight_rejects_excessive_tree_entries(self) -> None:
+        with (
+            mock.patch.object(workspace_runtime, "MAX_SNAPSHOT_ENTRIES", 0),
+            self.assertRaisesRegex(ReviewError, "frozen base tree metadata exceeds"),
+        ):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+        self.assertEqual(
+            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            [],
+        )
+
+    def test_snapshot_rejects_oversized_recursive_tree_metadata(self) -> None:
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "_commit_uses_reserved_control_path",
+                return_value=False,
+            ),
+            mock.patch.object(workspace_runtime, "MAX_TREE_METADATA_BYTES", 1),
+            self.assertRaisesRegex(ReviewError, "frozen Git tree metadata exceeds"),
+        ):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+        self.assertEqual(
+            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            [],
+        )
+
     def test_snapshot_rejects_oversized_total_before_materializing(self) -> None:
         with (
             mock.patch.object(workspace_runtime, "MAX_SNAPSHOT_BYTES", 1),

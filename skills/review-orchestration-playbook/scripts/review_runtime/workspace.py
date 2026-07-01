@@ -110,6 +110,7 @@ PROTECTED_REVIEW_PATHS = (".codex", ".agents")
 MAX_SNAPSHOT_BLOB_BYTES = 64 * 1024 * 1024
 MAX_SNAPSHOT_BYTES = 512 * 1024 * 1024
 MAX_SNAPSHOT_ENTRIES = 100_000
+MAX_TREE_METADATA_BYTES = 128 * 1024 * 1024
 MAX_DIFF_BYTES = 128 * 1024 * 1024
 MAX_CHANGED_METADATA_BYTES = 128 * 1024 * 1024
 MAX_CHANGED_ENTRIES = 100_000
@@ -233,20 +234,44 @@ def _commit_uses_reserved_control_path(
     git_view: pathlib.Path,
     object_directory: pathlib.Path,
     commit: str,
+    label: str,
 ) -> bool:
-    result = run(
-        _frozen_command(
-            git_view=git_view,
-            args=("ls-tree", "-z", "--name-only", commit),
-        ),
-        env=_git_environment(object_directory=object_directory),
-        check=True,
-    )
-    return any(
-        os.fsdecode(name).casefold() == ".codex-review"
-        for name in result.stdout.split(b"\0")
-        if name
-    )
+    with tempfile.TemporaryFile() as error_output:
+        process = subprocess.Popen(
+            _frozen_command(
+                git_view=git_view,
+                args=("ls-tree", "-z", "--name-only", commit),
+            ),
+            env=_git_environment(object_directory=object_directory),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=error_output,
+        )
+        if process.stdout is None:
+            _stop_process(process)
+            raise ReviewError(f"failed to create frozen {label} tree metadata pipe")
+        reserved = False
+        try:
+            for name in _iter_nul_records(
+                process.stdout,
+                byte_limit=MAX_TREE_METADATA_BYTES,
+                record_limit=MAX_SNAPSHOT_ENTRIES,
+                label=f"frozen {label} tree metadata",
+            ):
+                if os.fsdecode(name).casefold() == ".codex-review":
+                    reserved = True
+            _close_pipe(process.stdout)
+            returncode = process.wait()
+        except BaseException:
+            _close_pipe(process.stdout)
+            _stop_process(process)
+            raise
+        if returncode != 0:
+            raise ReviewError(
+                f"cannot inspect frozen {label} tree metadata: "
+                f"{_process_stderr(error_output)}"
+            )
+        return reserved
 
 
 def _reject_protected_review_path_aliases(workspace_root: pathlib.Path) -> None:
@@ -391,14 +416,30 @@ def _new_container(
         raise
 
 
-def _iter_nul_records(stream: BinaryIO) -> Iterator[bytes]:
+def _iter_nul_records(
+    stream: BinaryIO,
+    *,
+    byte_limit: int | None = None,
+    record_limit: int | None = None,
+    label: str = "Git metadata",
+) -> Iterator[bytes]:
     pending = bytearray()
+    total_bytes = 0
+    records = 0
     while chunk := stream.read(64 * 1024):
+        total_bytes += len(chunk)
+        if byte_limit is not None and total_bytes > byte_limit:
+            raise ReviewError(f"{label} exceeds the {byte_limit}-byte review limit")
         pending.extend(chunk)
         while True:
             boundary = pending.find(0)
             if boundary < 0:
                 break
+            records += 1
+            if record_limit is not None and records > record_limit:
+                raise ReviewError(
+                    f"{label} exceeds the {record_limit}-entry review limit"
+                )
             yield bytes(pending[:boundary])
             del pending[: boundary + 1]
     if pending:
@@ -627,7 +668,11 @@ def _materialize_frozen_tree(
         materialized_bytes = 0
         materialized_entries = 0
         try:
-            for record in _iter_nul_records(tree_process.stdout):
+            for record in _iter_nul_records(
+                tree_process.stdout,
+                byte_limit=MAX_TREE_METADATA_BYTES,
+                label="frozen Git tree metadata",
+            ):
                 materialized_entries += 1
                 if materialized_entries > MAX_SNAPSHOT_ENTRIES:
                     raise ReviewError(
@@ -1234,6 +1279,7 @@ def prepare_workspace(
                 git_view=git_view,
                 object_directory=object_directory,
                 commit=commit,
+                label=label,
             ):
                 raise ReviewError(
                     f"the frozen {label} uses the reserved top-level .codex-review path"
