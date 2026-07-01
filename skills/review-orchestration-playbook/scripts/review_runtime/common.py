@@ -52,6 +52,8 @@ TRUSTED_PATH = os.pathsep.join(
 BASE_ENV_KEYS = (
     "ALL_PROXY",
     "COLORTERM",
+    "CURL_CA_BUNDLE",
+    "GIT_SSL_CAINFO",
     "HOME",
     "HTTPS_PROXY",
     "HTTP_PROXY",
@@ -61,6 +63,7 @@ BASE_ENV_KEYS = (
     "LOGNAME",
     "NO_COLOR",
     "NO_PROXY",
+    "REQUESTS_CA_BUNDLE",
     "SHELL",
     "SSL_CERT_DIR",
     "SSL_CERT_FILE",

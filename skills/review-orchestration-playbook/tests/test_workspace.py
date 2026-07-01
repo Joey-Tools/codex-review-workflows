@@ -231,6 +231,19 @@ class WorkspaceTest(unittest.TestCase):
             )
         self.assertEqual(list(outside.iterdir()), [])
 
+    def test_group_writable_review_root_is_rejected(self) -> None:
+        review_root = self.repo / ".codex-tmp"
+        review_root.mkdir(mode=0o700)
+        review_root.chmod(0o770)
+
+        with self.assertRaisesRegex(ReviewError, "group or other writable"):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+        self.assertEqual(list(review_root.iterdir()), [])
+
     def test_reserved_control_path_in_base_is_rejected(self) -> None:
         control = self.repo / ".codex-review"
         control.mkdir()
@@ -300,6 +313,32 @@ class WorkspaceTest(unittest.TestCase):
         self.reviews.append(review)
         with self.assertRaisesRegex(ReviewError, r"fixtures/\.netrc.*credential-path"):
             validate_external_workspace(review)
+
+    def test_unchanged_secret_in_path_name_blocks_external_review(self) -> None:
+        secret = "sk-" + "A" * 40
+        secret_path = self.repo / "fixtures" / secret
+        secret_path.parent.mkdir()
+        secret_path.write_text("ordinary content\n", encoding="utf-8")
+        git(self.repo, "add", str(secret_path.relative_to(self.repo)))
+        git(self.repo, "commit", "-m", "Add secret-shaped path")
+        sensitive_base = git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "example.txt").write_text("three\n", encoding="utf-8")
+        git(self.repo, "add", "example.txt")
+        git(self.repo, "commit", "-m", "Change unrelated content")
+        unrelated_head = git(self.repo, "rev-parse", "HEAD")
+
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=sensitive_base,
+            head_ref=unrelated_head,
+        )
+        self.reviews.append(review)
+        with self.assertRaisesRegex(
+            ReviewError,
+            r"<redacted snapshot path>.*openai-key.*path-name",
+        ) as raised:
+            validate_external_workspace(review)
+        self.assertNotIn(secret, str(raised.exception))
 
     def test_deleted_binary_secret_is_detected_from_base_blob(self) -> None:
         secret = ("sk-" + "A" * 40).encode()

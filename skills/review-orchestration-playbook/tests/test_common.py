@@ -194,6 +194,9 @@ class ChildEnvironmentTest(unittest.TestCase):
                     {
                         "HOME": "/home/reviewer",
                         "GH_TOKEN": "github-auth",
+                        "REQUESTS_CA_BUNDLE": "/etc/corporate-ca.pem",
+                        "CURL_CA_BUNDLE": "/etc/curl-ca.pem",
+                        "GIT_SSL_CAINFO": "/etc/git-ca.pem",
                         "UNRELATED_PRIVATE_VALUE": "must-not-pass",
                         "DATABASE_PASSWORD": "must-not-pass",
                     },
@@ -215,6 +218,9 @@ class ChildEnvironmentTest(unittest.TestCase):
                 )
         self.assertEqual(env["HOME"], "/home/reviewer")
         self.assertEqual(env["GH_TOKEN"], "github-auth")
+        self.assertEqual(env["REQUESTS_CA_BUNDLE"], "/etc/corporate-ca.pem")
+        self.assertEqual(env["CURL_CA_BUNDLE"], "/etc/curl-ca.pem")
+        self.assertEqual(env["GIT_SSL_CAINFO"], "/etc/git-ca.pem")
         self.assertNotIn("UNRELATED_PRIVATE_VALUE", env)
         self.assertNotIn("DATABASE_PASSWORD", env)
 

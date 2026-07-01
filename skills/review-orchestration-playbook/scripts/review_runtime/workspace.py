@@ -298,6 +298,14 @@ def _new_container(
             raise ReviewError(
                 f"review root must be a real directory, not a symlink: {review_root}"
             )
+        if root_status.st_uid != os.geteuid():
+            raise ReviewError(
+                f"review root must be owned by the current user: {review_root}"
+            )
+        if root_status.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise ReviewError(
+                f"review root must not be group or other writable: {review_root}"
+            )
         if review_root.resolve() != review_root.absolute():
             raise ReviewError(
                 f"review root resolves outside the source repository: {review_root}"
@@ -314,9 +322,15 @@ def _new_container(
             raise ReviewError(
                 f"cannot securely open review root {review_root}: {error}"
             ) from error
-        name = f"isolated-review-{stamp}-{suffix}"
-        container = review_root / name
         try:
+            opened_status = os.fstat(root_fd)
+            if (opened_status.st_dev, opened_status.st_ino) != (
+                root_status.st_dev,
+                root_status.st_ino,
+            ):
+                raise ReviewError("review root changed while opening it securely")
+            name = f"isolated-review-{stamp}-{suffix}"
+            container = review_root / name
             os.mkdir(name, mode=0o700, dir_fd=root_fd)
             descriptor_status = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
             path_status = os.lstat(container)
@@ -878,6 +892,12 @@ def validate_external_workspace(review: ReviewWorkspace) -> None:
         path_rule = _sensitive_path_rule(relative)
         if path_rule:
             record_finding(f"{relative} ({path_rule})")
+            continue
+        path_secret_rule = _value_secret_rule(os.fsencode(relative))
+        if path_secret_rule:
+            record_finding(
+                f"<redacted snapshot path> ({path_secret_rule}; path-name)"
+            )
             continue
         if candidate.is_symlink() or not candidate.is_file():
             continue
