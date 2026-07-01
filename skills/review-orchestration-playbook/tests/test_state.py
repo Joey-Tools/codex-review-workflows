@@ -17,7 +17,10 @@ sys.path.insert(0, str(SCRIPTS))
 
 from review_runtime import cleanup_worker, state  # noqa: E402
 from review_runtime.common import ReviewError, write_json  # noqa: E402
-from review_runtime.workspace import cleanup_workspace, prepare_workspace  # noqa: E402
+from review_runtime.workspace import (  # noqa: E402
+    cleanup_workspace,
+    prepare_workspace as _prepare_workspace,
+)
 
 
 def git(repo: pathlib.Path, *args: str) -> str:
@@ -29,6 +32,22 @@ def git(repo: pathlib.Path, *args: str) -> str:
         text=True,
     )
     return completed.stdout.strip()
+
+
+def prepare_workspace(**kwargs):
+    captured = []
+    review = _prepare_workspace(ownership_handoff=captured.append, **kwargs)
+    if captured != [review]:
+        raise AssertionError("workspace ownership was not handed off exactly once")
+    return review
+
+
+def prepared_workspace(review):
+    def prepare(**kwargs):
+        kwargs["ownership_handoff"](review)
+        return review
+
+    return prepare
 
 
 class StatefulLifecycleTest(unittest.TestCase):
@@ -374,6 +393,40 @@ time.sleep(0.2)
 
         popen.assert_not_called()
 
+    def test_start_cleans_workspace_when_signal_follows_handoff(self) -> None:
+        def handoff_then_signal(**kwargs):
+            kwargs["ownership_handoff"](self.review)
+            raise state.ForwardedSignal(signal.SIGTERM)
+
+        with (
+            mock.patch.object(
+                state,
+                "prepare_workspace",
+                side_effect=handoff_then_signal,
+            ),
+            mock.patch.object(state.subprocess, "Popen") as popen,
+            mock.patch.object(
+                state,
+                "cleanup_workspace",
+                return_value=None,
+            ) as cleanup,
+            self.assertRaises(state.ForwardedSignal) as raised,
+        ):
+            state.start(
+                script_path=pathlib.Path("runner.py"),
+                repo=self.repo,
+                reviewer="codex",
+                base_ref=self.base,
+                head_ref=self.head,
+                prompt_file=None,
+                keep_workspace=False,
+                egress_consent=None,
+            )
+
+        self.assertEqual(raised.exception.signum, signal.SIGTERM)
+        popen.assert_not_called()
+        cleanup.assert_called_once_with(self.review, keep_container=False)
+
     def test_start_preserves_prepare_cleanup_failure_detail(self) -> None:
         installed: dict[signal.Signals, object] = {}
         retained_detail = (
@@ -443,7 +496,7 @@ time.sleep(0.2)
             mock.patch.object(
                 state,
                 "prepare_workspace",
-                return_value=self.review,
+                side_effect=prepared_workspace(self.review),
             ),
             mock.patch.object(state.subprocess, "Popen", side_effect=spawn),
             mock.patch.object(state, "signal_process_group") as forward,
@@ -491,7 +544,7 @@ time.sleep(0.2)
             mock.patch.object(
                 state,
                 "prepare_workspace",
-                return_value=self.review,
+                side_effect=prepared_workspace(self.review),
             ),
             mock.patch.object(state.subprocess, "Popen", side_effect=spawn),
             mock.patch.object(
@@ -531,7 +584,7 @@ time.sleep(0.2)
             mock.patch.object(
                 state,
                 "prepare_workspace",
-                return_value=self.review,
+                side_effect=prepared_workspace(self.review),
             ),
             mock.patch.object(state.subprocess, "Popen", return_value=process),
             mock.patch.object(state, "terminate_process_group") as terminate,
@@ -568,7 +621,7 @@ time.sleep(0.2)
             mock.patch.object(
                 state,
                 "prepare_workspace",
-                return_value=self.review,
+                side_effect=prepared_workspace(self.review),
             ),
             mock.patch.object(state.subprocess, "Popen", return_value=process),
             mock.patch.object(state, "terminate_process_group"),
@@ -616,7 +669,7 @@ time.sleep(0.2)
             mock.patch.object(
                 state,
                 "prepare_workspace",
-                return_value=self.review,
+                side_effect=prepared_workspace(self.review),
             ),
             mock.patch.object(state.subprocess, "Popen", return_value=process),
             mock.patch.object(
@@ -659,7 +712,7 @@ time.sleep(0.2)
             mock.patch.object(
                 state,
                 "prepare_workspace",
-                return_value=self.review,
+                side_effect=prepared_workspace(self.review),
             ),
             mock.patch.object(state.subprocess, "Popen", return_value=process),
             mock.patch.object(

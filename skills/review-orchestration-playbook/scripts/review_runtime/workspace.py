@@ -11,7 +11,7 @@ import tempfile
 import time
 import uuid
 from dataclasses import asdict, dataclass
-from typing import BinaryIO, Iterator
+from typing import BinaryIO, Callable, Iterator
 
 from .common import (
     TRUSTED_PATH,
@@ -397,11 +397,12 @@ def _parse_tree_record(record: bytes) -> tuple[str, str, str, pathlib.PurePosixP
         object_id = raw_object.decode("ascii")
         relative = pathlib.PurePosixPath(os.fsdecode(raw_path))
     except (UnicodeDecodeError, ValueError) as error:
-        raise ReviewError(f"malformed record from git ls-tree: {record!r}") from error
+        raise ReviewError("malformed record from git ls-tree") from error
+    path_display = _redact_secret_path(os.fsdecode(raw_path), "snapshot path")
     if not raw_path or relative.is_absolute() or ".." in relative.parts:
-        raise ReviewError(f"unsafe path in frozen Git tree: {os.fsdecode(raw_path)!r}")
+        raise ReviewError(f"unsafe path in frozen Git tree: {path_display}")
     if any(part.casefold() == ".git" for part in relative.parts):
-        raise ReviewError(f"reserved .git path in frozen Git tree: {relative}")
+        raise ReviewError(f"reserved .git path in frozen Git tree: {path_display}")
     return mode, object_type, object_id, relative
 
 
@@ -576,28 +577,43 @@ def _materialize_frozen_tree(
             for record in _iter_nul_records(tree_process.stdout):
                 mode, object_type, object_id, relative = _parse_tree_record(record)
                 destination = workspace_root.joinpath(*relative.parts)
-                if mode == "160000" and object_type == "commit":
-                    resolved_parent = destination.parent.resolve(strict=False)
-                    if not is_relative_to(
-                        resolved_parent, workspace_root.resolve(strict=False)
-                    ):
-                        raise ReviewError(
-                            f"frozen Git tree path escapes workspace: {destination}"
-                        )
-                    destination.mkdir(parents=True, exist_ok=False)
-                    continue
-                if object_type != "blob":
-                    raise ReviewError(
-                        f"unsupported object in frozen Git tree: {object_type} {relative}"
-                    )
-                _materialize_blob(
-                    cat_input=cat_process.stdin,
-                    cat_output=cat_process.stdout,
-                    workspace_root=workspace_root,
-                    destination=destination,
-                    object_id=object_id,
-                    mode=mode,
+                path_display = _redact_secret_path(
+                    os.fspath(relative),
+                    "snapshot path",
                 )
+                try:
+                    if mode == "160000" and object_type == "commit":
+                        resolved_parent = destination.parent.resolve(strict=False)
+                        if not is_relative_to(
+                            resolved_parent, workspace_root.resolve(strict=False)
+                        ):
+                            raise ReviewError(
+                                "frozen Git tree path escapes workspace: "
+                                f"{path_display}"
+                            )
+                        destination.mkdir(parents=True, exist_ok=False)
+                        continue
+                    if object_type != "blob":
+                        raise ReviewError(
+                            "unsupported object in frozen Git tree: "
+                            f"{object_type} {path_display}"
+                        )
+                    _materialize_blob(
+                        cat_input=cat_process.stdin,
+                        cat_output=cat_process.stdout,
+                        workspace_root=workspace_root,
+                        destination=destination,
+                        object_id=object_id,
+                        mode=mode,
+                    )
+                except OSError as error:
+                    error_code = (
+                        f" (errno {error.errno})" if error.errno is not None else ""
+                    )
+                    raise ReviewError(
+                        "filesystem error while materializing frozen Git tree path "
+                        f"{path_display}{error_code}"
+                    ) from error
             _close_pipe(tree_process.stdout)
             tree_returncode = tree_process.wait()
             _close_pipe(cat_process.stdin)
@@ -1055,12 +1071,14 @@ def prepare_workspace(
     repo: pathlib.Path,
     base_ref: str,
     head_ref: str,
+    ownership_handoff: Callable[[ReviewWorkspace], None],
     prompt_override: pathlib.Path | None = None,
 ) -> ReviewWorkspace:
     source_root = resolve_repo_root(repo)
     base_sha = resolve_commit(source_root, base_ref, label="base ref")
     head_sha = resolve_commit(source_root, head_ref, label="head ref")
     container, handoff_mask = _new_container(source_root)
+    ownership_transferred = False
 
     try:
         restore_signal_mask(handoff_mask)
@@ -1127,13 +1145,20 @@ def prepare_workspace(
                 head_ref=head_sha,
             )
         else:
-            prompt = prompt_override.expanduser().resolve().read_text(encoding="utf-8")
-            prompt = (
-                prompt.replace("{workspace}", str(workspace_root))
-                .replace("{diff_file}", str(diff_file))
-                .replace("{base_ref}", base_sha)
-                .replace("{head_ref}", head_sha)
-                .replace("{review_range}", f"{base_sha}..{head_sha}")
+            template = prompt_override.expanduser().resolve().read_text(
+                encoding="utf-8"
+            )
+            replacements = {
+                "workspace": str(workspace_root),
+                "diff_file": str(diff_file),
+                "base_ref": base_sha,
+                "head_ref": head_sha,
+                "review_range": f"{base_sha}..{head_sha}",
+            }
+            prompt = re.sub(
+                r"\{(workspace|diff_file|base_ref|head_ref|review_range)\}",
+                lambda match: replacements[match.group(1)],
+                template,
             )
         write_text_atomic(prompt_file, prompt)
         review = ReviewWorkspace(
@@ -1146,8 +1171,16 @@ def prepare_workspace(
             prompt_file=prompt_file,
         )
         validate_workspace_layout(review)
+        ownership_mask = block_forwarded_signals()
+        try:
+            ownership_handoff(review)
+            ownership_transferred = True
+        finally:
+            restore_signal_mask(ownership_mask)
         return review
     except BaseException as error:
+        if ownership_transferred:
+            raise
         cleanup_mask = block_forwarded_signals()
         cleanup_signal: signal.Signals | None = None
         cleanup_error: str | None = None

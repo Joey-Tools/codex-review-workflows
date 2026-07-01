@@ -17,7 +17,7 @@ from .common import (
 )
 from .providers import CLAUDE_EGRESS_CONSENTS, run_review
 from .state import final, run_state, start, status, wait
-from .workspace import cleanup_workspace, prepare_workspace
+from .workspace import ReviewWorkspace, cleanup_workspace, prepare_workspace
 
 
 def _add_review_arguments(parser: argparse.ArgumentParser) -> None:
@@ -101,15 +101,23 @@ def _run_foreground(args: argparse.Namespace, *, script_path: pathlib.Path) -> i
         signum: signal.signal(signum, forward_signal)
         for signum in forwarded_signals()
     }
+
+    def accept_workspace(prepared: ReviewWorkspace) -> None:
+        nonlocal review
+        review = prepared
+
     try:
-        review = prepare_workspace(
+        prepare_workspace(
             repo=pathlib.Path(args.repo),
             base_ref=args.base_ref,
             head_ref=args.head_ref,
+            ownership_handoff=accept_workspace,
             prompt_override=(
                 pathlib.Path(args.prompt_file) if args.prompt_file else None
             ),
         )
+        if review is None:
+            raise ReviewError("workspace ownership handoff did not complete")
         outcome = run_review(
             review=review,
             reviewer=args.reviewer,

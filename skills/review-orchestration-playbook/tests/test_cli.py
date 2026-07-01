@@ -18,6 +18,14 @@ from review_runtime import cli, providers  # noqa: E402
 from review_runtime.workspace import ReviewWorkspace  # noqa: E402
 
 
+def prepared_workspace(review):
+    def prepare(**kwargs):
+        kwargs["ownership_handoff"](review)
+        return review
+
+    return prepare
+
+
 class ForegroundCleanupTest(unittest.TestCase):
     def test_main_reports_signal_cleanup_detail(self) -> None:
         stderr = io.StringIO()
@@ -83,6 +91,53 @@ class ForegroundCleanupTest(unittest.TestCase):
         self.assertEqual(raised.exception.signum, signal.SIGTERM)
         run_review.assert_not_called()
 
+    def test_handoff_signal_cleans_workspace_owned_by_caller(self) -> None:
+        root = pathlib.Path("/tmp/review-handoff")
+        review = ReviewWorkspace(
+            source_root=root,
+            container_dir=root / ".codex-tmp/isolated-review-test",
+            workspace_root=root / ".codex-tmp/isolated-review-test/workspace",
+            base_ref="a" * 40,
+            head_ref="b" * 40,
+            diff_file=root
+            / ".codex-tmp/isolated-review-test/workspace/.codex-review/review.diff",
+            prompt_file=root
+            / ".codex-tmp/isolated-review-test/workspace/.codex-review/review.prompt",
+        )
+        args = argparse.Namespace(
+            repo=str(root),
+            reviewer="codex",
+            base_ref=review.base_ref,
+            head_ref=review.head_ref,
+            prompt_file=None,
+            keep_workspace=False,
+            egress_consent=None,
+        )
+
+        def handoff_then_signal(**kwargs):
+            kwargs["ownership_handoff"](review)
+            raise cli.ForwardedSignal(signal.SIGTERM)
+
+        with (
+            mock.patch.object(
+                cli,
+                "prepare_workspace",
+                side_effect=handoff_then_signal,
+            ),
+            mock.patch.object(cli, "run_review") as run_review,
+            mock.patch.object(
+                cli,
+                "cleanup_workspace",
+                return_value=None,
+            ) as cleanup,
+            self.assertRaises(cli.ForwardedSignal) as raised,
+        ):
+            cli._run_foreground(args, script_path=SCRIPTS / "isolated_review")
+
+        self.assertEqual(raised.exception.signum, signal.SIGTERM)
+        run_review.assert_not_called()
+        cleanup.assert_called_once_with(review, keep_container=True)
+
     def test_success_becomes_failure_when_workspace_cleanup_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -108,7 +163,11 @@ class ForegroundCleanupTest(unittest.TestCase):
             )
             stderr = io.StringIO()
             with (
-                mock.patch.object(cli, "prepare_workspace", return_value=review),
+                mock.patch.object(
+                    cli,
+                    "prepare_workspace",
+                    side_effect=prepared_workspace(review),
+                ),
                 mock.patch.object(
                     cli,
                     "run_review",

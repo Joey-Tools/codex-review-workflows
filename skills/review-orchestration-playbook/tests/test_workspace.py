@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import pathlib
 import signal
@@ -13,12 +14,14 @@ from unittest import mock
 SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+from review_runtime import workspace as workspace_runtime  # noqa: E402
 from review_runtime.common import ForwardedSignal, ReviewError  # noqa: E402
 from review_runtime.workspace import (  # noqa: E402
     _file_secret_rule,
+    _parse_tree_record,
     _sensitive_path_rule,
     cleanup_workspace,
-    prepare_workspace,
+    prepare_workspace as _prepare_workspace,
     validate_external_workspace,
 )
 
@@ -36,6 +39,14 @@ def git(repo: pathlib.Path, *args: str) -> str:
 
 def oauth_refresh_credential() -> str:
     return "1//" + "".join(("oauth", "-refresh", "-credential", "-value"))
+
+
+def prepare_workspace(**kwargs):
+    captured = []
+    review = _prepare_workspace(ownership_handoff=captured.append, **kwargs)
+    if captured != [review]:
+        raise AssertionError("workspace ownership was not handed off exactly once")
+    return review
 
 
 class WorkspaceTest(unittest.TestCase):
@@ -117,6 +128,72 @@ class WorkspaceTest(unittest.TestCase):
         self.assertIn(str(review.diff_file), prompt)
         self.assertIn(f"{self.base}..{self.head}", prompt)
 
+    def test_prompt_override_replacement_is_single_pass(self) -> None:
+        renamed_repo = self.repo.with_name("repo-{diff_file}")
+        self.repo.rename(renamed_repo)
+        self.repo = renamed_repo
+        template = pathlib.Path(self.temporary.name) / "single-pass-prompt.txt"
+        template.write_text(
+            "Workspace={workspace}\nDiff={diff_file}\n",
+            encoding="utf-8",
+        )
+
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+            prompt_override=template,
+        )
+        self.reviews.append(review)
+
+        self.assertEqual(
+            review.prompt_file.read_text(encoding="utf-8"),
+            f"Workspace={review.workspace_root}\nDiff={review.diff_file}\n",
+        )
+
+    def test_tree_record_diagnostics_redact_secret_paths_and_payloads(self) -> None:
+        secret = "AKIA" + "A" * 16
+        malformed = f"malformed-{secret}".encode()
+        with self.assertRaises(ReviewError) as malformed_error:
+            _parse_tree_record(malformed)
+        self.assertNotIn(secret, str(malformed_error.exception))
+
+        reserved = f"100644 blob {'a' * 40}\t.git/{secret}".encode()
+        with self.assertRaises(ReviewError) as reserved_error:
+            _parse_tree_record(reserved)
+        self.assertIn("<redacted snapshot path>", str(reserved_error.exception))
+        self.assertNotIn(secret, str(reserved_error.exception))
+
+    def test_materialization_os_error_redacts_secret_path(self) -> None:
+        secret = "AKIA" + "B" * 16
+        (self.repo / secret).write_text("secret-shaped path\n", encoding="utf-8")
+        git(self.repo, "add", secret)
+        git(self.repo, "commit", "-m", "Add secret-shaped path")
+        self.head = git(self.repo, "rev-parse", "HEAD")
+        materialize_blob = workspace_runtime._materialize_blob
+
+        def fail_secret_path(**kwargs):
+            if kwargs["destination"].name == secret:
+                raise OSError(errno.ENAMETOOLONG, f"path too long: {secret}")
+            return materialize_blob(**kwargs)
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "_materialize_blob",
+                side_effect=fail_secret_path,
+            ),
+            self.assertRaises(ReviewError) as raised,
+        ):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+
+        self.assertIn("<redacted snapshot path>", str(raised.exception))
+        self.assertNotIn(secret, str(raised.exception))
+
     def test_invalid_ref_fails_before_creating_a_review_container(self) -> None:
         with self.assertRaises(ReviewError):
             prepare_workspace(
@@ -191,6 +268,35 @@ class WorkspaceTest(unittest.TestCase):
 
         review_root = self.repo / ".codex-tmp"
         self.assertEqual(list(review_root.glob("isolated-review-*")), [])
+
+    def test_completed_workspace_is_owned_before_handoff_signal(self) -> None:
+        restore_calls = 0
+        captured = []
+
+        def interrupt_ownership_restore(_mask):
+            nonlocal restore_calls
+            restore_calls += 1
+            if restore_calls == 2:
+                raise ForwardedSignal(signal.SIGTERM)
+
+        with (
+            mock.patch(
+                "review_runtime.workspace.restore_signal_mask",
+                side_effect=interrupt_ownership_restore,
+            ),
+            self.assertRaises(ForwardedSignal) as raised,
+        ):
+            _prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+                ownership_handoff=captured.append,
+            )
+
+        self.assertEqual(raised.exception.signum, signal.SIGTERM)
+        self.assertEqual(len(captured), 1)
+        self.assertTrue(captured[0].workspace_root.exists())
+        cleanup_workspace(captured[0], keep_container=False)
 
     def test_partial_snapshot_cleanup_reports_second_signal(self) -> None:
         with (

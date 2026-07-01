@@ -174,13 +174,20 @@ def start(
             previous_handlers[forwarded] = signal.getsignal(forwarded)
             signal.signal(forwarded, forward_signal)
 
+    def accept_workspace(prepared: ReviewWorkspace) -> None:
+        nonlocal review
+        review = prepared
+
     try:
-        review = prepare_workspace(
+        prepare_workspace(
             repo=repo,
             base_ref=base_ref,
             head_ref=head_ref,
+            ownership_handoff=accept_workspace,
             prompt_override=prompt_file,
         )
+        if review is None:
+            raise ReviewError("workspace ownership handoff did not complete")
         state_dir = review.container_dir
         write_text_atomic(state_dir / STATE_MARKER, "isolated-review-state-v1\n")
         stdout_path = state_dir / "runner.stdout.log"
