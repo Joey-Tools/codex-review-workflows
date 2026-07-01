@@ -3,11 +3,16 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import signal
 import sys
 
 from .common import (
     ForwardedSignal,
     ReviewError,
+    block_forwarded_signals,
+    consume_pending_forwarded_signal,
+    forwarded_signals,
+    restore_signal_mask,
 )
 from .providers import CLAUDE_EGRESS_CONSENTS, run_review
 from .state import final, run_state, start, status, wait
@@ -84,15 +89,26 @@ def _shim_source(script_path: pathlib.Path) -> pathlib.Path:
 
 def _run_foreground(args: argparse.Namespace, *, script_path: pathlib.Path) -> int:
     _validate_review_arguments(args)
-    review = prepare_workspace(
-        repo=pathlib.Path(args.repo),
-        base_ref=args.base_ref,
-        head_ref=args.head_ref,
-        prompt_override=pathlib.Path(args.prompt_file) if args.prompt_file else None,
-    )
+    review = None
     returncode = 1
     cleanup_error: str | None = None
+
+    def forward_signal(signum: int, _frame) -> None:
+        raise ForwardedSignal(signum)
+
+    previous_handlers = {
+        signum: signal.signal(signum, forward_signal)
+        for signum in forwarded_signals()
+    }
     try:
+        review = prepare_workspace(
+            repo=pathlib.Path(args.repo),
+            base_ref=args.base_ref,
+            head_ref=args.head_ref,
+            prompt_override=(
+                pathlib.Path(args.prompt_file) if args.prompt_file else None
+            ),
+        )
         outcome = run_review(
             review=review,
             reviewer=args.reviewer,
@@ -115,18 +131,32 @@ def _run_foreground(args: argparse.Namespace, *, script_path: pathlib.Path) -> i
             )
         returncode = outcome.returncode
     finally:
-        if args.keep_workspace:
-            print(f"kept review workspace: {review.container_dir}", file=sys.stderr)
-        elif (review.container_dir / "final.txt").is_file():
-            cleanup_error = cleanup_workspace(review, keep_container=False)
-        else:
-            cleanup_error = cleanup_workspace(review, keep_container=True)
-        if cleanup_error:
-            print(
-                f"review cleanup failed; evidence retained at {review.container_dir}: "
-                f"{cleanup_error}",
-                file=sys.stderr,
-            )
+        previous_mask = block_forwarded_signals()
+        pending_signal: signal.Signals | None = None
+        try:
+            if review is not None:
+                if args.keep_workspace:
+                    print(
+                        f"kept review workspace: {review.container_dir}",
+                        file=sys.stderr,
+                    )
+                elif (review.container_dir / "final.txt").is_file():
+                    cleanup_error = cleanup_workspace(review, keep_container=False)
+                else:
+                    cleanup_error = cleanup_workspace(review, keep_container=True)
+                if cleanup_error:
+                    print(
+                        "review cleanup failed; evidence retained at "
+                        f"{review.container_dir}: {cleanup_error}",
+                        file=sys.stderr,
+                    )
+            pending_signal = consume_pending_forwarded_signal()
+        finally:
+            restore_signal_mask(previous_mask)
+            for signum, previous_handler in previous_handlers.items():
+                signal.signal(signum, previous_handler)
+        if pending_signal is not None:
+            raise ForwardedSignal(pending_signal)
     return 1 if cleanup_error and returncode == 0 else returncode
 
 

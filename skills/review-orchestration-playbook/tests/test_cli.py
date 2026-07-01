@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import io
 import pathlib
+import signal
 import sys
 import tempfile
 import unittest
@@ -18,6 +19,50 @@ from review_runtime.workspace import ReviewWorkspace  # noqa: E402
 
 
 class ForegroundCleanupTest(unittest.TestCase):
+    def test_signal_handler_covers_workspace_preparation(self) -> None:
+        args = argparse.Namespace(
+            repo=".",
+            reviewer="codex",
+            base_ref="a" * 40,
+            head_ref="b" * 40,
+            prompt_file=None,
+            keep_workspace=False,
+            egress_consent=None,
+        )
+        handlers = {}
+
+        def install_handler(signum, handler):
+            previous = handlers.get(signum, signal.SIG_DFL)
+            handlers[signum] = handler
+            return previous
+
+        def cancelled_prepare(**_kwargs):
+            handler = handlers[signal.SIGTERM]
+            handler(signal.SIGTERM, None)
+            self.fail("signal handler should interrupt workspace preparation")
+
+        with (
+            mock.patch.object(cli.signal, "signal", side_effect=install_handler),
+            mock.patch.object(
+                cli,
+                "prepare_workspace",
+                side_effect=cancelled_prepare,
+            ),
+            mock.patch.object(cli, "run_review") as run_review,
+            mock.patch.object(cli, "block_forwarded_signals", return_value=set()),
+            mock.patch.object(
+                cli,
+                "consume_pending_forwarded_signal",
+                return_value=None,
+            ),
+            mock.patch.object(cli, "restore_signal_mask"),
+            self.assertRaises(cli.ForwardedSignal) as raised,
+        ):
+            cli._run_foreground(args, script_path=SCRIPTS / "isolated_review")
+
+        self.assertEqual(raised.exception.signum, signal.SIGTERM)
+        run_review.assert_not_called()
+
     def test_success_becomes_failure_when_workspace_cleanup_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)

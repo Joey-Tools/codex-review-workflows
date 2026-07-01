@@ -654,7 +654,15 @@ class ProviderPolicyTest(unittest.TestCase):
                             "network": "restricted",
                             "file_system": {
                                 "type": "restricted",
+                                "glob_scan_max_depth": 8,
                                 "entries": [
+                                    {
+                                        "path": {
+                                            "type": "special",
+                                            "value": {"kind": "minimal"},
+                                        },
+                                        "access": "read",
+                                    },
                                     {
                                         "path": {
                                             "type": "path",
@@ -673,6 +681,19 @@ class ProviderPolicyTest(unittest.TestCase):
                                             "access": "deny",
                                         }
                                         for name in (".git", ".codex", ".agents")
+                                    ],
+                                    *[
+                                        {
+                                            "path": {
+                                                "type": "glob_pattern",
+                                                "pattern": str(
+                                                    self.review.workspace_root.resolve()
+                                                    / pattern
+                                                ),
+                                            },
+                                            "access": "deny",
+                                        }
+                                        for pattern in ("*.env", "**/*.env")
                                     ],
                                 ],
                             },
@@ -740,6 +761,61 @@ class ProviderPolicyTest(unittest.TestCase):
                 "type": "managed",
                 "network": "restricted",
                 "file_system": {"type": "restricted", "entries": []},
+            },
+        }
+        self.assertFalse(
+            providers._codex_permissions_match(
+                payload,
+                review_root=self.review.workspace_root,
+            )
+        )
+
+    def test_codex_rejects_extra_permission_profile_read_path(self) -> None:
+        root = self.review.workspace_root.resolve()
+        payload = {
+            "approval_policy": "never",
+            "sandbox_policy": {"type": "read-only"},
+            "permission_profile": {
+                "type": "managed",
+                "network": "restricted",
+                "file_system": {
+                    "type": "restricted",
+                    "glob_scan_max_depth": 8,
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": {"kind": "minimal"},
+                            },
+                            "access": "read",
+                        },
+                        {"path": {"type": "path", "path": str(root)}, "access": "read"},
+                        *[
+                            {
+                                "path": {
+                                    "type": "path",
+                                    "path": str((root / name).resolve()),
+                                },
+                                "access": "deny",
+                            }
+                            for name in (".git", ".codex", ".agents")
+                        ],
+                        *[
+                            {
+                                "path": {
+                                    "type": "glob_pattern",
+                                    "pattern": str(root / pattern),
+                                },
+                                "access": "deny",
+                            }
+                            for pattern in ("*.env", "**/*.env")
+                        ],
+                        {
+                            "path": {"type": "path", "path": str(root.parent)},
+                            "access": "read",
+                        },
+                    ],
+                },
             },
         }
         self.assertFalse(

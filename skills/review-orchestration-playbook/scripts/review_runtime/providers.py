@@ -426,7 +426,11 @@ def _codex_session_metadata(
                     return (
                         model if isinstance(model, str) and model else None,
                         effort if isinstance(effort, str) and effort else None,
-                        _codex_permissions_match(payload, review_root=review_root),
+                        _codex_permissions_match(
+                            payload,
+                            review_root=review_root,
+                            codex_home=codex_home,
+                        ),
                     )
         except OSError:
             continue
@@ -437,6 +441,7 @@ def _codex_permissions_match(
     payload: dict[str, Any],
     *,
     review_root: pathlib.Path,
+    codex_home: pathlib.Path | None = None,
 ) -> bool:
     sandbox_policy = payload.get("sandbox_policy")
     permission_profile = payload.get("permission_profile")
@@ -450,7 +455,11 @@ def _codex_permissions_match(
     ):
         return False
     filesystem = permission_profile.get("file_system")
-    if not isinstance(filesystem, dict) or filesystem.get("type") != "restricted":
+    if (
+        not isinstance(filesystem, dict)
+        or filesystem.get("type") != "restricted"
+        or filesystem.get("glob_scan_max_depth") != 8
+    ):
         return False
     entries = filesystem.get("entries")
     if not isinstance(entries, list):
@@ -462,17 +471,59 @@ def _codex_permissions_match(
         str((review_root / ".codex").resolve()): "deny",
         str((review_root / ".agents").resolve()): "deny",
     }
-    observed_paths: dict[str, str] = {}
+    expected_globs = {
+        str(review_root.resolve() / "*.env"): "deny",
+        str(review_root.resolve() / "**/*.env"): "deny",
+    }
+    remaining_paths = dict(expected_paths)
+    remaining_globs = dict(expected_globs)
+    minimal_seen = False
+    codex_arg_root = (
+        (codex_home.expanduser().resolve() / "tmp/arg0")
+        if codex_home is not None
+        else None
+    )
     for entry in entries:
         if not isinstance(entry, dict) or not isinstance(entry.get("access"), str):
-            continue
+            return False
         path_value = entry.get("path")
-        if not isinstance(path_value, dict) or path_value.get("type") != "path":
+        if not isinstance(path_value, dict):
+            return False
+        path_type = path_value.get("type")
+        access = entry["access"]
+        if path_type == "special":
+            value = path_value.get("value")
+            if (
+                minimal_seen
+                or access != "read"
+                or value != {"kind": "minimal"}
+            ):
+                return False
+            minimal_seen = True
             continue
+        if path_type == "glob_pattern":
+            pattern = path_value.get("pattern")
+            if not isinstance(pattern, str) or remaining_globs.pop(pattern, None) != access:
+                return False
+            continue
+        if path_type != "path":
+            return False
         value = path_value.get("path")
-        if isinstance(value, str):
-            observed_paths[value] = entry["access"]
-    return all(observed_paths.get(path) == access for path, access in expected_paths.items())
+        if not isinstance(value, str):
+            return False
+        expected_access = remaining_paths.pop(value, None)
+        if expected_access == access:
+            continue
+        candidate = pathlib.Path(value).expanduser().resolve()
+        if (
+            codex_arg_root is not None
+            and access == "read"
+            and candidate != codex_arg_root
+            and candidate.is_relative_to(codex_arg_root)
+        ):
+            continue
+        return False
+    return minimal_seen and not remaining_paths and not remaining_globs
 
 
 def _attempt_paths(
