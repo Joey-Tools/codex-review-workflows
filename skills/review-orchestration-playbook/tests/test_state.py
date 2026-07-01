@@ -6,7 +6,10 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
 
@@ -100,6 +103,35 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.assertEqual(text, "No findings.")
         self.assertFalse(self.review.workspace_root.exists())
         self.assertTrue(self.review.container_dir.exists())
+
+    def test_concurrent_wait_serializes_workspace_cleanup(self) -> None:
+        self.write_completed_state()
+        cleanup_started = threading.Event()
+        allow_cleanup = threading.Event()
+        cleanup_calls = 0
+
+        def delayed_cleanup(*args, **kwargs):
+            nonlocal cleanup_calls
+            cleanup_calls += 1
+            cleanup_started.set()
+            self.assertTrue(allow_cleanup.wait(timeout=2))
+            return cleanup_workspace(*args, **kwargs)
+
+        with (
+            mock.patch.object(state, "cleanup_workspace", side_effect=delayed_cleanup),
+            ThreadPoolExecutor(max_workers=2) as executor,
+        ):
+            first = executor.submit(state.wait, self.review.container_dir, timeout_seconds=0)
+            self.assertTrue(cleanup_started.wait(timeout=2))
+            second = executor.submit(state.wait, self.review.container_dir, timeout_seconds=0)
+            time.sleep(0.05)
+            self.assertEqual(cleanup_calls, 1)
+            allow_cleanup.set()
+            self.assertEqual(first.result(timeout=2), 0)
+            self.assertEqual(second.result(timeout=2), 0)
+
+        self.assertEqual(cleanup_calls, 1)
+        self.assertFalse((self.review.container_dir / "cleanup-error.txt").exists())
 
     def test_forged_workspace_escape_is_rejected_before_cleanup(self) -> None:
         self.write_completed_state()

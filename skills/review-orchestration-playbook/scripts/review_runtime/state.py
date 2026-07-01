@@ -39,6 +39,7 @@ STATE_FILE = "state.json"
 STATE_MARKER = ".isolated-review-state"
 EXIT_FILE = "exit-code"
 LOCK_FILE = "runner.lock"
+CLEANUP_LOCK_FILE = "cleanup.lock"
 _STARTED_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
 
 
@@ -352,6 +353,7 @@ def wait(
     *,
     timeout_seconds: float | None,
 ) -> int:
+    state_dir = state_dir.expanduser().resolve()
     deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
     while True:
         summary = status(state_dir)
@@ -361,17 +363,23 @@ def wait(
             return 124
         time.sleep(0.25)
 
-    state, review = load_review_state(state_dir)
-    keep_workspace = bool(state.get("keep_workspace"))
-    if review.workspace_root.exists() and not keep_workspace:
-        cleanup_error = cleanup_workspace(review, keep_container=True)
-        if cleanup_error:
-            write_text_atomic(state_dir / "cleanup-error.txt", cleanup_error + "\n")
-            return 1
-    if (state_dir / "cleanup-error.txt").is_file():
-        return 1
-    exit_code = _read_exit_code(state_dir)
-    return 1 if exit_code is None else exit_code
+    cleanup_lock_path = state_dir / CLEANUP_LOCK_FILE
+    with cleanup_lock_path.open("a+b") as cleanup_lock:
+        fcntl.flock(cleanup_lock.fileno(), fcntl.LOCK_EX)
+        try:
+            state, review = load_review_state(state_dir)
+            keep_workspace = bool(state.get("keep_workspace"))
+            if review.workspace_root.exists() and not keep_workspace:
+                cleanup_error = cleanup_workspace(review, keep_container=True)
+                if cleanup_error:
+                    write_text_atomic(state_dir / "cleanup-error.txt", cleanup_error + "\n")
+                    return 1
+            if (state_dir / "cleanup-error.txt").is_file():
+                return 1
+            exit_code = _read_exit_code(state_dir)
+            return 1 if exit_code is None else exit_code
+        finally:
+            fcntl.flock(cleanup_lock.fileno(), fcntl.LOCK_UN)
 
 
 def final(state_dir: pathlib.Path) -> tuple[int, str]:
