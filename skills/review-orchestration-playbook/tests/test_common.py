@@ -138,10 +138,6 @@ class ChildEnvironmentTest(unittest.TestCase):
     ) -> None:
         cases = (
             ({"output_file_limit_bytes": 0}, "must be positive"),
-            (
-                {"output_file_limit_bytes": 4096, "stdin": b"payload"},
-                "does not support stdin",
-            ),
         )
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -165,6 +161,24 @@ class ChildEnvironmentTest(unittest.TestCase):
                     self.assertEqual(stderr_path.read_bytes(), b"existing stderr")
 
         popen.assert_not_called()
+
+    def test_bounded_logged_output_supports_stdin(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            completed = common.run(
+                (
+                    sys.executable,
+                    "-c",
+                    "import os,sys; os.write(1, sys.stdin.buffer.read())",
+                ),
+                stdin=b"review prompt",
+                stdout_path=root / "stdout.log",
+                stderr_path=root / "stderr.log",
+                timeout_seconds=5,
+                output_file_limit_bytes=4096,
+            )
+
+        self.assertEqual(completed.stdout, b"review prompt")
 
     @mock.patch.object(common.threading, "Thread")
     def test_failed_drain_thread_start_is_not_joined(

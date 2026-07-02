@@ -81,6 +81,10 @@ CLAUDE_PROBE_SYSTEM_READ_LITERALS = (
 )
 CLAUDE_PROBE_TIMEOUT_SECONDS = 20.0
 CLAUDE_PROBE_OUTPUT_LIMIT_BYTES = 64 * 1024
+COPILOT_PROBE_TIMEOUT_SECONDS = 20.0
+COPILOT_PROBE_OUTPUT_LIMIT_BYTES = 64 * 1024
+REVIEW_ATTEMPT_TIMEOUT_SECONDS = 30 * 60.0
+REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES = 64 * 1024 * 1024
 COPILOT_JSONL_RECORD_LIMIT_BYTES = 4 * 1024 * 1024
 CLAUDE_EGRESS_CONSENTS = (
     "explicit-claude-review",
@@ -1188,6 +1192,8 @@ def _codex_attempt(
         stdin=prompt,
         stdout_path=stdout_path,
         stderr_path=stderr_path,
+        timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
+        output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
     )
     final_text = None
     if completed.returncode == 0 and attempt_final.is_file():
@@ -1331,6 +1337,8 @@ def _claude_attempt(
         stdin=review.prompt_file.read_bytes(),
         stdout_path=stdout_path,
         stderr_path=stderr_path,
+        timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
+        output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
     )
     final_text, effective_model = _parse_claude_output(
         completed.stdout, requested_model=model
@@ -1371,7 +1379,16 @@ def _copilot_attempt(
         raise ReviewError("isolated Copilot home is not a real directory")
     env = dict(env)
     env["COPILOT_HOME"] = str(copilot_home)
-    permission_help = run((str(executable), "help", "permissions"), env=env)
+    stdout_path, stderr_path = _attempt_paths(review, index, "copilot", model)
+    permission_help = run(
+        (str(executable), "help", "permissions"),
+        env=env,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        capture_limit_bytes=COPILOT_PROBE_OUTPUT_LIMIT_BYTES,
+        timeout_seconds=COPILOT_PROBE_TIMEOUT_SECONDS,
+        output_file_limit_bytes=COPILOT_PROBE_OUTPUT_LIMIT_BYTES,
+    )
     normalized_permission_help = " ".join(
         (permission_help.stdout + b"\n" + permission_help.stderr)
         .decode("utf-8", errors="replace")
@@ -1386,7 +1403,6 @@ def _copilot_attempt(
             "Copilot CLI did not expose the required cwd-only path verifier, "
             "temporary-directory denial, and deny-over-allow permission semantics"
         )
-    stdout_path, stderr_path = _attempt_paths(review, index, "copilot", model)
     command = [
         str(executable),
         "-C",
@@ -1440,6 +1456,8 @@ def _copilot_attempt(
         env=env,
         stdout_path=stdout_path,
         stderr_path=stderr_path,
+        timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
+        output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
     )
     final_text, effective_model = _parse_copilot_output_file(
         stdout_path, requested_model=model
@@ -1502,16 +1520,45 @@ def _run_model_chain(
     review: ReviewWorkspace,
     models: Iterable[str],
     runner: AttemptRunner,
+    runtime: str,
+    requested_effort: str,
     env: dict[str, str],
     attempts: list[Attempt],
 ) -> tuple[str, str | None]:
     for model in models:
-        attempt = runner(
-            review=review,
-            model=model,
-            index=len(attempts) + 1,
-            env=env,
-        )
+        index = len(attempts) + 1
+        try:
+            attempt = runner(
+                review=review,
+                model=model,
+                index=index,
+                env=env,
+            )
+        except (
+            ReviewTimeoutError,
+            ReviewOutputDrainError,
+            ReviewOutputLimitError,
+            ReviewProcessLeakError,
+        ) as error:
+            stdout_path, stderr_path = _attempt_paths(review, index, runtime, model)
+            stdout_path.touch(exist_ok=True)
+            _append_attempt_diagnostic(stderr_path, f"review supervision failed: {error}")
+            attempts.append(
+                Attempt(
+                    runtime=runtime,
+                    requested_model=model,
+                    effective_model=None,
+                    requested_effort=requested_effort,
+                    effective_effort=None,
+                    returncode=75,
+                    category="inconclusive",
+                    final_text=None,
+                    stdout_path=str(stdout_path),
+                    stderr_path=str(stderr_path),
+                )
+            )
+            _write_attempts(review, attempts)
+            raise
         attempts.append(attempt)
         _write_attempts(review, attempts)
         if attempt.category == "success":
@@ -1599,12 +1646,26 @@ def run_review(
                 review=review,
                 models=CODEX_MODELS,
                 runner=_codex_attempt,
+                runtime="codex",
+                requested_effort=CODEX_REASONING_EFFORT,
                 env=env,
                 attempts=attempts,
             )
         except FileNotFoundError as error:
             write_text_atomic(review.container_dir / "runner-error.txt", f"{error}\n")
             return Outcome(127, None, tuple())
+        except (
+            ReviewTimeoutError,
+            ReviewOutputDrainError,
+            ReviewOutputLimitError,
+            ReviewProcessLeakError,
+        ) as error:
+            write_text_atomic(
+                review.container_dir / "runner-error.txt",
+                f"Codex review was inconclusive: {error}\n",
+            )
+            _write_attempts(review, attempts)
+            return Outcome(75, None, tuple(attempts))
         return _finish(review, attempts, final_text)
 
     claude_env = _review_environment(
@@ -1662,6 +1723,8 @@ def run_review(
                 review=review,
                 models=CLAUDE_MODELS,
                 runner=_claude_attempt,
+                runtime="claude",
+                requested_effort=CLAUDE_REASONING_EFFORT,
                 env=claude_env,
                 attempts=attempts,
             )
@@ -1726,9 +1789,23 @@ def run_review(
             review=review,
             models=COPILOT_MODELS,
             runner=_copilot_attempt,
+            runtime="copilot",
+            requested_effort=COPILOT_REASONING_EFFORT,
             env=copilot_env,
             attempts=attempts,
         )
+    except (
+        ReviewTimeoutError,
+        ReviewOutputDrainError,
+        ReviewOutputLimitError,
+        ReviewProcessLeakError,
+    ) as error:
+        write_text_atomic(
+            review.container_dir / "runner-error.txt",
+            f"Copilot review was inconclusive: {error}\n",
+        )
+        _write_attempts(review, attempts)
+        return Outcome(75, None, tuple(attempts))
     except (FileNotFoundError, ReviewError) as error:
         write_text_atomic(
             review.container_dir / "runner-error.txt",

@@ -174,8 +174,6 @@ def run(
         raise ReviewError("timeout_seconds requires logged output paths")
     if output_file_limit_bytes is not None and output_file_limit_bytes <= 0:
         raise ReviewError("output_file_limit_bytes must be positive")
-    if output_file_limit_bytes is not None and stdin is not None:
-        raise ReviewError("bounded logged output does not support stdin")
     try:
         if stdout_path is None or stderr_path is None:
             completed = subprocess.run(
@@ -350,8 +348,8 @@ def _run_logged_process(
 ) -> int:
     process: subprocess.Popen[bytes] | None = None
     pending_signal: signal.Signals | None = None
-    drain_threads: list[threading.Thread] = []
-    stop_draining = threading.Event()
+    io_threads: list[threading.Thread] = []
+    stop_io = threading.Event()
 
     def forward_signal(signum: int, _frame: object) -> None:
         nonlocal pending_signal
@@ -401,7 +399,7 @@ def _run_logged_process(
                 written = 0
                 descriptor = stream.fileno()
                 os.set_blocking(descriptor, False)
-                while not stop_draining.is_set():
+                while not stop_io.is_set():
                     readable, _, _ = select.select(
                         (descriptor,), (), (), PROCESS_GROUP_POLL_SECONDS
                     )
@@ -425,6 +423,30 @@ def _run_logged_process(
                 drain_errors.append(error)
                 signal_process_group(process, signal.SIGTERM)
 
+        def write_stdin_bounded(stream: BinaryIO, payload: bytes) -> None:
+            try:
+                descriptor = stream.fileno()
+                os.set_blocking(descriptor, False)
+                offset = 0
+                while offset < len(payload) and not stop_io.is_set():
+                    _, writable, _ = select.select(
+                        (), (descriptor,), (), PROCESS_GROUP_POLL_SECONDS
+                    )
+                    if not writable:
+                        continue
+                    try:
+                        written = os.write(descriptor, payload[offset:])
+                    except BlockingIOError:
+                        continue
+                    offset += written
+                if offset == len(payload):
+                    stream.close()
+            except BrokenPipeError:
+                return
+            except Exception as error:
+                drain_errors.append(error)
+                signal_process_group(process, signal.SIGTERM)
+
         thread_start_mask = block_forwarded_signals()
         try:
             for stream, destination in (
@@ -437,7 +459,16 @@ def _run_logged_process(
                     daemon=True,
                 )
                 thread.start()
-                drain_threads.append(thread)
+                io_threads.append(thread)
+            if stdin is not None:
+                assert process.stdin is not None
+                thread = threading.Thread(
+                    target=write_stdin_bounded,
+                    args=(process.stdin, stdin),
+                    daemon=True,
+                )
+                thread.start()
+                io_threads.append(thread)
         finally:
             restore_signal_mask(thread_start_mask)
         assert timeout_seconds is not None
@@ -456,14 +487,14 @@ def _run_logged_process(
         leftover_process_group = _process_group_exists(process.pid)
         if leftover_process_group:
             terminate_process_group(process)
-        for thread in drain_threads:
+        for thread in io_threads:
             thread.join(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
-        if any(thread.is_alive() for thread in drain_threads):
-            stop_draining.set()
-            for thread in drain_threads:
+        if any(thread.is_alive() for thread in io_threads):
+            stop_io.set()
+            for thread in io_threads:
                 thread.join(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
             raise ReviewProcessLeakError(
-                "command output streams remained open after bounded cleanup: "
+                "command I/O streams remained open after bounded cleanup: "
                 f"{' '.join(command)}"
             )
         if drain_errors:
@@ -493,11 +524,11 @@ def _run_logged_process(
                     initial_signal=cleanup_signal,
                     signal_already_sent=pending_signal is not None,
                 )
-            stop_draining.set()
-            for thread in drain_threads:
+            stop_io.set()
+            for thread in io_threads:
                 thread.join(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
             if process is not None and output_file_limit_bytes is not None:
-                for stream in (process.stdout, process.stderr):
+                for stream in (process.stdin, process.stdout, process.stderr):
                     if stream is not None:
                         stream.close()
             for forwarded, previous in previous_handlers.items():
