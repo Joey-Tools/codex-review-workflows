@@ -896,15 +896,15 @@ def _upstream_proxy_url(
         {"no": no_proxy},
     ):
         return None
-    for key in (
-        "https_proxy",
-        "HTTPS_PROXY",
-        "http_proxy",
-        "HTTP_PROXY",
-        "all_proxy",
-        "ALL_PROXY",
+    for lowercase, uppercase in (
+        ("https_proxy", "HTTPS_PROXY"),
+        ("http_proxy", "HTTP_PROXY"),
+        ("all_proxy", "ALL_PROXY"),
     ):
-        value = env.get(key)
+        if lowercase in env:
+            value = env[lowercase]
+        else:
+            value = env.get(uppercase)
         if value:
             return value
     return None

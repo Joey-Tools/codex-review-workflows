@@ -3767,6 +3767,24 @@ class ProviderPolicyTest(unittest.TestCase):
             "http://task-proxy:8080",
         )
 
+    def test_empty_lowercase_proxy_disables_uppercase_pair(self) -> None:
+        for lowercase, uppercase in (
+            ("https_proxy", "HTTPS_PROXY"),
+            ("http_proxy", "HTTP_PROXY"),
+            ("all_proxy", "ALL_PROXY"),
+        ):
+            with self.subTest(lowercase=lowercase):
+                self.assertIsNone(
+                    providers._upstream_proxy_url(
+                        {
+                            lowercase: "",
+                            uppercase: "http://system-proxy:8080",
+                        },
+                        host="api.anthropic.com",
+                        port=443,
+                    )
+                )
+
     def test_claude_proxy_rejects_invalid_upstream_ports_before_bind(self) -> None:
         for value in (
             "http://corporate-proxy:0",
