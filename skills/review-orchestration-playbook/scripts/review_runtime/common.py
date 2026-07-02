@@ -30,6 +30,10 @@ class ReviewOutputLimitError(ReviewError):
     """A bounded reviewer subprocess exceeded its output allowance."""
 
 
+class ReviewProcessLeakError(ReviewError):
+    """A reviewer subprocess exited while descendants retained its process group."""
+
+
 class ForwardedSignal(RuntimeError):
     """A termination signal forwarded to the active reviewer process group."""
 
@@ -406,12 +410,24 @@ def _run_logged_process(
             drain_threads.append(thread)
             thread.start()
         process.wait(timeout=timeout_seconds)
+        leftover_process_group = _process_group_exists(process.pid)
+        if leftover_process_group:
+            terminate_process_group(process)
         for thread in drain_threads:
             thread.join(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
+        if any(thread.is_alive() for thread in drain_threads):
+            raise ReviewProcessLeakError(
+                "command output streams remained open after bounded cleanup: "
+                f"{' '.join(command)}"
+            )
         if output_overflow.is_set():
             raise ReviewOutputLimitError(
                 "command output exceeded "
                 f"{output_file_limit_bytes} bytes per stream: {' '.join(command)}"
+            )
+        if leftover_process_group:
+            raise ReviewProcessLeakError(
+                f"command left descendant processes after exit: {' '.join(command)}"
             )
         return int(process.returncode)
     except ForwardedSignal as error:

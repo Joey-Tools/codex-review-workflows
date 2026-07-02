@@ -12,6 +12,7 @@ from .common import (
     InvalidReviewerExecutable,
     ReviewError,
     ReviewOutputLimitError,
+    ReviewProcessLeakError,
     ReviewTimeoutError,
     child_environment,
     reviewer_executable_path,
@@ -515,14 +516,45 @@ def _parse_claude_output(
     return final_text, effective_model
 
 
+def _copilot_error_effective_model(
+    objects: list[dict[str, Any]], requested_model: str | None
+) -> str | None:
+    candidates: list[str] = []
+    for item in objects:
+        event_type = item.get("type")
+        data = item.get("data")
+        if not isinstance(data, dict) or data.get("parentToolCallId"):
+            continue
+        if event_type == "session.start":
+            candidate = data.get("selectedModel")
+        elif event_type in {"assistant.message", "assistant.usage"}:
+            candidate = data.get("model")
+        else:
+            continue
+        if isinstance(candidate, str) and candidate:
+            candidates.append(candidate)
+    if requested_model is not None:
+        mismatch = next(
+            (
+                candidate
+                for candidate in reversed(candidates)
+                if not _model_matches(requested_model, candidate)
+            ),
+            None,
+        )
+        if mismatch is not None:
+            return mismatch
+    return candidates[-1] if candidates else None
+
+
 def _parse_copilot_output(
-    stdout: bytes,
+    stdout: bytes, *, requested_model: str | None = None
 ) -> tuple[str | None, str | None]:
     objects = _strict_jsonl_objects(stdout)
     if objects is None:
         return None, None
     if _structured_error_text(stdout).strip():
-        return None, None
+        return None, _copilot_error_effective_model(objects, requested_model)
     open_turn: tuple[str, int] | None = None
     completed_turns: list[tuple[str, int, int]] = []
     for index, item in enumerate(objects):
@@ -558,20 +590,22 @@ def _parse_copilot_output(
         for item in turn_events
     ):
         return None, None
-    message_index = next(
-        (
-            index
-            for index in range(len(turn_events) - 1, -1, -1)
-            if turn_events[index].get("type") == "assistant.message"
-            and isinstance(turn_events[index].get("data"), dict)
-            and not turn_events[index]["data"].get("parentToolCallId")
-        ),
-        None,
-    )
+    message_index = None
+    for index in range(len(turn_events) - 1, -1, -1):
+        item = turn_events[index]
+        if item.get("type") != "assistant.message":
+            continue
+        item_data = item.get("data")
+        if isinstance(item_data, dict) and item_data.get("parentToolCallId"):
+            continue
+        message_index = index
+        break
     if message_index is None:
         return None, None
     message = turn_events[message_index]
-    data = message["data"]
+    data = message.get("data")
+    if not isinstance(data, dict):
+        return None, None
     tool_requests = data.get("toolRequests", [])
     if not isinstance(tool_requests, list) or tool_requests:
         return None, None
@@ -1200,7 +1234,9 @@ def _copilot_attempt(
         stdout_path=stdout_path,
         stderr_path=stderr_path,
     )
-    final_text, effective_model = _parse_copilot_output(completed.stdout)
+    final_text, effective_model = _parse_copilot_output(
+        completed.stdout, requested_model=model
+    )
     return _record_attempt(
         review=review,
         index=index,
@@ -1384,7 +1420,11 @@ def run_review(
             review.container_dir / "claude-skip.txt",
             f"Claude Code probe runtime is unavailable: {error}\n",
         )
-    except (ReviewTimeoutError, ReviewOutputLimitError) as error:
+    except (
+        ReviewTimeoutError,
+        ReviewOutputLimitError,
+        ReviewProcessLeakError,
+    ) as error:
         write_text_atomic(
             review.container_dir / "runner-error.txt",
             f"Claude Code validation was inconclusive: {error}\n",
@@ -1419,7 +1459,11 @@ def run_review(
         except FileNotFoundError:
             category = "unavailable"
             final_text = None
-        except (ReviewTimeoutError, ReviewOutputLimitError) as error:
+        except (
+            ReviewTimeoutError,
+            ReviewOutputLimitError,
+            ReviewProcessLeakError,
+        ) as error:
             write_text_atomic(
                 review.container_dir / "runner-error.txt",
                 f"Claude Code validation was inconclusive: {error}\n",

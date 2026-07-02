@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import pathlib
 import signal
 import sys
@@ -60,6 +61,26 @@ class ChildEnvironmentTest(unittest.TestCase):
             output_size = stdout_path.stat().st_size
 
         self.assertLessEqual(output_size, 4096)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork")
+    def test_logged_command_rejects_descendant_holding_output_stream(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with self.assertRaises(common.ReviewProcessLeakError):
+                common.run(
+                    (
+                        sys.executable,
+                        "-c",
+                        (
+                            "import os,time; pid=os.fork(); "
+                            "os._exit(0) if pid else (time.sleep(5), os._exit(0))"
+                        ),
+                    ),
+                    stdout_path=root / "stdout.log",
+                    stderr_path=root / "stderr.log",
+                    timeout_seconds=5,
+                    output_file_limit_bytes=4096,
+                )
 
     def test_streamed_command_logs_are_complete_and_memory_capture_is_bounded(
         self,

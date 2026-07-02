@@ -387,6 +387,28 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
 
+    def test_copilot_error_preserves_mismatched_effective_model(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "session.start",
+                    "data": {"selectedModel": "claude-opus-4.7"},
+                },
+                {
+                    "type": "turn.failed",
+                    "error": {"message": "Model is not available for your account"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(
+            providers._parse_copilot_output(
+                stdout, requested_model="claude-opus-4.8"
+            ),
+            (None, "claude-opus-4.7"),
+        )
+
     def test_copilot_preserves_unicode_separators_at_content_edges(self) -> None:
         content = "\u2028No findings.\u2029"
         stdout = "\n".join(
@@ -508,6 +530,31 @@ class ProviderPolicyTest(unittest.TestCase):
                 {
                     "type": "assistant.turn_end",
                     "data": {"turnId": "turn-b"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
+
+    def test_copilot_rejects_malformed_later_top_level_message(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "content": "stale findings",
+                        "model": "claude-opus-4.8",
+                    },
+                },
+                {"type": "assistant.message", "data": None},
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
                 },
             )
         ).encode()
@@ -1061,6 +1108,34 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         resolve.side_effect = providers.ReviewOutputLimitError(
             "probe output exceeded limit"
+        )
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="triple-review",
+        )
+
+        self.assertEqual(outcome.returncode, 75)
+        copilot_attempt.assert_not_called()
+        self.assertIn(
+            "inconclusive",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(providers, "resolve_reviewer_executable")
+    @mock.patch.object(providers, "_copilot_attempt")
+    def test_claude_probe_process_leak_is_inconclusive_not_fallback(
+        self,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        resolve.side_effect = providers.ReviewProcessLeakError(
+            "probe left descendant process"
         )
 
         outcome = providers.run_review(
