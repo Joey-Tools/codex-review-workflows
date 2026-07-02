@@ -4,6 +4,7 @@ import base64
 import contextlib
 import hmac
 import json
+import math
 import os
 import pathlib
 import re
@@ -16,6 +17,7 @@ import struct
 import subprocess
 import tempfile
 import threading
+import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, replace
@@ -117,6 +119,7 @@ CLAUDE_KEYCHAIN_BROKER_TIMEOUT_SECONDS = 20.0
 CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES = 64 * 1024
 CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS = 5.0
 CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES = 1024 * 1024
+CLAUDE_KEYCHAIN_SECURITY_STDIN_LIMIT_BYTES = 4032
 CLAUDE_REVIEW_TOOL_EXECUTABLE_CANDIDATES = (
     pathlib.Path("/opt/homebrew/bin/rg"),
     pathlib.Path("/usr/local/bin/rg"),
@@ -439,37 +442,142 @@ def _read_claude_keychain_credential(
     return credential
 
 
+def _write_claude_keychain_credential(
+    review: ReviewWorkspace,
+    credential: bytearray,
+) -> bool:
+    if not credential or len(credential) > CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES:
+        return False
+    try:
+        payload = json.loads(credential)
+        oauth = payload["claudeAiOauth"]
+        expires_at = oauth["expiresAt"]
+        if (
+            not isinstance(oauth.get("accessToken"), str)
+            or not oauth["accessToken"]
+            or not isinstance(oauth.get("refreshToken"), str)
+            or not oauth["refreshToken"]
+            or not isinstance(expires_at, (int, float))
+            or isinstance(expires_at, bool)
+            or not math.isfinite(expires_at)
+            or expires_at <= time.time() * 1000
+        ):
+            return False
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    account = _claude_keychain_account()
+    hex_value = credential.hex()
+    script = (
+        f'add-generic-password -U -a "{account}" '
+        f'-s "{CLAUDE_KEYCHAIN_SERVICE}" -X "{hex_value}"\n'
+    ).encode("ascii")
+    security_env = child_environment(container_dir=review.container_dir)
+    security_env["USER"] = account
+    if len(script) <= CLAUDE_KEYCHAIN_SECURITY_STDIN_LIMIT_BYTES:
+        argv = (str(CLAUDE_KEYCHAIN_CLIENT), "-i")
+        stdin = script
+    else:
+        argv = (
+            str(CLAUDE_KEYCHAIN_CLIENT),
+            "add-generic-password",
+            "-U",
+            "-a",
+            account,
+            "-s",
+            CLAUDE_KEYCHAIN_SERVICE,
+            "-X",
+            hex_value,
+        )
+        stdin = None
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=review.container_dir,
+            env=security_env,
+            input=stdin,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    within_limit = (
+        len(completed.stdout) <= CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES
+        and len(completed.stderr) <= CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES
+    )
+    completed.stdout = b""
+    completed.stderr = b""
+    return completed.returncode == 0 and within_limit
+
+
+def _recv_exact(sock: socket.socket, length: int) -> bytes | None:
+    result = bytearray()
+    try:
+        while len(result) < length:
+            chunk = sock.recv(length - len(result))
+            if not chunk:
+                return None
+            result.extend(chunk)
+    except OSError:
+        return None
+    return bytes(result)
+
+
 class _ClaudeKeychainCredentialHandler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         server = self.server
         if not isinstance(server, _ClaudeKeychainCredentialServer):
             return
         self.request.settimeout(2.0)
-        capability = bytearray()
-        try:
-            while len(capability) < CLAUDE_KEYCHAIN_BROKER_CAPABILITY_BYTES:
-                chunk = self.request.recv(
-                    CLAUDE_KEYCHAIN_BROKER_CAPABILITY_BYTES - len(capability)
-                )
-                if not chunk:
-                    return
-                capability.extend(chunk)
-        except OSError:
+        raw_capability = _recv_exact(
+            self.request,
+            CLAUDE_KEYCHAIN_BROKER_CAPABILITY_BYTES,
+        )
+        if raw_capability is None:
             return
+        capability = bytearray(raw_capability)
         authorized = hmac.compare_digest(capability, server.capability)
         capability[:] = b"\x00" * len(capability)
         if not authorized:
             return
-        with server.credential_lock:
-            if server.consumed:
-                credential = b""
+        operation = _recv_exact(self.request, 1)
+        if operation == b"R":
+            with server.credential_lock:
+                if server.consumed:
+                    credential = b""
+                else:
+                    server.consumed = True
+                    credential = bytes(server.credential or b"")
+            try:
+                self.request.sendall(struct.pack("!I", len(credential)))
+                if credential:
+                    self.request.sendall(credential)
+            except OSError:
+                return
+            return
+        if operation != b"W":
+            return
+        raw_length = _recv_exact(self.request, 4)
+        if raw_length is None:
+            return
+        length = struct.unpack("!I", raw_length)[0]
+        if not 1 <= length <= CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES:
+            return
+        raw_credential = _recv_exact(self.request, length)
+        if raw_credential is None:
+            return
+        updated_credential = bytearray(raw_credential)
+        with server.update_lock:
+            if server.updated or server.update_callback is None:
+                success = False
             else:
-                server.consumed = True
-                credential = bytes(server.credential or b"")
+                success = server.update_callback(updated_credential)
+                if success:
+                    server.updated = True
+        updated_credential[:] = b"\x00" * len(updated_credential)
         try:
-            self.request.sendall(struct.pack("!I", len(credential)))
-            if credential:
-                self.request.sendall(credential)
+            self.request.sendall(b"\x00" if success else b"\x01")
         except OSError:
             return
 
@@ -478,22 +586,35 @@ class _ClaudeKeychainCredentialServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, credential: bytearray | None, capability: bytes) -> None:
+    def __init__(
+        self,
+        credential: bytearray | None,
+        capability: bytes,
+        update_callback: Callable[[bytearray], bool] | None,
+    ) -> None:
         super().__init__(("127.0.0.1", 0), _ClaudeKeychainCredentialHandler)
         self.credential = credential
         self.capability = capability
         self.credential_lock = threading.Lock()
         self.consumed = False
+        self.update_callback = update_callback
+        self.update_lock = threading.Lock()
+        self.updated = False
 
 
 @contextlib.contextmanager
 def _claude_keychain_credential_server(
     credential: bytearray | None,
     capability: bytes,
+    update_callback: Callable[[bytearray], bool] | None = None,
 ) -> Iterator[int]:
     if len(capability) != CLAUDE_KEYCHAIN_BROKER_CAPABILITY_BYTES:
         raise ReviewError("Claude Keychain broker capability has an invalid length")
-    server = _ClaudeKeychainCredentialServer(credential, capability)
+    server = _ClaudeKeychainCredentialServer(
+        credential,
+        capability,
+        update_callback,
+    )
     thread = threading.Thread(
         target=server.serve_forever,
         daemon=True,
@@ -521,7 +642,14 @@ def _claude_keychain_runtime(
         return
     credential = _read_claude_keychain_credential(review)
     capability = secrets.token_bytes(CLAUDE_KEYCHAIN_BROKER_CAPABILITY_BYTES)
-    with _claude_keychain_credential_server(credential, capability) as port:
+    with _claude_keychain_credential_server(
+        credential,
+        capability,
+        update_callback=lambda updated: _write_claude_keychain_credential(
+            review,
+            updated,
+        ),
+    ) as port:
         result[CLAUDE_KEYCHAIN_BROKER_PORT_ENV] = str(port)
         result[CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV] = capability.hex()
         yield result

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tomllib
 import unittest
 from unittest import mock
@@ -215,10 +216,17 @@ class ProviderPolicyTest(unittest.TestCase):
         broker = broker_dir / "security"
         credential = bytearray(b"fixture-value")
         capability = bytes.fromhex("01" * 32)
+        updates: list[bytes] = []
+
+        def record_update(updated: bytearray) -> bool:
+            updates.append(bytes(updated))
+            return True
+
         try:
             context = providers._claude_keychain_credential_server(
                 credential,
                 capability,
+                update_callback=record_update,
             )
             with context as port:
                 prepared["TMPDIR"] = str(self.review.container_dir / "tmp")
@@ -249,30 +257,108 @@ class ProviderPolicyTest(unittest.TestCase):
                     self.assertEqual(unauthorized.recv(1), b"")
                 first = providers.run(query, env=prepared)
                 second = providers.run(query, env=prepared)
+                updated_payload = json.dumps(
+                    {
+                        "claudeAiOauth": {
+                            "accessToken": "updated-fixture-value",
+                            "refreshToken": "updated-refresh-fixture-value",
+                            "expiresAt": (time.time() + 3600) * 1000,
+                        }
+                    }
+                ).encode()
+                update_script = (
+                    f'add-generic-password -U -a "{prepared["USER"]}" '
+                    f'-s "{providers.CLAUDE_KEYCHAIN_SERVICE}" '
+                    f'-X "{updated_payload.hex()}"\n'
+                ).encode()
+                updated = providers.run(
+                    (
+                        str(providers.CLAUDE_PROBE_SANDBOX),
+                        "-p",
+                        profile,
+                        str(broker),
+                        "-i",
+                    ),
+                    env=prepared,
+                    stdin=update_script,
+                )
         except PermissionError:
             self.skipTest("loopback bind is unavailable in the current sandbox")
 
         self.assertEqual(first.returncode, 0)
         self.assertEqual(first.stdout, b"fixture-value\n")
         self.assertEqual(second.returncode, 44)
+        self.assertEqual(updated.returncode, 0)
+        self.assertEqual(updates, [updated_payload])
         self.assertEqual(credential, bytearray(len(credential)))
+
+        direct_updates: list[bytes] = []
+
+        def record_direct_update(updated: bytearray) -> bool:
+            direct_updates.append(bytes(updated))
+            return True
+
+        try:
+            with providers._claude_keychain_credential_server(
+                None,
+                capability,
+                update_callback=record_direct_update,
+            ) as port:
+                prepared[providers.CLAUDE_KEYCHAIN_BROKER_PORT_ENV] = str(port)
+                direct_profile = providers._claude_review_sandbox_profile(
+                    pathlib.Path("/bin/true"),
+                    self.review,
+                    prepared,
+                    proxy_port=43210,
+                )
+                direct_updated = providers.run(
+                    (
+                        str(providers.CLAUDE_PROBE_SANDBOX),
+                        "-p",
+                        direct_profile,
+                        str(broker),
+                        "add-generic-password",
+                        "-U",
+                        "-a",
+                        prepared["USER"],
+                        "-s",
+                        providers.CLAUDE_KEYCHAIN_SERVICE,
+                        "-X",
+                        updated_payload.hex(),
+                    ),
+                    env=prepared,
+                )
+        except PermissionError:
+            self.skipTest("loopback bind is unavailable in the current sandbox")
+
+        self.assertEqual(direct_updated.returncode, 0)
+        self.assertEqual(direct_updates, [updated_payload])
 
     @mock.patch.object(providers.subprocess, "run")
     def test_keychain_prefetch_uses_fixed_service_and_account(
         self,
         run_command: mock.Mock,
     ) -> None:
+        payload = json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "fixture-value",
+                    "refreshToken": "refresh-fixture-value",
+                    "expiresAt": (time.time() + 3600) * 1000,
+                }
+            }
+        ).encode()
         completed = subprocess.CompletedProcess(
             args=(),
             returncode=0,
-            stdout=b"fixture-value\n",
+            stdout=payload,
             stderr=b"",
         )
         run_command.return_value = completed
 
         credential = providers._read_claude_keychain_credential(self.review)
 
-        self.assertEqual(credential, bytearray(b"fixture-value"))
+        self.assertEqual(credential, bytearray(payload))
         argv = run_command.call_args.args[0]
         self.assertEqual(argv[0], "/usr/bin/security")
         self.assertEqual(
@@ -287,6 +373,84 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
         )
         self.assertEqual(completed.stdout, b"")
+
+    @mock.patch.object(providers.subprocess, "run")
+    def test_keychain_update_validates_and_persists_oauth_payload(
+        self,
+        run_command: mock.Mock,
+    ) -> None:
+        run_command.return_value = subprocess.CompletedProcess(
+            args=(),
+            returncode=0,
+            stdout=b"",
+            stderr=b"",
+        )
+        credential = bytearray(
+            json.dumps(
+                {
+                    "claudeAiOauth": {
+                        "accessToken": "updated-fixture-value",
+                        "refreshToken": "updated-refresh-fixture-value",
+                        "expiresAt": (time.time() + 3600) * 1000,
+                    }
+                }
+            ).encode()
+        )
+
+        self.assertTrue(
+            providers._write_claude_keychain_credential(self.review, credential)
+        )
+        self.assertEqual(run_command.call_args.args[0], ("/usr/bin/security", "-i"))
+        script = run_command.call_args.kwargs["input"]
+        self.assertIn(b'add-generic-password -U -a "', script)
+        self.assertIn(b'-s "Claude Code-credentials" -X "', script)
+
+    @mock.patch.object(providers.subprocess, "run")
+    def test_keychain_update_rejects_invalid_oauth_payload(
+        self,
+        run_command: mock.Mock,
+    ) -> None:
+        self.assertFalse(
+            providers._write_claude_keychain_credential(
+                self.review,
+                bytearray(b"not-json"),
+            )
+        )
+        run_command.assert_not_called()
+
+    @mock.patch.object(providers.subprocess, "run")
+    def test_large_keychain_update_uses_validated_direct_arguments(
+        self,
+        run_command: mock.Mock,
+    ) -> None:
+        run_command.return_value = subprocess.CompletedProcess(
+            args=(),
+            returncode=0,
+            stdout=b"",
+            stderr=b"",
+        )
+        credential = bytearray(
+            json.dumps(
+                {
+                    "claudeAiOauth": {
+                        "accessToken": "updated-fixture-value",
+                        "refreshToken": "updated-refresh-fixture-value",
+                        "expiresAt": (time.time() + 3600) * 1000,
+                    },
+                    "padding": "x" * 3000,
+                }
+            ).encode()
+        )
+
+        self.assertTrue(
+            providers._write_claude_keychain_credential(self.review, credential)
+        )
+        argv = run_command.call_args.args[0]
+        self.assertEqual(argv[0:2], ("/usr/bin/security", "add-generic-password"))
+        self.assertEqual(argv[2:4], ("-U", "-a"))
+        self.assertEqual(argv[5:7], ("-s", "Claude Code-credentials"))
+        self.assertEqual(argv[7], "-X")
+        self.assertIsNone(run_command.call_args.kwargs["input"])
 
     @mock.patch.object(
         providers,
