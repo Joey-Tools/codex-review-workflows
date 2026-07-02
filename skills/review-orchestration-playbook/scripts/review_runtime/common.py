@@ -137,44 +137,58 @@ def run(
     stdout_path: pathlib.Path | None = None,
     stderr_path: pathlib.Path | None = None,
     capture_limit_bytes: int = 4 * 1024 * 1024,
+    timeout_seconds: float | None = None,
+    output_file_limit_bytes: int | None = None,
 ) -> Completed:
     command = tuple(str(item) for item in argv)
     if (stdout_path is None) != (stderr_path is None):
         raise ReviewError("stdout_path and stderr_path must be provided together")
-    if stdout_path is None or stderr_path is None:
-        completed = subprocess.run(
-            command,
-            cwd=cwd,
-            env=env,
-            input=stdin,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        result = Completed(
-            command, completed.returncode, completed.stdout, completed.stderr
-        )
-    else:
-        stdout_path.parent.mkdir(parents=True, exist_ok=True)
-        stderr_path.parent.mkdir(parents=True, exist_ok=True)
-        with (
-            stdout_path.open("wb") as stdout_handle,
-            stderr_path.open("wb") as stderr_handle,
-        ):
-            returncode = _run_logged_process(
+    if output_file_limit_bytes is not None and (
+        stdout_path is None or stderr_path is None
+    ):
+        raise ReviewError("output_file_limit_bytes requires logged output paths")
+    try:
+        if stdout_path is None or stderr_path is None:
+            completed = subprocess.run(
                 command,
                 cwd=cwd,
                 env=env,
-                stdin=stdin,
-                stdout_handle=stdout_handle,
-                stderr_handle=stderr_handle,
+                input=stdin,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=timeout_seconds,
             )
-        result = Completed(
-            command,
-            returncode,
-            _read_bounded_bytes(stdout_path, capture_limit_bytes),
-            _read_bounded_bytes(stderr_path, capture_limit_bytes),
-        )
+            result = Completed(
+                command, completed.returncode, completed.stdout, completed.stderr
+            )
+        else:
+            stdout_path.parent.mkdir(parents=True, exist_ok=True)
+            stderr_path.parent.mkdir(parents=True, exist_ok=True)
+            with (
+                stdout_path.open("wb") as stdout_handle,
+                stderr_path.open("wb") as stderr_handle,
+            ):
+                returncode = _run_logged_process(
+                    command,
+                    cwd=cwd,
+                    env=env,
+                    stdin=stdin,
+                    stdout_handle=stdout_handle,
+                    stderr_handle=stderr_handle,
+                    timeout_seconds=timeout_seconds,
+                    output_file_limit_bytes=output_file_limit_bytes,
+                )
+            result = Completed(
+                command,
+                returncode,
+                _read_bounded_bytes(stdout_path, capture_limit_bytes),
+                _read_bounded_bytes(stderr_path, capture_limit_bytes),
+            )
+    except subprocess.TimeoutExpired as error:
+        raise ReviewError(
+            f"command timed out after {timeout_seconds} seconds: {' '.join(command)}"
+        ) from error
     if check and result.returncode != 0:
         detail = result.stderr.decode("utf-8", errors="replace").strip()
         if not detail:
@@ -247,11 +261,10 @@ def signal_process_group(
             return
         except ProcessLookupError:
             return
+        except PermissionError:
+            pass
     try:
-        if signum == signal.SIGTERM:
-            process.terminate()
-        else:
-            process.kill()
+        process.send_signal(signum)
     except ProcessLookupError:
         pass
 
@@ -285,6 +298,11 @@ def terminate_process_group(
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        except PermissionError:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
     try:
         process.wait(timeout=grace_seconds)
     except subprocess.TimeoutExpired:
@@ -299,9 +317,12 @@ def _run_logged_process(
     stdin: bytes | None,
     stdout_handle: BinaryIO,
     stderr_handle: BinaryIO,
+    timeout_seconds: float | None = None,
+    output_file_limit_bytes: int | None = None,
 ) -> int:
     process: subprocess.Popen[bytes] | None = None
     pending_signal: signal.Signals | None = None
+    drain_threads: list[threading.Thread] = []
 
     def forward_signal(signum: int, _frame: object) -> None:
         nonlocal pending_signal
@@ -322,20 +343,60 @@ def _run_logged_process(
     try:
         if pending_signal is not None:
             raise ForwardedSignal(pending_signal)
+        if output_file_limit_bytes is not None and output_file_limit_bytes <= 0:
+            raise ReviewError("output_file_limit_bytes must be positive")
+        if output_file_limit_bytes is not None and stdin is not None:
+            raise ReviewError("bounded logged output does not support stdin")
         process = subprocess.Popen(
             command,
             cwd=cwd,
             env=env,
             stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
-            stdout=stdout_handle,
-            stderr=stderr_handle,
+            stdout=subprocess.PIPE if output_file_limit_bytes is not None else stdout_handle,
+            stderr=subprocess.PIPE if output_file_limit_bytes is not None else stderr_handle,
             start_new_session=os.name == "posix",
         )
         if pending_signal is not None:
             signal_process_group(process, pending_signal)
             raise ForwardedSignal(pending_signal)
-        process.communicate(input=stdin)
-        return int(process.returncode)
+        if output_file_limit_bytes is None:
+            if timeout_seconds is None:
+                process.communicate(input=stdin)
+            else:
+                process.communicate(input=stdin, timeout=timeout_seconds)
+            return int(process.returncode)
+
+        assert process.stdout is not None
+        assert process.stderr is not None
+        output_overflow = threading.Event()
+
+        def drain_bounded(stream: BinaryIO, destination: BinaryIO) -> None:
+            written = 0
+            while chunk := stream.read(64 * 1024):
+                remaining = output_file_limit_bytes - written
+                if remaining > 0:
+                    destination.write(chunk[:remaining])
+                    destination.flush()
+                    written += min(len(chunk), remaining)
+                if len(chunk) > remaining and not output_overflow.is_set():
+                    output_overflow.set()
+                    signal_process_group(process, signal.SIGTERM)
+
+        for stream, destination in (
+            (process.stdout, stdout_handle),
+            (process.stderr, stderr_handle),
+        ):
+            thread = threading.Thread(
+                target=drain_bounded,
+                args=(stream, destination),
+                daemon=True,
+            )
+            drain_threads.append(thread)
+            thread.start()
+        process.wait(timeout=timeout_seconds)
+        for thread in drain_threads:
+            thread.join(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
+        return 70 if output_overflow.is_set() else int(process.returncode)
     except ForwardedSignal as error:
         cleanup_signal = error.signum
         raise
@@ -349,6 +410,12 @@ def _run_logged_process(
                     initial_signal=cleanup_signal,
                     signal_already_sent=pending_signal is not None,
                 )
+            for thread in drain_threads:
+                thread.join(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
+            if process is not None and output_file_limit_bytes is not None:
+                for stream in (process.stdout, process.stderr):
+                    if stream is not None:
+                        stream.close()
             for forwarded, previous in previous_handlers.items():
                 signal.signal(forwarded, previous)
             if previous_mask is not None:

@@ -1430,6 +1430,23 @@ class ProviderPolicyTest(unittest.TestCase):
             ("/bin/claude", "--bare", "--help"),
         )
         self.assertEqual(run_command.call_args_list[1].kwargs["env"], probe_env)
+        for probe_call in run_command.call_args_list[:2]:
+            self.assertEqual(
+                probe_call.kwargs["timeout_seconds"],
+                providers.CLAUDE_PROBE_TIMEOUT_SECONDS,
+            )
+            self.assertEqual(
+                probe_call.kwargs["capture_limit_bytes"],
+                providers.CLAUDE_PROBE_OUTPUT_LIMIT_BYTES,
+            )
+            self.assertEqual(
+                probe_call.kwargs["output_file_limit_bytes"],
+                providers.CLAUDE_PROBE_OUTPUT_LIMIT_BYTES,
+            )
+            self.assertEqual(
+                probe_call.kwargs["stdout_path"].parent,
+                self.review.container_dir / "claude-home",
+            )
         review_env = run_command.call_args_list[2].kwargs["env"]
         self.assertEqual(review_env["ANTHROPIC_API_KEY"], "secret")
         self.assertEqual(review_env["HOME"], probe_env["HOME"])

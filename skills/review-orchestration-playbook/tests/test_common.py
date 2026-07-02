@@ -29,6 +29,38 @@ class ChildEnvironmentTest(unittest.TestCase):
         self.assertEqual(result, "keep-two\nkeep-three")
         self.assertNotIn("discarded-line", result)
 
+    def test_logged_command_timeout_terminates_child(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with self.assertRaisesRegex(ReviewError, "command timed out"):
+                common.run(
+                    (sys.executable, "-c", "import time; time.sleep(5)"),
+                    stdout_path=root / "stdout.log",
+                    stderr_path=root / "stderr.log",
+                    timeout_seconds=0.05,
+                )
+
+    def test_logged_command_output_file_limit_is_enforced(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            stdout_path = root / "stdout.log"
+            completed = common.run(
+                (
+                    sys.executable,
+                    "-c",
+                    "import os; os.write(1, b'x' * 1048576)",
+                ),
+                stdout_path=stdout_path,
+                stderr_path=root / "stderr.log",
+                capture_limit_bytes=4096,
+                timeout_seconds=5,
+                output_file_limit_bytes=4096,
+            )
+            output_size = stdout_path.stat().st_size
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertLessEqual(output_size, 4096)
+
     def test_streamed_command_logs_are_complete_and_memory_capture_is_bounded(
         self,
     ) -> None:

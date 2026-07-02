@@ -55,6 +55,8 @@ CLAUDE_PROBE_SANDBOX = pathlib.Path("/usr/bin/sandbox-exec")
 CLAUDE_PROBE_SANDBOX_PROFILE = (
     "(version 1)(allow default)(deny file-write*)(deny network*)"
 )
+CLAUDE_PROBE_TIMEOUT_SECONDS = 20.0
+CLAUDE_PROBE_OUTPUT_LIMIT_BYTES = 64 * 1024
 CLAUDE_EGRESS_CONSENTS = (
     "explicit-claude-review",
     "double-review",
@@ -255,10 +257,16 @@ def _require_claude_identity(
     executable: pathlib.Path,
     env: dict[str, str],
 ) -> None:
+    probe_cwd = _claude_probe_cwd(env)
     completed = run(
         _claude_probe_command(executable, "--version"),
-        cwd=_claude_probe_cwd(env),
+        cwd=probe_cwd,
         env=env,
+        stdout_path=probe_cwd / "identity.stdout.log",
+        stderr_path=probe_cwd / "identity.stderr.log",
+        capture_limit_bytes=CLAUDE_PROBE_OUTPUT_LIMIT_BYTES,
+        timeout_seconds=CLAUDE_PROBE_TIMEOUT_SECONDS,
+        output_file_limit_bytes=CLAUDE_PROBE_OUTPUT_LIMIT_BYTES,
     )
     output = (completed.stdout + b"\n" + completed.stderr).decode(
         "utf-8", errors="replace"
@@ -271,10 +279,16 @@ def _require_claude_bare_mode(
     executable: pathlib.Path,
     env: dict[str, str],
 ) -> None:
+    probe_cwd = _claude_probe_cwd(env)
     completed = run(
         _claude_probe_command(executable, "--help"),
-        cwd=_claude_probe_cwd(env),
+        cwd=probe_cwd,
         env=env,
+        stdout_path=probe_cwd / "help.stdout.log",
+        stderr_path=probe_cwd / "help.stderr.log",
+        capture_limit_bytes=CLAUDE_PROBE_OUTPUT_LIMIT_BYTES,
+        timeout_seconds=CLAUDE_PROBE_TIMEOUT_SECONDS,
+        output_file_limit_bytes=CLAUDE_PROBE_OUTPUT_LIMIT_BYTES,
     )
     help_text = (completed.stdout + b"\n" + completed.stderr).decode(
         "utf-8", errors="replace"
