@@ -71,6 +71,27 @@ class ChildEnvironmentTest(unittest.TestCase):
 
         self.assertLessEqual(output_size, 4096)
 
+    def test_output_limit_is_detected_while_stream_remains_open(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with self.assertRaises(common.ReviewOutputLimitError):
+                common.run(
+                    (
+                        sys.executable,
+                        "-c",
+                        (
+                            "import os,time; "
+                            "os.write(1, b'x' * 4097); "
+                            "time.sleep(5)"
+                        ),
+                    ),
+                    stdout_path=root / "stdout.log",
+                    stderr_path=root / "stderr.log",
+                    capture_limit_bytes=4096,
+                    timeout_seconds=1,
+                    output_file_limit_bytes=4096,
+                )
+
     @mock.patch.object(common.subprocess, "Popen")
     def test_output_file_limit_requires_timeout_before_launch(
         self, popen: mock.Mock
@@ -465,6 +486,53 @@ class ChildEnvironmentTest(unittest.TestCase):
                             )
                         ),
                     )
+
+    def test_all_invalid_deferred_candidates_are_not_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = pathlib.Path(temporary)
+            executable = home / ".local/bin/claude"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o755)
+
+            with (
+                mock.patch.dict(common.os.environ, {"HOME": str(home)}, clear=True),
+                mock.patch.object(
+                    common,
+                    "_user_executable_candidates",
+                    return_value=[executable],
+                ),
+                mock.patch.object(common.shutil, "which", return_value=None),
+                mock.patch.object(
+                    common.os,
+                    "access",
+                    side_effect=lambda path, _mode: pathlib.Path(path) == executable,
+                ),
+            ):
+                with self.assertRaisesRegex(ReviewError, "validation failed"):
+                    common.resolve_reviewer_executable(
+                        "claude",
+                        candidate_validator=mock.Mock(
+                            side_effect=common.InvalidReviewerExecutable(
+                                "not Claude Code"
+                            )
+                        ),
+                    )
+
+    def test_non_utf8_shebang_dependency_fails_closed_without_crashing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = pathlib.Path(temporary) / "claude"
+            executable.write_bytes(b"#!/\xff\n")
+
+            dependencies = common.reviewer_executable_dependencies(executable)
+
+        self.assertIn(executable.absolute(), dependencies)
+        self.assertTrue(
+            all(
+                dependency in {executable.absolute(), executable.resolve()}
+                for dependency in dependencies
+            )
+        )
 
     def test_deferred_identity_does_not_swallow_probe_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

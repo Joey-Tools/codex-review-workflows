@@ -391,7 +391,12 @@ def _run_logged_process(
 
         def drain_bounded(stream: BinaryIO, destination: BinaryIO) -> None:
             written = 0
-            while chunk := stream.read(64 * 1024):
+            # BufferedReader.read(size) may wait for the full size or EOF. That
+            # turns an already-observable limit breach into a timeout when a
+            # hostile child keeps the stream open. read1() returns currently
+            # available pipe data while preserving the same bounded chunk size.
+            read_available = getattr(stream, "read1", stream.read)
+            while chunk := read_available(64 * 1024):
                 remaining = output_file_limit_bytes - written
                 if remaining > 0:
                     destination.write(chunk[:remaining])
@@ -545,6 +550,7 @@ def _user_executable_candidates(name: str) -> list[pathlib.Path]:
 ENV_SHEBANG = re.compile(
     rb"^#![ \t]*/usr/bin/env(?:[ \t]+-S)?[ \t]+([A-Za-z0-9_.+-]+)(?:[ \t]|$)"
 )
+DIRECT_SHEBANG = re.compile(rb"^#![ \t]*(/[^ \t\r\n]+)")
 
 
 def _env_shebang_runtime(path: pathlib.Path) -> pathlib.Path | None:
@@ -580,6 +586,35 @@ def reviewer_executable_path(
         if entry and entry not in entries:
             entries.append(entry)
     return os.pathsep.join(entries)
+
+
+def reviewer_executable_dependencies(path: pathlib.Path) -> tuple[pathlib.Path, ...]:
+    """Return exact files required to exec a reviewer entrypoint."""
+    candidates = [path.absolute(), path.resolve()]
+    try:
+        with path.open("rb") as handle:
+            first_line = handle.readline(512).rstrip(b"\r\n")
+    except OSError:
+        first_line = b""
+    direct_match = DIRECT_SHEBANG.match(first_line)
+    if direct_match is not None:
+        try:
+            direct = pathlib.Path(direct_match.group(1).decode("utf-8"))
+        except UnicodeDecodeError:
+            direct = None
+        if direct is not None and direct.is_file() and os.access(direct, os.X_OK):
+            candidates.extend((direct.absolute(), direct.resolve()))
+    env_runtime = _env_shebang_runtime(path)
+    if env_runtime is not None:
+        candidates.extend((env_runtime.absolute(), env_runtime.resolve()))
+    result: list[pathlib.Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key not in seen:
+            seen.add(key)
+            result.append(candidate)
+    return tuple(result)
 
 
 def _executable_identity_matches(
@@ -687,8 +722,6 @@ def resolve_reviewer_executable(
         if _executable_identity_matches(candidate, markers):
             return absolute
         rejected.append(candidate.absolute())
-    if defer_identity and candidate_validator is not None:
-        return None
     if rejected:
         paths = ", ".join(str(path) for path in rejected)
         raise ReviewError(

@@ -766,6 +766,34 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
 
+    def test_copilot_rejects_usage_after_turn_end(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "content": "No findings.",
+                        "model": "claude-opus-4.8",
+                    },
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.usage",
+                    "data": {"model": "claude-opus-4.7"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
+
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(providers, "_codex_attempt")
     def test_codex_falls_back_from_56_to_55_only_on_entitlement(
@@ -1861,6 +1889,32 @@ class ProviderPolicyTest(unittest.TestCase):
 
     @mock.patch.object(
         providers,
+        "reviewer_executable_dependencies",
+        return_value=(
+            pathlib.Path("/review-install/claude"),
+            pathlib.Path("/review-runtime/node"),
+        ),
+    )
+    def test_claude_probe_profile_only_reads_runtime_and_probe_roots(
+        self,
+        _dependencies: mock.Mock,
+    ) -> None:
+        profile = providers._claude_probe_sandbox_profile(
+            pathlib.Path("/review-install/claude"),
+            pathlib.Path("/isolated/probe-home"),
+        )
+
+        self.assertIn("(deny default)", profile)
+        self.assertNotIn("(allow default)", profile)
+        self.assertIn('(literal "/review-install/claude")', profile)
+        self.assertIn('(literal "/review-runtime/node")', profile)
+        self.assertIn('(subpath "/isolated/probe-home")', profile)
+        self.assertIn('(subpath "/review-install")', profile)
+        self.assertIn('(subpath "/review-runtime")', profile)
+        self.assertNotIn("/Users/joey", profile)
+
+    @mock.patch.object(
+        providers,
         "resolve_reviewer_executable",
         return_value=pathlib.Path("/bin/claude"),
     )
@@ -1881,7 +1935,8 @@ class ProviderPolicyTest(unittest.TestCase):
             return candidate
 
         resolve.side_effect = resolve_and_validate
-        self.assertIn("(deny process-fork)", providers.CLAUDE_PROBE_SANDBOX_PROFILE)
+        self.assertIn("(deny default)", providers.CLAUDE_PROBE_SANDBOX_PROFILE)
+        self.assertNotIn("(allow default)", providers.CLAUDE_PROBE_SANDBOX_PROFILE)
         payload = {
             "type": "result",
             "subtype": "success",
@@ -1936,17 +1991,15 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn("--bare", argv)
         self.assertNotIn("--safe-mode", argv)
         self.assertIn("--strict-mcp-config", argv)
+        version_argv = run_command.call_args_list[0].args[0]
+        self.assertEqual(version_argv[:2], ("/usr/bin/true", "-p"))
         self.assertEqual(
-            run_command.call_args_list[0].args[0],
-            (
-                "/usr/bin/true",
-                "-p",
-                providers.CLAUDE_PROBE_SANDBOX_PROFILE,
-                "/bin/claude",
-                "--bare",
-                "--version",
-            ),
+            version_argv[3:],
+            ("/bin/claude", "--bare", "--version"),
         )
+        self.assertIn("(deny default)", version_argv[2])
+        self.assertIn('(literal "/bin/claude")', version_argv[2])
+        self.assertNotIn("(allow default)", version_argv[2])
         probe_env = run_command.call_args_list[0].kwargs["env"]
         self.assertNotIn("ANTHROPIC_API_KEY", probe_env)
         self.assertNotIn("CODEX_ISOLATED_REVIEW_RANGE", probe_env)
@@ -1973,9 +2026,10 @@ class ProviderPolicyTest(unittest.TestCase):
                 providers.CLAUDE_PROBE_OUTPUT_LIMIT_BYTES,
             )
             self.assertEqual(
-                probe_call.kwargs["stdout_path"].parent,
+                probe_call.kwargs["stdout_path"].parent.parent,
                 self.review.container_dir / "claude-home",
             )
+            self.assertFalse(probe_call.kwargs["stdout_path"].parent.exists())
         review_env = run_command.call_args_list[2].kwargs["env"]
         self.assertEqual(review_env["ANTHROPIC_API_KEY"], "secret")
         self.assertEqual(review_env["HOME"], probe_env["HOME"])

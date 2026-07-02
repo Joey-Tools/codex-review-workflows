@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import re
+import tempfile
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Iterable
 
@@ -15,6 +16,7 @@ from .common import (
     ReviewProcessLeakError,
     ReviewTimeoutError,
     child_environment,
+    reviewer_executable_dependencies,
     reviewer_executable_path,
     resolve_reviewer_executable,
     run,
@@ -56,9 +58,25 @@ CLAUDE_BARE_MODE_HELP_FORM = (
 CLAUDE_HELP_OPTION_START = re.compile(r"^  (--[a-z0-9][a-z0-9-]*)\b")
 CLAUDE_BARE_TOKEN = re.compile(r"(?<![a-z0-9-])--bare(?![a-z0-9-])")
 CLAUDE_PROBE_SANDBOX = pathlib.Path("/usr/bin/sandbox-exec")
-CLAUDE_PROBE_SANDBOX_PROFILE = (
-    "(version 1)(allow default)(deny file-write*)(deny network*)"
-    "(deny process-fork)"
+CLAUDE_PROBE_SANDBOX_PROFILE = "(version 1)(deny default)"
+CLAUDE_PROBE_SYSTEM_READ_SUBPATHS = (
+    pathlib.Path("/System/Library"),
+    pathlib.Path("/usr/lib"),
+    pathlib.Path("/usr/share"),
+    pathlib.Path("/Library/Apple"),
+    pathlib.Path("/private/var/db/dyld"),
+    pathlib.Path("/private/var/db/timezone"),
+)
+CLAUDE_PROBE_SYSTEM_READ_LITERALS = (
+    # Bun's standalone runtime enumerates the filesystem root during startup.
+    # A literal filter permits that directory entry without allowing descendants.
+    pathlib.Path("/"),
+    pathlib.Path("/dev/null"),
+    pathlib.Path("/dev/random"),
+    pathlib.Path("/dev/urandom"),
+    pathlib.Path("/etc/hosts"),
+    pathlib.Path("/etc/localtime"),
+    pathlib.Path("/etc/resolv.conf"),
 )
 CLAUDE_PROBE_TIMEOUT_SECONDS = 20.0
 CLAUDE_PROBE_OUTPUT_LIMIT_BYTES = 64 * 1024
@@ -230,6 +248,7 @@ def _claude_help_option_blocks(help_text: str, option: str) -> tuple[str, ...]:
 
 def _claude_probe_command(
     executable: pathlib.Path,
+    probe_cwd: pathlib.Path,
     *args: str,
 ) -> tuple[str, ...]:
     if not CLAUDE_PROBE_SANDBOX.is_file() or not os.access(
@@ -241,10 +260,61 @@ def _claude_probe_command(
     return (
         str(CLAUDE_PROBE_SANDBOX),
         "-p",
-        CLAUDE_PROBE_SANDBOX_PROFILE,
+        _claude_probe_sandbox_profile(executable, probe_cwd),
         str(executable),
         "--bare",
         *args,
+    )
+
+
+def _sandbox_path_filter(kind: str, path: pathlib.Path) -> str:
+    return f"({kind} {json.dumps(str(path), ensure_ascii=False)})"
+
+
+def _claude_probe_sandbox_profile(
+    executable: pathlib.Path,
+    probe_cwd: pathlib.Path,
+) -> str:
+    dependencies = reviewer_executable_dependencies(executable)
+    read_subpaths = {
+        probe_cwd.resolve(),
+        *(path.resolve() for path in CLAUDE_PROBE_SYSTEM_READ_SUBPATHS),
+        *(path.parent.resolve() for path in dependencies),
+    }
+    read_files = {
+        *(path.resolve() for path in CLAUDE_PROBE_SYSTEM_READ_LITERALS),
+        *dependencies,
+    }
+    read_filters = "".join(
+        [
+            *(
+                _sandbox_path_filter("literal", path)
+                for path in sorted(read_files, key=str)
+            ),
+            *(
+                _sandbox_path_filter("subpath", path)
+                for path in sorted(read_subpaths, key=str)
+            ),
+        ]
+    )
+    exec_filters = "".join(
+        [
+            *(
+                _sandbox_path_filter("literal", path)
+                for path in sorted(dependencies, key=str)
+            ),
+            *(
+                _sandbox_path_filter("subpath", path.parent.resolve())
+                for path in sorted(dependencies, key=str)
+            ),
+        ]
+    )
+    return (
+        CLAUDE_PROBE_SANDBOX_PROFILE
+        + "(allow file-read-metadata)"
+        + f"(allow file-read* {read_filters})"
+        + f"(allow process-exec {exec_filters})"
+        + "(allow sysctl-read)"
     )
 
 
@@ -258,21 +328,31 @@ def _claude_probe_cwd(env: dict[str, str]) -> pathlib.Path:
     return home
 
 
+def _run_claude_probe(
+    executable: pathlib.Path,
+    env: dict[str, str],
+    *args: str,
+) -> Completed:
+    probe_cwd = _claude_probe_cwd(env)
+    with tempfile.TemporaryDirectory(prefix=".claude-probe-", dir=probe_cwd) as raw:
+        output_dir = pathlib.Path(raw)
+        return run(
+            _claude_probe_command(executable, probe_cwd, *args),
+            cwd=probe_cwd,
+            env=env,
+            stdout_path=output_dir / "stdout.log",
+            stderr_path=output_dir / "stderr.log",
+            capture_limit_bytes=CLAUDE_PROBE_OUTPUT_LIMIT_BYTES,
+            timeout_seconds=CLAUDE_PROBE_TIMEOUT_SECONDS,
+            output_file_limit_bytes=CLAUDE_PROBE_OUTPUT_LIMIT_BYTES,
+        )
+
+
 def _require_claude_identity(
     executable: pathlib.Path,
     env: dict[str, str],
 ) -> None:
-    probe_cwd = _claude_probe_cwd(env)
-    completed = run(
-        _claude_probe_command(executable, "--version"),
-        cwd=probe_cwd,
-        env=env,
-        stdout_path=probe_cwd / "identity.stdout.log",
-        stderr_path=probe_cwd / "identity.stderr.log",
-        capture_limit_bytes=CLAUDE_PROBE_OUTPUT_LIMIT_BYTES,
-        timeout_seconds=CLAUDE_PROBE_TIMEOUT_SECONDS,
-        output_file_limit_bytes=CLAUDE_PROBE_OUTPUT_LIMIT_BYTES,
-    )
+    completed = _run_claude_probe(executable, env, "--version")
     output = (completed.stdout + b"\n" + completed.stderr).decode(
         "utf-8", errors="replace"
     )
@@ -286,17 +366,7 @@ def _require_claude_bare_mode(
     executable: pathlib.Path,
     env: dict[str, str],
 ) -> None:
-    probe_cwd = _claude_probe_cwd(env)
-    completed = run(
-        _claude_probe_command(executable, "--help"),
-        cwd=probe_cwd,
-        env=env,
-        stdout_path=probe_cwd / "help.stdout.log",
-        stderr_path=probe_cwd / "help.stderr.log",
-        capture_limit_bytes=CLAUDE_PROBE_OUTPUT_LIMIT_BYTES,
-        timeout_seconds=CLAUDE_PROBE_TIMEOUT_SECONDS,
-        output_file_limit_bytes=CLAUDE_PROBE_OUTPUT_LIMIT_BYTES,
-    )
+    completed = _run_claude_probe(executable, env, "--help")
     help_text = (completed.stdout + b"\n" + completed.stderr).decode(
         "utf-8", errors="replace"
     )
@@ -595,10 +665,7 @@ def _parse_copilot_output(
     if open_turn is not None or not completed_turns:
         return None, None
     _, start_index, terminal_index = completed_turns[-1]
-    if any(
-        item.get("type") in {"assistant.message", "assistant.turn_start"}
-        for item in objects[terminal_index + 1 :]
-    ):
+    if objects[terminal_index + 1 :]:
         return None, None
     turn_events = objects[start_index + 1 : terminal_index]
     if any(
