@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import fcntl
 import hmac
 import json
 import math
@@ -13,6 +14,7 @@ import select
 import socket
 import socketserver
 import ssl
+import stat
 import struct
 import subprocess
 import tempfile
@@ -119,6 +121,7 @@ CLAUDE_KEYCHAIN_BROKER_CAPABILITY_BYTES = 32
 CLAUDE_KEYCHAIN_BROKER_TIMEOUT_SECONDS = 20.0
 CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES = 64 * 1024
 CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS = 5.0
+CLAUDE_KEYCHAIN_UPDATE_LOCK_TIMEOUT_SECONDS = 5.0
 CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES = 1024 * 1024
 CLAUDE_KEYCHAIN_SECURITY_STDIN_LIMIT_BYTES = 4032
 CLAUDE_KEYCHAIN_SECURITY_PREFLIGHT_LIMIT_BYTES = (
@@ -277,6 +280,10 @@ class ClaudeKeychainBrokerUnavailable(ReviewError):
 
 class ClaudeKeychainCredentialUnavailable(ReviewError):
     """The local Claude credential cannot be refreshed without argv exposure."""
+
+
+class ClaudeReviewToolUnavailable(ReviewError):
+    """The host lacks a trusted local tool required by Claude Code."""
 
 
 @dataclass(frozen=True)
@@ -450,9 +457,43 @@ def _read_claude_keychain_credential(
     return credential
 
 
+@contextlib.contextmanager
+def _claude_keychain_update_lock() -> Iterator[None]:
+    path = pathlib.Path(f"/tmp/codex-claude-keychain-{os.getuid()}.lock")
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        details = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or details.st_uid != os.getuid()
+            or details.st_mode & 0o077
+        ):
+            raise ReviewError("Claude Keychain update lock is not private")
+        deadline = time.monotonic() + CLAUDE_KEYCHAIN_UPDATE_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise ClaudeKeychainCredentialUnavailable(
+                        "another isolated review is updating Claude credentials"
+                    )
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
 def _write_claude_keychain_credential(
     review: ReviewWorkspace,
     credential: bytearray,
+    expected_credential: bytearray,
 ) -> bool:
     if not credential or len(credential) > CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES:
         return False
@@ -480,17 +521,30 @@ def _write_claude_keychain_credential(
     security_env = child_environment(container_dir=review.container_dir)
     security_env["USER"] = account
     try:
-        completed = subprocess.run(
-            (str(CLAUDE_KEYCHAIN_CLIENT), "-i"),
-            cwd=review.container_dir,
-            env=security_env,
-            input=script,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS,
-        )
-    except (OSError, subprocess.TimeoutExpired):
+        with _claude_keychain_update_lock():
+            current = _read_claude_keychain_credential(review)
+            if current is None:
+                return False
+            try:
+                if not hmac.compare_digest(current, expected_credential):
+                    return False
+            finally:
+                current[:] = b"\x00" * len(current)
+            completed = subprocess.run(
+                (str(CLAUDE_KEYCHAIN_CLIENT), "-i"),
+                cwd=review.container_dir,
+                env=security_env,
+                input=script,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS,
+            )
+    except (
+        OSError,
+        subprocess.TimeoutExpired,
+        ReviewError,
+    ):
         return False
     within_limit = (
         len(completed.stdout) <= CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES
@@ -678,6 +732,7 @@ def _claude_keychain_runtime(
         update_callback=lambda updated: _write_claude_keychain_credential(
             review,
             updated,
+            credential or bytearray(),
         ),
     ) as port:
         result[CLAUDE_KEYCHAIN_BROKER_PORT_ENV] = str(port)
@@ -1107,7 +1162,13 @@ def _with_claude_review_tool_path(
 ) -> dict[str, str]:
     rg = _trusted_claude_ripgrep()
     if rg is None:
-        raise ReviewError("Claude Code Grep sandbox requires ripgrep in a trusted path")
+        raise ClaudeReviewToolUnavailable(
+            "Claude Code Grep sandbox requires ripgrep in a trusted path"
+        )
+    try:
+        _native_macho_dependencies(rg, label="ripgrep")
+    except InvalidReviewerExecutable as error:
+        raise ClaudeReviewToolUnavailable(str(error)) from error
     entries: list[pathlib.Path] = []
     if not env.get("ANTHROPIC_API_KEY"):
         broker_dir = (
@@ -2775,10 +2836,12 @@ def run_review(
             claude_env = _prepare_claude_keychain_broker(review, claude_env)
             if not claude_env.get("ANTHROPIC_API_KEY"):
                 _require_safe_claude_keychain_credential(review)
+            claude_env = _with_claude_review_tool_path(review, claude_env)
     except (
         ClaudeProbeSandboxUnavailable,
         ClaudeKeychainBrokerUnavailable,
         ClaudeKeychainCredentialUnavailable,
+        ClaudeReviewToolUnavailable,
     ) as error:
         claude_available = False
         write_text_atomic(
@@ -2830,7 +2893,10 @@ def run_review(
             )
             _write_attempts(review, attempts)
             return Outcome(75, None, tuple(attempts))
-        except ClaudeKeychainCredentialUnavailable as error:
+        except (
+            ClaudeKeychainCredentialUnavailable,
+            ClaudeReviewToolUnavailable,
+        ) as error:
             category = "unavailable"
             final_text = None
             write_text_atomic(

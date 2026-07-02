@@ -380,10 +380,12 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         self.assertEqual(completed.stdout, b"")
 
+    @mock.patch.object(providers, "_read_claude_keychain_credential")
     @mock.patch.object(providers.subprocess, "run")
     def test_keychain_update_validates_and_persists_oauth_payload(
         self,
         run_command: mock.Mock,
+        read_credential: mock.Mock,
     ) -> None:
         run_command.return_value = subprocess.CompletedProcess(
             args=(),
@@ -392,9 +394,15 @@ class ProviderPolicyTest(unittest.TestCase):
             stderr=b"",
         )
         credential = bytearray(oauth_credential_fixture())
+        expected = bytearray(oauth_credential_fixture())
+        read_credential.return_value = bytearray(expected)
 
         self.assertTrue(
-            providers._write_claude_keychain_credential(self.review, credential)
+            providers._write_claude_keychain_credential(
+                self.review,
+                credential,
+                expected,
+            )
         )
         self.assertEqual(run_command.call_args.args[0], ("/usr/bin/security", "-i"))
         script = run_command.call_args.kwargs["input"]
@@ -410,6 +418,7 @@ class ProviderPolicyTest(unittest.TestCase):
             providers._write_claude_keychain_credential(
                 self.review,
                 bytearray(b"not-json"),
+                bytearray(oauth_credential_fixture()),
             )
         )
         run_command.assert_not_called()
@@ -422,7 +431,41 @@ class ProviderPolicyTest(unittest.TestCase):
         credential = bytearray(oauth_credential_fixture(padding=3000))
 
         self.assertFalse(
-            providers._write_claude_keychain_credential(self.review, credential)
+            providers._write_claude_keychain_credential(
+                self.review,
+                credential,
+                bytearray(oauth_credential_fixture()),
+            )
+        )
+        run_command.assert_not_called()
+
+    @mock.patch.object(providers, "_read_claude_keychain_credential")
+    @mock.patch.object(providers.subprocess, "run")
+    def test_keychain_update_rejects_changed_shared_credential(
+        self,
+        run_command: mock.Mock,
+        read_credential: mock.Mock,
+    ) -> None:
+        updated = bytearray(oauth_credential_fixture())
+        expected = bytearray(oauth_credential_fixture())
+        read_credential.return_value = bytearray(
+            json.dumps(
+                {
+                    "claudeAiOauth": {
+                        "access" + "Token": "other-" + "access-value",
+                        "refresh" + "Token": "other-" + "refresh-value",
+                        "expiresAt": (time.time() + 3600) * 1000,
+                    }
+                }
+            ).encode()
+        )
+
+        self.assertFalse(
+            providers._write_claude_keychain_credential(
+                self.review,
+                updated,
+                expected,
+            )
         )
         run_command.assert_not_called()
 
@@ -2096,6 +2139,54 @@ class ProviderPolicyTest(unittest.TestCase):
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(
         providers,
+        "_resolve_validated_claude_executable",
+        return_value=(pathlib.Path("/bin/claude"), {}),
+    )
+    @mock.patch.object(
+        providers,
+        "_with_claude_review_tool_path",
+        side_effect=providers.ClaudeReviewToolUnavailable("trusted rg unavailable"),
+    )
+    @mock.patch.object(
+        providers,
+        "resolve_reviewer_executable",
+        return_value=pathlib.Path("/bin/copilot"),
+    )
+    @mock.patch.object(providers, "_copilot_attempt")
+    def test_missing_trusted_rg_allows_authorized_copilot_fallback(
+        self,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _tools: mock.Mock,
+        _resolve_claude: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        copilot_attempt.return_value = self.attempt(
+            "copilot",
+            providers.COPILOT_MODELS[0],
+            "success",
+            final_text="No findings.",
+        )
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="triple-review",
+        )
+
+        self.assertEqual(outcome.returncode, 0)
+        copilot_attempt.assert_called_once()
+        resolve.assert_called_once_with("copilot")
+        self.assertIn(
+            "trusted rg unavailable",
+            (self.review.container_dir / "claude-skip.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
         "resolve_reviewer_executable",
         side_effect=(pathlib.Path("/bin/claude"), pathlib.Path("/bin/copilot")),
     )
@@ -3038,6 +3129,29 @@ class ProviderPolicyTest(unittest.TestCase):
             prepared["PATH"].split(os.pathsep),
             [str(self.claude_broker.parent.resolve()), str(trusted_dir.absolute())],
         )
+
+    def test_claude_review_path_classifies_non_native_ripgrep_unavailable(
+        self,
+    ) -> None:
+        with (
+            mock.patch.object(
+                providers,
+                "_trusted_claude_ripgrep",
+                return_value=pathlib.Path("/usr/bin/rg"),
+            ),
+            mock.patch.object(
+                providers,
+                "_native_macho_dependencies",
+                side_effect=providers.InvalidReviewerExecutable(
+                    "ripgrep must be native"
+                ),
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeReviewToolUnavailable,
+                "ripgrep must be native",
+            ),
+        ):
+            providers._with_claude_review_tool_path(self.review, {})
 
     @mock.patch.object(
         providers,
