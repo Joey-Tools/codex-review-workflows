@@ -1151,17 +1151,11 @@ class ProviderPolicyTest(unittest.TestCase):
         _resolve: mock.Mock,
     ) -> None:
         payload = {"result": "No findings.", "modelUsage": {"claude-opus-4-8": {}}}
-        safe_mode_help = (
-            "--safe-mode Start with all customizations disabled to troubleshoot. "
-            "CLAUDE.md. "
-            "Model selection, built-in tools, and permissions work normally. "
-            "Sets CLAUDE_CODE_SAFE_MODE."
-        )
         run_command.side_effect = (
             Completed(
                 argv=("claude", "--help"),
                 returncode=0,
-                stdout=safe_mode_help.encode(),
+                stdout=providers.CLAUDE_SAFE_MODE_CLI_HELP_FORM.encode(),
                 stderr=b"",
             ),
             Completed(
@@ -1224,103 +1218,38 @@ class ProviderPolicyTest(unittest.TestCase):
         self,
         run_command: mock.Mock,
     ) -> None:
-        for disable_help in (
-            (
-                b"--safe-mode Start with all customizations disabled to troubleshoot. "
-                b"CLAUDE.md does not load. Managed plugins and policy-configured MCP "
-                b"servers do not. "
-            ),
-            (
-                b"--safe-mode Start with all customizations "
-                b"(CLAUDE.md, skills, plugins) disabled - useful. "
-            ),
-            (
-                "--safe-mode Start with all customizations "
-                "(CLAUDE.md, skills, plugins, hooks, MCP servers, and more) "
-                "disabled — useful for troubleshooting. "
-            ).encode(),
-        ):
-            for wording in (
-                b"Sets CLAUDE_CODE_SAFE_MODE.",
-                b"Sets CLAUDE_CODE_SAFE_MODE=1.",
-                (
-                    b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode --session-id "
-                    b"Use a specific session ID for the conversation "
-                    b"(must be a valid UUID) claude --session-id 550e8400"
-                ),
-            ):
-                with self.subTest(disable_help=disable_help, wording=wording):
-                    run_command.return_value = Completed(
-                        argv=("claude", "--help"),
-                        returncode=0,
-                        stdout=(
-                            disable_help
-                            + b"Authentication, model selection, built-in tools, and "
-                            b"permissions work normally. "
-                            + wording
-                        ),
-                        stderr=b"",
-                    )
+        for help_form in providers.CLAUDE_SAFE_MODE_VERIFIED_HELP_FORMS:
+            with self.subTest(help_form=help_form):
+                run_command.return_value = Completed(
+                    argv=("claude", "--help"),
+                    returncode=0,
+                    stdout=f"prefix {help_form} suffix".encode(),
+                    stderr=b"",
+                )
 
-                    providers._require_claude_safe_mode(pathlib.Path("/bin/claude"), {})
+                providers._require_claude_safe_mode(pathlib.Path("/bin/claude"), {})
 
     @mock.patch.object(providers, "run")
     def test_claude_rejects_negated_safe_mode_disable_wording(
         self,
         run_command: mock.Mock,
     ) -> None:
-        for wording in (
-            b"--safe-mode Not all customizations including CLAUDE.md are disabled. ",
-            (
-                b"--safe-mode Start with not all customizations including "
-                b"CLAUDE.md disabled. "
+        cli_form = providers.CLAUDE_SAFE_MODE_CLI_HELP_FORM
+        for help_text in (
+            cli_form.replace("all customizations", "not all customizations"),
+            cli_form.replace("disabled — useful", "disabled — useful; however"),
+            cli_form.replace(
+                "claude.md, skills, plugins",
+                "all but claude.md, skills, plugins",
             ),
-            (
-                b"--safe-mode Start with all customizations not disabled, "
-                b"including CLAUDE.md. "
-            ),
-            b"--safe-mode Start with all customizations (not, CLAUDE.md) disabled. ",
-            b"--safe-mode Start with all customizations (except CLAUDE.md) disabled. ",
-            (
-                b"--safe-mode Start with all customizations "
-                b"(excluding CLAUDE.md) disabled. "
-            ),
-            b"--safe-mode Start with all customizations (without CLAUDE.md) disabled. ",
-            b"--safe-mode Start with all customizations disabled except CLAUDE.md. ",
-            (
-                b"--safe-mode Start with all customizations disabled to troubleshoot. "
-                b"Except CLAUDE.md, everything is disabled. "
-            ),
-            (
-                b"--safe-mode Start with all customizations disabled to troubleshoot: "
-                b"except CLAUDE.md. "
-            ),
-            (
-                b"--safe-mode Start with all customizations "
-                b"(CLAUDE.md, skills, plugins) disabled - useful except CLAUDE.md. "
-            ),
-            (
-                b"--safe-mode Start with all customizations "
-                b"(all but CLAUDE.md, skills, plugins) disabled - useful. "
-            ),
-            (
-                b"--safe-mode Start with all customizations "
-                b"(CLAUDE.md enabled, skills, plugins) disabled - useful. "
-            ),
-            (
-                b"--safe-mode Start with all customizations "
-                b"(CLAUDE.md, skills, pluginsenabled) disabled - useful. "
-            ),
+            cli_form.replace("claude.md", "claude.md enabled", 1),
+            cli_form.replace("—", "-"),
         ):
-            with self.subTest(wording=wording):
+            with self.subTest(help_text=help_text):
                 run_command.return_value = Completed(
                     argv=("claude", "--help"),
                     returncode=0,
-                    stdout=(
-                        wording
-                        + b"Authentication, model selection, built-in tools, and "
-                        b"permissions work normally. Sets CLAUDE_CODE_SAFE_MODE."
-                    ),
+                    stdout=help_text.encode(),
                     stderr=b"",
                 )
 
@@ -1334,41 +1263,22 @@ class ProviderPolicyTest(unittest.TestCase):
         self,
         run_command: mock.Mock,
     ) -> None:
+        cli_form = providers.CLAUDE_SAFE_MODE_CLI_HELP_FORM
         for wording in (
-            b"Never sets CLAUDE_CODE_SAFE_MODE.",
-            b"Does not set CLAUDE_CODE_SAFE_MODE.",
-            b"Unsets CLAUDE_CODE_SAFE_MODE.",
-            b"Sets CLAUDE_CODE_SAFE_MODE to 0.",
-            b"Sets CLAUDE_CODE_SAFE_MODE = 0.",
-            b"Sets CLAUDE_CODE_SAFE_MODE=0.",
-            b"Sets CLAUDE_CODE_SAFE_MODE: 0.",
-            b"Sets CLAUDE_CODE_SAFE_MODE, default 0.",
-            b"Sets CLAUDE_CODE_SAFE_MODE; value 0.",
-            b"Sets CLAUDE_CODE_SAFE_MODE=1.0.",
-            b"Sets CLAUDE_CODE_SAFE_MODE.foo.",
-            b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode to 0.",
-            b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode.foo.",
-            b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode --model opus",
-            b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode --session-id --model opus",
-            (
-                b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode --session-id <uuid> "
-                b"Use a specific session ID for the conversation "
-                b"(must be a valid UUID)"
-            ),
-            b"not.sets CLAUDE_CODE_SAFE_MODE.",
+            "never sets claude_code_safe_mode=1.",
+            "does not set claude_code_safe_mode=1.",
+            "sets claude_code_safe_mode=0.",
+            "sets claude_code_safe_mode=1.0.",
+            "sets claude_code_safe_mode=1. however disabled is false.",
         ):
             with self.subTest(wording=wording):
                 run_command.return_value = Completed(
                     argv=("claude", "--help"),
                     returncode=0,
-                    stdout=(
-                        b"--safe-mode Start with all customizations disabled "
-                        b"to troubleshoot. "
-                        b"CLAUDE.md does not load. Authentication, model selection, "
-                        b"built-in tools, "
-                        b"and permissions work normally. "
-                        + wording
-                    ),
+                    stdout=cli_form.replace(
+                        "sets claude_code_safe_mode=1.",
+                        wording,
+                    ).encode(),
                     stderr=b"",
                 )
 

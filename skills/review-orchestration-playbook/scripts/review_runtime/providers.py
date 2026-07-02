@@ -35,28 +35,32 @@ COPILOT_PERMISSION_HELP_FRAGMENTS = (
     "--disallow-temp-dir flag prevents automatic access",
     "denial rules always take precedence over allow rules, even --allow-all-tools",
 )
-CLAUDE_SAFE_MODE_MODEL_FRAGMENT = (
-    "model selection, built-in tools, and permissions work normally"
+CLAUDE_SAFE_MODE_CLI_HELP_FORM = (
+    "--safe-mode start with all customizations "
+    "(claude.md, skills, plugins, hooks, mcp servers, custom commands and agents, "
+    "output styles, workflows, custom themes, keybindings, and more) disabled — useful "
+    "for troubleshooting a broken configuration. admin-managed (policy) settings still "
+    "apply. auth, model selection, built-in tools, and permissions work normally. sets "
+    "claude_code_safe_mode=1. --session-id <uuid> use a specific session id for the "
+    "conversation (must be a valid uuid) --setting-sources <sources>"
 )
-CLAUDE_SAFE_MODE_HELP_FRAGMENTS = (
-    "--safe-mode",
-    "claude.md",
-    CLAUDE_SAFE_MODE_MODEL_FRAGMENT,
+CLAUDE_SAFE_MODE_TABLE_HELP_FORM = (
+    "--safe-mode start with all customizations disabled to troubleshoot a broken "
+    "configuration: claude.md, skills, plugins, hooks, mcp servers, custom commands and "
+    "agents, output styles, workflows, custom themes, custom keybindings, status line and "
+    "file-suggestion commands, lsp servers, and auto-memory do not load. authentication, "
+    "model selection, built-in tools, and permissions work normally, which differs from "
+    "--bare. managed settings policy still applies, including policy-configured hooks, "
+    "status line, and file-suggestion commands; managed plugins, managed skills, managed "
+    "claude.md, and policy-configured mcp servers do not. useful for checking whether a "
+    "customization is what triggers automatic fallback from fable 5. sets "
+    "claude_code_safe_mode claude --safe-mode --session-id use a specific session id for "
+    "the conversation (must be a valid uuid) claude --session-id "
+    '"550e8400-e29b-41d4-a716-446655440000" --setting-sources'
 )
-CLAUDE_SAFE_MODE_DISABLE_PATTERN = re.compile(
-    r"--safe-mode\s+start with all customizations(?:"
-    r"\s+disabled\s+to troubleshoot\b"
-    r"|\s+\((?P<customizations>[^)]{1,2048})\)\s+disabled"
-    r"\s+(?:-|–|—)\s*useful\b)"
-)
-CLAUDE_SAFE_MODE_DISABLE_NEGATION_PATTERN = re.compile(
-    r"\b(?:no|not|never|but|except|excluding|without|other than|enabled)\b"
-)
-CLAUDE_SAFE_MODE_ENV_PATTERN = re.compile(
-    r"(?:^|[.;:]\s+)sets claude_code_safe_mode(?:=1)?(?:\.(?=\s|$)|$)"
-    r"|(?:^|[.;:]\s+)sets claude_code_safe_mode claude --safe-mode "
-    r"--session-id use a specific session id for the conversation "
-    r"\(must be a valid uuid\)(?=\s|$)"
+CLAUDE_SAFE_MODE_VERIFIED_HELP_FORMS = (
+    CLAUDE_SAFE_MODE_CLI_HELP_FORM,
+    CLAUDE_SAFE_MODE_TABLE_HELP_FORM,
 )
 CLAUDE_EGRESS_CONSENTS = (
     "explicit-claude-review",
@@ -228,44 +232,14 @@ def _require_claude_safe_mode(
     )
     if (
         completed.returncode != 0
-        or not all(
-            fragment in help_text for fragment in CLAUDE_SAFE_MODE_HELP_FRAGMENTS
+        or not any(
+            form in help_text for form in CLAUDE_SAFE_MODE_VERIFIED_HELP_FORMS
         )
-        or not _claude_safe_mode_disable_semantics_are_verified(help_text)
-        or CLAUDE_SAFE_MODE_ENV_PATTERN.search(help_text) is None
     ):
         raise ReviewError(
             "Claude Code does not expose verifiable --safe-mode semantics that "
             "disable CLAUDE.md and other project customizations"
         )
-
-
-def _claude_safe_mode_disable_semantics_are_verified(help_text: str) -> bool:
-    disable_match = CLAUDE_SAFE_MODE_DISABLE_PATTERN.search(help_text)
-    if disable_match is None:
-        return False
-    customization_list = disable_match.group("customizations")
-    if customization_list is not None:
-        customization_core = "claude.md, skills, plugins"
-        if (
-            customization_list != customization_core
-            and not customization_list.startswith(customization_core + ",")
-        ):
-            return False
-    model_marker = help_text.find(
-        CLAUDE_SAFE_MODE_MODEL_FRAGMENT,
-        disable_match.end(),
-    )
-    if model_marker < 0:
-        return False
-    semantics = help_text[disable_match.start() : model_marker]
-    for allowed_phrase in (
-        "do not load",
-        "does not load",
-        "policy-configured mcp servers do not",
-    ):
-        semantics = semantics.replace(allowed_phrase, "disabled")
-    return CLAUDE_SAFE_MODE_DISABLE_NEGATION_PATTERN.search(semantics) is None
 
 
 def classify_failure(stdout: bytes | str, stderr: bytes | str) -> str:
