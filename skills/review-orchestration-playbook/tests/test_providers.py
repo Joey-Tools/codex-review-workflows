@@ -1256,6 +1256,8 @@ class ProviderPolicyTest(unittest.TestCase):
             b"Sets CLAUDE_CODE_SAFE_MODE: 0.",
             b"Sets CLAUDE_CODE_SAFE_MODE, default 0.",
             b"Sets CLAUDE_CODE_SAFE_MODE; value 0.",
+            b"Sets CLAUDE_CODE_SAFE_MODE=1.0.",
+            b"Sets CLAUDE_CODE_SAFE_MODE.foo.",
         ):
             with self.subTest(wording=wording):
                 run_command.return_value = Completed(
