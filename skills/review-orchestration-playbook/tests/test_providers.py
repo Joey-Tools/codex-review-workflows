@@ -1267,6 +1267,11 @@ class ProviderPolicyTest(unittest.TestCase):
             b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode.foo.",
             b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode --model opus",
             b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode --session-id --model opus",
+            (
+                b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode --session-id <uuid> "
+                b"Use a specific session ID for the conversation "
+                b"(must be a valid UUID)"
+            ),
             b"not.sets CLAUDE_CODE_SAFE_MODE.",
         ):
             with self.subTest(wording=wording):
