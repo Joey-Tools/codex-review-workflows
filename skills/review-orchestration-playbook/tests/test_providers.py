@@ -1152,7 +1152,8 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         payload = {"result": "No findings.", "modelUsage": {"claude-opus-4-8": {}}}
         safe_mode_help = (
-            "--safe-mode Start with all customizations disabled. CLAUDE.md. "
+            "--safe-mode Start with all customizations disabled to troubleshoot. "
+            "CLAUDE.md. "
             "Model selection, built-in tools, and permissions work normally. "
             "Sets CLAUDE_CODE_SAFE_MODE."
         )
@@ -1232,6 +1233,11 @@ class ProviderPolicyTest(unittest.TestCase):
                 b"--safe-mode Start with all customizations "
                 b"(CLAUDE.md, skills, plugins) disabled - useful. "
             ),
+            (
+                "--safe-mode Start with all customizations "
+                "(CLAUDE.md, skills, plugins, hooks, MCP servers, and more) "
+                "disabled — useful for troubleshooting. "
+            ).encode(),
         ):
             for wording in (
                 b"Sets CLAUDE_CODE_SAFE_MODE.",
@@ -1280,6 +1286,26 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
             b"--safe-mode Start with all customizations (without CLAUDE.md) disabled. ",
             b"--safe-mode Start with all customizations disabled except CLAUDE.md. ",
+            (
+                b"--safe-mode Start with all customizations disabled to troubleshoot. "
+                b"Except CLAUDE.md, everything is disabled. "
+            ),
+            (
+                b"--safe-mode Start with all customizations disabled to troubleshoot: "
+                b"except CLAUDE.md. "
+            ),
+            (
+                b"--safe-mode Start with all customizations "
+                b"(CLAUDE.md, skills, plugins) disabled - useful except CLAUDE.md. "
+            ),
+            (
+                b"--safe-mode Start with all customizations "
+                b"(all but CLAUDE.md, skills, plugins) disabled - useful. "
+            ),
+            (
+                b"--safe-mode Start with all customizations "
+                b"(CLAUDE.md enabled, skills, plugins) disabled - useful. "
+            ),
         ):
             with self.subTest(wording=wording):
                 run_command.return_value = Completed(
@@ -1331,7 +1357,8 @@ class ProviderPolicyTest(unittest.TestCase):
                     argv=("claude", "--help"),
                     returncode=0,
                     stdout=(
-                        b"--safe-mode Start with all customizations disabled. "
+                        b"--safe-mode Start with all customizations disabled "
+                        b"to troubleshoot. "
                         b"CLAUDE.md does not load. Authentication, model selection, "
                         b"built-in tools, "
                         b"and permissions work normally. "

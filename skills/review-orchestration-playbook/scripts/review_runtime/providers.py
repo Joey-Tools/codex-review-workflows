@@ -35,19 +35,22 @@ COPILOT_PERMISSION_HELP_FRAGMENTS = (
     "--disallow-temp-dir flag prevents automatic access",
     "denial rules always take precedence over allow rules, even --allow-all-tools",
 )
+CLAUDE_SAFE_MODE_MODEL_FRAGMENT = (
+    "model selection, built-in tools, and permissions work normally"
+)
 CLAUDE_SAFE_MODE_HELP_FRAGMENTS = (
     "--safe-mode",
     "claude.md",
-    "model selection, built-in tools, and permissions work normally",
+    CLAUDE_SAFE_MODE_MODEL_FRAGMENT,
 )
 CLAUDE_SAFE_MODE_DISABLE_PATTERN = re.compile(
     r"--safe-mode\s+start with all customizations(?:"
-    r"\s+disabled(?=\s+to troubleshoot\b|[.;:]|$)"
+    r"\s+disabled\s+to troubleshoot\b"
     r"|\s+\((?P<customizations>[^)]{1,2048})\)\s+disabled"
-    r"(?=\s+(?:(?:-|–|—)\s*)?useful\b|[.;:]|$))"
+    r"\s+(?:-|–|—)\s*useful\b)"
 )
 CLAUDE_SAFE_MODE_DISABLE_NEGATION_PATTERN = re.compile(
-    r"\b(?:no|not|never|except|excluding|without|other than)\b"
+    r"\b(?:no|not|never|but|except|excluding|without|other than|enabled)\b"
 )
 CLAUDE_SAFE_MODE_ENV_PATTERN = re.compile(
     r"(?:^|[.;:]\s+)sets claude_code_safe_mode(?:=1)?(?:\.(?=\s|$)|$)"
@@ -223,27 +226,43 @@ def _require_claude_safe_mode(
         .lower()
         .split()
     )
-    disable_match = CLAUDE_SAFE_MODE_DISABLE_PATTERN.search(help_text)
-    customization_list = (
-        disable_match.group("customizations") if disable_match is not None else None
-    )
     if (
         completed.returncode != 0
         or not all(
             fragment in help_text for fragment in CLAUDE_SAFE_MODE_HELP_FRAGMENTS
         )
-        or disable_match is None
-        or (
-            customization_list is not None
-            and CLAUDE_SAFE_MODE_DISABLE_NEGATION_PATTERN.search(customization_list)
-            is not None
-        )
+        or not _claude_safe_mode_disable_semantics_are_verified(help_text)
         or CLAUDE_SAFE_MODE_ENV_PATTERN.search(help_text) is None
     ):
         raise ReviewError(
             "Claude Code does not expose verifiable --safe-mode semantics that "
             "disable CLAUDE.md and other project customizations"
         )
+
+
+def _claude_safe_mode_disable_semantics_are_verified(help_text: str) -> bool:
+    disable_match = CLAUDE_SAFE_MODE_DISABLE_PATTERN.search(help_text)
+    if disable_match is None:
+        return False
+    customization_list = disable_match.group("customizations")
+    if customization_list is not None and not customization_list.startswith(
+        "claude.md, skills, plugins"
+    ):
+        return False
+    model_marker = help_text.find(
+        CLAUDE_SAFE_MODE_MODEL_FRAGMENT,
+        disable_match.end(),
+    )
+    if model_marker < 0:
+        return False
+    semantics = help_text[disable_match.start() : model_marker]
+    for allowed_phrase in (
+        "do not load",
+        "does not load",
+        "servers do not",
+    ):
+        semantics = semantics.replace(allowed_phrase, "disabled")
+    return CLAUDE_SAFE_MODE_DISABLE_NEGATION_PATTERN.search(semantics) is None
 
 
 def classify_failure(stdout: bytes | str, stderr: bytes | str) -> str:
