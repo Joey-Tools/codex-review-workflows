@@ -455,6 +455,10 @@ class ProviderPolicyTest(unittest.TestCase):
                     "data": {"selectedModel": "claude-opus-4.7"},
                 },
                 {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
                     "type": "turn.failed",
                     "error": {"message": "Model is not available for your account"},
                 },
@@ -466,6 +470,28 @@ class ProviderPolicyTest(unittest.TestCase):
                 stdout, requested_model="claude-opus-4.8"
             ),
             (None, "claude-opus-4.7"),
+        )
+
+    def test_copilot_error_without_turn_is_unverifiable(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "session.start",
+                    "data": {"selectedModel": "claude-opus-4.8"},
+                },
+                {
+                    "type": "turn.failed",
+                    "error": {"message": "Model is not available for your account"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(
+            providers._parse_copilot_output(
+                stdout, requested_model="claude-opus-4.8"
+            ),
+            (None, None),
         )
 
     def test_copilot_error_rejects_malformed_model_evidence(self) -> None:
@@ -1355,7 +1381,7 @@ class ProviderPolicyTest(unittest.TestCase):
     )
     @mock.patch.object(providers, "_copilot_attempt")
     @mock.patch.object(providers, "_claude_attempt")
-    def test_claude_disappearance_uses_authorized_copilot_fallback(
+    def test_claude_disappearance_is_inconclusive_not_fallback(
         self,
         claude_attempt: mock.Mock,
         copilot_attempt: mock.Mock,
@@ -1363,6 +1389,42 @@ class ProviderPolicyTest(unittest.TestCase):
         _environment: mock.Mock,
     ) -> None:
         claude_attempt.side_effect = FileNotFoundError("claude disappeared")
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
+
+        self.assertEqual(outcome.returncode, 75)
+        claude_attempt.assert_called_once()
+        copilot_attempt.assert_not_called()
+        self.assertEqual(resolve.call_count, 1)
+        self.assertIn(
+            "inconclusive",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        side_effect=providers.ClaudeProbeSandboxUnavailable("sandbox unavailable"),
+    )
+    @mock.patch.object(
+        providers,
+        "resolve_reviewer_executable",
+        return_value=pathlib.Path("/bin/copilot"),
+    )
+    @mock.patch.object(providers, "_copilot_attempt")
+    def test_missing_claude_probe_sandbox_allows_authorized_copilot_fallback(
+        self,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _resolve_claude: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
         copilot_attempt.return_value = self.attempt(
             "copilot",
             providers.COPILOT_MODELS[0],
@@ -1373,13 +1435,18 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="double-review",
+            egress_consent="triple-review",
         )
 
         self.assertEqual(outcome.returncode, 0)
-        claude_attempt.assert_called_once()
         copilot_attempt.assert_called_once()
-        self.assertEqual(resolve.call_count, 2)
+        resolve.assert_called_once_with("copilot")
+        self.assertIn(
+            "probe runtime is unavailable",
+            (self.review.container_dir / "claude-skip.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
 
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(
@@ -2250,6 +2317,30 @@ class ProviderPolicyTest(unittest.TestCase):
             profile,
         )
         self.assertNotIn("/Users/joey", profile)
+
+    def test_claude_probe_profile_rejects_overly_broad_dependency_roots(
+        self,
+    ) -> None:
+        for dependency in (
+            pathlib.Path("/Users/joey/claude"),
+            pathlib.Path("/claude"),
+        ):
+            with (
+                self.subTest(dependency=dependency),
+                mock.patch.object(
+                    providers,
+                    "reviewer_executable_dependencies",
+                    return_value=(dependency,),
+                ),
+                mock.patch.dict(providers.os.environ, {"HOME": "/Users/joey"}),
+            ):
+                with self.assertRaisesRegex(
+                    providers.InvalidReviewerExecutable, "overly broad"
+                ):
+                    providers._claude_probe_sandbox_profile(
+                        dependency,
+                        pathlib.Path("/isolated/probe-home"),
+                    )
 
     @mock.patch.object(
         providers,

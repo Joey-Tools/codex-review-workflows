@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import re
+import select
 import signal
 import shutil
 import subprocess
@@ -171,6 +172,10 @@ def run(
         raise ReviewError("output_file_limit_bytes requires timeout_seconds")
     if timeout_seconds is not None and (stdout_path is None or stderr_path is None):
         raise ReviewError("timeout_seconds requires logged output paths")
+    if output_file_limit_bytes is not None and output_file_limit_bytes <= 0:
+        raise ReviewError("output_file_limit_bytes must be positive")
+    if output_file_limit_bytes is not None and stdin is not None:
+        raise ReviewError("bounded logged output does not support stdin")
     try:
         if stdout_path is None or stderr_path is None:
             completed = subprocess.run(
@@ -346,6 +351,7 @@ def _run_logged_process(
     process: subprocess.Popen[bytes] | None = None
     pending_signal: signal.Signals | None = None
     drain_threads: list[threading.Thread] = []
+    stop_draining = threading.Event()
 
     def forward_signal(signum: int, _frame: object) -> None:
         nonlocal pending_signal
@@ -366,10 +372,6 @@ def _run_logged_process(
     try:
         if pending_signal is not None:
             raise ForwardedSignal(pending_signal)
-        if output_file_limit_bytes is not None and output_file_limit_bytes <= 0:
-            raise ReviewError("output_file_limit_bytes must be positive")
-        if output_file_limit_bytes is not None and stdin is not None:
-            raise ReviewError("bounded logged output does not support stdin")
         process = subprocess.Popen(
             command,
             cwd=cwd,
@@ -397,12 +399,20 @@ def _run_logged_process(
         def drain_bounded(stream: BinaryIO, destination: BinaryIO) -> None:
             try:
                 written = 0
-                # BufferedReader.read(size) may wait for the full size or EOF. That
-                # turns an already-observable limit breach into a timeout when a
-                # hostile child keeps the stream open. read1() returns currently
-                # available pipe data while preserving the same bounded chunk size.
-                read_available = getattr(stream, "read1", stream.read)
-                while chunk := read_available(64 * 1024):
+                descriptor = stream.fileno()
+                os.set_blocking(descriptor, False)
+                while not stop_draining.is_set():
+                    readable, _, _ = select.select(
+                        (descriptor,), (), (), PROCESS_GROUP_POLL_SECONDS
+                    )
+                    if not readable:
+                        continue
+                    try:
+                        chunk = os.read(descriptor, 64 * 1024)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        return
                     remaining = output_file_limit_bytes - written
                     if remaining > 0:
                         destination.write(chunk[:remaining])
@@ -449,6 +459,9 @@ def _run_logged_process(
         for thread in drain_threads:
             thread.join(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
         if any(thread.is_alive() for thread in drain_threads):
+            stop_draining.set()
+            for thread in drain_threads:
+                thread.join(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
             raise ReviewProcessLeakError(
                 "command output streams remained open after bounded cleanup: "
                 f"{' '.join(command)}"
@@ -480,6 +493,7 @@ def _run_logged_process(
                     initial_signal=cleanup_signal,
                     signal_already_sent=pending_signal is not None,
                 )
+            stop_draining.set()
             for thread in drain_threads:
                 thread.join(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
             if process is not None and output_file_limit_bytes is not None:

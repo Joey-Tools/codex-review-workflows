@@ -5,6 +5,7 @@ import pathlib
 import signal
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -131,6 +132,40 @@ class ChildEnvironmentTest(unittest.TestCase):
 
         popen.assert_not_called()
 
+    @mock.patch.object(common.subprocess, "Popen")
+    def test_invalid_bounded_output_arguments_preserve_existing_logs(
+        self, popen: mock.Mock
+    ) -> None:
+        cases = (
+            ({"output_file_limit_bytes": 0}, "must be positive"),
+            (
+                {"output_file_limit_bytes": 4096, "stdin": b"payload"},
+                "does not support stdin",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            for index, (arguments, message) in enumerate(cases):
+                with self.subTest(message=message):
+                    stdout_path = root / f"stdout-{index}.log"
+                    stderr_path = root / f"stderr-{index}.log"
+                    stdout_path.write_bytes(b"existing stdout")
+                    stderr_path.write_bytes(b"existing stderr")
+
+                    with self.assertRaisesRegex(ReviewError, message):
+                        common.run(
+                            (sys.executable, "-c", "pass"),
+                            stdout_path=stdout_path,
+                            stderr_path=stderr_path,
+                            timeout_seconds=5,
+                            **arguments,
+                        )
+
+                    self.assertEqual(stdout_path.read_bytes(), b"existing stdout")
+                    self.assertEqual(stderr_path.read_bytes(), b"existing stderr")
+
+        popen.assert_not_called()
+
     @mock.patch.object(common.threading, "Thread")
     def test_failed_drain_thread_start_is_not_joined(
         self, thread_factory: mock.Mock
@@ -152,14 +187,17 @@ class ChildEnvironmentTest(unittest.TestCase):
 
     def test_drain_thread_io_failure_is_propagated(self) -> None:
         process = mock.Mock(pid=12345, returncode=0)
-        process.stdout.read1.side_effect = OSError("read failed")
-        process.stderr.read1.return_value = b""
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             with (
                 mock.patch.object(common.subprocess, "Popen", return_value=process),
                 mock.patch.object(common, "_process_group_exists", return_value=False),
                 mock.patch.object(common, "signal_process_group") as terminate,
+                mock.patch.object(common.os, "set_blocking"),
+                mock.patch.object(
+                    common.select, "select", return_value=([123], [], [])
+                ),
+                mock.patch.object(common.os, "read", side_effect=OSError("read failed")),
             ):
                 with self.assertRaises(common.ReviewOutputDrainError):
                     common.run(
@@ -170,7 +208,47 @@ class ChildEnvironmentTest(unittest.TestCase):
                         output_file_limit_bytes=4096,
                     )
 
-        terminate.assert_called_once_with(process, signal.SIGTERM)
+        self.assertGreaterEqual(terminate.call_count, 1)
+        terminate.assert_any_call(process, signal.SIGTERM)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork")
+    def test_timeout_does_not_wait_for_detached_descendant_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            child_pid_path = root / "child.pid"
+            started = time.monotonic()
+            try:
+                with self.assertRaises(common.ReviewTimeoutError):
+                    common.run(
+                        (
+                            sys.executable,
+                            "-c",
+                            (
+                                "import os,pathlib,sys,time\n"
+                                "pid = os.fork()\n"
+                                "if pid == 0:\n"
+                                "    os.setsid()\n"
+                                "    pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+                                "    time.sleep(3)\n"
+                                "    os._exit(0)\n"
+                                "time.sleep(3)\n"
+                            ),
+                            str(child_pid_path),
+                        ),
+                        stdout_path=root / "stdout.log",
+                        stderr_path=root / "stderr.log",
+                        timeout_seconds=0.2,
+                        output_file_limit_bytes=4096,
+                    )
+            finally:
+                if child_pid_path.exists():
+                    child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+            self.assertLess(time.monotonic() - started, 1.5)
 
     @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork")
     def test_logged_command_rejects_descendant_holding_output_stream(self) -> None:

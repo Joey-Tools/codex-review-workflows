@@ -176,6 +176,10 @@ AUTH_FAILURE_FRAGMENTS = (
 CODEX_ARG_TRANSPORT_NAME = re.compile(r"codex-arg0[A-Za-z0-9]+")
 
 
+class ClaudeProbeSandboxUnavailable(ReviewError):
+    """The host does not provide the required Claude probe sandbox runtime."""
+
+
 @dataclass(frozen=True)
 class Attempt:
     runtime: str
@@ -256,7 +260,7 @@ def _claude_probe_command(
     if not CLAUDE_PROBE_SANDBOX.is_file() or not os.access(
         CLAUDE_PROBE_SANDBOX, os.X_OK
     ):
-        raise FileNotFoundError(
+        raise ClaudeProbeSandboxUnavailable(
             "Claude Code review requires macOS sandbox-exec for preflight probes"
         )
     return (
@@ -278,10 +282,21 @@ def _claude_probe_sandbox_profile(
     probe_cwd: pathlib.Path,
 ) -> str:
     dependencies = reviewer_executable_dependencies(executable)
+    host_home = pathlib.Path(
+        os.environ.get("HOME", str(pathlib.Path.home()))
+    ).expanduser().resolve()
+    dependency_roots = {path.parent.resolve() for path in dependencies}
+    if any(
+        root == pathlib.Path("/") or root == host_home or root in host_home.parents
+        for root in dependency_roots
+    ):
+        raise InvalidReviewerExecutable(
+            "Claude Code executable or interpreter has an overly broad installation root"
+        )
     read_subpaths = {
         probe_cwd.resolve(),
         *(path.resolve() for path in CLAUDE_PROBE_SYSTEM_READ_SUBPATHS),
-        *(path.parent.resolve() for path in dependencies),
+        *dependency_roots,
     }
     read_files = {
         *(path.resolve() for path in CLAUDE_PROBE_SYSTEM_READ_LITERALS),
@@ -763,6 +778,8 @@ def _parse_copilot_objects(
                 or last_error_index >= terminal_index
             ):
                 return None, None
+        else:
+            return None, None
         effective_model = latest_requested_mismatch or latest_model
         return None, effective_model
     if (
@@ -1600,13 +1617,14 @@ def run_review(
             env=claude_env,
         )
         claude_available = claude_executable is not None
-    except FileNotFoundError as error:
+    except ClaudeProbeSandboxUnavailable as error:
         claude_available = False
         write_text_atomic(
             review.container_dir / "claude-skip.txt",
             f"Claude Code probe runtime is unavailable: {error}\n",
         )
     except (
+        FileNotFoundError,
         ReviewTimeoutError,
         ReviewOutputDrainError,
         ReviewOutputLimitError,
@@ -1643,10 +1661,8 @@ def run_review(
                 env=claude_env,
                 attempts=attempts,
             )
-        except FileNotFoundError:
-            category = "unavailable"
-            final_text = None
         except (
+            FileNotFoundError,
             ReviewTimeoutError,
             ReviewOutputDrainError,
             ReviewOutputLimitError,
