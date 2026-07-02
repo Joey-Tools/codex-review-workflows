@@ -30,6 +30,10 @@ class ReviewOutputLimitError(ReviewError):
     """A bounded reviewer subprocess exceeded its output allowance."""
 
 
+class ReviewOutputDrainError(ReviewError):
+    """A reviewer output stream could not be drained completely."""
+
+
 class ReviewProcessLeakError(ReviewError):
     """A reviewer subprocess exited while descendants retained its process group."""
 
@@ -388,23 +392,28 @@ def _run_logged_process(
         assert process.stdout is not None
         assert process.stderr is not None
         output_overflow = threading.Event()
+        drain_errors: list[Exception] = []
 
         def drain_bounded(stream: BinaryIO, destination: BinaryIO) -> None:
-            written = 0
-            # BufferedReader.read(size) may wait for the full size or EOF. That
-            # turns an already-observable limit breach into a timeout when a
-            # hostile child keeps the stream open. read1() returns currently
-            # available pipe data while preserving the same bounded chunk size.
-            read_available = getattr(stream, "read1", stream.read)
-            while chunk := read_available(64 * 1024):
-                remaining = output_file_limit_bytes - written
-                if remaining > 0:
-                    destination.write(chunk[:remaining])
-                    destination.flush()
-                    written += min(len(chunk), remaining)
-                if len(chunk) > remaining and not output_overflow.is_set():
-                    output_overflow.set()
-                    signal_process_group(process, signal.SIGTERM)
+            try:
+                written = 0
+                # BufferedReader.read(size) may wait for the full size or EOF. That
+                # turns an already-observable limit breach into a timeout when a
+                # hostile child keeps the stream open. read1() returns currently
+                # available pipe data while preserving the same bounded chunk size.
+                read_available = getattr(stream, "read1", stream.read)
+                while chunk := read_available(64 * 1024):
+                    remaining = output_file_limit_bytes - written
+                    if remaining > 0:
+                        destination.write(chunk[:remaining])
+                        destination.flush()
+                        written += min(len(chunk), remaining)
+                    if len(chunk) > remaining and not output_overflow.is_set():
+                        output_overflow.set()
+                        signal_process_group(process, signal.SIGTERM)
+            except Exception as error:
+                drain_errors.append(error)
+                signal_process_group(process, signal.SIGTERM)
 
         thread_start_mask = block_forwarded_signals()
         try:
@@ -432,6 +441,10 @@ def _run_logged_process(
                 "command output streams remained open after bounded cleanup: "
                 f"{' '.join(command)}"
             )
+        if drain_errors:
+            raise ReviewOutputDrainError(
+                f"command output drain failed: {' '.join(command)}"
+            ) from drain_errors[0]
         if output_overflow.is_set():
             raise ReviewOutputLimitError(
                 "command output exceeded "

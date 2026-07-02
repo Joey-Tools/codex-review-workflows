@@ -127,6 +127,28 @@ class ChildEnvironmentTest(unittest.TestCase):
 
         thread.join.assert_not_called()
 
+    def test_drain_thread_io_failure_is_propagated(self) -> None:
+        process = mock.Mock(pid=12345, returncode=0)
+        process.stdout.read1.side_effect = OSError("read failed")
+        process.stderr.read1.return_value = b""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with (
+                mock.patch.object(common.subprocess, "Popen", return_value=process),
+                mock.patch.object(common, "_process_group_exists", return_value=False),
+                mock.patch.object(common, "signal_process_group") as terminate,
+            ):
+                with self.assertRaises(common.ReviewOutputDrainError):
+                    common.run(
+                        ("reviewer",),
+                        stdout_path=root / "stdout.log",
+                        stderr_path=root / "stderr.log",
+                        timeout_seconds=5,
+                        output_file_limit_bytes=4096,
+                    )
+
+        terminate.assert_called_once_with(process, signal.SIGTERM)
+
     @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork")
     def test_logged_command_rejects_descendant_holding_output_stream(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

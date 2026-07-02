@@ -12,6 +12,7 @@ from .common import (
     Completed,
     InvalidReviewerExecutable,
     ReviewError,
+    ReviewOutputDrainError,
     ReviewOutputLimitError,
     ReviewProcessLeakError,
     ReviewTimeoutError,
@@ -80,6 +81,7 @@ CLAUDE_PROBE_SYSTEM_READ_LITERALS = (
 )
 CLAUDE_PROBE_TIMEOUT_SECONDS = 20.0
 CLAUDE_PROBE_OUTPUT_LIMIT_BYTES = 64 * 1024
+COPILOT_JSONL_RECORD_LIMIT_BYTES = 4 * 1024 * 1024
 CLAUDE_EGRESS_CONSENTS = (
     "explicit-claude-review",
     "double-review",
@@ -541,41 +543,41 @@ def _error_payload_text(value: Any) -> list[str]:
     return []
 
 
-def _structured_error_text(stdout: bytes) -> str:
+def _structured_error_item_text(item: dict[str, Any]) -> str:
     messages: list[str] = []
-
-    def error_state(value: Any) -> tuple[bool, str]:
-        if not isinstance(value, dict):
-            return False, ""
-        tokens = [
-            item.lower()
-            for key in ("type", "subtype", "status")
-            if isinstance((item := value.get(key)), str)
-        ]
-        explicit = value.get("is_error") is True or any(
-            token == "error"
-            or token in {"failed", "failure", "error_during_execution"}
-            or token.endswith(".failed")
-            or token.endswith(".failure")
-            or token.endswith(".error")
-            or token.endswith("_error")
-            or token.startswith("error_")
-            for token in tokens
-        )
-        return explicit, " ".join(tokens)
-
-    for item in _json_objects(stdout):
-        explicit_error, state_text = error_state(item)
-        if not explicit_error:
-            continue
-        messages.append(f"event {state_text or 'explicit error'}")
-        for key in ("error", "errors", "message", "reason", "detail", "code"):
-            if key in item:
-                messages.extend(_error_payload_text(item[key]))
-        api_error_status = item.get("api_error_status")
-        if isinstance(api_error_status, (int, str)):
-            messages.append(f"status {api_error_status}")
+    tokens = [
+        value.lower()
+        for key in ("type", "subtype", "status")
+        if isinstance((value := item.get(key)), str)
+    ]
+    explicit_error = item.get("is_error") is True or any(
+        token == "error"
+        or token in {"failed", "failure", "error_during_execution"}
+        or token.endswith(".failed")
+        or token.endswith(".failure")
+        or token.endswith(".error")
+        or token.endswith("_error")
+        or token.startswith("error_")
+        for token in tokens
+    )
+    if not explicit_error:
+        return ""
+    messages.append(f"event {' '.join(tokens) or 'explicit error'}")
+    for key in ("error", "errors", "message", "reason", "detail", "code"):
+        if key in item:
+            messages.extend(_error_payload_text(item[key]))
+    api_error_status = item.get("api_error_status")
+    if isinstance(api_error_status, (int, str)):
+        messages.append(f"status {api_error_status}")
     return "\n".join(messages)
+
+
+def _structured_error_text(stdout: bytes) -> str:
+    return "\n".join(
+        message
+        for item in _json_objects(stdout)
+        if (message := _structured_error_item_text(item))
+    )
 
 
 def _parse_claude_output(
@@ -611,14 +613,23 @@ def _parse_claude_output(
         effective_model = candidates[-1]
     if result.get("subtype") != "success" or result.get("is_error") is not False:
         return None, effective_model
-    if any(
-        _error_payload_text(result.get(key))
-        for key in ("error", "errors")
-    ):
-        return None, effective_model
-    api_error_status = result.get("api_error_status")
-    if isinstance(api_error_status, (int, str)) and str(api_error_status).strip():
-        return None, effective_model
+    for key in ("error", "errors"):
+        if key not in result:
+            continue
+        value = result[key]
+        explicitly_empty = (
+            value is None
+            or (isinstance(value, str) and not value.strip())
+            or (isinstance(value, (list, dict)) and not value)
+        )
+        if not explicitly_empty:
+            return None, effective_model
+    if "api_error_status" in result:
+        value = result["api_error_status"]
+        if value is not None and not (
+            isinstance(value, str) and not value.strip()
+        ):
+            return None, effective_model
     final_text = result.get("result")
     if not isinstance(final_text, str) or not final_text.strip() or not candidates:
         return None, effective_model
@@ -627,111 +638,142 @@ def _parse_claude_output(
     return final_text, effective_model
 
 
-def _copilot_model_evidence(
-    objects: list[dict[str, Any]],
-) -> list[str] | None:
-    candidates: list[str] = []
-    for item in objects:
-        event_type = item.get("type")
-        if event_type == "session.start":
-            model_key = "selectedModel"
-        elif event_type in {"assistant.message", "assistant.usage"}:
-            model_key = "model"
-        else:
-            continue
-        data = item.get("data")
-        if not isinstance(data, dict):
-            return None
-        if event_type != "session.start" and data.get("parentToolCallId"):
-            continue
-        if model_key not in data:
-            continue
-        candidate = data[model_key]
-        if not isinstance(candidate, str) or not candidate:
-            return None
-        candidates.append(candidate)
-    return candidates
+def _copilot_item_model_evidence(
+    item: dict[str, Any],
+) -> tuple[bool, str | None]:
+    event_type = item.get("type")
+    if event_type == "session.start":
+        model_key = "selectedModel"
+    elif event_type in {"assistant.message", "assistant.usage"}:
+        model_key = "model"
+    else:
+        return True, None
+    data = item.get("data")
+    if not isinstance(data, dict):
+        return False, None
+    if event_type != "session.start" and data.get("parentToolCallId"):
+        return True, None
+    if model_key not in data:
+        return True, None
+    candidate = data[model_key]
+    if not isinstance(candidate, str) or not candidate:
+        return False, None
+    return True, candidate
 
 
-def _copilot_error_effective_model(
-    candidates: list[str], requested_model: str | None
-) -> str | None:
-    if requested_model is not None:
-        mismatch = next(
-            (
-                candidate
-                for candidate in reversed(candidates)
-                if not _model_matches(requested_model, candidate)
-            ),
-            None,
-        )
-        if mismatch is not None:
-            return mismatch
-    return candidates[-1] if candidates else None
-
-
-def _parse_copilot_output(
-    stdout: bytes, *, requested_model: str | None = None
+def _parse_copilot_objects(
+    objects: Iterable[dict[str, Any]],
+    *,
+    requested_model: str | None = None,
 ) -> tuple[str | None, str | None]:
-    objects = _strict_jsonl_objects(stdout)
-    if objects is None:
-        return None, None
-    model_evidence = _copilot_model_evidence(objects)
-    if model_evidence is None:
-        return None, None
-    structured_error = bool(_structured_error_text(stdout).strip())
-    open_turn: tuple[str, int] | None = None
-    completed_turns: list[tuple[str, int, int]] = []
+    open_turn: dict[str, Any] | None = None
+    completed_turn: tuple[int, dict[str, Any]] | None = None
+    latest_session_model: str | None = None
+    first_model: str | None = None
+    latest_model: str | None = None
+    latest_requested_mismatch: str | None = None
+    evidence_conflict = False
+    structured_error = False
+    first_error_index: int | None = None
+    last_error_index: int | None = None
+    last_index = -1
+
     for index, item in enumerate(objects):
+        last_index = index
+        valid_model, candidate = _copilot_item_model_evidence(item)
+        if not valid_model:
+            return None, None
+        if candidate is not None:
+            latest_model = candidate
+            if first_model is None:
+                first_model = candidate
+            elif not _model_matches(first_model, candidate):
+                evidence_conflict = True
+            if requested_model is not None and not _model_matches(
+                requested_model, candidate
+            ):
+                latest_requested_mismatch = candidate
+        if _structured_error_item_text(item):
+            structured_error = True
+            first_error_index = (
+                index if first_error_index is None else first_error_index
+            )
+            last_error_index = index
+
         event_type = item.get("type")
-        if event_type not in {"assistant.turn_start", "assistant.turn_end"}:
-            continue
-        data = item.get("data")
-        if not isinstance(data, dict):
-            return None, None
-        event_turn_id = data.get("turnId")
-        if not isinstance(event_turn_id, str) or not event_turn_id:
-            return None, None
-        if event_type == "assistant.turn_start":
-            if open_turn is not None:
+        if event_type == "session.start" and candidate is not None:
+            latest_session_model = candidate
+        if event_type in {"assistant.turn_start", "assistant.turn_end"}:
+            data = item.get("data")
+            if not isinstance(data, dict):
                 return None, None
-            open_turn = (event_turn_id, index)
+            turn_id = data.get("turnId")
+            if not isinstance(turn_id, str) or not turn_id:
+                return None, None
+            if event_type == "assistant.turn_start":
+                if open_turn is not None:
+                    return None, None
+                open_turn = {
+                    "id": turn_id,
+                    "start_index": index,
+                    "message": None,
+                    "session_model": latest_session_model,
+                    "usage_model": None,
+                }
+                continue
+            if open_turn is None or open_turn["id"] != turn_id:
+                return None, None
+            completed_turn = (
+                index,
+                {
+                    "message": open_turn["message"],
+                    "session_model": open_turn["session_model"],
+                    "start_index": open_turn["start_index"],
+                    "usage_model": open_turn["usage_model"],
+                },
+            )
+            open_turn = None
             continue
-        if open_turn is None or open_turn[0] != event_turn_id:
-            return None, None
-        completed_turns.append((event_turn_id, open_turn[1], index))
-        open_turn = None
+
+        if open_turn is None:
+            continue
+        if event_type == "assistant.message":
+            data = item["data"]
+            if data.get("parentToolCallId"):
+                continue
+            open_turn["message"] = data
+            open_turn["usage_model"] = None
+        elif event_type == "assistant.usage":
+            data = item["data"]
+            if data.get("parentToolCallId") or open_turn["message"] is None:
+                continue
+            if candidate is not None and open_turn["usage_model"] is None:
+                open_turn["usage_model"] = candidate
+
     if structured_error:
-        if completed_turns and completed_turns[-1][2] != len(objects) - 1:
+        assert first_error_index is not None and last_error_index is not None
+        if completed_turn is not None:
+            terminal_index, turn = completed_turn
+            if (
+                terminal_index != last_index
+                or first_error_index <= turn["start_index"]
+                or last_error_index >= terminal_index
+            ):
+                return None, None
+        elif open_turn is not None and first_error_index <= open_turn["start_index"]:
             return None, None
-        return None, _copilot_error_effective_model(
-            model_evidence, requested_model
-        )
-    if open_turn is not None or not completed_turns:
-        return None, None
-    _, start_index, terminal_index = completed_turns[-1]
-    if objects[terminal_index + 1 :]:
-        return None, None
-    turn_events = objects[start_index + 1 : terminal_index]
-    if any(
-        item.get("type") in {"assistant.turn_start", "assistant.turn_end"}
-        for item in turn_events
+        effective_model = latest_requested_mismatch or latest_model
+        return None, effective_model
+    if (
+        open_turn is not None
+        or completed_turn is None
+        or completed_turn[0] != last_index
+        or evidence_conflict
     ):
         return None, None
-    message_index = None
-    for index in range(len(turn_events) - 1, -1, -1):
-        item = turn_events[index]
-        if item.get("type") != "assistant.message":
-            continue
-        item_data = item.get("data")
-        if isinstance(item_data, dict) and item_data.get("parentToolCallId"):
-            continue
-        message_index = index
-        break
-    if message_index is None:
-        return None, None
-    message = turn_events[message_index]
-    data = message.get("data")
+
+    turn = completed_turn[1]
+    data = turn["message"]
     if not isinstance(data, dict):
         return None, None
     tool_requests = data.get("toolRequests", [])
@@ -740,47 +782,56 @@ def _parse_copilot_output(
     content = data.get("content")
     if not isinstance(content, str) or not content.strip():
         return None, None
-    usage_models: list[str] = []
-    for item in turn_events[message_index + 1 :]:
-        if item.get("type") != "assistant.usage":
-            continue
-        usage_data = item.get("data")
-        if not isinstance(usage_data, dict):
-            return None, None
-        if usage_data.get("parentToolCallId"):
-            continue
-        usage_model = usage_data.get("model")
-        if not isinstance(usage_model, str) or not usage_model:
-            return None, None
-        usage_models.append(usage_model)
-    if usage_models and any(
-        not _model_matches(usage_models[0], candidate)
-        for candidate in usage_models[1:]
-    ):
-        return None, None
+    usage_model = turn["usage_model"]
     message_model = data.get("model")
-    if usage_models and isinstance(message_model, str) and message_model:
-        if not _model_matches(usage_models[0], message_model):
-            return None, None
-    model = usage_models[0] if usage_models else message_model
-    if not isinstance(model, str) or not model:
-        session_model = next(
-            (
-                item["data"].get("selectedModel")
-                for item in reversed(objects[: start_index + 1])
-                if item.get("type") == "session.start"
-                and isinstance(item.get("data"), dict)
-                and isinstance(item["data"].get("selectedModel"), str)
-                and item["data"]["selectedModel"]
-            ),
-            None,
-        )
-        model = session_model
+    model = usage_model or message_model or turn["session_model"]
     if not isinstance(model, str) or not model:
         return None, None
-    if any(not _model_matches(model, candidate) for candidate in model_evidence):
+    if first_model is not None and not _model_matches(model, first_model):
         return None, None
     return content, model
+
+
+def _parse_copilot_output(
+    stdout: bytes, *, requested_model: str | None = None
+) -> tuple[str | None, str | None]:
+    objects = _strict_jsonl_objects(stdout)
+    if objects is None:
+        return None, None
+    return _parse_copilot_objects(objects, requested_model=requested_model)
+
+
+def _strict_jsonl_file_objects(path: pathlib.Path) -> Iterable[dict[str, Any]]:
+    with path.open("rb") as handle:
+        while raw_line := handle.readline(COPILOT_JSONL_RECORD_LIMIT_BYTES + 2):
+            line = raw_line[:-1] if raw_line.endswith(b"\n") else raw_line
+            if len(line) > COPILOT_JSONL_RECORD_LIMIT_BYTES:
+                raise ValueError("Copilot JSONL record exceeds the bounded parser limit")
+            if not line.strip(b" \t\r"):
+                continue
+            text = line.decode("utf-8")
+            parsed = json.loads(
+                text,
+                parse_constant=_reject_nonstandard_json_constant,
+                object_pairs_hook=_strict_json_object_from_pairs,
+            )
+            if not isinstance(parsed, dict):
+                raise ValueError("Copilot JSONL record is not an object")
+            yield parsed
+
+
+def _parse_copilot_output_file(
+    path: pathlib.Path,
+    *,
+    requested_model: str | None = None,
+) -> tuple[str | None, str | None]:
+    try:
+        return _parse_copilot_objects(
+            _strict_jsonl_file_objects(path),
+            requested_model=requested_model,
+        )
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None, None
 
 
 def _codex_thread_id(stdout: bytes) -> str | None:
@@ -1368,8 +1419,8 @@ def _copilot_attempt(
         stdout_path=stdout_path,
         stderr_path=stderr_path,
     )
-    final_text, effective_model = _parse_copilot_output(
-        completed.stdout, requested_model=model
+    final_text, effective_model = _parse_copilot_output_file(
+        stdout_path, requested_model=model
     )
     return _record_attempt(
         review=review,
@@ -1556,6 +1607,7 @@ def run_review(
         )
     except (
         ReviewTimeoutError,
+        ReviewOutputDrainError,
         ReviewOutputLimitError,
         ReviewProcessLeakError,
     ) as error:
@@ -1595,6 +1647,7 @@ def run_review(
             final_text = None
         except (
             ReviewTimeoutError,
+            ReviewOutputDrainError,
             ReviewOutputLimitError,
             ReviewProcessLeakError,
         ) as error:

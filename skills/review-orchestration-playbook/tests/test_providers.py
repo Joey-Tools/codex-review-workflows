@@ -294,6 +294,26 @@ class ProviderPolicyTest(unittest.TestCase):
             (None, "claude-opus-4-8"),
         )
 
+    def test_claude_rejects_unknown_or_malformed_error_payloads(self) -> None:
+        for field, value in (
+            ("errors", [{"exception": "failed"}]),
+            ("api_error_status", {"code": 500}),
+        ):
+            with self.subTest(field=field):
+                payload = {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "result": "No findings.",
+                    "modelUsage": {"claude-opus-4-8": {}},
+                    field: value,
+                }
+
+                self.assertEqual(
+                    providers._parse_claude_output(json.dumps(payload).encode()),
+                    (None, "claude-opus-4-8"),
+                )
+
     def test_nonterminal_claude_payload_cannot_supply_final_text(self) -> None:
         stdout = json.dumps(
             {
@@ -500,6 +520,44 @@ class ProviderPolicyTest(unittest.TestCase):
                 {
                     "type": "turn.failed",
                     "error": {"message": "Model is not available for your account"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(
+            providers._parse_copilot_output(
+                stdout, requested_model="claude-opus-4.8"
+            ),
+            (None, None),
+        )
+
+    def test_copilot_error_cannot_be_hidden_by_empty_completed_turn(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "session.start",
+                    "data": {"selectedModel": "claude-opus-4.8"},
+                },
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "turn.failed",
+                    "error": {"message": "Model is not available for your account"},
+                },
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-2"},
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-2"},
                 },
             )
         ).encode()
@@ -799,6 +857,42 @@ class ProviderPolicyTest(unittest.TestCase):
             providers._parse_copilot_output(stdout),
             ("No findings.", "claude-opus-4.8"),
         )
+
+    def test_copilot_streams_complete_jsonl_larger_than_memory_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            stdout_path = pathlib.Path(temporary) / "copilot.stdout.log"
+            progress = json.dumps(
+                {"type": "progress", "data": {"padding": "x" * 4096}}
+            )
+            with stdout_path.open("w", encoding="utf-8") as handle:
+                while handle.tell() <= 4 * 1024 * 1024:
+                    handle.write(progress + "\n")
+                for item in (
+                    {
+                        "type": "session.start",
+                        "data": {"selectedModel": "claude-opus-4.8"},
+                    },
+                    {
+                        "type": "assistant.turn_start",
+                        "data": {"turnId": "turn-1"},
+                    },
+                    {
+                        "type": "assistant.message",
+                        "data": {
+                            "content": "No findings.",
+                            "model": "claude-opus-4.8",
+                        },
+                    },
+                    {
+                        "type": "assistant.turn_end",
+                        "data": {"turnId": "turn-1"},
+                    },
+                ):
+                    handle.write(json.dumps(item) + "\n")
+
+            result = providers._parse_copilot_output_file(stdout_path)
+
+        self.assertEqual(result, ("No findings.", "claude-opus-4.8"))
 
     def test_copilot_rejects_malformed_terminal_message_model(self) -> None:
         stdout = "\n".join(
@@ -1359,6 +1453,34 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         resolve.side_effect = providers.ReviewOutputLimitError(
             "probe output exceeded limit"
+        )
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="triple-review",
+        )
+
+        self.assertEqual(outcome.returncode, 75)
+        copilot_attempt.assert_not_called()
+        self.assertIn(
+            "inconclusive",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(providers, "resolve_reviewer_executable")
+    @mock.patch.object(providers, "_copilot_attempt")
+    def test_claude_probe_drain_failure_is_inconclusive_not_fallback(
+        self,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        resolve.side_effect = providers.ReviewOutputDrainError(
+            "probe output drain failed"
         )
 
         outcome = providers.run_review(
