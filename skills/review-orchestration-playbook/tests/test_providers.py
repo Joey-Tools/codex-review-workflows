@@ -1235,6 +1235,7 @@ class ProviderPolicyTest(unittest.TestCase):
         run_command: mock.Mock,
     ) -> None:
         cli_form = providers.CLAUDE_SAFE_MODE_CLI_HELP_FORM
+        table_form = providers.CLAUDE_SAFE_MODE_TABLE_HELP_FORM
         for help_text in (
             cli_form.replace("all customizations", "not all customizations"),
             cli_form.replace("disabled — useful", "disabled — useful; however"),
@@ -1244,6 +1245,12 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
             cli_form.replace("claude.md", "claude.md enabled", 1),
             cli_form.replace("—", "-"),
+            table_form.replace("all customizations", "not all customizations"),
+            table_form.replace("do not load", "load", 1),
+            table_form.replace(
+                "sets claude_code_safe_mode",
+                "does not set claude_code_safe_mode",
+            ),
         ):
             with self.subTest(help_text=help_text):
                 run_command.return_value = Completed(
@@ -1292,23 +1299,23 @@ class ProviderPolicyTest(unittest.TestCase):
         self,
         run_command: mock.Mock,
     ) -> None:
-        form = providers.CLAUDE_SAFE_MODE_CLI_HELP_FORM
-        for help_text in (
-            "prefix" + form + " suffix",
-            "prefix " + form + "suffix",
-        ):
-            with self.subTest(help_text=help_text):
-                run_command.return_value = Completed(
-                    argv=("claude", "--help"),
-                    returncode=0,
-                    stdout=help_text.encode(),
-                    stderr=b"",
-                )
-
-                with self.assertRaisesRegex(ReviewError, "disable CLAUDE.md"):
-                    providers._require_claude_safe_mode(
-                        pathlib.Path("/bin/claude"), {}
+        for form in providers.CLAUDE_SAFE_MODE_VERIFIED_HELP_FORMS:
+            for help_text in (
+                "prefix" + form + " suffix",
+                "prefix " + form + "suffix",
+            ):
+                with self.subTest(form=form, help_text=help_text):
+                    run_command.return_value = Completed(
+                        argv=("claude", "--help"),
+                        returncode=0,
+                        stdout=help_text.encode(),
+                        stderr=b"",
                     )
+
+                    with self.assertRaisesRegex(ReviewError, "disable CLAUDE.md"):
+                        providers._require_claude_safe_mode(
+                            pathlib.Path("/bin/claude"), {}
+                        )
 
     @mock.patch.object(
         providers,

@@ -35,6 +35,9 @@ COPILOT_PERMISSION_HELP_FRAGMENTS = (
     "--disallow-temp-dir flag prevents automatic access",
     "denial rules always take precedence over allow rules, even --allow-all-tools",
 )
+# These are normalized from Claude Code 2.1.187 `--help` and the current official
+# CLI reference table. Exact matching is intentional: new wording fails closed
+# until this whitelist and its mutation tests are updated together.
 CLAUDE_SAFE_MODE_CLI_HELP_FORM = (
     "--safe-mode start with all customizations "
     "(claude.md, skills, plugins, hooks, mcp servers, custom commands and agents, "
