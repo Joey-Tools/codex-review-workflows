@@ -11,7 +11,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, BinaryIO, Iterable
+from typing import Any, BinaryIO, Callable, Iterable
 
 
 class ReviewError(RuntimeError):
@@ -569,7 +569,11 @@ def _executable_identity_matches(
     return all(marker.lower() in output for marker in marker_values)
 
 
-def resolve_reviewer_executable(name: str) -> pathlib.Path | None:
+def resolve_reviewer_executable(
+    name: str,
+    *,
+    candidate_validator: Callable[[pathlib.Path], None] | None = None,
+) -> pathlib.Path | None:
     specs = {
         "codex": (
             "CODEX_REVIEW_CODEX_PATH",
@@ -600,7 +604,15 @@ def resolve_reviewer_executable(name: str) -> pathlib.Path | None:
             raise ReviewError(f"{override_key} must be an absolute executable path")
         if not override.is_file() or not os.access(override, os.X_OK):
             raise ReviewError(f"{override_key} is not executable: {override}")
-        if not defer_identity and not _executable_identity_matches(override, markers):
+        if defer_identity and candidate_validator is not None:
+            try:
+                candidate_validator(override.absolute())
+            except ReviewError as error:
+                raise ReviewError(
+                    f"{override_key} did not pass sandboxed {name} validation: "
+                    f"{override}"
+                ) from error
+        elif not defer_identity and not _executable_identity_matches(override, markers):
             raise ReviewError(
                 f"{override_key} did not identify as the expected {name} CLI: {override}"
             )
@@ -622,9 +634,21 @@ def resolve_reviewer_executable(name: str) -> pathlib.Path | None:
         seen.add(key)
         if not candidate.is_file() or not os.access(candidate, os.X_OK):
             continue
-        if defer_identity or _executable_identity_matches(candidate, markers):
-            return candidate.absolute()
+        absolute = candidate.absolute()
+        if defer_identity:
+            if candidate_validator is None:
+                return absolute
+            try:
+                candidate_validator(absolute)
+            except ReviewError:
+                rejected.append(absolute)
+                continue
+            return absolute
+        if _executable_identity_matches(candidate, markers):
+            return absolute
         rejected.append(candidate.absolute())
+    if defer_identity and candidate_validator is not None:
+        return None
     if rejected:
         paths = ", ".join(str(path) for path in rejected)
         raise ReviewError(

@@ -243,7 +243,7 @@ class ProviderPolicyTest(unittest.TestCase):
         ).encode()
         final_text, effective_model = providers._parse_claude_output(stdout)
         self.assertIsNone(final_text)
-        self.assertIsNone(effective_model)
+        self.assertEqual(effective_model, "claude-opus-4-8")
 
     def test_requested_model_wins_over_auxiliary_claude_model_usage(self) -> None:
         stdout = json.dumps(
@@ -400,6 +400,65 @@ class ProviderPolicyTest(unittest.TestCase):
             providers._parse_copilot_output(stdout),
             ("No findings.", "claude-opus-4.8"),
         )
+
+    def test_copilot_ignores_usage_before_terminal_message(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.usage",
+                    "data": {"model": "claude-opus-4.7"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "content": "No findings.",
+                        "model": "claude-opus-4.8",
+                    },
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(
+            providers._parse_copilot_output(stdout),
+            ("No findings.", "claude-opus-4.8"),
+        )
+
+    def test_copilot_rejects_conflicting_terminal_usage_model(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "content": "No findings.",
+                        "model": "claude-opus-4.8",
+                    },
+                },
+                {
+                    "type": "assistant.usage",
+                    "data": {"model": "claude-opus-4.7"},
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
 
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(providers, "_codex_attempt")

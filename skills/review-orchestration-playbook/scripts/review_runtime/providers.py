@@ -447,19 +447,14 @@ def _parse_claude_output(
     if len(objects) != 1:
         return None, None
     result = objects[0]
-    if (
-        result.get("type") != "result"
-        or result.get("subtype") != "success"
-        or result.get("is_error") is not False
-    ):
-        return None, None
-    final_text = result.get("result")
-    if not isinstance(final_text, str) or not final_text.strip():
+    if result.get("type") != "result":
         return None, None
     model_usage = result.get("modelUsage")
-    if not isinstance(model_usage, dict) or not model_usage:
-        return None, None
-    candidates = [key for key in model_usage if isinstance(key, str) and key]
+    candidates = (
+        [key for key in model_usage if isinstance(key, str) and key]
+        if isinstance(model_usage, dict)
+        else []
+    )
     effective_model = None
     if requested_model is not None:
         effective_model = next(
@@ -472,6 +467,11 @@ def _parse_claude_output(
         )
     if effective_model is None and candidates:
         effective_model = candidates[-1]
+    if result.get("subtype") != "success" or result.get("is_error") is not False:
+        return None, effective_model
+    final_text = result.get("result")
+    if not isinstance(final_text, str) or not final_text.strip() or not candidates:
+        return None, effective_model
     if _structured_error_text(stdout).strip():
         return None, effective_model
     return final_text.strip(), effective_model
@@ -517,18 +517,19 @@ def _parse_copilot_output(
     if start_index is None:
         return None, None
     turn_events = objects[start_index + 1 : terminal_index]
-    message = next(
+    message_index = next(
         (
-            item
-            for item in reversed(turn_events)
-            if item.get("type") == "assistant.message"
-            and isinstance(item.get("data"), dict)
-            and not item["data"].get("parentToolCallId")
+            index
+            for index in range(len(turn_events) - 1, -1, -1)
+            if turn_events[index].get("type") == "assistant.message"
+            and isinstance(turn_events[index].get("data"), dict)
+            and not turn_events[index]["data"].get("parentToolCallId")
         ),
         None,
     )
-    if message is None:
+    if message_index is None:
         return None, None
+    message = turn_events[message_index]
     data = message["data"]
     tool_requests = data.get("toolRequests", [])
     if not isinstance(tool_requests, list) or tool_requests:
@@ -536,19 +537,25 @@ def _parse_copilot_output(
     content = data.get("content")
     if not isinstance(content, str) or not content.strip():
         return None, None
-    usage = next(
-        (
-            item["data"]
-            for item in reversed(turn_events)
-            if item.get("type") == "assistant.usage"
-            and isinstance(item.get("data"), dict)
-            and not item["data"].get("parentToolCallId")
-            and isinstance(item["data"].get("model"), str)
-            and item["data"]["model"]
-        ),
-        None,
-    )
-    model = usage["model"] if usage is not None else data.get("model")
+    usage_models = [
+        item["data"]["model"]
+        for item in turn_events[message_index + 1 :]
+        if item.get("type") == "assistant.usage"
+        and isinstance(item.get("data"), dict)
+        and not item["data"].get("parentToolCallId")
+        and isinstance(item["data"].get("model"), str)
+        and item["data"]["model"]
+    ]
+    if usage_models and any(
+        not _model_matches(usage_models[0], candidate)
+        for candidate in usage_models[1:]
+    ):
+        return None, None
+    message_model = data.get("model")
+    if usage_models and isinstance(message_model, str) and message_model:
+        if not _model_matches(usage_models[0], message_model):
+            return None, None
+    model = usage_models[0] if usage_models else message_model
     if not isinstance(model, str) or not model:
         session_model = next(
             (
@@ -947,12 +954,6 @@ def _claude_attempt(
     index: int,
     env: dict[str, str],
 ) -> Attempt:
-    executable = resolve_reviewer_executable("claude")
-    if executable is None:
-        raise FileNotFoundError(
-            "claude is not available in a validated executable path"
-        )
-    env = _with_executable_path(env, executable)
     claude_home = review.container_dir / "claude-home"
     claude_home.mkdir(parents=True, exist_ok=True)
     env = dict(env)
@@ -964,8 +965,25 @@ def _claude_attempt(
         if key != "ANTHROPIC_API_KEY"
         and not key.startswith("CODEX_ISOLATED_REVIEW_")
     }
-    _require_claude_identity(executable, probe_env)
-    _require_claude_bare_mode(executable, probe_env)
+    validated: set[pathlib.Path] = set()
+
+    def validate_candidate(candidate: pathlib.Path) -> None:
+        candidate_env = dict(probe_env)
+        candidate_env["PATH"] = reviewer_executable_path(candidate)
+        _require_claude_identity(candidate, candidate_env)
+        _require_claude_bare_mode(candidate, candidate_env)
+        validated.add(candidate)
+
+    executable = resolve_reviewer_executable(
+        "claude", candidate_validator=validate_candidate
+    )
+    if executable is None:
+        raise FileNotFoundError(
+            "claude is not available in a validated executable path"
+        )
+    if executable not in validated:
+        validate_candidate(executable)
+    env = _with_executable_path(env, executable)
     stdout_path, stderr_path = _attempt_paths(review, index, "claude", model)
     settings = json.dumps(
         {

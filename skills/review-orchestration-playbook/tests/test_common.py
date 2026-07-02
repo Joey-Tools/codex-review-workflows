@@ -339,6 +339,66 @@ class ChildEnvironmentTest(unittest.TestCase):
                 resolved = common.resolve_reviewer_executable("claude")
         self.assertEqual(resolved, executable.absolute())
 
+    def test_deferred_identity_continues_past_invalid_claude_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = pathlib.Path(temporary)
+            invalid = home / "invalid/claude"
+            valid = home / "valid/claude"
+            for executable in (invalid, valid):
+                executable.parent.mkdir(parents=True)
+                executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                executable.chmod(0o755)
+            validated: list[pathlib.Path] = []
+
+            def validate(candidate: pathlib.Path) -> None:
+                validated.append(candidate)
+                if candidate == invalid:
+                    raise ReviewError("not Claude Code")
+
+            with (
+                mock.patch.dict(common.os.environ, {"HOME": str(home)}, clear=True),
+                mock.patch.object(
+                    common,
+                    "_user_executable_candidates",
+                    return_value=[invalid, valid],
+                ),
+                mock.patch.object(common.shutil, "which", return_value=None),
+                mock.patch.object(
+                    common.os,
+                    "access",
+                    side_effect=lambda path, _mode: pathlib.Path(path)
+                    in {invalid, valid},
+                ),
+            ):
+                resolved = common.resolve_reviewer_executable(
+                    "claude", candidate_validator=validate
+                )
+
+        self.assertEqual(resolved, valid.absolute())
+        self.assertEqual(validated, [invalid.absolute(), valid.absolute()])
+
+    def test_invalid_explicit_claude_override_remains_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = pathlib.Path(temporary) / "claude"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o755)
+
+            with mock.patch.dict(
+                common.os.environ,
+                {
+                    "HOME": temporary,
+                    "CODEX_REVIEW_CLAUDE_PATH": str(executable),
+                },
+                clear=True,
+            ):
+                with self.assertRaisesRegex(ReviewError, "sandboxed claude validation"):
+                    common.resolve_reviewer_executable(
+                        "claude",
+                        candidate_validator=mock.Mock(
+                            side_effect=ReviewError("not Claude Code")
+                        ),
+                    )
+
     def test_present_but_invalid_codex_cli_is_not_treated_as_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             home = pathlib.Path(temporary)
