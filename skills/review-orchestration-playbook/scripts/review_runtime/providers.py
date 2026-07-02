@@ -41,8 +41,13 @@ CLAUDE_SAFE_MODE_HELP_FRAGMENTS = (
     "model selection, built-in tools, and permissions work normally",
 )
 CLAUDE_SAFE_MODE_DISABLE_PATTERN = re.compile(
-    r"--safe-mode\s+start with all customizations(?:\s+disabled\b"
-    r"|\s+\([^)]{1,2048}\)\s+disabled\b)"
+    r"--safe-mode\s+start with all customizations(?:"
+    r"\s+disabled(?=\s+to troubleshoot\b|[.;:]|$)"
+    r"|\s+\((?P<customizations>[^)]{1,2048})\)\s+disabled"
+    r"(?=\s+(?:(?:-|–|—)\s*)?useful\b|[.;:]|$))"
+)
+CLAUDE_SAFE_MODE_DISABLE_NEGATION_PATTERN = re.compile(
+    r"\b(?:no|not|never|except|excluding|without|other than)\b"
 )
 CLAUDE_SAFE_MODE_ENV_PATTERN = re.compile(
     r"(?:^|[.;:]\s+)sets claude_code_safe_mode(?:=1)?(?:\.(?=\s|$)|$)"
@@ -218,12 +223,21 @@ def _require_claude_safe_mode(
         .lower()
         .split()
     )
+    disable_match = CLAUDE_SAFE_MODE_DISABLE_PATTERN.search(help_text)
+    customization_list = (
+        disable_match.group("customizations") if disable_match is not None else None
+    )
     if (
         completed.returncode != 0
         or not all(
             fragment in help_text for fragment in CLAUDE_SAFE_MODE_HELP_FRAGMENTS
         )
-        or CLAUDE_SAFE_MODE_DISABLE_PATTERN.search(help_text) is None
+        or disable_match is None
+        or (
+            customization_list is not None
+            and CLAUDE_SAFE_MODE_DISABLE_NEGATION_PATTERN.search(customization_list)
+            is not None
+        )
         or CLAUDE_SAFE_MODE_ENV_PATTERN.search(help_text) is None
     ):
         raise ReviewError(

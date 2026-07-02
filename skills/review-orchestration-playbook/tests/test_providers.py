@@ -1225,12 +1225,12 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         for disable_help in (
             (
-                b"--safe-mode Start with all customizations disabled. "
+                b"--safe-mode Start with all customizations disabled to troubleshoot. "
                 b"CLAUDE.md does not load. "
             ),
             (
                 b"--safe-mode Start with all customizations "
-                b"(CLAUDE.md, skills, plugins) disabled. "
+                b"(CLAUDE.md, skills, plugins) disabled - useful. "
             ),
         ):
             for wording in (
@@ -1272,6 +1272,14 @@ class ProviderPolicyTest(unittest.TestCase):
                 b"--safe-mode Start with all customizations not disabled, "
                 b"including CLAUDE.md. "
             ),
+            b"--safe-mode Start with all customizations (not, CLAUDE.md) disabled. ",
+            b"--safe-mode Start with all customizations (except CLAUDE.md) disabled. ",
+            (
+                b"--safe-mode Start with all customizations "
+                b"(excluding CLAUDE.md) disabled. "
+            ),
+            b"--safe-mode Start with all customizations (without CLAUDE.md) disabled. ",
+            b"--safe-mode Start with all customizations disabled except CLAUDE.md. ",
         ):
             with self.subTest(wording=wording):
                 run_command.return_value = Completed(
