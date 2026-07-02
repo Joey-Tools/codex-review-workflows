@@ -1228,6 +1228,8 @@ class ProviderPolicyTest(unittest.TestCase):
                 review=self.review,
                 models=providers.CODEX_MODELS,
                 runner=runner,
+                runtime="codex",
+                requested_effort=providers.CODEX_REASONING_EFFORT,
                 env={},
                 attempts=attempts,
             )
@@ -1257,6 +1259,8 @@ class ProviderPolicyTest(unittest.TestCase):
             review=self.review,
             models=("gpt-5.6-sol",),
             runner=runner,
+            runtime="codex",
+            requested_effort=providers.CODEX_REASONING_EFFORT,
             env={},
             attempts=attempts,
         )
@@ -1314,6 +1318,11 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertEqual(outcome.returncode, 75)
         codex_attempt.assert_called_once()
+        self.assertEqual(len(outcome.attempts), 1)
+        self.assertEqual(outcome.attempts[0].runtime, "codex")
+        self.assertEqual(outcome.attempts[0].requested_model, "gpt-5.6-sol")
+        self.assertEqual(outcome.attempts[0].category, "inconclusive")
+        self.assertTrue(pathlib.Path(outcome.attempts[0].stderr_path).is_file())
         self.assertIn(
             "inconclusive",
             (self.review.container_dir / "runner-error.txt").read_text(
@@ -1406,6 +1415,14 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertEqual(outcome.returncode, 75)
         copilot_attempt.assert_called_once()
+        self.assertEqual(len(outcome.attempts), 1)
+        self.assertEqual(outcome.attempts[0].runtime, "copilot")
+        self.assertEqual(
+            outcome.attempts[0].requested_model,
+            providers.COPILOT_MODELS[0],
+        )
+        self.assertEqual(outcome.attempts[0].category, "inconclusive")
+        self.assertTrue(pathlib.Path(outcome.attempts[0].stderr_path).is_file())
         self.assertIn(
             "inconclusive",
             (self.review.container_dir / "runner-error.txt").read_text(
@@ -2833,6 +2850,18 @@ class ProviderPolicyTest(unittest.TestCase):
             str(self.review.container_dir / "copilot-home"),
         )
         self.assertTrue((self.review.container_dir / "copilot-home").is_dir())
+        self.assertEqual(
+            run_command.call_args_list[0].kwargs["timeout_seconds"],
+            providers.COPILOT_PROBE_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            run_command.call_args_list[0].kwargs["capture_limit_bytes"],
+            providers.COPILOT_PROBE_OUTPUT_LIMIT_BYTES,
+        )
+        self.assertEqual(
+            run_command.call_args_list[0].kwargs["output_file_limit_bytes"],
+            providers.COPILOT_PROBE_OUTPUT_LIMIT_BYTES,
+        )
         self.assertEqual(
             run_command.call_args_list[1].kwargs["timeout_seconds"],
             providers.REVIEW_ATTEMPT_TIMEOUT_SECONDS,
