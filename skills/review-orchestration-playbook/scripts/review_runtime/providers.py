@@ -245,10 +245,13 @@ def _claude_safe_mode_disable_semantics_are_verified(help_text: str) -> bool:
     if disable_match is None:
         return False
     customization_list = disable_match.group("customizations")
-    if customization_list is not None and not customization_list.startswith(
-        "claude.md, skills, plugins"
-    ):
-        return False
+    if customization_list is not None:
+        customization_core = "claude.md, skills, plugins"
+        if (
+            customization_list != customization_core
+            and not customization_list.startswith(customization_core + ",")
+        ):
+            return False
     model_marker = help_text.find(
         CLAUDE_SAFE_MODE_MODEL_FRAGMENT,
         disable_match.end(),
@@ -259,7 +262,7 @@ def _claude_safe_mode_disable_semantics_are_verified(help_text: str) -> bool:
     for allowed_phrase in (
         "do not load",
         "does not load",
-        "servers do not",
+        "policy-configured mcp servers do not",
     ):
         semantics = semantics.replace(allowed_phrase, "disabled")
     return CLAUDE_SAFE_MODE_DISABLE_NEGATION_PATTERN.search(semantics) is None

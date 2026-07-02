@@ -1227,7 +1227,8 @@ class ProviderPolicyTest(unittest.TestCase):
         for disable_help in (
             (
                 b"--safe-mode Start with all customizations disabled to troubleshoot. "
-                b"CLAUDE.md does not load. "
+                b"CLAUDE.md does not load. Managed plugins and policy-configured MCP "
+                b"servers do not. "
             ),
             (
                 b"--safe-mode Start with all customizations "
@@ -1305,6 +1306,10 @@ class ProviderPolicyTest(unittest.TestCase):
             (
                 b"--safe-mode Start with all customizations "
                 b"(CLAUDE.md enabled, skills, plugins) disabled - useful. "
+            ),
+            (
+                b"--safe-mode Start with all customizations "
+                b"(CLAUDE.md, skills, pluginsenabled) disabled - useful. "
             ),
         ):
             with self.subTest(wording=wording):
