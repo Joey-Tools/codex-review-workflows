@@ -9,7 +9,9 @@ from typing import Any, Callable, Iterable
 
 from .common import (
     Completed,
+    InvalidReviewerExecutable,
     ReviewError,
+    ReviewTimeoutError,
     child_environment,
     reviewer_executable_path,
     resolve_reviewer_executable,
@@ -272,7 +274,9 @@ def _require_claude_identity(
         "utf-8", errors="replace"
     )
     if completed.returncode != 0 or "claude code" not in output.lower():
-        raise ReviewError("sandboxed executable did not identify as Claude Code")
+        raise InvalidReviewerExecutable(
+            "sandboxed executable did not identify as Claude Code"
+        )
 
 
 def _require_claude_bare_mode(
@@ -299,7 +303,7 @@ def _require_claude_bare_mode(
         or _claude_help_option_blocks(help_text, "--bare")
         != (CLAUDE_BARE_MODE_HELP_FORM,)
     ):
-        raise ReviewError(
+        raise InvalidReviewerExecutable(
             "Claude Code does not expose a uniquely verifiable --bare mode that "
             "skips hooks and other project customizations"
         )
@@ -947,6 +951,37 @@ def _codex_attempt(
     return attempt
 
 
+def _resolve_validated_claude_executable(
+    *,
+    review: ReviewWorkspace,
+    env: dict[str, str],
+) -> tuple[pathlib.Path | None, dict[str, str]]:
+    claude_home = review.container_dir / "claude-home"
+    claude_home.mkdir(parents=True, exist_ok=True)
+    prepared_env = dict(env)
+    prepared_env["HOME"] = str(claude_home)
+    prepared_env.pop("XDG_CONFIG_HOME", None)
+    probe_env = {
+        key: value
+        for key, value in prepared_env.items()
+        if key != "ANTHROPIC_API_KEY"
+        and not key.startswith("CODEX_ISOLATED_REVIEW_")
+    }
+
+    def validate_candidate(candidate: pathlib.Path) -> None:
+        candidate_env = dict(probe_env)
+        candidate_env["PATH"] = reviewer_executable_path(candidate)
+        _require_claude_identity(candidate, candidate_env)
+        _require_claude_bare_mode(candidate, candidate_env)
+
+    executable = resolve_reviewer_executable(
+        "claude", candidate_validator=validate_candidate
+    )
+    if executable is None:
+        return None, prepared_env
+    return executable, _with_executable_path(prepared_env, executable)
+
+
 def _claude_attempt(
     *,
     review: ReviewWorkspace,
@@ -954,36 +989,14 @@ def _claude_attempt(
     index: int,
     env: dict[str, str],
 ) -> Attempt:
-    claude_home = review.container_dir / "claude-home"
-    claude_home.mkdir(parents=True, exist_ok=True)
-    env = dict(env)
-    env["HOME"] = str(claude_home)
-    env.pop("XDG_CONFIG_HOME", None)
-    probe_env = {
-        key: value
-        for key, value in env.items()
-        if key != "ANTHROPIC_API_KEY"
-        and not key.startswith("CODEX_ISOLATED_REVIEW_")
-    }
-    validated: set[pathlib.Path] = set()
-
-    def validate_candidate(candidate: pathlib.Path) -> None:
-        candidate_env = dict(probe_env)
-        candidate_env["PATH"] = reviewer_executable_path(candidate)
-        _require_claude_identity(candidate, candidate_env)
-        _require_claude_bare_mode(candidate, candidate_env)
-        validated.add(candidate)
-
-    executable = resolve_reviewer_executable(
-        "claude", candidate_validator=validate_candidate
+    executable, env = _resolve_validated_claude_executable(
+        review=review,
+        env=env,
     )
     if executable is None:
         raise FileNotFoundError(
             "claude is not available in a validated executable path"
         )
-    if executable not in validated:
-        validate_candidate(executable)
-    env = _with_executable_path(env, executable)
     stdout_path, stderr_path = _attempt_paths(review, index, "claude", model)
     settings = json.dumps(
         {
@@ -1314,8 +1327,33 @@ def run_review(
             return Outcome(127, None, tuple())
         return _finish(review, attempts, final_text)
 
+    claude_env = _review_environment(
+        review=review,
+        passthrough_keys=CLAUDE_ENV_KEYS,
+        extra={
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
+        },
+    )
     try:
-        claude_available = resolve_reviewer_executable("claude") is not None
+        claude_executable, claude_env = _resolve_validated_claude_executable(
+            review=review,
+            env=claude_env,
+        )
+        claude_available = claude_executable is not None
+    except FileNotFoundError as error:
+        claude_available = False
+        write_text_atomic(
+            review.container_dir / "claude-skip.txt",
+            f"Claude Code probe runtime is unavailable: {error}\n",
+        )
+    except ReviewTimeoutError as error:
+        write_text_atomic(
+            review.container_dir / "runner-error.txt",
+            f"Claude Code validation was inconclusive: {error}\n",
+        )
+        write_json(review.container_dir / "attempts.json", [])
+        return Outcome(75, None, tuple(attempts))
     except ReviewError as error:
         write_text_atomic(
             review.container_dir / "runner-error.txt",
@@ -1325,14 +1363,6 @@ def run_review(
         write_json(review.container_dir / "attempts.json", [])
         return Outcome(2, None, tuple(attempts))
     if claude_available:
-        claude_env = _review_environment(
-            review=review,
-            passthrough_keys=CLAUDE_ENV_KEYS,
-            extra={
-                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-                "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
-            },
-        )
         if not claude_env.get("ANTHROPIC_API_KEY"):
             claude_available = False
             write_text_atomic(
@@ -1352,6 +1382,13 @@ def run_review(
         except FileNotFoundError:
             category = "unavailable"
             final_text = None
+        except ReviewTimeoutError as error:
+            write_text_atomic(
+                review.container_dir / "runner-error.txt",
+                f"Claude Code validation was inconclusive: {error}\n",
+            )
+            _write_attempts(review, attempts)
+            return Outcome(75, None, tuple(attempts))
         except ReviewError as error:
             write_text_atomic(
                 review.container_dir / "runner-error.txt",

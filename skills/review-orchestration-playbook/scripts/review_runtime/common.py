@@ -18,6 +18,14 @@ class ReviewError(RuntimeError):
     """A user-facing review helper failure."""
 
 
+class InvalidReviewerExecutable(ReviewError):
+    """A candidate executable failed deterministic identity validation."""
+
+
+class ReviewTimeoutError(ReviewError):
+    """A bounded reviewer subprocess exceeded its deadline."""
+
+
 class ForwardedSignal(RuntimeError):
     """A termination signal forwarded to the active reviewer process group."""
 
@@ -186,7 +194,7 @@ def run(
                 _read_bounded_bytes(stderr_path, capture_limit_bytes),
             )
     except subprocess.TimeoutExpired as error:
-        raise ReviewError(
+        raise ReviewTimeoutError(
             f"command timed out after {timeout_seconds} seconds: {' '.join(command)}"
         ) from error
     if check and result.returncode != 0:
@@ -607,7 +615,7 @@ def resolve_reviewer_executable(
         if defer_identity and candidate_validator is not None:
             try:
                 candidate_validator(override.absolute())
-            except ReviewError as error:
+            except InvalidReviewerExecutable as error:
                 raise ReviewError(
                     f"{override_key} did not pass sandboxed {name} validation: "
                     f"{override}"
@@ -640,7 +648,7 @@ def resolve_reviewer_executable(
                 return absolute
             try:
                 candidate_validator(absolute)
-            except ReviewError:
+            except InvalidReviewerExecutable:
                 rejected.append(absolute)
                 continue
             return absolute

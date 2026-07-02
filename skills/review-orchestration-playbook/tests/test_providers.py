@@ -770,6 +770,62 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
         )
 
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(providers, "resolve_reviewer_executable")
+    @mock.patch.object(providers, "_copilot_attempt")
+    def test_invalid_explicit_claude_override_blocks_without_api_key(
+        self,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        def reject_override(_name: str, **kwargs):
+            self.assertTrue(callable(kwargs["candidate_validator"]))
+            raise ReviewError("invalid explicit override")
+
+        resolve.side_effect = reject_override
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
+
+        self.assertEqual(outcome.returncode, 2)
+        copilot_attempt.assert_not_called()
+        self.assertIn(
+            "refusing Copilot fallback",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(providers, "resolve_reviewer_executable")
+    @mock.patch.object(providers, "_copilot_attempt")
+    def test_claude_probe_timeout_is_inconclusive_not_fallback(
+        self,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        resolve.side_effect = providers.ReviewTimeoutError("probe timed out")
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="triple-review",
+        )
+
+        self.assertEqual(outcome.returncode, 75)
+        copilot_attempt.assert_not_called()
+        self.assertIn(
+            "inconclusive",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
     @mock.patch.object(
         providers,
         "child_environment",
@@ -823,7 +879,9 @@ class ProviderPolicyTest(unittest.TestCase):
             egress_consent="explicit-claude-review",
         )
         self.assertEqual(outcome.returncode, 2)
-        resolve.assert_called_once_with("claude")
+        resolve.assert_called_once()
+        self.assertEqual(resolve.call_args.args, ("claude",))
+        self.assertTrue(callable(resolve.call_args.kwargs["candidate_validator"]))
         copilot_attempt.assert_not_called()
         self.assertIn(
             "does not authorize GitHub Copilot",
@@ -1410,8 +1468,14 @@ class ProviderPolicyTest(unittest.TestCase):
     def test_claude_command_pins_model_and_max_in_bare_mode(
         self,
         run_command: mock.Mock,
-        _resolve: mock.Mock,
+        resolve: mock.Mock,
     ) -> None:
+        def resolve_and_validate(_name: str, **kwargs) -> pathlib.Path:
+            candidate = pathlib.Path("/bin/claude")
+            kwargs["candidate_validator"](candidate)
+            return candidate
+
+        resolve.side_effect = resolve_and_validate
         payload = {
             "type": "result",
             "subtype": "success",
@@ -1524,8 +1588,14 @@ class ProviderPolicyTest(unittest.TestCase):
     def test_claude_refuses_unverified_bare_mode_semantics(
         self,
         run_command: mock.Mock,
-        _resolve: mock.Mock,
+        resolve: mock.Mock,
     ) -> None:
+        def resolve_and_validate(_name: str, **kwargs) -> pathlib.Path:
+            candidate = pathlib.Path("/bin/claude")
+            kwargs["candidate_validator"](candidate)
+            return candidate
+
+        resolve.side_effect = resolve_and_validate
         run_command.side_effect = (
             Completed(
                 argv=("claude", "--version"),

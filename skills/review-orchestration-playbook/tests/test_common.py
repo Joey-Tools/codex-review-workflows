@@ -353,7 +353,7 @@ class ChildEnvironmentTest(unittest.TestCase):
             def validate(candidate: pathlib.Path) -> None:
                 validated.append(candidate)
                 if candidate == invalid:
-                    raise ReviewError("not Claude Code")
+                    raise common.InvalidReviewerExecutable("not Claude Code")
 
             with (
                 mock.patch.dict(common.os.environ, {"HOME": str(home)}, clear=True),
@@ -395,7 +395,38 @@ class ChildEnvironmentTest(unittest.TestCase):
                     common.resolve_reviewer_executable(
                         "claude",
                         candidate_validator=mock.Mock(
-                            side_effect=ReviewError("not Claude Code")
+                            side_effect=common.InvalidReviewerExecutable(
+                                "not Claude Code"
+                            )
+                        ),
+                    )
+
+    def test_deferred_identity_does_not_swallow_probe_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = pathlib.Path(temporary)
+            executable = home / "claude"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o755)
+
+            with (
+                mock.patch.dict(common.os.environ, {"HOME": str(home)}, clear=True),
+                mock.patch.object(
+                    common,
+                    "_user_executable_candidates",
+                    return_value=[executable],
+                ),
+                mock.patch.object(common.shutil, "which", return_value=None),
+                mock.patch.object(
+                    common.os,
+                    "access",
+                    side_effect=lambda path, _mode: pathlib.Path(path) == executable,
+                ),
+            ):
+                with self.assertRaises(common.ReviewTimeoutError):
+                    common.resolve_reviewer_executable(
+                        "claude",
+                        candidate_validator=mock.Mock(
+                            side_effect=common.ReviewTimeoutError("probe timed out")
                         ),
                     )
 
