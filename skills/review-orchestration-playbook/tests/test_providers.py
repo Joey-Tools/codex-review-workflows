@@ -1226,6 +1226,7 @@ class ProviderPolicyTest(unittest.TestCase):
             b"Sets CLAUDE_CODE_SAFE_MODE.",
             b"Sets CLAUDE_CODE_SAFE_MODE=1.",
             b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode",
+            b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode --session-id <uuid>",
         ):
             with self.subTest(wording=wording):
                 run_command.return_value = Completed(
@@ -1261,6 +1262,7 @@ class ProviderPolicyTest(unittest.TestCase):
             b"Sets CLAUDE_CODE_SAFE_MODE.foo.",
             b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode to 0.",
             b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode.foo.",
+            b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode --model opus",
             b"not.sets CLAUDE_CODE_SAFE_MODE.",
         ):
             with self.subTest(wording=wording):

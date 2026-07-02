@@ -44,7 +44,7 @@ CLAUDE_SAFE_MODE_HELP_FRAGMENTS = (
 )
 CLAUDE_SAFE_MODE_ENV_PATTERN = re.compile(
     r"(?:^|[.;:]\s+)sets claude_code_safe_mode(?:(?:=1)?(?:\.(?=\s|$)|$)"
-    r"|\s+claude --safe-mode(?:\.(?=\s|$)|$))"
+    r"|\s+claude --safe-mode(?:\.(?=\s|$)|(?=\s+--session-id(?:\s|$))|$))"
 )
 CLAUDE_EGRESS_CONSENTS = (
     "explicit-claude-review",
