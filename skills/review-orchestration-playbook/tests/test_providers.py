@@ -1287,6 +1287,29 @@ class ProviderPolicyTest(unittest.TestCase):
                         pathlib.Path("/bin/claude"), {}
                     )
 
+    @mock.patch.object(providers, "run")
+    def test_claude_rejects_unbounded_verified_help_forms(
+        self,
+        run_command: mock.Mock,
+    ) -> None:
+        form = providers.CLAUDE_SAFE_MODE_CLI_HELP_FORM
+        for help_text in (
+            "prefix" + form + " suffix",
+            "prefix " + form + "suffix",
+        ):
+            with self.subTest(help_text=help_text):
+                run_command.return_value = Completed(
+                    argv=("claude", "--help"),
+                    returncode=0,
+                    stdout=help_text.encode(),
+                    stderr=b"",
+                )
+
+                with self.assertRaisesRegex(ReviewError, "disable CLAUDE.md"):
+                    providers._require_claude_safe_mode(
+                        pathlib.Path("/bin/claude"), {}
+                    )
+
     @mock.patch.object(
         providers,
         "resolve_reviewer_executable",

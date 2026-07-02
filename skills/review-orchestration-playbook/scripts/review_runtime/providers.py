@@ -62,6 +62,10 @@ CLAUDE_SAFE_MODE_VERIFIED_HELP_FORMS = (
     CLAUDE_SAFE_MODE_CLI_HELP_FORM,
     CLAUDE_SAFE_MODE_TABLE_HELP_FORM,
 )
+CLAUDE_SAFE_MODE_VERIFIED_HELP_PATTERNS = tuple(
+    re.compile(r"(?:^|\s)" + re.escape(form) + r"(?=\s|$)")
+    for form in CLAUDE_SAFE_MODE_VERIFIED_HELP_FORMS
+)
 CLAUDE_EGRESS_CONSENTS = (
     "explicit-claude-review",
     "double-review",
@@ -233,7 +237,8 @@ def _require_claude_safe_mode(
     if (
         completed.returncode != 0
         or not any(
-            form in help_text for form in CLAUDE_SAFE_MODE_VERIFIED_HELP_FORMS
+            pattern.search(help_text) is not None
+            for pattern in CLAUDE_SAFE_MODE_VERIFIED_HELP_PATTERNS
         )
     ):
         raise ReviewError(
