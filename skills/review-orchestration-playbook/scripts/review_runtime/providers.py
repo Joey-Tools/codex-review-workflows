@@ -285,6 +285,14 @@ def _claude_probe_sandbox_profile(
         *(path.resolve() for path in CLAUDE_PROBE_SYSTEM_READ_LITERALS),
         *dependencies,
     }
+    metadata_paths: set[pathlib.Path] = set()
+    for path in {*read_files, *read_subpaths}:
+        current = path
+        while True:
+            metadata_paths.add(current)
+            if current.parent == current:
+                break
+            current = current.parent
     read_filters = "".join(
         [
             *(
@@ -296,6 +304,10 @@ def _claude_probe_sandbox_profile(
                 for path in sorted(read_subpaths, key=str)
             ),
         ]
+    )
+    metadata_filters = "".join(
+        _sandbox_path_filter("literal", path)
+        for path in sorted(metadata_paths, key=str)
     )
     exec_filters = "".join(
         [
@@ -311,7 +323,7 @@ def _claude_probe_sandbox_profile(
     )
     return (
         CLAUDE_PROBE_SANDBOX_PROFILE
-        + "(allow file-read-metadata)"
+        + f"(allow file-read-metadata {metadata_filters})"
         + f"(allow file-read* {read_filters})"
         + f"(allow process-exec {exec_filters})"
         + "(allow sysctl-read)"
@@ -602,23 +614,35 @@ def _parse_claude_output(
     return final_text, effective_model
 
 
-def _copilot_error_effective_model(
-    objects: list[dict[str, Any]], requested_model: str | None
-) -> str | None:
+def _copilot_model_evidence(
+    objects: list[dict[str, Any]],
+) -> list[str] | None:
     candidates: list[str] = []
     for item in objects:
         event_type = item.get("type")
-        data = item.get("data")
-        if not isinstance(data, dict) or data.get("parentToolCallId"):
-            continue
         if event_type == "session.start":
-            candidate = data.get("selectedModel")
+            model_key = "selectedModel"
         elif event_type in {"assistant.message", "assistant.usage"}:
-            candidate = data.get("model")
+            model_key = "model"
         else:
             continue
-        if isinstance(candidate, str) and candidate:
-            candidates.append(candidate)
+        data = item.get("data")
+        if not isinstance(data, dict):
+            return None
+        if event_type != "session.start" and data.get("parentToolCallId"):
+            continue
+        if model_key not in data:
+            continue
+        candidate = data[model_key]
+        if not isinstance(candidate, str) or not candidate:
+            return None
+        candidates.append(candidate)
+    return candidates
+
+
+def _copilot_error_effective_model(
+    candidates: list[str], requested_model: str | None
+) -> str | None:
     if requested_model is not None:
         mismatch = next(
             (
@@ -639,8 +663,13 @@ def _parse_copilot_output(
     objects = _strict_jsonl_objects(stdout)
     if objects is None:
         return None, None
+    model_evidence = _copilot_model_evidence(objects)
+    if model_evidence is None:
+        return None, None
     if _structured_error_text(stdout).strip():
-        return None, _copilot_error_effective_model(objects, requested_model)
+        return None, _copilot_error_effective_model(
+            model_evidence, requested_model
+        )
     open_turn: tuple[str, int] | None = None
     completed_turns: list[tuple[str, int, int]] = []
     for index, item in enumerate(objects):
@@ -732,6 +761,14 @@ def _parse_copilot_output(
         )
         model = session_model
     if not isinstance(model, str) or not model:
+        return None, None
+    session_models = [
+        item["data"]["selectedModel"]
+        for item in objects[: start_index + 1]
+        if item.get("type") == "session.start"
+        and "selectedModel" in item["data"]
+    ]
+    if any(not _model_matches(model, candidate) for candidate in session_models):
         return None, None
     return content, model
 

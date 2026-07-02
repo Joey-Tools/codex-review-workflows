@@ -418,6 +418,32 @@ class ProviderPolicyTest(unittest.TestCase):
             (None, "claude-opus-4.7"),
         )
 
+    def test_copilot_error_rejects_malformed_model_evidence(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "session.start",
+                    "data": {"selectedModel": "claude-opus-4.8"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {"model": 123},
+                },
+                {
+                    "type": "turn.failed",
+                    "error": {"message": "Model is not available for your account"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(
+            providers._parse_copilot_output(
+                stdout, requested_model="claude-opus-4.8"
+            ),
+            (None, None),
+        )
+
     def test_copilot_preserves_unicode_separators_at_content_edges(self) -> None:
         content = "\u2028No findings.\u2029"
         stdout = "\n".join(
@@ -706,6 +732,62 @@ class ProviderPolicyTest(unittest.TestCase):
             providers._parse_copilot_output(stdout),
             ("No findings.", "claude-opus-4.8"),
         )
+
+    def test_copilot_rejects_malformed_terminal_message_model(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "session.start",
+                    "data": {"selectedModel": "claude-opus-4.8"},
+                },
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "content": "No findings.",
+                        "model": 123,
+                    },
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
+
+    def test_copilot_rejects_conflicting_session_model(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "session.start",
+                    "data": {"selectedModel": "claude-opus-4.7"},
+                },
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "content": "No findings.",
+                        "model": "claude-opus-4.8",
+                    },
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
 
     def test_copilot_ignores_usage_before_terminal_message(self) -> None:
         stdout = "\n".join(
@@ -1911,6 +1993,11 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn('(subpath "/isolated/probe-home")', profile)
         self.assertIn('(subpath "/review-install")', profile)
         self.assertIn('(subpath "/review-runtime")', profile)
+        self.assertNotIn("(allow file-read-metadata)", profile)
+        self.assertIn(
+            '(allow file-read-metadata (literal "/")',
+            profile,
+        )
         self.assertNotIn("/Users/joey", profile)
 
     @mock.patch.object(
