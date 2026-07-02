@@ -22,6 +22,7 @@ superseded_by:
 - Claude Code and trusted `rg` must be native Mach-O executables; script or wrapper installations are rejected, and the final sandbox reads the Claude executable only by exact path rather than exposing its parent directory.
 - Custom CA environment paths are reduced to validated certificate-only copies under the helper container before entering the sandbox, with distinct source directories kept separate.
 - Uppercase and lowercase corporate proxy variables are preserved before Claude is routed through the helper-owned local proxy.
+- The parent helper honors the original `NO_PROXY` / `no_proxy` list when choosing direct versus corporate-proxy routing for each pinned Anthropic target.
 - HTTPS corporate proxy tunnels drain OpenSSL's already-decrypted pending data before waiting on the underlying socket.
 - Missing Claude authentication can fall back to GitHub Copilot only for explicitly authorized double or triple reviews.
 - Skill policy, egress language, helper contract, and provider tests describe the same behavior.

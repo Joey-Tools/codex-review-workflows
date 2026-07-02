@@ -17,6 +17,7 @@ import subprocess
 import tempfile
 import threading
 import urllib.parse
+import urllib.request
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Iterable, Iterator
 
@@ -661,7 +662,18 @@ def _read_proxy_headers(sock: socket.socket) -> bytes:
     return bytes(data)
 
 
-def _upstream_proxy_url(env: dict[str, str]) -> str | None:
+def _upstream_proxy_url(
+    env: dict[str, str],
+    *,
+    host: str,
+    port: int,
+) -> str | None:
+    no_proxy = env.get("no_proxy") if "no_proxy" in env else env.get("NO_PROXY")
+    if no_proxy and urllib.request.proxy_bypass_environment(
+        f"{host}:{port}",
+        {"no": no_proxy},
+    ):
+        return None
     for key in (
         "HTTPS_PROXY",
         "https_proxy",
@@ -698,7 +710,7 @@ def _open_proxy_target(
     *,
     env: dict[str, str],
 ) -> socket.socket:
-    upstream_url = _upstream_proxy_url(env)
+    upstream_url = _upstream_proxy_url(env, host=host, port=port)
     if upstream_url is None:
         return socket.create_connection(
             (host, port),
