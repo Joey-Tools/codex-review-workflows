@@ -1225,8 +1225,11 @@ class ProviderPolicyTest(unittest.TestCase):
         for wording in (
             b"Sets CLAUDE_CODE_SAFE_MODE.",
             b"Sets CLAUDE_CODE_SAFE_MODE=1.",
-            b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode",
-            b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode --session-id <uuid>",
+            (
+                b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode --session-id "
+                b"Use a specific session ID for the conversation "
+                b"(must be a valid UUID) claude --session-id 550e8400"
+            ),
         ):
             with self.subTest(wording=wording):
                 run_command.return_value = Completed(
@@ -1263,6 +1266,7 @@ class ProviderPolicyTest(unittest.TestCase):
             b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode to 0.",
             b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode.foo.",
             b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode --model opus",
+            b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode --session-id --model opus",
             b"not.sets CLAUDE_CODE_SAFE_MODE.",
         ):
             with self.subTest(wording=wording):
