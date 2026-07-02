@@ -30,6 +30,10 @@ from .prompt import build_review_prompt
 
 SECRET_PATTERNS = (
     (
+        "pgp-private-key",
+        re.compile(rb"-----BEGIN PGP PRIVATE[ ]KEY BLOCK-----"),
+    ),
+    (
         "private-key",
         re.compile(
             rb"-----BEGIN (?:ENCRYPTED |RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"

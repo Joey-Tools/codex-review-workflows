@@ -296,6 +296,11 @@ class WorkspaceTest(unittest.TestCase):
                     _value_secret_rule(b"aws_secret_access_key=" + value + b"A")
                 )
 
+    def test_pgp_private_key_marker_is_rejected(self) -> None:
+        marker = b"-----BEGIN PGP PRIVATE" + b" KEY BLOCK-----"
+
+        self.assertEqual(_value_secret_rule(marker), "pgp-private-key")
+
     def test_placeholder_secret_requires_a_complete_placeholder_value(self) -> None:
         self.assertIsNone(
             _value_secret_rule(b'password = "example-test-secret"')
