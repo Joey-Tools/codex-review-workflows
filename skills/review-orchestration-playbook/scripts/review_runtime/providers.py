@@ -58,6 +58,7 @@ CLAUDE_BARE_TOKEN = re.compile(r"(?<![a-z0-9-])--bare(?![a-z0-9-])")
 CLAUDE_PROBE_SANDBOX = pathlib.Path("/usr/bin/sandbox-exec")
 CLAUDE_PROBE_SANDBOX_PROFILE = (
     "(version 1)(allow default)(deny file-write*)(deny network*)"
+    "(deny process-fork)"
 )
 CLAUDE_PROBE_TIMEOUT_SECONDS = 20.0
 CLAUDE_PROBE_OUTPUT_LIMIT_BYTES = 64 * 1024

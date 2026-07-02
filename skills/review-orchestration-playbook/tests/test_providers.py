@@ -1803,6 +1803,7 @@ class ProviderPolicyTest(unittest.TestCase):
             return candidate
 
         resolve.side_effect = resolve_and_validate
+        self.assertIn("(deny process-fork)", providers.CLAUDE_PROBE_SANDBOX_PROFILE)
         payload = {
             "type": "result",
             "subtype": "success",

@@ -41,6 +41,15 @@ class ChildEnvironmentTest(unittest.TestCase):
                     timeout_seconds=0.05,
                 )
 
+    @mock.patch.object(common.subprocess, "run")
+    def test_unlogged_timeout_is_rejected_before_launch(
+        self, subprocess_run: mock.Mock
+    ) -> None:
+        with self.assertRaisesRegex(ReviewError, "requires logged output paths"):
+            common.run((sys.executable, "-c", "pass"), timeout_seconds=1)
+
+        subprocess_run.assert_not_called()
+
     def test_logged_command_output_file_limit_is_enforced(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)

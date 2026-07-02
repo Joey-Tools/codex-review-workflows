@@ -163,6 +163,8 @@ def run(
         stdout_path is None or stderr_path is None
     ):
         raise ReviewError("output_file_limit_bytes requires logged output paths")
+    if timeout_seconds is not None and (stdout_path is None or stderr_path is None):
+        raise ReviewError("timeout_seconds requires logged output paths")
     try:
         if stdout_path is None or stderr_path is None:
             completed = subprocess.run(
@@ -173,7 +175,6 @@ def run(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
-                timeout=timeout_seconds,
             )
             result = Completed(
                 command, completed.returncode, completed.stdout, completed.stderr
