@@ -35,12 +35,21 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(providers.CODEX_REASONING_EFFORT, "xhigh")
         self.assertEqual(
             providers.CLAUDE_MODELS,
-            ("claude-sonnet-5", "claude-opus-4-8", "claude-opus-4-7"),
+            ("claude-opus-4-8", "claude-opus-4-7"),
         )
         self.assertEqual(
             providers.COPILOT_MODELS,
-            ("claude-sonnet-5", "claude-opus-4.8", "claude-opus-4.7"),
+            ("claude-opus-4.8", "claude-opus-4.7"),
         )
+        for candidate in (
+            SKILL_ROOT / "SKILL.md",
+            SKILL_ROOT / "references/helper-contract.md",
+        ):
+            self.assertNotIn(
+                "claude-sonnet-5",
+                candidate.read_text(encoding="utf-8"),
+                str(candidate),
+            )
         with (REPO_ROOT / "agents/reviewer.toml").open("rb") as handle:
             reviewer = tomllib.load(handle)
         self.assertEqual(reviewer["model"], "gpt-5.6-sol")
@@ -109,6 +118,20 @@ class RepositoryContractTest(unittest.TestCase):
             "all pinned Claude models are entitlement-blocked",
             consent,
         )
+
+    def test_triple_review_consent_names_all_provider_organizations(self) -> None:
+        candidates = (
+            REPO_ROOT / "AGENTS.md",
+            SKILL_ROOT / "SKILL.md",
+            SKILL_ROOT / "references/egress-consent.md",
+        )
+        for candidate in candidates:
+            content = candidate.read_text(encoding="utf-8")
+            self.assertIn(
+                "OpenAI, Anthropic, and Microsoft/GitHub",
+                content,
+                str(candidate),
+            )
 
 
 if __name__ == "__main__":

@@ -49,14 +49,12 @@ The parent acquires an exclusive runner lock before spawn and passes its file de
 
 `--reviewer claude`:
 
-1. Claude Code `claude-sonnet-5`, `max`
-2. Claude Code `claude-opus-4-8`, `max`, entitlement-only fallback
-3. Claude Code `claude-opus-4-7`, `max`, entitlement-only fallback
-4. Copilot CLI `claude-sonnet-5`, `max`, only when Claude Code is absent, lacks bare-mode API-key authentication, or all Claude Code models are entitlement-blocked
-5. Copilot CLI `claude-opus-4.8`, `max`, entitlement-only fallback
-6. Copilot CLI `claude-opus-4.7`, `max`, entitlement-only fallback
+1. Claude Code `claude-opus-4-8`, `max`
+2. Claude Code `claude-opus-4-7`, `max`, only after explicit account, plan, organization-policy, or model-entitlement denial for Opus 4.8
+3. Copilot CLI `claude-opus-4.8`, `max`, only when Claude Code is absent, lacks bare-mode API-key authentication, or both Claude Code Opus models are entitlement-blocked
+4. Copilot CLI `claude-opus-4.7`, `max`, only after the same explicit account, plan, organization-policy, or model-entitlement denial for Opus 4.8
 
-The Copilot IDs follow GitHub's authoritative [supported models matrix](https://docs.github.com/en/copilot/reference/ai-models/supported-models), which lists Sonnet 5, Opus 4.8, and Opus 4.7 for Copilot CLI. The shorter command-reference example table can lag product availability and is not treated as a runtime allowlist; exact model verification still fails closed if the installed CLI rejects or substitutes any ID.
+The Copilot IDs follow GitHub's authoritative [supported models matrix](https://docs.github.com/en/copilot/reference/ai-models/supported-models), which lists Opus 4.8 and Opus 4.7 for Copilot CLI. The shorter command-reference example table can lag product availability and is not treated as a runtime allowlist; exact model verification still fails closed if the installed CLI rejects or substitutes any ID.
 
 The Claude-family lane requires one of `--egress-consent explicit-claude-review`, `--egress-consent double-review`, or `--egress-consent triple-review`. The helper saves this value in state and writes `egress.json`; it refuses to start the external lane without it. `explicit-claude-review` authorizes Anthropic only, while `double-review` and `triple-review` also authorize GitHub Copilot fallback when Claude Code is unavailable, lacks bare-mode API-key authentication, or all pinned Claude models are entitlement-blocked.
 

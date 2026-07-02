@@ -29,10 +29,10 @@ from .workspace import ReviewWorkspace, validate_external_workspace
 
 CODEX_MODELS = ("gpt-5.6-sol", "gpt-5.5")
 CODEX_REASONING_EFFORT = "xhigh"
-CLAUDE_MODELS = ("claude-sonnet-5", "claude-opus-4-8", "claude-opus-4-7")
+CLAUDE_MODELS = ("claude-opus-4-8", "claude-opus-4-7")
 # GitHub's supported-models matrix lists all pinned IDs for Copilot CLI. The
 # shorter command-reference examples can lag product availability.
-COPILOT_MODELS = ("claude-sonnet-5", "claude-opus-4.8", "claude-opus-4.7")
+COPILOT_MODELS = ("claude-opus-4.8", "claude-opus-4.7")
 CLAUDE_REASONING_EFFORT = "max"
 COPILOT_REASONING_EFFORT = "max"
 COPILOT_PERMISSION_HELP_FRAGMENTS = (
