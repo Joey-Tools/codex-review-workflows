@@ -1225,6 +1225,7 @@ class ProviderPolicyTest(unittest.TestCase):
         for wording in (
             b"Sets CLAUDE_CODE_SAFE_MODE.",
             b"Sets CLAUDE_CODE_SAFE_MODE=1.",
+            b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode",
         ):
             with self.subTest(wording=wording):
                 run_command.return_value = Completed(
@@ -1258,6 +1259,8 @@ class ProviderPolicyTest(unittest.TestCase):
             b"Sets CLAUDE_CODE_SAFE_MODE; value 0.",
             b"Sets CLAUDE_CODE_SAFE_MODE=1.0.",
             b"Sets CLAUDE_CODE_SAFE_MODE.foo.",
+            b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode to 0.",
+            b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode.foo.",
         ):
             with self.subTest(wording=wording):
                 run_command.return_value = Completed(
