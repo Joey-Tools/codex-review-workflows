@@ -382,7 +382,7 @@ def _json_objects(stdout: bytes) -> list[dict[str, Any]]:
 
 def _strict_json_object(stdout: bytes) -> dict[str, Any] | None:
     try:
-        text = stdout.decode("utf-8").strip()
+        text = stdout.decode("utf-8")
         parsed = json.loads(text)
     except (UnicodeDecodeError, json.JSONDecodeError):
         return None
@@ -396,7 +396,7 @@ def _strict_jsonl_objects(stdout: bytes) -> list[dict[str, Any]] | None:
         return None
     objects: list[dict[str, Any]] = []
     for line in text.split("\n"):
-        if not line.strip():
+        if not line.strip(" \t\r"):
             continue
         try:
             parsed = json.loads(line)
@@ -550,6 +550,11 @@ def _parse_copilot_output(
     if start_index is None:
         return None, None
     turn_events = objects[start_index + 1 : terminal_index]
+    if any(
+        item.get("type") in {"assistant.turn_start", "assistant.turn_end"}
+        for item in turn_events
+    ):
+        return None, None
     message_index = next(
         (
             index

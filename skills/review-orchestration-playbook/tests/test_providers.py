@@ -293,6 +293,22 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertEqual(providers._parse_claude_output(stdout), (None, None))
 
+    def test_claude_rejects_unicode_separator_prefix_before_success(self) -> None:
+        stdout = (
+            "\u2028"
+            + json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "result": "No findings.",
+                    "modelUsage": {"claude-opus-4-8": {}},
+                }
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_claude_output(stdout), (None, None))
+
     def test_copilot_requires_terminal_message_for_the_ended_turn(self) -> None:
         stdout = "\n".join(
             json.dumps(item)
@@ -371,6 +387,65 @@ class ProviderPolicyTest(unittest.TestCase):
             providers._parse_copilot_output(stdout),
             (content, "claude-opus-4.8"),
         )
+
+    def test_copilot_rejects_unicode_separator_only_record(self) -> None:
+        stdout = (
+            "\u2028\n"
+            + "\n".join(
+                json.dumps(item)
+                for item in (
+                    {
+                        "type": "assistant.turn_start",
+                        "data": {"turnId": "turn-1"},
+                    },
+                    {
+                        "type": "assistant.message",
+                        "data": {
+                            "content": "No findings.",
+                            "model": "claude-opus-4.8",
+                        },
+                    },
+                    {
+                        "type": "assistant.turn_end",
+                        "data": {"turnId": "turn-1"},
+                    },
+                )
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
+
+    def test_copilot_rejects_nested_or_interleaved_turn_boundaries(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-a"},
+                },
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-b"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "content": "No findings.",
+                        "model": "claude-opus-4.8",
+                    },
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-b"},
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-a"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
 
     def test_copilot_accepts_only_tool_free_message_for_ended_turn(self) -> None:
         stdout = "\n".join(
