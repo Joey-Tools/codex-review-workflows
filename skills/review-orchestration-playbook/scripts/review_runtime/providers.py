@@ -81,6 +81,8 @@ CLAUDE_PROBE_SYSTEM_READ_LITERALS = (
 )
 CLAUDE_PROBE_TIMEOUT_SECONDS = 20.0
 CLAUDE_PROBE_OUTPUT_LIMIT_BYTES = 64 * 1024
+REVIEW_ATTEMPT_TIMEOUT_SECONDS = 30 * 60.0
+REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES = 64 * 1024 * 1024
 COPILOT_JSONL_RECORD_LIMIT_BYTES = 4 * 1024 * 1024
 CLAUDE_EGRESS_CONSENTS = (
     "explicit-claude-review",
@@ -1188,6 +1190,8 @@ def _codex_attempt(
         stdin=prompt,
         stdout_path=stdout_path,
         stderr_path=stderr_path,
+        timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
+        output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
     )
     final_text = None
     if completed.returncode == 0 and attempt_final.is_file():
@@ -1331,6 +1335,8 @@ def _claude_attempt(
         stdin=review.prompt_file.read_bytes(),
         stdout_path=stdout_path,
         stderr_path=stderr_path,
+        timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
+        output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
     )
     final_text, effective_model = _parse_claude_output(
         completed.stdout, requested_model=model
@@ -1440,6 +1446,8 @@ def _copilot_attempt(
         env=env,
         stdout_path=stdout_path,
         stderr_path=stderr_path,
+        timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
+        output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
     )
     final_text, effective_model = _parse_copilot_output_file(
         stdout_path, requested_model=model
@@ -1605,6 +1613,18 @@ def run_review(
         except FileNotFoundError as error:
             write_text_atomic(review.container_dir / "runner-error.txt", f"{error}\n")
             return Outcome(127, None, tuple())
+        except (
+            ReviewTimeoutError,
+            ReviewOutputDrainError,
+            ReviewOutputLimitError,
+            ReviewProcessLeakError,
+        ) as error:
+            write_text_atomic(
+                review.container_dir / "runner-error.txt",
+                f"Codex review was inconclusive: {error}\n",
+            )
+            _write_attempts(review, attempts)
+            return Outcome(75, None, tuple(attempts))
         return _finish(review, attempts, final_text)
 
     claude_env = _review_environment(
@@ -1729,6 +1749,18 @@ def run_review(
             env=copilot_env,
             attempts=attempts,
         )
+    except (
+        ReviewTimeoutError,
+        ReviewOutputDrainError,
+        ReviewOutputLimitError,
+        ReviewProcessLeakError,
+    ) as error:
+        write_text_atomic(
+            review.container_dir / "runner-error.txt",
+            f"Copilot review was inconclusive: {error}\n",
+        )
+        _write_attempts(review, attempts)
+        return Outcome(75, None, tuple(attempts))
     except (FileNotFoundError, ReviewError) as error:
         write_text_atomic(
             review.container_dir / "runner-error.txt",

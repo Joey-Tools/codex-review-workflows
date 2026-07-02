@@ -1299,6 +1299,28 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(outcome.returncode, 75)
         self.assertEqual(codex_attempt.call_count, 1)
 
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_codex_attempt",
+        side_effect=providers.ReviewTimeoutError("review timed out"),
+    )
+    def test_codex_attempt_timeout_is_inconclusive(
+        self,
+        codex_attempt: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        outcome = providers.run_review(review=self.review, reviewer="codex")
+
+        self.assertEqual(outcome.returncode, 75)
+        codex_attempt.assert_called_once()
+        self.assertIn(
+            "inconclusive",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
     @mock.patch.object(
         providers,
         "child_environment",
@@ -1351,6 +1373,44 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(
             [call.kwargs["passthrough_keys"] for call in _environment.call_args_list],
             [providers.CLAUDE_ENV_KEYS, providers.COPILOT_ENV_KEYS],
+        )
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        return_value=(None, {}),
+    )
+    @mock.patch.object(
+        providers,
+        "resolve_reviewer_executable",
+        return_value=pathlib.Path("/bin/copilot"),
+    )
+    @mock.patch.object(
+        providers,
+        "_copilot_attempt",
+        side_effect=providers.ReviewOutputLimitError("review output exceeded limit"),
+    )
+    def test_copilot_attempt_output_limit_is_inconclusive(
+        self,
+        copilot_attempt: mock.Mock,
+        _resolve: mock.Mock,
+        _resolve_claude: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
+
+        self.assertEqual(outcome.returncode, 75)
+        copilot_attempt.assert_called_once()
+        self.assertIn(
+            "inconclusive",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
         )
 
     @mock.patch.object(
@@ -2207,6 +2267,14 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(attempt.effective_model, "gpt-5.6-sol")
         self.assertEqual(attempt.effective_effort, "xhigh")
         self.assertEqual(attempt.category, "success")
+        self.assertEqual(
+            run_command.call_args.kwargs["timeout_seconds"],
+            providers.REVIEW_ATTEMPT_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            run_command.call_args.kwargs["output_file_limit_bytes"],
+            providers.REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
+        )
 
     def test_codex_rejects_legacy_sandbox_override(self) -> None:
         payload = {
@@ -2531,6 +2599,14 @@ class ProviderPolicyTest(unittest.TestCase):
         review_env = run_command.call_args_list[2].kwargs["env"]
         self.assertEqual(review_env["ANTHROPIC_API_KEY"], "secret")
         self.assertEqual(review_env["HOME"], probe_env["HOME"])
+        self.assertEqual(
+            run_command.call_args_list[2].kwargs["timeout_seconds"],
+            providers.REVIEW_ATTEMPT_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            run_command.call_args_list[2].kwargs["output_file_limit_bytes"],
+            providers.REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
+        )
 
     @mock.patch.object(
         providers,
@@ -2757,6 +2833,14 @@ class ProviderPolicyTest(unittest.TestCase):
             str(self.review.container_dir / "copilot-home"),
         )
         self.assertTrue((self.review.container_dir / "copilot-home").is_dir())
+        self.assertEqual(
+            run_command.call_args_list[1].kwargs["timeout_seconds"],
+            providers.REVIEW_ATTEMPT_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            run_command.call_args_list[1].kwargs["output_file_limit_bytes"],
+            providers.REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
+        )
 
     @mock.patch.object(
         providers,
