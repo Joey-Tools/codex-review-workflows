@@ -43,7 +43,10 @@ CLAUDE_SAFE_MODE_HELP_FRAGMENTS = (
     "model selection, built-in tools, and permissions work normally",
 )
 CLAUDE_SAFE_MODE_ENV_PATTERN = re.compile(
-    r"(?:^|[.;:])\s*sets claude_code_safe_mode(?:=1)?(?:[.;:,]|\s|$)"
+    r"(?:^|[.;:]\s+)sets claude_code_safe_mode(?:=1)?(?:\.(?=\s|$)|$)"
+    r"|(?:^|[.;:]\s+)sets claude_code_safe_mode claude --safe-mode "
+    r"--session-id use a specific session id for the conversation "
+    r"\(must be a valid uuid\)(?=\s|$)"
 )
 CLAUDE_EGRESS_CONSENTS = (
     "explicit-claude-review",

@@ -1222,18 +1222,29 @@ class ProviderPolicyTest(unittest.TestCase):
         self,
         run_command: mock.Mock,
     ) -> None:
-        run_command.return_value = Completed(
-            argv=("claude", "--help"),
-            returncode=0,
-            stdout=(
-                b"--safe-mode all customizations including CLAUDE.md are disabled; "
-                b"Authentication, model selection, built-in tools, and permissions "
-                b"work normally. Sets CLAUDE_CODE_SAFE_MODE."
+        for wording in (
+            b"Sets CLAUDE_CODE_SAFE_MODE.",
+            b"Sets CLAUDE_CODE_SAFE_MODE=1.",
+            (
+                b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode --session-id "
+                b"Use a specific session ID for the conversation "
+                b"(must be a valid UUID) claude --session-id 550e8400"
             ),
-            stderr=b"",
-        )
+        ):
+            with self.subTest(wording=wording):
+                run_command.return_value = Completed(
+                    argv=("claude", "--help"),
+                    returncode=0,
+                    stdout=(
+                        b"--safe-mode all customizations including CLAUDE.md are "
+                        b"disabled; Authentication, model selection, built-in tools, "
+                        b"and permissions work normally. "
+                        + wording
+                    ),
+                    stderr=b"",
+                )
 
-        providers._require_claude_safe_mode(pathlib.Path("/bin/claude"), {})
+                providers._require_claude_safe_mode(pathlib.Path("/bin/claude"), {})
 
     @mock.patch.object(providers, "run")
     def test_claude_rejects_negated_safe_mode_variable_wording(
@@ -1244,6 +1255,24 @@ class ProviderPolicyTest(unittest.TestCase):
             b"Never sets CLAUDE_CODE_SAFE_MODE.",
             b"Does not set CLAUDE_CODE_SAFE_MODE.",
             b"Unsets CLAUDE_CODE_SAFE_MODE.",
+            b"Sets CLAUDE_CODE_SAFE_MODE to 0.",
+            b"Sets CLAUDE_CODE_SAFE_MODE = 0.",
+            b"Sets CLAUDE_CODE_SAFE_MODE=0.",
+            b"Sets CLAUDE_CODE_SAFE_MODE: 0.",
+            b"Sets CLAUDE_CODE_SAFE_MODE, default 0.",
+            b"Sets CLAUDE_CODE_SAFE_MODE; value 0.",
+            b"Sets CLAUDE_CODE_SAFE_MODE=1.0.",
+            b"Sets CLAUDE_CODE_SAFE_MODE.foo.",
+            b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode to 0.",
+            b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode.foo.",
+            b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode --model opus",
+            b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode --session-id --model opus",
+            (
+                b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode --session-id <uuid> "
+                b"Use a specific session ID for the conversation "
+                b"(must be a valid UUID)"
+            ),
+            b"not.sets CLAUDE_CODE_SAFE_MODE.",
         ):
             with self.subTest(wording=wording):
                 run_command.return_value = Completed(
