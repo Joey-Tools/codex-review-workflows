@@ -3577,6 +3577,18 @@ class ProviderPolicyTest(unittest.TestCase):
             "http://task-proxy:8080",
         )
 
+    def test_claude_proxy_rejects_invalid_upstream_ports_before_bind(self) -> None:
+        for value in (
+            "http://corporate-proxy:0",
+            "http://corporate-proxy:99999",
+        ):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ReviewError,
+                "upstream proxy .* invalid",
+            ):
+                with providers._claude_connect_proxy({"https_proxy": value}):
+                    self.fail("invalid upstream proxy unexpectedly started")
+
     def test_claude_upstream_proxy_respects_bypass_environment(self) -> None:
         for key in ("NO_PROXY", "no_proxy"):
             with self.subTest(key=key):

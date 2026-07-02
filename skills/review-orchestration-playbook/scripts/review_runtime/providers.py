@@ -862,6 +862,29 @@ def _proxy_ssl_context(env: dict[str, str]) -> ssl.SSLContext:
     return context
 
 
+def _parse_upstream_proxy_url(
+    upstream_url: str,
+) -> tuple[urllib.parse.SplitResult, int]:
+    try:
+        parsed = urllib.parse.urlsplit(upstream_url)
+        hostname = parsed.hostname
+        explicit_port = parsed.port
+    except ValueError as error:
+        raise ReviewError("Claude review upstream proxy URL is invalid") from error
+    if parsed.scheme not in {"http", "https"} or not hostname:
+        raise ReviewError(
+            "Claude review proxy supports only HTTP(S) upstream proxies"
+        )
+    proxy_port = (
+        explicit_port
+        if explicit_port is not None
+        else (443 if parsed.scheme == "https" else 80)
+    )
+    if not 1 <= proxy_port <= 65535:
+        raise ReviewError("Claude review upstream proxy port is invalid")
+    return parsed, proxy_port
+
+
 def _open_proxy_target(
     host: str,
     port: int,
@@ -874,12 +897,7 @@ def _open_proxy_target(
             (host, port),
             timeout=CLAUDE_PROXY_CONNECT_TIMEOUT_SECONDS,
         )
-    parsed = urllib.parse.urlsplit(upstream_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise ReviewError(
-            "Claude review proxy supports only HTTP(S) upstream proxies"
-        )
-    proxy_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    parsed, proxy_port = _parse_upstream_proxy_url(upstream_url)
     connection = socket.create_connection(
         (parsed.hostname, proxy_port),
         timeout=CLAUDE_PROXY_CONNECT_TIMEOUT_SECONDS,
@@ -997,6 +1015,10 @@ def _claude_connect_proxy(
     *,
     allowed_targets: frozenset[tuple[str, int]] = CLAUDE_PROXY_TARGETS,
 ) -> Iterator[int]:
+    for host, port in allowed_targets:
+        upstream_url = _upstream_proxy_url(env, host=host, port=port)
+        if upstream_url is not None:
+            _parse_upstream_proxy_url(upstream_url)
     server = _ClaudeProxyServer(
         allowed_targets=allowed_targets,
         upstream_env=env,
