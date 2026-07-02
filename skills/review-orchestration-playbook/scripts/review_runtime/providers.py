@@ -4,13 +4,20 @@ import json
 import os
 import pathlib
 import re
+import tempfile
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Iterable
 
 from .common import (
     Completed,
+    InvalidReviewerExecutable,
     ReviewError,
+    ReviewOutputDrainError,
+    ReviewOutputLimitError,
+    ReviewProcessLeakError,
+    ReviewTimeoutError,
     child_environment,
+    reviewer_executable_dependencies,
     reviewer_executable_path,
     resolve_reviewer_executable,
     run,
@@ -51,6 +58,30 @@ CLAUDE_BARE_MODE_HELP_FORM = (
 )
 CLAUDE_HELP_OPTION_START = re.compile(r"^  (--[a-z0-9][a-z0-9-]*)\b")
 CLAUDE_BARE_TOKEN = re.compile(r"(?<![a-z0-9-])--bare(?![a-z0-9-])")
+CLAUDE_PROBE_SANDBOX = pathlib.Path("/usr/bin/sandbox-exec")
+CLAUDE_PROBE_SANDBOX_PROFILE = "(version 1)(deny default)"
+CLAUDE_PROBE_SYSTEM_READ_SUBPATHS = (
+    pathlib.Path("/System/Library"),
+    pathlib.Path("/usr/lib"),
+    pathlib.Path("/usr/share"),
+    pathlib.Path("/Library/Apple"),
+    pathlib.Path("/private/var/db/dyld"),
+    pathlib.Path("/private/var/db/timezone"),
+)
+CLAUDE_PROBE_SYSTEM_READ_LITERALS = (
+    # Bun's standalone runtime enumerates the filesystem root during startup.
+    # A literal filter permits that directory entry without allowing descendants.
+    pathlib.Path("/"),
+    pathlib.Path("/dev/null"),
+    pathlib.Path("/dev/random"),
+    pathlib.Path("/dev/urandom"),
+    pathlib.Path("/etc/hosts"),
+    pathlib.Path("/etc/localtime"),
+    pathlib.Path("/etc/resolv.conf"),
+)
+CLAUDE_PROBE_TIMEOUT_SECONDS = 20.0
+CLAUDE_PROBE_OUTPUT_LIMIT_BYTES = 64 * 1024
+COPILOT_JSONL_RECORD_LIMIT_BYTES = 4 * 1024 * 1024
 CLAUDE_EGRESS_CONSENTS = (
     "explicit-claude-review",
     "double-review",
@@ -145,6 +176,10 @@ AUTH_FAILURE_FRAGMENTS = (
 CODEX_ARG_TRANSPORT_NAME = re.compile(r"codex-arg0[A-Za-z0-9]+")
 
 
+class ClaudeProbeSandboxUnavailable(ReviewError):
+    """The host does not provide the required Claude probe sandbox runtime."""
+
+
 @dataclass(frozen=True)
 class Attempt:
     runtime: str
@@ -217,15 +252,150 @@ def _claude_help_option_blocks(help_text: str, option: str) -> tuple[str, ...]:
     return tuple(blocks)
 
 
+def _claude_probe_command(
+    executable: pathlib.Path,
+    probe_cwd: pathlib.Path,
+    *args: str,
+) -> tuple[str, ...]:
+    if not CLAUDE_PROBE_SANDBOX.is_file() or not os.access(
+        CLAUDE_PROBE_SANDBOX, os.X_OK
+    ):
+        raise ClaudeProbeSandboxUnavailable(
+            "Claude Code review requires macOS sandbox-exec for preflight probes"
+        )
+    return (
+        str(CLAUDE_PROBE_SANDBOX),
+        "-p",
+        _claude_probe_sandbox_profile(executable, probe_cwd),
+        str(executable),
+        "--bare",
+        *args,
+    )
+
+
+def _sandbox_path_filter(kind: str, path: pathlib.Path) -> str:
+    return f"({kind} {json.dumps(str(path), ensure_ascii=False)})"
+
+
+def _claude_probe_sandbox_profile(
+    executable: pathlib.Path,
+    probe_cwd: pathlib.Path,
+) -> str:
+    dependencies = reviewer_executable_dependencies(executable)
+    host_home = pathlib.Path(
+        os.environ.get("HOME", str(pathlib.Path.home()))
+    ).expanduser().resolve()
+    dependency_roots = {path.parent.resolve() for path in dependencies}
+    if any(
+        root == pathlib.Path("/") or root == host_home or root in host_home.parents
+        for root in dependency_roots
+    ):
+        raise InvalidReviewerExecutable(
+            "Claude Code executable or interpreter has an overly broad installation root"
+        )
+    read_subpaths = {
+        probe_cwd.resolve(),
+        *(path.resolve() for path in CLAUDE_PROBE_SYSTEM_READ_SUBPATHS),
+        *dependency_roots,
+    }
+    read_files = {
+        *(path.resolve() for path in CLAUDE_PROBE_SYSTEM_READ_LITERALS),
+        *dependencies,
+    }
+    metadata_paths: set[pathlib.Path] = set()
+    for path in {*read_files, *read_subpaths}:
+        current = path
+        while True:
+            metadata_paths.add(current)
+            if current.parent == current:
+                break
+            current = current.parent
+    read_filters = "".join(
+        [
+            *(
+                _sandbox_path_filter("literal", path)
+                for path in sorted(read_files, key=str)
+            ),
+            *(
+                _sandbox_path_filter("subpath", path)
+                for path in sorted(read_subpaths, key=str)
+            ),
+        ]
+    )
+    metadata_filters = "".join(
+        _sandbox_path_filter("literal", path)
+        for path in sorted(metadata_paths, key=str)
+    )
+    exec_filters = "".join(
+        [
+            *(
+                _sandbox_path_filter("literal", path)
+                for path in sorted(dependencies, key=str)
+            ),
+            *(
+                _sandbox_path_filter("subpath", path.parent.resolve())
+                for path in sorted(dependencies, key=str)
+            ),
+        ]
+    )
+    return (
+        CLAUDE_PROBE_SANDBOX_PROFILE
+        + f"(allow file-read-metadata {metadata_filters})"
+        + f"(allow file-read* {read_filters})"
+        + f"(allow process-exec {exec_filters})"
+        + "(allow sysctl-read)"
+    )
+
+
+def _claude_probe_cwd(env: dict[str, str]) -> pathlib.Path:
+    raw_home = env.get("HOME")
+    if not raw_home:
+        raise ReviewError("Claude Code probe requires an isolated HOME")
+    home = pathlib.Path(raw_home)
+    if not home.is_absolute() or home.is_symlink() or not home.is_dir():
+        raise ReviewError("Claude Code probe HOME must be an existing real directory")
+    return home
+
+
+def _run_claude_probe(
+    executable: pathlib.Path,
+    env: dict[str, str],
+    *args: str,
+) -> Completed:
+    probe_cwd = _claude_probe_cwd(env)
+    with tempfile.TemporaryDirectory(prefix=".claude-probe-", dir=probe_cwd) as raw:
+        output_dir = pathlib.Path(raw)
+        return run(
+            _claude_probe_command(executable, probe_cwd, *args),
+            cwd=probe_cwd,
+            env=env,
+            stdout_path=output_dir / "stdout.log",
+            stderr_path=output_dir / "stderr.log",
+            capture_limit_bytes=CLAUDE_PROBE_OUTPUT_LIMIT_BYTES,
+            timeout_seconds=CLAUDE_PROBE_TIMEOUT_SECONDS,
+            output_file_limit_bytes=CLAUDE_PROBE_OUTPUT_LIMIT_BYTES,
+        )
+
+
+def _require_claude_identity(
+    executable: pathlib.Path,
+    env: dict[str, str],
+) -> None:
+    completed = _run_claude_probe(executable, env, "--version")
+    output = (completed.stdout + b"\n" + completed.stderr).decode(
+        "utf-8", errors="replace"
+    )
+    if completed.returncode != 0 or "claude code" not in output.lower():
+        raise InvalidReviewerExecutable(
+            "sandboxed executable did not identify as Claude Code"
+        )
+
+
 def _require_claude_bare_mode(
     executable: pathlib.Path,
     env: dict[str, str],
 ) -> None:
-    completed = run(
-        (str(executable), "--bare", "--help"),
-        cwd=pathlib.Path(os.path.abspath(os.sep)),
-        env=env,
-    )
+    completed = _run_claude_probe(executable, env, "--help")
     help_text = (completed.stdout + b"\n" + completed.stderr).decode(
         "utf-8", errors="replace"
     )
@@ -235,7 +405,7 @@ def _require_claude_bare_mode(
         or _claude_help_option_blocks(help_text, "--bare")
         != (CLAUDE_BARE_MODE_HELP_FORM,)
     ):
-        raise ReviewError(
+        raise InvalidReviewerExecutable(
             "Claude Code does not expose a uniquely verifiable --bare mode that "
             "skips hooks and other project customizations"
         )
@@ -302,7 +472,7 @@ def _json_objects(stdout: bytes) -> list[dict[str, Any]]:
     if isinstance(parsed, dict):
         values.append(parsed)
         return values
-    for line in text.splitlines():
+    for line in text.split("\n"):
         try:
             parsed_line = json.loads(line)
         except json.JSONDecodeError:
@@ -310,6 +480,55 @@ def _json_objects(stdout: bytes) -> list[dict[str, Any]]:
         if isinstance(parsed_line, dict):
             values.append(parsed_line)
     return values
+
+
+def _strict_json_object_from_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key: {key}")
+        result[key] = value
+    return result
+
+
+def _strict_json_object(stdout: bytes) -> dict[str, Any] | None:
+    try:
+        text = stdout.decode("utf-8")
+        parsed = json.loads(
+            text,
+            parse_constant=_reject_nonstandard_json_constant,
+            object_pairs_hook=_strict_json_object_from_pairs,
+        )
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _strict_jsonl_objects(stdout: bytes) -> list[dict[str, Any]] | None:
+    try:
+        text = stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    objects: list[dict[str, Any]] = []
+    for line in text.split("\n"):
+        if not line.strip(" \t\r"):
+            continue
+        try:
+            parsed = json.loads(
+                line,
+                parse_constant=_reject_nonstandard_json_constant,
+                object_pairs_hook=_strict_json_object_from_pairs,
+            )
+        except ValueError:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        objects.append(parsed)
+    return objects
+
+
+def _reject_nonstandard_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant: {value}")
 
 
 def _error_payload_text(value: Any) -> list[str]:
@@ -339,112 +558,302 @@ def _error_payload_text(value: Any) -> list[str]:
     return []
 
 
-def _structured_error_text(stdout: bytes) -> str:
+def _structured_error_item_text(item: dict[str, Any]) -> str:
     messages: list[str] = []
-
-    def error_state(value: Any) -> tuple[bool, str]:
-        if not isinstance(value, dict):
-            return False, ""
-        tokens = [
-            item.lower()
-            for key in ("type", "subtype", "status")
-            if isinstance((item := value.get(key)), str)
-        ]
-        explicit = value.get("is_error") is True or any(
-            token == "error"
-            or token in {"failed", "failure", "error_during_execution"}
-            or token.endswith(".failed")
-            or token.endswith(".failure")
-            or token.endswith(".error")
-            or token.endswith("_error")
-            or token.startswith("error_")
-            for token in tokens
-        )
-        return explicit, " ".join(tokens)
-
-    for item in _json_objects(stdout):
-        explicit_error, state_text = error_state(item)
-        if not explicit_error:
-            continue
-        messages.append(f"event {state_text or 'explicit error'}")
-        for key in ("error", "errors", "message", "reason", "detail", "code"):
-            if key in item:
-                messages.extend(_error_payload_text(item[key]))
-        api_error_status = item.get("api_error_status")
-        if isinstance(api_error_status, (int, str)):
-            messages.append(f"status {api_error_status}")
+    tokens = [
+        value.lower()
+        for key in ("type", "subtype", "status")
+        if isinstance((value := item.get(key)), str)
+    ]
+    explicit_error = item.get("is_error") is True or any(
+        token == "error"
+        or token in {"failed", "failure", "error_during_execution"}
+        or token.endswith(".failed")
+        or token.endswith(".failure")
+        or token.endswith(".error")
+        or token.endswith("_error")
+        or token.startswith("error_")
+        for token in tokens
+    )
+    if not explicit_error:
+        return ""
+    messages.append(f"event {' '.join(tokens) or 'explicit error'}")
+    for key in ("error", "errors", "message", "reason", "detail", "code"):
+        if key in item:
+            messages.extend(_error_payload_text(item[key]))
+    api_error_status = item.get("api_error_status")
+    if isinstance(api_error_status, (int, str)):
+        messages.append(f"status {api_error_status}")
     return "\n".join(messages)
 
 
-def _find_text(value: Any) -> str | None:
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    if isinstance(value, dict):
-        for key in (
-            "result",
-            "final",
-            "content",
-            "text",
-            "message",
-            "response",
-            "data",
-        ):
-            if key in value:
-                found = _find_text(value[key])
-                if found:
-                    return found
-    if isinstance(value, list):
-        for item in reversed(value):
-            found = _find_text(item)
-            if found:
-                return found
-    return None
+def _structured_error_text(stdout: bytes) -> str:
+    return "\n".join(
+        message
+        for item in _json_objects(stdout)
+        if (message := _structured_error_item_text(item))
+    )
 
 
-def _find_model(value: Any, *, requested_model: str | None = None) -> str | None:
-    if isinstance(value, dict):
-        model_usage = value.get("modelUsage")
-        if isinstance(model_usage, dict) and model_usage:
-            candidates = [key for key in model_usage if isinstance(key, str) and key]
-            if requested_model is not None:
-                for candidate in candidates:
-                    if _model_matches(requested_model, candidate):
-                        return candidate
-            if candidates:
-                return candidates[-1]
-        for key in ("model", "modelName", "model_id", "modelId"):
-            candidate = value.get(key)
-            if isinstance(candidate, str) and candidate:
-                return candidate
-        for key in ("data", "metadata", "result", "usage"):
-            if key in value:
-                found = _find_model(value[key], requested_model=requested_model)
-                if found:
-                    return found
-    if isinstance(value, list):
-        for item in reversed(value):
-            found = _find_model(item, requested_model=requested_model)
-            if found:
-                return found
-    return None
-
-
-def _parse_structured_output(
+def _parse_claude_output(
     stdout: bytes, *, requested_model: str | None = None
 ) -> tuple[str | None, str | None]:
-    objects = _json_objects(stdout)
-    final_text: str | None = None
-    effective_model: str | None = None
-    for item in reversed(objects):
-        if final_text is None:
-            final_text = _find_text(item)
-        if effective_model is None:
-            effective_model = _find_model(item, requested_model=requested_model)
-        if final_text is not None and effective_model is not None:
-            break
+    result = _strict_json_object(stdout)
+    if result is None:
+        return None, None
+    if result.get("type") != "result":
+        return None, None
+    model_usage = result.get("modelUsage")
+    if not isinstance(model_usage, dict) or not model_usage:
+        return None, None
+    if any(
+        not isinstance(key, str)
+        or not key
+        or not isinstance(value, dict)
+        for key, value in model_usage.items()
+    ):
+        return None, None
+    candidates = list(model_usage)
+    effective_model = None
+    if requested_model is not None:
+        effective_model = next(
+            (
+                candidate
+                for candidate in candidates
+                if _model_matches(requested_model, candidate)
+            ),
+            None,
+        )
+    if effective_model is None and candidates:
+        effective_model = candidates[-1]
+    if result.get("subtype") != "success" or result.get("is_error") is not False:
+        return None, effective_model
+    for key in ("error", "errors"):
+        if key not in result:
+            continue
+        value = result[key]
+        explicitly_empty = (
+            value is None
+            or (isinstance(value, str) and not value.strip())
+            or (isinstance(value, (list, dict)) and not value)
+        )
+        if not explicitly_empty:
+            return None, effective_model
+    if "api_error_status" in result:
+        value = result["api_error_status"]
+        if value is not None and not (
+            isinstance(value, str) and not value.strip()
+        ):
+            return None, effective_model
+    final_text = result.get("result")
+    if not isinstance(final_text, str) or not final_text.strip() or not candidates:
+        return None, effective_model
     if _structured_error_text(stdout).strip():
-        final_text = None
+        return None, effective_model
     return final_text, effective_model
+
+
+def _copilot_item_model_evidence(
+    item: dict[str, Any],
+) -> tuple[bool, str | None]:
+    event_type = item.get("type")
+    if event_type == "session.start":
+        model_key = "selectedModel"
+    elif event_type in {"assistant.message", "assistant.usage"}:
+        model_key = "model"
+    else:
+        return True, None
+    data = item.get("data")
+    if not isinstance(data, dict):
+        return False, None
+    if event_type != "session.start" and data.get("parentToolCallId"):
+        return True, None
+    if model_key not in data:
+        return True, None
+    candidate = data[model_key]
+    if not isinstance(candidate, str) or not candidate:
+        return False, None
+    return True, candidate
+
+
+def _parse_copilot_objects(
+    objects: Iterable[dict[str, Any]],
+    *,
+    requested_model: str | None = None,
+) -> tuple[str | None, str | None]:
+    open_turn: dict[str, Any] | None = None
+    completed_turn: tuple[int, dict[str, Any]] | None = None
+    latest_session_model: str | None = None
+    first_model: str | None = None
+    evidence_conflict = False
+    structured_error = False
+    first_error_index: int | None = None
+    last_error_index: int | None = None
+    last_index = -1
+
+    for index, item in enumerate(objects):
+        last_index = index
+        valid_model, candidate = _copilot_item_model_evidence(item)
+        if not valid_model:
+            return None, None
+        if candidate is not None:
+            if first_model is None:
+                first_model = candidate
+            elif not _model_matches(first_model, candidate):
+                evidence_conflict = True
+        if _structured_error_item_text(item):
+            structured_error = True
+            first_error_index = (
+                index if first_error_index is None else first_error_index
+            )
+            last_error_index = index
+
+        event_type = item.get("type")
+        if event_type == "session.start":
+            if open_turn is not None:
+                return None, None
+            latest_session_model = candidate
+        if event_type in {"assistant.turn_start", "assistant.turn_end"}:
+            data = item.get("data")
+            if not isinstance(data, dict):
+                return None, None
+            turn_id = data.get("turnId")
+            if not isinstance(turn_id, str) or not turn_id:
+                return None, None
+            if event_type == "assistant.turn_start":
+                if open_turn is not None:
+                    return None, None
+                open_turn = {
+                    "id": turn_id,
+                    "start_index": index,
+                    "message": None,
+                    "session_model": latest_session_model,
+                    "usage_model": None,
+                }
+                continue
+            if open_turn is None or open_turn["id"] != turn_id:
+                return None, None
+            completed_turn = (
+                index,
+                {
+                    "message": open_turn["message"],
+                    "session_model": open_turn["session_model"],
+                    "start_index": open_turn["start_index"],
+                    "usage_model": open_turn["usage_model"],
+                },
+            )
+            open_turn = None
+            continue
+
+        if open_turn is None:
+            continue
+        if event_type == "assistant.message":
+            data = item["data"]
+            if data.get("parentToolCallId"):
+                continue
+            open_turn["message"] = data
+            open_turn["usage_model"] = None
+        elif event_type == "assistant.usage":
+            data = item["data"]
+            if data.get("parentToolCallId") or open_turn["message"] is None:
+                continue
+            if candidate is not None and open_turn["usage_model"] is None:
+                open_turn["usage_model"] = candidate
+
+    if structured_error:
+        assert first_error_index is not None and last_error_index is not None
+        if open_turn is not None:
+            if first_error_index <= open_turn["start_index"]:
+                return None, None
+        elif completed_turn is not None:
+            terminal_index, turn = completed_turn
+            if (
+                terminal_index != last_index
+                or first_error_index <= turn["start_index"]
+                or last_error_index >= terminal_index
+            ):
+                return None, None
+        else:
+            return None, None
+        if evidence_conflict:
+            return None, None
+        turn = open_turn if open_turn is not None else completed_turn[1]
+        message = turn["message"]
+        message_model = message.get("model") if isinstance(message, dict) else None
+        effective_model = (
+            turn["usage_model"] or message_model or turn["session_model"]
+        )
+        if not isinstance(effective_model, str) or not effective_model:
+            return None, None
+        return None, effective_model
+    if (
+        open_turn is not None
+        or completed_turn is None
+        or completed_turn[0] != last_index
+        or evidence_conflict
+    ):
+        return None, None
+
+    turn = completed_turn[1]
+    data = turn["message"]
+    if not isinstance(data, dict):
+        return None, None
+    tool_requests = data.get("toolRequests", [])
+    if not isinstance(tool_requests, list) or tool_requests:
+        return None, None
+    content = data.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return None, None
+    usage_model = turn["usage_model"]
+    message_model = data.get("model")
+    model = usage_model or message_model or turn["session_model"]
+    if not isinstance(model, str) or not model:
+        return None, None
+    if first_model is not None and not _model_matches(model, first_model):
+        return None, None
+    return content, model
+
+
+def _parse_copilot_output(
+    stdout: bytes, *, requested_model: str | None = None
+) -> tuple[str | None, str | None]:
+    objects = _strict_jsonl_objects(stdout)
+    if objects is None:
+        return None, None
+    return _parse_copilot_objects(objects, requested_model=requested_model)
+
+
+def _strict_jsonl_file_objects(path: pathlib.Path) -> Iterable[dict[str, Any]]:
+    with path.open("rb") as handle:
+        while raw_line := handle.readline(COPILOT_JSONL_RECORD_LIMIT_BYTES + 2):
+            line = raw_line[:-1] if raw_line.endswith(b"\n") else raw_line
+            if len(line) > COPILOT_JSONL_RECORD_LIMIT_BYTES:
+                raise ValueError("Copilot JSONL record exceeds the bounded parser limit")
+            if not line.strip(b" \t\r"):
+                continue
+            text = line.decode("utf-8")
+            parsed = json.loads(
+                text,
+                parse_constant=_reject_nonstandard_json_constant,
+                object_pairs_hook=_strict_json_object_from_pairs,
+            )
+            if not isinstance(parsed, dict):
+                raise ValueError("Copilot JSONL record is not an object")
+            yield parsed
+
+
+def _parse_copilot_output_file(
+    path: pathlib.Path,
+    *,
+    requested_model: str | None = None,
+) -> tuple[str | None, str | None]:
+    try:
+        return _parse_copilot_objects(
+            _strict_jsonl_file_objects(path),
+            requested_model=requested_model,
+        )
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None, None
 
 
 def _codex_thread_id(stdout: bytes) -> str | None:
@@ -657,13 +1066,13 @@ def _record_attempt(
         stdout_path=str(stdout_path),
         stderr_path=str(stderr_path),
     )
-    if attempt.category == "success" and (
+    if attempt.category in {"success", "entitlement"} and (
         (require_verified_model and effective_model is None)
         or (require_verified_effort and effective_effort is None)
     ):
         detail = (
-            "successful reviewer result did not expose required runtime verification "
-            "metadata; refusing to mark the pinned lane successful"
+            "reviewer result did not expose required runtime verification "
+            "metadata; refusing to accept the pinned lane result"
         )
         _append_attempt_diagnostic(stderr_path, detail)
         return replace(
@@ -820,6 +1229,37 @@ def _codex_attempt(
     return attempt
 
 
+def _resolve_validated_claude_executable(
+    *,
+    review: ReviewWorkspace,
+    env: dict[str, str],
+) -> tuple[pathlib.Path | None, dict[str, str]]:
+    claude_home = review.container_dir / "claude-home"
+    claude_home.mkdir(parents=True, exist_ok=True)
+    prepared_env = dict(env)
+    prepared_env["HOME"] = str(claude_home)
+    prepared_env.pop("XDG_CONFIG_HOME", None)
+    probe_env = {
+        key: value
+        for key, value in prepared_env.items()
+        if key != "ANTHROPIC_API_KEY"
+        and not key.startswith("CODEX_ISOLATED_REVIEW_")
+    }
+
+    def validate_candidate(candidate: pathlib.Path) -> None:
+        candidate_env = dict(probe_env)
+        candidate_env["PATH"] = reviewer_executable_path(candidate)
+        _require_claude_identity(candidate, candidate_env)
+        _require_claude_bare_mode(candidate, candidate_env)
+
+    executable = resolve_reviewer_executable(
+        "claude", candidate_validator=validate_candidate
+    )
+    if executable is None:
+        return None, prepared_env
+    return executable, _with_executable_path(prepared_env, executable)
+
+
 def _claude_attempt(
     *,
     review: ReviewWorkspace,
@@ -827,24 +1267,14 @@ def _claude_attempt(
     index: int,
     env: dict[str, str],
 ) -> Attempt:
-    executable = resolve_reviewer_executable("claude")
+    executable, env = _resolve_validated_claude_executable(
+        review=review,
+        env=env,
+    )
     if executable is None:
         raise FileNotFoundError(
             "claude is not available in a validated executable path"
         )
-    env = _with_executable_path(env, executable)
-    claude_home = review.container_dir / "claude-home"
-    claude_home.mkdir(parents=True, exist_ok=True)
-    env = dict(env)
-    env["HOME"] = str(claude_home)
-    env.pop("XDG_CONFIG_HOME", None)
-    probe_env = {
-        key: value
-        for key, value in env.items()
-        if key != "ANTHROPIC_API_KEY"
-        and not key.startswith("CODEX_ISOLATED_REVIEW_")
-    }
-    _require_claude_bare_mode(executable, probe_env)
     stdout_path, stderr_path = _attempt_paths(review, index, "claude", model)
     settings = json.dumps(
         {
@@ -902,7 +1332,7 @@ def _claude_attempt(
         stdout_path=stdout_path,
         stderr_path=stderr_path,
     )
-    final_text, effective_model = _parse_structured_output(
+    final_text, effective_model = _parse_claude_output(
         completed.stdout, requested_model=model
     )
     return _record_attempt(
@@ -1011,8 +1441,8 @@ def _copilot_attempt(
         stdout_path=stdout_path,
         stderr_path=stderr_path,
     )
-    final_text, effective_model = _parse_structured_output(
-        completed.stdout, requested_model=model
+    final_text, effective_model = _parse_copilot_output_file(
+        stdout_path, requested_model=model
     )
     return _record_attempt(
         review=review,
@@ -1059,7 +1489,7 @@ def _finish(
     _write_attempts(review, attempts)
     if final_text:
         write_text_atomic(
-            review.container_dir / "final.txt", final_text.rstrip() + "\n"
+            review.container_dir / "final.txt", final_text.rstrip("\r\n") + "\n"
         )
         return Outcome(0, final_text, tuple(attempts))
     if attempts and attempts[-1].category == "transient":
@@ -1177,8 +1607,39 @@ def run_review(
             return Outcome(127, None, tuple())
         return _finish(review, attempts, final_text)
 
+    claude_env = _review_environment(
+        review=review,
+        passthrough_keys=CLAUDE_ENV_KEYS,
+        extra={
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
+        },
+    )
     try:
-        claude_available = resolve_reviewer_executable("claude") is not None
+        claude_executable, claude_env = _resolve_validated_claude_executable(
+            review=review,
+            env=claude_env,
+        )
+        claude_available = claude_executable is not None
+    except ClaudeProbeSandboxUnavailable as error:
+        claude_available = False
+        write_text_atomic(
+            review.container_dir / "claude-skip.txt",
+            f"Claude Code probe runtime is unavailable: {error}\n",
+        )
+    except (
+        FileNotFoundError,
+        ReviewTimeoutError,
+        ReviewOutputDrainError,
+        ReviewOutputLimitError,
+        ReviewProcessLeakError,
+    ) as error:
+        write_text_atomic(
+            review.container_dir / "runner-error.txt",
+            f"Claude Code validation was inconclusive: {error}\n",
+        )
+        write_json(review.container_dir / "attempts.json", [])
+        return Outcome(75, None, tuple(attempts))
     except ReviewError as error:
         write_text_atomic(
             review.container_dir / "runner-error.txt",
@@ -1188,14 +1649,6 @@ def run_review(
         write_json(review.container_dir / "attempts.json", [])
         return Outcome(2, None, tuple(attempts))
     if claude_available:
-        claude_env = _review_environment(
-            review=review,
-            passthrough_keys=CLAUDE_ENV_KEYS,
-            extra={
-                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-                "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
-            },
-        )
         if not claude_env.get("ANTHROPIC_API_KEY"):
             claude_available = False
             write_text_atomic(
@@ -1212,9 +1665,19 @@ def run_review(
                 env=claude_env,
                 attempts=attempts,
             )
-        except FileNotFoundError:
-            category = "unavailable"
-            final_text = None
+        except (
+            FileNotFoundError,
+            ReviewTimeoutError,
+            ReviewOutputDrainError,
+            ReviewOutputLimitError,
+            ReviewProcessLeakError,
+        ) as error:
+            write_text_atomic(
+                review.container_dir / "runner-error.txt",
+                f"Claude Code validation was inconclusive: {error}\n",
+            )
+            _write_attempts(review, attempts)
+            return Outcome(75, None, tuple(attempts))
         except ReviewError as error:
             write_text_atomic(
                 review.container_dir / "runner-error.txt",

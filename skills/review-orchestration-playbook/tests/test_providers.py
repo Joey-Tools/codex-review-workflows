@@ -241,7 +241,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 "modelUsage": {"claude-opus-4-8": {}},
             }
         ).encode()
-        final_text, effective_model = providers._parse_structured_output(stdout)
+        final_text, effective_model = providers._parse_claude_output(stdout)
         self.assertIsNone(final_text)
         self.assertEqual(effective_model, "claude-opus-4-8")
 
@@ -249,6 +249,8 @@ class ProviderPolicyTest(unittest.TestCase):
         stdout = json.dumps(
             {
                 "type": "result",
+                "subtype": "success",
+                "is_error": False,
                 "result": "No findings.",
                 "modelUsage": {
                     "claude-haiku-4-5-20251001": {},
@@ -256,11 +258,941 @@ class ProviderPolicyTest(unittest.TestCase):
                 },
             }
         ).encode()
-        final_text, effective_model = providers._parse_structured_output(
+        final_text, effective_model = providers._parse_claude_output(
             stdout, requested_model="claude-opus-4-8"
         )
         self.assertEqual(final_text, "No findings.")
         self.assertEqual(effective_model, "claude-opus-4-8")
+
+    def test_claude_rejects_malformed_model_usage_entry(self) -> None:
+        stdout = json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": "No findings.",
+                "modelUsage": {"claude-opus-4-8": None},
+            }
+        ).encode()
+
+        self.assertEqual(providers._parse_claude_output(stdout), (None, None))
+
+    def test_claude_rejects_success_with_nonempty_errors(self) -> None:
+        stdout = json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": "No findings.",
+                "errors": [{"message": "contradictory failure"}],
+                "modelUsage": {"claude-opus-4-8": {}},
+            }
+        ).encode()
+
+        self.assertEqual(
+            providers._parse_claude_output(stdout),
+            (None, "claude-opus-4-8"),
+        )
+
+    def test_claude_rejects_unknown_or_malformed_error_payloads(self) -> None:
+        for field, value in (
+            ("errors", [{"exception": "failed"}]),
+            ("api_error_status", {"code": 500}),
+        ):
+            with self.subTest(field=field):
+                payload = {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "result": "No findings.",
+                    "modelUsage": {"claude-opus-4-8": {}},
+                    field: value,
+                }
+
+                self.assertEqual(
+                    providers._parse_claude_output(json.dumps(payload).encode()),
+                    (None, "claude-opus-4-8"),
+                )
+
+    def test_nonterminal_claude_payload_cannot_supply_final_text(self) -> None:
+        stdout = json.dumps(
+            {
+                "type": "progress",
+                "data": {
+                    "message": "LGTM",
+                    "model": "claude-opus-4-8",
+                },
+            }
+        ).encode()
+
+        self.assertEqual(providers._parse_claude_output(stdout), (None, None))
+
+    def test_claude_rejects_non_json_prefix_before_success_object(self) -> None:
+        stdout = (
+            b"warning: degraded output\n"
+            + json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "result": "No findings.",
+                    "modelUsage": {"claude-opus-4-8": {}},
+                }
+            ).encode()
+        )
+
+        self.assertEqual(providers._parse_claude_output(stdout), (None, None))
+
+    def test_claude_rejects_unicode_separator_prefix_before_success(self) -> None:
+        stdout = (
+            "\u2028"
+            + json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "result": "No findings.",
+                    "modelUsage": {"claude-opus-4-8": {}},
+                }
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_claude_output(stdout), (None, None))
+
+    def test_claude_rejects_nonstandard_json_constant(self) -> None:
+        stdout = (
+            b'{"type":"result","subtype":"success","is_error":false,'
+            b'"result":"No findings.","modelUsage":{"claude-opus-4-8":{}},'
+            b'"metric":NaN}'
+        )
+
+        self.assertEqual(providers._parse_claude_output(stdout), (None, None))
+
+    def test_claude_rejects_duplicate_json_object_key(self) -> None:
+        stdout = (
+            b'{"type":"result","subtype":"success","is_error":true,'
+            b'"is_error":false,"result":"No findings.",'
+            b'"modelUsage":{"claude-opus-4-8":{}}}'
+        )
+
+        self.assertEqual(providers._parse_claude_output(stdout), (None, None))
+
+    def test_claude_preserves_unicode_separator_at_result_edges(self) -> None:
+        result = "\u2028No findings.\u2029"
+        stdout = json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": result,
+                "modelUsage": {"claude-opus-4-8": {}},
+            },
+            ensure_ascii=False,
+        ).encode()
+
+        self.assertEqual(
+            providers._parse_claude_output(stdout),
+            (result, "claude-opus-4-8"),
+        )
+
+    def test_copilot_requires_terminal_message_for_the_ended_turn(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "tool.execution_complete",
+                    "data": {
+                        "message": "LGTM",
+                        "model": "claude-opus-4.8",
+                    },
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
+
+    def test_copilot_rejects_non_json_line_before_terminal_events(self) -> None:
+        stdout = (
+            "warning: degraded output\n"
+            + "\n".join(
+                json.dumps(item)
+                for item in (
+                    {
+                        "type": "assistant.turn_start",
+                        "data": {"turnId": "turn-1"},
+                    },
+                    {
+                        "type": "assistant.message",
+                        "data": {
+                            "content": "No findings.",
+                            "model": "claude-opus-4.8",
+                        },
+                    },
+                    {
+                        "type": "assistant.turn_end",
+                        "data": {"turnId": "turn-1"},
+                    },
+                )
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
+
+    def test_copilot_error_preserves_mismatched_effective_model(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "session.start",
+                    "data": {"selectedModel": "claude-opus-4.7"},
+                },
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "turn.failed",
+                    "error": {"message": "Model is not available for your account"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(
+            providers._parse_copilot_output(
+                stdout, requested_model="claude-opus-4.8"
+            ),
+            (None, "claude-opus-4.7"),
+        )
+
+    def test_copilot_error_without_turn_is_unverifiable(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "session.start",
+                    "data": {"selectedModel": "claude-opus-4.8"},
+                },
+                {
+                    "type": "turn.failed",
+                    "error": {"message": "Model is not available for your account"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(
+            providers._parse_copilot_output(
+                stdout, requested_model="claude-opus-4.8"
+            ),
+            (None, None),
+        )
+
+    def test_copilot_error_does_not_inherit_previous_session_model(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "session.start",
+                    "data": {"selectedModel": "claude-opus-4.8"},
+                },
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+                {"type": "session.start", "data": {}},
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-2"},
+                },
+                {
+                    "type": "turn.failed",
+                    "error": {"message": "Model is not available for your account"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(
+            providers._parse_copilot_output(
+                stdout, requested_model="claude-opus-4.8"
+            ),
+            (None, None),
+        )
+
+    def test_copilot_error_rejects_malformed_model_evidence(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "session.start",
+                    "data": {"selectedModel": "claude-opus-4.8"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {"model": 123},
+                },
+                {
+                    "type": "turn.failed",
+                    "error": {"message": "Model is not available for your account"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(
+            providers._parse_copilot_output(
+                stdout, requested_model="claude-opus-4.8"
+            ),
+            (None, None),
+        )
+
+    def test_copilot_error_after_completed_turn_is_unverifiable(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "session.start",
+                    "data": {"selectedModel": "claude-opus-4.8"},
+                },
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "content": "No findings.",
+                        "model": "claude-opus-4.8",
+                    },
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "turn.failed",
+                    "error": {"message": "Model is not available for your account"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(
+            providers._parse_copilot_output(
+                stdout, requested_model="claude-opus-4.8"
+            ),
+            (None, None),
+        )
+
+    def test_copilot_error_cannot_be_hidden_by_empty_completed_turn(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "session.start",
+                    "data": {"selectedModel": "claude-opus-4.8"},
+                },
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "turn.failed",
+                    "error": {"message": "Model is not available for your account"},
+                },
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-2"},
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-2"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(
+            providers._parse_copilot_output(
+                stdout, requested_model="claude-opus-4.8"
+            ),
+            (None, None),
+        )
+
+    def test_copilot_error_in_open_turn_after_completed_turn_keeps_model(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "session.start",
+                    "data": {"selectedModel": "claude-opus-4.8"},
+                },
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-2"},
+                },
+                {
+                    "type": "turn.failed",
+                    "error": {"message": "Model is not available for your account"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(
+            providers._parse_copilot_output(
+                stdout, requested_model="claude-opus-4.8"
+            ),
+            (None, "claude-opus-4.8"),
+        )
+
+    def test_copilot_preserves_unicode_separators_at_content_edges(self) -> None:
+        content = "\u2028No findings.\u2029"
+        stdout = "\n".join(
+            json.dumps(item, ensure_ascii=False)
+            for item in (
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "content": content,
+                        "model": "claude-opus-4.8",
+                    },
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(
+            providers._parse_copilot_output(stdout),
+            (content, "claude-opus-4.8"),
+        )
+
+    def test_copilot_rejects_nonstandard_json_constant(self) -> None:
+        stdout = "\n".join(
+            (
+                '{"type":"assistant.turn_start","data":{"turnId":"turn-1"}}',
+                '{"type":"assistant.message","data":{"content":"No findings.",'
+                '"model":"claude-opus-4.8","metric":Infinity}}',
+                '{"type":"assistant.turn_end","data":{"turnId":"turn-1"}}',
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
+
+    def test_copilot_rejects_duplicate_json_object_key(self) -> None:
+        stdout = "\n".join(
+            (
+                '{"type":"assistant.turn_start","data":{"turnId":"turn-1"}}',
+                '{"type":"assistant.message","data":{"content":"No findings.",'
+                '"model":"claude-opus-4.7","model":"claude-opus-4.8"}}',
+                '{"type":"assistant.turn_end","data":{"turnId":"turn-1"}}',
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
+
+    def test_copilot_rejects_unicode_separator_only_record(self) -> None:
+        stdout = (
+            "\u2028\n"
+            + "\n".join(
+                json.dumps(item)
+                for item in (
+                    {
+                        "type": "assistant.turn_start",
+                        "data": {"turnId": "turn-1"},
+                    },
+                    {
+                        "type": "assistant.message",
+                        "data": {
+                            "content": "No findings.",
+                            "model": "claude-opus-4.8",
+                        },
+                    },
+                    {
+                        "type": "assistant.turn_end",
+                        "data": {"turnId": "turn-1"},
+                    },
+                )
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
+
+    def test_copilot_rejects_nested_or_interleaved_turn_boundaries(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-a"},
+                },
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-b"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "content": "No findings.",
+                        "model": "claude-opus-4.8",
+                    },
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-b"},
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-a"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
+
+    def test_copilot_rejects_unclosed_outer_turn_before_completed_inner(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-a"},
+                },
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-b"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "content": "No findings.",
+                        "model": "claude-opus-4.8",
+                    },
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-b"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
+
+    def test_copilot_rejects_malformed_later_top_level_message(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "content": "stale findings",
+                        "model": "claude-opus-4.8",
+                    },
+                },
+                {"type": "assistant.message", "data": None},
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
+
+    def test_copilot_rejects_malformed_terminal_usage_event(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "content": "No findings.",
+                        "model": "claude-opus-4.8",
+                    },
+                },
+                {"type": "assistant.usage", "data": {"model": None}},
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
+
+    def test_copilot_accepts_only_tool_free_message_for_ended_turn(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "content": "intermediate LGTM",
+                        "toolRequests": [{"name": "view"}],
+                    },
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "content": "No findings.",
+                    },
+                },
+                {
+                    "type": "assistant.usage",
+                    "data": {"model": "claude-opus-4.8"},
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(
+            providers._parse_copilot_output(stdout),
+            ("No findings.", "claude-opus-4.8"),
+        )
+
+    def test_copilot_does_not_fall_back_past_terminal_tool_request(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "content": "premature LGTM",
+                    },
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "content": "checking one more file",
+                        "toolRequests": [{"name": "view"}],
+                    },
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
+
+    def test_copilot_accepts_current_cli_model_extension(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "session.start",
+                    "data": {"selectedModel": "claude-opus-4.8"},
+                },
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "messageId": "message-1",
+                        "content": "No findings.",
+                        "model": "claude-opus-4.8",
+                        "toolRequests": [],
+                    },
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(
+            providers._parse_copilot_output(stdout),
+            ("No findings.", "claude-opus-4.8"),
+        )
+
+    def test_copilot_success_does_not_inherit_previous_session_model(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "session.start",
+                    "data": {"selectedModel": "claude-opus-4.8"},
+                },
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+                {"type": "session.start", "data": {}},
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-2"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {"content": "No findings.", "toolRequests": []},
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-2"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
+
+    def test_copilot_streams_complete_jsonl_larger_than_memory_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            stdout_path = pathlib.Path(temporary) / "copilot.stdout.log"
+            progress = json.dumps(
+                {"type": "progress", "data": {"padding": "x" * 4096}}
+            )
+            with stdout_path.open("w", encoding="utf-8") as handle:
+                while handle.tell() <= 4 * 1024 * 1024:
+                    handle.write(progress + "\n")
+                for item in (
+                    {
+                        "type": "session.start",
+                        "data": {"selectedModel": "claude-opus-4.8"},
+                    },
+                    {
+                        "type": "assistant.turn_start",
+                        "data": {"turnId": "turn-1"},
+                    },
+                    {
+                        "type": "assistant.message",
+                        "data": {
+                            "content": "No findings.",
+                            "model": "claude-opus-4.8",
+                        },
+                    },
+                    {
+                        "type": "assistant.turn_end",
+                        "data": {"turnId": "turn-1"},
+                    },
+                ):
+                    handle.write(json.dumps(item) + "\n")
+
+            result = providers._parse_copilot_output_file(stdout_path)
+
+        self.assertEqual(result, ("No findings.", "claude-opus-4.8"))
+
+    def test_copilot_rejects_malformed_terminal_message_model(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "session.start",
+                    "data": {"selectedModel": "claude-opus-4.8"},
+                },
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "content": "No findings.",
+                        "model": 123,
+                    },
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
+
+    def test_copilot_rejects_conflicting_session_model(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "session.start",
+                    "data": {"selectedModel": "claude-opus-4.7"},
+                },
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "content": "No findings.",
+                        "model": "claude-opus-4.8",
+                    },
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
+
+    def test_copilot_rejects_conflicting_usage_before_terminal_message(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.usage",
+                    "data": {"model": "claude-opus-4.7"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "content": "No findings.",
+                        "model": "claude-opus-4.8",
+                    },
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
+
+    def test_copilot_rejects_conflicting_earlier_message_model(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "content": "draft",
+                        "model": "claude-opus-4.7",
+                    },
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "content": "No findings.",
+                        "model": "claude-opus-4.8",
+                    },
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
+
+    def test_copilot_rejects_conflicting_terminal_usage_model(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "content": "No findings.",
+                        "model": "claude-opus-4.8",
+                    },
+                },
+                {
+                    "type": "assistant.usage",
+                    "data": {"model": "claude-opus-4.7"},
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
+
+    def test_copilot_rejects_usage_after_turn_end(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "content": "No findings.",
+                        "model": "claude-opus-4.8",
+                    },
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.usage",
+                    "data": {"model": "claude-opus-4.7"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
 
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(providers, "_codex_attempt")
@@ -339,6 +1271,17 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertNotIn(
             final_text,
             (self.review.container_dir / "attempts.json").read_text(encoding="utf-8"),
+        )
+
+    def test_finish_preserves_unicode_separator_at_result_edges(self) -> None:
+        final_text = "\u2028No findings.\u2029"
+
+        outcome = providers._finish(self.review, [], final_text)
+
+        self.assertEqual(outcome.final_text, final_text)
+        self.assertEqual(
+            (self.review.container_dir / "final.txt").read_text(encoding="utf-8"),
+            final_text + "\n",
         )
 
     @mock.patch.object(providers, "child_environment", return_value={})
@@ -507,7 +1450,7 @@ class ProviderPolicyTest(unittest.TestCase):
     )
     @mock.patch.object(providers, "_copilot_attempt")
     @mock.patch.object(providers, "_claude_attempt")
-    def test_claude_disappearance_uses_authorized_copilot_fallback(
+    def test_claude_disappearance_is_inconclusive_not_fallback(
         self,
         claude_attempt: mock.Mock,
         copilot_attempt: mock.Mock,
@@ -515,6 +1458,42 @@ class ProviderPolicyTest(unittest.TestCase):
         _environment: mock.Mock,
     ) -> None:
         claude_attempt.side_effect = FileNotFoundError("claude disappeared")
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
+
+        self.assertEqual(outcome.returncode, 75)
+        claude_attempt.assert_called_once()
+        copilot_attempt.assert_not_called()
+        self.assertEqual(resolve.call_count, 1)
+        self.assertIn(
+            "inconclusive",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        side_effect=providers.ClaudeProbeSandboxUnavailable("sandbox unavailable"),
+    )
+    @mock.patch.object(
+        providers,
+        "resolve_reviewer_executable",
+        return_value=pathlib.Path("/bin/copilot"),
+    )
+    @mock.patch.object(providers, "_copilot_attempt")
+    def test_missing_claude_probe_sandbox_allows_authorized_copilot_fallback(
+        self,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _resolve_claude: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
         copilot_attempt.return_value = self.attempt(
             "copilot",
             providers.COPILOT_MODELS[0],
@@ -525,13 +1504,18 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="double-review",
+            egress_consent="triple-review",
         )
 
         self.assertEqual(outcome.returncode, 0)
-        claude_attempt.assert_called_once()
         copilot_attempt.assert_called_once()
-        self.assertEqual(resolve.call_count, 2)
+        resolve.assert_called_once_with("copilot")
+        self.assertIn(
+            "probe runtime is unavailable",
+            (self.review.container_dir / "claude-skip.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
 
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(
@@ -568,6 +1552,146 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn(
             "requires ANTHROPIC_API_KEY",
             (self.review.container_dir / "claude-skip.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(providers, "resolve_reviewer_executable")
+    @mock.patch.object(providers, "_copilot_attempt")
+    def test_invalid_explicit_claude_override_blocks_without_api_key(
+        self,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        def reject_override(_name: str, **kwargs):
+            self.assertTrue(callable(kwargs["candidate_validator"]))
+            raise ReviewError("invalid explicit override")
+
+        resolve.side_effect = reject_override
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
+
+        self.assertEqual(outcome.returncode, 2)
+        copilot_attempt.assert_not_called()
+        self.assertIn(
+            "refusing Copilot fallback",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(providers, "resolve_reviewer_executable")
+    @mock.patch.object(providers, "_copilot_attempt")
+    def test_claude_probe_timeout_is_inconclusive_not_fallback(
+        self,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        resolve.side_effect = providers.ReviewTimeoutError("probe timed out")
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="triple-review",
+        )
+
+        self.assertEqual(outcome.returncode, 75)
+        copilot_attempt.assert_not_called()
+        self.assertIn(
+            "inconclusive",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(providers, "resolve_reviewer_executable")
+    @mock.patch.object(providers, "_copilot_attempt")
+    def test_claude_probe_output_limit_is_inconclusive_not_fallback(
+        self,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        resolve.side_effect = providers.ReviewOutputLimitError(
+            "probe output exceeded limit"
+        )
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="triple-review",
+        )
+
+        self.assertEqual(outcome.returncode, 75)
+        copilot_attempt.assert_not_called()
+        self.assertIn(
+            "inconclusive",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(providers, "resolve_reviewer_executable")
+    @mock.patch.object(providers, "_copilot_attempt")
+    def test_claude_probe_drain_failure_is_inconclusive_not_fallback(
+        self,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        resolve.side_effect = providers.ReviewOutputDrainError(
+            "probe output drain failed"
+        )
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="triple-review",
+        )
+
+        self.assertEqual(outcome.returncode, 75)
+        copilot_attempt.assert_not_called()
+        self.assertIn(
+            "inconclusive",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(providers, "resolve_reviewer_executable")
+    @mock.patch.object(providers, "_copilot_attempt")
+    def test_claude_probe_process_leak_is_inconclusive_not_fallback(
+        self,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        resolve.side_effect = providers.ReviewProcessLeakError(
+            "probe left descendant process"
+        )
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="triple-review",
+        )
+
+        self.assertEqual(outcome.returncode, 75)
+        copilot_attempt.assert_not_called()
+        self.assertIn(
+            "inconclusive",
+            (self.review.container_dir / "runner-error.txt").read_text(
                 encoding="utf-8"
             ),
         )
@@ -625,7 +1749,9 @@ class ProviderPolicyTest(unittest.TestCase):
             egress_consent="explicit-claude-review",
         )
         self.assertEqual(outcome.returncode, 2)
-        resolve.assert_called_once_with("claude")
+        resolve.assert_called_once()
+        self.assertEqual(resolve.call_args.args, ("claude",))
+        self.assertTrue(callable(resolve.call_args.kwargs["candidate_validator"]))
         copilot_attempt.assert_not_called()
         self.assertIn(
             "does not authorize GitHub Copilot",
@@ -745,6 +1871,38 @@ class ProviderPolicyTest(unittest.TestCase):
             require_verified_model=True,
             require_verified_effort=True,
         )
+        self.assertEqual(attempt.category, "runtime-unverified")
+        self.assertIsNone(attempt.final_text)
+
+    def test_entitlement_without_verified_model_cannot_authorize_fallback(
+        self,
+    ) -> None:
+        completed = Completed(
+            argv=("copilot",),
+            returncode=1,
+            stdout=json.dumps(
+                {
+                    "type": "turn.failed",
+                    "error": {
+                        "message": "Model is not available for your account"
+                    },
+                }
+            ).encode(),
+            stderr=b"",
+        )
+        attempt = providers._record_attempt(
+            review=self.review,
+            index=1,
+            runtime="copilot",
+            model="claude-opus-4.8",
+            completed=completed,
+            final_text=None,
+            effective_model=None,
+            requested_effort="max",
+            effective_effort=None,
+            require_verified_model=True,
+        )
+
         self.assertEqual(attempt.category, "runtime-unverified")
         self.assertIsNone(attempt.final_text)
 
@@ -1200,17 +2358,97 @@ class ProviderPolicyTest(unittest.TestCase):
 
     @mock.patch.object(
         providers,
+        "reviewer_executable_dependencies",
+        return_value=(
+            pathlib.Path("/review-install/claude"),
+            pathlib.Path("/review-runtime/node"),
+        ),
+    )
+    def test_claude_probe_profile_only_reads_runtime_and_probe_roots(
+        self,
+        _dependencies: mock.Mock,
+    ) -> None:
+        profile = providers._claude_probe_sandbox_profile(
+            pathlib.Path("/review-install/claude"),
+            pathlib.Path("/isolated/probe-home"),
+        )
+
+        self.assertIn("(deny default)", profile)
+        self.assertNotIn("(allow default)", profile)
+        self.assertIn('(literal "/review-install/claude")', profile)
+        self.assertIn('(literal "/review-runtime/node")', profile)
+        self.assertIn('(subpath "/isolated/probe-home")', profile)
+        self.assertIn('(subpath "/review-install")', profile)
+        self.assertIn('(subpath "/review-runtime")', profile)
+        self.assertNotIn("(allow file-read-metadata)", profile)
+        self.assertIn(
+            '(allow file-read-metadata (literal "/")',
+            profile,
+        )
+        self.assertNotIn("/Users/joey", profile)
+
+    def test_claude_probe_profile_rejects_overly_broad_dependency_roots(
+        self,
+    ) -> None:
+        for dependency in (
+            pathlib.Path("/Users/joey/claude"),
+            pathlib.Path("/claude"),
+        ):
+            with (
+                self.subTest(dependency=dependency),
+                mock.patch.object(
+                    providers,
+                    "reviewer_executable_dependencies",
+                    return_value=(dependency,),
+                ),
+                mock.patch.dict(providers.os.environ, {"HOME": "/Users/joey"}),
+            ):
+                with self.assertRaisesRegex(
+                    providers.InvalidReviewerExecutable, "overly broad"
+                ):
+                    providers._claude_probe_sandbox_profile(
+                        dependency,
+                        pathlib.Path("/isolated/probe-home"),
+                    )
+
+    @mock.patch.object(
+        providers,
         "resolve_reviewer_executable",
         return_value=pathlib.Path("/bin/claude"),
+    )
+    @mock.patch.object(
+        providers,
+        "CLAUDE_PROBE_SANDBOX",
+        pathlib.Path("/usr/bin/true"),
     )
     @mock.patch.object(providers, "run")
     def test_claude_command_pins_model_and_max_in_bare_mode(
         self,
         run_command: mock.Mock,
-        _resolve: mock.Mock,
+        resolve: mock.Mock,
     ) -> None:
-        payload = {"result": "No findings.", "modelUsage": {"claude-opus-4-8": {}}}
+        def resolve_and_validate(_name: str, **kwargs) -> pathlib.Path:
+            candidate = pathlib.Path("/bin/claude")
+            kwargs["candidate_validator"](candidate)
+            return candidate
+
+        resolve.side_effect = resolve_and_validate
+        self.assertIn("(deny default)", providers.CLAUDE_PROBE_SANDBOX_PROFILE)
+        self.assertNotIn("(allow default)", providers.CLAUDE_PROBE_SANDBOX_PROFILE)
+        payload = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "No findings.",
+            "modelUsage": {"claude-opus-4-8": {}},
+        }
         run_command.side_effect = (
+            Completed(
+                argv=("claude", "--version"),
+                returncode=0,
+                stdout=b"2.1.187 (Claude Code)\n",
+                stderr=b"",
+            ),
             Completed(
                 argv=("claude", "--help"),
                 returncode=0,
@@ -1237,7 +2475,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 "CODEX_ISOLATED_REVIEW_RANGE": "base..head",
             },
         )
-        argv = run_command.call_args.args[0]
+        argv = run_command.call_args_list[2].args[0]
         self.assertIn("claude-opus-4-8", argv)
         self.assertEqual(argv[argv.index("--effort") + 1], "max")
         self.assertEqual(argv[argv.index("--permission-mode") + 1], "dontAsk")
@@ -1251,10 +2489,15 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn("--bare", argv)
         self.assertNotIn("--safe-mode", argv)
         self.assertIn("--strict-mcp-config", argv)
+        version_argv = run_command.call_args_list[0].args[0]
+        self.assertEqual(version_argv[:2], ("/usr/bin/true", "-p"))
         self.assertEqual(
-            run_command.call_args_list[0].args[0],
-            ("/bin/claude", "--bare", "--help"),
+            version_argv[3:],
+            ("/bin/claude", "--bare", "--version"),
         )
+        self.assertIn("(deny default)", version_argv[2])
+        self.assertIn('(literal "/bin/claude")', version_argv[2])
+        self.assertNotIn("(allow default)", version_argv[2])
         probe_env = run_command.call_args_list[0].kwargs["env"]
         self.assertNotIn("ANTHROPIC_API_KEY", probe_env)
         self.assertNotIn("CODEX_ISOLATED_REVIEW_RANGE", probe_env)
@@ -1262,7 +2505,30 @@ class ProviderPolicyTest(unittest.TestCase):
             probe_env["HOME"],
             str(self.review.container_dir / "claude-home"),
         )
-        review_env = run_command.call_args_list[1].kwargs["env"]
+        self.assertEqual(
+            run_command.call_args_list[1].args[0][-3:],
+            ("/bin/claude", "--bare", "--help"),
+        )
+        self.assertEqual(run_command.call_args_list[1].kwargs["env"], probe_env)
+        for probe_call in run_command.call_args_list[:2]:
+            self.assertEqual(
+                probe_call.kwargs["timeout_seconds"],
+                providers.CLAUDE_PROBE_TIMEOUT_SECONDS,
+            )
+            self.assertEqual(
+                probe_call.kwargs["capture_limit_bytes"],
+                providers.CLAUDE_PROBE_OUTPUT_LIMIT_BYTES,
+            )
+            self.assertEqual(
+                probe_call.kwargs["output_file_limit_bytes"],
+                providers.CLAUDE_PROBE_OUTPUT_LIMIT_BYTES,
+            )
+            self.assertEqual(
+                probe_call.kwargs["stdout_path"].parent.parent,
+                self.review.container_dir / "claude-home",
+            )
+            self.assertFalse(probe_call.kwargs["stdout_path"].parent.exists())
+        review_env = run_command.call_args_list[2].kwargs["env"]
         self.assertEqual(review_env["ANTHROPIC_API_KEY"], "secret")
         self.assertEqual(review_env["HOME"], probe_env["HOME"])
 
@@ -1271,17 +2537,36 @@ class ProviderPolicyTest(unittest.TestCase):
         "resolve_reviewer_executable",
         return_value=pathlib.Path("/bin/claude"),
     )
+    @mock.patch.object(
+        providers,
+        "CLAUDE_PROBE_SANDBOX",
+        pathlib.Path("/usr/bin/true"),
+    )
     @mock.patch.object(providers, "run")
     def test_claude_refuses_unverified_bare_mode_semantics(
         self,
         run_command: mock.Mock,
-        _resolve: mock.Mock,
+        resolve: mock.Mock,
     ) -> None:
-        run_command.return_value = Completed(
-            argv=("claude", "--help"),
-            returncode=0,
-            stdout=b"generic help",
-            stderr=b"",
+        def resolve_and_validate(_name: str, **kwargs) -> pathlib.Path:
+            candidate = pathlib.Path("/bin/claude")
+            kwargs["candidate_validator"](candidate)
+            return candidate
+
+        resolve.side_effect = resolve_and_validate
+        run_command.side_effect = (
+            Completed(
+                argv=("claude", "--version"),
+                returncode=0,
+                stdout=b"2.1.187 (Claude Code)\n",
+                stderr=b"",
+            ),
+            Completed(
+                argv=("claude", "--help"),
+                returncode=0,
+                stdout=b"generic help",
+                stderr=b"",
+            ),
         )
 
         with self.assertRaisesRegex(ReviewError, "uniquely verifiable --bare"):
@@ -1292,8 +2577,13 @@ class ProviderPolicyTest(unittest.TestCase):
                 env={"ANTHROPIC_API_KEY": "secret"},
             )
 
-        self.assertEqual(run_command.call_count, 1)
+        self.assertEqual(run_command.call_count, 2)
 
+    @mock.patch.object(
+        providers,
+        "CLAUDE_PROBE_SANDBOX",
+        pathlib.Path("/usr/bin/true"),
+    )
     @mock.patch.object(providers, "run")
     def test_claude_accepts_exact_bare_option_block(
         self,
@@ -1310,8 +2600,16 @@ class ProviderPolicyTest(unittest.TestCase):
             stderr=b"",
         )
 
-        providers._require_claude_bare_mode(pathlib.Path("/bin/claude"), {})
+        providers._require_claude_bare_mode(
+            pathlib.Path("/bin/claude"),
+            {"HOME": str(self.review.container_dir)},
+        )
 
+    @mock.patch.object(
+        providers,
+        "CLAUDE_PROBE_SANDBOX",
+        pathlib.Path("/usr/bin/true"),
+    )
     @mock.patch.object(providers, "run")
     def test_claude_rejects_bare_option_mutations(
         self,
@@ -1337,8 +2635,16 @@ class ProviderPolicyTest(unittest.TestCase):
                 )
 
                 with self.assertRaisesRegex(ReviewError, "uniquely verifiable --bare"):
-                    providers._require_claude_bare_mode(pathlib.Path("/bin/claude"), {})
+                    providers._require_claude_bare_mode(
+                        pathlib.Path("/bin/claude"),
+                        {"HOME": str(self.review.container_dir)},
+                    )
 
+    @mock.patch.object(
+        providers,
+        "CLAUDE_PROBE_SANDBOX",
+        pathlib.Path("/usr/bin/true"),
+    )
     @mock.patch.object(providers, "run")
     def test_claude_rejects_duplicate_or_conflicting_bare_descriptions(
         self,
@@ -1363,7 +2669,10 @@ class ProviderPolicyTest(unittest.TestCase):
                 )
 
                 with self.assertRaisesRegex(ReviewError, "uniquely verifiable --bare"):
-                    providers._require_claude_bare_mode(pathlib.Path("/bin/claude"), {})
+                    providers._require_claude_bare_mode(
+                        pathlib.Path("/bin/claude"),
+                        {"HOME": str(self.review.container_dir)},
+                    )
 
     @mock.patch.object(
         providers,
@@ -1376,7 +2685,32 @@ class ProviderPolicyTest(unittest.TestCase):
         run_command: mock.Mock,
         _resolve: mock.Mock,
     ) -> None:
-        payload = {"result": "No findings.", "model": "claude-opus-4.8"}
+        payload = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "session.start",
+                    "data": {"selectedModel": "claude-opus-4.8"},
+                },
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "messageId": "message-1",
+                        "content": "No findings.",
+                        "model": "claude-opus-4.8",
+                        "toolRequests": [],
+                    },
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+            )
+        )
         permission_help = " ".join(providers.COPILOT_PERMISSION_HELP_FRAGMENTS)
         run_command.side_effect = (
             Completed(
@@ -1388,7 +2722,7 @@ class ProviderPolicyTest(unittest.TestCase):
             Completed(
                 argv=("copilot",),
                 returncode=0,
-                stdout=json.dumps(payload).encode(),
+                stdout=payload.encode(),
                 stderr=b"",
             ),
         )

@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import re
+import select
 import signal
 import shutil
 import subprocess
@@ -11,11 +12,31 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, BinaryIO, Iterable
+from typing import Any, BinaryIO, Callable, Iterable
 
 
 class ReviewError(RuntimeError):
     """A user-facing review helper failure."""
+
+
+class InvalidReviewerExecutable(ReviewError):
+    """A candidate executable failed deterministic identity validation."""
+
+
+class ReviewTimeoutError(ReviewError):
+    """A bounded reviewer subprocess exceeded its deadline."""
+
+
+class ReviewOutputLimitError(ReviewError):
+    """A bounded reviewer subprocess exceeded its output allowance."""
+
+
+class ReviewOutputDrainError(ReviewError):
+    """A reviewer output stream could not be drained completely."""
+
+
+class ReviewProcessLeakError(ReviewError):
+    """A reviewer subprocess exited while descendants retained its process group."""
 
 
 class ForwardedSignal(RuntimeError):
@@ -137,44 +158,65 @@ def run(
     stdout_path: pathlib.Path | None = None,
     stderr_path: pathlib.Path | None = None,
     capture_limit_bytes: int = 4 * 1024 * 1024,
+    timeout_seconds: float | None = None,
+    output_file_limit_bytes: int | None = None,
 ) -> Completed:
     command = tuple(str(item) for item in argv)
     if (stdout_path is None) != (stderr_path is None):
         raise ReviewError("stdout_path and stderr_path must be provided together")
-    if stdout_path is None or stderr_path is None:
-        completed = subprocess.run(
-            command,
-            cwd=cwd,
-            env=env,
-            input=stdin,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        result = Completed(
-            command, completed.returncode, completed.stdout, completed.stderr
-        )
-    else:
-        stdout_path.parent.mkdir(parents=True, exist_ok=True)
-        stderr_path.parent.mkdir(parents=True, exist_ok=True)
-        with (
-            stdout_path.open("wb") as stdout_handle,
-            stderr_path.open("wb") as stderr_handle,
-        ):
-            returncode = _run_logged_process(
+    if output_file_limit_bytes is not None and (
+        stdout_path is None or stderr_path is None
+    ):
+        raise ReviewError("output_file_limit_bytes requires logged output paths")
+    if output_file_limit_bytes is not None and timeout_seconds is None:
+        raise ReviewError("output_file_limit_bytes requires timeout_seconds")
+    if timeout_seconds is not None and (stdout_path is None or stderr_path is None):
+        raise ReviewError("timeout_seconds requires logged output paths")
+    if output_file_limit_bytes is not None and output_file_limit_bytes <= 0:
+        raise ReviewError("output_file_limit_bytes must be positive")
+    if output_file_limit_bytes is not None and stdin is not None:
+        raise ReviewError("bounded logged output does not support stdin")
+    try:
+        if stdout_path is None or stderr_path is None:
+            completed = subprocess.run(
                 command,
                 cwd=cwd,
                 env=env,
-                stdin=stdin,
-                stdout_handle=stdout_handle,
-                stderr_handle=stderr_handle,
+                input=stdin,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
             )
-        result = Completed(
-            command,
-            returncode,
-            _read_bounded_bytes(stdout_path, capture_limit_bytes),
-            _read_bounded_bytes(stderr_path, capture_limit_bytes),
-        )
+            result = Completed(
+                command, completed.returncode, completed.stdout, completed.stderr
+            )
+        else:
+            stdout_path.parent.mkdir(parents=True, exist_ok=True)
+            stderr_path.parent.mkdir(parents=True, exist_ok=True)
+            with (
+                stdout_path.open("wb") as stdout_handle,
+                stderr_path.open("wb") as stderr_handle,
+            ):
+                returncode = _run_logged_process(
+                    command,
+                    cwd=cwd,
+                    env=env,
+                    stdin=stdin,
+                    stdout_handle=stdout_handle,
+                    stderr_handle=stderr_handle,
+                    timeout_seconds=timeout_seconds,
+                    output_file_limit_bytes=output_file_limit_bytes,
+                )
+            result = Completed(
+                command,
+                returncode,
+                _read_bounded_bytes(stdout_path, capture_limit_bytes),
+                _read_bounded_bytes(stderr_path, capture_limit_bytes),
+            )
+    except subprocess.TimeoutExpired as error:
+        raise ReviewTimeoutError(
+            f"command timed out after {timeout_seconds} seconds: {' '.join(command)}"
+        ) from error
     if check and result.returncode != 0:
         detail = result.stderr.decode("utf-8", errors="replace").strip()
         if not detail:
@@ -247,11 +289,10 @@ def signal_process_group(
             return
         except ProcessLookupError:
             return
+        except PermissionError:
+            pass
     try:
-        if signum == signal.SIGTERM:
-            process.terminate()
-        else:
-            process.kill()
+        process.send_signal(signum)
     except ProcessLookupError:
         pass
 
@@ -285,6 +326,11 @@ def terminate_process_group(
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        except PermissionError:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
     try:
         process.wait(timeout=grace_seconds)
     except subprocess.TimeoutExpired:
@@ -299,9 +345,13 @@ def _run_logged_process(
     stdin: bytes | None,
     stdout_handle: BinaryIO,
     stderr_handle: BinaryIO,
+    timeout_seconds: float | None = None,
+    output_file_limit_bytes: int | None = None,
 ) -> int:
     process: subprocess.Popen[bytes] | None = None
     pending_signal: signal.Signals | None = None
+    drain_threads: list[threading.Thread] = []
+    stop_draining = threading.Event()
 
     def forward_signal(signum: int, _frame: object) -> None:
         nonlocal pending_signal
@@ -327,14 +377,108 @@ def _run_logged_process(
             cwd=cwd,
             env=env,
             stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
-            stdout=stdout_handle,
-            stderr=stderr_handle,
+            stdout=subprocess.PIPE if output_file_limit_bytes is not None else stdout_handle,
+            stderr=subprocess.PIPE if output_file_limit_bytes is not None else stderr_handle,
             start_new_session=os.name == "posix",
         )
         if pending_signal is not None:
             signal_process_group(process, pending_signal)
             raise ForwardedSignal(pending_signal)
-        process.communicate(input=stdin)
+        if output_file_limit_bytes is None:
+            if timeout_seconds is None:
+                process.communicate(input=stdin)
+            else:
+                process.communicate(input=stdin, timeout=timeout_seconds)
+            return int(process.returncode)
+
+        assert process.stdout is not None
+        assert process.stderr is not None
+        output_overflow = threading.Event()
+        drain_errors: list[Exception] = []
+
+        def drain_bounded(stream: BinaryIO, destination: BinaryIO) -> None:
+            try:
+                written = 0
+                descriptor = stream.fileno()
+                os.set_blocking(descriptor, False)
+                while not stop_draining.is_set():
+                    readable, _, _ = select.select(
+                        (descriptor,), (), (), PROCESS_GROUP_POLL_SECONDS
+                    )
+                    if not readable:
+                        continue
+                    try:
+                        chunk = os.read(descriptor, 64 * 1024)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        return
+                    remaining = output_file_limit_bytes - written
+                    if remaining > 0:
+                        destination.write(chunk[:remaining])
+                        destination.flush()
+                        written += min(len(chunk), remaining)
+                    if len(chunk) > remaining and not output_overflow.is_set():
+                        output_overflow.set()
+                        signal_process_group(process, signal.SIGTERM)
+            except Exception as error:
+                drain_errors.append(error)
+                signal_process_group(process, signal.SIGTERM)
+
+        thread_start_mask = block_forwarded_signals()
+        try:
+            for stream, destination in (
+                (process.stdout, stdout_handle),
+                (process.stderr, stderr_handle),
+            ):
+                thread = threading.Thread(
+                    target=drain_bounded,
+                    args=(stream, destination),
+                    daemon=True,
+                )
+                thread.start()
+                drain_threads.append(thread)
+        finally:
+            restore_signal_mask(thread_start_mask)
+        assert timeout_seconds is not None
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout_seconds)
+            try:
+                process.wait(timeout=min(PROCESS_GROUP_POLL_SECONDS, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                if output_overflow.is_set() or drain_errors:
+                    terminate_process_group(process)
+                    break
+        leftover_process_group = _process_group_exists(process.pid)
+        if leftover_process_group:
+            terminate_process_group(process)
+        for thread in drain_threads:
+            thread.join(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
+        if any(thread.is_alive() for thread in drain_threads):
+            stop_draining.set()
+            for thread in drain_threads:
+                thread.join(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
+            raise ReviewProcessLeakError(
+                "command output streams remained open after bounded cleanup: "
+                f"{' '.join(command)}"
+            )
+        if drain_errors:
+            raise ReviewOutputDrainError(
+                f"command output drain failed: {' '.join(command)}"
+            ) from drain_errors[0]
+        if output_overflow.is_set():
+            raise ReviewOutputLimitError(
+                "command output exceeded "
+                f"{output_file_limit_bytes} bytes per stream: {' '.join(command)}"
+            )
+        if leftover_process_group:
+            raise ReviewProcessLeakError(
+                f"command left descendant processes after exit: {' '.join(command)}"
+            )
         return int(process.returncode)
     except ForwardedSignal as error:
         cleanup_signal = error.signum
@@ -349,6 +493,13 @@ def _run_logged_process(
                     initial_signal=cleanup_signal,
                     signal_already_sent=pending_signal is not None,
                 )
+            stop_draining.set()
+            for thread in drain_threads:
+                thread.join(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
+            if process is not None and output_file_limit_bytes is not None:
+                for stream in (process.stdout, process.stderr):
+                    if stream is not None:
+                        stream.close()
             for forwarded, previous in previous_handlers.items():
                 signal.signal(forwarded, previous)
             if previous_mask is not None:
@@ -438,6 +589,7 @@ def _user_executable_candidates(name: str) -> list[pathlib.Path]:
 ENV_SHEBANG = re.compile(
     rb"^#![ \t]*/usr/bin/env(?:[ \t]+-S)?[ \t]+([A-Za-z0-9_.+-]+)(?:[ \t]|$)"
 )
+DIRECT_SHEBANG = re.compile(rb"^#![ \t]*(/[^ \t\r\n]+)")
 
 
 def _env_shebang_runtime(path: pathlib.Path) -> pathlib.Path | None:
@@ -475,6 +627,35 @@ def reviewer_executable_path(
     return os.pathsep.join(entries)
 
 
+def reviewer_executable_dependencies(path: pathlib.Path) -> tuple[pathlib.Path, ...]:
+    """Return exact files required to exec a reviewer entrypoint."""
+    candidates = [path.absolute(), path.resolve()]
+    try:
+        with path.open("rb") as handle:
+            first_line = handle.readline(512).rstrip(b"\r\n")
+    except OSError:
+        first_line = b""
+    direct_match = DIRECT_SHEBANG.match(first_line)
+    if direct_match is not None:
+        try:
+            direct = pathlib.Path(direct_match.group(1).decode("utf-8"))
+        except UnicodeDecodeError:
+            direct = None
+        if direct is not None and direct.is_file() and os.access(direct, os.X_OK):
+            candidates.extend((direct.absolute(), direct.resolve()))
+    env_runtime = _env_shebang_runtime(path)
+    if env_runtime is not None:
+        candidates.extend((env_runtime.absolute(), env_runtime.resolve()))
+    result: list[pathlib.Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key not in seen:
+            seen.add(key)
+            result.append(candidate)
+    return tuple(result)
+
+
 def _executable_identity_matches(
     path: pathlib.Path,
     markers: Iterable[str],
@@ -485,14 +666,9 @@ def _executable_identity_matches(
         "NO_COLOR": "1",
         "PATH": reviewer_executable_path(path),
     }
-    version_args = (
-        ("--bare", "--version")
-        if any(marker.lower() == "claude code" for marker in marker_values)
-        else ("--version",)
-    )
     try:
         completed = subprocess.run(
-            (str(path), *version_args),
+            (str(path), "--version"),
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -507,27 +683,34 @@ def _executable_identity_matches(
     return all(marker.lower() in output for marker in marker_values)
 
 
-def resolve_reviewer_executable(name: str) -> pathlib.Path | None:
+def resolve_reviewer_executable(
+    name: str,
+    *,
+    candidate_validator: Callable[[pathlib.Path], None] | None = None,
+) -> pathlib.Path | None:
     specs = {
         "codex": (
             "CODEX_REVIEW_CODEX_PATH",
             ("/opt/homebrew/bin/codex", "/usr/local/bin/codex"),
             ("codex-cli",),
+            False,
         ),
         "claude": (
             "CODEX_REVIEW_CLAUDE_PATH",
             ("/opt/homebrew/bin/claude", "/usr/local/bin/claude"),
             ("claude code",),
+            True,
         ),
         "copilot": (
             "CODEX_REVIEW_COPILOT_PATH",
             ("/opt/homebrew/bin/copilot", "/usr/local/bin/copilot"),
             ("github copilot cli",),
+            False,
         ),
     }
     if name not in specs:
         raise ReviewError(f"unknown review executable: {name}")
-    override_key, system_paths, markers = specs[name]
+    override_key, system_paths, markers, defer_identity = specs[name]
     override_value = os.environ.get(override_key)
     if override_value:
         override = pathlib.Path(override_value).expanduser()
@@ -535,7 +718,15 @@ def resolve_reviewer_executable(name: str) -> pathlib.Path | None:
             raise ReviewError(f"{override_key} must be an absolute executable path")
         if not override.is_file() or not os.access(override, os.X_OK):
             raise ReviewError(f"{override_key} is not executable: {override}")
-        if not _executable_identity_matches(override, markers):
+        if defer_identity and candidate_validator is not None:
+            try:
+                candidate_validator(override.absolute())
+            except InvalidReviewerExecutable as error:
+                raise ReviewError(
+                    f"{override_key} did not pass sandboxed {name} validation: "
+                    f"{override}"
+                ) from error
+        elif not defer_identity and not _executable_identity_matches(override, markers):
             raise ReviewError(
                 f"{override_key} did not identify as the expected {name} CLI: {override}"
             )
@@ -557,8 +748,18 @@ def resolve_reviewer_executable(name: str) -> pathlib.Path | None:
         seen.add(key)
         if not candidate.is_file() or not os.access(candidate, os.X_OK):
             continue
+        absolute = candidate.absolute()
+        if defer_identity:
+            if candidate_validator is None:
+                return absolute
+            try:
+                candidate_validator(absolute)
+            except InvalidReviewerExecutable:
+                rejected.append(absolute)
+                continue
+            return absolute
         if _executable_identity_matches(candidate, markers):
-            return candidate.absolute()
+            return absolute
         rejected.append(candidate.absolute())
     if rejected:
         paths = ", ".join(str(path) for path in rejected)

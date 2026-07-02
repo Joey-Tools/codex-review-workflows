@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
 import pathlib
 import signal
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -28,6 +30,245 @@ class ChildEnvironmentTest(unittest.TestCase):
 
         self.assertEqual(result, "keep-two\nkeep-three")
         self.assertNotIn("discarded-line", result)
+
+    def test_logged_command_timeout_terminates_child(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with self.assertRaisesRegex(ReviewError, "command timed out"):
+                common.run(
+                    (sys.executable, "-c", "import time; time.sleep(5)"),
+                    stdout_path=root / "stdout.log",
+                    stderr_path=root / "stderr.log",
+                    timeout_seconds=0.05,
+                )
+
+    @mock.patch.object(common.subprocess, "run")
+    def test_unlogged_timeout_is_rejected_before_launch(
+        self, subprocess_run: mock.Mock
+    ) -> None:
+        with self.assertRaisesRegex(ReviewError, "requires logged output paths"):
+            common.run((sys.executable, "-c", "pass"), timeout_seconds=1)
+
+        subprocess_run.assert_not_called()
+
+    def test_logged_command_output_file_limit_is_enforced(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            stdout_path = root / "stdout.log"
+            with self.assertRaises(common.ReviewOutputLimitError):
+                common.run(
+                    (
+                        sys.executable,
+                        "-c",
+                        "import os; os.write(1, b'x' * 1048576)",
+                    ),
+                    stdout_path=stdout_path,
+                    stderr_path=root / "stderr.log",
+                    capture_limit_bytes=4096,
+                    timeout_seconds=5,
+                    output_file_limit_bytes=4096,
+                )
+            output_size = stdout_path.stat().st_size
+
+        self.assertLessEqual(output_size, 4096)
+
+    def test_output_limit_is_detected_while_stream_remains_open(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with self.assertRaises(common.ReviewOutputLimitError):
+                common.run(
+                    (
+                        sys.executable,
+                        "-c",
+                        (
+                            "import os,time; "
+                            "os.write(1, b'x' * 4097); "
+                            "time.sleep(5)"
+                        ),
+                    ),
+                    stdout_path=root / "stdout.log",
+                    stderr_path=root / "stderr.log",
+                    capture_limit_bytes=4096,
+                    timeout_seconds=1,
+                    output_file_limit_bytes=4096,
+                )
+
+    @unittest.skipUnless(hasattr(signal, "SIGTERM"), "requires SIGTERM")
+    def test_output_limit_kills_process_that_ignores_sigterm(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with self.assertRaises(common.ReviewOutputLimitError):
+                common.run(
+                    (
+                        sys.executable,
+                        "-c",
+                        (
+                            "import os,signal,time; "
+                            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                            "os.write(1, b'x' * 4097); "
+                            "time.sleep(5)"
+                        ),
+                    ),
+                    stdout_path=root / "stdout.log",
+                    stderr_path=root / "stderr.log",
+                    capture_limit_bytes=4096,
+                    timeout_seconds=2,
+                    output_file_limit_bytes=4096,
+                )
+
+    @mock.patch.object(common.subprocess, "Popen")
+    def test_output_file_limit_requires_timeout_before_launch(
+        self, popen: mock.Mock
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with self.assertRaisesRegex(ReviewError, "requires timeout_seconds"):
+                common.run(
+                    (sys.executable, "-c", "pass"),
+                    stdout_path=root / "stdout.log",
+                    stderr_path=root / "stderr.log",
+                    output_file_limit_bytes=4096,
+                )
+
+        popen.assert_not_called()
+
+    @mock.patch.object(common.subprocess, "Popen")
+    def test_invalid_bounded_output_arguments_preserve_existing_logs(
+        self, popen: mock.Mock
+    ) -> None:
+        cases = (
+            ({"output_file_limit_bytes": 0}, "must be positive"),
+            (
+                {"output_file_limit_bytes": 4096, "stdin": b"payload"},
+                "does not support stdin",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            for index, (arguments, message) in enumerate(cases):
+                with self.subTest(message=message):
+                    stdout_path = root / f"stdout-{index}.log"
+                    stderr_path = root / f"stderr-{index}.log"
+                    stdout_path.write_bytes(b"existing stdout")
+                    stderr_path.write_bytes(b"existing stderr")
+
+                    with self.assertRaisesRegex(ReviewError, message):
+                        common.run(
+                            (sys.executable, "-c", "pass"),
+                            stdout_path=stdout_path,
+                            stderr_path=stderr_path,
+                            timeout_seconds=5,
+                            **arguments,
+                        )
+
+                    self.assertEqual(stdout_path.read_bytes(), b"existing stdout")
+                    self.assertEqual(stderr_path.read_bytes(), b"existing stderr")
+
+        popen.assert_not_called()
+
+    @mock.patch.object(common.threading, "Thread")
+    def test_failed_drain_thread_start_is_not_joined(
+        self, thread_factory: mock.Mock
+    ) -> None:
+        thread = thread_factory.return_value
+        thread.start.side_effect = RuntimeError("thread start failed")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with self.assertRaisesRegex(RuntimeError, "thread start failed"):
+                common.run(
+                    (sys.executable, "-c", "pass"),
+                    stdout_path=root / "stdout.log",
+                    stderr_path=root / "stderr.log",
+                    timeout_seconds=5,
+                    output_file_limit_bytes=4096,
+                )
+
+        thread.join.assert_not_called()
+
+    def test_drain_thread_io_failure_is_propagated(self) -> None:
+        process = mock.Mock(pid=12345, returncode=0)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with (
+                mock.patch.object(common.subprocess, "Popen", return_value=process),
+                mock.patch.object(common, "_process_group_exists", return_value=False),
+                mock.patch.object(common, "signal_process_group") as terminate,
+                mock.patch.object(common.os, "set_blocking"),
+                mock.patch.object(
+                    common.select, "select", return_value=([123], [], [])
+                ),
+                mock.patch.object(common.os, "read", side_effect=OSError("read failed")),
+            ):
+                with self.assertRaises(common.ReviewOutputDrainError):
+                    common.run(
+                        ("reviewer",),
+                        stdout_path=root / "stdout.log",
+                        stderr_path=root / "stderr.log",
+                        timeout_seconds=5,
+                        output_file_limit_bytes=4096,
+                    )
+
+        self.assertGreaterEqual(terminate.call_count, 1)
+        terminate.assert_any_call(process, signal.SIGTERM)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork")
+    def test_timeout_does_not_wait_for_detached_descendant_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            child_pid_path = root / "child.pid"
+            started = time.monotonic()
+            try:
+                with self.assertRaises(common.ReviewTimeoutError):
+                    common.run(
+                        (
+                            sys.executable,
+                            "-c",
+                            (
+                                "import os,pathlib,sys,time\n"
+                                "pid = os.fork()\n"
+                                "if pid == 0:\n"
+                                "    os.setsid()\n"
+                                "    pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+                                "    time.sleep(3)\n"
+                                "    os._exit(0)\n"
+                                "time.sleep(3)\n"
+                            ),
+                            str(child_pid_path),
+                        ),
+                        stdout_path=root / "stdout.log",
+                        stderr_path=root / "stderr.log",
+                        timeout_seconds=0.2,
+                        output_file_limit_bytes=4096,
+                    )
+            finally:
+                if child_pid_path.exists():
+                    child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+            self.assertLess(time.monotonic() - started, 1.5)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork")
+    def test_logged_command_rejects_descendant_holding_output_stream(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with self.assertRaises(common.ReviewProcessLeakError):
+                common.run(
+                    (
+                        sys.executable,
+                        "-c",
+                        (
+                            "import os,time; pid=os.fork(); "
+                            "os._exit(0) if pid else (time.sleep(5), os._exit(0))"
+                        ),
+                    ),
+                    stdout_path=root / "stdout.log",
+                    stderr_path=root / "stderr.log",
+                    timeout_seconds=5,
+                    output_file_limit_bytes=4096,
+                )
 
     def test_streamed_command_logs_are_complete_and_memory_capture_is_bounded(
         self,
@@ -277,29 +518,6 @@ class ChildEnvironmentTest(unittest.TestCase):
             [str(executable.parent), str(node.parent)],
         )
 
-    @mock.patch.object(common.subprocess, "run")
-    def test_claude_identity_probe_enters_bare_mode_before_version(
-        self,
-        run_command: mock.Mock,
-    ) -> None:
-        run_command.return_value = common.subprocess.CompletedProcess(
-            args=("claude", "--bare", "--version"),
-            returncode=0,
-            stdout=b"2.1.187 (Claude Code)\n",
-            stderr=b"",
-        )
-
-        matched = common._executable_identity_matches(
-            pathlib.Path("/opt/homebrew/bin/claude"),
-            ("claude code",),
-        )
-
-        self.assertTrue(matched)
-        self.assertEqual(
-            run_command.call_args.args[0],
-            ("/opt/homebrew/bin/claude", "--bare", "--version"),
-        )
-
     def test_reviewer_path_override_must_be_absolute(self) -> None:
         with mock.patch.dict(
             common.os.environ,
@@ -317,24 +535,161 @@ class ChildEnvironmentTest(unittest.TestCase):
             executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             executable.chmod(0o755)
 
-            def matches(path: pathlib.Path, _markers) -> bool:
-                return path == executable
-
             with (
-                mock.patch.dict(common.os.environ, {"HOME": str(home)}, clear=True),
-                mock.patch.object(
-                    common,
-                    "_executable_identity_matches",
-                    side_effect=matches,
+                mock.patch.dict(
+                    common.os.environ,
+                    {
+                        "HOME": str(home),
+                        "CODEX_REVIEW_CLAUDE_PATH": str(executable),
+                    },
+                    clear=True,
                 ),
             ):
                 resolved = common.resolve_reviewer_executable("claude")
         self.assertEqual(resolved, executable.absolute())
 
-    def test_present_but_invalid_cli_is_not_treated_as_unavailable(self) -> None:
+    def test_deferred_identity_continues_past_invalid_claude_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = pathlib.Path(temporary)
+            invalid = home / "invalid/claude"
+            valid = home / "valid/claude"
+            for executable in (invalid, valid):
+                executable.parent.mkdir(parents=True)
+                executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                executable.chmod(0o755)
+            validated: list[pathlib.Path] = []
+
+            def validate(candidate: pathlib.Path) -> None:
+                validated.append(candidate)
+                if candidate == invalid:
+                    raise common.InvalidReviewerExecutable("not Claude Code")
+
+            with (
+                mock.patch.dict(common.os.environ, {"HOME": str(home)}, clear=True),
+                mock.patch.object(
+                    common,
+                    "_user_executable_candidates",
+                    return_value=[invalid, valid],
+                ),
+                mock.patch.object(common.shutil, "which", return_value=None),
+                mock.patch.object(
+                    common.os,
+                    "access",
+                    side_effect=lambda path, _mode: pathlib.Path(path)
+                    in {invalid, valid},
+                ),
+            ):
+                resolved = common.resolve_reviewer_executable(
+                    "claude", candidate_validator=validate
+                )
+
+        self.assertEqual(resolved, valid.absolute())
+        self.assertEqual(validated, [invalid.absolute(), valid.absolute()])
+
+    def test_invalid_explicit_claude_override_remains_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = pathlib.Path(temporary) / "claude"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o755)
+
+            with mock.patch.dict(
+                common.os.environ,
+                {
+                    "HOME": temporary,
+                    "CODEX_REVIEW_CLAUDE_PATH": str(executable),
+                },
+                clear=True,
+            ):
+                with self.assertRaisesRegex(ReviewError, "sandboxed claude validation"):
+                    common.resolve_reviewer_executable(
+                        "claude",
+                        candidate_validator=mock.Mock(
+                            side_effect=common.InvalidReviewerExecutable(
+                                "not Claude Code"
+                            )
+                        ),
+                    )
+
+    def test_all_invalid_deferred_candidates_are_not_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             home = pathlib.Path(temporary)
             executable = home / ".local/bin/claude"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o755)
+
+            with (
+                mock.patch.dict(common.os.environ, {"HOME": str(home)}, clear=True),
+                mock.patch.object(
+                    common,
+                    "_user_executable_candidates",
+                    return_value=[executable],
+                ),
+                mock.patch.object(common.shutil, "which", return_value=None),
+                mock.patch.object(
+                    common.os,
+                    "access",
+                    side_effect=lambda path, _mode: pathlib.Path(path) == executable,
+                ),
+            ):
+                with self.assertRaisesRegex(ReviewError, "validation failed"):
+                    common.resolve_reviewer_executable(
+                        "claude",
+                        candidate_validator=mock.Mock(
+                            side_effect=common.InvalidReviewerExecutable(
+                                "not Claude Code"
+                            )
+                        ),
+                    )
+
+    def test_non_utf8_shebang_dependency_fails_closed_without_crashing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = pathlib.Path(temporary) / "claude"
+            executable.write_bytes(b"#!/\xff\n")
+
+            dependencies = common.reviewer_executable_dependencies(executable)
+
+        self.assertIn(executable.absolute(), dependencies)
+        self.assertTrue(
+            all(
+                dependency in {executable.absolute(), executable.resolve()}
+                for dependency in dependencies
+            )
+        )
+
+    def test_deferred_identity_does_not_swallow_probe_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = pathlib.Path(temporary)
+            executable = home / "claude"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o755)
+
+            with (
+                mock.patch.dict(common.os.environ, {"HOME": str(home)}, clear=True),
+                mock.patch.object(
+                    common,
+                    "_user_executable_candidates",
+                    return_value=[executable],
+                ),
+                mock.patch.object(common.shutil, "which", return_value=None),
+                mock.patch.object(
+                    common.os,
+                    "access",
+                    side_effect=lambda path, _mode: pathlib.Path(path) == executable,
+                ),
+            ):
+                with self.assertRaises(common.ReviewTimeoutError):
+                    common.resolve_reviewer_executable(
+                        "claude",
+                        candidate_validator=mock.Mock(
+                            side_effect=common.ReviewTimeoutError("probe timed out")
+                        ),
+                    )
+
+    def test_present_but_invalid_codex_cli_is_not_treated_as_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = pathlib.Path(temporary)
+            executable = home / ".local/bin/codex"
             executable.parent.mkdir(parents=True)
             executable.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
             executable.chmod(0o755)
@@ -358,7 +713,7 @@ class ChildEnvironmentTest(unittest.TestCase):
                 ),
             ):
                 with self.assertRaisesRegex(ReviewError, "validation failed"):
-                    common.resolve_reviewer_executable("claude")
+                    common.resolve_reviewer_executable("codex")
 
 
 if __name__ == "__main__":
