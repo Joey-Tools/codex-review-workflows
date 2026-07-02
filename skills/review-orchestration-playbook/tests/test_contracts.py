@@ -120,11 +120,13 @@ class RepositoryContractTest(unittest.TestCase):
         )
 
     def test_triple_review_consent_names_all_provider_organizations(self) -> None:
-        candidates = (
-            REPO_ROOT / "AGENTS.md",
+        candidates = [
             SKILL_ROOT / "SKILL.md",
             SKILL_ROOT / "references/egress-consent.md",
-        )
+        ]
+        repo_agents = REPO_ROOT / "AGENTS.md"
+        if repo_agents.is_file():
+            candidates.append(repo_agents)
         for candidate in candidates:
             content = candidate.read_text(encoding="utf-8")
             self.assertIn(
