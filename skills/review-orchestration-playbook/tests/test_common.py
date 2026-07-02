@@ -92,6 +92,29 @@ class ChildEnvironmentTest(unittest.TestCase):
                     output_file_limit_bytes=4096,
                 )
 
+    @unittest.skipUnless(hasattr(signal, "SIGTERM"), "requires SIGTERM")
+    def test_output_limit_kills_process_that_ignores_sigterm(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with self.assertRaises(common.ReviewOutputLimitError):
+                common.run(
+                    (
+                        sys.executable,
+                        "-c",
+                        (
+                            "import os,signal,time; "
+                            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                            "os.write(1, b'x' * 4097); "
+                            "time.sleep(5)"
+                        ),
+                    ),
+                    stdout_path=root / "stdout.log",
+                    stderr_path=root / "stderr.log",
+                    capture_limit_bytes=4096,
+                    timeout_seconds=2,
+                    output_file_limit_bytes=4096,
+                )
+
     @mock.patch.object(common.subprocess, "Popen")
     def test_output_file_limit_requires_timeout_before_launch(
         self, popen: mock.Mock

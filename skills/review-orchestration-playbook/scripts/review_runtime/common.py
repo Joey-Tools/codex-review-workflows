@@ -430,7 +430,19 @@ def _run_logged_process(
                 drain_threads.append(thread)
         finally:
             restore_signal_mask(thread_start_mask)
-        process.wait(timeout=timeout_seconds)
+        assert timeout_seconds is not None
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout_seconds)
+            try:
+                process.wait(timeout=min(PROCESS_GROUP_POLL_SECONDS, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                if output_overflow.is_set() or drain_errors:
+                    terminate_process_group(process)
+                    break
         leftover_process_group = _process_group_exists(process.pid)
         if leftover_process_group:
             terminate_process_group(process)

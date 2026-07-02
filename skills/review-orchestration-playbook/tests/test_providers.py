@@ -569,6 +569,40 @@ class ProviderPolicyTest(unittest.TestCase):
             (None, None),
         )
 
+    def test_copilot_error_in_open_turn_after_completed_turn_keeps_model(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "session.start",
+                    "data": {"selectedModel": "claude-opus-4.8"},
+                },
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-2"},
+                },
+                {
+                    "type": "turn.failed",
+                    "error": {"message": "Model is not available for your account"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(
+            providers._parse_copilot_output(
+                stdout, requested_model="claude-opus-4.8"
+            ),
+            (None, "claude-opus-4.8"),
+        )
+
     def test_copilot_preserves_unicode_separators_at_content_edges(self) -> None:
         content = "\u2028No findings.\u2029"
         stdout = "\n".join(

@@ -752,7 +752,10 @@ def _parse_copilot_objects(
 
     if structured_error:
         assert first_error_index is not None and last_error_index is not None
-        if completed_turn is not None:
+        if open_turn is not None:
+            if first_error_index <= open_turn["start_index"]:
+                return None, None
+        elif completed_turn is not None:
             terminal_index, turn = completed_turn
             if (
                 terminal_index != last_index
@@ -760,8 +763,6 @@ def _parse_copilot_objects(
                 or last_error_index >= terminal_index
             ):
                 return None, None
-        elif open_turn is not None and first_error_index <= open_turn["start_index"]:
-            return None, None
         effective_model = latest_requested_mismatch or latest_model
         return None, effective_model
     if (
