@@ -25,16 +25,14 @@ from review_runtime.common import Completed, ReviewError  # noqa: E402
 from review_runtime.workspace import ReviewWorkspace  # noqa: E402
 
 
-def oauth_credential_fixture(*, padding: int = 0) -> bytes:
+def oauth_credential_fixture(*, expires_in_seconds: float = 3600) -> bytes:
     payload: dict[str, object] = {
         "claudeAiOauth": {
             "access" + "Token": "fixture-" + "access-value",
             "refresh" + "Token": "fixture-" + "refresh-value",
-            "expiresAt": (time.time() + 3600) * 1000,
+            "expiresAt": (time.time() + expires_in_seconds) * 1000,
         }
     }
-    if padding:
-        payload["padding"] = "x" * padding
     return json.dumps(payload).encode()
 
 
@@ -93,17 +91,18 @@ class ProviderPolicyTest(unittest.TestCase):
             side_effect=self.fake_claude_keychain_runtime,
         )
         self.keychain_runtime_patcher.start()
-        self.require_safe_claude_keychain_credential = (
-            providers._require_safe_claude_keychain_credential
+        self.require_fresh_claude_keychain_credential = (
+            providers._require_fresh_claude_keychain_credential
         )
-        self.keychain_preflight_patcher = mock.patch.object(
+        self.warm_claude_local_login = providers._warm_claude_local_login
+        self.warmup_patcher = mock.patch.object(
             providers,
-            "_require_safe_claude_keychain_credential",
+            "_warm_claude_local_login",
         )
-        self.keychain_preflight = self.keychain_preflight_patcher.start()
+        self.warmup = self.warmup_patcher.start()
 
     def tearDown(self) -> None:
-        self.keychain_preflight_patcher.stop()
+        self.warmup_patcher.stop()
         self.keychain_runtime_patcher.stop()
         self.keychain_broker_patcher.stop()
         self.native_dependency_patcher.stop()
@@ -257,17 +256,11 @@ class ProviderPolicyTest(unittest.TestCase):
         broker = broker_dir / "security"
         credential = bytearray(b"fixture-value")
         capability = bytes.fromhex("01" * 32)
-        updates: list[bytes] = []
-
-        def record_update(updated: bytearray) -> bool:
-            updates.append(bytes(updated))
-            return True
 
         try:
             context = providers._claude_keychain_credential_server(
                 credential,
                 capability,
-                update_callback=record_update,
             )
             with context as port:
                 prepared["TMPDIR"] = str(self.review.container_dir / "tmp")
@@ -298,13 +291,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     self.assertEqual(unauthorized.recv(1), b"")
                 first = providers.run(query, env=prepared)
                 second = providers.run(query, env=prepared)
-                updated_payload = oauth_credential_fixture()
-                update_script = (
-                    f'add-generic-password -U -a "{prepared["USER"]}" '
-                    f'-s "{providers.CLAUDE_KEYCHAIN_SERVICE}" '
-                    f'-X "{updated_payload.hex()}"\n'
-                ).encode()
-                updated = providers.run(
+                stdin_update = providers.run(
                     (
                         str(providers.CLAUDE_PROBE_SANDBOX),
                         "-p",
@@ -313,42 +300,13 @@ class ProviderPolicyTest(unittest.TestCase):
                         "-i",
                     ),
                     env=prepared,
-                    stdin=update_script,
+                    stdin=b"add-generic-password\n",
                 )
-        except PermissionError:
-            self.skipTest("loopback bind is unavailable in the current sandbox")
-
-        self.assertEqual(first.returncode, 0)
-        self.assertEqual(first.stdout, b"fixture-value\n")
-        self.assertEqual(second.returncode, 44)
-        self.assertEqual(updated.returncode, 0)
-        self.assertEqual(updates, [updated_payload])
-        self.assertEqual(credential, bytearray(len(credential)))
-
-        direct_updates: list[bytes] = []
-
-        def record_direct_update(updated: bytearray) -> bool:
-            direct_updates.append(bytes(updated))
-            return True
-
-        try:
-            with providers._claude_keychain_credential_server(
-                None,
-                capability,
-                update_callback=record_direct_update,
-            ) as port:
-                prepared[providers.CLAUDE_KEYCHAIN_BROKER_PORT_ENV] = str(port)
-                direct_profile = providers._claude_review_sandbox_profile(
-                    pathlib.Path("/bin/true"),
-                    self.review,
-                    prepared,
-                    proxy_port=43210,
-                )
-                direct_updated = providers.run(
+                direct_update = providers.run(
                     (
                         str(providers.CLAUDE_PROBE_SANDBOX),
                         "-p",
-                        direct_profile,
+                        profile,
                         str(broker),
                         "add-generic-password",
                         "-U",
@@ -357,15 +315,19 @@ class ProviderPolicyTest(unittest.TestCase):
                         "-s",
                         providers.CLAUDE_KEYCHAIN_SERVICE,
                         "-X",
-                        updated_payload.hex(),
+                        "00",
                     ),
                     env=prepared,
                 )
         except PermissionError:
             self.skipTest("loopback bind is unavailable in the current sandbox")
 
-        self.assertEqual(direct_updated.returncode, 64)
-        self.assertEqual(direct_updates, [])
+        self.assertEqual(first.returncode, 0)
+        self.assertEqual(first.stdout, b"fixture-value\n")
+        self.assertEqual(second.returncode, 44)
+        self.assertEqual(stdin_update.returncode, 64)
+        self.assertEqual(direct_update.returncode, 64)
+        self.assertEqual(credential, bytearray(len(credential)))
 
     @mock.patch.object(providers.subprocess, "run")
     def test_keychain_prefetch_uses_fixed_service_and_account(
@@ -400,121 +362,99 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(completed.stdout, b"")
 
     @mock.patch.object(providers, "_read_claude_keychain_credential")
-    @mock.patch.object(providers.subprocess, "run")
-    def test_keychain_update_validates_and_persists_oauth_payload(
-        self,
-        run_command: mock.Mock,
-        read_credential: mock.Mock,
-    ) -> None:
-        run_command.return_value = subprocess.CompletedProcess(
-            args=(),
-            returncode=0,
-            stdout=b"",
-            stderr=b"",
-        )
-        credential = bytearray(oauth_credential_fixture())
-        expected = bytearray(oauth_credential_fixture())
-        read_credential.return_value = bytearray(expected)
-
-        self.assertTrue(
-            providers._write_claude_keychain_credential(
-                self.review,
-                credential,
-                expected,
-            )
-        )
-        self.assertEqual(run_command.call_args.args[0], ("/usr/bin/security", "-i"))
-        script = run_command.call_args.kwargs["input"]
-        self.assertIn(b'add-generic-password -U -a "', script)
-        self.assertIn(b'-s "Claude Code-credentials" -X "', script)
-
-    @mock.patch.object(providers.subprocess, "run")
-    def test_keychain_update_rejects_invalid_oauth_payload(
-        self,
-        run_command: mock.Mock,
-    ) -> None:
-        self.assertFalse(
-            providers._write_claude_keychain_credential(
-                self.review,
-                bytearray(b"not-json"),
-                bytearray(oauth_credential_fixture()),
-            )
-        )
-        run_command.assert_not_called()
-
-    @mock.patch.object(providers.subprocess, "run")
-    def test_large_keychain_update_rejects_command_line_exposure(
-        self,
-        run_command: mock.Mock,
-    ) -> None:
-        credential = bytearray(oauth_credential_fixture(padding=3000))
-
-        self.assertFalse(
-            providers._write_claude_keychain_credential(
-                self.review,
-                credential,
-                bytearray(oauth_credential_fixture()),
-            )
-        )
-        run_command.assert_not_called()
-
-    @mock.patch.object(providers, "_read_claude_keychain_credential")
-    @mock.patch.object(providers.subprocess, "run")
-    def test_keychain_update_rejects_changed_shared_credential(
-        self,
-        run_command: mock.Mock,
-        read_credential: mock.Mock,
-    ) -> None:
-        updated = bytearray(oauth_credential_fixture())
-        expected = bytearray(oauth_credential_fixture())
-        read_credential.return_value = bytearray(
-            json.dumps(
-                {
-                    "claudeAiOauth": {
-                        "access" + "Token": "other-" + "access-value",
-                        "refresh" + "Token": "other-" + "refresh-value",
-                        "expiresAt": (time.time() + 3600) * 1000,
-                    }
-                }
-            ).encode()
-        )
-
-        self.assertFalse(
-            providers._write_claude_keychain_credential(
-                self.review,
-                updated,
-                expected,
-            )
-        )
-        run_command.assert_not_called()
-
-    @mock.patch.object(providers, "_read_claude_keychain_credential")
-    def test_keychain_preflight_rejects_credential_without_refresh_margin(
+    def test_keychain_preflight_rejects_stale_access_token(
         self,
         read_credential: mock.Mock,
     ) -> None:
-        credential = bytearray(oauth_credential_fixture(padding=3000))
+        credential = bytearray(oauth_credential_fixture(expires_in_seconds=60))
         read_credential.return_value = credential
 
         with self.assertRaisesRegex(
             providers.ClaudeKeychainCredentialUnavailable,
-            "too large for safe refresh persistence",
+            "cannot cover the isolated review window",
         ):
-            self.require_safe_claude_keychain_credential(self.review)
+            self.require_fresh_claude_keychain_credential(self.review)
 
         self.assertEqual(credential, bytearray(len(credential)))
 
     @mock.patch.object(providers, "_read_claude_keychain_credential")
-    def test_keychain_preflight_accepts_bounded_credential(
+    def test_keychain_preflight_accepts_fresh_access_token(
         self,
         read_credential: mock.Mock,
     ) -> None:
         credential = bytearray(oauth_credential_fixture())
         read_credential.return_value = credential
 
-        self.require_safe_claude_keychain_credential(self.review)
+        self.require_fresh_claude_keychain_credential(self.review)
 
         self.assertEqual(credential, bytearray(len(credential)))
+
+    @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
+    @mock.patch.object(
+        providers,
+        "_trusted_claude_ripgrep",
+        return_value=pathlib.Path("/bin/echo"),
+    )
+    @mock.patch.object(
+        providers,
+        "_claude_review_sandbox_profile",
+        return_value="(version 1)(deny default)",
+    )
+    @mock.patch.object(
+        providers,
+        "_claude_connect_proxy",
+        return_value=contextlib.nullcontext(43210),
+    )
+    @mock.patch.object(providers, "run")
+    def test_stale_local_login_uses_fixed_safe_mode_warmup(
+        self,
+        run_command: mock.Mock,
+        proxy: mock.Mock,
+        sandbox_profile: mock.Mock,
+        _rg: mock.Mock,
+        require_fresh: mock.Mock,
+    ) -> None:
+        require_fresh.side_effect = (
+            providers.ClaudeKeychainCredentialUnavailable("stale"),
+            None,
+        )
+        run_command.return_value = Completed(
+            argv=("claude",),
+            returncode=0,
+            stdout=b'OK',
+            stderr=b"",
+        )
+        home = self.review.container_dir / "claude-home"
+        temporary = self.review.container_dir / "tmp"
+        home.mkdir(exist_ok=True)
+        temporary.mkdir(exist_ok=True)
+
+        self.warm_claude_local_login(
+            self.review,
+            pathlib.Path("/bin/claude"),
+            {
+                "HOME": str(home),
+                "TMPDIR": str(temporary),
+                "PATH": "/untrusted",
+            },
+        )
+
+        argv = run_command.call_args.args[0]
+        self.assertIn("--safe-mode", argv)
+        self.assertEqual(argv[argv.index("--tools") + 1], "")
+        self.assertEqual(run_command.call_args.kwargs["stdin"], b"Reply with exactly OK.")
+        self.assertEqual(
+            run_command.call_args.kwargs["timeout_seconds"],
+            providers.CLAUDE_AUTH_WARMUP_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(require_fresh.call_count, 2)
+        self.assertEqual(
+            proxy.call_args.kwargs["allowed_targets"],
+            providers.CLAUDE_AUTH_PROXY_TARGETS,
+        )
+        self.assertTrue(
+            sandbox_profile.call_args.kwargs["allow_direct_keychain"]
+        )
 
     @mock.patch.object(
         providers,
@@ -2122,15 +2062,15 @@ class ProviderPolicyTest(unittest.TestCase):
         return_value=pathlib.Path("/bin/copilot"),
     )
     @mock.patch.object(providers, "_copilot_attempt")
-    def test_oversized_claude_credential_allows_authorized_copilot_fallback(
+    def test_stale_claude_credential_allows_authorized_copilot_fallback(
         self,
         copilot_attempt: mock.Mock,
         resolve: mock.Mock,
         _resolve_claude: mock.Mock,
         _environment: mock.Mock,
     ) -> None:
-        self.keychain_preflight.side_effect = (
-            providers.ClaudeKeychainCredentialUnavailable("credential too large")
+        self.warmup.side_effect = (
+            providers.ClaudeKeychainCredentialUnavailable("credential remains stale")
         )
         copilot_attempt.return_value = self.attempt(
             "copilot",
@@ -2149,7 +2089,7 @@ class ProviderPolicyTest(unittest.TestCase):
         copilot_attempt.assert_called_once()
         resolve.assert_called_once_with("copilot")
         self.assertIn(
-            "credential too large",
+            "credential remains stale",
             (self.review.container_dir / "claude-skip.txt").read_text(
                 encoding="utf-8"
             ),
@@ -3337,6 +3277,10 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn("--safe-mode", argv)
         self.assertNotIn("--bare", argv)
         self.assertIn("--strict-mcp-config", argv)
+        self.assertEqual(
+            argv[argv.index("--mcp-config") + 1],
+            '{"mcpServers":{}}',
+        )
         version_argv = run_command.call_args_list[0].args[0]
         self.assertEqual(version_argv[:2], ("/usr/bin/true", "-p"))
         self.assertEqual(
@@ -3535,6 +3479,31 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertNotIn("/usr/bin/security", profile)
         self.assertNotIn("com.apple.securityd.xpc", profile)
+
+    @mock.patch.object(
+        providers,
+        "_trusted_claude_ripgrep",
+        return_value=pathlib.Path("/bin/echo"),
+    )
+    def test_claude_auth_warmup_allows_only_direct_keychain_client(
+        self,
+        _rg: mock.Mock,
+    ) -> None:
+        profile = providers._claude_review_sandbox_profile(
+            pathlib.Path("/bin/true"),
+            self.review,
+            {
+                "HOME": str(self.review.container_dir / "claude-home"),
+                "TMPDIR": str(self.review.container_dir / "tmp"),
+                "PATH": "/usr/bin:/bin",
+            },
+            proxy_port=43210,
+            allow_direct_keychain=True,
+        )
+
+        self.assertIn('(literal "/usr/bin/security")', profile)
+        self.assertIn("com.apple.securityd.xpc", profile)
+        self.assertNotIn(str(self.claude_broker.resolve()), profile)
 
     @mock.patch.object(
         providers,
@@ -3830,6 +3799,10 @@ class ProviderPolicyTest(unittest.TestCase):
     def test_claude_proxy_allows_api_and_oauth_refresh_targets(self) -> None:
         self.assertEqual(
             providers.CLAUDE_PROXY_TARGETS,
+            frozenset({("api.anthropic.com", 443)}),
+        )
+        self.assertEqual(
+            providers.CLAUDE_AUTH_PROXY_TARGETS,
             frozenset(
                 {
                     ("api.anthropic.com", 443),
@@ -3838,6 +3811,10 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
         )
         self.assertIn(
+            providers._parse_connect_target("platform.claude.com:443"),
+            providers.CLAUDE_AUTH_PROXY_TARGETS,
+        )
+        self.assertNotIn(
             providers._parse_connect_target("platform.claude.com:443"),
             providers.CLAUDE_PROXY_TARGETS,
         )

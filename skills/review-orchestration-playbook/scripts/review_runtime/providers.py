@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import contextlib
-import fcntl
 import hmac
 import json
 import math
@@ -14,7 +13,6 @@ import select
 import socket
 import socketserver
 import ssl
-import stat
 import struct
 import subprocess
 import tempfile
@@ -107,6 +105,7 @@ CLAUDE_REVIEW_BASE_MACH_SERVICES = (
     "com.apple.trustd",
     "com.apple.trustd.agent",
 )
+CLAUDE_KEYCHAIN_MACH_SERVICES = ("com.apple.securityd.xpc",)
 CLAUDE_KEYCHAIN_BROKER_COMPILER = pathlib.Path("/usr/bin/clang")
 CLAUDE_KEYCHAIN_CLIENT = pathlib.Path("/usr/bin/security")
 CLAUDE_KEYCHAIN_BROKER_SOURCE = pathlib.Path(__file__).with_name(
@@ -121,12 +120,9 @@ CLAUDE_KEYCHAIN_BROKER_CAPABILITY_BYTES = 32
 CLAUDE_KEYCHAIN_BROKER_TIMEOUT_SECONDS = 20.0
 CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES = 64 * 1024
 CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS = 5.0
-CLAUDE_KEYCHAIN_UPDATE_LOCK_TIMEOUT_SECONDS = 5.0
 CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES = 1024 * 1024
-CLAUDE_KEYCHAIN_SECURITY_STDIN_LIMIT_BYTES = 4032
-CLAUDE_KEYCHAIN_SECURITY_PREFLIGHT_LIMIT_BYTES = (
-    CLAUDE_KEYCHAIN_SECURITY_STDIN_LIMIT_BYTES // 2
-)
+CLAUDE_AUTH_WARMUP_TIMEOUT_SECONDS = 120.0
+CLAUDE_AUTH_EXPIRY_MARGIN_SECONDS = 120.0
 CLAUDE_REVIEW_TOOL_EXECUTABLE_CANDIDATES = (
     pathlib.Path("/opt/homebrew/bin/rg"),
     pathlib.Path("/usr/local/bin/rg"),
@@ -151,7 +147,8 @@ CLAUDE_CERTIFICATE_BLOCK = re.compile(
     re.DOTALL,
 )
 CLAUDE_PRIVATE_KEY_MARKER = re.compile(rb"-----BEGIN [^-\r\n]*PRIVATE KEY-----")
-CLAUDE_PROXY_TARGETS = frozenset(
+CLAUDE_PROXY_TARGETS = frozenset({("api.anthropic.com", 443)})
+CLAUDE_AUTH_PROXY_TARGETS = frozenset(
     {
         ("api.anthropic.com", 443),
         ("platform.claude.com", 443),
@@ -461,133 +458,41 @@ def _read_claude_keychain_credential(
     return credential
 
 
-@contextlib.contextmanager
-def _claude_keychain_update_lock() -> Iterator[None]:
-    path = pathlib.Path(f"/tmp/codex-claude-keychain-{os.getuid()}.lock")
-    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags, 0o600)
-    try:
-        details = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(details.st_mode)
-            or details.st_uid != os.getuid()
-            or details.st_mode & 0o077
-        ):
-            raise ReviewError("Claude Keychain update lock is not private")
-        deadline = time.monotonic() + CLAUDE_KEYCHAIN_UPDATE_LOCK_TIMEOUT_SECONDS
-        while True:
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise ClaudeKeychainCredentialUnavailable(
-                        "another isolated review is updating Claude credentials"
-                    )
-                time.sleep(0.05)
-        try:
-            yield
-        finally:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-    finally:
-        os.close(descriptor)
-
-
-def _write_claude_keychain_credential(
-    review: ReviewWorkspace,
-    credential: bytearray,
-    expected_credential: bytearray,
-) -> bool:
-    if not credential or len(credential) > CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES:
-        return False
+def _validate_fresh_claude_keychain_credential(credential: bytearray) -> None:
     try:
         payload = json.loads(credential)
         oauth = payload["claudeAiOauth"]
         expires_at = oauth["expiresAt"]
+        required_expiry = (
+            time.time()
+            + REVIEW_ATTEMPT_TIMEOUT_SECONDS
+            + CLAUDE_AUTH_EXPIRY_MARGIN_SECONDS
+        ) * 1000
         if (
             not isinstance(oauth.get("accessToken"), str)
             or not oauth["accessToken"]
-            or not isinstance(oauth.get("refreshToken"), str)
-            or not oauth["refreshToken"]
             or not isinstance(expires_at, (int, float))
             or isinstance(expires_at, bool)
             or not math.isfinite(expires_at)
-            or expires_at <= time.time() * 1000
+            or expires_at <= required_expiry
         ):
-            return False
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-        return False
-    script = _claude_keychain_update_script(credential)
-    if len(script) > CLAUDE_KEYCHAIN_SECURITY_STDIN_LIMIT_BYTES:
-        return False
-    account = _claude_keychain_account()
-    security_env = child_environment(container_dir=review.container_dir)
-    security_env["USER"] = account
-    try:
-        with _claude_keychain_update_lock():
-            current = _read_claude_keychain_credential(review)
-            if current is None:
-                return False
-            try:
-                if not hmac.compare_digest(current, expected_credential):
-                    return False
-            finally:
-                current[:] = b"\x00" * len(current)
-            completed = subprocess.run(
-                (str(CLAUDE_KEYCHAIN_CLIENT), "-i"),
-                cwd=review.container_dir,
-                env=security_env,
-                input=script,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-                timeout=CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS,
+            raise ClaudeKeychainCredentialUnavailable(
+                "Claude local-login access token cannot cover the isolated review window"
             )
-    except (
-        OSError,
-        subprocess.TimeoutExpired,
-        ReviewError,
-    ):
-        return False
-    within_limit = (
-        len(completed.stdout) <= CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES
-        and len(completed.stderr) <= CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES
-    )
-    completed.stdout = b""
-    completed.stderr = b""
-    return completed.returncode == 0 and within_limit
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ClaudeKeychainCredentialUnavailable(
+            "Claude local-login credential is malformed"
+        ) from error
 
 
-def _claude_keychain_update_script(credential: bytes | bytearray) -> bytes:
-    account = _claude_keychain_account()
-    return (
-        f'add-generic-password -U -a "{account}" '
-        f'-s "{CLAUDE_KEYCHAIN_SERVICE}" -X "{credential.hex()}"\n'
-    ).encode("ascii")
-
-
-def _claude_keychain_credential_has_refresh_margin(
-    credential: bytes | bytearray,
-) -> bool:
-    return (
-        len(_claude_keychain_update_script(credential))
-        <= CLAUDE_KEYCHAIN_SECURITY_PREFLIGHT_LIMIT_BYTES
-    )
-
-
-def _require_safe_claude_keychain_credential(
-    review: ReviewWorkspace,
-) -> None:
+def _require_fresh_claude_keychain_credential(review: ReviewWorkspace) -> None:
     credential = _read_claude_keychain_credential(review)
     if credential is None:
-        return
+        raise ClaudeKeychainCredentialUnavailable(
+            "Claude local-login credential is unavailable"
+        )
     try:
-        if not _claude_keychain_credential_has_refresh_margin(credential):
-            raise ClaudeKeychainCredentialUnavailable(
-                "Claude local-login credential is too large for safe refresh "
-                "persistence without command-line exposure"
-            )
+        _validate_fresh_claude_keychain_credential(credential)
     finally:
         credential[:] = b"\x00" * len(credential)
 
@@ -623,42 +528,18 @@ class _ClaudeKeychainCredentialHandler(socketserver.BaseRequestHandler):
         if not authorized:
             return
         operation = _recv_exact(self.request, 1)
-        if operation == b"R":
-            with server.credential_lock:
-                if server.consumed:
-                    credential = b""
-                else:
-                    server.consumed = True
-                    credential = bytes(server.credential or b"")
-            try:
-                self.request.sendall(struct.pack("!I", len(credential)))
-                if credential:
-                    self.request.sendall(credential)
-            except OSError:
-                return
+        if operation != b"R":
             return
-        if operation != b"W":
-            return
-        raw_length = _recv_exact(self.request, 4)
-        if raw_length is None:
-            return
-        length = struct.unpack("!I", raw_length)[0]
-        if not 1 <= length <= CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES:
-            return
-        raw_credential = _recv_exact(self.request, length)
-        if raw_credential is None:
-            return
-        updated_credential = bytearray(raw_credential)
-        with server.update_lock:
-            if server.updated or server.update_callback is None:
-                success = False
+        with server.credential_lock:
+            if server.consumed:
+                credential = b""
             else:
-                success = server.update_callback(updated_credential)
-                if success:
-                    server.updated = True
-        updated_credential[:] = b"\x00" * len(updated_credential)
+                server.consumed = True
+                credential = bytes(server.credential or b"")
         try:
-            self.request.sendall(b"\x00" if success else b"\x01")
+            self.request.sendall(struct.pack("!I", len(credential)))
+            if credential:
+                self.request.sendall(credential)
         except OSError:
             return
 
@@ -671,23 +552,18 @@ class _ClaudeKeychainCredentialServer(socketserver.ThreadingTCPServer):
         self,
         credential: bytearray | None,
         capability: bytes,
-        update_callback: Callable[[bytearray], bool] | None,
     ) -> None:
         super().__init__(("127.0.0.1", 0), _ClaudeKeychainCredentialHandler)
         self.credential = credential
         self.capability = capability
         self.credential_lock = threading.Lock()
         self.consumed = False
-        self.update_callback = update_callback
-        self.update_lock = threading.Lock()
-        self.updated = False
 
 
 @contextlib.contextmanager
 def _claude_keychain_credential_server(
     credential: bytearray | None,
     capability: bytes,
-    update_callback: Callable[[bytearray], bool] | None = None,
 ) -> Iterator[int]:
     if len(capability) != CLAUDE_KEYCHAIN_BROKER_CAPABILITY_BYTES:
         raise ReviewError("Claude Keychain broker capability has an invalid length")
@@ -695,7 +571,6 @@ def _claude_keychain_credential_server(
         server = _ClaudeKeychainCredentialServer(
             credential,
             capability,
-            update_callback,
         )
     except OSError as error:
         raise ClaudeLoopbackUnavailable(
@@ -727,22 +602,19 @@ def _claude_keychain_runtime(
         yield result
         return
     credential = _read_claude_keychain_credential(review)
-    if credential is not None and not _claude_keychain_credential_has_refresh_margin(
-        credential
-    ):
-        credential[:] = b"\x00" * len(credential)
+    if credential is None:
         raise ClaudeKeychainCredentialUnavailable(
-            "Claude local-login credential lost its safe refresh margin"
+            "Claude local-login credential is unavailable"
         )
+    try:
+        _validate_fresh_claude_keychain_credential(credential)
+    except ReviewError:
+        credential[:] = b"\x00" * len(credential)
+        raise
     capability = secrets.token_bytes(CLAUDE_KEYCHAIN_BROKER_CAPABILITY_BYTES)
     with _claude_keychain_credential_server(
         credential,
         capability,
-        update_callback=lambda updated: _write_claude_keychain_credential(
-            review,
-            updated,
-            credential or bytearray(),
-        ),
     ) as port:
         result[CLAUDE_KEYCHAIN_BROKER_PORT_ENV] = str(port)
         result[CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV] = capability.hex()
@@ -1126,6 +998,95 @@ def _with_claude_proxy_environment(
     return result
 
 
+def _run_claude_auth_warmup(
+    review: ReviewWorkspace,
+    executable: pathlib.Path,
+    env: dict[str, str],
+) -> None:
+    rg = _trusted_claude_ripgrep()
+    if rg is None:
+        raise ClaudeReviewToolUnavailable(
+            "Claude authentication warmup requires trusted ripgrep"
+        )
+    warmup_env = dict(env)
+    warmup_env["PATH"] = os.pathsep.join(("/usr/bin", str(rg.absolute().parent)))
+    settings = json.dumps(
+        {"disableAllHooks": True},
+        separators=(",", ":"),
+    )
+    with (
+        _claude_connect_proxy(
+            warmup_env,
+            allowed_targets=CLAUDE_AUTH_PROXY_TARGETS,
+        ) as proxy_port,
+        tempfile.TemporaryDirectory(
+            prefix="claude-auth-warmup-",
+            dir=review.container_dir,
+        ) as raw_output_dir,
+    ):
+        output_dir = pathlib.Path(raw_output_dir)
+        proxied_env = _with_claude_proxy_environment(warmup_env, proxy_port)
+        run(
+            (
+                str(CLAUDE_PROBE_SANDBOX),
+                "-p",
+                _claude_review_sandbox_profile(
+                    executable,
+                    review,
+                    proxied_env,
+                    proxy_port=proxy_port,
+                    allow_direct_keychain=True,
+                ),
+                str(executable),
+                "--print",
+                "--model",
+                CLAUDE_MODELS[0],
+                "--effort",
+                CLAUDE_REASONING_EFFORT,
+                "--permission-mode",
+                "dontAsk",
+                "--output-format",
+                "json",
+                "--no-session-persistence",
+                "--safe-mode",
+                "--no-chrome",
+                "--disable-slash-commands",
+                "--strict-mcp-config",
+                "--mcp-config",
+                '{"mcpServers":{}}',
+                "--setting-sources",
+                "",
+                "--settings",
+                settings,
+                "--tools",
+                "",
+                "--disallowedTools",
+                "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Task",
+            ),
+            cwd=pathlib.Path(proxied_env["HOME"]),
+            env=proxied_env,
+            stdin=b"Reply with exactly OK.",
+            stdout_path=output_dir / "stdout.log",
+            stderr_path=output_dir / "stderr.log",
+            timeout_seconds=CLAUDE_AUTH_WARMUP_TIMEOUT_SECONDS,
+            output_file_limit_bytes=CLAUDE_PROBE_OUTPUT_LIMIT_BYTES,
+        )
+
+
+def _warm_claude_local_login(
+    review: ReviewWorkspace,
+    executable: pathlib.Path,
+    env: dict[str, str],
+) -> None:
+    try:
+        _require_fresh_claude_keychain_credential(review)
+        return
+    except ClaudeKeychainCredentialUnavailable:
+        pass
+    _run_claude_auth_warmup(review, executable, env)
+    _require_fresh_claude_keychain_credential(review)
+
+
 def _review_environment(
     *,
     review: ReviewWorkspace,
@@ -1321,6 +1282,7 @@ def _claude_review_sandbox_profile(
     env: dict[str, str],
     *,
     proxy_port: int,
+    allow_direct_keychain: bool = False,
 ) -> str:
     dependencies = _native_macho_dependencies(executable, label="Claude Code")
     home_raw = env.get("HOME")
@@ -1368,7 +1330,12 @@ def _claude_review_sandbox_profile(
             tls_dirs.update((path.absolute(), resolved))
     auth_executables: tuple[pathlib.Path, ...] = ()
     keychain_broker_port: int | None = None
-    if not env.get("ANTHROPIC_API_KEY"):
+    if allow_direct_keychain:
+        auth_executables = _native_macho_dependencies(
+            CLAUDE_KEYCHAIN_CLIENT,
+            label="Apple security client",
+        )
+    elif not env.get("ANTHROPIC_API_KEY"):
         broker_dir = container / "claude-runtime" / "keychain-broker"
         security_candidate = next(
             (
@@ -1471,7 +1438,10 @@ def _claude_review_sandbox_profile(
     )
     mach_filters = "".join(
         f"(global-name {json.dumps(name)})"
-        for name in CLAUDE_REVIEW_BASE_MACH_SERVICES
+        for name in (
+            *CLAUDE_REVIEW_BASE_MACH_SERVICES,
+            *(CLAUDE_KEYCHAIN_MACH_SERVICES if allow_direct_keychain else ()),
+        )
     )
     network_filters = f'(remote ip "localhost:{proxy_port}")'
     if keychain_broker_port is not None:
@@ -2482,7 +2452,7 @@ def _claude_attempt(
                 "--disable-slash-commands",
                 "--strict-mcp-config",
                 "--mcp-config",
-                "{}",
+                '{"mcpServers":{}}',
                 "--setting-sources",
                 "",
                 "--settings",
@@ -2846,9 +2816,14 @@ def run_review(
         claude_available = claude_executable is not None
         if claude_available:
             claude_env = _prepare_claude_keychain_broker(review, claude_env)
-            if not claude_env.get("ANTHROPIC_API_KEY"):
-                _require_safe_claude_keychain_credential(review)
             claude_env = _with_claude_review_tool_path(review, claude_env)
+            claude_env = _prepare_claude_tls_environment(review, claude_env)
+            if not claude_env.get("ANTHROPIC_API_KEY"):
+                _warm_claude_local_login(
+                    review,
+                    claude_executable,
+                    claude_env,
+                )
     except (
         ClaudeProbeSandboxUnavailable,
         ClaudeKeychainBrokerUnavailable,
