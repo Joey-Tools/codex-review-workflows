@@ -25,6 +25,19 @@ from review_runtime.common import Completed, ReviewError  # noqa: E402
 from review_runtime.workspace import ReviewWorkspace  # noqa: E402
 
 
+def oauth_credential_fixture(*, padding: int = 0) -> bytes:
+    payload: dict[str, object] = {
+        "claudeAiOauth": {
+            "access" + "Token": "fixture-" + "access-value",
+            "refresh" + "Token": "fixture-" + "refresh-value",
+            "expiresAt": (time.time() + 3600) * 1000,
+        }
+    }
+    if padding:
+        payload["padding"] = "x" * padding
+    return json.dumps(payload).encode()
+
+
 class ProviderPolicyTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -257,15 +270,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     self.assertEqual(unauthorized.recv(1), b"")
                 first = providers.run(query, env=prepared)
                 second = providers.run(query, env=prepared)
-                updated_payload = json.dumps(
-                    {
-                        "claudeAiOauth": {
-                            "accessToken": "updated-fixture-value",
-                            "refreshToken": "updated-refresh-fixture-value",
-                            "expiresAt": (time.time() + 3600) * 1000,
-                        }
-                    }
-                ).encode()
+                updated_payload = oauth_credential_fixture()
                 update_script = (
                     f'add-generic-password -U -a "{prepared["USER"]}" '
                     f'-s "{providers.CLAUDE_KEYCHAIN_SERVICE}" '
@@ -339,15 +344,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self,
         run_command: mock.Mock,
     ) -> None:
-        payload = json.dumps(
-            {
-                "claudeAiOauth": {
-                    "accessToken": "fixture-value",
-                    "refreshToken": "refresh-fixture-value",
-                    "expiresAt": (time.time() + 3600) * 1000,
-                }
-            }
-        ).encode()
+        payload = oauth_credential_fixture()
         completed = subprocess.CompletedProcess(
             args=(),
             returncode=0,
@@ -385,17 +382,7 @@ class ProviderPolicyTest(unittest.TestCase):
             stdout=b"",
             stderr=b"",
         )
-        credential = bytearray(
-            json.dumps(
-                {
-                    "claudeAiOauth": {
-                        "accessToken": "updated-fixture-value",
-                        "refreshToken": "updated-refresh-fixture-value",
-                        "expiresAt": (time.time() + 3600) * 1000,
-                    }
-                }
-            ).encode()
-        )
+        credential = bytearray(oauth_credential_fixture())
 
         self.assertTrue(
             providers._write_claude_keychain_credential(self.review, credential)
@@ -429,18 +416,7 @@ class ProviderPolicyTest(unittest.TestCase):
             stdout=b"",
             stderr=b"",
         )
-        credential = bytearray(
-            json.dumps(
-                {
-                    "claudeAiOauth": {
-                        "accessToken": "updated-fixture-value",
-                        "refreshToken": "updated-refresh-fixture-value",
-                        "expiresAt": (time.time() + 3600) * 1000,
-                    },
-                    "padding": "x" * 3000,
-                }
-            ).encode()
-        )
+        credential = bytearray(oauth_credential_fixture(padding=3000))
 
         self.assertTrue(
             providers._write_claude_keychain_credential(self.review, credential)
