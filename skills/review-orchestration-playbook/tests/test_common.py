@@ -277,6 +277,29 @@ class ChildEnvironmentTest(unittest.TestCase):
             [str(executable.parent), str(node.parent)],
         )
 
+    @mock.patch.object(common.subprocess, "run")
+    def test_claude_identity_probe_enters_bare_mode_before_version(
+        self,
+        run_command: mock.Mock,
+    ) -> None:
+        run_command.return_value = common.subprocess.CompletedProcess(
+            args=("claude", "--bare", "--version"),
+            returncode=0,
+            stdout=b"2.1.187 (Claude Code)\n",
+            stderr=b"",
+        )
+
+        matched = common._executable_identity_matches(
+            pathlib.Path("/opt/homebrew/bin/claude"),
+            ("claude code",),
+        )
+
+        self.assertTrue(matched)
+        self.assertEqual(
+            run_command.call_args.args[0],
+            ("/opt/homebrew/bin/claude", "--bare", "--version"),
+        )
+
     def test_reviewer_path_override_must_be_absolute(self) -> None:
         with mock.patch.dict(
             common.os.environ,

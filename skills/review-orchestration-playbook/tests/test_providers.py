@@ -356,7 +356,11 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(outcome.returncode, 75)
         self.assertEqual(codex_attempt.call_count, 1)
 
-    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "child_environment",
+        return_value={"ANTHROPIC_API_KEY": "secret"},
+    )
     @mock.patch.object(
         providers, "resolve_reviewer_executable", return_value=pathlib.Path("/bin/true")
     )
@@ -406,7 +410,11 @@ class ProviderPolicyTest(unittest.TestCase):
             [providers.CLAUDE_ENV_KEYS, providers.COPILOT_ENV_KEYS],
         )
 
-    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "child_environment",
+        return_value={"ANTHROPIC_API_KEY": "secret"},
+    )
     @mock.patch.object(
         providers, "resolve_reviewer_executable", return_value=pathlib.Path("/bin/true")
     )
@@ -431,7 +439,11 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(claude_attempt.call_count, 1)
         copilot_attempt.assert_not_called()
 
-    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "child_environment",
+        return_value={"ANTHROPIC_API_KEY": "secret"},
+    )
     @mock.patch.object(
         providers, "resolve_reviewer_executable", return_value=pathlib.Path("/bin/true")
     )
@@ -483,7 +495,11 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
         )
 
-    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "child_environment",
+        return_value={"ANTHROPIC_API_KEY": "secret"},
+    )
     @mock.patch.object(
         providers,
         "resolve_reviewer_executable",
@@ -518,6 +534,49 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(resolve.call_count, 2)
 
     @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "resolve_reviewer_executable",
+        side_effect=(pathlib.Path("/bin/claude"), pathlib.Path("/bin/copilot")),
+    )
+    @mock.patch.object(providers, "_copilot_attempt")
+    @mock.patch.object(providers, "_claude_attempt")
+    def test_claude_without_bare_auth_uses_authorized_copilot_fallback(
+        self,
+        claude_attempt: mock.Mock,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        copilot_attempt.return_value = self.attempt(
+            "copilot",
+            providers.COPILOT_MODELS[0],
+            "success",
+            final_text="No findings.",
+        )
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
+
+        self.assertEqual(outcome.returncode, 0)
+        claude_attempt.assert_not_called()
+        copilot_attempt.assert_called_once()
+        self.assertEqual(resolve.call_count, 2)
+        self.assertIn(
+            "requires ANTHROPIC_API_KEY",
+            (self.review.container_dir / "claude-skip.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    @mock.patch.object(
+        providers,
+        "child_environment",
+        return_value={"ANTHROPIC_API_KEY": "secret"},
+    )
     @mock.patch.object(
         providers,
         "resolve_reviewer_executable",
@@ -1145,21 +1204,21 @@ class ProviderPolicyTest(unittest.TestCase):
         return_value=pathlib.Path("/bin/claude"),
     )
     @mock.patch.object(providers, "run")
-    def test_claude_command_pins_opus_and_max(
+    def test_claude_command_pins_model_and_max_in_bare_mode(
         self,
         run_command: mock.Mock,
         _resolve: mock.Mock,
     ) -> None:
         payload = {"result": "No findings.", "modelUsage": {"claude-opus-4-8": {}}}
-        safe_mode_help = (
-            " ".join(providers.CLAUDE_SAFE_MODE_HELP_FRAGMENTS)
-            + ". Sets CLAUDE_CODE_SAFE_MODE."
-        )
         run_command.side_effect = (
             Completed(
                 argv=("claude", "--help"),
                 returncode=0,
-                stdout=safe_mode_help.encode(),
+                stdout=(
+                    "Options:\n  "
+                    + providers.CLAUDE_BARE_MODE_HELP_FORM
+                    + "\n  --betas <betas...> Beta headers\n"
+                ).encode(),
                 stderr=b"",
             ),
             Completed(
@@ -1173,7 +1232,10 @@ class ProviderPolicyTest(unittest.TestCase):
             review=self.review,
             model="claude-opus-4-8",
             index=1,
-            env={},
+            env={
+                "ANTHROPIC_API_KEY": "secret",
+                "CODEX_ISOLATED_REVIEW_RANGE": "base..head",
+            },
         )
         argv = run_command.call_args.args[0]
         self.assertIn("claude-opus-4-8", argv)
@@ -1185,9 +1247,24 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertNotIn("Read,Grep,Glob", argv[argv.index("--allowedTools") + 1 :])
         settings = json.loads(argv[argv.index("--settings") + 1])
         self.assertIn("Read(~/.ssh/**)", settings["permissions"]["deny"])
-        self.assertIn("--safe-mode", argv)
+        self.assertTrue(settings["disableAllHooks"])
+        self.assertIn("--bare", argv)
+        self.assertNotIn("--safe-mode", argv)
         self.assertIn("--strict-mcp-config", argv)
-        self.assertEqual(run_command.call_args_list[0].args[0][-1], "--help")
+        self.assertEqual(
+            run_command.call_args_list[0].args[0],
+            ("/bin/claude", "--bare", "--help"),
+        )
+        probe_env = run_command.call_args_list[0].kwargs["env"]
+        self.assertNotIn("ANTHROPIC_API_KEY", probe_env)
+        self.assertNotIn("CODEX_ISOLATED_REVIEW_RANGE", probe_env)
+        self.assertEqual(
+            probe_env["HOME"],
+            str(self.review.container_dir / "claude-home"),
+        )
+        review_env = run_command.call_args_list[1].kwargs["env"]
+        self.assertEqual(review_env["ANTHROPIC_API_KEY"], "secret")
+        self.assertEqual(review_env["HOME"], probe_env["HOME"])
 
     @mock.patch.object(
         providers,
@@ -1195,7 +1272,7 @@ class ProviderPolicyTest(unittest.TestCase):
         return_value=pathlib.Path("/bin/claude"),
     )
     @mock.patch.object(providers, "run")
-    def test_claude_refuses_unverified_safe_mode_semantics(
+    def test_claude_refuses_unverified_bare_mode_semantics(
         self,
         run_command: mock.Mock,
         _resolve: mock.Mock,
@@ -1207,90 +1284,86 @@ class ProviderPolicyTest(unittest.TestCase):
             stderr=b"",
         )
 
-        with self.assertRaisesRegex(ReviewError, "disable CLAUDE.md"):
+        with self.assertRaisesRegex(ReviewError, "uniquely verifiable --bare"):
             providers._claude_attempt(
                 review=self.review,
                 model="claude-opus-4-8",
                 index=1,
-                env={},
+                env={"ANTHROPIC_API_KEY": "secret"},
             )
 
         self.assertEqual(run_command.call_count, 1)
 
     @mock.patch.object(providers, "run")
-    def test_claude_accepts_documented_safe_mode_wording(
+    def test_claude_accepts_exact_bare_option_block(
         self,
         run_command: mock.Mock,
     ) -> None:
-        for wording in (
-            b"Sets CLAUDE_CODE_SAFE_MODE.",
-            b"Sets CLAUDE_CODE_SAFE_MODE=1.",
-            (
-                b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode --session-id "
-                b"Use a specific session ID for the conversation "
-                b"(must be a valid UUID) claude --session-id 550e8400"
-            ),
-        ):
-            with self.subTest(wording=wording):
-                run_command.return_value = Completed(
-                    argv=("claude", "--help"),
-                    returncode=0,
-                    stdout=(
-                        b"--safe-mode all customizations including CLAUDE.md are "
-                        b"disabled; Authentication, model selection, built-in tools, "
-                        b"and permissions work normally. "
-                        + wording
-                    ),
-                    stderr=b"",
-                )
+        run_command.return_value = Completed(
+            argv=("claude", "--help"),
+            returncode=0,
+            stdout=(
+                "Usage: claude [options]\nOptions:\n  "
+                + providers.CLAUDE_BARE_MODE_HELP_FORM
+                + "\n  --betas <betas...> Beta headers\n"
+            ).encode(),
+            stderr=b"",
+        )
 
-                providers._require_claude_safe_mode(pathlib.Path("/bin/claude"), {})
+        providers._require_claude_bare_mode(pathlib.Path("/bin/claude"), {})
 
     @mock.patch.object(providers, "run")
-    def test_claude_rejects_negated_safe_mode_variable_wording(
+    def test_claude_rejects_bare_option_mutations(
         self,
         run_command: mock.Mock,
     ) -> None:
-        for wording in (
-            b"Never sets CLAUDE_CODE_SAFE_MODE.",
-            b"Does not set CLAUDE_CODE_SAFE_MODE.",
-            b"Unsets CLAUDE_CODE_SAFE_MODE.",
-            b"Sets CLAUDE_CODE_SAFE_MODE to 0.",
-            b"Sets CLAUDE_CODE_SAFE_MODE = 0.",
-            b"Sets CLAUDE_CODE_SAFE_MODE=0.",
-            b"Sets CLAUDE_CODE_SAFE_MODE: 0.",
-            b"Sets CLAUDE_CODE_SAFE_MODE, default 0.",
-            b"Sets CLAUDE_CODE_SAFE_MODE; value 0.",
-            b"Sets CLAUDE_CODE_SAFE_MODE=1.0.",
-            b"Sets CLAUDE_CODE_SAFE_MODE.foo.",
-            b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode to 0.",
-            b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode.foo.",
-            b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode --model opus",
-            b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode --session-id --model opus",
-            (
-                b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode --session-id <uuid> "
-                b"Use a specific session ID for the conversation "
-                b"(must be a valid UUID)"
-            ),
-            b"not.sets CLAUDE_CODE_SAFE_MODE.",
+        form = providers.CLAUDE_BARE_MODE_HELP_FORM
+        for mutated_form in (
+            form.replace("skip hooks", "load hooks", 1),
+            form.replace("oauth and keychain are never read", "oauth is read", 1),
+            form.replace("claude_code_simple=1", "claude_code_simple=0", 1),
+            form.replace("claude.md auto-discovery", "claude.md discovery", 1),
         ):
-            with self.subTest(wording=wording):
+            with self.subTest(mutated_form=mutated_form):
                 run_command.return_value = Completed(
                     argv=("claude", "--help"),
                     returncode=0,
                     stdout=(
-                        b"--safe-mode all customizations including CLAUDE.md are "
-                        b"disabled; Authentication, model selection, built-in tools, "
-                        b"and permissions work normally. "
-                        + wording
-                    ),
+                        "Options:\n  "
+                        + mutated_form
+                        + "\n  --betas <betas...> Beta headers\n"
+                    ).encode(),
                     stderr=b"",
                 )
 
-                with self.assertRaisesRegex(ReviewError, "disable CLAUDE.md"):
-                    providers._require_claude_safe_mode(
-                        pathlib.Path("/bin/claude"), {}
-                    )
+                with self.assertRaisesRegex(ReviewError, "uniquely verifiable --bare"):
+                    providers._require_claude_bare_mode(pathlib.Path("/bin/claude"), {})
+
+    @mock.patch.object(providers, "run")
+    def test_claude_rejects_duplicate_or_conflicting_bare_descriptions(
+        self,
+        run_command: mock.Mock,
+    ) -> None:
+        form = providers.CLAUDE_BARE_MODE_HELP_FORM
+        for help_text in (
+            "Options:\n  " + form + "\n  --bare hooks still load\n",
+            "Options:\n  "
+            + form
+            + "\n  hooks still load\n  --betas <betas...> Beta headers\n",
+            "Options:\n  "
+            + form
+            + "\n  --betas <betas...> Unlike --bare, hooks still load\n",
+        ):
+            with self.subTest(help_text=help_text):
+                run_command.return_value = Completed(
+                    argv=("claude", "--help"),
+                    returncode=0,
+                    stdout=help_text.encode(),
+                    stderr=b"",
+                )
+
+                with self.assertRaisesRegex(ReviewError, "uniquely verifiable --bare"):
+                    providers._require_claude_bare_mode(pathlib.Path("/bin/claude"), {})
 
     @mock.patch.object(
         providers,

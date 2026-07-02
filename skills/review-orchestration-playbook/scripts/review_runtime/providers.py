@@ -35,19 +35,22 @@ COPILOT_PERMISSION_HELP_FRAGMENTS = (
     "--disallow-temp-dir flag prevents automatic access",
     "denial rules always take precedence over allow rules, even --allow-all-tools",
 )
-CLAUDE_SAFE_MODE_HELP_FRAGMENTS = (
-    "--safe-mode",
-    "all customizations",
-    "claude.md",
-    "disabled",
-    "model selection, built-in tools, and permissions work normally",
+# Normalized from Claude Code 2.1.187 `--help`. Exact option-block matching is
+# intentional: safe mode still permits managed hooks, while bare mode explicitly
+# skips hooks. New wording fails closed until this whitelist and its mutation
+# tests are updated together.
+CLAUDE_BARE_MODE_HELP_FORM = (
+    "--bare minimal mode: skip hooks, lsp, plugin sync, attribution, auto-memory, "
+    "background prefetches, keychain reads, and claude.md auto-discovery. sets "
+    "claude_code_simple=1. anthropic auth is strictly anthropic_api_key or apikeyhelper "
+    "via --settings (oauth and keychain are never read). 3p providers "
+    "(bedrock/vertex/foundry) use their own credentials. skills still resolve via "
+    "/skill-name. explicitly provide context via: --system-prompt[-file], "
+    "--append-system-prompt[-file], --add-dir (claude.md dirs), --mcp-config, "
+    "--settings, --agents, --plugin-dir."
 )
-CLAUDE_SAFE_MODE_ENV_PATTERN = re.compile(
-    r"(?:^|[.;:]\s+)sets claude_code_safe_mode(?:=1)?(?:\.(?=\s|$)|$)"
-    r"|(?:^|[.;:]\s+)sets claude_code_safe_mode claude --safe-mode "
-    r"--session-id use a specific session id for the conversation "
-    r"\(must be a valid uuid\)(?=\s|$)"
-)
+CLAUDE_HELP_OPTION_START = re.compile(r"^  (--[a-z0-9][a-z0-9-]*)\b")
+CLAUDE_BARE_TOKEN = re.compile(r"(?<![a-z0-9-])--bare(?![a-z0-9-])")
 CLAUDE_EGRESS_CONSENTS = (
     "explicit-claude-review",
     "double-review",
@@ -55,12 +58,7 @@ CLAUDE_EGRESS_CONSENTS = (
 )
 COPILOT_EGRESS_CONSENTS = ("double-review", "triple-review")
 CODEX_ENV_KEYS = ("CODEX_HOME", "OPENAI_API_KEY")
-CLAUDE_ENV_KEYS = (
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "CLAUDE_CONFIG_DIR",
-)
+CLAUDE_ENV_KEYS = ("ANTHROPIC_API_KEY",)
 COPILOT_ENV_KEYS = (
     "COPILOT_GITHUB_TOKEN",
     "GH_TOKEN",
@@ -201,31 +199,45 @@ def _with_executable_path(
     return result
 
 
-def _require_claude_safe_mode(
+def _claude_help_option_blocks(help_text: str, option: str) -> tuple[str, ...]:
+    blocks: list[str] = []
+    current: list[str] | None = None
+    current_option = ""
+    for line in help_text.splitlines():
+        match = CLAUDE_HELP_OPTION_START.match(line)
+        if match:
+            if current is not None and current_option == option:
+                blocks.append(" ".join(" ".join(current).lower().split()))
+            current = [line.strip()]
+            current_option = match.group(1)
+        elif current is not None:
+            current.append(line.strip())
+    if current is not None and current_option == option:
+        blocks.append(" ".join(" ".join(current).lower().split()))
+    return tuple(blocks)
+
+
+def _require_claude_bare_mode(
     executable: pathlib.Path,
     env: dict[str, str],
 ) -> None:
     completed = run(
-        (str(executable), "--help"),
+        (str(executable), "--bare", "--help"),
         cwd=pathlib.Path(os.path.abspath(os.sep)),
         env=env,
     )
-    help_text = " ".join(
-        (completed.stdout + b"\n" + completed.stderr)
-        .decode("utf-8", errors="replace")
-        .lower()
-        .split()
+    help_text = (completed.stdout + b"\n" + completed.stderr).decode(
+        "utf-8", errors="replace"
     )
     if (
         completed.returncode != 0
-        or not all(
-            fragment in help_text for fragment in CLAUDE_SAFE_MODE_HELP_FRAGMENTS
-        )
-        or CLAUDE_SAFE_MODE_ENV_PATTERN.search(help_text) is None
+        or len(CLAUDE_BARE_TOKEN.findall(help_text.lower())) != 1
+        or _claude_help_option_blocks(help_text, "--bare")
+        != (CLAUDE_BARE_MODE_HELP_FORM,)
     ):
         raise ReviewError(
-            "Claude Code does not expose verifiable --safe-mode semantics that "
-            "disable CLAUDE.md and other project customizations"
+            "Claude Code does not expose a uniquely verifiable --bare mode that "
+            "skips hooks and other project customizations"
         )
 
 
@@ -821,10 +833,22 @@ def _claude_attempt(
             "claude is not available in a validated executable path"
         )
     env = _with_executable_path(env, executable)
-    _require_claude_safe_mode(executable, env)
+    claude_home = review.container_dir / "claude-home"
+    claude_home.mkdir(parents=True, exist_ok=True)
+    env = dict(env)
+    env["HOME"] = str(claude_home)
+    env.pop("XDG_CONFIG_HOME", None)
+    probe_env = {
+        key: value
+        for key, value in env.items()
+        if key != "ANTHROPIC_API_KEY"
+        and not key.startswith("CODEX_ISOLATED_REVIEW_")
+    }
+    _require_claude_bare_mode(executable, probe_env)
     stdout_path, stderr_path = _attempt_paths(review, index, "claude", model)
     settings = json.dumps(
         {
+            "disableAllHooks": True,
             "permissions": {
                 "deny": [
                     "Read(~/.aws/**)",
@@ -855,7 +879,7 @@ def _claude_attempt(
             "--output-format",
             "json",
             "--no-session-persistence",
-            "--safe-mode",
+            "--bare",
             "--no-chrome",
             "--disable-slash-commands",
             "--strict-mcp-config",
@@ -1167,8 +1191,19 @@ def run_review(
         claude_env = _review_environment(
             review=review,
             passthrough_keys=CLAUDE_ENV_KEYS,
-            extra={"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"},
+            extra={
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
+            },
         )
+        if not claude_env.get("ANTHROPIC_API_KEY"):
+            claude_available = False
+            write_text_atomic(
+                review.container_dir / "claude-skip.txt",
+                "Claude Code bare mode requires ANTHROPIC_API_KEY; OAuth and "
+                "keychain authentication are intentionally unavailable in bare mode.\n",
+            )
+    if claude_available:
         try:
             category, final_text = _run_model_chain(
                 review=review,
@@ -1196,7 +1231,8 @@ def run_review(
     if egress_consent not in COPILOT_EGRESS_CONSENTS:
         write_text_atomic(
             review.container_dir / "runner-error.txt",
-            "Claude Code was unavailable or lacked model entitlement, but "
+            "Claude Code was unavailable, lacked bare-mode API-key authentication, "
+            "or lacked model entitlement, but "
             "explicit-claude-review does not authorize GitHub Copilot fallback.\n",
         )
         _write_attempts(review, attempts)
@@ -1214,7 +1250,8 @@ def run_review(
     if not copilot_available:
         write_text_atomic(
             review.container_dir / "runner-error.txt",
-            "Claude Code was unavailable or lacked model entitlement, and Copilot CLI is unavailable.\n",
+            "Claude Code was unavailable, lacked bare-mode API-key authentication, "
+            "or lacked model entitlement, and Copilot CLI is unavailable.\n",
         )
         return _finish(review, attempts, None)
     copilot_env = _review_environment(
