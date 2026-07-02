@@ -41,7 +41,9 @@ CLAUDE_SAFE_MODE_HELP_FRAGMENTS = (
     "claude.md",
     "disabled",
     "model selection, built-in tools, and permissions work normally",
-    "claude_code_safe_mode=1",
+)
+CLAUDE_SAFE_MODE_ENV_PATTERN = re.compile(
+    r"(?:^|[.;:])\s*sets claude_code_safe_mode(?:=1)?(?:[.;:,]|\s|$)"
 )
 CLAUDE_EGRESS_CONSENTS = (
     "explicit-claude-review",
@@ -211,8 +213,12 @@ def _require_claude_safe_mode(
         .lower()
         .split()
     )
-    if completed.returncode != 0 or not all(
-        fragment in help_text for fragment in CLAUDE_SAFE_MODE_HELP_FRAGMENTS
+    if (
+        completed.returncode != 0
+        or not all(
+            fragment in help_text for fragment in CLAUDE_SAFE_MODE_HELP_FRAGMENTS
+        )
+        or CLAUDE_SAFE_MODE_ENV_PATTERN.search(help_text) is None
     ):
         raise ReviewError(
             "Claude Code does not expose verifiable --safe-mode semantics that "

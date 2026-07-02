@@ -1151,7 +1151,10 @@ class ProviderPolicyTest(unittest.TestCase):
         _resolve: mock.Mock,
     ) -> None:
         payload = {"result": "No findings.", "modelUsage": {"claude-opus-4-8": {}}}
-        safe_mode_help = " ".join(providers.CLAUDE_SAFE_MODE_HELP_FRAGMENTS)
+        safe_mode_help = (
+            " ".join(providers.CLAUDE_SAFE_MODE_HELP_FRAGMENTS)
+            + ". Sets CLAUDE_CODE_SAFE_MODE."
+        )
         run_command.side_effect = (
             Completed(
                 argv=("claude", "--help"),
@@ -1225,12 +1228,40 @@ class ProviderPolicyTest(unittest.TestCase):
             stdout=(
                 b"--safe-mode all customizations including CLAUDE.md are disabled; "
                 b"Authentication, model selection, built-in tools, and permissions "
-                b"work normally. Sets CLAUDE_CODE_SAFE_MODE=1."
+                b"work normally. Sets CLAUDE_CODE_SAFE_MODE."
             ),
             stderr=b"",
         )
 
         providers._require_claude_safe_mode(pathlib.Path("/bin/claude"), {})
+
+    @mock.patch.object(providers, "run")
+    def test_claude_rejects_negated_safe_mode_variable_wording(
+        self,
+        run_command: mock.Mock,
+    ) -> None:
+        for wording in (
+            b"Never sets CLAUDE_CODE_SAFE_MODE.",
+            b"Does not set CLAUDE_CODE_SAFE_MODE.",
+            b"Unsets CLAUDE_CODE_SAFE_MODE.",
+        ):
+            with self.subTest(wording=wording):
+                run_command.return_value = Completed(
+                    argv=("claude", "--help"),
+                    returncode=0,
+                    stdout=(
+                        b"--safe-mode all customizations including CLAUDE.md are "
+                        b"disabled; Authentication, model selection, built-in tools, "
+                        b"and permissions work normally. "
+                        + wording
+                    ),
+                    stderr=b"",
+                )
+
+                with self.assertRaisesRegex(ReviewError, "disable CLAUDE.md"):
+                    providers._require_claude_safe_mode(
+                        pathlib.Path("/bin/claude"), {}
+                    )
 
     @mock.patch.object(
         providers,
