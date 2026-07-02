@@ -370,7 +370,7 @@ def _json_objects(stdout: bytes) -> list[dict[str, Any]]:
     if isinstance(parsed, dict):
         values.append(parsed)
         return values
-    for line in text.splitlines():
+    for line in text.split("\n"):
         try:
             parsed_line = json.loads(line)
         except json.JSONDecodeError:
@@ -395,7 +395,7 @@ def _strict_jsonl_objects(stdout: bytes) -> list[dict[str, Any]] | None:
     except UnicodeDecodeError:
         return None
     objects: list[dict[str, Any]] = []
-    for line in text.splitlines():
+    for line in text.split("\n"):
         if not line.strip():
             continue
         try:

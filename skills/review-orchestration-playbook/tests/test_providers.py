@@ -344,6 +344,34 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
 
+    def test_copilot_preserves_non_lf_unicode_line_separator_in_content(self) -> None:
+        content = "No\u2028findings."
+        stdout = "\n".join(
+            json.dumps(item, ensure_ascii=False)
+            for item in (
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "content": content,
+                        "model": "claude-opus-4.8",
+                    },
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(
+            providers._parse_copilot_output(stdout),
+            (content, "claude-opus-4.8"),
+        )
+
     def test_copilot_accepts_only_tool_free_message_for_ended_turn(self) -> None:
         stdout = "\n".join(
             json.dumps(item)
