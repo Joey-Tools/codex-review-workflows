@@ -494,6 +494,41 @@ class ProviderPolicyTest(unittest.TestCase):
             (None, None),
         )
 
+    def test_copilot_error_does_not_inherit_previous_session_model(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "session.start",
+                    "data": {"selectedModel": "claude-opus-4.8"},
+                },
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+                {"type": "session.start", "data": {}},
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-2"},
+                },
+                {
+                    "type": "turn.failed",
+                    "error": {"message": "Model is not available for your account"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(
+            providers._parse_copilot_output(
+                stdout, requested_model="claude-opus-4.8"
+            ),
+            (None, None),
+        )
+
     def test_copilot_error_rejects_malformed_model_evidence(self) -> None:
         stdout = "\n".join(
             json.dumps(item)
@@ -917,6 +952,40 @@ class ProviderPolicyTest(unittest.TestCase):
             providers._parse_copilot_output(stdout),
             ("No findings.", "claude-opus-4.8"),
         )
+
+    def test_copilot_success_does_not_inherit_previous_session_model(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "session.start",
+                    "data": {"selectedModel": "claude-opus-4.8"},
+                },
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+                {"type": "session.start", "data": {}},
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-2"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {"content": "No findings.", "toolRequests": []},
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-2"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
 
     def test_copilot_streams_complete_jsonl_larger_than_memory_capture(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

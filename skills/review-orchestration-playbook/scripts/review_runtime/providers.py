@@ -685,8 +685,6 @@ def _parse_copilot_objects(
     completed_turn: tuple[int, dict[str, Any]] | None = None
     latest_session_model: str | None = None
     first_model: str | None = None
-    latest_model: str | None = None
-    latest_requested_mismatch: str | None = None
     evidence_conflict = False
     structured_error = False
     first_error_index: int | None = None
@@ -699,15 +697,10 @@ def _parse_copilot_objects(
         if not valid_model:
             return None, None
         if candidate is not None:
-            latest_model = candidate
             if first_model is None:
                 first_model = candidate
             elif not _model_matches(first_model, candidate):
                 evidence_conflict = True
-            if requested_model is not None and not _model_matches(
-                requested_model, candidate
-            ):
-                latest_requested_mismatch = candidate
         if _structured_error_item_text(item):
             structured_error = True
             first_error_index = (
@@ -716,7 +709,9 @@ def _parse_copilot_objects(
             last_error_index = index
 
         event_type = item.get("type")
-        if event_type == "session.start" and candidate is not None:
+        if event_type == "session.start":
+            if open_turn is not None:
+                return None, None
             latest_session_model = candidate
         if event_type in {"assistant.turn_start", "assistant.turn_end"}:
             data = item.get("data")
@@ -780,7 +775,16 @@ def _parse_copilot_objects(
                 return None, None
         else:
             return None, None
-        effective_model = latest_requested_mismatch or latest_model
+        if evidence_conflict:
+            return None, None
+        turn = open_turn if open_turn is not None else completed_turn[1]
+        message = turn["message"]
+        message_model = message.get("model") if isinstance(message, dict) else None
+        effective_model = (
+            turn["usage_model"] or message_model or turn["session_model"]
+        )
+        if not isinstance(effective_model, str) or not effective_model:
+            return None, None
         return None, effective_model
     if (
         open_turn is not None
