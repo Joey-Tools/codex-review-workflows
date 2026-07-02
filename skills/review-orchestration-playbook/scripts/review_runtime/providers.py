@@ -43,7 +43,7 @@ CLAUDE_SAFE_MODE_HELP_FRAGMENTS = (
     "model selection, built-in tools, and permissions work normally",
 )
 CLAUDE_SAFE_MODE_ENV_PATTERN = re.compile(
-    r"(?:^|[.;:])\s*sets claude_code_safe_mode(?:=1)?(?=[.;:,]|$)"
+    r"(?:^|[.;:])\s*sets claude_code_safe_mode(?:=1)?(?=\.|$)"
 )
 CLAUDE_EGRESS_CONSENTS = (
     "explicit-claude-review",
