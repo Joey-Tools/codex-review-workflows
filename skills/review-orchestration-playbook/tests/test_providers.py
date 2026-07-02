@@ -264,6 +264,36 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(final_text, "No findings.")
         self.assertEqual(effective_model, "claude-opus-4-8")
 
+    def test_claude_rejects_malformed_model_usage_entry(self) -> None:
+        stdout = json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": "No findings.",
+                "modelUsage": {"claude-opus-4-8": None},
+            }
+        ).encode()
+
+        self.assertEqual(providers._parse_claude_output(stdout), (None, None))
+
+    def test_claude_rejects_success_with_nonempty_errors(self) -> None:
+        stdout = json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": "No findings.",
+                "errors": [{"message": "contradictory failure"}],
+                "modelUsage": {"claude-opus-4-8": {}},
+            }
+        ).encode()
+
+        self.assertEqual(
+            providers._parse_claude_output(stdout),
+            (None, "claude-opus-4-8"),
+        )
+
     def test_nonterminal_claude_payload_cannot_supply_final_text(self) -> None:
         stdout = json.dumps(
             {
@@ -429,6 +459,43 @@ class ProviderPolicyTest(unittest.TestCase):
                 {
                     "type": "assistant.message",
                     "data": {"model": 123},
+                },
+                {
+                    "type": "turn.failed",
+                    "error": {"message": "Model is not available for your account"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(
+            providers._parse_copilot_output(
+                stdout, requested_model="claude-opus-4.8"
+            ),
+            (None, None),
+        )
+
+    def test_copilot_error_after_completed_turn_is_unverifiable(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "session.start",
+                    "data": {"selectedModel": "claude-opus-4.8"},
+                },
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "content": "No findings.",
+                        "model": "claude-opus-4.8",
+                    },
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
                 },
                 {
                     "type": "turn.failed",
@@ -789,7 +856,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
 
-    def test_copilot_ignores_usage_before_terminal_message(self) -> None:
+    def test_copilot_rejects_conflicting_usage_before_terminal_message(self) -> None:
         stdout = "\n".join(
             json.dumps(item)
             for item in (
@@ -815,10 +882,38 @@ class ProviderPolicyTest(unittest.TestCase):
             )
         ).encode()
 
-        self.assertEqual(
-            providers._parse_copilot_output(stdout),
-            ("No findings.", "claude-opus-4.8"),
-        )
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
+
+    def test_copilot_rejects_conflicting_earlier_message_model(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "content": "draft",
+                        "model": "claude-opus-4.7",
+                    },
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "content": "No findings.",
+                        "model": "claude-opus-4.8",
+                    },
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
 
     def test_copilot_rejects_conflicting_terminal_usage_model(self) -> None:
         stdout = "\n".join(

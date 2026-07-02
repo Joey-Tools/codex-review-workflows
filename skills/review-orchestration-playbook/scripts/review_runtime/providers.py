@@ -587,11 +587,16 @@ def _parse_claude_output(
     if result.get("type") != "result":
         return None, None
     model_usage = result.get("modelUsage")
-    candidates = (
-        [key for key in model_usage if isinstance(key, str) and key]
-        if isinstance(model_usage, dict)
-        else []
-    )
+    if not isinstance(model_usage, dict) or not model_usage:
+        return None, None
+    if any(
+        not isinstance(key, str)
+        or not key
+        or not isinstance(value, dict)
+        for key, value in model_usage.items()
+    ):
+        return None, None
+    candidates = list(model_usage)
     effective_model = None
     if requested_model is not None:
         effective_model = next(
@@ -605,6 +610,14 @@ def _parse_claude_output(
     if effective_model is None and candidates:
         effective_model = candidates[-1]
     if result.get("subtype") != "success" or result.get("is_error") is not False:
+        return None, effective_model
+    if any(
+        _error_payload_text(result.get(key))
+        for key in ("error", "errors")
+    ):
+        return None, effective_model
+    api_error_status = result.get("api_error_status")
+    if isinstance(api_error_status, (int, str)) and str(api_error_status).strip():
         return None, effective_model
     final_text = result.get("result")
     if not isinstance(final_text, str) or not final_text.strip() or not candidates:
@@ -666,10 +679,7 @@ def _parse_copilot_output(
     model_evidence = _copilot_model_evidence(objects)
     if model_evidence is None:
         return None, None
-    if _structured_error_text(stdout).strip():
-        return None, _copilot_error_effective_model(
-            model_evidence, requested_model
-        )
+    structured_error = bool(_structured_error_text(stdout).strip())
     open_turn: tuple[str, int] | None = None
     completed_turns: list[tuple[str, int, int]] = []
     for index, item in enumerate(objects):
@@ -691,6 +701,12 @@ def _parse_copilot_output(
             return None, None
         completed_turns.append((event_turn_id, open_turn[1], index))
         open_turn = None
+    if structured_error:
+        if completed_turns and completed_turns[-1][2] != len(objects) - 1:
+            return None, None
+        return None, _copilot_error_effective_model(
+            model_evidence, requested_model
+        )
     if open_turn is not None or not completed_turns:
         return None, None
     _, start_index, terminal_index = completed_turns[-1]
@@ -762,13 +778,7 @@ def _parse_copilot_output(
         model = session_model
     if not isinstance(model, str) or not model:
         return None, None
-    session_models = [
-        item["data"]["selectedModel"]
-        for item in objects[: start_index + 1]
-        if item.get("type") == "session.start"
-        and "selectedModel" in item["data"]
-    ]
-    if any(not _model_matches(model, candidate) for candidate in session_models):
+    if any(not _model_matches(model, candidate) for candidate in model_evidence):
         return None, None
     return content, model
 
