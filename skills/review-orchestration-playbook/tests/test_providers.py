@@ -221,6 +221,25 @@ class ProviderPolicyTest(unittest.TestCase):
         rejected = providers.run((str(broker), "show-keychain-info"))
         self.assertEqual(rejected.returncode, 64)
 
+    @mock.patch.object(
+        providers,
+        "_ClaudeKeychainCredentialServer",
+        side_effect=PermissionError("bind denied"),
+    )
+    def test_keychain_broker_bind_failure_is_runtime_unavailable(
+        self,
+        _server: mock.Mock,
+    ) -> None:
+        with self.assertRaisesRegex(
+            providers.ClaudeLoopbackUnavailable,
+            "Keychain broker cannot bind loopback",
+        ):
+            with providers._claude_keychain_credential_server(
+                None,
+                bytes.fromhex("01" * 32),
+            ):
+                self.fail("unavailable broker unexpectedly started")
+
     def test_claude_keychain_broker_serves_one_in_memory_value(self) -> None:
         if (
             sys.platform != "darwin"
@@ -2187,6 +2206,61 @@ class ProviderPolicyTest(unittest.TestCase):
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(
         providers,
+        "_resolve_validated_claude_executable",
+        return_value=(pathlib.Path("/bin/claude"), {}),
+    )
+    @mock.patch.object(
+        providers,
+        "_with_claude_review_tool_path",
+        return_value={},
+    )
+    @mock.patch.object(
+        providers,
+        "resolve_reviewer_executable",
+        return_value=pathlib.Path("/bin/copilot"),
+    )
+    @mock.patch.object(providers, "_copilot_attempt")
+    @mock.patch.object(
+        providers,
+        "_claude_attempt",
+        side_effect=providers.ClaudeLoopbackUnavailable("loopback bind failed"),
+    )
+    def test_loopback_unavailable_allows_authorized_copilot_fallback(
+        self,
+        claude_attempt: mock.Mock,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _tools: mock.Mock,
+        _resolve_claude: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        copilot_attempt.return_value = self.attempt(
+            "copilot",
+            providers.COPILOT_MODELS[0],
+            "success",
+            final_text="No findings.",
+        )
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
+
+        self.assertEqual(outcome.returncode, 0)
+        claude_attempt.assert_called_once()
+        copilot_attempt.assert_called_once()
+        resolve.assert_called_once_with("copilot")
+        self.assertIn(
+            "loopback bind failed",
+            (self.review.container_dir / "claude-skip.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
         "resolve_reviewer_executable",
         side_effect=(pathlib.Path("/bin/claude"), pathlib.Path("/bin/copilot")),
     )
@@ -3257,6 +3331,8 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertNotIn(f'(subpath "{self.claude_broker.parent}")', review_profile)
         self.assertIn('(literal "/bin/echo")', review_profile)
         self.assertNotIn('(literal "/bin/sh")', review_profile)
+        self.assertNotIn("mdsDirectory.db", review_profile)
+        self.assertNotIn("mdsObject.db", review_profile)
         self.assertNotIn("/Users/reviewer", review_profile)
         self.assertIn("--safe-mode", argv)
         self.assertNotIn("--bare", argv)
@@ -3702,6 +3778,22 @@ class ProviderPolicyTest(unittest.TestCase):
             ):
                 with providers._claude_connect_proxy({"https_proxy": value}):
                     self.fail("invalid upstream proxy unexpectedly started")
+
+    @mock.patch.object(
+        providers,
+        "_ClaudeProxyServer",
+        side_effect=OSError("bind failed"),
+    )
+    def test_claude_proxy_bind_failure_is_runtime_unavailable(
+        self,
+        _server: mock.Mock,
+    ) -> None:
+        with self.assertRaisesRegex(
+            providers.ClaudeLoopbackUnavailable,
+            "CONNECT proxy cannot bind loopback",
+        ):
+            with providers._claude_connect_proxy({}):
+                self.fail("unavailable proxy unexpectedly started")
 
     def test_claude_upstream_proxy_respects_bypass_environment(self) -> None:
         for key in ("NO_PROXY", "no_proxy"):

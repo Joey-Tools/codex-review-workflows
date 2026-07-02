@@ -28,6 +28,7 @@ superseded_by:
 - HTTPS corporate proxy tunnels drain OpenSSL's already-decrypted pending data before waiting on the underlying socket.
 - Missing Claude authentication can fall back to GitHub Copilot only for explicitly authorized double or triple reviews.
 - A missing or non-native trusted `rg` is treated as Claude runtime unavailability and follows the same authorized Copilot fallback rule.
+- Loopback bind failures for the Keychain broker or Anthropic CONNECT proxy are converted to structured Claude runtime unavailability; the final sandbox no longer reads host Spotlight databases.
 - Skill policy, egress language, helper contract, and provider tests describe the same behavior.
 
 ## Next Steps

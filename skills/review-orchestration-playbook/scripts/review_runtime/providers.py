@@ -286,6 +286,10 @@ class ClaudeReviewToolUnavailable(ReviewError):
     """The host lacks a trusted local tool required by Claude Code."""
 
 
+class ClaudeLoopbackUnavailable(ReviewError):
+    """The host cannot bind a loopback service required by Claude Code."""
+
+
 @dataclass(frozen=True)
 class Attempt:
     runtime: str
@@ -687,11 +691,16 @@ def _claude_keychain_credential_server(
 ) -> Iterator[int]:
     if len(capability) != CLAUDE_KEYCHAIN_BROKER_CAPABILITY_BYTES:
         raise ReviewError("Claude Keychain broker capability has an invalid length")
-    server = _ClaudeKeychainCredentialServer(
-        credential,
-        capability,
-        update_callback,
-    )
+    try:
+        server = _ClaudeKeychainCredentialServer(
+            credential,
+            capability,
+            update_callback,
+        )
+    except OSError as error:
+        raise ClaudeLoopbackUnavailable(
+            f"Claude Keychain broker cannot bind loopback: {error}"
+        ) from error
     thread = threading.Thread(
         target=server.serve_forever,
         daemon=True,
@@ -1074,10 +1083,15 @@ def _claude_connect_proxy(
         upstream_url = _upstream_proxy_url(env, host=host, port=port)
         if upstream_url is not None:
             _parse_upstream_proxy_url(upstream_url)
-    server = _ClaudeProxyServer(
-        allowed_targets=allowed_targets,
-        upstream_env=env,
-    )
+    try:
+        server = _ClaudeProxyServer(
+            allowed_targets=allowed_targets,
+            upstream_env=env,
+        )
+    except OSError as error:
+        raise ClaudeLoopbackUnavailable(
+            f"Claude CONNECT proxy cannot bind loopback: {error}"
+        ) from error
     thread = threading.Thread(
         target=server.serve_forever,
         name="claude-review-connect-proxy",
@@ -1420,8 +1434,6 @@ def _claude_review_sandbox_profile(
         *auth_executables,
         *tool_executables,
         *tls_files,
-        pathlib.Path("/private/var/db/mds/system/mdsDirectory.db"),
-        pathlib.Path("/private/var/db/mds/system/mdsObject.db"),
     }
     metadata_paths: set[pathlib.Path] = set()
     for path in {*read_files, *read_subpaths}:
@@ -2842,6 +2854,7 @@ def run_review(
         ClaudeKeychainBrokerUnavailable,
         ClaudeKeychainCredentialUnavailable,
         ClaudeReviewToolUnavailable,
+        ClaudeLoopbackUnavailable,
     ) as error:
         claude_available = False
         write_text_atomic(
@@ -2896,6 +2909,7 @@ def run_review(
         except (
             ClaudeKeychainCredentialUnavailable,
             ClaudeReviewToolUnavailable,
+            ClaudeLoopbackUnavailable,
         ) as error:
             category = "unavailable"
             final_text = None
