@@ -93,8 +93,17 @@ class ProviderPolicyTest(unittest.TestCase):
             side_effect=self.fake_claude_keychain_runtime,
         )
         self.keychain_runtime_patcher.start()
+        self.require_safe_claude_keychain_credential = (
+            providers._require_safe_claude_keychain_credential
+        )
+        self.keychain_preflight_patcher = mock.patch.object(
+            providers,
+            "_require_safe_claude_keychain_credential",
+        )
+        self.keychain_preflight = self.keychain_preflight_patcher.start()
 
     def tearDown(self) -> None:
+        self.keychain_preflight_patcher.stop()
         self.keychain_runtime_patcher.stop()
         self.keychain_broker_patcher.stop()
         self.native_dependency_patcher.stop()
@@ -336,8 +345,8 @@ class ProviderPolicyTest(unittest.TestCase):
         except PermissionError:
             self.skipTest("loopback bind is unavailable in the current sandbox")
 
-        self.assertEqual(direct_updated.returncode, 0)
-        self.assertEqual(direct_updates, [updated_payload])
+        self.assertEqual(direct_updated.returncode, 64)
+        self.assertEqual(direct_updates, [])
 
     @mock.patch.object(providers.subprocess, "run")
     def test_keychain_prefetch_uses_fixed_service_and_account(
@@ -406,27 +415,44 @@ class ProviderPolicyTest(unittest.TestCase):
         run_command.assert_not_called()
 
     @mock.patch.object(providers.subprocess, "run")
-    def test_large_keychain_update_uses_validated_direct_arguments(
+    def test_large_keychain_update_rejects_command_line_exposure(
         self,
         run_command: mock.Mock,
     ) -> None:
-        run_command.return_value = subprocess.CompletedProcess(
-            args=(),
-            returncode=0,
-            stdout=b"",
-            stderr=b"",
-        )
         credential = bytearray(oauth_credential_fixture(padding=3000))
 
-        self.assertTrue(
+        self.assertFalse(
             providers._write_claude_keychain_credential(self.review, credential)
         )
-        argv = run_command.call_args.args[0]
-        self.assertEqual(argv[0:2], ("/usr/bin/security", "add-generic-password"))
-        self.assertEqual(argv[2:4], ("-U", "-a"))
-        self.assertEqual(argv[5:7], ("-s", "Claude Code-credentials"))
-        self.assertEqual(argv[7], "-X")
-        self.assertIsNone(run_command.call_args.kwargs["input"])
+        run_command.assert_not_called()
+
+    @mock.patch.object(providers, "_read_claude_keychain_credential")
+    def test_keychain_preflight_rejects_credential_without_refresh_margin(
+        self,
+        read_credential: mock.Mock,
+    ) -> None:
+        credential = bytearray(oauth_credential_fixture(padding=3000))
+        read_credential.return_value = credential
+
+        with self.assertRaisesRegex(
+            providers.ClaudeKeychainCredentialUnavailable,
+            "too large for safe refresh persistence",
+        ):
+            self.require_safe_claude_keychain_credential(self.review)
+
+        self.assertEqual(credential, bytearray(len(credential)))
+
+    @mock.patch.object(providers, "_read_claude_keychain_credential")
+    def test_keychain_preflight_accepts_bounded_credential(
+        self,
+        read_credential: mock.Mock,
+    ) -> None:
+        credential = bytearray(oauth_credential_fixture())
+        read_credential.return_value = credential
+
+        self.require_safe_claude_keychain_credential(self.review)
+
+        self.assertEqual(credential, bytearray(len(credential)))
 
     @mock.patch.object(
         providers,
@@ -2025,6 +2051,51 @@ class ProviderPolicyTest(unittest.TestCase):
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(
         providers,
+        "_resolve_validated_claude_executable",
+        return_value=(pathlib.Path("/bin/claude"), {}),
+    )
+    @mock.patch.object(
+        providers,
+        "resolve_reviewer_executable",
+        return_value=pathlib.Path("/bin/copilot"),
+    )
+    @mock.patch.object(providers, "_copilot_attempt")
+    def test_oversized_claude_credential_allows_authorized_copilot_fallback(
+        self,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _resolve_claude: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        self.keychain_preflight.side_effect = (
+            providers.ClaudeKeychainCredentialUnavailable("credential too large")
+        )
+        copilot_attempt.return_value = self.attempt(
+            "copilot",
+            providers.COPILOT_MODELS[0],
+            "success",
+            final_text="No findings.",
+        )
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
+
+        self.assertEqual(outcome.returncode, 0)
+        copilot_attempt.assert_called_once()
+        resolve.assert_called_once_with("copilot")
+        self.assertIn(
+            "credential too large",
+            (self.review.container_dir / "claude-skip.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
         "resolve_reviewer_executable",
         side_effect=(pathlib.Path("/bin/claude"), pathlib.Path("/bin/copilot")),
     )
@@ -2923,6 +2994,51 @@ class ProviderPolicyTest(unittest.TestCase):
                         pathlib.Path("/isolated/probe-home"),
                     )
 
+    @mock.patch.object(providers, "_run_claude_probe")
+    def test_claude_identity_requires_exact_supported_version(
+        self,
+        run_probe: mock.Mock,
+    ) -> None:
+        run_probe.return_value = Completed(
+            argv=("claude", "--version"),
+            returncode=0,
+            stdout=b"2.1.188 (Claude Code)\n",
+            stderr=b"",
+        )
+
+        with self.assertRaisesRegex(
+            providers.InvalidReviewerExecutable,
+            "supported Claude Code 2.1.187",
+        ):
+            providers._require_claude_identity(
+                pathlib.Path("/bin/claude"),
+                {"HOME": "/isolated/probe-home"},
+            )
+
+    def test_claude_review_path_pins_broker_and_trusted_ripgrep(self) -> None:
+        trusted_dir = self.review.source_root / "trusted-tools"
+        trusted_dir.mkdir()
+        trusted_rg = trusted_dir / "rg"
+        trusted_rg.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 32)
+        trusted_rg.chmod(0o700)
+
+        with mock.patch.object(
+            providers,
+            "CLAUDE_REVIEW_TOOL_EXECUTABLE_CANDIDATES",
+            (trusted_rg,),
+        ):
+            prepared = providers._with_claude_review_tool_path(
+                self.review,
+                {
+                    "PATH": "/untrusted/claude:/usr/bin",
+                },
+            )
+
+        self.assertEqual(
+            prepared["PATH"].split(os.pathsep),
+            [str(self.claude_broker.parent.resolve()), str(trusted_dir.absolute())],
+        )
+
     @mock.patch.object(
         providers,
         "resolve_reviewer_executable",
@@ -2930,8 +3046,8 @@ class ProviderPolicyTest(unittest.TestCase):
     )
     @mock.patch.object(
         providers,
-        "CLAUDE_REVIEW_TOOL_EXECUTABLE_CANDIDATES",
-        (pathlib.Path("/bin/echo"),),
+        "_trusted_claude_ripgrep",
+        return_value=pathlib.Path("/bin/echo"),
     )
     @mock.patch.object(
         providers,
@@ -2948,6 +3064,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self,
         run_command: mock.Mock,
         _proxy: mock.Mock,
+        _rg: mock.Mock,
         resolve: mock.Mock,
     ) -> None:
         def resolve_and_validate(_name: str, **kwargs) -> pathlib.Path:
@@ -3077,6 +3194,10 @@ class ProviderPolicyTest(unittest.TestCase):
             str(self.review.container_dir / "claude-home"),
         )
         self.assertNotIn("XDG_CONFIG_HOME", review_env)
+        self.assertEqual(
+            review_env["PATH"].split(os.pathsep),
+            [str(self.claude_broker.parent.resolve()), "/bin"],
+        )
         self.assertEqual(review_env["HTTPS_PROXY"], "http://127.0.0.1:43210")
         self.assertEqual(review_env["HTTP_PROXY"], review_env["HTTPS_PROXY"])
         self.assertEqual(review_env["ALL_PROXY"], review_env["HTTPS_PROXY"])
@@ -3104,10 +3225,13 @@ class ProviderPolicyTest(unittest.TestCase):
 
     @mock.patch.object(
         providers,
-        "CLAUDE_REVIEW_TOOL_EXECUTABLE_CANDIDATES",
-        (pathlib.Path("/missing/rg"),),
+        "_trusted_claude_ripgrep",
+        return_value=None,
     )
-    def test_claude_review_sandbox_requires_trusted_ripgrep(self) -> None:
+    def test_claude_review_sandbox_requires_trusted_ripgrep(
+        self,
+        _rg: mock.Mock,
+    ) -> None:
         with self.assertRaisesRegex(ReviewError, "requires ripgrep"):
             providers._claude_review_sandbox_profile(
                 pathlib.Path("/bin/true"),
@@ -3124,10 +3248,13 @@ class ProviderPolicyTest(unittest.TestCase):
 
     @mock.patch.object(
         providers,
-        "CLAUDE_REVIEW_TOOL_EXECUTABLE_CANDIDATES",
-        (pathlib.Path("/bin/echo"),),
+        "_trusted_claude_ripgrep",
+        return_value=pathlib.Path("/bin/echo"),
     )
-    def test_claude_review_sandbox_reads_only_exact_executable(self) -> None:
+    def test_claude_review_sandbox_reads_only_exact_executable(
+        self,
+        _rg: mock.Mock,
+    ) -> None:
         install_dir = self.review.source_root / "private-install"
         install_dir.mkdir()
         executable = install_dir / "claude"
@@ -3152,10 +3279,13 @@ class ProviderPolicyTest(unittest.TestCase):
 
     @mock.patch.object(
         providers,
-        "CLAUDE_REVIEW_TOOL_EXECUTABLE_CANDIDATES",
-        (pathlib.Path("/bin/echo"),),
+        "_trusted_claude_ripgrep",
+        return_value=pathlib.Path("/bin/echo"),
     )
-    def test_claude_review_sandbox_allows_exact_custom_ca_paths(self) -> None:
+    def test_claude_review_sandbox_allows_exact_custom_ca_paths(
+        self,
+        _rg: mock.Mock,
+    ) -> None:
         certificate = self.sample_ca_certificate()
         ca_file = self.review.source_root / "corporate-ca.pem"
         ca_file.write_bytes(certificate)
@@ -3194,10 +3324,13 @@ class ProviderPolicyTest(unittest.TestCase):
 
     @mock.patch.object(
         providers,
-        "CLAUDE_REVIEW_TOOL_EXECUTABLE_CANDIDATES",
-        (pathlib.Path("/bin/echo"),),
+        "_trusted_claude_ripgrep",
+        return_value=pathlib.Path("/bin/echo"),
     )
-    def test_claude_review_sandbox_omits_keychain_broker_for_api_key(self) -> None:
+    def test_claude_review_sandbox_omits_keychain_broker_for_api_key(
+        self,
+        _rg: mock.Mock,
+    ) -> None:
         profile = providers._claude_review_sandbox_profile(
             pathlib.Path("/bin/true"),
             self.review,
@@ -3215,10 +3348,13 @@ class ProviderPolicyTest(unittest.TestCase):
 
     @mock.patch.object(
         providers,
-        "CLAUDE_REVIEW_TOOL_EXECUTABLE_CANDIDATES",
-        (pathlib.Path("/bin/echo"),),
+        "_trusted_claude_ripgrep",
+        return_value=pathlib.Path("/bin/echo"),
     )
-    def test_claude_review_sandbox_rejects_relative_ca_file(self) -> None:
+    def test_claude_review_sandbox_rejects_relative_ca_file(
+        self,
+        _rg: mock.Mock,
+    ) -> None:
         with self.assertRaisesRegex(ReviewError, "valid absolute SSL_CERT_FILE"):
             providers._prepare_claude_tls_environment(
                 self.review,
@@ -3229,10 +3365,13 @@ class ProviderPolicyTest(unittest.TestCase):
 
     @mock.patch.object(
         providers,
-        "CLAUDE_REVIEW_TOOL_EXECUTABLE_CANDIDATES",
-        (pathlib.Path("/bin/echo"),),
+        "_trusted_claude_ripgrep",
+        return_value=pathlib.Path("/bin/echo"),
     )
-    def test_claude_review_sandbox_rejects_host_ca_directory(self) -> None:
+    def test_claude_review_sandbox_rejects_host_ca_directory(
+        self,
+        _rg: mock.Mock,
+    ) -> None:
         with self.assertRaisesRegex(ReviewError, "helper-owned SSL_CERT_DIR"):
             providers._claude_review_sandbox_profile(
                 pathlib.Path("/bin/true"),

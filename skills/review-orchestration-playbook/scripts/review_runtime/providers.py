@@ -45,6 +45,7 @@ from .workspace import ReviewWorkspace, validate_external_workspace
 CODEX_MODELS = ("gpt-5.6-sol", "gpt-5.5")
 CODEX_REASONING_EFFORT = "xhigh"
 CLAUDE_MODELS = ("claude-opus-4-8", "claude-opus-4-7")
+CLAUDE_SUPPORTED_VERSION = "2.1.187"
 # GitHub's supported-models matrix lists all pinned IDs for Copilot CLI. The
 # shorter command-reference examples can lag product availability.
 COPILOT_MODELS = ("claude-opus-4.8", "claude-opus-4.7")
@@ -120,6 +121,9 @@ CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES = 64 * 1024
 CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS = 5.0
 CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES = 1024 * 1024
 CLAUDE_KEYCHAIN_SECURITY_STDIN_LIMIT_BYTES = 4032
+CLAUDE_KEYCHAIN_SECURITY_PREFLIGHT_LIMIT_BYTES = (
+    CLAUDE_KEYCHAIN_SECURITY_STDIN_LIMIT_BYTES // 2
+)
 CLAUDE_REVIEW_TOOL_EXECUTABLE_CANDIDATES = (
     pathlib.Path("/opt/homebrew/bin/rg"),
     pathlib.Path("/usr/local/bin/rg"),
@@ -269,6 +273,10 @@ class ClaudeProbeSandboxUnavailable(ReviewError):
 
 class ClaudeKeychainBrokerUnavailable(ReviewError):
     """The host cannot build the restricted Claude Keychain broker."""
+
+
+class ClaudeKeychainCredentialUnavailable(ReviewError):
+    """The local Claude credential cannot be refreshed without argv exposure."""
 
 
 @dataclass(frozen=True)
@@ -465,36 +473,18 @@ def _write_claude_keychain_credential(
             return False
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return False
+    script = _claude_keychain_update_script(credential)
+    if len(script) > CLAUDE_KEYCHAIN_SECURITY_STDIN_LIMIT_BYTES:
+        return False
     account = _claude_keychain_account()
-    hex_value = credential.hex()
-    script = (
-        f'add-generic-password -U -a "{account}" '
-        f'-s "{CLAUDE_KEYCHAIN_SERVICE}" -X "{hex_value}"\n'
-    ).encode("ascii")
     security_env = child_environment(container_dir=review.container_dir)
     security_env["USER"] = account
-    if len(script) <= CLAUDE_KEYCHAIN_SECURITY_STDIN_LIMIT_BYTES:
-        argv = (str(CLAUDE_KEYCHAIN_CLIENT), "-i")
-        stdin = script
-    else:
-        argv = (
-            str(CLAUDE_KEYCHAIN_CLIENT),
-            "add-generic-password",
-            "-U",
-            "-a",
-            account,
-            "-s",
-            CLAUDE_KEYCHAIN_SERVICE,
-            "-X",
-            hex_value,
-        )
-        stdin = None
     try:
         completed = subprocess.run(
-            argv,
+            (str(CLAUDE_KEYCHAIN_CLIENT), "-i"),
             cwd=review.container_dir,
             env=security_env,
-            input=stdin,
+            input=script,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
@@ -509,6 +499,39 @@ def _write_claude_keychain_credential(
     completed.stdout = b""
     completed.stderr = b""
     return completed.returncode == 0 and within_limit
+
+
+def _claude_keychain_update_script(credential: bytes | bytearray) -> bytes:
+    account = _claude_keychain_account()
+    return (
+        f'add-generic-password -U -a "{account}" '
+        f'-s "{CLAUDE_KEYCHAIN_SERVICE}" -X "{credential.hex()}"\n'
+    ).encode("ascii")
+
+
+def _claude_keychain_credential_has_refresh_margin(
+    credential: bytes | bytearray,
+) -> bool:
+    return (
+        len(_claude_keychain_update_script(credential))
+        <= CLAUDE_KEYCHAIN_SECURITY_PREFLIGHT_LIMIT_BYTES
+    )
+
+
+def _require_safe_claude_keychain_credential(
+    review: ReviewWorkspace,
+) -> None:
+    credential = _read_claude_keychain_credential(review)
+    if credential is None:
+        return
+    try:
+        if not _claude_keychain_credential_has_refresh_margin(credential):
+            raise ClaudeKeychainCredentialUnavailable(
+                "Claude local-login credential is too large for safe refresh "
+                "persistence without command-line exposure"
+            )
+    finally:
+        credential[:] = b"\x00" * len(credential)
 
 
 def _recv_exact(sock: socket.socket, length: int) -> bytes | None:
@@ -641,6 +664,13 @@ def _claude_keychain_runtime(
         yield result
         return
     credential = _read_claude_keychain_credential(review)
+    if credential is not None and not _claude_keychain_credential_has_refresh_margin(
+        credential
+    ):
+        credential[:] = b"\x00" * len(credential)
+        raise ClaudeKeychainCredentialUnavailable(
+            "Claude local-login credential lost its safe refresh margin"
+        )
     capability = secrets.token_bytes(CLAUDE_KEYCHAIN_BROKER_CAPABILITY_BYTES)
     with _claude_keychain_credential_server(
         credential,
@@ -1038,6 +1068,43 @@ def _with_executable_path(
     return result
 
 
+def _trusted_claude_ripgrep() -> pathlib.Path | None:
+    return next(
+        (
+            path
+            for path in CLAUDE_REVIEW_TOOL_EXECUTABLE_CANDIDATES
+            if path.name == "rg" and path.is_file() and os.access(path, os.X_OK)
+        ),
+        None,
+    )
+
+
+def _with_claude_review_tool_path(
+    review: ReviewWorkspace,
+    env: dict[str, str],
+) -> dict[str, str]:
+    rg = _trusted_claude_ripgrep()
+    if rg is None:
+        raise ReviewError("Claude Code Grep sandbox requires ripgrep in a trusted path")
+    entries: list[pathlib.Path] = []
+    if not env.get("ANTHROPIC_API_KEY"):
+        broker_dir = (
+            review.container_dir.resolve() / "claude-runtime" / "keychain-broker"
+        )
+        security = broker_dir / "security"
+        if not security.is_file() or not os.access(security, os.X_OK):
+            raise ReviewError(
+                "Claude local-login sandbox requires the restricted Keychain broker"
+            )
+        entries.append(broker_dir)
+    entries.append(rg.absolute().parent)
+    result = dict(env)
+    result["PATH"] = os.pathsep.join(
+        dict.fromkeys(str(entry) for entry in entries)
+    )
+    return result
+
+
 def _claude_help_option_blocks(help_text: str, option: str) -> tuple[str, ...]:
     blocks: list[str] = []
     current: list[str] | None = None
@@ -1245,14 +1312,7 @@ def _claude_review_sandbox_profile(
             raise ReviewError(
                 "Claude local-login sandbox requires a valid Keychain broker capability"
             )
-    rg_candidate = next(
-        (
-            path
-            for path in CLAUDE_REVIEW_TOOL_EXECUTABLE_CANDIDATES
-            if path.is_file() and os.access(path, os.X_OK)
-        ),
-        None,
-    )
+    rg_candidate = _trusted_claude_ripgrep()
     if rg_candidate is None:
         raise ReviewError("Claude Code Grep sandbox requires ripgrep in a trusted path")
     tool_executables = _native_macho_dependencies(rg_candidate, label="ripgrep")
@@ -1373,9 +1433,13 @@ def _require_claude_identity(
     output = (completed.stdout + b"\n" + completed.stderr).decode(
         "utf-8", errors="replace"
     )
-    if completed.returncode != 0 or "claude code" not in output.lower():
+    lines = tuple(line.strip() for line in output.splitlines() if line.strip())
+    if completed.returncode != 0 or lines != (
+        f"{CLAUDE_SUPPORTED_VERSION} (Claude Code)",
+    ):
         raise InvalidReviewerExecutable(
-            "sandboxed executable did not identify as Claude Code"
+            "sandboxed executable did not identify as the supported Claude Code "
+            f"{CLAUDE_SUPPORTED_VERSION}"
         )
 
 
@@ -2270,6 +2334,7 @@ def _claude_attempt(
         raise FileNotFoundError(
             "claude is not available in a validated executable path"
         )
+    env = _with_claude_review_tool_path(review, env)
     env = _prepare_claude_tls_environment(review, env)
     stdout_path, stderr_path = _attempt_paths(review, index, "claude", model)
     settings = json.dumps(
@@ -2686,7 +2751,13 @@ def run_review(
         claude_available = claude_executable is not None
         if claude_available:
             claude_env = _prepare_claude_keychain_broker(review, claude_env)
-    except (ClaudeProbeSandboxUnavailable, ClaudeKeychainBrokerUnavailable) as error:
+            if not claude_env.get("ANTHROPIC_API_KEY"):
+                _require_safe_claude_keychain_credential(review)
+    except (
+        ClaudeProbeSandboxUnavailable,
+        ClaudeKeychainBrokerUnavailable,
+        ClaudeKeychainCredentialUnavailable,
+    ) as error:
         claude_available = False
         write_text_atomic(
             review.container_dir / "claude-skip.txt",
@@ -2737,6 +2808,13 @@ def run_review(
             )
             _write_attempts(review, attempts)
             return Outcome(75, None, tuple(attempts))
+        except ClaudeKeychainCredentialUnavailable as error:
+            category = "unavailable"
+            final_text = None
+            write_text_atomic(
+                review.container_dir / "claude-skip.txt",
+                f"Claude Code local authentication became unavailable: {error}\n",
+            )
         except ReviewError as error:
             write_text_atomic(
                 review.container_dir / "runner-error.txt",

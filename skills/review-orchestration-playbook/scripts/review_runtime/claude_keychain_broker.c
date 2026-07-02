@@ -10,10 +10,10 @@
 #include <unistd.h>
 
 // This executable is exposed to Claude Code as `security`, but it supports only
-// the exact local-login lookup and refresh update forms Claude Code 2.1.187
-// performs. The parent helper handles the fixed Keychain operations through
-// Apple's trusted client and brokers bounded values over a capability-protected
-// loopback-only socket.
+// the exact local-login lookup and stdin refresh update form Claude
+// Code 2.1.187 performs. The parent helper handles the fixed Keychain
+// operations through Apple's trusted client and brokers bounded values over a
+// capability-protected loopback-only socket.
 static const char *const kService = "Claude Code-credentials";
 static const char *const kPortEnvironment = "CODEX_CLAUDE_KEYCHAIN_BROKER_PORT";
 static const char *const kCapabilityEnvironment =
@@ -193,17 +193,6 @@ static int read_update_script(const char *account, unsigned char **credential,
   return result;
 }
 
-static int direct_update(int argc, char *argv[], const char *account,
-                         unsigned char **credential, uint32_t *length) {
-  if (argc != 9 || strcmp(argv[1], "add-generic-password") != 0 ||
-      strcmp(argv[2], "-U") != 0 || strcmp(argv[3], "-a") != 0 ||
-      strcmp(argv[4], account) != 0 || strcmp(argv[5], "-s") != 0 ||
-      strcmp(argv[6], kService) != 0 || strcmp(argv[7], "-X") != 0) {
-    return -1;
-  }
-  return decode_hex(argv[8], strlen(argv[8]), credential, length);
-}
-
 static void clear_credential(unsigned char **credential, uint32_t length) {
   if (*credential != NULL) {
     memset(*credential, 0, length);
@@ -225,11 +214,9 @@ int main(int argc, char *argv[]) {
                 strcmp(argv[6], kService) == 0;
   unsigned char *updated_credential = NULL;
   uint32_t updated_length = 0;
-  int is_update = argc == 2 && strcmp(argv[1], "-i") == 0
-                      ? read_update_script(account, &updated_credential,
-                                           &updated_length) == 0
-                      : direct_update(argc, argv, account, &updated_credential,
-                                      &updated_length) == 0;
+  int is_update =
+      argc == 2 && strcmp(argv[1], "-i") == 0 &&
+      read_update_script(account, &updated_credential, &updated_length) == 0;
   if (!is_read && !is_update) {
     return 64;
   }
