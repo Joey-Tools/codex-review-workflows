@@ -1,6 +1,6 @@
 # GitHub PR Probes
 
-Use these recipes when `$pr-readiness-review-workflow` needs PR metadata, review threads, branch protection, rules, check status, or merge state.
+Use these recipes when `$review-orchestration-playbook` needs PR metadata, review threads, branch protection, rules, check status, or merge state.
 
 ## Prefer Typed `gh`
 

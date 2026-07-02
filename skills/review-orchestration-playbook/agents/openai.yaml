@@ -1,4 +1,4 @@
 interface:
   display_name: "Review Orchestration Playbook"
-  short_description: "Choose and drive reliable internal or external review lanes."
-  default_prompt: "Use $review-orchestration-playbook to choose the right internal or external review lane and report only terminal findings or explicit failure modes."
+  short_description: "Run pinned single, double, triple, or PR-readiness review."
+  default_prompt: "Use $review-orchestration-playbook as the single review entrypoint. Preserve the pinned Codex and Claude-family model policy, freeze the review range, record explicit Claude-family egress consent, and report terminal evidence for every requested logical lane."

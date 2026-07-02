@@ -19,7 +19,7 @@ jobs:
           python-version: "3.x"
       - name: Compile Python helpers
         run: |
-          python3 -m py_compile skills/review-orchestration-playbook/scripts/* skills/external-review-playbook/scripts/* skills/copilot-review-playbook/scripts/*
+          python3 -m py_compile skills/review-orchestration-playbook/scripts/isolated_review skills/review-orchestration-playbook/scripts/review_runtime/*.py
       - name: Run tests
         run: |
-          python3 -m unittest discover -s skills/external-review-playbook/tests
+          python3 -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py' -v
