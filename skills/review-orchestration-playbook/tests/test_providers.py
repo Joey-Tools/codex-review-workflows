@@ -1317,6 +1317,40 @@ class ProviderPolicyTest(unittest.TestCase):
                             pathlib.Path("/bin/claude"), {}
                         )
 
+    @mock.patch.object(providers, "run")
+    def test_claude_rejects_symmetric_verified_help_form_mutations(
+        self,
+        run_command: mock.Mock,
+    ) -> None:
+        for form in providers.CLAUDE_SAFE_MODE_VERIFIED_HELP_FORMS:
+            mutations = (
+                form.replace(
+                    "permissions work normally",
+                    "permissions work normally however",
+                    1,
+                ),
+                form.replace("claude.md, ", "", 1),
+                form.replace("all customizations", "some customizations", 1),
+                form.replace(
+                    "sets claude_code_safe_mode",
+                    "does not set claude_code_safe_mode",
+                    1,
+                ),
+            )
+            for help_text in mutations:
+                with self.subTest(form=form, help_text=help_text):
+                    run_command.return_value = Completed(
+                        argv=("claude", "--help"),
+                        returncode=0,
+                        stdout=help_text.encode(),
+                        stderr=b"",
+                    )
+
+                    with self.assertRaisesRegex(ReviewError, "disable CLAUDE.md"):
+                        providers._require_claude_safe_mode(
+                            pathlib.Path("/bin/claude"), {}
+                        )
+
     @mock.patch.object(
         providers,
         "resolve_reviewer_executable",
