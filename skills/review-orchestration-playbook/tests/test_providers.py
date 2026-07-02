@@ -1232,6 +1232,25 @@ class ProviderPolicyTest(unittest.TestCase):
 
         providers._require_claude_safe_mode(pathlib.Path("/bin/claude"), {})
 
+    @mock.patch.object(providers, "run")
+    def test_claude_rejects_negated_safe_mode_variable_wording(
+        self,
+        run_command: mock.Mock,
+    ) -> None:
+        run_command.return_value = Completed(
+            argv=("claude", "--help"),
+            returncode=0,
+            stdout=(
+                b"--safe-mode all customizations including CLAUDE.md are disabled; "
+                b"Authentication, model selection, built-in tools, and permissions "
+                b"work normally. Does not set CLAUDE_CODE_SAFE_MODE."
+            ),
+            stderr=b"",
+        )
+
+        with self.assertRaisesRegex(ReviewError, "disable CLAUDE.md"):
+            providers._require_claude_safe_mode(pathlib.Path("/bin/claude"), {})
+
     @mock.patch.object(
         providers,
         "resolve_reviewer_executable",

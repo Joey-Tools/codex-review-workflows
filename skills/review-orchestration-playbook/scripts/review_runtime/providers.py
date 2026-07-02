@@ -41,7 +41,7 @@ CLAUDE_SAFE_MODE_HELP_FRAGMENTS = (
     "claude.md",
     "disabled",
     "model selection, built-in tools, and permissions work normally",
-    "claude_code_safe_mode",
+    "sets claude_code_safe_mode",
 )
 CLAUDE_EGRESS_CONSENTS = (
     "explicit-claude-review",
