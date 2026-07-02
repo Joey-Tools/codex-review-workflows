@@ -11,6 +11,7 @@ from .common import (
     Completed,
     InvalidReviewerExecutable,
     ReviewError,
+    ReviewOutputLimitError,
     ReviewTimeoutError,
     child_environment,
     reviewer_executable_path,
@@ -383,8 +384,8 @@ def _json_objects(stdout: bytes) -> list[dict[str, Any]]:
 def _strict_json_object(stdout: bytes) -> dict[str, Any] | None:
     try:
         text = stdout.decode("utf-8")
-        parsed = json.loads(text)
-    except (UnicodeDecodeError, json.JSONDecodeError):
+        parsed = json.loads(text, parse_constant=_reject_nonstandard_json_constant)
+    except (UnicodeDecodeError, ValueError):
         return None
     return parsed if isinstance(parsed, dict) else None
 
@@ -399,13 +400,19 @@ def _strict_jsonl_objects(stdout: bytes) -> list[dict[str, Any]] | None:
         if not line.strip(" \t\r"):
             continue
         try:
-            parsed = json.loads(line)
-        except json.JSONDecodeError:
+            parsed = json.loads(
+                line, parse_constant=_reject_nonstandard_json_constant
+            )
+        except ValueError:
             return None
         if not isinstance(parsed, dict):
             return None
         objects.append(parsed)
     return objects
+
+
+def _reject_nonstandard_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant: {value}")
 
 
 def _error_payload_text(value: Any) -> list[str]:
@@ -505,7 +512,7 @@ def _parse_claude_output(
         return None, effective_model
     if _structured_error_text(stdout).strip():
         return None, effective_model
-    return final_text.strip(), effective_model
+    return final_text, effective_model
 
 
 def _parse_copilot_output(
@@ -516,38 +523,34 @@ def _parse_copilot_output(
         return None, None
     if _structured_error_text(stdout).strip():
         return None, None
-    terminal_index = next(
-        (
-            index
-            for index in range(len(objects) - 1, -1, -1)
-            if objects[index].get("type") == "assistant.turn_end"
-        ),
-        None,
-    )
-    if terminal_index is None:
+    open_turn: tuple[str, int] | None = None
+    completed_turns: list[tuple[str, int, int]] = []
+    for index, item in enumerate(objects):
+        event_type = item.get("type")
+        if event_type not in {"assistant.turn_start", "assistant.turn_end"}:
+            continue
+        data = item.get("data")
+        if not isinstance(data, dict):
+            return None, None
+        event_turn_id = data.get("turnId")
+        if not isinstance(event_turn_id, str) or not event_turn_id:
+            return None, None
+        if event_type == "assistant.turn_start":
+            if open_turn is not None:
+                return None, None
+            open_turn = (event_turn_id, index)
+            continue
+        if open_turn is None or open_turn[0] != event_turn_id:
+            return None, None
+        completed_turns.append((event_turn_id, open_turn[1], index))
+        open_turn = None
+    if open_turn is not None or not completed_turns:
         return None, None
-    terminal_data = objects[terminal_index].get("data")
-    if not isinstance(terminal_data, dict):
-        return None, None
-    turn_id = terminal_data.get("turnId")
-    if not isinstance(turn_id, str) or not turn_id:
-        return None, None
+    _, start_index, terminal_index = completed_turns[-1]
     if any(
         item.get("type") in {"assistant.message", "assistant.turn_start"}
         for item in objects[terminal_index + 1 :]
     ):
-        return None, None
-    start_index = next(
-        (
-            index
-            for index in range(terminal_index - 1, -1, -1)
-            if objects[index].get("type") == "assistant.turn_start"
-            and isinstance(objects[index].get("data"), dict)
-            and objects[index]["data"].get("turnId") == turn_id
-        ),
-        None,
-    )
-    if start_index is None:
         return None, None
     turn_events = objects[start_index + 1 : terminal_index]
     if any(
@@ -609,7 +612,7 @@ def _parse_copilot_output(
         model = session_model
     if not isinstance(model, str) or not model:
         return None, None
-    return content.strip(), model
+    return content, model
 
 
 def _codex_thread_id(stdout: bytes) -> str | None:
@@ -1243,7 +1246,7 @@ def _finish(
     _write_attempts(review, attempts)
     if final_text:
         write_text_atomic(
-            review.container_dir / "final.txt", final_text.rstrip() + "\n"
+            review.container_dir / "final.txt", final_text.rstrip("\r\n") + "\n"
         )
         return Outcome(0, final_text, tuple(attempts))
     if attempts and attempts[-1].category == "transient":
@@ -1381,7 +1384,7 @@ def run_review(
             review.container_dir / "claude-skip.txt",
             f"Claude Code probe runtime is unavailable: {error}\n",
         )
-    except ReviewTimeoutError as error:
+    except (ReviewTimeoutError, ReviewOutputLimitError) as error:
         write_text_atomic(
             review.container_dir / "runner-error.txt",
             f"Claude Code validation was inconclusive: {error}\n",
@@ -1416,7 +1419,7 @@ def run_review(
         except FileNotFoundError:
             category = "unavailable"
             final_text = None
-        except ReviewTimeoutError as error:
+        except (ReviewTimeoutError, ReviewOutputLimitError) as error:
             write_text_atomic(
                 review.container_dir / "runner-error.txt",
                 f"Claude Code validation was inconclusive: {error}\n",

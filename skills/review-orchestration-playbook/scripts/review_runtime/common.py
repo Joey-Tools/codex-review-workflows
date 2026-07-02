@@ -26,6 +26,10 @@ class ReviewTimeoutError(ReviewError):
     """A bounded reviewer subprocess exceeded its deadline."""
 
 
+class ReviewOutputLimitError(ReviewError):
+    """A bounded reviewer subprocess exceeded its output allowance."""
+
+
 class ForwardedSignal(RuntimeError):
     """A termination signal forwarded to the active reviewer process group."""
 
@@ -404,7 +408,12 @@ def _run_logged_process(
         process.wait(timeout=timeout_seconds)
         for thread in drain_threads:
             thread.join(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
-        return 70 if output_overflow.is_set() else int(process.returncode)
+        if output_overflow.is_set():
+            raise ReviewOutputLimitError(
+                "command output exceeded "
+                f"{output_file_limit_bytes} bytes per stream: {' '.join(command)}"
+            )
+        return int(process.returncode)
     except ForwardedSignal as error:
         cleanup_signal = error.signum
         raise

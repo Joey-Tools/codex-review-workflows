@@ -309,6 +309,33 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertEqual(providers._parse_claude_output(stdout), (None, None))
 
+    def test_claude_rejects_nonstandard_json_constant(self) -> None:
+        stdout = (
+            b'{"type":"result","subtype":"success","is_error":false,'
+            b'"result":"No findings.","modelUsage":{"claude-opus-4-8":{}},'
+            b'"metric":NaN}'
+        )
+
+        self.assertEqual(providers._parse_claude_output(stdout), (None, None))
+
+    def test_claude_preserves_unicode_separator_at_result_edges(self) -> None:
+        result = "\u2028No findings.\u2029"
+        stdout = json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": result,
+                "modelUsage": {"claude-opus-4-8": {}},
+            },
+            ensure_ascii=False,
+        ).encode()
+
+        self.assertEqual(
+            providers._parse_claude_output(stdout),
+            (result, "claude-opus-4-8"),
+        )
+
     def test_copilot_requires_terminal_message_for_the_ended_turn(self) -> None:
         stdout = "\n".join(
             json.dumps(item)
@@ -360,8 +387,8 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
 
-    def test_copilot_preserves_non_lf_unicode_line_separator_in_content(self) -> None:
-        content = "No\u2028findings."
+    def test_copilot_preserves_unicode_separators_at_content_edges(self) -> None:
+        content = "\u2028No findings.\u2029"
         stdout = "\n".join(
             json.dumps(item, ensure_ascii=False)
             for item in (
@@ -387,6 +414,18 @@ class ProviderPolicyTest(unittest.TestCase):
             providers._parse_copilot_output(stdout),
             (content, "claude-opus-4.8"),
         )
+
+    def test_copilot_rejects_nonstandard_json_constant(self) -> None:
+        stdout = "\n".join(
+            (
+                '{"type":"assistant.turn_start","data":{"turnId":"turn-1"}}',
+                '{"type":"assistant.message","data":{"content":"No findings.",'
+                '"model":"claude-opus-4.8","metric":Infinity}}',
+                '{"type":"assistant.turn_end","data":{"turnId":"turn-1"}}',
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
 
     def test_copilot_rejects_unicode_separator_only_record(self) -> None:
         stdout = (
@@ -441,6 +480,34 @@ class ProviderPolicyTest(unittest.TestCase):
                 {
                     "type": "assistant.turn_end",
                     "data": {"turnId": "turn-a"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
+
+    def test_copilot_rejects_unclosed_outer_turn_before_completed_inner(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-a"},
+                },
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-b"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "content": "No findings.",
+                        "model": "claude-opus-4.8",
+                    },
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-b"},
                 },
             )
         ).encode()
@@ -683,6 +750,17 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertNotIn(
             final_text,
             (self.review.container_dir / "attempts.json").read_text(encoding="utf-8"),
+        )
+
+    def test_finish_preserves_unicode_separator_at_result_edges(self) -> None:
+        final_text = "\u2028No findings.\u2029"
+
+        outcome = providers._finish(self.review, [], final_text)
+
+        self.assertEqual(outcome.final_text, final_text)
+        self.assertEqual(
+            (self.review.container_dir / "final.txt").read_text(encoding="utf-8"),
+            final_text + "\n",
         )
 
     @mock.patch.object(providers, "child_environment", return_value={})
@@ -956,6 +1034,34 @@ class ProviderPolicyTest(unittest.TestCase):
         _environment: mock.Mock,
     ) -> None:
         resolve.side_effect = providers.ReviewTimeoutError("probe timed out")
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="triple-review",
+        )
+
+        self.assertEqual(outcome.returncode, 75)
+        copilot_attempt.assert_not_called()
+        self.assertIn(
+            "inconclusive",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(providers, "resolve_reviewer_executable")
+    @mock.patch.object(providers, "_copilot_attempt")
+    def test_claude_probe_output_limit_is_inconclusive_not_fallback(
+        self,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        resolve.side_effect = providers.ReviewOutputLimitError(
+            "probe output exceeded limit"
+        )
 
         outcome = providers.run_review(
             review=self.review,
