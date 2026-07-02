@@ -490,31 +490,67 @@ def _parse_copilot_output(
         for item in objects[terminal_index + 1 :]
     ):
         return None, None
+    start_index = next(
+        (
+            index
+            for index in range(terminal_index - 1, -1, -1)
+            if objects[index].get("type") == "assistant.turn_start"
+            and isinstance(objects[index].get("data"), dict)
+            and objects[index]["data"].get("turnId") == turn_id
+        ),
+        None,
+    )
+    if start_index is None:
+        return None, None
+    turn_events = objects[start_index + 1 : terminal_index]
     message = next(
         (
             item
-            for item in reversed(objects[:terminal_index])
+            for item in reversed(turn_events)
             if item.get("type") == "assistant.message"
             and isinstance(item.get("data"), dict)
-            and item["data"].get("turnId") == turn_id
+            and not item["data"].get("parentToolCallId")
         ),
         None,
     )
     if message is None:
         return None, None
     data = message["data"]
-    if data.get("toolRequests") != []:
+    tool_requests = data.get("toolRequests", [])
+    if not isinstance(tool_requests, list) or tool_requests:
         return None, None
     content = data.get("content")
-    model = data.get("model")
-    if (
-        isinstance(content, str)
-        and content.strip()
-        and isinstance(model, str)
-        and model
-    ):
-        return content.strip(), model
-    return None, None
+    if not isinstance(content, str) or not content.strip():
+        return None, None
+    usage = next(
+        (
+            item["data"]
+            for item in reversed(turn_events)
+            if item.get("type") == "assistant.usage"
+            and isinstance(item.get("data"), dict)
+            and not item["data"].get("parentToolCallId")
+            and isinstance(item["data"].get("model"), str)
+            and item["data"]["model"]
+        ),
+        None,
+    )
+    model = usage["model"] if usage is not None else data.get("model")
+    if not isinstance(model, str) or not model:
+        session_model = next(
+            (
+                item["data"].get("selectedModel")
+                for item in reversed(objects[: start_index + 1])
+                if item.get("type") == "session.start"
+                and isinstance(item.get("data"), dict)
+                and isinstance(item["data"].get("selectedModel"), str)
+                and item["data"]["selectedModel"]
+            ),
+            None,
+        )
+        model = session_model
+    if not isinstance(model, str) or not model:
+        return None, None
+    return content.strip(), model
 
 
 def _codex_thread_id(stdout: bytes) -> str | None:

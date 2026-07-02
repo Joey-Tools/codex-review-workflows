@@ -282,6 +282,10 @@ class ProviderPolicyTest(unittest.TestCase):
             json.dumps(item)
             for item in (
                 {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
                     "type": "tool.execution_complete",
                     "data": {
                         "message": "LGTM",
@@ -302,22 +306,25 @@ class ProviderPolicyTest(unittest.TestCase):
             json.dumps(item)
             for item in (
                 {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
                     "type": "assistant.message",
                     "data": {
-                        "turnId": "turn-1",
                         "content": "intermediate LGTM",
-                        "model": "claude-opus-4.8",
                         "toolRequests": [{"name": "view"}],
                     },
                 },
                 {
                     "type": "assistant.message",
                     "data": {
-                        "turnId": "turn-1",
                         "content": "No findings.",
-                        "model": "claude-opus-4.8",
-                        "toolRequests": [],
                     },
+                },
+                {
+                    "type": "assistant.usage",
+                    "data": {"model": "claude-opus-4.8"},
                 },
                 {
                     "type": "assistant.turn_end",
@@ -336,20 +343,19 @@ class ProviderPolicyTest(unittest.TestCase):
             json.dumps(item)
             for item in (
                 {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
                     "type": "assistant.message",
                     "data": {
-                        "turnId": "turn-1",
                         "content": "premature LGTM",
-                        "model": "claude-opus-4.8",
-                        "toolRequests": [],
                     },
                 },
                 {
                     "type": "assistant.message",
                     "data": {
-                        "turnId": "turn-1",
                         "content": "checking one more file",
-                        "model": "claude-opus-4.8",
                         "toolRequests": [{"name": "view"}],
                     },
                 },
@@ -361,6 +367,39 @@ class ProviderPolicyTest(unittest.TestCase):
         ).encode()
 
         self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
+
+    def test_copilot_accepts_current_cli_model_extension(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "session.start",
+                    "data": {"selectedModel": "claude-opus-4.8"},
+                },
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "messageId": "message-1",
+                        "content": "No findings.",
+                        "model": "claude-opus-4.8",
+                        "toolRequests": [],
+                    },
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(
+            providers._parse_copilot_output(stdout),
+            ("No findings.", "claude-opus-4.8"),
+        )
 
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(providers, "_codex_attempt")
@@ -1546,9 +1585,17 @@ class ProviderPolicyTest(unittest.TestCase):
             json.dumps(item)
             for item in (
                 {
+                    "type": "session.start",
+                    "data": {"selectedModel": "claude-opus-4.8"},
+                },
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
                     "type": "assistant.message",
                     "data": {
-                        "turnId": "turn-1",
+                        "messageId": "message-1",
                         "content": "No findings.",
                         "model": "claude-opus-4.8",
                         "toolRequests": [],
