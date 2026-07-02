@@ -380,6 +380,34 @@ def _json_objects(stdout: bytes) -> list[dict[str, Any]]:
     return values
 
 
+def _strict_json_object(stdout: bytes) -> dict[str, Any] | None:
+    try:
+        text = stdout.decode("utf-8").strip()
+        parsed = json.loads(text)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _strict_jsonl_objects(stdout: bytes) -> list[dict[str, Any]] | None:
+    try:
+        text = stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    objects: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        objects.append(parsed)
+    return objects
+
+
 def _error_payload_text(value: Any) -> list[str]:
     if isinstance(value, str) and value.strip():
         return [value.strip()]
@@ -447,10 +475,9 @@ def _structured_error_text(stdout: bytes) -> str:
 def _parse_claude_output(
     stdout: bytes, *, requested_model: str | None = None
 ) -> tuple[str | None, str | None]:
-    objects = _json_objects(stdout)
-    if len(objects) != 1:
+    result = _strict_json_object(stdout)
+    if result is None:
         return None, None
-    result = objects[0]
     if result.get("type") != "result":
         return None, None
     model_usage = result.get("modelUsage")
@@ -484,7 +511,9 @@ def _parse_claude_output(
 def _parse_copilot_output(
     stdout: bytes,
 ) -> tuple[str | None, str | None]:
-    objects = _json_objects(stdout)
+    objects = _strict_jsonl_objects(stdout)
+    if objects is None:
+        return None, None
     if _structured_error_text(stdout).strip():
         return None, None
     terminal_index = next(

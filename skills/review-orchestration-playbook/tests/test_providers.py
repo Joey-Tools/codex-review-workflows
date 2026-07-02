@@ -277,6 +277,22 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertEqual(providers._parse_claude_output(stdout), (None, None))
 
+    def test_claude_rejects_non_json_prefix_before_success_object(self) -> None:
+        stdout = (
+            b"warning: degraded output\n"
+            + json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "result": "No findings.",
+                    "modelUsage": {"claude-opus-4-8": {}},
+                }
+            ).encode()
+        )
+
+        self.assertEqual(providers._parse_claude_output(stdout), (None, None))
+
     def test_copilot_requires_terminal_message_for_the_ended_turn(self) -> None:
         stdout = "\n".join(
             json.dumps(item)
@@ -296,6 +312,33 @@ class ProviderPolicyTest(unittest.TestCase):
                     "type": "assistant.turn_end",
                     "data": {"turnId": "turn-1"},
                 },
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
+
+    def test_copilot_rejects_non_json_line_before_terminal_events(self) -> None:
+        stdout = (
+            "warning: degraded output\n"
+            + "\n".join(
+                json.dumps(item)
+                for item in (
+                    {
+                        "type": "assistant.turn_start",
+                        "data": {"turnId": "turn-1"},
+                    },
+                    {
+                        "type": "assistant.message",
+                        "data": {
+                            "content": "No findings.",
+                            "model": "claude-opus-4.8",
+                        },
+                    },
+                    {
+                        "type": "assistant.turn_end",
+                        "data": {"turnId": "turn-1"},
+                    },
+                )
             )
         ).encode()
 
