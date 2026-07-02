@@ -22,7 +22,7 @@ superseded_by:
 - OAuth refresh updates are accepted only through Claude 2.1.187's exact current-account/service stdin Keychain form; the parent validates bounded OAuth JSON before persisting rotated tokens with Apple's trusted client, while oversized credentials and argv updates fail closed.
 - Claude Code 2.1.187 and trusted `rg` must be native Mach-O executables; script or wrapper installations are rejected, the final sandbox reads the Claude executable only by exact path, and the child `PATH` is reduced to the restricted broker plus the verified `rg` directory.
 - Custom CA environment paths are reduced to validated certificate-only copies under the helper container before entering the sandbox, with distinct source directories kept separate.
-- Uppercase and lowercase corporate proxy variables are preserved before Claude is routed through the helper-owned local proxy.
+- Uppercase and lowercase corporate proxy variables are preserved before Claude is routed through the helper-owned local proxy, with lowercase task overrides taking precedence over uppercase system defaults.
 - The parent helper honors the original `NO_PROXY` / `no_proxy` list when choosing direct versus corporate-proxy routing for each pinned Anthropic target.
 - HTTPS corporate proxy tunnels drain OpenSSL's already-decrypted pending data before waiting on the underlying socket.
 - Missing Claude authentication can fall back to GitHub Copilot only for explicitly authorized double or triple reviews.

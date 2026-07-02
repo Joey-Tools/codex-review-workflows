@@ -3564,6 +3564,19 @@ class ProviderPolicyTest(unittest.TestCase):
             "http://corporate-proxy:8080",
         )
 
+    def test_claude_upstream_proxy_prefers_lowercase_override(self) -> None:
+        self.assertEqual(
+            providers._upstream_proxy_url(
+                {
+                    "HTTPS_PROXY": "http://system-proxy:8080",
+                    "https_proxy": "http://task-proxy:8080",
+                },
+                host="api.anthropic.com",
+                port=443,
+            ),
+            "http://task-proxy:8080",
+        )
+
     def test_claude_upstream_proxy_respects_bypass_environment(self) -> None:
         for key in ("NO_PROXY", "no_proxy"):
             with self.subTest(key=key):

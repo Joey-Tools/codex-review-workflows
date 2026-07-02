@@ -833,12 +833,12 @@ def _upstream_proxy_url(
     ):
         return None
     for key in (
-        "HTTPS_PROXY",
         "https_proxy",
-        "HTTP_PROXY",
+        "HTTPS_PROXY",
         "http_proxy",
-        "ALL_PROXY",
+        "HTTP_PROXY",
         "all_proxy",
+        "ALL_PROXY",
     ):
         value = env.get(key)
         if value:
