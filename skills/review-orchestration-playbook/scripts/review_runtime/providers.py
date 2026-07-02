@@ -468,18 +468,20 @@ def _validate_fresh_claude_keychain_credential(credential: bytearray) -> None:
             + REVIEW_ATTEMPT_TIMEOUT_SECONDS
             + CLAUDE_AUTH_EXPIRY_MARGIN_SECONDS
         ) * 1000
+        maximum_expiry = (time.time() + 7 * 24 * 60 * 60) * 1000
         if (
             not isinstance(oauth.get("accessToken"), str)
             or not oauth["accessToken"]
             or not isinstance(expires_at, (int, float))
             or isinstance(expires_at, bool)
-            or not math.isfinite(expires_at)
+            or (isinstance(expires_at, float) and not math.isfinite(expires_at))
             or expires_at <= required_expiry
+            or expires_at > maximum_expiry
         ):
             raise ClaudeKeychainCredentialUnavailable(
                 "Claude local-login access token cannot cover the isolated review window"
             )
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+    except (KeyError, TypeError, ValueError, OverflowError, json.JSONDecodeError) as error:
         raise ClaudeKeychainCredentialUnavailable(
             "Claude local-login credential is malformed"
         ) from error

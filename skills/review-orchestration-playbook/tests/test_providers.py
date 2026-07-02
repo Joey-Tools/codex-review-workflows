@@ -389,6 +389,25 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertEqual(credential, bytearray(len(credential)))
 
+    def test_keychain_preflight_rejects_unbounded_integer_expiry(self) -> None:
+        credential = bytearray(
+            json.dumps(
+                {
+                    "claudeAiOauth": {
+                        "access" + "Token": "fixture-" + "access-value",
+                        "refresh" + "Token": "fixture-" + "refresh-value",
+                        "expiresAt": 10**1000,
+                    }
+                }
+            ).encode()
+        )
+
+        with self.assertRaisesRegex(
+            providers.ClaudeKeychainCredentialUnavailable,
+            "cannot cover the isolated review window",
+        ):
+            providers._validate_fresh_claude_keychain_credential(credential)
+
     @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
     @mock.patch.object(
         providers,
