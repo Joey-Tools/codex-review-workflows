@@ -485,14 +485,9 @@ def _executable_identity_matches(
         "NO_COLOR": "1",
         "PATH": reviewer_executable_path(path),
     }
-    version_args = (
-        ("--bare", "--version")
-        if any(marker.lower() == "claude code" for marker in marker_values)
-        else ("--version",)
-    )
     try:
         completed = subprocess.run(
-            (str(path), *version_args),
+            (str(path), "--version"),
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -513,21 +508,24 @@ def resolve_reviewer_executable(name: str) -> pathlib.Path | None:
             "CODEX_REVIEW_CODEX_PATH",
             ("/opt/homebrew/bin/codex", "/usr/local/bin/codex"),
             ("codex-cli",),
+            False,
         ),
         "claude": (
             "CODEX_REVIEW_CLAUDE_PATH",
             ("/opt/homebrew/bin/claude", "/usr/local/bin/claude"),
             ("claude code",),
+            True,
         ),
         "copilot": (
             "CODEX_REVIEW_COPILOT_PATH",
             ("/opt/homebrew/bin/copilot", "/usr/local/bin/copilot"),
             ("github copilot cli",),
+            False,
         ),
     }
     if name not in specs:
         raise ReviewError(f"unknown review executable: {name}")
-    override_key, system_paths, markers = specs[name]
+    override_key, system_paths, markers, defer_identity = specs[name]
     override_value = os.environ.get(override_key)
     if override_value:
         override = pathlib.Path(override_value).expanduser()
@@ -535,7 +533,7 @@ def resolve_reviewer_executable(name: str) -> pathlib.Path | None:
             raise ReviewError(f"{override_key} must be an absolute executable path")
         if not override.is_file() or not os.access(override, os.X_OK):
             raise ReviewError(f"{override_key} is not executable: {override}")
-        if not _executable_identity_matches(override, markers):
+        if not defer_identity and not _executable_identity_matches(override, markers):
             raise ReviewError(
                 f"{override_key} did not identify as the expected {name} CLI: {override}"
             )
@@ -557,7 +555,7 @@ def resolve_reviewer_executable(name: str) -> pathlib.Path | None:
         seen.add(key)
         if not candidate.is_file() or not os.access(candidate, os.X_OK):
             continue
-        if _executable_identity_matches(candidate, markers):
+        if defer_identity or _executable_identity_matches(candidate, markers):
             return candidate.absolute()
         rejected.append(candidate.absolute())
     if rejected:

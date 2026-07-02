@@ -51,6 +51,10 @@ CLAUDE_BARE_MODE_HELP_FORM = (
 )
 CLAUDE_HELP_OPTION_START = re.compile(r"^  (--[a-z0-9][a-z0-9-]*)\b")
 CLAUDE_BARE_TOKEN = re.compile(r"(?<![a-z0-9-])--bare(?![a-z0-9-])")
+CLAUDE_PROBE_SANDBOX = pathlib.Path("/usr/bin/sandbox-exec")
+CLAUDE_PROBE_SANDBOX_PROFILE = (
+    "(version 1)(allow default)(deny file-write*)(deny network*)"
+)
 CLAUDE_EGRESS_CONSENTS = (
     "explicit-claude-review",
     "double-review",
@@ -217,13 +221,59 @@ def _claude_help_option_blocks(help_text: str, option: str) -> tuple[str, ...]:
     return tuple(blocks)
 
 
+def _claude_probe_command(
+    executable: pathlib.Path,
+    *args: str,
+) -> tuple[str, ...]:
+    if not CLAUDE_PROBE_SANDBOX.is_file() or not os.access(
+        CLAUDE_PROBE_SANDBOX, os.X_OK
+    ):
+        raise FileNotFoundError(
+            "Claude Code review requires macOS sandbox-exec for preflight probes"
+        )
+    return (
+        str(CLAUDE_PROBE_SANDBOX),
+        "-p",
+        CLAUDE_PROBE_SANDBOX_PROFILE,
+        str(executable),
+        "--bare",
+        *args,
+    )
+
+
+def _claude_probe_cwd(env: dict[str, str]) -> pathlib.Path:
+    raw_home = env.get("HOME")
+    if not raw_home:
+        raise ReviewError("Claude Code probe requires an isolated HOME")
+    home = pathlib.Path(raw_home)
+    if not home.is_absolute() or home.is_symlink() or not home.is_dir():
+        raise ReviewError("Claude Code probe HOME must be an existing real directory")
+    return home
+
+
+def _require_claude_identity(
+    executable: pathlib.Path,
+    env: dict[str, str],
+) -> None:
+    completed = run(
+        _claude_probe_command(executable, "--version"),
+        cwd=_claude_probe_cwd(env),
+        env=env,
+    )
+    output = (completed.stdout + b"\n" + completed.stderr).decode(
+        "utf-8", errors="replace"
+    )
+    if completed.returncode != 0 or "claude code" not in output.lower():
+        raise ReviewError("sandboxed executable did not identify as Claude Code")
+
+
 def _require_claude_bare_mode(
     executable: pathlib.Path,
     env: dict[str, str],
 ) -> None:
     completed = run(
-        (str(executable), "--bare", "--help"),
-        cwd=pathlib.Path(os.path.abspath(os.sep)),
+        _claude_probe_command(executable, "--help"),
+        cwd=_claude_probe_cwd(env),
         env=env,
     )
     help_text = (completed.stdout + b"\n" + completed.stderr).decode(
@@ -376,75 +426,95 @@ def _structured_error_text(stdout: bytes) -> str:
     return "\n".join(messages)
 
 
-def _find_text(value: Any) -> str | None:
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    if isinstance(value, dict):
-        for key in (
-            "result",
-            "final",
-            "content",
-            "text",
-            "message",
-            "response",
-            "data",
-        ):
-            if key in value:
-                found = _find_text(value[key])
-                if found:
-                    return found
-    if isinstance(value, list):
-        for item in reversed(value):
-            found = _find_text(item)
-            if found:
-                return found
-    return None
-
-
-def _find_model(value: Any, *, requested_model: str | None = None) -> str | None:
-    if isinstance(value, dict):
-        model_usage = value.get("modelUsage")
-        if isinstance(model_usage, dict) and model_usage:
-            candidates = [key for key in model_usage if isinstance(key, str) and key]
-            if requested_model is not None:
-                for candidate in candidates:
-                    if _model_matches(requested_model, candidate):
-                        return candidate
-            if candidates:
-                return candidates[-1]
-        for key in ("model", "modelName", "model_id", "modelId"):
-            candidate = value.get(key)
-            if isinstance(candidate, str) and candidate:
-                return candidate
-        for key in ("data", "metadata", "result", "usage"):
-            if key in value:
-                found = _find_model(value[key], requested_model=requested_model)
-                if found:
-                    return found
-    if isinstance(value, list):
-        for item in reversed(value):
-            found = _find_model(item, requested_model=requested_model)
-            if found:
-                return found
-    return None
-
-
-def _parse_structured_output(
+def _parse_claude_output(
     stdout: bytes, *, requested_model: str | None = None
 ) -> tuple[str | None, str | None]:
     objects = _json_objects(stdout)
-    final_text: str | None = None
-    effective_model: str | None = None
-    for item in reversed(objects):
-        if final_text is None:
-            final_text = _find_text(item)
-        if effective_model is None:
-            effective_model = _find_model(item, requested_model=requested_model)
-        if final_text is not None and effective_model is not None:
-            break
+    if len(objects) != 1:
+        return None, None
+    result = objects[0]
+    if (
+        result.get("type") != "result"
+        or result.get("subtype") != "success"
+        or result.get("is_error") is not False
+    ):
+        return None, None
+    final_text = result.get("result")
+    if not isinstance(final_text, str) or not final_text.strip():
+        return None, None
+    model_usage = result.get("modelUsage")
+    if not isinstance(model_usage, dict) or not model_usage:
+        return None, None
+    candidates = [key for key in model_usage if isinstance(key, str) and key]
+    effective_model = None
+    if requested_model is not None:
+        effective_model = next(
+            (
+                candidate
+                for candidate in candidates
+                if _model_matches(requested_model, candidate)
+            ),
+            None,
+        )
+    if effective_model is None and candidates:
+        effective_model = candidates[-1]
     if _structured_error_text(stdout).strip():
-        final_text = None
-    return final_text, effective_model
+        return None, effective_model
+    return final_text.strip(), effective_model
+
+
+def _parse_copilot_output(
+    stdout: bytes,
+) -> tuple[str | None, str | None]:
+    objects = _json_objects(stdout)
+    if _structured_error_text(stdout).strip():
+        return None, None
+    terminal_index = next(
+        (
+            index
+            for index in range(len(objects) - 1, -1, -1)
+            if objects[index].get("type") == "assistant.turn_end"
+        ),
+        None,
+    )
+    if terminal_index is None:
+        return None, None
+    terminal_data = objects[terminal_index].get("data")
+    if not isinstance(terminal_data, dict):
+        return None, None
+    turn_id = terminal_data.get("turnId")
+    if not isinstance(turn_id, str) or not turn_id:
+        return None, None
+    if any(
+        item.get("type") in {"assistant.message", "assistant.turn_start"}
+        for item in objects[terminal_index + 1 :]
+    ):
+        return None, None
+    message = next(
+        (
+            item
+            for item in reversed(objects[:terminal_index])
+            if item.get("type") == "assistant.message"
+            and isinstance(item.get("data"), dict)
+            and item["data"].get("turnId") == turn_id
+        ),
+        None,
+    )
+    if message is None:
+        return None, None
+    data = message["data"]
+    if data.get("toolRequests") != []:
+        return None, None
+    content = data.get("content")
+    model = data.get("model")
+    if (
+        isinstance(content, str)
+        and content.strip()
+        and isinstance(model, str)
+        and model
+    ):
+        return content.strip(), model
+    return None, None
 
 
 def _codex_thread_id(stdout: bytes) -> str | None:
@@ -844,6 +914,7 @@ def _claude_attempt(
         if key != "ANTHROPIC_API_KEY"
         and not key.startswith("CODEX_ISOLATED_REVIEW_")
     }
+    _require_claude_identity(executable, probe_env)
     _require_claude_bare_mode(executable, probe_env)
     stdout_path, stderr_path = _attempt_paths(review, index, "claude", model)
     settings = json.dumps(
@@ -902,7 +973,7 @@ def _claude_attempt(
         stdout_path=stdout_path,
         stderr_path=stderr_path,
     )
-    final_text, effective_model = _parse_structured_output(
+    final_text, effective_model = _parse_claude_output(
         completed.stdout, requested_model=model
     )
     return _record_attempt(
@@ -1011,9 +1082,7 @@ def _copilot_attempt(
         stdout_path=stdout_path,
         stderr_path=stderr_path,
     )
-    final_text, effective_model = _parse_structured_output(
-        completed.stdout, requested_model=model
-    )
+    final_text, effective_model = _parse_copilot_output(completed.stdout)
     return _record_attempt(
         review=review,
         index=index,

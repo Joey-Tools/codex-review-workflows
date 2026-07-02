@@ -277,29 +277,6 @@ class ChildEnvironmentTest(unittest.TestCase):
             [str(executable.parent), str(node.parent)],
         )
 
-    @mock.patch.object(common.subprocess, "run")
-    def test_claude_identity_probe_enters_bare_mode_before_version(
-        self,
-        run_command: mock.Mock,
-    ) -> None:
-        run_command.return_value = common.subprocess.CompletedProcess(
-            args=("claude", "--bare", "--version"),
-            returncode=0,
-            stdout=b"2.1.187 (Claude Code)\n",
-            stderr=b"",
-        )
-
-        matched = common._executable_identity_matches(
-            pathlib.Path("/opt/homebrew/bin/claude"),
-            ("claude code",),
-        )
-
-        self.assertTrue(matched)
-        self.assertEqual(
-            run_command.call_args.args[0],
-            ("/opt/homebrew/bin/claude", "--bare", "--version"),
-        )
-
     def test_reviewer_path_override_must_be_absolute(self) -> None:
         with mock.patch.dict(
             common.os.environ,
@@ -317,24 +294,23 @@ class ChildEnvironmentTest(unittest.TestCase):
             executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             executable.chmod(0o755)
 
-            def matches(path: pathlib.Path, _markers) -> bool:
-                return path == executable
-
             with (
-                mock.patch.dict(common.os.environ, {"HOME": str(home)}, clear=True),
-                mock.patch.object(
-                    common,
-                    "_executable_identity_matches",
-                    side_effect=matches,
+                mock.patch.dict(
+                    common.os.environ,
+                    {
+                        "HOME": str(home),
+                        "CODEX_REVIEW_CLAUDE_PATH": str(executable),
+                    },
+                    clear=True,
                 ),
             ):
                 resolved = common.resolve_reviewer_executable("claude")
         self.assertEqual(resolved, executable.absolute())
 
-    def test_present_but_invalid_cli_is_not_treated_as_unavailable(self) -> None:
+    def test_present_but_invalid_codex_cli_is_not_treated_as_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             home = pathlib.Path(temporary)
-            executable = home / ".local/bin/claude"
+            executable = home / ".local/bin/codex"
             executable.parent.mkdir(parents=True)
             executable.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
             executable.chmod(0o755)
@@ -358,7 +334,7 @@ class ChildEnvironmentTest(unittest.TestCase):
                 ),
             ):
                 with self.assertRaisesRegex(ReviewError, "validation failed"):
-                    common.resolve_reviewer_executable("claude")
+                    common.resolve_reviewer_executable("codex")
 
 
 if __name__ == "__main__":

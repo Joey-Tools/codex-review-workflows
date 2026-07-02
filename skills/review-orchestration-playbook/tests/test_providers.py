@@ -241,14 +241,16 @@ class ProviderPolicyTest(unittest.TestCase):
                 "modelUsage": {"claude-opus-4-8": {}},
             }
         ).encode()
-        final_text, effective_model = providers._parse_structured_output(stdout)
+        final_text, effective_model = providers._parse_claude_output(stdout)
         self.assertIsNone(final_text)
-        self.assertEqual(effective_model, "claude-opus-4-8")
+        self.assertIsNone(effective_model)
 
     def test_requested_model_wins_over_auxiliary_claude_model_usage(self) -> None:
         stdout = json.dumps(
             {
                 "type": "result",
+                "subtype": "success",
+                "is_error": False,
                 "result": "No findings.",
                 "modelUsage": {
                     "claude-haiku-4-5-20251001": {},
@@ -256,11 +258,109 @@ class ProviderPolicyTest(unittest.TestCase):
                 },
             }
         ).encode()
-        final_text, effective_model = providers._parse_structured_output(
+        final_text, effective_model = providers._parse_claude_output(
             stdout, requested_model="claude-opus-4-8"
         )
         self.assertEqual(final_text, "No findings.")
         self.assertEqual(effective_model, "claude-opus-4-8")
+
+    def test_nonterminal_claude_payload_cannot_supply_final_text(self) -> None:
+        stdout = json.dumps(
+            {
+                "type": "progress",
+                "data": {
+                    "message": "LGTM",
+                    "model": "claude-opus-4-8",
+                },
+            }
+        ).encode()
+
+        self.assertEqual(providers._parse_claude_output(stdout), (None, None))
+
+    def test_copilot_requires_terminal_message_for_the_ended_turn(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "tool.execution_complete",
+                    "data": {
+                        "message": "LGTM",
+                        "model": "claude-opus-4.8",
+                    },
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
+
+    def test_copilot_accepts_only_tool_free_message_for_ended_turn(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "turnId": "turn-1",
+                        "content": "intermediate LGTM",
+                        "model": "claude-opus-4.8",
+                        "toolRequests": [{"name": "view"}],
+                    },
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "turnId": "turn-1",
+                        "content": "No findings.",
+                        "model": "claude-opus-4.8",
+                        "toolRequests": [],
+                    },
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(
+            providers._parse_copilot_output(stdout),
+            ("No findings.", "claude-opus-4.8"),
+        )
+
+    def test_copilot_does_not_fall_back_past_terminal_tool_request(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "turnId": "turn-1",
+                        "content": "premature LGTM",
+                        "model": "claude-opus-4.8",
+                        "toolRequests": [],
+                    },
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "turnId": "turn-1",
+                        "content": "checking one more file",
+                        "model": "claude-opus-4.8",
+                        "toolRequests": [{"name": "view"}],
+                    },
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
 
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(providers, "_codex_attempt")
@@ -1203,14 +1303,31 @@ class ProviderPolicyTest(unittest.TestCase):
         "resolve_reviewer_executable",
         return_value=pathlib.Path("/bin/claude"),
     )
+    @mock.patch.object(
+        providers,
+        "CLAUDE_PROBE_SANDBOX",
+        pathlib.Path("/usr/bin/true"),
+    )
     @mock.patch.object(providers, "run")
     def test_claude_command_pins_model_and_max_in_bare_mode(
         self,
         run_command: mock.Mock,
         _resolve: mock.Mock,
     ) -> None:
-        payload = {"result": "No findings.", "modelUsage": {"claude-opus-4-8": {}}}
+        payload = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "No findings.",
+            "modelUsage": {"claude-opus-4-8": {}},
+        }
         run_command.side_effect = (
+            Completed(
+                argv=("claude", "--version"),
+                returncode=0,
+                stdout=b"2.1.187 (Claude Code)\n",
+                stderr=b"",
+            ),
             Completed(
                 argv=("claude", "--help"),
                 returncode=0,
@@ -1237,7 +1354,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 "CODEX_ISOLATED_REVIEW_RANGE": "base..head",
             },
         )
-        argv = run_command.call_args.args[0]
+        argv = run_command.call_args_list[2].args[0]
         self.assertIn("claude-opus-4-8", argv)
         self.assertEqual(argv[argv.index("--effort") + 1], "max")
         self.assertEqual(argv[argv.index("--permission-mode") + 1], "dontAsk")
@@ -1253,7 +1370,14 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn("--strict-mcp-config", argv)
         self.assertEqual(
             run_command.call_args_list[0].args[0],
-            ("/bin/claude", "--bare", "--help"),
+            (
+                "/usr/bin/true",
+                "-p",
+                providers.CLAUDE_PROBE_SANDBOX_PROFILE,
+                "/bin/claude",
+                "--bare",
+                "--version",
+            ),
         )
         probe_env = run_command.call_args_list[0].kwargs["env"]
         self.assertNotIn("ANTHROPIC_API_KEY", probe_env)
@@ -1262,7 +1386,12 @@ class ProviderPolicyTest(unittest.TestCase):
             probe_env["HOME"],
             str(self.review.container_dir / "claude-home"),
         )
-        review_env = run_command.call_args_list[1].kwargs["env"]
+        self.assertEqual(
+            run_command.call_args_list[1].args[0][-3:],
+            ("/bin/claude", "--bare", "--help"),
+        )
+        self.assertEqual(run_command.call_args_list[1].kwargs["env"], probe_env)
+        review_env = run_command.call_args_list[2].kwargs["env"]
         self.assertEqual(review_env["ANTHROPIC_API_KEY"], "secret")
         self.assertEqual(review_env["HOME"], probe_env["HOME"])
 
@@ -1271,17 +1400,30 @@ class ProviderPolicyTest(unittest.TestCase):
         "resolve_reviewer_executable",
         return_value=pathlib.Path("/bin/claude"),
     )
+    @mock.patch.object(
+        providers,
+        "CLAUDE_PROBE_SANDBOX",
+        pathlib.Path("/usr/bin/true"),
+    )
     @mock.patch.object(providers, "run")
     def test_claude_refuses_unverified_bare_mode_semantics(
         self,
         run_command: mock.Mock,
         _resolve: mock.Mock,
     ) -> None:
-        run_command.return_value = Completed(
-            argv=("claude", "--help"),
-            returncode=0,
-            stdout=b"generic help",
-            stderr=b"",
+        run_command.side_effect = (
+            Completed(
+                argv=("claude", "--version"),
+                returncode=0,
+                stdout=b"2.1.187 (Claude Code)\n",
+                stderr=b"",
+            ),
+            Completed(
+                argv=("claude", "--help"),
+                returncode=0,
+                stdout=b"generic help",
+                stderr=b"",
+            ),
         )
 
         with self.assertRaisesRegex(ReviewError, "uniquely verifiable --bare"):
@@ -1292,8 +1434,13 @@ class ProviderPolicyTest(unittest.TestCase):
                 env={"ANTHROPIC_API_KEY": "secret"},
             )
 
-        self.assertEqual(run_command.call_count, 1)
+        self.assertEqual(run_command.call_count, 2)
 
+    @mock.patch.object(
+        providers,
+        "CLAUDE_PROBE_SANDBOX",
+        pathlib.Path("/usr/bin/true"),
+    )
     @mock.patch.object(providers, "run")
     def test_claude_accepts_exact_bare_option_block(
         self,
@@ -1310,8 +1457,16 @@ class ProviderPolicyTest(unittest.TestCase):
             stderr=b"",
         )
 
-        providers._require_claude_bare_mode(pathlib.Path("/bin/claude"), {})
+        providers._require_claude_bare_mode(
+            pathlib.Path("/bin/claude"),
+            {"HOME": str(self.review.container_dir)},
+        )
 
+    @mock.patch.object(
+        providers,
+        "CLAUDE_PROBE_SANDBOX",
+        pathlib.Path("/usr/bin/true"),
+    )
     @mock.patch.object(providers, "run")
     def test_claude_rejects_bare_option_mutations(
         self,
@@ -1337,8 +1492,16 @@ class ProviderPolicyTest(unittest.TestCase):
                 )
 
                 with self.assertRaisesRegex(ReviewError, "uniquely verifiable --bare"):
-                    providers._require_claude_bare_mode(pathlib.Path("/bin/claude"), {})
+                    providers._require_claude_bare_mode(
+                        pathlib.Path("/bin/claude"),
+                        {"HOME": str(self.review.container_dir)},
+                    )
 
+    @mock.patch.object(
+        providers,
+        "CLAUDE_PROBE_SANDBOX",
+        pathlib.Path("/usr/bin/true"),
+    )
     @mock.patch.object(providers, "run")
     def test_claude_rejects_duplicate_or_conflicting_bare_descriptions(
         self,
@@ -1363,7 +1526,10 @@ class ProviderPolicyTest(unittest.TestCase):
                 )
 
                 with self.assertRaisesRegex(ReviewError, "uniquely verifiable --bare"):
-                    providers._require_claude_bare_mode(pathlib.Path("/bin/claude"), {})
+                    providers._require_claude_bare_mode(
+                        pathlib.Path("/bin/claude"),
+                        {"HOME": str(self.review.container_dir)},
+                    )
 
     @mock.patch.object(
         providers,
@@ -1376,7 +1542,24 @@ class ProviderPolicyTest(unittest.TestCase):
         run_command: mock.Mock,
         _resolve: mock.Mock,
     ) -> None:
-        payload = {"result": "No findings.", "model": "claude-opus-4.8"}
+        payload = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "turnId": "turn-1",
+                        "content": "No findings.",
+                        "model": "claude-opus-4.8",
+                        "toolRequests": [],
+                    },
+                },
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+            )
+        )
         permission_help = " ".join(providers.COPILOT_PERMISSION_HELP_FRAGMENTS)
         run_command.side_effect = (
             Completed(
@@ -1388,7 +1571,7 @@ class ProviderPolicyTest(unittest.TestCase):
             Completed(
                 argv=("copilot",),
                 returncode=0,
-                stdout=json.dumps(payload).encode(),
+                stdout=payload.encode(),
                 stderr=b"",
             ),
         )
