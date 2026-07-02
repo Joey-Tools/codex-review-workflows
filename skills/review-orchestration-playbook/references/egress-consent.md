@@ -19,7 +19,7 @@ No consent covers secrets, credentials, untracked private files, unrelated repos
 
 - Codex local lane sends the frozen diff/prompt and necessary nearby tracked context to OpenAI Codex.
 - Claude Code sends the same bounded scope to Anthropic.
-- Copilot fallback sends the same bounded scope through GitHub Copilot only when the Claude Code backend is absent or all pinned Claude models are entitlement-blocked.
+- Copilot fallback sends the same bounded scope through GitHub Copilot only when the Claude Code backend is absent, lacks hook-free bare-mode API-key authentication, or all pinned Claude models are entitlement-blocked.
 - GitHub Codex review uses the PR diff and repository guidance on GitHub.
 
 `explicit-claude-review` authorizes only the Anthropic destination. The helper may use GitHub Copilot fallback only with `double-review` or `triple-review`, whose consent language explicitly names that fallback.
@@ -44,7 +44,7 @@ isolated_review stateful start \
 When sandbox or network approval is required, use a narrow justification with concrete values:
 
 ```text
-Joey explicitly requested <double review|triple review>, which is opt-in consent under AGENTS.md and $review-orchestration-playbook to send necessary tracked code and the generated diff for <owner/repo> at <base_sha>..<head_sha>, plus the review prompt/result, to Anthropic Claude Code for read-only review and, only if Claude Code is unavailable or all pinned Claude models are entitlement-blocked, GitHub Copilot. This excludes credentials, untracked files, unrelated repositories, and broad workspace or home-directory content. Allow this exact frozen Claude-family review lane?
+Joey explicitly requested <double review|triple review>, which is opt-in consent under AGENTS.md and $review-orchestration-playbook to send necessary tracked code and the generated diff for <owner/repo> at <base_sha>..<head_sha>, plus the review prompt/result, to Anthropic Claude Code for read-only review and, only if Claude Code is unavailable, lacks hook-free bare-mode API-key authentication, or all pinned Claude models are entitlement-blocked, GitHub Copilot. This excludes credentials, untracked files, unrelated repositories, and broad workspace or home-directory content. Allow this exact frozen Claude-family review lane?
 ```
 
 Do not shorten this to `run external reviewer`: the exact user opt-in, destination, repository, range, included data, and exclusions are what let the approver evaluate the request. The argv consent flag is an audit marker, not a substitute for the justification.
