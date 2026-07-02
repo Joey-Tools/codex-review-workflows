@@ -1225,7 +1225,7 @@ class ProviderPolicyTest(unittest.TestCase):
             stdout=(
                 b"--safe-mode all customizations including CLAUDE.md are disabled; "
                 b"Authentication, model selection, built-in tools, and permissions "
-                b"work normally. Sets CLAUDE_CODE_SAFE_MODE=1."
+                b"work normally. Sets CLAUDE_CODE_SAFE_MODE."
             ),
             stderr=b"",
         )
