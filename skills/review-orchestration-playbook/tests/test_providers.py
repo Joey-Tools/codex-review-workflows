@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import pathlib
+import socket
+import socketserver
+import ssl
+import subprocess
 import sys
 import tempfile
+import threading
 import tomllib
 import unittest
 from unittest import mock
@@ -41,9 +48,69 @@ class ProviderPolicyTest(unittest.TestCase):
             diff_file=diff_file,
             prompt_file=prompt_file,
         )
+        self.claude_broker = (
+            container / "claude-runtime" / "keychain-broker" / "security"
+        )
+        self.claude_broker.parent.mkdir(parents=True)
+        self.claude_broker.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 32)
+        self.claude_broker.chmod(0o700)
+        self.native_macho_dependencies = providers._native_macho_dependencies
+        self.native_dependency_patcher = mock.patch.object(
+            providers,
+            "_native_macho_dependencies",
+            side_effect=lambda path, *, label: tuple(
+                dict.fromkeys((path.absolute(), path.resolve()))
+            ),
+        )
+        self.native_dependency_patcher.start()
+        self.prepare_claude_keychain_broker = (
+            providers._prepare_claude_keychain_broker
+        )
+        self.keychain_broker_patcher = mock.patch.object(
+            providers,
+            "_prepare_claude_keychain_broker",
+            side_effect=self.fake_prepare_claude_keychain_broker,
+        )
+        self.keychain_broker_patcher.start()
+        self.claude_keychain_runtime = providers._claude_keychain_runtime
+        self.keychain_runtime_patcher = mock.patch.object(
+            providers,
+            "_claude_keychain_runtime",
+            side_effect=self.fake_claude_keychain_runtime,
+        )
+        self.keychain_runtime_patcher.start()
 
     def tearDown(self) -> None:
+        self.keychain_runtime_patcher.stop()
+        self.keychain_broker_patcher.stop()
+        self.native_dependency_patcher.stop()
         self.temporary.cleanup()
+
+    def fake_prepare_claude_keychain_broker(
+        self,
+        _review: ReviewWorkspace,
+        env: dict[str, str],
+    ) -> dict[str, str]:
+        result = dict(env)
+        if not result.get("ANTHROPIC_API_KEY"):
+            result["PATH"] = os.pathsep.join(
+                value
+                for value in (str(self.claude_broker.parent), result.get("PATH"))
+                if value
+            )
+        return result
+
+    @contextlib.contextmanager
+    def fake_claude_keychain_runtime(
+        self,
+        _review: ReviewWorkspace,
+        env: dict[str, str],
+    ):
+        result = dict(env)
+        if not result.get("ANTHROPIC_API_KEY"):
+            result[providers.CLAUDE_KEYCHAIN_BROKER_PORT_ENV] = "43211"
+            result[providers.CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV] = "00" * 32
+        yield result
 
     def attempt(
         self,
@@ -67,12 +134,191 @@ class ProviderPolicyTest(unittest.TestCase):
             stderr_path=str(self.review.container_dir / "stderr"),
         )
 
+    def sample_ca_certificate(self) -> bytes:
+        defaults = ssl.get_default_verify_paths()
+        for raw in (defaults.cafile, "/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt"):
+            if not raw:
+                continue
+            path = pathlib.Path(raw)
+            if not path.is_file():
+                continue
+            blocks = providers.CLAUDE_CERTIFICATE_BLOCK.findall(path.read_bytes())
+            if blocks:
+                return blocks[0] + b"\n"
+        self.skipTest("no system PEM CA certificate is available")
+
     def test_capacity_wins_over_unavailable_wording(self) -> None:
         category = providers.classify_failure(
             "",
             "Selected model is temporarily unavailable because it is at capacity",
         )
         self.assertEqual(category, "transient")
+
+    def test_native_macho_dependencies_rejects_interpreter_wrapper(self) -> None:
+        wrapper = self.review.source_root / "rg-wrapper"
+        wrapper.write_text("#!/bin/sh\nexec /usr/bin/rg \"$@\"\n", encoding="utf-8")
+        wrapper.chmod(0o755)
+
+        with self.assertRaisesRegex(
+            providers.InvalidReviewerExecutable,
+            "native Mach-O executable",
+        ):
+            self.native_macho_dependencies(wrapper, label="ripgrep")
+
+    def test_native_macho_dependencies_accepts_native_magic(self) -> None:
+        executable = self.review.source_root / "native-rg"
+        executable.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 32)
+        executable.chmod(0o755)
+
+        dependencies = self.native_macho_dependencies(executable, label="ripgrep")
+
+        self.assertEqual(
+            dependencies,
+            tuple(dict.fromkeys((executable.absolute(), executable.resolve()))),
+        )
+
+    def test_claude_keychain_broker_compiles_and_rejects_other_queries(self) -> None:
+        if (
+            sys.platform != "darwin"
+            or not providers.CLAUDE_KEYCHAIN_BROKER_COMPILER.is_file()
+        ):
+            self.skipTest("the native Claude Keychain broker requires macOS clang")
+
+        prepared = self.prepare_claude_keychain_broker(
+            self.review,
+            {
+                "HOME": str(self.review.container_dir / "claude-home"),
+                "PATH": "/usr/bin",
+            },
+        )
+        broker_dir = pathlib.Path(prepared["PATH"].split(providers.os.pathsep)[0])
+        broker = broker_dir / "security"
+
+        self.native_macho_dependencies(broker, label="Claude Keychain broker")
+        rejected = providers.run((str(broker), "show-keychain-info"))
+        self.assertEqual(rejected.returncode, 64)
+
+    def test_claude_keychain_broker_serves_one_in_memory_value(self) -> None:
+        if (
+            sys.platform != "darwin"
+            or not providers.CLAUDE_KEYCHAIN_BROKER_COMPILER.is_file()
+        ):
+            self.skipTest("the native Claude Keychain broker requires macOS clang")
+        prepared = self.prepare_claude_keychain_broker(
+            self.review,
+            {
+                "HOME": str(self.review.container_dir / "claude-home"),
+                "PATH": "/usr/bin",
+            },
+        )
+        broker_dir = pathlib.Path(prepared["PATH"].split(os.pathsep)[0])
+        broker = broker_dir / "security"
+        credential = bytearray(b"fixture-value")
+        capability = bytes.fromhex("01" * 32)
+        try:
+            context = providers._claude_keychain_credential_server(
+                credential,
+                capability,
+            )
+            with context as port:
+                prepared["TMPDIR"] = str(self.review.container_dir / "tmp")
+                prepared[providers.CLAUDE_KEYCHAIN_BROKER_PORT_ENV] = str(port)
+                prepared[providers.CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV] = (
+                    capability.hex()
+                )
+                profile = providers._claude_review_sandbox_profile(
+                    pathlib.Path("/bin/true"),
+                    self.review,
+                    prepared,
+                    proxy_port=43210,
+                )
+                query = (
+                    str(providers.CLAUDE_PROBE_SANDBOX),
+                    "-p",
+                    profile,
+                    str(broker),
+                    "find-generic-password",
+                    "-a",
+                    prepared["USER"],
+                    "-w",
+                    "-s",
+                    providers.CLAUDE_KEYCHAIN_SERVICE,
+                )
+                with socket.create_connection(("127.0.0.1", port)) as unauthorized:
+                    unauthorized.sendall(bytes.fromhex("02" * 32))
+                    self.assertEqual(unauthorized.recv(1), b"")
+                first = providers.run(query, env=prepared)
+                second = providers.run(query, env=prepared)
+        except PermissionError:
+            self.skipTest("loopback bind is unavailable in the current sandbox")
+
+        self.assertEqual(first.returncode, 0)
+        self.assertEqual(first.stdout, b"fixture-value\n")
+        self.assertEqual(second.returncode, 44)
+        self.assertEqual(credential, bytearray(len(credential)))
+
+    @mock.patch.object(providers.subprocess, "run")
+    def test_keychain_prefetch_uses_fixed_service_and_account(
+        self,
+        run_command: mock.Mock,
+    ) -> None:
+        completed = subprocess.CompletedProcess(
+            args=(),
+            returncode=0,
+            stdout=b"fixture-value\n",
+            stderr=b"",
+        )
+        run_command.return_value = completed
+
+        credential = providers._read_claude_keychain_credential(self.review)
+
+        self.assertEqual(credential, bytearray(b"fixture-value"))
+        argv = run_command.call_args.args[0]
+        self.assertEqual(argv[0], "/usr/bin/security")
+        self.assertEqual(
+            argv[1:],
+            (
+                "find-generic-password",
+                "-a",
+                providers._claude_keychain_account(),
+                "-w",
+                "-s",
+                "Claude Code-credentials",
+            ),
+        )
+        self.assertEqual(completed.stdout, b"")
+
+    @mock.patch.object(
+        providers,
+        "CLAUDE_KEYCHAIN_BROKER_COMPILER",
+        pathlib.Path("/missing/clang"),
+    )
+    def test_missing_keychain_broker_compiler_is_unavailable(self) -> None:
+        with self.assertRaisesRegex(
+            providers.ClaudeKeychainBrokerUnavailable,
+            "requires /usr/bin/clang",
+        ):
+            self.prepare_claude_keychain_broker(
+                self.review,
+                {
+                    "HOME": str(self.review.container_dir / "claude-home"),
+                    "PATH": "/usr/bin",
+                },
+            )
+
+    @mock.patch.object(providers, "run")
+    def test_claude_api_key_skips_keychain_broker(self, run_command: mock.Mock) -> None:
+        env = {
+            "ANTHROPIC_API_KEY": "test-api-key",
+            "HOME": str(self.review.container_dir / "claude-home"),
+            "PATH": "/usr/bin",
+        }
+
+        self.assertEqual(
+            self.prepare_claude_keychain_broker(self.review, env),
+            env,
+        )
+        run_command.assert_not_called()
 
     def test_model_match_is_normalized_but_not_prefix_based(self) -> None:
         self.assertTrue(providers._model_matches("claude-opus-4-8", "claude-opus-4.8"))
@@ -1382,6 +1628,50 @@ class ProviderPolicyTest(unittest.TestCase):
             [providers.CLAUDE_ENV_KEYS, providers.COPILOT_ENV_KEYS],
         )
 
+    @mock.patch.object(
+        providers,
+        "child_environment",
+        return_value={"HOME": "/Users/reviewer"},
+    )
+    @mock.patch.object(
+        providers,
+        "resolve_reviewer_executable",
+        return_value=pathlib.Path("/bin/claude"),
+    )
+    @mock.patch.object(providers, "_copilot_attempt")
+    @mock.patch.object(providers, "_claude_attempt")
+    def test_claude_local_login_is_default_without_api_key(
+        self,
+        claude_attempt: mock.Mock,
+        copilot_attempt: mock.Mock,
+        _resolve: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        claude_attempt.return_value = self.attempt(
+            "claude",
+            providers.CLAUDE_MODELS[0],
+            "success",
+            final_text="No findings.",
+        )
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
+
+        self.assertEqual(outcome.returncode, 0)
+        claude_attempt.assert_called_once()
+        self.assertEqual(
+            claude_attempt.call_args.kwargs["env"]["HOME"],
+            str(self.review.container_dir / "claude-home"),
+        )
+        self.assertNotIn(
+            "ANTHROPIC_API_KEY",
+            claude_attempt.call_args.kwargs["env"],
+        )
+        copilot_attempt.assert_not_called()
+
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(
         providers,
@@ -1586,7 +1876,7 @@ class ProviderPolicyTest(unittest.TestCase):
         copilot_attempt.assert_called_once()
         resolve.assert_called_once_with("copilot")
         self.assertIn(
-            "probe runtime is unavailable",
+            "secure runtime is unavailable",
             (self.review.container_dir / "claude-skip.txt").read_text(
                 encoding="utf-8"
             ),
@@ -1600,13 +1890,18 @@ class ProviderPolicyTest(unittest.TestCase):
     )
     @mock.patch.object(providers, "_copilot_attempt")
     @mock.patch.object(providers, "_claude_attempt")
-    def test_claude_without_bare_auth_uses_authorized_copilot_fallback(
+    def test_claude_without_usable_auth_uses_authorized_copilot_fallback(
         self,
         claude_attempt: mock.Mock,
         copilot_attempt: mock.Mock,
         resolve: mock.Mock,
         _environment: mock.Mock,
     ) -> None:
+        claude_attempt.return_value = self.attempt(
+            "claude",
+            providers.CLAUDE_MODELS[0],
+            "auth",
+        )
         copilot_attempt.return_value = self.attempt(
             "copilot",
             providers.COPILOT_MODELS[0],
@@ -1621,20 +1916,14 @@ class ProviderPolicyTest(unittest.TestCase):
         )
 
         self.assertEqual(outcome.returncode, 0)
-        claude_attempt.assert_not_called()
+        claude_attempt.assert_called_once()
         copilot_attempt.assert_called_once()
         self.assertEqual(resolve.call_count, 2)
-        self.assertIn(
-            "requires ANTHROPIC_API_KEY",
-            (self.review.container_dir / "claude-skip.txt").read_text(
-                encoding="utf-8"
-            ),
-        )
 
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(providers, "resolve_reviewer_executable")
     @mock.patch.object(providers, "_copilot_attempt")
-    def test_invalid_explicit_claude_override_blocks_without_api_key(
+    def test_invalid_explicit_claude_override_blocks_without_fallback(
         self,
         copilot_attempt: mock.Mock,
         resolve: mock.Mock,
@@ -2441,10 +2730,10 @@ class ProviderPolicyTest(unittest.TestCase):
 
     @mock.patch.object(
         providers,
-        "reviewer_executable_dependencies",
+        "_native_macho_dependencies",
         return_value=(
             pathlib.Path("/review-install/claude"),
-            pathlib.Path("/review-runtime/node"),
+            pathlib.Path("/review-real/claude"),
         ),
     )
     def test_claude_probe_profile_only_reads_runtime_and_probe_roots(
@@ -2459,10 +2748,10 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn("(deny default)", profile)
         self.assertNotIn("(allow default)", profile)
         self.assertIn('(literal "/review-install/claude")', profile)
-        self.assertIn('(literal "/review-runtime/node")', profile)
+        self.assertIn('(literal "/review-real/claude")', profile)
         self.assertIn('(subpath "/isolated/probe-home")', profile)
         self.assertIn('(subpath "/review-install")', profile)
-        self.assertIn('(subpath "/review-runtime")', profile)
+        self.assertIn('(subpath "/review-real")', profile)
         self.assertNotIn("(allow file-read-metadata)", profile)
         self.assertIn(
             '(allow file-read-metadata (literal "/")',
@@ -2481,7 +2770,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 self.subTest(dependency=dependency),
                 mock.patch.object(
                     providers,
-                    "reviewer_executable_dependencies",
+                    "_native_macho_dependencies",
                     return_value=(dependency,),
                 ),
                 mock.patch.dict(providers.os.environ, {"HOME": "/Users/joey"}),
@@ -2501,13 +2790,24 @@ class ProviderPolicyTest(unittest.TestCase):
     )
     @mock.patch.object(
         providers,
+        "CLAUDE_REVIEW_TOOL_EXECUTABLE_CANDIDATES",
+        (pathlib.Path("/bin/echo"),),
+    )
+    @mock.patch.object(
+        providers,
         "CLAUDE_PROBE_SANDBOX",
         pathlib.Path("/usr/bin/true"),
     )
+    @mock.patch.object(
+        providers,
+        "_claude_connect_proxy",
+        return_value=contextlib.nullcontext(43210),
+    )
     @mock.patch.object(providers, "run")
-    def test_claude_command_pins_model_and_max_in_bare_mode(
+    def test_claude_command_pins_model_and_max_with_local_login_safe_mode(
         self,
         run_command: mock.Mock,
+        _proxy: mock.Mock,
         resolve: mock.Mock,
     ) -> None:
         def resolve_and_validate(_name: str, **kwargs) -> pathlib.Path:
@@ -2537,7 +2837,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 returncode=0,
                 stdout=(
                     "Options:\n  "
-                    + providers.CLAUDE_BARE_MODE_HELP_FORM
+                    + providers.CLAUDE_SAFE_MODE_HELP_FORM
                     + "\n  --betas <betas...> Beta headers\n"
                 ).encode(),
                 stderr=b"",
@@ -2554,7 +2854,10 @@ class ProviderPolicyTest(unittest.TestCase):
             model="claude-opus-4-8",
             index=1,
             env={
-                "ANTHROPIC_API_KEY": "secret",
+                "HOME": "/Users/reviewer",
+                "XDG_CONFIG_HOME": "/Users/reviewer/.config",
+                "TMPDIR": str(self.review.container_dir / "tmp"),
+                "PATH": str(self.claude_broker.parent),
                 "CODEX_ISOLATED_REVIEW_RANGE": "base..head",
             },
         )
@@ -2569,14 +2872,29 @@ class ProviderPolicyTest(unittest.TestCase):
         settings = json.loads(argv[argv.index("--settings") + 1])
         self.assertIn("Read(~/.ssh/**)", settings["permissions"]["deny"])
         self.assertTrue(settings["disableAllHooks"])
-        self.assertIn("--bare", argv)
-        self.assertNotIn("--safe-mode", argv)
+        self.assertEqual(argv[:2], ("/usr/bin/true", "-p"))
+        self.assertEqual(argv[3], "/bin/claude")
+        review_profile = argv[2]
+        self.assertIn("(deny default)", review_profile)
+        self.assertIn(str(self.review.workspace_root), review_profile)
+        self.assertNotIn("com.apple.securityd.xpc", review_profile)
+        self.assertIn('(remote ip "localhost:43210")', review_profile)
+        self.assertIn('(remote ip "localhost:43211")', review_profile)
+        self.assertIn("(allow process-fork)", review_profile)
+        self.assertIn(f'(literal "{self.claude_broker.resolve()}")', review_profile)
+        self.assertNotIn('(literal "/usr/bin/security")', review_profile)
+        self.assertNotIn(f'(subpath "{self.claude_broker.parent}")', review_profile)
+        self.assertIn('(literal "/bin/echo")', review_profile)
+        self.assertNotIn('(literal "/bin/sh")', review_profile)
+        self.assertNotIn("/Users/reviewer", review_profile)
+        self.assertIn("--safe-mode", argv)
+        self.assertNotIn("--bare", argv)
         self.assertIn("--strict-mcp-config", argv)
         version_argv = run_command.call_args_list[0].args[0]
         self.assertEqual(version_argv[:2], ("/usr/bin/true", "-p"))
         self.assertEqual(
             version_argv[3:],
-            ("/bin/claude", "--bare", "--version"),
+            ("/bin/claude", "--safe-mode", "--version"),
         )
         self.assertIn("(deny default)", version_argv[2])
         self.assertIn('(literal "/bin/claude")', version_argv[2])
@@ -2586,11 +2904,12 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertNotIn("CODEX_ISOLATED_REVIEW_RANGE", probe_env)
         self.assertEqual(
             probe_env["HOME"],
-            str(self.review.container_dir / "claude-home"),
+            str(self.review.container_dir / "claude-probe-home"),
         )
+        self.assertNotIn("XDG_CONFIG_HOME", probe_env)
         self.assertEqual(
             run_command.call_args_list[1].args[0][-3:],
-            ("/bin/claude", "--bare", "--help"),
+            ("/bin/claude", "--safe-mode", "--help"),
         )
         self.assertEqual(run_command.call_args_list[1].kwargs["env"], probe_env)
         for probe_call in run_command.call_args_list[:2]:
@@ -2608,12 +2927,20 @@ class ProviderPolicyTest(unittest.TestCase):
             )
             self.assertEqual(
                 probe_call.kwargs["stdout_path"].parent.parent,
-                self.review.container_dir / "claude-home",
+                self.review.container_dir / "claude-probe-home",
             )
             self.assertFalse(probe_call.kwargs["stdout_path"].parent.exists())
         review_env = run_command.call_args_list[2].kwargs["env"]
-        self.assertEqual(review_env["ANTHROPIC_API_KEY"], "secret")
-        self.assertEqual(review_env["HOME"], probe_env["HOME"])
+        self.assertNotIn("ANTHROPIC_API_KEY", review_env)
+        self.assertEqual(
+            review_env["HOME"],
+            str(self.review.container_dir / "claude-home"),
+        )
+        self.assertNotIn("XDG_CONFIG_HOME", review_env)
+        self.assertEqual(review_env["HTTPS_PROXY"], "http://127.0.0.1:43210")
+        self.assertEqual(review_env["HTTP_PROXY"], review_env["HTTPS_PROXY"])
+        self.assertEqual(review_env["ALL_PROXY"], review_env["HTTPS_PROXY"])
+        self.assertEqual(review_env["NO_PROXY"], "")
         self.assertEqual(
             run_command.call_args_list[2].kwargs["timeout_seconds"],
             providers.REVIEW_ATTEMPT_TIMEOUT_SECONDS,
@@ -2621,6 +2948,286 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(
             run_command.call_args_list[2].kwargs["output_file_limit_bytes"],
             providers.REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
+        )
+
+    def test_claude_review_sandbox_rejects_host_home(self) -> None:
+        with self.assertRaisesRegex(ReviewError, "helper-owned HOME and TMPDIR"):
+            providers._claude_review_sandbox_profile(
+                pathlib.Path("/bin/true"),
+                self.review,
+                {
+                    "HOME": "/Users/reviewer",
+                    "TMPDIR": str(self.review.container_dir / "tmp"),
+                },
+                proxy_port=43210,
+            )
+
+    @mock.patch.object(
+        providers,
+        "CLAUDE_REVIEW_TOOL_EXECUTABLE_CANDIDATES",
+        (pathlib.Path("/missing/rg"),),
+    )
+    def test_claude_review_sandbox_requires_trusted_ripgrep(self) -> None:
+        with self.assertRaisesRegex(ReviewError, "requires ripgrep"):
+            providers._claude_review_sandbox_profile(
+                pathlib.Path("/bin/true"),
+                self.review,
+                {
+                    "HOME": str(self.review.container_dir / "claude-home"),
+                    "TMPDIR": str(self.review.container_dir / "tmp"),
+                    "PATH": str(self.claude_broker.parent),
+                    providers.CLAUDE_KEYCHAIN_BROKER_PORT_ENV: "43211",
+                    providers.CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV: "00" * 32,
+                },
+                proxy_port=43210,
+            )
+
+    @mock.patch.object(
+        providers,
+        "CLAUDE_REVIEW_TOOL_EXECUTABLE_CANDIDATES",
+        (pathlib.Path("/bin/echo"),),
+    )
+    def test_claude_review_sandbox_allows_exact_custom_ca_paths(self) -> None:
+        certificate = self.sample_ca_certificate()
+        ca_file = self.review.source_root / "corporate-ca.pem"
+        ca_file.write_bytes(certificate)
+        ca_dir = self.review.source_root / "certs"
+        ca_dir.mkdir()
+        (ca_dir / "12345678.0").write_bytes(certificate)
+
+        prepared_env = providers._prepare_claude_tls_environment(
+            self.review,
+            {
+                "HOME": str(self.review.container_dir / "claude-home"),
+                "TMPDIR": str(self.review.container_dir / "tmp"),
+                "PATH": str(self.claude_broker.parent),
+                providers.CLAUDE_KEYCHAIN_BROKER_PORT_ENV: "43211",
+                providers.CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV: "00" * 32,
+                "SSL_CERT_FILE": str(ca_file),
+                "SSL_CERT_DIR": str(ca_dir),
+            },
+        )
+
+        profile = providers._claude_review_sandbox_profile(
+            pathlib.Path("/bin/true"),
+            self.review,
+            prepared_env,
+            proxy_port=43210,
+        )
+
+        prepared_file = pathlib.Path(prepared_env["SSL_CERT_FILE"])
+        prepared_dir = pathlib.Path(prepared_env["SSL_CERT_DIR"])
+        self.assertTrue(providers.is_relative_to(prepared_file, self.review.container_dir))
+        self.assertTrue(providers.is_relative_to(prepared_dir, self.review.container_dir))
+        self.assertIn(f'(literal "{prepared_file}")', profile)
+        self.assertIn(f'(subpath "{prepared_dir}")', profile)
+        self.assertNotIn(str(ca_file), profile)
+        self.assertNotIn(str(ca_dir), profile)
+
+    @mock.patch.object(
+        providers,
+        "CLAUDE_REVIEW_TOOL_EXECUTABLE_CANDIDATES",
+        (pathlib.Path("/bin/echo"),),
+    )
+    def test_claude_review_sandbox_omits_keychain_broker_for_api_key(self) -> None:
+        profile = providers._claude_review_sandbox_profile(
+            pathlib.Path("/bin/true"),
+            self.review,
+            {
+                "ANTHROPIC_API_KEY": "test-api-key",
+                "HOME": str(self.review.container_dir / "claude-home"),
+                "TMPDIR": str(self.review.container_dir / "tmp"),
+                "PATH": "/usr/bin",
+            },
+            proxy_port=43210,
+        )
+
+        self.assertNotIn("/usr/bin/security", profile)
+        self.assertNotIn("com.apple.securityd.xpc", profile)
+
+    @mock.patch.object(
+        providers,
+        "CLAUDE_REVIEW_TOOL_EXECUTABLE_CANDIDATES",
+        (pathlib.Path("/bin/echo"),),
+    )
+    def test_claude_review_sandbox_rejects_relative_ca_file(self) -> None:
+        with self.assertRaisesRegex(ReviewError, "valid absolute SSL_CERT_FILE"):
+            providers._prepare_claude_tls_environment(
+                self.review,
+                {
+                    "SSL_CERT_FILE": "corporate-ca.pem",
+                },
+            )
+
+    @mock.patch.object(
+        providers,
+        "CLAUDE_REVIEW_TOOL_EXECUTABLE_CANDIDATES",
+        (pathlib.Path("/bin/echo"),),
+    )
+    def test_claude_review_sandbox_rejects_host_ca_directory(self) -> None:
+        with self.assertRaisesRegex(ReviewError, "helper-owned SSL_CERT_DIR"):
+            providers._claude_review_sandbox_profile(
+                pathlib.Path("/bin/true"),
+                self.review,
+                {
+                    "HOME": str(self.review.container_dir / "claude-home"),
+                    "TMPDIR": str(self.review.container_dir / "tmp"),
+                    "SSL_CERT_DIR": "/",
+                },
+                proxy_port=43210,
+            )
+
+    def test_claude_tls_preparation_rejects_non_certificate_file(self) -> None:
+        source = self.review.source_root / ".netrc"
+        source.write_text(
+            "machine example.test login user password secret\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ReviewError, "contains no PEM certificate"):
+            providers._prepare_claude_tls_environment(
+                self.review,
+                {"SSL_CERT_FILE": str(source)},
+            )
+
+    def test_claude_tls_preparation_rejects_private_key_material(self) -> None:
+        source = self.review.source_root / "combined.pem"
+        source.write_bytes(
+            self.sample_ca_certificate()
+            + b"-----BEGIN "
+            + b"PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n"
+        )
+
+        with self.assertRaisesRegex(ReviewError, "contains a private key"):
+            providers._prepare_claude_tls_environment(
+                self.review,
+                {"SSL_CERT_FILE": str(source)},
+            )
+
+    def test_claude_tls_preparation_preserves_same_named_ca_entries(self) -> None:
+        certificate = self.sample_ca_certificate()
+        source_dirs = []
+        for name in ("first", "second"):
+            source_dir = self.review.source_root / name
+            source_dir.mkdir()
+            (source_dir / "deadbeef.0").write_bytes(certificate)
+            source_dirs.append(source_dir)
+
+        prepared = providers._prepare_claude_tls_environment(
+            self.review,
+            {"SSL_CERT_DIR": os.pathsep.join(str(path) for path in source_dirs)},
+        )
+
+        prepared_dirs = [
+            pathlib.Path(raw) for raw in prepared["SSL_CERT_DIR"].split(os.pathsep)
+        ]
+        self.assertEqual(len(prepared_dirs), 2)
+        self.assertNotEqual(prepared_dirs[0], prepared_dirs[1])
+        for prepared_dir in prepared_dirs:
+            self.assertEqual((prepared_dir / "deadbeef.0").read_bytes(), certificate)
+
+    @mock.patch.object(providers.ssl, "create_default_context")
+    def test_proxy_ssl_context_loads_each_ca_directory(
+        self,
+        create_context: mock.Mock,
+    ) -> None:
+        context = create_context.return_value
+
+        result = providers._proxy_ssl_context(
+            {"SSL_CERT_DIR": os.pathsep.join(("/first", "/second"))}
+        )
+
+        self.assertIs(result, context)
+        create_context.assert_called_once_with(cafile=None)
+        self.assertEqual(
+            context.load_verify_locations.call_args_list,
+            [mock.call(capath="/first"), mock.call(capath="/second")],
+        )
+
+    def test_claude_connect_proxy_allows_only_configured_target(self) -> None:
+        class EchoHandler(socketserver.BaseRequestHandler):
+            def handle(self) -> None:
+                data = self.request.recv(1024)
+                self.request.sendall(data)
+
+        try:
+            target = socketserver.ThreadingTCPServer(("127.0.0.1", 0), EchoHandler)
+        except PermissionError:
+            self.skipTest("loopback bind is unavailable in the current sandbox")
+        target.daemon_threads = True
+        target_thread = threading.Thread(target=target.serve_forever, daemon=True)
+        target_thread.start()
+        target_port = int(target.server_address[1])
+        try:
+            with providers._claude_connect_proxy(
+                {},
+                allowed_targets=frozenset({("127.0.0.1", target_port)}),
+            ) as proxy_port:
+                with socket.create_connection(("127.0.0.1", proxy_port)) as client:
+                    client.sendall(
+                        (
+                            f"CONNECT 127.0.0.1:{target_port} HTTP/1.1\r\n"
+                            f"Host: 127.0.0.1:{target_port}\r\n\r\n"
+                        ).encode("ascii")
+                    )
+                    response = client.recv(4096)
+                    self.assertIn(b"200 Connection Established", response)
+                    client.sendall(b"ping")
+                    self.assertEqual(client.recv(4), b"ping")
+
+                with socket.create_connection(("127.0.0.1", proxy_port)) as client:
+                    client.sendall(
+                        b"CONNECT example.com:443 HTTP/1.1\r\n"
+                        b"Host: example.com:443\r\n\r\n"
+                    )
+                    self.assertIn(b"403 Forbidden", client.recv(4096))
+        finally:
+            target.shutdown()
+            target.server_close()
+            target_thread.join(timeout=5.0)
+
+    def test_claude_proxy_environment_blocks_bypass_variables(self) -> None:
+        env = providers._with_claude_proxy_environment(
+            {
+                "HTTPS_PROXY": "http://corporate-proxy:8080",
+                "NO_PROXY": "example.com",
+            },
+            43210,
+        )
+
+        for key in (
+            "ALL_PROXY",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "all_proxy",
+            "http_proxy",
+            "https_proxy",
+        ):
+            self.assertEqual(env[key], "http://127.0.0.1:43210")
+        self.assertEqual(env["NO_PROXY"], "")
+        self.assertEqual(env["no_proxy"], "")
+
+    def test_claude_upstream_proxy_accepts_lowercase_environment(self) -> None:
+        self.assertEqual(
+            providers._upstream_proxy_url(
+                {"https_proxy": "http://corporate-proxy:8080"}
+            ),
+            "http://corporate-proxy:8080",
+        )
+
+    def test_claude_proxy_allows_api_and_oauth_refresh_targets(self) -> None:
+        self.assertEqual(
+            providers.CLAUDE_PROXY_TARGETS,
+            frozenset(
+                {
+                    ("api.anthropic.com", 443),
+                    ("platform.claude.com", 443),
+                }
+            ),
+        )
+        self.assertIn(
+            providers._parse_connect_target("platform.claude.com:443"),
+            providers.CLAUDE_PROXY_TARGETS,
         )
 
     @mock.patch.object(
@@ -2634,7 +3241,7 @@ class ProviderPolicyTest(unittest.TestCase):
         pathlib.Path("/usr/bin/true"),
     )
     @mock.patch.object(providers, "run")
-    def test_claude_refuses_unverified_bare_mode_semantics(
+    def test_claude_refuses_unverified_safe_mode_semantics(
         self,
         run_command: mock.Mock,
         resolve: mock.Mock,
@@ -2660,12 +3267,12 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
         )
 
-        with self.assertRaisesRegex(ReviewError, "uniquely verifiable --bare"):
+        with self.assertRaisesRegex(ReviewError, "uniquely verifiable --safe-mode"):
             providers._claude_attempt(
                 review=self.review,
                 model="claude-opus-4-8",
                 index=1,
-                env={"ANTHROPIC_API_KEY": "secret"},
+                env={"HOME": "/Users/reviewer"},
             )
 
         self.assertEqual(run_command.call_count, 2)
@@ -2676,7 +3283,7 @@ class ProviderPolicyTest(unittest.TestCase):
         pathlib.Path("/usr/bin/true"),
     )
     @mock.patch.object(providers, "run")
-    def test_claude_accepts_exact_bare_option_block(
+    def test_claude_accepts_exact_safe_mode_option_block(
         self,
         run_command: mock.Mock,
     ) -> None:
@@ -2685,13 +3292,13 @@ class ProviderPolicyTest(unittest.TestCase):
             returncode=0,
             stdout=(
                 "Usage: claude [options]\nOptions:\n  "
-                + providers.CLAUDE_BARE_MODE_HELP_FORM
+                + providers.CLAUDE_SAFE_MODE_HELP_FORM
                 + "\n  --betas <betas...> Beta headers\n"
             ).encode(),
             stderr=b"",
         )
 
-        providers._require_claude_bare_mode(
+        providers._require_claude_safe_mode(
             pathlib.Path("/bin/claude"),
             {"HOME": str(self.review.container_dir)},
         )
@@ -2702,16 +3309,16 @@ class ProviderPolicyTest(unittest.TestCase):
         pathlib.Path("/usr/bin/true"),
     )
     @mock.patch.object(providers, "run")
-    def test_claude_rejects_bare_option_mutations(
+    def test_claude_rejects_safe_mode_option_mutations(
         self,
         run_command: mock.Mock,
     ) -> None:
-        form = providers.CLAUDE_BARE_MODE_HELP_FORM
+        form = providers.CLAUDE_SAFE_MODE_HELP_FORM
         for mutated_form in (
-            form.replace("skip hooks", "load hooks", 1),
-            form.replace("oauth and keychain are never read", "oauth is read", 1),
-            form.replace("claude_code_simple=1", "claude_code_simple=0", 1),
-            form.replace("claude.md auto-discovery", "claude.md discovery", 1),
+            form.replace("plugins, hooks", "plugins with hooks", 1),
+            form.replace("auth, model selection", "model selection", 1),
+            form.replace("claude_code_safe_mode=1", "claude_code_safe_mode=0", 1),
+            form.replace("all customizations", "some customizations", 1),
         ):
             with self.subTest(mutated_form=mutated_form):
                 run_command.return_value = Completed(
@@ -2725,8 +3332,8 @@ class ProviderPolicyTest(unittest.TestCase):
                     stderr=b"",
                 )
 
-                with self.assertRaisesRegex(ReviewError, "uniquely verifiable --bare"):
-                    providers._require_claude_bare_mode(
+                with self.assertRaisesRegex(ReviewError, "uniquely verifiable --safe-mode"):
+                    providers._require_claude_safe_mode(
                         pathlib.Path("/bin/claude"),
                         {"HOME": str(self.review.container_dir)},
                     )
@@ -2737,19 +3344,19 @@ class ProviderPolicyTest(unittest.TestCase):
         pathlib.Path("/usr/bin/true"),
     )
     @mock.patch.object(providers, "run")
-    def test_claude_rejects_duplicate_or_conflicting_bare_descriptions(
+    def test_claude_rejects_duplicate_or_conflicting_safe_mode_descriptions(
         self,
         run_command: mock.Mock,
     ) -> None:
-        form = providers.CLAUDE_BARE_MODE_HELP_FORM
+        form = providers.CLAUDE_SAFE_MODE_HELP_FORM
         for help_text in (
-            "Options:\n  " + form + "\n  --bare hooks still load\n",
+            "Options:\n  " + form + "\n  --safe-mode hooks still load\n",
             "Options:\n  "
             + form
             + "\n  hooks still load\n  --betas <betas...> Beta headers\n",
             "Options:\n  "
             + form
-            + "\n  --betas <betas...> Unlike --bare, hooks still load\n",
+            + "\n  --betas <betas...> Unlike --safe-mode, hooks still load\n",
         ):
             with self.subTest(help_text=help_text):
                 run_command.return_value = Completed(
@@ -2759,8 +3366,8 @@ class ProviderPolicyTest(unittest.TestCase):
                     stderr=b"",
                 )
 
-                with self.assertRaisesRegex(ReviewError, "uniquely verifiable --bare"):
-                    providers._require_claude_bare_mode(
+                with self.assertRaisesRegex(ReviewError, "uniquely verifiable --safe-mode"):
+                    providers._require_claude_safe_mode(
                         pathlib.Path("/bin/claude"),
                         {"HOME": str(self.review.container_dir)},
                     )

@@ -91,6 +91,10 @@ BASE_ENV_KEYS = (
     "TERM",
     "USER",
     "XDG_CONFIG_HOME",
+    "all_proxy",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
 )
 
 PROCESS_GROUP_TERM_GRACE_SECONDS = 0.5

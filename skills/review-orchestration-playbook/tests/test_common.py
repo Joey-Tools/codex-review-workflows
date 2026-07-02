@@ -452,6 +452,8 @@ class ChildEnvironmentTest(unittest.TestCase):
                         "REQUESTS_CA_BUNDLE": "/etc/corporate-ca.pem",
                         "CURL_CA_BUNDLE": "/etc/curl-ca.pem",
                         "GIT_SSL_CAINFO": "/etc/git-ca.pem",
+                        "https_proxy": "http://corporate-proxy:8080",
+                        "no_proxy": "localhost",
                         "UNRELATED_PRIVATE_VALUE": "must-not-pass",
                         "DATABASE_PASSWORD": "must-not-pass",
                     },
@@ -467,6 +469,8 @@ class ChildEnvironmentTest(unittest.TestCase):
         self.assertEqual(env["REQUESTS_CA_BUNDLE"], "/etc/corporate-ca.pem")
         self.assertEqual(env["CURL_CA_BUNDLE"], "/etc/curl-ca.pem")
         self.assertEqual(env["GIT_SSL_CAINFO"], "/etc/git-ca.pem")
+        self.assertEqual(env["https_proxy"], "http://corporate-proxy:8080")
+        self.assertEqual(env["no_proxy"], "localhost")
         self.assertNotIn("UNRELATED_PRIVATE_VALUE", env)
         self.assertNotIn("DATABASE_PASSWORD", env)
 

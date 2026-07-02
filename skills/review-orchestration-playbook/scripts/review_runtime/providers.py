@@ -1,12 +1,24 @@
 from __future__ import annotations
 
+import base64
+import contextlib
+import hmac
 import json
 import os
 import pathlib
 import re
+import secrets
+import select
+import socket
+import socketserver
+import ssl
+import struct
+import subprocess
 import tempfile
+import threading
+import urllib.parse
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Iterator
 
 from .common import (
     Completed,
@@ -17,7 +29,7 @@ from .common import (
     ReviewProcessLeakError,
     ReviewTimeoutError,
     child_environment,
-    reviewer_executable_dependencies,
+    is_relative_to,
     reviewer_executable_path,
     resolve_reviewer_executable,
     run,
@@ -43,21 +55,19 @@ COPILOT_PERMISSION_HELP_FRAGMENTS = (
     "denial rules always take precedence over allow rules, even --allow-all-tools",
 )
 # Normalized from Claude Code 2.1.187 `--help`. Exact option-block matching is
-# intentional: safe mode still permits managed hooks, while bare mode explicitly
-# skips hooks. New wording fails closed until this whitelist and its mutation
+# intentional: safe mode must disable local customizations while preserving normal
+# authentication. New wording fails closed until this whitelist and its mutation
 # tests are updated together.
-CLAUDE_BARE_MODE_HELP_FORM = (
-    "--bare minimal mode: skip hooks, lsp, plugin sync, attribution, auto-memory, "
-    "background prefetches, keychain reads, and claude.md auto-discovery. sets "
-    "claude_code_simple=1. anthropic auth is strictly anthropic_api_key or apikeyhelper "
-    "via --settings (oauth and keychain are never read). 3p providers "
-    "(bedrock/vertex/foundry) use their own credentials. skills still resolve via "
-    "/skill-name. explicitly provide context via: --system-prompt[-file], "
-    "--append-system-prompt[-file], --add-dir (claude.md dirs), --mcp-config, "
-    "--settings, --agents, --plugin-dir."
+CLAUDE_SAFE_MODE_HELP_FORM = (
+    "--safe-mode start with all customizations (claude.md, skills, plugins, hooks, "
+    "mcp servers, custom commands and agents, output styles, workflows, custom "
+    "themes, keybindings, and more) disabled — useful for troubleshooting a broken "
+    "configuration. admin-managed (policy) settings still apply. auth, model "
+    "selection, built-in tools, and permissions work normally. sets "
+    "claude_code_safe_mode=1."
 )
 CLAUDE_HELP_OPTION_START = re.compile(r"^  (--[a-z0-9][a-z0-9-]*)\b")
-CLAUDE_BARE_TOKEN = re.compile(r"(?<![a-z0-9-])--bare(?![a-z0-9-])")
+CLAUDE_SAFE_MODE_TOKEN = re.compile(r"(?<![a-z0-9-])--safe-mode(?![a-z0-9-])")
 CLAUDE_PROBE_SANDBOX = pathlib.Path("/usr/bin/sandbox-exec")
 CLAUDE_PROBE_SANDBOX_PROFILE = "(version 1)(deny default)"
 CLAUDE_PROBE_SYSTEM_READ_SUBPATHS = (
@@ -81,6 +91,75 @@ CLAUDE_PROBE_SYSTEM_READ_LITERALS = (
 )
 CLAUDE_PROBE_TIMEOUT_SECONDS = 20.0
 CLAUDE_PROBE_OUTPUT_LIMIT_BYTES = 64 * 1024
+CLAUDE_REVIEW_BASE_MACH_SERVICES = (
+    "com.apple.cfprefsd.agent",
+    "com.apple.cfprefsd.daemon",
+    "com.apple.cfnetwork.cfnetworkagent",
+    "com.apple.system.DirectoryService.libinfo_v1",
+    "com.apple.system.opendirectoryd.libinfo",
+    "com.apple.system.opendirectoryd.membership",
+    "com.apple.trustd",
+    "com.apple.trustd.agent",
+)
+CLAUDE_KEYCHAIN_BROKER_COMPILER = pathlib.Path("/usr/bin/clang")
+CLAUDE_KEYCHAIN_CLIENT = pathlib.Path("/usr/bin/security")
+CLAUDE_KEYCHAIN_BROKER_SOURCE = pathlib.Path(__file__).with_name(
+    "claude_keychain_broker.c"
+)
+CLAUDE_KEYCHAIN_ACCOUNT = re.compile(r"^[A-Za-z0-9._-]+$")
+CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials"
+CLAUDE_KEYCHAIN_BROKER_PORT_ENV = "CODEX_CLAUDE_KEYCHAIN_BROKER_PORT"
+CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV = "CODEX_CLAUDE_KEYCHAIN_BROKER_CAPABILITY"
+CLAUDE_KEYCHAIN_BROKER_CAPABILITY = re.compile(r"^[0-9a-f]{64}$")
+CLAUDE_KEYCHAIN_BROKER_CAPABILITY_BYTES = 32
+CLAUDE_KEYCHAIN_BROKER_TIMEOUT_SECONDS = 20.0
+CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES = 64 * 1024
+CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS = 5.0
+CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES = 1024 * 1024
+CLAUDE_REVIEW_TOOL_EXECUTABLE_CANDIDATES = (
+    pathlib.Path("/opt/homebrew/bin/rg"),
+    pathlib.Path("/usr/local/bin/rg"),
+    pathlib.Path("/usr/bin/rg"),
+)
+CLAUDE_REVIEW_TOOL_LIBRARY_SUBPATH_CANDIDATES = (
+    pathlib.Path("/opt/homebrew/opt/pcre2/lib"),
+    pathlib.Path("/usr/local/opt/pcre2/lib"),
+)
+CLAUDE_TLS_FILE_ENV_KEYS = (
+    "CURL_CA_BUNDLE",
+    "GIT_SSL_CAINFO",
+    "REQUESTS_CA_BUNDLE",
+    "SSL_CERT_FILE",
+)
+CLAUDE_TLS_DIR_ENV_KEYS = ("SSL_CERT_DIR",)
+CLAUDE_CA_FILE_LIMIT_BYTES = 16 * 1024 * 1024
+CLAUDE_CA_DIR_LIMIT_BYTES = 64 * 1024 * 1024
+CLAUDE_CA_DIR_ENTRY_LIMIT = 4096
+CLAUDE_CERTIFICATE_BLOCK = re.compile(
+    rb"-----BEGIN CERTIFICATE-----\r?\n.*?-----END CERTIFICATE-----",
+    re.DOTALL,
+)
+CLAUDE_PRIVATE_KEY_MARKER = re.compile(rb"-----BEGIN [^-\r\n]*PRIVATE KEY-----")
+CLAUDE_PROXY_TARGETS = frozenset(
+    {
+        ("api.anthropic.com", 443),
+        ("platform.claude.com", 443),
+    }
+)
+CLAUDE_PROXY_HEADER_LIMIT_BYTES = 64 * 1024
+CLAUDE_PROXY_CONNECT_TIMEOUT_SECONDS = 20.0
+MACHO_MAGICS = frozenset(
+    {
+        b"\xca\xfe\xba\xbe",
+        b"\xbe\xba\xfe\xca",
+        b"\xca\xfe\xba\xbf",
+        b"\xbf\xba\xfe\xca",
+        b"\xce\xfa\xed\xfe",
+        b"\xfe\xed\xfa\xce",
+        b"\xcf\xfa\xed\xfe",
+        b"\xfe\xed\xfa\xcf",
+    }
+)
 COPILOT_PROBE_TIMEOUT_SECONDS = 20.0
 COPILOT_PROBE_OUTPUT_LIMIT_BYTES = 64 * 1024
 REVIEW_ATTEMPT_TIMEOUT_SECONDS = 30 * 60.0
@@ -184,6 +263,10 @@ class ClaudeProbeSandboxUnavailable(ReviewError):
     """The host does not provide the required Claude probe sandbox runtime."""
 
 
+class ClaudeKeychainBrokerUnavailable(ReviewError):
+    """The host cannot build the restricted Claude Keychain broker."""
+
+
 @dataclass(frozen=True)
 class Attempt:
     runtime: str
@@ -203,6 +286,577 @@ class Outcome:
     returncode: int
     final_text: str | None
     attempts: tuple[Attempt, ...]
+
+
+def _native_macho_dependencies(
+    path: pathlib.Path,
+    *,
+    label: str,
+) -> tuple[pathlib.Path, ...]:
+    candidates = (path.absolute(), path.resolve())
+    resolved = candidates[-1]
+    try:
+        with resolved.open("rb") as handle:
+            magic = handle.read(4)
+    except OSError as error:
+        raise InvalidReviewerExecutable(
+            f"cannot inspect {label} executable: {error}"
+        ) from error
+    if magic not in MACHO_MAGICS or not os.access(resolved, os.X_OK):
+        raise InvalidReviewerExecutable(
+            f"{label} must be a native Mach-O executable, not a script or wrapper"
+        )
+    return tuple(dict.fromkeys(candidates))
+
+
+def _claude_keychain_account() -> str:
+    try:
+        import pwd
+
+        account = pwd.getpwuid(os.getuid()).pw_name
+    except (ImportError, KeyError, OSError) as error:
+        raise ReviewError(
+            f"cannot resolve the Claude Keychain account: {error}"
+        ) from error
+    if not CLAUDE_KEYCHAIN_ACCOUNT.fullmatch(account):
+        return "claude-code-user"
+    return account
+
+
+def _prepare_claude_keychain_broker(
+    review: ReviewWorkspace,
+    env: dict[str, str],
+) -> dict[str, str]:
+    result = dict(env)
+    if result.get("ANTHROPIC_API_KEY"):
+        return result
+    if not CLAUDE_KEYCHAIN_CLIENT.is_file() or not os.access(
+        CLAUDE_KEYCHAIN_CLIENT, os.X_OK
+    ):
+        raise ClaudeKeychainBrokerUnavailable(
+            "Claude local-login review requires /usr/bin/security"
+        )
+    compiler = CLAUDE_KEYCHAIN_BROKER_COMPILER
+    if not compiler.is_file() or not os.access(compiler, os.X_OK):
+        raise ClaudeKeychainBrokerUnavailable(
+            "Claude local-login review requires /usr/bin/clang"
+        )
+    if not CLAUDE_KEYCHAIN_BROKER_SOURCE.is_file():
+        raise ReviewError("Claude Keychain broker source is unavailable")
+    home_raw = result.get("HOME")
+    if not home_raw:
+        raise ReviewError("Claude Keychain broker requires an isolated HOME")
+    home = pathlib.Path(home_raw).resolve()
+    if not is_relative_to(home, review.container_dir.resolve()):
+        raise ReviewError("Claude Keychain broker requires a helper-owned HOME")
+    broker_dir = review.container_dir.resolve() / "claude-runtime" / "keychain-broker"
+    broker_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    broker = broker_dir / "security"
+    broker.unlink(missing_ok=True)
+    stdout_path = broker_dir / "build.stdout.log"
+    stderr_path = broker_dir / "build.stderr.log"
+    completed = run(
+        (
+            str(compiler),
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wno-deprecated-declarations",
+            str(CLAUDE_KEYCHAIN_BROKER_SOURCE),
+            "-o",
+            str(broker),
+        ),
+        cwd=broker_dir,
+        env=child_environment(container_dir=review.container_dir),
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        timeout_seconds=CLAUDE_KEYCHAIN_BROKER_TIMEOUT_SECONDS,
+        output_file_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise ReviewError(
+            "failed to build the Claude Keychain broker"
+            + (f": {detail}" if detail else "")
+        )
+    broker.chmod(0o700)
+    _native_macho_dependencies(broker, label="Claude Keychain broker")
+    result["USER"] = _claude_keychain_account()
+    result["PATH"] = os.pathsep.join(
+        value for value in (str(broker_dir), result.get("PATH")) if value
+    )
+    return result
+
+
+def _read_claude_keychain_credential(
+    review: ReviewWorkspace,
+) -> bytearray | None:
+    client = CLAUDE_KEYCHAIN_CLIENT
+    if not client.is_file() or not os.access(client, os.X_OK):
+        raise ClaudeKeychainBrokerUnavailable(
+            "Claude local-login review requires /usr/bin/security"
+        )
+    account = _claude_keychain_account()
+    security_env = child_environment(container_dir=review.container_dir)
+    security_env["USER"] = account
+    try:
+        completed = subprocess.run(
+            (
+                str(client),
+                "find-generic-password",
+                "-a",
+                account,
+                "-w",
+                "-s",
+                CLAUDE_KEYCHAIN_SERVICE,
+            ),
+            cwd=review.container_dir,
+            env=security_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise ReviewTimeoutError("Claude Keychain query timed out") from error
+    except OSError as error:
+        raise ReviewError(f"Claude Keychain query failed: {error}") from error
+    if (
+        len(completed.stdout) > CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES
+        or len(completed.stderr) > CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES
+    ):
+        completed.stdout = b""
+        raise ReviewError("Claude Keychain query exceeded its output limit")
+    if completed.returncode != 0:
+        completed.stdout = b""
+        return None
+    credential = bytearray(completed.stdout.strip())
+    completed.stdout = b""
+    if not credential:
+        return None
+    return credential
+
+
+class _ClaudeKeychainCredentialHandler(socketserver.BaseRequestHandler):
+    def handle(self) -> None:
+        server = self.server
+        if not isinstance(server, _ClaudeKeychainCredentialServer):
+            return
+        self.request.settimeout(2.0)
+        capability = bytearray()
+        try:
+            while len(capability) < CLAUDE_KEYCHAIN_BROKER_CAPABILITY_BYTES:
+                chunk = self.request.recv(
+                    CLAUDE_KEYCHAIN_BROKER_CAPABILITY_BYTES - len(capability)
+                )
+                if not chunk:
+                    return
+                capability.extend(chunk)
+        except OSError:
+            return
+        authorized = hmac.compare_digest(capability, server.capability)
+        capability[:] = b"\x00" * len(capability)
+        if not authorized:
+            return
+        with server.credential_lock:
+            if server.consumed:
+                credential = b""
+            else:
+                server.consumed = True
+                credential = bytes(server.credential or b"")
+        try:
+            self.request.sendall(struct.pack("!I", len(credential)))
+            if credential:
+                self.request.sendall(credential)
+        except OSError:
+            return
+
+
+class _ClaudeKeychainCredentialServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, credential: bytearray | None, capability: bytes) -> None:
+        super().__init__(("127.0.0.1", 0), _ClaudeKeychainCredentialHandler)
+        self.credential = credential
+        self.capability = capability
+        self.credential_lock = threading.Lock()
+        self.consumed = False
+
+
+@contextlib.contextmanager
+def _claude_keychain_credential_server(
+    credential: bytearray | None,
+    capability: bytes,
+) -> Iterator[int]:
+    if len(capability) != CLAUDE_KEYCHAIN_BROKER_CAPABILITY_BYTES:
+        raise ReviewError("Claude Keychain broker capability has an invalid length")
+    server = _ClaudeKeychainCredentialServer(credential, capability)
+    thread = threading.Thread(
+        target=server.serve_forever,
+        daemon=True,
+        name="claude-review-keychain-broker",
+    )
+    thread.start()
+    try:
+        yield int(server.server_address[1])
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+        if credential is not None:
+            credential[:] = b"\x00" * len(credential)
+
+
+@contextlib.contextmanager
+def _claude_keychain_runtime(
+    review: ReviewWorkspace,
+    env: dict[str, str],
+) -> Iterator[dict[str, str]]:
+    result = dict(env)
+    if result.get("ANTHROPIC_API_KEY"):
+        yield result
+        return
+    credential = _read_claude_keychain_credential(review)
+    capability = secrets.token_bytes(CLAUDE_KEYCHAIN_BROKER_CAPABILITY_BYTES)
+    with _claude_keychain_credential_server(credential, capability) as port:
+        result[CLAUDE_KEYCHAIN_BROKER_PORT_ENV] = str(port)
+        result[CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV] = capability.hex()
+        yield result
+
+
+def _extract_ca_certificates(data: bytes, *, source: str) -> bytes:
+    if CLAUDE_PRIVATE_KEY_MARKER.search(data):
+        raise ReviewError(f"Claude review CA source contains a private key: {source}")
+    blocks = CLAUDE_CERTIFICATE_BLOCK.findall(data)
+    if not blocks:
+        raise ReviewError(f"Claude review CA source contains no PEM certificate: {source}")
+    return b"\n".join(block.strip() for block in blocks) + b"\n"
+
+
+def _read_ca_source(path: pathlib.Path, *, source: str) -> bytes:
+    try:
+        size = path.stat().st_size
+    except OSError as error:
+        raise ReviewError(f"cannot inspect Claude review CA source {source}: {error}") from error
+    if size > CLAUDE_CA_FILE_LIMIT_BYTES:
+        raise ReviewError(f"Claude review CA source exceeds the size limit: {source}")
+    try:
+        data = path.read_bytes()
+    except OSError as error:
+        raise ReviewError(f"cannot read Claude review CA source {source}: {error}") from error
+    return _extract_ca_certificates(data, source=source)
+
+
+def _write_private_ca_file(path: pathlib.Path, data: bytes) -> None:
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary_path = pathlib.Path(temporary)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temporary_path.unlink()
+
+
+def _validate_ca_file(path: pathlib.Path) -> None:
+    try:
+        ssl.create_default_context(cafile=str(path))
+    except (OSError, ssl.SSLError) as error:
+        raise ReviewError(f"Claude review CA bundle is invalid: {path.name}") from error
+
+
+def _prepare_claude_tls_environment(
+    review: ReviewWorkspace,
+    env: dict[str, str],
+) -> dict[str, str]:
+    result = dict(env)
+    ca_root = review.container_dir / "claude-ca"
+    ca_root.mkdir(mode=0o700, exist_ok=True)
+    if ca_root.is_symlink() or not ca_root.is_dir():
+        raise ReviewError("Claude review CA directory is not a real directory")
+    for key in CLAUDE_TLS_FILE_ENV_KEYS:
+        raw = result.get(key)
+        if not raw:
+            continue
+        source_path = pathlib.Path(raw)
+        if not source_path.is_absolute() or not source_path.is_file():
+            raise ReviewError(f"Claude review requires valid absolute {key}")
+        destination = ca_root / f"{key.lower()}.pem"
+        _write_private_ca_file(
+            destination,
+            _read_ca_source(source_path, source=key),
+        )
+        _validate_ca_file(destination)
+        result[key] = str(destination)
+
+    for key in CLAUDE_TLS_DIR_ENV_KEYS:
+        raw_entries = [entry for entry in result.get(key, "").split(os.pathsep) if entry]
+        if not raw_entries:
+            continue
+        destination_root = pathlib.Path(
+            tempfile.mkdtemp(prefix=f"{key.lower()}-", dir=ca_root)
+        )
+        prepared_dirs: list[pathlib.Path] = []
+        total_size = 0
+        entry_count = 0
+        for index, raw in enumerate(raw_entries):
+            source_dir = pathlib.Path(raw)
+            if not source_dir.is_absolute() or not source_dir.is_dir():
+                raise ReviewError(
+                    f"Claude review requires valid absolute {key} entries"
+                )
+            destination_dir = destination_root / f"{index:04d}"
+            destination_dir.mkdir(mode=0o700)
+            copied = False
+            for source_path in sorted(source_dir.iterdir(), key=lambda path: path.name):
+                if not source_path.is_file():
+                    continue
+                entry_count += 1
+                if entry_count > CLAUDE_CA_DIR_ENTRY_LIMIT:
+                    raise ReviewError("Claude review CA directory has too many entries")
+                try:
+                    source_size = source_path.stat().st_size
+                except OSError as error:
+                    raise ReviewError(
+                        f"cannot inspect Claude review CA directory entry: {error}"
+                    ) from error
+                total_size += source_size
+                if total_size > CLAUDE_CA_DIR_LIMIT_BYTES:
+                    raise ReviewError("Claude review CA directory exceeds the size limit")
+                try:
+                    material = _read_ca_source(source_path, source=key)
+                except ReviewError as error:
+                    if "contains no PEM certificate" in str(error):
+                        continue
+                    raise
+                destination = destination_dir / source_path.name
+                _write_private_ca_file(destination, material)
+                _validate_ca_file(destination)
+                copied = True
+            if copied:
+                prepared_dirs.append(destination_dir)
+            else:
+                destination_dir.rmdir()
+        if not prepared_dirs:
+            raise ReviewError("Claude review CA directory contains no PEM certificates")
+        result[key] = os.pathsep.join(str(path) for path in prepared_dirs)
+    return result
+
+
+def _read_proxy_headers(sock: socket.socket) -> bytes:
+    data = bytearray()
+    while b"\r\n\r\n" not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        data.extend(chunk)
+        if len(data) > CLAUDE_PROXY_HEADER_LIMIT_BYTES:
+            raise ReviewError("Claude review proxy headers exceeded the size limit")
+    return bytes(data)
+
+
+def _upstream_proxy_url(env: dict[str, str]) -> str | None:
+    for key in (
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ):
+        value = env.get(key)
+        if value:
+            return value
+    return None
+
+
+def _proxy_ssl_context(env: dict[str, str]) -> ssl.SSLContext:
+    cafile = next(
+        (
+            env[key]
+            for key in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
+            if env.get(key)
+        ),
+        None,
+    )
+    context = ssl.create_default_context(cafile=cafile)
+    for raw in env.get("SSL_CERT_DIR", "").split(os.pathsep):
+        if raw:
+            context.load_verify_locations(capath=raw)
+    return context
+
+
+def _open_proxy_target(
+    host: str,
+    port: int,
+    *,
+    env: dict[str, str],
+) -> socket.socket:
+    upstream_url = _upstream_proxy_url(env)
+    if upstream_url is None:
+        return socket.create_connection(
+            (host, port),
+            timeout=CLAUDE_PROXY_CONNECT_TIMEOUT_SECONDS,
+        )
+    parsed = urllib.parse.urlsplit(upstream_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ReviewError(
+            "Claude review proxy supports only HTTP(S) upstream proxies"
+        )
+    proxy_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    connection = socket.create_connection(
+        (parsed.hostname, proxy_port),
+        timeout=CLAUDE_PROXY_CONNECT_TIMEOUT_SECONDS,
+    )
+    if parsed.scheme == "https":
+        connection = _proxy_ssl_context(env).wrap_socket(
+            connection,
+            server_hostname=parsed.hostname,
+        )
+    headers = [
+        f"CONNECT {host}:{port} HTTP/1.1",
+        f"Host: {host}:{port}",
+    ]
+    if parsed.username is not None:
+        username = urllib.parse.unquote(parsed.username)
+        password = urllib.parse.unquote(parsed.password or "")
+        token = base64.b64encode(f"{username}:{password}".encode()).decode("ascii")
+        headers.append(f"Proxy-Authorization: Basic {token}")
+    connection.sendall(("\r\n".join(headers) + "\r\n\r\n").encode("ascii"))
+    response = _read_proxy_headers(connection)
+    status_line = response.split(b"\r\n", 1)[0]
+    if not re.fullmatch(rb"HTTP/1\.[01] 2\d\d(?: .*)?", status_line):
+        connection.close()
+        raise ReviewError("upstream proxy refused the Anthropic CONNECT request")
+    return connection
+
+
+def _parse_connect_target(authority: str) -> tuple[str, int] | None:
+    try:
+        parsed = urllib.parse.urlsplit(f"//{authority}")
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if host is None or port is None:
+        return None
+    return host.lower().rstrip("."), port
+
+
+def _tunnel_proxy_sockets(client: socket.socket, upstream: socket.socket) -> None:
+    sockets = (client, upstream)
+    for current in sockets:
+        current.settimeout(None)
+    while True:
+        readable, _, _ = select.select(sockets, (), (), 1.0)
+        for current in readable:
+            data = current.recv(64 * 1024)
+            if not data:
+                return
+            target = upstream if current is client else client
+            target.sendall(data)
+
+
+class _ClaudeProxyHandler(socketserver.BaseRequestHandler):
+    def handle(self) -> None:
+        client = self.request
+        client.settimeout(CLAUDE_PROXY_CONNECT_TIMEOUT_SECONDS)
+        upstream: socket.socket | None = None
+        try:
+            headers = _read_proxy_headers(client)
+            request_line = headers.split(b"\r\n", 1)[0].decode(
+                "ascii", errors="replace"
+            )
+            parts = request_line.split()
+            target = (
+                _parse_connect_target(parts[1])
+                if len(parts) == 3 and parts[0].upper() == "CONNECT"
+                else None
+            )
+            server = self.server
+            if not isinstance(server, _ClaudeProxyServer):
+                raise ReviewError("invalid Claude review proxy server")
+            if target not in server.allowed_targets:
+                client.sendall(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
+                return
+            upstream = _open_proxy_target(*target, env=server.upstream_env)
+            client.sendall(
+                b"HTTP/1.1 200 Connection Established\r\nConnection: close\r\n\r\n"
+            )
+            _tunnel_proxy_sockets(client, upstream)
+        except (OSError, ReviewError):
+            with contextlib.suppress(OSError):
+                client.sendall(
+                    b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n"
+                )
+        finally:
+            if upstream is not None:
+                upstream.close()
+
+
+class _ClaudeProxyServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    allow_reuse_address = False
+    daemon_threads = True
+
+    def __init__(
+        self,
+        *,
+        allowed_targets: frozenset[tuple[str, int]],
+        upstream_env: dict[str, str],
+    ) -> None:
+        self.allowed_targets = allowed_targets
+        self.upstream_env = dict(upstream_env)
+        super().__init__(("127.0.0.1", 0), _ClaudeProxyHandler)
+
+
+@contextlib.contextmanager
+def _claude_connect_proxy(
+    env: dict[str, str],
+    *,
+    allowed_targets: frozenset[tuple[str, int]] = CLAUDE_PROXY_TARGETS,
+) -> Iterator[int]:
+    server = _ClaudeProxyServer(
+        allowed_targets=allowed_targets,
+        upstream_env=env,
+    )
+    thread = threading.Thread(
+        target=server.serve_forever,
+        name="claude-review-connect-proxy",
+        daemon=True,
+    )
+    thread.start()
+    try:
+        yield int(server.server_address[1])
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+
+def _with_claude_proxy_environment(
+    env: dict[str, str],
+    port: int,
+) -> dict[str, str]:
+    result = dict(env)
+    proxy_url = f"http://127.0.0.1:{port}"
+    for key in (
+        "ALL_PROXY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "all_proxy",
+        "http_proxy",
+        "https_proxy",
+    ):
+        result[key] = proxy_url
+    result["NO_PROXY"] = ""
+    result["no_proxy"] = ""
+    return result
 
 
 def _review_environment(
@@ -272,7 +926,7 @@ def _claude_probe_command(
         "-p",
         _claude_probe_sandbox_profile(executable, probe_cwd),
         str(executable),
-        "--bare",
+        "--safe-mode",
         *args,
     )
 
@@ -285,7 +939,7 @@ def _claude_probe_sandbox_profile(
     executable: pathlib.Path,
     probe_cwd: pathlib.Path,
 ) -> str:
-    dependencies = reviewer_executable_dependencies(executable)
+    dependencies = _native_macho_dependencies(executable, label="Claude Code")
     host_home = pathlib.Path(
         os.environ.get("HOME", str(pathlib.Path.home()))
     ).expanduser().resolve()
@@ -351,6 +1005,192 @@ def _claude_probe_sandbox_profile(
     )
 
 
+def _claude_review_sandbox_profile(
+    executable: pathlib.Path,
+    review: ReviewWorkspace,
+    env: dict[str, str],
+    *,
+    proxy_port: int,
+) -> str:
+    dependencies = _native_macho_dependencies(executable, label="Claude Code")
+    dependency_roots = {path.parent.resolve() for path in dependencies}
+    home_raw = env.get("HOME")
+    tmp_raw = env.get("TMPDIR")
+    if not home_raw or not tmp_raw:
+        raise ReviewError("Claude Code review sandbox requires HOME and TMPDIR")
+    if not 1 <= proxy_port <= 65535:
+        raise ReviewError("Claude Code review sandbox requires a valid proxy port")
+    home = pathlib.Path(home_raw).resolve()
+    tmp = pathlib.Path(tmp_raw).resolve()
+    container = review.container_dir.resolve()
+    if not is_relative_to(home, container) or not is_relative_to(tmp, container):
+        raise ReviewError(
+            "Claude Code review sandbox requires helper-owned HOME and TMPDIR"
+        )
+    tls_files: set[pathlib.Path] = set()
+    for key in CLAUDE_TLS_FILE_ENV_KEYS:
+        raw = env.get(key)
+        if not raw:
+            continue
+        path = pathlib.Path(raw)
+        if not path.is_absolute() or not path.is_file():
+            raise ReviewError(f"Claude Code review sandbox requires valid absolute {key}")
+        resolved = path.resolve()
+        if not is_relative_to(resolved, container):
+            raise ReviewError(
+                f"Claude Code review sandbox requires helper-owned {key}"
+            )
+        tls_files.update((path.absolute(), resolved))
+    tls_dirs: set[pathlib.Path] = set()
+    for key in CLAUDE_TLS_DIR_ENV_KEYS:
+        for raw in env.get(key, "").split(os.pathsep):
+            if not raw:
+                continue
+            path = pathlib.Path(raw)
+            if not path.is_absolute() or not path.is_dir():
+                raise ReviewError(
+                    f"Claude Code review sandbox requires valid absolute {key} entries"
+                )
+            resolved = path.resolve()
+            if not is_relative_to(resolved, container):
+                raise ReviewError(
+                    f"Claude Code review sandbox requires helper-owned {key} entries"
+                )
+            tls_dirs.update((path.absolute(), resolved))
+    auth_executables: tuple[pathlib.Path, ...] = ()
+    keychain_broker_port: int | None = None
+    if not env.get("ANTHROPIC_API_KEY"):
+        broker_dir = container / "claude-runtime" / "keychain-broker"
+        security_candidate = next(
+            (
+                pathlib.Path(entry) / "security"
+                for entry in env.get("PATH", "").split(os.pathsep)
+                if entry
+                and (pathlib.Path(entry) / "security").is_file()
+                and os.access(pathlib.Path(entry) / "security", os.X_OK)
+            ),
+            None,
+        )
+        if (
+            security_candidate is None
+            or security_candidate.resolve() != (broker_dir / "security").resolve()
+        ):
+            raise ReviewError(
+                "Claude local-login sandbox requires the restricted Keychain broker"
+            )
+        auth_executables = _native_macho_dependencies(
+            broker_dir / "security",
+            label="Claude Keychain broker",
+        )
+        if any(not is_relative_to(path.resolve(), container) for path in auth_executables):
+            raise ReviewError("Claude Keychain broker must be helper-owned")
+        try:
+            keychain_broker_port = int(env[CLAUDE_KEYCHAIN_BROKER_PORT_ENV])
+        except (KeyError, ValueError) as error:
+            raise ReviewError(
+                "Claude local-login sandbox requires a valid Keychain broker port"
+            ) from error
+        if not 1 <= keychain_broker_port <= 65535:
+            raise ReviewError(
+                "Claude local-login sandbox requires a valid Keychain broker port"
+            )
+        if not CLAUDE_KEYCHAIN_BROKER_CAPABILITY.fullmatch(
+            env.get(CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV, "")
+        ):
+            raise ReviewError(
+                "Claude local-login sandbox requires a valid Keychain broker capability"
+            )
+    rg_candidate = next(
+        (
+            path
+            for path in CLAUDE_REVIEW_TOOL_EXECUTABLE_CANDIDATES
+            if path.is_file() and os.access(path, os.X_OK)
+        ),
+        None,
+    )
+    if rg_candidate is None:
+        raise ReviewError("Claude Code Grep sandbox requires ripgrep in a trusted path")
+    tool_executables = _native_macho_dependencies(rg_candidate, label="ripgrep")
+    tool_library_subpaths = {
+        candidate
+        for path in CLAUDE_REVIEW_TOOL_LIBRARY_SUBPATH_CANDIDATES
+        if path.is_dir()
+        for candidate in (path.absolute(), path.resolve())
+    }
+    read_subpaths = {
+        review.workspace_root.resolve(),
+        home,
+        tmp,
+        pathlib.Path("/private/etc/ssl"),
+        *(path.resolve() for path in CLAUDE_PROBE_SYSTEM_READ_SUBPATHS),
+        *dependency_roots,
+        *tool_library_subpaths,
+        *tls_dirs,
+    }
+    read_files = {
+        *(path.resolve() for path in CLAUDE_PROBE_SYSTEM_READ_LITERALS),
+        *dependencies,
+        *auth_executables,
+        *tool_executables,
+        *tls_files,
+        pathlib.Path("/private/var/db/mds/system/mdsDirectory.db"),
+        pathlib.Path("/private/var/db/mds/system/mdsObject.db"),
+    }
+    metadata_paths: set[pathlib.Path] = set()
+    for path in {*read_files, *read_subpaths}:
+        current = path
+        while True:
+            metadata_paths.add(current)
+            if current.parent == current:
+                break
+            current = current.parent
+    read_filters = "".join(
+        [
+            *(
+                _sandbox_path_filter("literal", path)
+                for path in sorted(read_files, key=str)
+            ),
+            *(
+                _sandbox_path_filter("subpath", path)
+                for path in sorted(read_subpaths, key=str)
+            ),
+        ]
+    )
+    metadata_filters = "".join(
+        _sandbox_path_filter("literal", path)
+        for path in sorted(metadata_paths, key=str)
+    )
+    exec_filters = "".join(
+        _sandbox_path_filter("literal", path)
+        for path in sorted(
+            (*dependencies, *auth_executables, *tool_executables),
+            key=str,
+        )
+    )
+    write_filters = "".join(
+        _sandbox_path_filter("subpath", path) for path in sorted((home, tmp), key=str)
+    )
+    mach_filters = "".join(
+        f"(global-name {json.dumps(name)})"
+        for name in CLAUDE_REVIEW_BASE_MACH_SERVICES
+    )
+    network_filters = f'(remote ip "localhost:{proxy_port}")'
+    if keychain_broker_port is not None:
+        network_filters += f'(remote ip "localhost:{keychain_broker_port}")'
+    return (
+        CLAUDE_PROBE_SANDBOX_PROFILE
+        + f"(allow file-read-metadata {metadata_filters})"
+        + f"(allow file-read* {read_filters})"
+        + f"(allow file-write* {write_filters})"
+        + f"(allow process-exec {exec_filters})"
+        + "(allow process-fork)"
+        + f"(allow mach-lookup {mach_filters})"
+        + f"(allow network-outbound {network_filters})"
+        + "(allow ipc-posix-shm-read*)"
+        + "(allow sysctl-read)"
+    )
+
+
 def _claude_probe_cwd(env: dict[str, str]) -> pathlib.Path:
     raw_home = env.get("HOME")
     if not raw_home:
@@ -395,7 +1235,7 @@ def _require_claude_identity(
         )
 
 
-def _require_claude_bare_mode(
+def _require_claude_safe_mode(
     executable: pathlib.Path,
     env: dict[str, str],
 ) -> None:
@@ -405,13 +1245,13 @@ def _require_claude_bare_mode(
     )
     if (
         completed.returncode != 0
-        or len(CLAUDE_BARE_TOKEN.findall(help_text.lower())) != 1
-        or _claude_help_option_blocks(help_text, "--bare")
-        != (CLAUDE_BARE_MODE_HELP_FORM,)
+        or len(CLAUDE_SAFE_MODE_TOKEN.findall(help_text.lower())) != 1
+        or _claude_help_option_blocks(help_text, "--safe-mode")
+        != (CLAUDE_SAFE_MODE_HELP_FORM,)
     ):
         raise InvalidReviewerExecutable(
-            "Claude Code does not expose a uniquely verifiable --bare mode that "
-            "skips hooks and other project customizations"
+            "Claude Code does not expose a uniquely verifiable --safe-mode that "
+            "disables hooks and other local customizations while preserving authentication"
         )
 
 
@@ -1245,18 +2085,23 @@ def _resolve_validated_claude_executable(
     prepared_env = dict(env)
     prepared_env["HOME"] = str(claude_home)
     prepared_env.pop("XDG_CONFIG_HOME", None)
+    probe_home = review.container_dir / "claude-probe-home"
+    probe_home.mkdir(parents=True, exist_ok=True)
     probe_env = {
         key: value
         for key, value in prepared_env.items()
         if key != "ANTHROPIC_API_KEY"
         and not key.startswith("CODEX_ISOLATED_REVIEW_")
     }
+    probe_env["HOME"] = str(probe_home)
+    probe_env.pop("XDG_CONFIG_HOME", None)
 
     def validate_candidate(candidate: pathlib.Path) -> None:
         candidate_env = dict(probe_env)
         candidate_env["PATH"] = reviewer_executable_path(candidate)
+        _native_macho_dependencies(candidate, label="Claude Code")
         _require_claude_identity(candidate, candidate_env)
-        _require_claude_bare_mode(candidate, candidate_env)
+        _require_claude_safe_mode(candidate, candidate_env)
 
     executable = resolve_reviewer_executable(
         "claude", candidate_validator=validate_candidate
@@ -1281,6 +2126,7 @@ def _claude_attempt(
         raise FileNotFoundError(
             "claude is not available in a validated executable path"
         )
+    env = _prepare_claude_tls_environment(review, env)
     stdout_path, stderr_path = _attempt_paths(review, index, "claude", model)
     settings = json.dumps(
         {
@@ -1302,44 +2148,56 @@ def _claude_attempt(
         },
         separators=(",", ":"),
     )
-    completed = run(
-        (
-            str(executable),
-            "--print",
-            "--model",
-            model,
-            "--effort",
-            CLAUDE_REASONING_EFFORT,
-            "--permission-mode",
-            "dontAsk",
-            "--output-format",
-            "json",
-            "--no-session-persistence",
-            "--bare",
-            "--no-chrome",
-            "--disable-slash-commands",
-            "--strict-mcp-config",
-            "--mcp-config",
-            "{}",
-            "--setting-sources",
-            "",
-            "--settings",
-            settings,
-            "--tools",
-            "Read,Grep,Glob",
-            "--allowedTools",
-            "Read(./**)",
-            "--disallowedTools",
-            "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Task",
-        ),
-        cwd=review.workspace_root,
-        env=env,
-        stdin=review.prompt_file.read_bytes(),
-        stdout_path=stdout_path,
-        stderr_path=stderr_path,
-        timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
-        output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
-    )
+    with contextlib.ExitStack() as stack:
+        env = stack.enter_context(_claude_keychain_runtime(review, env))
+        proxy_port = stack.enter_context(_claude_connect_proxy(env))
+        review_env = _with_claude_proxy_environment(env, proxy_port)
+        completed = run(
+            (
+                str(CLAUDE_PROBE_SANDBOX),
+                "-p",
+                _claude_review_sandbox_profile(
+                    executable,
+                    review,
+                    review_env,
+                    proxy_port=proxy_port,
+                ),
+                str(executable),
+                "--print",
+                "--model",
+                model,
+                "--effort",
+                CLAUDE_REASONING_EFFORT,
+                "--permission-mode",
+                "dontAsk",
+                "--output-format",
+                "json",
+                "--no-session-persistence",
+                "--safe-mode",
+                "--no-chrome",
+                "--disable-slash-commands",
+                "--strict-mcp-config",
+                "--mcp-config",
+                "{}",
+                "--setting-sources",
+                "",
+                "--settings",
+                settings,
+                "--tools",
+                "Read,Grep,Glob",
+                "--allowedTools",
+                "Read(./**)",
+                "--disallowedTools",
+                "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Task",
+            ),
+            cwd=review.workspace_root,
+            env=review_env,
+            stdin=review.prompt_file.read_bytes(),
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
+            output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
+        )
     final_text, effective_model = _parse_claude_output(
         completed.stdout, requested_model=model
     )
@@ -1682,11 +2540,13 @@ def run_review(
             env=claude_env,
         )
         claude_available = claude_executable is not None
-    except ClaudeProbeSandboxUnavailable as error:
+        if claude_available:
+            claude_env = _prepare_claude_keychain_broker(review, claude_env)
+    except (ClaudeProbeSandboxUnavailable, ClaudeKeychainBrokerUnavailable) as error:
         claude_available = False
         write_text_atomic(
             review.container_dir / "claude-skip.txt",
-            f"Claude Code probe runtime is unavailable: {error}\n",
+            f"Claude Code secure runtime is unavailable: {error}\n",
         )
     except (
         FileNotFoundError,
@@ -1709,14 +2569,6 @@ def run_review(
         )
         write_json(review.container_dir / "attempts.json", [])
         return Outcome(2, None, tuple(attempts))
-    if claude_available:
-        if not claude_env.get("ANTHROPIC_API_KEY"):
-            claude_available = False
-            write_text_atomic(
-                review.container_dir / "claude-skip.txt",
-                "Claude Code bare mode requires ANTHROPIC_API_KEY; OAuth and "
-                "keychain authentication are intentionally unavailable in bare mode.\n",
-            )
     if claude_available:
         try:
             category, final_text = _run_model_chain(
@@ -1751,13 +2603,13 @@ def run_review(
             return Outcome(2, None, tuple(attempts))
         if final_text:
             return _finish(review, attempts, final_text)
-        if category not in {"entitlement", "unavailable"}:
+        if category not in {"auth", "entitlement", "unavailable"}:
             return _finish(review, attempts, None)
 
     if egress_consent not in COPILOT_EGRESS_CONSENTS:
         write_text_atomic(
             review.container_dir / "runner-error.txt",
-            "Claude Code was unavailable, lacked bare-mode API-key authentication, "
+            "Claude Code was unavailable, lacked usable local/API authentication, "
             "or lacked model entitlement, but "
             "explicit-claude-review does not authorize GitHub Copilot fallback.\n",
         )
@@ -1776,7 +2628,7 @@ def run_review(
     if not copilot_available:
         write_text_atomic(
             review.container_dir / "runner-error.txt",
-            "Claude Code was unavailable, lacked bare-mode API-key authentication, "
+            "Claude Code was unavailable, lacked usable local/API authentication, "
             "or lacked model entitlement, and Copilot CLI is unavailable.\n",
         )
         return _finish(review, attempts, None)

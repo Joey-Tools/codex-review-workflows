@@ -55,6 +55,19 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(reviewer["model"], "gpt-5.6-sol")
         self.assertEqual(reviewer["model_reasoning_effort"], "xhigh")
 
+    def test_claude_policy_defaults_to_local_login_in_safe_mode(self) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        helper_contract = (SKILL_ROOT / "references/helper-contract.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("ordinary local Claude login by default", skill)
+        self.assertIn("runs in safe mode", helper_contract)
+        self.assertIn("separate default-deny `sandbox-exec` profile", helper_contract)
+        self.assertIn("ordinary macOS OAuth/keychain login", helper_contract)
+        self.assertIn("localhost CONNECT proxy", helper_contract)
+        self.assertNotIn("requires `ANTHROPIC_API_KEY`", skill)
+
     def test_ci_targets_only_the_canonical_runtime_and_tests(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self.assertIn("review-orchestration-playbook/tests", workflow)
