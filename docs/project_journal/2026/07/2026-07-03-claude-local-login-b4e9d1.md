@@ -19,7 +19,7 @@ superseded_by:
 ## Current State
 
 - Claude Code runs with verified `--safe-mode`, restricted read-only tools, disabled setting sources, an isolated home, a capability-authenticated memory-only parent query plus native broker restricted to Claude's current-account Keychain item, and an Anthropic-only local CONNECT proxy.
-- Claude Code and trusted `rg` must be native Mach-O executables; script or wrapper installations are rejected before an interpreter can enter the sandbox execution allowlist.
+- Claude Code and trusted `rg` must be native Mach-O executables; script or wrapper installations are rejected, and the final sandbox reads the Claude executable only by exact path rather than exposing its parent directory.
 - Custom CA environment paths are reduced to validated certificate-only copies under the helper container before entering the sandbox, with distinct source directories kept separate.
 - Uppercase and lowercase corporate proxy variables are preserved before Claude is routed through the helper-owned local proxy.
 - Missing Claude authentication can fall back to GitHub Copilot only for explicitly authorized double or triple reviews.

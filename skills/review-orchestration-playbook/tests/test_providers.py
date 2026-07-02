@@ -2987,6 +2987,34 @@ class ProviderPolicyTest(unittest.TestCase):
         "CLAUDE_REVIEW_TOOL_EXECUTABLE_CANDIDATES",
         (pathlib.Path("/bin/echo"),),
     )
+    def test_claude_review_sandbox_reads_only_exact_executable(self) -> None:
+        install_dir = self.review.source_root / "private-install"
+        install_dir.mkdir()
+        executable = install_dir / "claude"
+        executable.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 32)
+        executable.chmod(0o700)
+
+        profile = providers._claude_review_sandbox_profile(
+            executable,
+            self.review,
+            {
+                "HOME": str(self.review.container_dir / "claude-home"),
+                "TMPDIR": str(self.review.container_dir / "tmp"),
+                "PATH": str(self.claude_broker.parent),
+                providers.CLAUDE_KEYCHAIN_BROKER_PORT_ENV: "43211",
+                providers.CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV: "00" * 32,
+            },
+            proxy_port=43210,
+        )
+
+        self.assertIn(f'(literal "{executable.resolve()}")', profile)
+        self.assertNotIn(f'(subpath "{install_dir.resolve()}")', profile)
+
+    @mock.patch.object(
+        providers,
+        "CLAUDE_REVIEW_TOOL_EXECUTABLE_CANDIDATES",
+        (pathlib.Path("/bin/echo"),),
+    )
     def test_claude_review_sandbox_allows_exact_custom_ca_paths(self) -> None:
         certificate = self.sample_ca_certificate()
         ca_file = self.review.source_root / "corporate-ca.pem"

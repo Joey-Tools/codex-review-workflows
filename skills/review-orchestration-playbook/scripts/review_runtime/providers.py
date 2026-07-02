@@ -1013,7 +1013,6 @@ def _claude_review_sandbox_profile(
     proxy_port: int,
 ) -> str:
     dependencies = _native_macho_dependencies(executable, label="Claude Code")
-    dependency_roots = {path.parent.resolve() for path in dependencies}
     home_raw = env.get("HOME")
     tmp_raw = env.get("TMPDIR")
     if not home_raw or not tmp_raw:
@@ -1123,7 +1122,6 @@ def _claude_review_sandbox_profile(
         tmp,
         pathlib.Path("/private/etc/ssl"),
         *(path.resolve() for path in CLAUDE_PROBE_SYSTEM_READ_SUBPATHS),
-        *dependency_roots,
         *tool_library_subpaths,
         *tls_dirs,
     }
