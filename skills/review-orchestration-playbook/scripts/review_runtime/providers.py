@@ -37,10 +37,12 @@ COPILOT_PERMISSION_HELP_FRAGMENTS = (
 )
 CLAUDE_SAFE_MODE_HELP_FRAGMENTS = (
     "--safe-mode",
-    "all customizations",
     "claude.md",
-    "disabled",
     "model selection, built-in tools, and permissions work normally",
+)
+CLAUDE_SAFE_MODE_DISABLE_PATTERN = re.compile(
+    r"--safe-mode\s+start with all customizations(?:\s+disabled\b"
+    r"|\s+\([^)]{1,2048}\)\s+disabled\b)"
 )
 CLAUDE_SAFE_MODE_ENV_PATTERN = re.compile(
     r"(?:^|[.;:]\s+)sets claude_code_safe_mode(?:=1)?(?:\.(?=\s|$)|$)"
@@ -221,6 +223,7 @@ def _require_claude_safe_mode(
         or not all(
             fragment in help_text for fragment in CLAUDE_SAFE_MODE_HELP_FRAGMENTS
         )
+        or CLAUDE_SAFE_MODE_DISABLE_PATTERN.search(help_text) is None
         or CLAUDE_SAFE_MODE_ENV_PATTERN.search(help_text) is None
     ):
         raise ReviewError(

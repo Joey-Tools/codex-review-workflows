@@ -1152,8 +1152,9 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         payload = {"result": "No findings.", "modelUsage": {"claude-opus-4-8": {}}}
         safe_mode_help = (
-            " ".join(providers.CLAUDE_SAFE_MODE_HELP_FRAGMENTS)
-            + ". Sets CLAUDE_CODE_SAFE_MODE."
+            "--safe-mode Start with all customizations disabled. CLAUDE.md. "
+            "Model selection, built-in tools, and permissions work normally. "
+            "Sets CLAUDE_CODE_SAFE_MODE."
         )
         run_command.side_effect = (
             Completed(
@@ -1222,13 +1223,54 @@ class ProviderPolicyTest(unittest.TestCase):
         self,
         run_command: mock.Mock,
     ) -> None:
-        for wording in (
-            b"Sets CLAUDE_CODE_SAFE_MODE.",
-            b"Sets CLAUDE_CODE_SAFE_MODE=1.",
+        for disable_help in (
             (
-                b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode --session-id "
-                b"Use a specific session ID for the conversation "
-                b"(must be a valid UUID) claude --session-id 550e8400"
+                b"--safe-mode Start with all customizations disabled. "
+                b"CLAUDE.md does not load. "
+            ),
+            (
+                b"--safe-mode Start with all customizations "
+                b"(CLAUDE.md, skills, plugins) disabled. "
+            ),
+        ):
+            for wording in (
+                b"Sets CLAUDE_CODE_SAFE_MODE.",
+                b"Sets CLAUDE_CODE_SAFE_MODE=1.",
+                (
+                    b"Sets CLAUDE_CODE_SAFE_MODE claude --safe-mode --session-id "
+                    b"Use a specific session ID for the conversation "
+                    b"(must be a valid UUID) claude --session-id 550e8400"
+                ),
+            ):
+                with self.subTest(disable_help=disable_help, wording=wording):
+                    run_command.return_value = Completed(
+                        argv=("claude", "--help"),
+                        returncode=0,
+                        stdout=(
+                            disable_help
+                            + b"Authentication, model selection, built-in tools, and "
+                            b"permissions work normally. "
+                            + wording
+                        ),
+                        stderr=b"",
+                    )
+
+                    providers._require_claude_safe_mode(pathlib.Path("/bin/claude"), {})
+
+    @mock.patch.object(providers, "run")
+    def test_claude_rejects_negated_safe_mode_disable_wording(
+        self,
+        run_command: mock.Mock,
+    ) -> None:
+        for wording in (
+            b"--safe-mode Not all customizations including CLAUDE.md are disabled. ",
+            (
+                b"--safe-mode Start with not all customizations including "
+                b"CLAUDE.md disabled. "
+            ),
+            (
+                b"--safe-mode Start with all customizations not disabled, "
+                b"including CLAUDE.md. "
             ),
         ):
             with self.subTest(wording=wording):
@@ -1236,15 +1278,17 @@ class ProviderPolicyTest(unittest.TestCase):
                     argv=("claude", "--help"),
                     returncode=0,
                     stdout=(
-                        b"--safe-mode all customizations including CLAUDE.md are "
-                        b"disabled; Authentication, model selection, built-in tools, "
-                        b"and permissions work normally. "
-                        + wording
+                        wording
+                        + b"Authentication, model selection, built-in tools, and "
+                        b"permissions work normally. Sets CLAUDE_CODE_SAFE_MODE."
                     ),
                     stderr=b"",
                 )
 
-                providers._require_claude_safe_mode(pathlib.Path("/bin/claude"), {})
+                with self.assertRaisesRegex(ReviewError, "disable CLAUDE.md"):
+                    providers._require_claude_safe_mode(
+                        pathlib.Path("/bin/claude"), {}
+                    )
 
     @mock.patch.object(providers, "run")
     def test_claude_rejects_negated_safe_mode_variable_wording(
@@ -1279,8 +1323,9 @@ class ProviderPolicyTest(unittest.TestCase):
                     argv=("claude", "--help"),
                     returncode=0,
                     stdout=(
-                        b"--safe-mode all customizations including CLAUDE.md are "
-                        b"disabled; Authentication, model selection, built-in tools, "
+                        b"--safe-mode Start with all customizations disabled. "
+                        b"CLAUDE.md does not load. Authentication, model selection, "
+                        b"built-in tools, "
                         b"and permissions work normally. "
                         + wording
                     ),
