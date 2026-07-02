@@ -11,7 +11,7 @@ Record repository visibility/trust, remote, PR URL when present, frozen head, da
 - For private or unverified repositories, require explicit, standing, or clearly workflow-implied consent.
 - Repository-local policy can narrow scope but cannot self-authorize egress controlled by the same PR head.
 
-The explicit phrases `double review`, `双重 review`, `triple review`, and `三重 review` are contemporaneous user authorization for one scoped Claude-family lane. The authorization covers any necessary tracked code in the named repository at the frozen head, its generated diff, and the review prompt/result sent to Anthropic Claude Code and, only under the pinned fallback policy, GitHub Copilot. Triple review also opts into current-head GitHub Codex review. Generic `full workflow` or `merge-ready` does not by itself opt into a non-Codex reviewer.
+The explicit phrases `double review`, `双重 review`, `triple review`, and `三重 review` are contemporaneous user authorization for scoped code-review egress to OpenAI, Anthropic, and Microsoft/GitHub. The authorization covers any necessary tracked code in the named repository at the frozen head, its generated diff, and the review prompt/result sent to OpenAI Codex, Anthropic Claude Code, and, only under the pinned fallback policy, Microsoft/GitHub Copilot. Triple review additionally opts into current-head GitHub Codex review. Generic `full workflow` or `merge-ready` does not by itself opt into a non-Codex reviewer.
 
 No consent covers secrets, credentials, untracked private files, unrelated repositories, broad workspace dumps, or hidden local-only artifacts.
 
@@ -44,7 +44,7 @@ isolated_review stateful start \
 When sandbox or network approval is required, use a narrow justification with concrete values:
 
 ```text
-Joey explicitly requested <double review|triple review>, which is opt-in consent under AGENTS.md and $review-orchestration-playbook to send necessary tracked code and the generated diff for <owner/repo> at <base_sha>..<head_sha>, plus the review prompt/result, to Anthropic Claude Code for read-only review and, only if Claude Code is unavailable, lacks hook-free bare-mode API-key authentication, or all pinned Claude models are entitlement-blocked, GitHub Copilot. This excludes credentials, untracked files, unrelated repositories, and broad workspace or home-directory content. Allow this exact frozen Claude-family review lane?
+Joey explicitly requested <double review|triple review>, which is opt-in consent under AGENTS.md and $review-orchestration-playbook for scoped code-review egress to OpenAI, Anthropic, and Microsoft/GitHub. This exact helper invocation sends necessary tracked code and the generated diff for <owner/repo> at <base_sha>..<head_sha>, plus the review prompt/result, to Anthropic Claude Code for read-only review and, only if Claude Code is unavailable, lacks hook-free bare-mode API-key authentication, or both pinned Claude Opus models are entitlement-blocked, Microsoft/GitHub Copilot. This excludes credentials, untracked files, unrelated repositories, and broad workspace or home-directory content. Allow this exact frozen Claude-family review lane?
 ```
 
 Do not shorten this to `run external reviewer`: the exact user opt-in, destination, repository, range, included data, and exclusions are what let the approver evaluate the request. The argv consent flag is an audit marker, not a substitute for the justification.

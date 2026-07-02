@@ -1340,7 +1340,7 @@ class ProviderPolicyTest(unittest.TestCase):
     )
     @mock.patch.object(providers, "_copilot_attempt")
     @mock.patch.object(providers, "_claude_attempt")
-    def test_claude_family_order_is_sonnet_5_then_opus_on_both_runtimes(
+    def test_claude_family_order_is_opus_4_8_then_4_7_on_both_runtimes(
         self,
         claude_attempt: mock.Mock,
         copilot_attempt: mock.Mock,
@@ -1371,10 +1371,8 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(
             [(item.runtime, item.requested_model) for item in outcome.attempts],
             [
-                ("claude", "claude-sonnet-5"),
                 ("claude", "claude-opus-4-8"),
                 ("claude", "claude-opus-4-7"),
-                ("copilot", "claude-sonnet-5"),
                 ("copilot", "claude-opus-4.8"),
                 ("copilot", "claude-opus-4.7"),
             ],
