@@ -71,6 +71,41 @@ class ChildEnvironmentTest(unittest.TestCase):
 
         self.assertLessEqual(output_size, 4096)
 
+    @mock.patch.object(common.subprocess, "Popen")
+    def test_output_file_limit_requires_timeout_before_launch(
+        self, popen: mock.Mock
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with self.assertRaisesRegex(ReviewError, "requires timeout_seconds"):
+                common.run(
+                    (sys.executable, "-c", "pass"),
+                    stdout_path=root / "stdout.log",
+                    stderr_path=root / "stderr.log",
+                    output_file_limit_bytes=4096,
+                )
+
+        popen.assert_not_called()
+
+    @mock.patch.object(common.threading, "Thread")
+    def test_failed_drain_thread_start_is_not_joined(
+        self, thread_factory: mock.Mock
+    ) -> None:
+        thread = thread_factory.return_value
+        thread.start.side_effect = RuntimeError("thread start failed")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with self.assertRaisesRegex(RuntimeError, "thread start failed"):
+                common.run(
+                    (sys.executable, "-c", "pass"),
+                    stdout_path=root / "stdout.log",
+                    stderr_path=root / "stderr.log",
+                    timeout_seconds=5,
+                    output_file_limit_bytes=4096,
+                )
+
+        thread.join.assert_not_called()
+
     @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork")
     def test_logged_command_rejects_descendant_holding_output_stream(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

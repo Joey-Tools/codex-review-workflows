@@ -383,10 +383,23 @@ def _json_objects(stdout: bytes) -> list[dict[str, Any]]:
     return values
 
 
+def _strict_json_object_from_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key: {key}")
+        result[key] = value
+    return result
+
+
 def _strict_json_object(stdout: bytes) -> dict[str, Any] | None:
     try:
         text = stdout.decode("utf-8")
-        parsed = json.loads(text, parse_constant=_reject_nonstandard_json_constant)
+        parsed = json.loads(
+            text,
+            parse_constant=_reject_nonstandard_json_constant,
+            object_pairs_hook=_strict_json_object_from_pairs,
+        )
     except (UnicodeDecodeError, ValueError):
         return None
     return parsed if isinstance(parsed, dict) else None
@@ -403,7 +416,9 @@ def _strict_jsonl_objects(stdout: bytes) -> list[dict[str, Any]] | None:
             continue
         try:
             parsed = json.loads(
-                line, parse_constant=_reject_nonstandard_json_constant
+                line,
+                parse_constant=_reject_nonstandard_json_constant,
+                object_pairs_hook=_strict_json_object_from_pairs,
             )
         except ValueError:
             return None
@@ -613,15 +628,19 @@ def _parse_copilot_output(
     content = data.get("content")
     if not isinstance(content, str) or not content.strip():
         return None, None
-    usage_models = [
-        item["data"]["model"]
-        for item in turn_events[message_index + 1 :]
-        if item.get("type") == "assistant.usage"
-        and isinstance(item.get("data"), dict)
-        and not item["data"].get("parentToolCallId")
-        and isinstance(item["data"].get("model"), str)
-        and item["data"]["model"]
-    ]
+    usage_models: list[str] = []
+    for item in turn_events[message_index + 1 :]:
+        if item.get("type") != "assistant.usage":
+            continue
+        usage_data = item.get("data")
+        if not isinstance(usage_data, dict):
+            return None, None
+        if usage_data.get("parentToolCallId"):
+            continue
+        usage_model = usage_data.get("model")
+        if not isinstance(usage_model, str) or not usage_model:
+            return None, None
+        usage_models.append(usage_model)
     if usage_models and any(
         not _model_matches(usage_models[0], candidate)
         for candidate in usage_models[1:]
@@ -860,13 +879,13 @@ def _record_attempt(
         stdout_path=str(stdout_path),
         stderr_path=str(stderr_path),
     )
-    if attempt.category == "success" and (
+    if attempt.category in {"success", "entitlement"} and (
         (require_verified_model and effective_model is None)
         or (require_verified_effort and effective_effort is None)
     ):
         detail = (
-            "successful reviewer result did not expose required runtime verification "
-            "metadata; refusing to mark the pinned lane successful"
+            "reviewer result did not expose required runtime verification "
+            "metadata; refusing to accept the pinned lane result"
         )
         _append_attempt_diagnostic(stderr_path, detail)
         return replace(

@@ -163,6 +163,8 @@ def run(
         stdout_path is None or stderr_path is None
     ):
         raise ReviewError("output_file_limit_bytes requires logged output paths")
+    if output_file_limit_bytes is not None and timeout_seconds is None:
+        raise ReviewError("output_file_limit_bytes requires timeout_seconds")
     if timeout_seconds is not None and (stdout_path is None or stderr_path is None):
         raise ReviewError("timeout_seconds requires logged output paths")
     try:
@@ -399,17 +401,21 @@ def _run_logged_process(
                     output_overflow.set()
                     signal_process_group(process, signal.SIGTERM)
 
-        for stream, destination in (
-            (process.stdout, stdout_handle),
-            (process.stderr, stderr_handle),
-        ):
-            thread = threading.Thread(
-                target=drain_bounded,
-                args=(stream, destination),
-                daemon=True,
-            )
-            drain_threads.append(thread)
-            thread.start()
+        thread_start_mask = block_forwarded_signals()
+        try:
+            for stream, destination in (
+                (process.stdout, stdout_handle),
+                (process.stderr, stderr_handle),
+            ):
+                thread = threading.Thread(
+                    target=drain_bounded,
+                    args=(stream, destination),
+                    daemon=True,
+                )
+                thread.start()
+                drain_threads.append(thread)
+        finally:
+            restore_signal_mask(thread_start_mask)
         process.wait(timeout=timeout_seconds)
         leftover_process_group = _process_group_exists(process.pid)
         if leftover_process_group:

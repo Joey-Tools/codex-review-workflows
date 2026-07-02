@@ -318,6 +318,15 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertEqual(providers._parse_claude_output(stdout), (None, None))
 
+    def test_claude_rejects_duplicate_json_object_key(self) -> None:
+        stdout = (
+            b'{"type":"result","subtype":"success","is_error":true,'
+            b'"is_error":false,"result":"No findings.",'
+            b'"modelUsage":{"claude-opus-4-8":{}}}'
+        )
+
+        self.assertEqual(providers._parse_claude_output(stdout), (None, None))
+
     def test_claude_preserves_unicode_separator_at_result_edges(self) -> None:
         result = "\u2028No findings.\u2029"
         stdout = json.dumps(
@@ -449,6 +458,18 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
 
+    def test_copilot_rejects_duplicate_json_object_key(self) -> None:
+        stdout = "\n".join(
+            (
+                '{"type":"assistant.turn_start","data":{"turnId":"turn-1"}}',
+                '{"type":"assistant.message","data":{"content":"No findings.",'
+                '"model":"claude-opus-4.7","model":"claude-opus-4.8"}}',
+                '{"type":"assistant.turn_end","data":{"turnId":"turn-1"}}',
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
+
     def test_copilot_rejects_unicode_separator_only_record(self) -> None:
         stdout = (
             "\u2028\n"
@@ -552,6 +573,31 @@ class ProviderPolicyTest(unittest.TestCase):
                     },
                 },
                 {"type": "assistant.message", "data": None},
+                {
+                    "type": "assistant.turn_end",
+                    "data": {"turnId": "turn-1"},
+                },
+            )
+        ).encode()
+
+        self.assertEqual(providers._parse_copilot_output(stdout), (None, None))
+
+    def test_copilot_rejects_malformed_terminal_usage_event(self) -> None:
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                {
+                    "type": "assistant.turn_start",
+                    "data": {"turnId": "turn-1"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {
+                        "content": "No findings.",
+                        "model": "claude-opus-4.8",
+                    },
+                },
+                {"type": "assistant.usage", "data": {"model": None}},
                 {
                     "type": "assistant.turn_end",
                     "data": {"turnId": "turn-1"},
@@ -1328,6 +1374,38 @@ class ProviderPolicyTest(unittest.TestCase):
             require_verified_model=True,
             require_verified_effort=True,
         )
+        self.assertEqual(attempt.category, "runtime-unverified")
+        self.assertIsNone(attempt.final_text)
+
+    def test_entitlement_without_verified_model_cannot_authorize_fallback(
+        self,
+    ) -> None:
+        completed = Completed(
+            argv=("copilot",),
+            returncode=1,
+            stdout=json.dumps(
+                {
+                    "type": "turn.failed",
+                    "error": {
+                        "message": "Model is not available for your account"
+                    },
+                }
+            ).encode(),
+            stderr=b"",
+        )
+        attempt = providers._record_attempt(
+            review=self.review,
+            index=1,
+            runtime="copilot",
+            model="claude-opus-4.8",
+            completed=completed,
+            final_text=None,
+            effective_model=None,
+            requested_effort="max",
+            effective_effort=None,
+            require_verified_model=True,
+        )
+
         self.assertEqual(attempt.category, "runtime-unverified")
         self.assertIsNone(attempt.final_text)
 
