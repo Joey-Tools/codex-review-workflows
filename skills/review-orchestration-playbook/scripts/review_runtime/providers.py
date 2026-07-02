@@ -26,6 +26,7 @@ from typing import Any, Callable, Iterable, Iterator
 from .common import (
     Completed,
     InvalidReviewerExecutable,
+    RejectedReviewerCandidates,
     ReviewError,
     ReviewOutputDrainError,
     ReviewOutputLimitError,
@@ -285,6 +286,10 @@ class ClaudeReviewToolUnavailable(ReviewError):
 
 class ClaudeLoopbackUnavailable(ReviewError):
     """The host cannot bind a loopback service required by Claude Code."""
+
+
+class ClaudeExecutableUnavailable(ReviewError):
+    """Automatic Claude discovery found only unsupported executables."""
 
 
 @dataclass(frozen=True)
@@ -2378,9 +2383,12 @@ def _resolve_validated_claude_executable(
         _require_claude_identity(candidate, candidate_env)
         _require_claude_safe_mode(candidate, candidate_env)
 
-    executable = resolve_reviewer_executable(
-        "claude", candidate_validator=validate_candidate
-    )
+    try:
+        executable = resolve_reviewer_executable(
+            "claude", candidate_validator=validate_candidate
+        )
+    except RejectedReviewerCandidates as error:
+        raise ClaudeExecutableUnavailable(str(error)) from error
     if executable is None:
         return None, prepared_env
     return executable, _with_executable_path(prepared_env, executable)
@@ -2832,6 +2840,7 @@ def run_review(
         ClaudeKeychainCredentialUnavailable,
         ClaudeReviewToolUnavailable,
         ClaudeLoopbackUnavailable,
+        ClaudeExecutableUnavailable,
     ) as error:
         claude_available = False
         write_text_atomic(
@@ -2887,6 +2896,7 @@ def run_review(
             ClaudeKeychainCredentialUnavailable,
             ClaudeReviewToolUnavailable,
             ClaudeLoopbackUnavailable,
+            ClaudeExecutableUnavailable,
         ) as error:
             category = "unavailable"
             final_text = None

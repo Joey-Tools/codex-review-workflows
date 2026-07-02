@@ -23,6 +23,10 @@ class InvalidReviewerExecutable(ReviewError):
     """A candidate executable failed deterministic identity validation."""
 
 
+class RejectedReviewerCandidates(ReviewError):
+    """Automatic discovery found candidates, but all failed identity validation."""
+
+
 class ReviewTimeoutError(ReviewError):
     """A bounded reviewer subprocess exceeded its deadline."""
 
@@ -798,7 +802,7 @@ def resolve_reviewer_executable(
         rejected.append(candidate.absolute())
     if rejected:
         paths = ", ".join(str(path) for path in rejected)
-        raise ReviewError(
+        raise RejectedReviewerCandidates(
             f"found {name} CLI candidate(s), but executable identity validation "
             f"failed or timed out: {paths}"
         )

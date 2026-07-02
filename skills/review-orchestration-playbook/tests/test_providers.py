@@ -20,7 +20,7 @@ from unittest import mock
 SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from review_runtime import providers  # noqa: E402
+from review_runtime import common, providers  # noqa: E402
 from review_runtime.common import Completed, ReviewError  # noqa: E402
 from review_runtime.workspace import ReviewWorkspace  # noqa: E402
 
@@ -2073,6 +2073,48 @@ class ProviderPolicyTest(unittest.TestCase):
     @mock.patch.object(
         providers,
         "_resolve_validated_claude_executable",
+        side_effect=providers.ClaudeExecutableUnavailable("only wrapper found"),
+    )
+    @mock.patch.object(
+        providers,
+        "resolve_reviewer_executable",
+        return_value=pathlib.Path("/bin/copilot"),
+    )
+    @mock.patch.object(providers, "_copilot_attempt")
+    def test_automatic_non_native_claude_allows_authorized_copilot_fallback(
+        self,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _resolve_claude: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        copilot_attempt.return_value = self.attempt(
+            "copilot",
+            providers.COPILOT_MODELS[0],
+            "success",
+            final_text="No findings.",
+        )
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
+
+        self.assertEqual(outcome.returncode, 0)
+        copilot_attempt.assert_called_once()
+        resolve.assert_called_once_with("copilot")
+        self.assertIn(
+            "only wrapper found",
+            (self.review.container_dir / "claude-skip.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
         return_value=(pathlib.Path("/bin/claude"), {}),
     )
     @mock.patch.object(
@@ -3137,6 +3179,60 @@ class ProviderPolicyTest(unittest.TestCase):
             providers._require_claude_identity(
                 pathlib.Path("/bin/claude"),
                 {"HOME": "/isolated/probe-home"},
+            )
+
+    def test_real_resolver_types_rejected_automatic_claude_candidate(
+        self,
+    ) -> None:
+        wrapper = self.review.source_root / "claude"
+        wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        wrapper.chmod(0o700)
+
+        def reject_candidate(_candidate: pathlib.Path) -> None:
+            raise providers.InvalidReviewerExecutable("not native")
+
+        with (
+            mock.patch.object(
+                common,
+                "_user_executable_candidates",
+                return_value=(wrapper,),
+            ),
+            mock.patch.object(common.shutil, "which", return_value=None),
+            mock.patch.object(
+                common.pathlib.Path,
+                "is_file",
+                autospec=True,
+                side_effect=lambda path: path == wrapper,
+            ),
+            mock.patch.object(
+                common.os,
+                "access",
+                side_effect=lambda path, _mode: pathlib.Path(path) == wrapper,
+            ),
+            mock.patch.dict(common.os.environ, {}, clear=True),
+            self.assertRaises(common.RejectedReviewerCandidates),
+        ):
+            common.resolve_reviewer_executable(
+                "claude",
+                candidate_validator=reject_candidate,
+            )
+
+    @mock.patch.object(
+        providers,
+        "resolve_reviewer_executable",
+        side_effect=common.RejectedReviewerCandidates("only wrapper found"),
+    )
+    def test_claude_resolver_maps_automatic_rejection_to_unavailable(
+        self,
+        _resolve: mock.Mock,
+    ) -> None:
+        with self.assertRaisesRegex(
+            providers.ClaudeExecutableUnavailable,
+            "only wrapper found",
+        ):
+            providers._resolve_validated_claude_executable(
+                review=self.review,
+                env={"HOME": str(self.review.container_dir / "home")},
             )
 
     def test_claude_review_path_pins_broker_and_trusted_ripgrep(self) -> None:
