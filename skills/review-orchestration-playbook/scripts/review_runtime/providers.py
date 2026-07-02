@@ -754,7 +754,13 @@ def _tunnel_proxy_sockets(client: socket.socket, upstream: socket.socket) -> Non
     for current in sockets:
         current.settimeout(None)
     while True:
-        readable, _, _ = select.select(sockets, (), (), 1.0)
+        readable = tuple(
+            current
+            for current in sockets
+            if isinstance(current, ssl.SSLSocket) and current.pending() > 0
+        )
+        if not readable:
+            readable, _, _ = select.select(sockets, (), (), 1.0)
         for current in readable:
             data = current.recv(64 * 1024)
             if not data:

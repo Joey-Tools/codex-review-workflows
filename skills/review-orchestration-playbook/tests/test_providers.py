@@ -3214,6 +3214,46 @@ class ProviderPolicyTest(unittest.TestCase):
             target.server_close()
             target_thread.join(timeout=5.0)
 
+    def test_https_proxy_tunnel_drains_decrypted_pending_data(self) -> None:
+        class PlainSocket:
+            def __init__(self) -> None:
+                self.sent: list[bytes] = []
+
+            def settimeout(self, _value) -> None:
+                return
+
+            def sendall(self, data: bytes) -> None:
+                self.sent.append(data)
+
+        class FakeTLSSocket:
+            def __init__(self) -> None:
+                self.pending_values = iter((1, 1, 0))
+                self.received = iter((b"a" * (64 * 1024), b"b" * (64 * 1024), b""))
+
+            def settimeout(self, _value) -> None:
+                return
+
+            def pending(self) -> int:
+                return next(self.pending_values)
+
+            def recv(self, _size: int) -> bytes:
+                return next(self.received)
+
+        client = PlainSocket()
+        upstream = FakeTLSSocket()
+        with (
+            mock.patch.object(providers.ssl, "SSLSocket", FakeTLSSocket),
+            mock.patch.object(
+                providers.select,
+                "select",
+                return_value=([upstream], (), ()),
+            ) as select_call,
+        ):
+            providers._tunnel_proxy_sockets(client, upstream)
+
+        self.assertEqual(client.sent, [b"a" * (64 * 1024), b"b" * (64 * 1024)])
+        select_call.assert_called_once()
+
     def test_claude_proxy_environment_blocks_bypass_variables(self) -> None:
         env = providers._with_claude_proxy_environment(
             {

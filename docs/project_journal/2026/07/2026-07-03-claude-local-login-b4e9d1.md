@@ -22,6 +22,7 @@ superseded_by:
 - Claude Code and trusted `rg` must be native Mach-O executables; script or wrapper installations are rejected, and the final sandbox reads the Claude executable only by exact path rather than exposing its parent directory.
 - Custom CA environment paths are reduced to validated certificate-only copies under the helper container before entering the sandbox, with distinct source directories kept separate.
 - Uppercase and lowercase corporate proxy variables are preserved before Claude is routed through the helper-owned local proxy.
+- HTTPS corporate proxy tunnels drain OpenSSL's already-decrypted pending data before waiting on the underlying socket.
 - Missing Claude authentication can fall back to GitHub Copilot only for explicitly authorized double or triple reviews.
 - Skill policy, egress language, helper contract, and provider tests describe the same behavior.
 
@@ -37,3 +38,4 @@ superseded_by:
 - Real local-auth smoke: sandboxed Claude Code 2.1.187 reported `loggedIn: true`, `authMethod: claude.ai`, and `apiProvider: firstParty` without `ANTHROPIC_API_KEY`.
 - macOS sandbox smoke probe: Claude authentication status remained readable, trusted `rg` could search the frozen workspace, and `/bin/sh` hook execution was blocked.
 - Local CONNECT proxy smoke probe: `api.anthropic.com:443` and `platform.claude.com:443` succeeded through the localhost-only sandbox route, while `example.com:443` was rejected.
+- HTTPS upstream proxy regression: two buffered 64 KiB TLS chunks were forwarded before the tunnel returned to `select()`.
