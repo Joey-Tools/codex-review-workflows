@@ -1232,7 +1232,10 @@ class ProviderPolicyTest(unittest.TestCase):
             review=self.review,
             model="claude-opus-4-8",
             index=1,
-            env={"ANTHROPIC_API_KEY": "secret"},
+            env={
+                "ANTHROPIC_API_KEY": "secret",
+                "CODEX_ISOLATED_REVIEW_RANGE": "base..head",
+            },
         )
         argv = run_command.call_args.args[0]
         self.assertIn("claude-opus-4-8", argv)
@@ -1248,7 +1251,20 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn("--bare", argv)
         self.assertNotIn("--safe-mode", argv)
         self.assertIn("--strict-mcp-config", argv)
-        self.assertEqual(run_command.call_args_list[0].args[0][-1], "--help")
+        self.assertEqual(
+            run_command.call_args_list[0].args[0],
+            ("/bin/claude", "--bare", "--help"),
+        )
+        probe_env = run_command.call_args_list[0].kwargs["env"]
+        self.assertNotIn("ANTHROPIC_API_KEY", probe_env)
+        self.assertNotIn("CODEX_ISOLATED_REVIEW_RANGE", probe_env)
+        self.assertEqual(
+            probe_env["HOME"],
+            str(self.review.container_dir / "claude-home"),
+        )
+        review_env = run_command.call_args_list[1].kwargs["env"]
+        self.assertEqual(review_env["ANTHROPIC_API_KEY"], "secret")
+        self.assertEqual(review_env["HOME"], probe_env["HOME"])
 
     @mock.patch.object(
         providers,

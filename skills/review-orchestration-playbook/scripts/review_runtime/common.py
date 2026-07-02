@@ -479,14 +479,20 @@ def _executable_identity_matches(
     path: pathlib.Path,
     markers: Iterable[str],
 ) -> bool:
+    marker_values = tuple(markers)
     env = {
         "HOME": os.environ.get("HOME", str(pathlib.Path.home())),
         "NO_COLOR": "1",
         "PATH": reviewer_executable_path(path),
     }
+    version_args = (
+        ("--bare", "--version")
+        if any(marker.lower() == "claude code" for marker in marker_values)
+        else ("--version",)
+    )
     try:
         completed = subprocess.run(
-            (str(path), "--version"),
+            (str(path), *version_args),
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -498,7 +504,7 @@ def _executable_identity_matches(
     if completed.returncode != 0:
         return False
     output = f"{completed.stdout.decode(errors='replace')}\n{completed.stderr.decode(errors='replace')}".lower()
-    return all(marker.lower() in output for marker in markers)
+    return all(marker.lower() in output for marker in marker_values)
 
 
 def resolve_reviewer_executable(name: str) -> pathlib.Path | None:

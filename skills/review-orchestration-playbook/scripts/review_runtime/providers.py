@@ -222,7 +222,7 @@ def _require_claude_bare_mode(
     env: dict[str, str],
 ) -> None:
     completed = run(
-        (str(executable), "--help"),
+        (str(executable), "--bare", "--help"),
         cwd=pathlib.Path(os.path.abspath(os.sep)),
         env=env,
     )
@@ -833,7 +833,18 @@ def _claude_attempt(
             "claude is not available in a validated executable path"
         )
     env = _with_executable_path(env, executable)
-    _require_claude_bare_mode(executable, env)
+    claude_home = review.container_dir / "claude-home"
+    claude_home.mkdir(parents=True, exist_ok=True)
+    env = dict(env)
+    env["HOME"] = str(claude_home)
+    env.pop("XDG_CONFIG_HOME", None)
+    probe_env = {
+        key: value
+        for key, value in env.items()
+        if key != "ANTHROPIC_API_KEY"
+        and not key.startswith("CODEX_ISOLATED_REVIEW_")
+    }
+    _require_claude_bare_mode(executable, probe_env)
     stdout_path, stderr_path = _attempt_paths(review, index, "claude", model)
     settings = json.dumps(
         {
