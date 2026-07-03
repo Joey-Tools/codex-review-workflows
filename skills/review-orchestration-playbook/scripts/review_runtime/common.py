@@ -9,6 +9,7 @@ import select
 import signal
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -346,7 +347,45 @@ def _process_group_exists(process_pid: int) -> bool:
         return False
     except PermissionError:
         return True
+    if sys.platform.startswith("linux"):
+        live_members = _linux_process_group_has_live_members(process_pid)
+        if live_members is not None:
+            return live_members
     return True
+
+
+def _linux_process_group_has_live_members(process_group: int) -> bool | None:
+    try:
+        entries = os.scandir("/proc")
+    except OSError:
+        return None
+    try:
+        with entries:
+            for entry in entries:
+                if not entry.name.isdigit():
+                    continue
+                try:
+                    with open(
+                        f"/proc/{entry.name}/stat",
+                        "r",
+                        encoding="utf-8",
+                    ) as handle:
+                        stat = handle.read(4096)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    return None
+                try:
+                    fields = stat.rsplit(") ", 1)[1].split()
+                    state = fields[0]
+                    member_group = int(fields[2])
+                except (IndexError, ValueError):
+                    return None
+                if member_group == process_group and state not in {"X", "Z"}:
+                    return True
+    except OSError:
+        return None
+    return False
 
 
 def signal_process_group(

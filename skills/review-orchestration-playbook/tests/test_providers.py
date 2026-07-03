@@ -67,6 +67,29 @@ class ProviderPolicyTest(unittest.TestCase):
         self.claude_broker.parent.mkdir(parents=True)
         self.claude_broker.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 32)
         self.claude_broker.chmod(0o700)
+        self.claude_keychain_client = root / "host-tools" / "security"
+        self.claude_ripgrep = root / "host-tools" / "rg"
+        for fixture in (
+            self.claude_keychain_client,
+            self.claude_ripgrep,
+        ):
+            fixture.parent.mkdir(parents=True, exist_ok=True)
+            fixture.write_bytes(b"fixture")
+            fixture.chmod(0o700)
+        self.host_dependency_patchers = (
+            mock.patch.object(
+                providers,
+                "CLAUDE_KEYCHAIN_CLIENT",
+                self.claude_keychain_client,
+            ),
+            mock.patch.object(
+                providers,
+                "CLAUDE_REVIEW_TOOL_EXECUTABLE_CANDIDATES",
+                (self.claude_ripgrep,),
+            ),
+        )
+        for patcher in self.host_dependency_patchers:
+            patcher.start()
         self.native_macho_dependencies = providers._native_macho_dependencies
         self.native_dependency_patcher = mock.patch.object(
             providers,
@@ -114,6 +137,8 @@ class ProviderPolicyTest(unittest.TestCase):
         self.keychain_broker_patcher.stop()
         self.trusted_digest_patcher.stop()
         self.native_dependency_patcher.stop()
+        for patcher in reversed(self.host_dependency_patchers):
+            patcher.stop()
         self.temporary.cleanup()
 
     def fake_prepare_claude_keychain_broker(
@@ -235,6 +260,15 @@ class ProviderPolicyTest(unittest.TestCase):
             "trusted macOS release digests",
         ):
             self.require_trusted_claude_digest(executable)
+
+    def test_native_executable_inspection_race_is_inconclusive(self) -> None:
+        missing = self.review.source_root / "disappeared-claude"
+
+        with self.assertRaisesRegex(
+            providers.ClaudeExecutableInspectionInconclusive,
+            "cannot inspect Claude Code executable",
+        ):
+            self.native_macho_dependencies(missing, label="Claude Code")
 
     def test_claude_keychain_broker_compiles_and_rejects_other_queries(self) -> None:
         if (
@@ -410,7 +444,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     ),
                     env=prepared,
                 )
-        except PermissionError:
+        except (PermissionError, providers.ClaudeLoopbackUnavailable):
             self.skipTest("loopback bind is unavailable in the current sandbox")
 
         self.assertEqual(first.returncode, 0)
@@ -439,7 +473,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertEqual(credential, bytearray(payload))
         argv = run_command.call_args.args[0]
-        self.assertEqual(argv[0], "/usr/bin/security")
+        self.assertEqual(argv[0], str(self.claude_keychain_client))
         self.assertEqual(
             argv[1:],
             (
@@ -602,6 +636,9 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertTrue(
             sandbox_profile.call_args.kwargs["allow_direct_keychain"]
         )
+        self.assertFalse(
+            sandbox_profile.call_args.kwargs["allow_workspace_read"]
+        )
 
     @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
     @mock.patch.object(providers, "_run_claude_auth_warmup")
@@ -684,6 +721,11 @@ class ProviderPolicyTest(unittest.TestCase):
                 },
             )
 
+    @mock.patch.object(
+        providers,
+        "CLAUDE_KEYCHAIN_BROKER_COMPILER",
+        pathlib.Path("/usr/bin/true"),
+    )
     @mock.patch.object(providers, "run")
     def test_keychain_broker_compile_failure_is_unavailable(
         self,
@@ -2205,6 +2247,36 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
         )
 
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(providers, "_copilot_attempt")
+    @mock.patch.object(
+        providers,
+        "resolve_reviewer_executable",
+        side_effect=providers.ClaudeExecutableInspectionInconclusive(
+            "Claude executable disappeared during inspection"
+        ),
+    )
+    def test_claude_inspection_race_refuses_copilot_fallback(
+        self,
+        _resolve: mock.Mock,
+        copilot_attempt: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
+
+        self.assertEqual(outcome.returncode, 75)
+        copilot_attempt.assert_not_called()
+        self.assertIn(
+            "inconclusive",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
     @mock.patch.object(
         providers,
         "child_environment",
@@ -3569,6 +3641,26 @@ class ProviderPolicyTest(unittest.TestCase):
         ):
             providers._with_claude_review_tool_path(self.review, {})
 
+    @mock.patch.object(providers, "_trusted_claude_ripgrep", return_value=None)
+    def test_claude_sandbox_classifies_missing_ripgrep_unavailable(
+        self,
+        _rg: mock.Mock,
+    ) -> None:
+        with self.assertRaisesRegex(
+            providers.ClaudeReviewToolUnavailable,
+            "requires ripgrep",
+        ):
+            providers._claude_review_sandbox_profile(
+                pathlib.Path("/bin/true"),
+                self.review,
+                {
+                    "ANTHROPIC_API_KEY": "test-api-key",
+                    "HOME": str(self.review.container_dir / "claude-home"),
+                    "TMPDIR": str(self.review.container_dir / "tmp"),
+                },
+                proxy_port=43210,
+            )
+
     @mock.patch.object(
         providers,
         "resolve_reviewer_executable",
@@ -3907,11 +3999,19 @@ class ProviderPolicyTest(unittest.TestCase):
             },
             proxy_port=43210,
             allow_direct_keychain=True,
+            allow_workspace_read=False,
         )
 
-        self.assertIn('(literal "/usr/bin/security")', profile)
+        self.assertIn(
+            f'(literal "{self.claude_keychain_client.resolve()}")',
+            profile,
+        )
         self.assertIn("com.apple.securityd.xpc", profile)
         self.assertNotIn(str(self.claude_broker.resolve()), profile)
+        self.assertNotIn(
+            f'(subpath "{self.review.workspace_root.resolve()}")',
+            profile,
+        )
 
     @mock.patch.object(
         providers,
@@ -4023,6 +4123,20 @@ class ProviderPolicyTest(unittest.TestCase):
             )
 
         self.assertEqual(consumed, providers.CLAUDE_CA_DIR_ENTRY_LIMIT + 1)
+
+    @mock.patch.object(providers.ssl, "create_default_context")
+    def test_proxy_ssl_context_honors_git_ca_bundle(
+        self,
+        create_context: mock.Mock,
+    ) -> None:
+        context = create_context.return_value
+
+        result = providers._proxy_ssl_context(
+            {"GIT_SSL_CAINFO": "/isolated/git-ca.pem"}
+        )
+
+        self.assertIs(result, context)
+        create_context.assert_called_once_with(cafile="/isolated/git-ca.pem")
 
     @mock.patch.object(providers.ssl, "create_default_context")
     def test_proxy_ssl_context_loads_each_ca_directory(

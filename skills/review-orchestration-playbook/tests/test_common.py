@@ -298,6 +298,22 @@ class ChildEnvironmentTest(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0)
 
+    @mock.patch.object(
+        common,
+        "_linux_process_group_has_live_members",
+        return_value=False,
+    )
+    @mock.patch.object(common.os, "killpg")
+    def test_process_group_ignores_zombie_only_linux_group(
+        self,
+        _killpg: mock.Mock,
+        live_members: mock.Mock,
+    ) -> None:
+        with mock.patch.object(common.sys, "platform", "linux"):
+            self.assertFalse(common._process_group_exists(12345))
+
+        live_members.assert_called_once_with(12345)
+
     @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork")
     def test_logged_command_rejects_descendant_holding_output_stream(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

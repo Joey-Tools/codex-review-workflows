@@ -307,6 +307,10 @@ class ClaudeExecutableUnavailable(ReviewError):
     """Automatic Claude discovery found only unsupported executables."""
 
 
+class ClaudeExecutableInspectionInconclusive(ReviewError):
+    """A Claude runtime file changed or became unreadable during inspection."""
+
+
 @dataclass(frozen=True)
 class Attempt:
     runtime: str
@@ -339,7 +343,7 @@ def _native_macho_dependencies(
         with resolved.open("rb") as handle:
             magic = handle.read(4)
     except OSError as error:
-        raise InvalidReviewerExecutable(
+        raise ClaudeExecutableInspectionInconclusive(
             f"cannot inspect {label} executable: {error}"
         ) from error
     if magic not in MACHO_MAGICS or not os.access(resolved, os.X_OK):
@@ -356,7 +360,7 @@ def _require_trusted_claude_digest(path: pathlib.Path) -> None:
             while chunk := handle.read(CLAUDE_TRUSTED_HASH_CHUNK_BYTES):
                 digest.update(chunk)
     except OSError as error:
-        raise InvalidReviewerExecutable(
+        raise ClaudeExecutableInspectionInconclusive(
             f"cannot hash Claude Code executable: {error}"
         ) from error
     actual = digest.hexdigest()
@@ -842,7 +846,12 @@ def _proxy_ssl_context(env: dict[str, str]) -> ssl.SSLContext:
     cafile = next(
         (
             env[key]
-            for key in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
+            for key in (
+                "SSL_CERT_FILE",
+                "REQUESTS_CA_BUNDLE",
+                "CURL_CA_BUNDLE",
+                "GIT_SSL_CAINFO",
+            )
             if env.get(key)
         ),
         None,
@@ -1101,6 +1110,7 @@ def _run_claude_auth_warmup(
                     proxied_env,
                     proxy_port=proxy_port,
                     allow_direct_keychain=True,
+                    allow_workspace_read=False,
                 ),
                 str(executable),
                 "--print",
@@ -1360,6 +1370,7 @@ def _claude_review_sandbox_profile(
     *,
     proxy_port: int,
     allow_direct_keychain: bool = False,
+    allow_workspace_read: bool = True,
 ) -> str:
     dependencies = _native_macho_dependencies(executable, label="Claude Code")
     home_raw = env.get("HOME")
@@ -1460,8 +1471,13 @@ def _claude_review_sandbox_profile(
             )
     rg_candidate = _trusted_claude_ripgrep()
     if rg_candidate is None:
-        raise ReviewError("Claude Code Grep sandbox requires ripgrep in a trusted path")
-    tool_executables = _native_macho_dependencies(rg_candidate, label="ripgrep")
+        raise ClaudeReviewToolUnavailable(
+            "Claude Code Grep sandbox requires ripgrep in a trusted path"
+        )
+    try:
+        tool_executables = _native_macho_dependencies(rg_candidate, label="ripgrep")
+    except InvalidReviewerExecutable as error:
+        raise ClaudeReviewToolUnavailable(str(error)) from error
     tool_library_subpaths = {
         candidate
         for path in CLAUDE_REVIEW_TOOL_LIBRARY_SUBPATH_CANDIDATES
@@ -1469,13 +1485,14 @@ def _claude_review_sandbox_profile(
         for candidate in (path.absolute(), path.resolve())
     }
     read_subpaths = {
-        review.workspace_root.resolve(),
         home,
         tmp,
         *(path.resolve() for path in CLAUDE_PROBE_SYSTEM_READ_SUBPATHS),
         *tool_library_subpaths,
         *tls_dirs,
     }
+    if allow_workspace_read:
+        read_subpaths.add(review.workspace_root.resolve())
     read_files = {
         *(path.resolve() for path in CLAUDE_PROBE_SYSTEM_READ_LITERALS),
         *dependencies,
@@ -2931,6 +2948,7 @@ def run_review(
     except (
         FileNotFoundError,
         ClaudeAuthWarmupInconclusive,
+        ClaudeExecutableInspectionInconclusive,
         ReviewTimeoutError,
         ReviewOutputDrainError,
         ReviewOutputLimitError,
@@ -2963,6 +2981,7 @@ def run_review(
             )
         except (
             FileNotFoundError,
+            ClaudeExecutableInspectionInconclusive,
             ReviewTimeoutError,
             ReviewOutputDrainError,
             ReviewOutputLimitError,
