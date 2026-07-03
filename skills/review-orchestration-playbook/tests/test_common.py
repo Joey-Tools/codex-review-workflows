@@ -72,6 +72,19 @@ class ChildEnvironmentTest(unittest.TestCase):
 
         self.assertLessEqual(output_size, 4096)
 
+    def test_bounded_capture_enforces_independent_stream_limits(self) -> None:
+        with self.assertRaises(common.ReviewOutputLimitError):
+            common.run_bounded_capture(
+                (
+                    sys.executable,
+                    "-c",
+                    "import os; os.write(2, b'x' * 2048)",
+                ),
+                timeout_seconds=5,
+                stdout_limit_bytes=4096,
+                stderr_limit_bytes=1024,
+            )
+
     def test_output_limit_is_detected_while_stream_remains_open(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -265,6 +278,43 @@ class ChildEnvironmentTest(unittest.TestCase):
             self.assertLess(time.monotonic() - started, 1.5)
 
     @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork")
+    def test_logged_command_allows_prompt_descendant_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            completed = common.run(
+                (
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os,time; pid=os.fork(); "
+                        "os._exit(0) if pid else (time.sleep(0.1), os._exit(0))"
+                    ),
+                ),
+                stdout_path=root / "stdout.log",
+                stderr_path=root / "stderr.log",
+                timeout_seconds=5,
+                output_file_limit_bytes=4096,
+            )
+
+        self.assertEqual(completed.returncode, 0)
+
+    @mock.patch.object(
+        common,
+        "_linux_process_group_has_live_members",
+        return_value=False,
+    )
+    @mock.patch.object(common.os, "killpg")
+    def test_process_group_ignores_zombie_only_linux_group(
+        self,
+        _killpg: mock.Mock,
+        live_members: mock.Mock,
+    ) -> None:
+        with mock.patch.object(common.sys, "platform", "linux"):
+            self.assertFalse(common._process_group_exists(12345))
+
+        live_members.assert_called_once_with(12345)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork")
     def test_logged_command_rejects_descendant_holding_output_stream(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -452,6 +502,8 @@ class ChildEnvironmentTest(unittest.TestCase):
                         "REQUESTS_CA_BUNDLE": "/etc/corporate-ca.pem",
                         "CURL_CA_BUNDLE": "/etc/curl-ca.pem",
                         "GIT_SSL_CAINFO": "/etc/git-ca.pem",
+                        "https_proxy": "http://corporate-proxy:8080",
+                        "no_proxy": "localhost",
                         "UNRELATED_PRIVATE_VALUE": "must-not-pass",
                         "DATABASE_PASSWORD": "must-not-pass",
                     },
@@ -467,6 +519,8 @@ class ChildEnvironmentTest(unittest.TestCase):
         self.assertEqual(env["REQUESTS_CA_BUNDLE"], "/etc/corporate-ca.pem")
         self.assertEqual(env["CURL_CA_BUNDLE"], "/etc/curl-ca.pem")
         self.assertEqual(env["GIT_SSL_CAINFO"], "/etc/git-ca.pem")
+        self.assertEqual(env["https_proxy"], "http://corporate-proxy:8080")
+        self.assertEqual(env["no_proxy"], "localhost")
         self.assertNotIn("UNRELATED_PRIVATE_VALUE", env)
         self.assertNotIn("DATABASE_PASSWORD", env)
 

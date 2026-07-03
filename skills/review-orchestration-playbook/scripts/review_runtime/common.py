@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import pathlib
@@ -8,6 +9,7 @@ import select
 import signal
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -21,6 +23,10 @@ class ReviewError(RuntimeError):
 
 class InvalidReviewerExecutable(ReviewError):
     """A candidate executable failed deterministic identity validation."""
+
+
+class RejectedReviewerCandidates(ReviewError):
+    """Automatic discovery found candidates, but all failed identity validation."""
 
 
 class ReviewTimeoutError(ReviewError):
@@ -59,6 +65,26 @@ class Completed:
     stderr: bytes
 
 
+@dataclass(frozen=True)
+class BoundedCapture:
+    argv: tuple[str, ...]
+    returncode: int
+    stdout: bytearray
+    stderr: bytearray
+
+
+class _BytearrayWriter:
+    def __init__(self) -> None:
+        self.data = bytearray()
+
+    def write(self, payload: bytes) -> int:
+        self.data.extend(payload)
+        return len(payload)
+
+    def flush(self) -> None:
+        return None
+
+
 TRUSTED_PATH = os.pathsep.join(
     (
         "/opt/homebrew/bin",
@@ -91,9 +117,14 @@ BASE_ENV_KEYS = (
     "TERM",
     "USER",
     "XDG_CONFIG_HOME",
+    "all_proxy",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
 )
 
 PROCESS_GROUP_TERM_GRACE_SECONDS = 0.5
+PROCESS_GROUP_EXIT_GRACE_SECONDS = 0.5
 PROCESS_GROUP_POLL_SECONDS = 0.05
 
 
@@ -203,7 +234,8 @@ def run(
                     stdout_handle=stdout_handle,
                     stderr_handle=stderr_handle,
                     timeout_seconds=timeout_seconds,
-                    output_file_limit_bytes=output_file_limit_bytes,
+                    stdout_file_limit_bytes=output_file_limit_bytes,
+                    stderr_file_limit_bytes=output_file_limit_bytes,
                 )
             result = Completed(
                 command,
@@ -223,6 +255,46 @@ def run(
             f"command failed ({result.returncode}): {' '.join(command)}\n{detail}"
         )
     return result
+
+
+def run_bounded_capture(
+    argv: Iterable[str],
+    *,
+    cwd: pathlib.Path | None = None,
+    env: dict[str, str] | None = None,
+    stdin: bytes | None = None,
+    timeout_seconds: float,
+    stdout_limit_bytes: int,
+    stderr_limit_bytes: int,
+) -> BoundedCapture:
+    command = tuple(str(item) for item in argv)
+    if stdout_limit_bytes <= 0 or stderr_limit_bytes <= 0:
+        raise ReviewError("bounded capture limits must be positive")
+    stdout = _BytearrayWriter()
+    stderr = _BytearrayWriter()
+    try:
+        returncode = _run_logged_process(
+            command,
+            cwd=cwd,
+            env=env,
+            stdin=stdin,
+            stdout_handle=stdout,
+            stderr_handle=stderr,
+            timeout_seconds=timeout_seconds,
+            stdout_file_limit_bytes=stdout_limit_bytes,
+            stderr_file_limit_bytes=stderr_limit_bytes,
+        )
+    except subprocess.TimeoutExpired as error:
+        stdout.data[:] = b"\x00" * len(stdout.data)
+        stderr.data[:] = b"\x00" * len(stderr.data)
+        raise ReviewTimeoutError(
+            f"command timed out after {timeout_seconds} seconds: {' '.join(command)}"
+        ) from error
+    except Exception:
+        stdout.data[:] = b"\x00" * len(stdout.data)
+        stderr.data[:] = b"\x00" * len(stderr.data)
+        raise
+    return BoundedCapture(command, returncode, stdout.data, stderr.data)
 
 
 def forwarded_signals() -> tuple[signal.Signals, ...]:
@@ -275,7 +347,45 @@ def _process_group_exists(process_pid: int) -> bool:
         return False
     except PermissionError:
         return True
+    if sys.platform.startswith("linux"):
+        live_members = _linux_process_group_has_live_members(process_pid)
+        if live_members is not None:
+            return live_members
     return True
+
+
+def _linux_process_group_has_live_members(process_group: int) -> bool | None:
+    try:
+        entries = os.scandir("/proc")
+    except OSError:
+        return None
+    try:
+        with entries:
+            for entry in entries:
+                if not entry.name.isdigit():
+                    continue
+                try:
+                    with open(
+                        f"/proc/{entry.name}/stat",
+                        "r",
+                        encoding="utf-8",
+                    ) as handle:
+                        stat = handle.read(4096)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    return None
+                try:
+                    fields = stat.rsplit(") ", 1)[1].split()
+                    state = fields[0]
+                    member_group = int(fields[2])
+                except (IndexError, ValueError):
+                    return None
+                if member_group == process_group and state not in {"X", "Z"}:
+                    return True
+    except OSError:
+        return None
+    return False
 
 
 def signal_process_group(
@@ -344,7 +454,8 @@ def _run_logged_process(
     stdout_handle: BinaryIO,
     stderr_handle: BinaryIO,
     timeout_seconds: float | None = None,
-    output_file_limit_bytes: int | None = None,
+    stdout_file_limit_bytes: int | None = None,
+    stderr_file_limit_bytes: int | None = None,
 ) -> int:
     process: subprocess.Popen[bytes] | None = None
     pending_signal: signal.Signals | None = None
@@ -375,14 +486,14 @@ def _run_logged_process(
             cwd=cwd,
             env=env,
             stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
-            stdout=subprocess.PIPE if output_file_limit_bytes is not None else stdout_handle,
-            stderr=subprocess.PIPE if output_file_limit_bytes is not None else stderr_handle,
+            stdout=subprocess.PIPE if stdout_file_limit_bytes is not None else stdout_handle,
+            stderr=subprocess.PIPE if stderr_file_limit_bytes is not None else stderr_handle,
             start_new_session=os.name == "posix",
         )
         if pending_signal is not None:
             signal_process_group(process, pending_signal)
             raise ForwardedSignal(pending_signal)
-        if output_file_limit_bytes is None:
+        if stdout_file_limit_bytes is None or stderr_file_limit_bytes is None:
             if timeout_seconds is None:
                 process.communicate(input=stdin)
             else:
@@ -394,7 +505,11 @@ def _run_logged_process(
         output_overflow = threading.Event()
         drain_errors: list[Exception] = []
 
-        def drain_bounded(stream: BinaryIO, destination: BinaryIO) -> None:
+        def drain_bounded(
+            stream: BinaryIO,
+            destination: BinaryIO,
+            limit_bytes: int,
+        ) -> None:
             try:
                 written = 0
                 descriptor = stream.fileno()
@@ -411,7 +526,7 @@ def _run_logged_process(
                         continue
                     if not chunk:
                         return
-                    remaining = output_file_limit_bytes - written
+                    remaining = limit_bytes - written
                     if remaining > 0:
                         destination.write(chunk[:remaining])
                         destination.flush()
@@ -449,13 +564,13 @@ def _run_logged_process(
 
         thread_start_mask = block_forwarded_signals()
         try:
-            for stream, destination in (
-                (process.stdout, stdout_handle),
-                (process.stderr, stderr_handle),
+            for stream, destination, limit_bytes in (
+                (process.stdout, stdout_handle, stdout_file_limit_bytes),
+                (process.stderr, stderr_handle, stderr_file_limit_bytes),
             ):
                 thread = threading.Thread(
                     target=drain_bounded,
-                    args=(stream, destination),
+                    args=(stream, destination, limit_bytes),
                     daemon=True,
                 )
                 thread.start()
@@ -486,6 +601,14 @@ def _run_logged_process(
                     break
         leftover_process_group = _process_group_exists(process.pid)
         if leftover_process_group:
+            exit_deadline = time.monotonic() + PROCESS_GROUP_EXIT_GRACE_SECONDS
+            while (
+                _process_group_exists(process.pid)
+                and time.monotonic() < exit_deadline
+            ):
+                time.sleep(PROCESS_GROUP_POLL_SECONDS)
+            leftover_process_group = _process_group_exists(process.pid)
+        if leftover_process_group:
             terminate_process_group(process)
         for thread in io_threads:
             thread.join(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
@@ -503,8 +626,8 @@ def _run_logged_process(
             ) from drain_errors[0]
         if output_overflow.is_set():
             raise ReviewOutputLimitError(
-                "command output exceeded "
-                f"{output_file_limit_bytes} bytes per stream: {' '.join(command)}"
+                "command output exceeded its bounded stream limit: "
+                f"{' '.join(command)}"
             )
         if leftover_process_group:
             raise ReviewProcessLeakError(
@@ -527,7 +650,7 @@ def _run_logged_process(
             stop_io.set()
             for thread in io_threads:
                 thread.join(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
-            if process is not None and output_file_limit_bytes is not None:
+            if process is not None and stdout_file_limit_bytes is not None:
                 for stream in (process.stdin, process.stdout, process.stderr):
                     if stream is not None:
                         stream.close()
@@ -794,7 +917,7 @@ def resolve_reviewer_executable(
         rejected.append(candidate.absolute())
     if rejected:
         paths = ", ".join(str(path) for path in rejected)
-        raise ReviewError(
+        raise RejectedReviewerCandidates(
             f"found {name} CLI candidate(s), but executable identity validation "
             f"failed or timed out: {paths}"
         )
