@@ -35,6 +35,10 @@ superseded_by:
 - An already-bound Anthropic CONNECT proxy socket is likewise closed if its serving thread cannot start, and the failure remains eligible for authorized runtime-unavailable fallback.
 - Missing or failing local broker toolchains are consistently classified as Claude runtime unavailability for explicitly authorized fallback.
 - Keychain stdout/stderr are captured into separately bounded in-memory buffers and zeroed after use; custom CA directories are enumerated only up to the global entry limit before sorting or inspecting entries.
+- The credential broker transfers its one-shot mutable buffer without creating an immutable credential copy, zeroes it after sending, and waits for request handlers before teardown.
+- The Claude sandbox grants literal access to the public system CA bundle instead of the complete `/private/etc/ssl` subtree; validated helper-owned custom CA copies remain supported.
+- `CLAUDE_CODE_TMPDIR` is pinned to the helper-owned `TMPDIR`, so Claude does not require access to the host-global `/tmp/claude-$UID` tree.
+- Logged reviewer commands allow a 0.5-second natural process-group shutdown window before treating descendants as leaks; persistent descendants are still terminated and rejected.
 - Skill policy, egress language, helper contract, and provider tests describe the same behavior.
 
 ## Next Steps
@@ -48,6 +52,7 @@ superseded_by:
 - Native broker integration: clang compilation, rejected wrong capability without consumption, sandboxed one-shot fixture delivery, second-read denial, stdin/direct update denial, and in-memory zeroing passed.
 - Real local-auth smoke: the fixed no-tools warmup refreshed an expired credential through ordinary Claude behavior; the final read-only sandbox reported `loggedIn: true`, `authMethod: claude.ai`, `apiProvider: firstParty`, and about 478 remaining token minutes without `ANTHROPIC_API_KEY`.
 - Real bounded Keychain smoke: the local Claude credential was read through separate stdout/stderr streaming limits, validated for the complete two-model review chain, and zeroed without printing or persisting credential contents.
+- Final exact-CA runtime smoke no longer hit global-temp, permission-mode, TLS-file, or sandbox-denial failures; its network-auth terminal check was inconclusive because the host's ordinary `claude auth status --json` had changed to `loggedIn: false`.
 - macOS sandbox smoke probe: Claude authentication status remained readable, trusted `rg` could search the frozen workspace, and `/bin/sh` hook execution was blocked.
 - Local CONNECT proxy smoke probe: the warmup route permits `api.anthropic.com:443` plus `platform.claude.com:443`, while the final review permits only the API target and rejects OAuth refresh plus unrelated hosts.
 - HTTPS upstream proxy regression: two buffered 64 KiB TLS chunks were forwarded before the tunnel returned to `select()`.

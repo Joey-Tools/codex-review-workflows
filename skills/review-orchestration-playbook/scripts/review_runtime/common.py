@@ -123,6 +123,7 @@ BASE_ENV_KEYS = (
 )
 
 PROCESS_GROUP_TERM_GRACE_SECONDS = 0.5
+PROCESS_GROUP_EXIT_GRACE_SECONDS = 0.5
 PROCESS_GROUP_POLL_SECONDS = 0.05
 
 
@@ -560,6 +561,14 @@ def _run_logged_process(
                     terminate_process_group(process)
                     break
         leftover_process_group = _process_group_exists(process.pid)
+        if leftover_process_group:
+            exit_deadline = time.monotonic() + PROCESS_GROUP_EXIT_GRACE_SECONDS
+            while (
+                _process_group_exists(process.pid)
+                and time.monotonic() < exit_deadline
+            ):
+                time.sleep(PROCESS_GROUP_POLL_SECONDS)
+            leftover_process_group = _process_group_exists(process.pid)
         if leftover_process_group:
             terminate_process_group(process)
         for thread in io_threads:

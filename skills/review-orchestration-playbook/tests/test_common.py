@@ -278,6 +278,27 @@ class ChildEnvironmentTest(unittest.TestCase):
             self.assertLess(time.monotonic() - started, 1.5)
 
     @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork")
+    def test_logged_command_allows_prompt_descendant_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            completed = common.run(
+                (
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os,time; pid=os.fork(); "
+                        "os._exit(0) if pid else (time.sleep(0.1), os._exit(0))"
+                    ),
+                ),
+                stdout_path=root / "stdout.log",
+                stderr_path=root / "stderr.log",
+                timeout_seconds=5,
+                output_file_limit_bytes=4096,
+            )
+
+        self.assertEqual(completed.returncode, 0)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork")
     def test_logged_command_rejects_descendant_holding_output_stream(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)

@@ -382,6 +382,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(stdin_update.returncode, 64)
         self.assertEqual(direct_update.returncode, 64)
         self.assertEqual(credential, bytearray(len(credential)))
+        self.assertFalse(providers._ClaudeKeychainCredentialServer.daemon_threads)
 
     @mock.patch.object(providers, "run_bounded_capture")
     def test_keychain_prefetch_uses_fixed_service_and_account(
@@ -545,7 +546,12 @@ class ProviderPolicyTest(unittest.TestCase):
 
         argv = run_command.call_args.args[0]
         self.assertIn("--safe-mode", argv)
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "default")
         self.assertEqual(argv[argv.index("--tools") + 1], "")
+        self.assertEqual(
+            argv[argv.index("--allowedTools") + 1],
+            "Read(./__claude_auth_warmup_no_files__)",
+        )
         self.assertEqual(run_command.call_args.kwargs["stdin"], b"Reply with exactly OK.")
         self.assertEqual(
             run_command.call_args.kwargs["timeout_seconds"],
@@ -3608,7 +3614,7 @@ class ProviderPolicyTest(unittest.TestCase):
         argv = run_command.call_args_list[2].args[0]
         self.assertIn("claude-opus-4-8", argv)
         self.assertEqual(argv[argv.index("--effort") + 1], "max")
-        self.assertEqual(argv[argv.index("--permission-mode") + 1], "dontAsk")
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "default")
         self.assertNotIn("--prompt-suggestions", argv)
         self.assertEqual(argv[argv.index("--tools") + 1], "Read,Grep,Glob")
         self.assertEqual(argv[argv.index("--allowedTools") + 1], "Read(./**)")
@@ -3632,6 +3638,8 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertNotIn('(literal "/bin/sh")', review_profile)
         self.assertNotIn("mdsDirectory.db", review_profile)
         self.assertNotIn("mdsObject.db", review_profile)
+        self.assertNotIn('(subpath "/private/etc/ssl")', review_profile)
+        self.assertIn('(literal "/private/etc/ssl/cert.pem")', review_profile)
         self.assertNotIn("/Users/reviewer", review_profile)
         self.assertIn("--safe-mode", argv)
         self.assertNotIn("--bare", argv)
@@ -3685,6 +3693,10 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(
             review_env["HOME"],
             str(self.review.container_dir / "claude-home"),
+        )
+        self.assertEqual(
+            review_env["CLAUDE_CODE_TMPDIR"],
+            str(self.review.container_dir / "tmp"),
         )
         self.assertNotIn("XDG_CONFIG_HOME", review_env)
         self.assertEqual(

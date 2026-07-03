@@ -95,6 +95,7 @@ CLAUDE_PROBE_SYSTEM_READ_LITERALS = (
     pathlib.Path("/etc/hosts"),
     pathlib.Path("/etc/localtime"),
     pathlib.Path("/etc/resolv.conf"),
+    pathlib.Path("/private/etc/ssl/cert.pem"),
 )
 CLAUDE_PROBE_TIMEOUT_SECONDS = 20.0
 CLAUDE_PROBE_OUTPUT_LIMIT_BYTES = 64 * 1024
@@ -542,23 +543,25 @@ class _ClaudeKeychainCredentialHandler(socketserver.BaseRequestHandler):
         operation = _recv_exact(self.request, 1)
         if operation != b"R":
             return
+        credential = bytearray()
         with server.credential_lock:
-            if server.consumed:
-                credential = b""
-            else:
+            if not server.consumed and server.credential is not None:
                 server.consumed = True
-                credential = bytes(server.credential or b"")
+                credential = server.credential
+                server.credential = None
         try:
             self.request.sendall(struct.pack("!I", len(credential)))
             if credential:
                 self.request.sendall(credential)
         except OSError:
             return
+        finally:
+            credential[:] = b"\x00" * len(credential)
 
 
 class _ClaudeKeychainCredentialServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
-    daemon_threads = True
+    daemon_threads = False
 
     def __init__(
         self,
@@ -1077,7 +1080,7 @@ def _run_claude_auth_warmup(
                 "--effort",
                 CLAUDE_REASONING_EFFORT,
                 "--permission-mode",
-                "dontAsk",
+                "default",
                 "--output-format",
                 "json",
                 "--no-session-persistence",
@@ -1093,6 +1096,8 @@ def _run_claude_auth_warmup(
                 settings,
                 "--tools",
                 "",
+                "--allowedTools",
+                "Read(./__claude_auth_warmup_no_files__)",
                 "--disallowedTools",
                 "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Task",
             ),
@@ -1336,8 +1341,13 @@ def _claude_review_sandbox_profile(
         raise ReviewError("Claude Code review sandbox requires a valid proxy port")
     home = pathlib.Path(home_raw).resolve()
     tmp = pathlib.Path(tmp_raw).resolve()
+    claude_tmp = pathlib.Path(env.get("CLAUDE_CODE_TMPDIR", tmp_raw)).resolve()
     container = review.container_dir.resolve()
-    if not is_relative_to(home, container) or not is_relative_to(tmp, container):
+    if (
+        not is_relative_to(home, container)
+        or not is_relative_to(tmp, container)
+        or claude_tmp != tmp
+    ):
         raise ReviewError(
             "Claude Code review sandbox requires helper-owned HOME and TMPDIR"
         )
@@ -1433,7 +1443,6 @@ def _claude_review_sandbox_profile(
         review.workspace_root.resolve(),
         home,
         tmp,
-        pathlib.Path("/private/etc/ssl"),
         *(path.resolve() for path in CLAUDE_PROBE_SYSTEM_READ_SUBPATHS),
         *tool_library_subpaths,
         *tls_dirs,
@@ -2400,6 +2409,12 @@ def _resolve_validated_claude_executable(
     claude_home.mkdir(parents=True, exist_ok=True)
     prepared_env = dict(env)
     prepared_env["HOME"] = str(claude_home)
+    claude_tmp = review.container_dir / "tmp"
+    claude_tmp.mkdir(parents=True, exist_ok=True)
+    prepared_env["TMPDIR"] = str(claude_tmp)
+    prepared_env["TMP"] = str(claude_tmp)
+    prepared_env["TEMP"] = str(claude_tmp)
+    prepared_env["CLAUDE_CODE_TMPDIR"] = str(claude_tmp)
     prepared_env.pop("XDG_CONFIG_HOME", None)
     probe_home = review.container_dir / "claude-probe-home"
     probe_home.mkdir(parents=True, exist_ok=True)
@@ -2489,7 +2504,7 @@ def _claude_attempt(
                 "--effort",
                 CLAUDE_REASONING_EFFORT,
                 "--permission-mode",
-                "dontAsk",
+                "default",
                 "--output-format",
                 "json",
                 "--no-session-persistence",
