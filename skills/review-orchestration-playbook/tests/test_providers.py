@@ -239,6 +239,60 @@ class ProviderPolicyTest(unittest.TestCase):
             ):
                 self.fail("unavailable broker unexpectedly started")
 
+    @mock.patch.object(providers, "_read_claude_keychain_credential")
+    @mock.patch.object(
+        providers,
+        "_claude_keychain_credential_server",
+        side_effect=providers.ClaudeLoopbackUnavailable("bind denied"),
+    )
+    def test_keychain_runtime_zeroes_credential_when_broker_bind_fails(
+        self,
+        _server: mock.Mock,
+        read_credential: mock.Mock,
+    ) -> None:
+        credential = bytearray(oauth_credential_fixture())
+        read_credential.return_value = credential
+
+        with self.assertRaisesRegex(
+            providers.ClaudeLoopbackUnavailable,
+            "bind denied",
+        ):
+            with self.claude_keychain_runtime(self.review, {}):
+                self.fail("unavailable broker unexpectedly started")
+
+        self.assertEqual(credential, bytearray(len(credential)))
+
+    def test_keychain_broker_thread_failure_closes_server_and_zeroes_credential(
+        self,
+    ) -> None:
+        credential = bytearray(b"fixture-value")
+        server = mock.Mock()
+        thread = mock.Mock()
+        thread.start.side_effect = RuntimeError("thread unavailable")
+
+        with (
+            mock.patch.object(
+                providers,
+                "_ClaudeKeychainCredentialServer",
+                return_value=server,
+            ),
+            mock.patch.object(providers.threading, "Thread", return_value=thread),
+            self.assertRaisesRegex(
+                providers.ClaudeLoopbackUnavailable,
+                "cannot start",
+            ),
+        ):
+            with providers._claude_keychain_credential_server(
+                credential,
+                bytes.fromhex("01" * 32),
+            ):
+                self.fail("unavailable broker unexpectedly started")
+
+        server.shutdown.assert_not_called()
+        server.server_close.assert_called_once_with()
+        thread.join.assert_not_called()
+        self.assertEqual(credential, bytearray(len(credential)))
+
     def test_claude_keychain_broker_serves_one_in_memory_value(self) -> None:
         if (
             sys.platform != "darwin"

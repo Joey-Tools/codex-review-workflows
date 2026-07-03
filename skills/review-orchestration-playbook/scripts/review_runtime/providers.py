@@ -592,13 +592,22 @@ def _claude_keychain_credential_server(
         daemon=True,
         name="claude-review-keychain-broker",
     )
-    thread.start()
+    thread_started = False
     try:
+        try:
+            thread.start()
+            thread_started = True
+        except RuntimeError as error:
+            raise ClaudeLoopbackUnavailable(
+                f"Claude Keychain broker cannot start: {error}"
+            ) from error
         yield int(server.server_address[1])
     finally:
-        server.shutdown()
+        if thread_started:
+            server.shutdown()
         server.server_close()
-        thread.join(timeout=5.0)
+        if thread_started:
+            thread.join(timeout=5.0)
         if credential is not None:
             credential[:] = b"\x00" * len(credential)
 
@@ -619,17 +628,16 @@ def _claude_keychain_runtime(
         )
     try:
         _validate_fresh_claude_keychain_credential(credential)
-    except ReviewError:
+        capability = secrets.token_bytes(CLAUDE_KEYCHAIN_BROKER_CAPABILITY_BYTES)
+        with _claude_keychain_credential_server(
+            credential,
+            capability,
+        ) as port:
+            result[CLAUDE_KEYCHAIN_BROKER_PORT_ENV] = str(port)
+            result[CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV] = capability.hex()
+            yield result
+    finally:
         credential[:] = b"\x00" * len(credential)
-        raise
-    capability = secrets.token_bytes(CLAUDE_KEYCHAIN_BROKER_CAPABILITY_BYTES)
-    with _claude_keychain_credential_server(
-        credential,
-        capability,
-    ) as port:
-        result[CLAUDE_KEYCHAIN_BROKER_PORT_ENV] = str(port)
-        result[CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV] = capability.hex()
-        yield result
 
 
 def _extract_ca_certificates(data: bytes, *, source: str) -> bytes:
