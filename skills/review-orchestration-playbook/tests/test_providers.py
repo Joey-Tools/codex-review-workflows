@@ -475,6 +475,69 @@ class ProviderPolicyTest(unittest.TestCase):
             sandbox_profile.call_args.kwargs["allow_direct_keychain"]
         )
 
+    @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
+    @mock.patch.object(providers, "_run_claude_auth_warmup")
+    def test_transient_login_warmup_failure_is_inconclusive(
+        self,
+        warmup: mock.Mock,
+        require_fresh: mock.Mock,
+    ) -> None:
+        require_fresh.side_effect = (
+            providers.ClaudeKeychainCredentialUnavailable("stale"),
+            providers.ClaudeKeychainCredentialUnavailable("still stale"),
+        )
+        warmup.return_value = Completed(
+            argv=("claude",),
+            returncode=1,
+            stdout=json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "error_during_execution",
+                    "is_error": True,
+                    "api_error_status": 429,
+                }
+            ).encode(),
+            stderr=b"",
+        )
+
+        with self.assertRaisesRegex(
+            providers.ClaudeAuthWarmupInconclusive,
+            "transient",
+        ):
+            self.warm_claude_local_login(
+                self.review,
+                pathlib.Path("/bin/claude"),
+                {},
+            )
+
+    @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
+    @mock.patch.object(providers, "_run_claude_auth_warmup")
+    def test_auth_login_warmup_failure_remains_unavailable(
+        self,
+        warmup: mock.Mock,
+        require_fresh: mock.Mock,
+    ) -> None:
+        require_fresh.side_effect = (
+            providers.ClaudeKeychainCredentialUnavailable("stale"),
+            providers.ClaudeKeychainCredentialUnavailable("still stale"),
+        )
+        warmup.return_value = Completed(
+            argv=("claude",),
+            returncode=1,
+            stdout=b"",
+            stderr=b"authentication failed",
+        )
+
+        with self.assertRaisesRegex(
+            providers.ClaudeKeychainCredentialUnavailable,
+            "still stale",
+        ):
+            self.warm_claude_local_login(
+                self.review,
+                pathlib.Path("/bin/claude"),
+                {},
+            )
+
     @mock.patch.object(
         providers,
         "CLAUDE_KEYCHAIN_BROKER_COMPILER",
@@ -2164,6 +2227,45 @@ class ProviderPolicyTest(unittest.TestCase):
     )
     @mock.patch.object(
         providers,
+        "resolve_reviewer_executable",
+        return_value=pathlib.Path("/bin/copilot"),
+    )
+    @mock.patch.object(providers, "_copilot_attempt")
+    def test_transient_claude_warmup_failure_refuses_copilot_fallback(
+        self,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _resolve_claude: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        self.warmup.side_effect = providers.ClaudeAuthWarmupInconclusive(
+            "transient refresh failure"
+        )
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
+
+        self.assertEqual(outcome.returncode, 75)
+        copilot_attempt.assert_not_called()
+        resolve.assert_not_called()
+        self.assertIn(
+            "transient refresh failure",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        return_value=(pathlib.Path("/bin/claude"), {}),
+    )
+    @mock.patch.object(
+        providers,
         "_with_claude_review_tool_path",
         side_effect=providers.ClaudeReviewToolUnavailable("trusted rg unavailable"),
     )
@@ -3258,6 +3360,39 @@ class ProviderPolicyTest(unittest.TestCase):
             prepared["PATH"].split(os.pathsep),
             [str(self.claude_broker.parent.resolve()), str(trusted_dir.absolute())],
         )
+
+    def test_trusted_ripgrep_skips_invalid_native_candidate(self) -> None:
+        first_dir = self.review.source_root / "first-tools"
+        second_dir = self.review.source_root / "second-tools"
+        first_dir.mkdir()
+        second_dir.mkdir()
+        first = first_dir / "rg"
+        second = second_dir / "rg"
+        for candidate in (first, second):
+            candidate.write_bytes(b"fixture")
+            candidate.chmod(0o700)
+
+        def dependencies(path: pathlib.Path, *, label: str) -> tuple[pathlib.Path, ...]:
+            self.assertEqual(label, "ripgrep")
+            if path == first:
+                raise providers.InvalidReviewerExecutable("not native")
+            return (path,)
+
+        with (
+            mock.patch.object(
+                providers,
+                "CLAUDE_REVIEW_TOOL_EXECUTABLE_CANDIDATES",
+                (first, second),
+            ),
+            mock.patch.object(
+                providers,
+                "_native_macho_dependencies",
+                side_effect=dependencies,
+            ),
+        ):
+            selected = providers._trusted_claude_ripgrep()
+
+        self.assertEqual(selected, second)
 
     def test_claude_review_path_classifies_non_native_ripgrep_unavailable(
         self,

@@ -5,7 +5,7 @@ status: completed
 created: 2026-07-03
 updated: 2026-07-03
 branch: wip/claude-local-login
-pr:
+pr: https://github.com/Joey-Tools/codex-review-workflows/pull/42
 supersedes: []
 superseded_by:
 ---
@@ -27,7 +27,9 @@ superseded_by:
 - The parent helper honors the original `NO_PROXY` / `no_proxy` list when choosing direct versus corporate-proxy routing for each pinned Anthropic target.
 - HTTPS corporate proxy tunnels drain OpenSSL's already-decrypted pending data before waiting on the underlying socket.
 - Missing Claude authentication can fall back to GitHub Copilot only for explicitly authorized double or triple reviews.
+- A transient or unclassified authentication-warmup failure is inconclusive and cannot trigger Copilot fallback; only a classified authentication failure is treated as unavailable local login.
 - A missing/non-native trusted `rg` or automatically discovered non-native Claude candidate is treated as Claude runtime unavailability and follows the authorized Copilot fallback rule; an invalid explicit Claude path remains a configuration error.
+- Trusted `rg` discovery skips invalid or non-native candidates and continues to the next pinned path.
 - Loopback bind failures for the Keychain broker or Anthropic CONNECT proxy are converted to structured Claude runtime unavailability; the final sandbox no longer reads host Spotlight databases.
 - Skill policy, egress language, helper contract, and provider tests describe the same behavior.
 

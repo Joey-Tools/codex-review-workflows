@@ -280,6 +280,10 @@ class ClaudeKeychainCredentialUnavailable(ReviewError):
     """The local Claude credential cannot be refreshed without argv exposure."""
 
 
+class ClaudeAuthWarmupInconclusive(ReviewError):
+    """Claude login refresh failed for a reason that must not trigger fallback."""
+
+
 class ClaudeReviewToolUnavailable(ReviewError):
     """The host lacks a trusted local tool required by Claude Code."""
 
@@ -1009,7 +1013,7 @@ def _run_claude_auth_warmup(
     review: ReviewWorkspace,
     executable: pathlib.Path,
     env: dict[str, str],
-) -> None:
+) -> Completed:
     rg = _trusted_claude_ripgrep()
     if rg is None:
         raise ClaudeReviewToolUnavailable(
@@ -1033,7 +1037,7 @@ def _run_claude_auth_warmup(
     ):
         output_dir = pathlib.Path(raw_output_dir)
         proxied_env = _with_claude_proxy_environment(warmup_env, proxy_port)
-        run(
+        return run(
             (
                 str(CLAUDE_PROBE_SANDBOX),
                 "-p",
@@ -1090,8 +1094,17 @@ def _warm_claude_local_login(
         return
     except ClaudeKeychainCredentialUnavailable:
         pass
-    _run_claude_auth_warmup(review, executable, env)
-    _require_fresh_claude_keychain_credential(review)
+    warmup = _run_claude_auth_warmup(review, executable, env)
+    try:
+        _require_fresh_claude_keychain_credential(review)
+    except ClaudeKeychainCredentialUnavailable as error:
+        category = classify_failure(warmup.stdout, warmup.stderr)
+        if category == "auth":
+            raise
+        raise ClaudeAuthWarmupInconclusive(
+            "Claude authentication warmup did not produce a fresh credential "
+            f"({category})"
+        ) from error
 
 
 def _review_environment(
@@ -1128,14 +1141,15 @@ def _with_executable_path(
 
 
 def _trusted_claude_ripgrep() -> pathlib.Path | None:
-    return next(
-        (
-            path
-            for path in CLAUDE_REVIEW_TOOL_EXECUTABLE_CANDIDATES
-            if path.name == "rg" and path.is_file() and os.access(path, os.X_OK)
-        ),
-        None,
-    )
+    for path in CLAUDE_REVIEW_TOOL_EXECUTABLE_CANDIDATES:
+        if path.name != "rg" or not path.is_file() or not os.access(path, os.X_OK):
+            continue
+        try:
+            _native_macho_dependencies(path, label="ripgrep")
+        except InvalidReviewerExecutable:
+            continue
+        return path
+    return None
 
 
 def _with_claude_review_tool_path(
@@ -2849,6 +2863,7 @@ def run_review(
         )
     except (
         FileNotFoundError,
+        ClaudeAuthWarmupInconclusive,
         ReviewTimeoutError,
         ReviewOutputDrainError,
         ReviewOutputLimitError,
