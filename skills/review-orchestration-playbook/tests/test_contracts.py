@@ -63,6 +63,15 @@ class RepositoryContractTest(unittest.TestCase):
 
         self.assertIn("ordinary local Claude login by default", skill)
         self.assertIn("runs in safe mode", helper_contract)
+        self.assertIn(
+            "hardening-compatible `default` permission mode",
+            helper_contract,
+        )
+        self.assertIn(
+            "noninteractive process cannot approve any unmatched access",
+            helper_contract,
+        )
+        self.assertNotIn("safe mode with `dontAsk` permissions", helper_contract)
         self.assertIn("separate default-deny `sandbox-exec` profile", helper_contract)
         self.assertIn("ordinary macOS OAuth/keychain login", helper_contract)
         self.assertIn("localhost CONNECT proxy", helper_contract)
