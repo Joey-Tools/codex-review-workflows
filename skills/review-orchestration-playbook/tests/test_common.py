@@ -72,6 +72,19 @@ class ChildEnvironmentTest(unittest.TestCase):
 
         self.assertLessEqual(output_size, 4096)
 
+    def test_bounded_capture_enforces_independent_stream_limits(self) -> None:
+        with self.assertRaises(common.ReviewOutputLimitError):
+            common.run_bounded_capture(
+                (
+                    sys.executable,
+                    "-c",
+                    "import os; os.write(2, b'x' * 2048)",
+                ),
+                timeout_seconds=5,
+                stdout_limit_bytes=4096,
+                stderr_limit_bytes=1024,
+            )
+
     def test_output_limit_is_detected_while_stream_remains_open(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)

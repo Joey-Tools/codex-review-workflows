@@ -25,7 +25,7 @@ from review_runtime.common import Completed, ReviewError  # noqa: E402
 from review_runtime.workspace import ReviewWorkspace  # noqa: E402
 
 
-def oauth_credential_fixture(*, expires_in_seconds: float = 3600) -> bytes:
+def oauth_credential_fixture(*, expires_in_seconds: float = 7200) -> bytes:
     payload: dict[str, object] = {
         "claudeAiOauth": {
             "access" + "Token": "fixture-" + "access-value",
@@ -383,17 +383,17 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(direct_update.returncode, 64)
         self.assertEqual(credential, bytearray(len(credential)))
 
-    @mock.patch.object(providers.subprocess, "run")
+    @mock.patch.object(providers, "run_bounded_capture")
     def test_keychain_prefetch_uses_fixed_service_and_account(
         self,
         run_command: mock.Mock,
     ) -> None:
         payload = oauth_credential_fixture()
-        completed = subprocess.CompletedProcess(
-            args=(),
+        completed = common.BoundedCapture(
+            argv=(),
             returncode=0,
-            stdout=payload,
-            stderr=b"",
+            stdout=bytearray(payload),
+            stderr=bytearray(),
         )
         run_command.return_value = completed
 
@@ -413,7 +413,15 @@ class ProviderPolicyTest(unittest.TestCase):
                 "Claude Code-credentials",
             ),
         )
-        self.assertEqual(completed.stdout, b"")
+        self.assertEqual(completed.stdout, bytearray(len(payload)))
+        self.assertEqual(
+            run_command.call_args.kwargs["stdout_limit_bytes"],
+            providers.CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES,
+        )
+        self.assertEqual(
+            run_command.call_args.kwargs["stderr_limit_bytes"],
+            providers.CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
+        )
 
     @mock.patch.object(providers, "_read_claude_keychain_credential")
     def test_keychain_preflight_rejects_stale_access_token(
@@ -440,6 +448,29 @@ class ProviderPolicyTest(unittest.TestCase):
         read_credential.return_value = credential
 
         self.require_fresh_claude_keychain_credential(self.review)
+
+        self.assertEqual(credential, bytearray(len(credential)))
+
+    @mock.patch.object(providers, "_read_claude_keychain_credential")
+    def test_keychain_preflight_requires_whole_model_chain_lifetime(
+        self,
+        read_credential: mock.Mock,
+    ) -> None:
+        single_attempt_lifetime = (
+            providers.REVIEW_ATTEMPT_TIMEOUT_SECONDS
+            + providers.CLAUDE_AUTH_EXPIRY_MARGIN_SECONDS
+            + 30
+        )
+        credential = bytearray(
+            oauth_credential_fixture(expires_in_seconds=single_attempt_lifetime)
+        )
+        read_credential.return_value = credential
+
+        with self.assertRaisesRegex(
+            providers.ClaudeKeychainCredentialUnavailable,
+            "cannot cover the isolated review window",
+        ):
+            self.require_fresh_claude_keychain_credential(self.review)
 
         self.assertEqual(credential, bytearray(len(credential)))
 
@@ -3919,6 +3950,30 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertNotEqual(prepared_dirs[0], prepared_dirs[1])
         for prepared_dir in prepared_dirs:
             self.assertEqual((prepared_dir / "deadbeef.0").read_bytes(), certificate)
+
+    def test_claude_tls_preparation_bounds_directory_enumeration_before_sort(
+        self,
+    ) -> None:
+        source_dir = self.review.source_root / "large-ca-dir"
+        source_dir.mkdir()
+        consumed = 0
+
+        def entries():
+            nonlocal consumed
+            for index in range(providers.CLAUDE_CA_DIR_ENTRY_LIMIT + 10):
+                consumed += 1
+                yield source_dir / f"entry-{index:05d}"
+
+        with (
+            mock.patch.object(pathlib.Path, "iterdir", return_value=entries()),
+            self.assertRaisesRegex(ReviewError, "too many entries"),
+        ):
+            providers._prepare_claude_tls_environment(
+                self.review,
+                {"SSL_CERT_DIR": str(source_dir)},
+            )
+
+        self.assertEqual(consumed, providers.CLAUDE_CA_DIR_ENTRY_LIMIT + 1)
 
     @mock.patch.object(providers.ssl, "create_default_context")
     def test_proxy_ssl_context_loads_each_ca_directory(

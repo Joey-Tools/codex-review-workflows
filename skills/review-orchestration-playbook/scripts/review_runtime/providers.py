@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import hmac
+import itertools
 import json
 import math
 import os
@@ -37,6 +38,7 @@ from .common import (
     reviewer_executable_path,
     resolve_reviewer_executable,
     run,
+    run_bounded_capture,
     write_json,
     write_text_atomic,
 )
@@ -429,7 +431,7 @@ def _read_claude_keychain_credential(
     security_env = child_environment(container_dir=review.container_dir)
     security_env["USER"] = account
     try:
-        completed = subprocess.run(
+        completed = run_bounded_capture(
             (
                 str(client),
                 "find-generic-password",
@@ -441,41 +443,37 @@ def _read_claude_keychain_credential(
             ),
             cwd=review.container_dir,
             env=security_env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS,
+            timeout_seconds=CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS,
+            stdout_limit_bytes=CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES,
+            stderr_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
         )
-    except subprocess.TimeoutExpired as error:
-        raise ReviewTimeoutError("Claude Keychain query timed out") from error
     except OSError as error:
         raise ReviewError(f"Claude Keychain query failed: {error}") from error
-    if (
-        len(completed.stdout) > CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES
-        or len(completed.stderr) > CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES
-    ):
-        completed.stdout = b""
-        raise ReviewError("Claude Keychain query exceeded its output limit")
-    if completed.returncode != 0:
-        completed.stdout = b""
-        return None
-    credential = bytearray(completed.stdout.strip())
-    completed.stdout = b""
-    if not credential:
-        return None
-    return credential
+    try:
+        if completed.returncode != 0:
+            return None
+        credential = bytearray(completed.stdout.strip())
+        if not credential:
+            return None
+        return credential
+    finally:
+        completed.stdout[:] = b"\x00" * len(completed.stdout)
+        completed.stderr[:] = b"\x00" * len(completed.stderr)
 
 
-def _validate_fresh_claude_keychain_credential(credential: bytearray) -> None:
+def _validate_fresh_claude_keychain_credential(
+    credential: bytearray,
+    *,
+    attempt_count: int = 1,
+) -> None:
     try:
         payload = json.loads(credential)
         oauth = payload["claudeAiOauth"]
         expires_at = oauth["expiresAt"]
         required_expiry = (
             time.time()
-            + REVIEW_ATTEMPT_TIMEOUT_SECONDS
-            + CLAUDE_AUTH_EXPIRY_MARGIN_SECONDS
+            + attempt_count
+            * (REVIEW_ATTEMPT_TIMEOUT_SECONDS + CLAUDE_AUTH_EXPIRY_MARGIN_SECONDS)
         ) * 1000
         maximum_expiry = (time.time() + 7 * 24 * 60 * 60) * 1000
         if (
@@ -503,7 +501,10 @@ def _require_fresh_claude_keychain_credential(review: ReviewWorkspace) -> None:
             "Claude local-login credential is unavailable"
         )
     try:
-        _validate_fresh_claude_keychain_credential(credential)
+        _validate_fresh_claude_keychain_credential(
+            credential,
+            attempt_count=len(CLAUDE_MODELS),
+        )
     finally:
         credential[:] = b"\x00" * len(credential)
 
@@ -728,12 +729,16 @@ def _prepare_claude_tls_environment(
             destination_dir = destination_root / f"{index:04d}"
             destination_dir.mkdir(mode=0o700)
             copied = False
-            for source_path in sorted(source_dir.iterdir(), key=lambda path: path.name):
+            remaining_entries = CLAUDE_CA_DIR_ENTRY_LIMIT - entry_count
+            source_paths = list(
+                itertools.islice(source_dir.iterdir(), remaining_entries + 1)
+            )
+            if len(source_paths) > remaining_entries:
+                raise ReviewError("Claude review CA directory has too many entries")
+            entry_count += len(source_paths)
+            for source_path in sorted(source_paths, key=lambda path: path.name):
                 if not source_path.is_file():
                     continue
-                entry_count += 1
-                if entry_count > CLAUDE_CA_DIR_ENTRY_LIMIT:
-                    raise ReviewError("Claude review CA directory has too many entries")
                 try:
                     source_size = source_path.stat().st_size
                 except OSError as error:
