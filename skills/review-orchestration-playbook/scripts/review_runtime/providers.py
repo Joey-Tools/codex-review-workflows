@@ -404,7 +404,7 @@ def _prepare_claude_keychain_broker(
     )
     if completed.returncode != 0:
         detail = completed.stderr.decode("utf-8", errors="replace").strip()
-        raise ReviewError(
+        raise ClaudeKeychainBrokerUnavailable(
             "failed to build the Claude Keychain broker"
             + (f": {detail}" if detail else "")
         )

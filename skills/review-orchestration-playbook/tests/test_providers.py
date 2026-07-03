@@ -611,6 +611,30 @@ class ProviderPolicyTest(unittest.TestCase):
             )
 
     @mock.patch.object(providers, "run")
+    def test_keychain_broker_compile_failure_is_unavailable(
+        self,
+        run_command: mock.Mock,
+    ) -> None:
+        run_command.return_value = Completed(
+            argv=("clang",),
+            returncode=1,
+            stdout=b"",
+            stderr=b"toolchain unavailable",
+        )
+
+        with self.assertRaisesRegex(
+            providers.ClaudeKeychainBrokerUnavailable,
+            "toolchain unavailable",
+        ):
+            self.prepare_claude_keychain_broker(
+                self.review,
+                {
+                    "HOME": str(self.review.container_dir / "claude-home"),
+                    "PATH": "/usr/bin",
+                },
+            )
+
+    @mock.patch.object(providers, "run")
     def test_claude_api_key_skips_keychain_broker(self, run_command: mock.Mock) -> None:
         env = {
             "ANTHROPIC_API_KEY": "test-api-key",
