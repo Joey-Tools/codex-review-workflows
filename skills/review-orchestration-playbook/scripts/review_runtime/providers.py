@@ -9,7 +9,6 @@ import json
 import math
 import os
 import pathlib
-import platform
 import re
 import secrets
 import select
@@ -351,12 +350,6 @@ def _native_macho_dependencies(
 
 
 def _require_trusted_claude_digest(path: pathlib.Path) -> None:
-    machine = platform.machine()
-    expected = CLAUDE_TRUSTED_SHA256_BY_MACHINE.get(machine)
-    if expected is None:
-        raise InvalidReviewerExecutable(
-            f"Claude Code {CLAUDE_SUPPORTED_VERSION} has no trusted digest for {machine}"
-        )
     digest = hashlib.sha256()
     try:
         with path.resolve().open("rb") as handle:
@@ -366,10 +359,14 @@ def _require_trusted_claude_digest(path: pathlib.Path) -> None:
         raise InvalidReviewerExecutable(
             f"cannot hash Claude Code executable: {error}"
         ) from error
-    if not hmac.compare_digest(digest.hexdigest(), expected):
+    actual = digest.hexdigest()
+    if not any(
+        hmac.compare_digest(actual, expected)
+        for expected in CLAUDE_TRUSTED_SHA256_BY_MACHINE.values()
+    ):
         raise InvalidReviewerExecutable(
             f"Claude Code {CLAUDE_SUPPORTED_VERSION} does not match the trusted "
-            f"{machine} release digest"
+            "macOS release digests"
         )
 
 

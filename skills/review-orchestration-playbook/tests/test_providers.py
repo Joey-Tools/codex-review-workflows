@@ -207,19 +207,18 @@ class ProviderPolicyTest(unittest.TestCase):
             tuple(dict.fromkeys((executable.absolute(), executable.resolve()))),
         )
 
-    def test_claude_digest_accepts_pinned_release_artifact(self) -> None:
+    def test_claude_digest_accepts_pinned_release_across_helper_architectures(
+        self,
+    ) -> None:
         executable = self.review.source_root / "claude"
         payload = b"trusted Claude release fixture"
         executable.write_bytes(payload)
         expected = hashlib.sha256(payload).hexdigest()
 
-        with (
-            mock.patch.object(
-                providers,
-                "CLAUDE_TRUSTED_SHA256_BY_MACHINE",
-                {"arm64": expected},
-            ),
-            mock.patch.object(providers.platform, "machine", return_value="arm64"),
+        with mock.patch.object(
+            providers,
+            "CLAUDE_TRUSTED_SHA256_BY_MACHINE",
+            {"arm64": "00" * 32, "x86_64": expected},
         ):
             self.require_trusted_claude_digest(executable)
 
@@ -227,17 +226,13 @@ class ProviderPolicyTest(unittest.TestCase):
         executable = self.review.source_root / "claude"
         executable.write_bytes(b"untrusted native fixture")
 
-        with (
-            mock.patch.object(
-                providers,
-                "CLAUDE_TRUSTED_SHA256_BY_MACHINE",
-                {"arm64": "00" * 32},
-            ),
-            mock.patch.object(providers.platform, "machine", return_value="arm64"),
-            self.assertRaisesRegex(
-                providers.InvalidReviewerExecutable,
-                "trusted arm64 release digest",
-            ),
+        with mock.patch.object(
+            providers,
+            "CLAUDE_TRUSTED_SHA256_BY_MACHINE",
+            {"arm64": "00" * 32, "x86_64": "11" * 32},
+        ), self.assertRaisesRegex(
+            providers.InvalidReviewerExecutable,
+            "trusted macOS release digests",
         ):
             self.require_trusted_claude_digest(executable)
 
