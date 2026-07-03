@@ -32,6 +32,7 @@ superseded_by:
 - Trusted `rg` discovery skips invalid or non-native candidates and continues to the next pinned path.
 - Loopback bind failures for the Keychain broker or Anthropic CONNECT proxy are converted to structured Claude runtime unavailability; the final sandbox no longer reads host Spotlight databases.
 - OAuth credential buffers are zeroed on every broker exit path, including loopback bind and broker-thread startup failures; an already-bound broker socket is closed if its serving thread cannot start.
+- An already-bound Anthropic CONNECT proxy socket is likewise closed if its serving thread cannot start, and the failure remains eligible for authorized runtime-unavailable fallback.
 - Skill policy, egress language, helper contract, and provider tests describe the same behavior.
 
 ## Next Steps

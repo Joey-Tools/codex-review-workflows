@@ -988,13 +988,22 @@ def _claude_connect_proxy(
         name="claude-review-connect-proxy",
         daemon=True,
     )
-    thread.start()
+    thread_started = False
     try:
+        try:
+            thread.start()
+            thread_started = True
+        except RuntimeError as error:
+            raise ClaudeLoopbackUnavailable(
+                f"Claude CONNECT proxy cannot start: {error}"
+            ) from error
         yield int(server.server_address[1])
     finally:
-        server.shutdown()
+        if thread_started:
+            server.shutdown()
         server.server_close()
-        thread.join(timeout=5.0)
+        if thread_started:
+            thread.join(timeout=5.0)
 
 
 def _with_claude_proxy_environment(

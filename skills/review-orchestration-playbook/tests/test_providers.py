@@ -4086,6 +4086,30 @@ class ProviderPolicyTest(unittest.TestCase):
             with providers._claude_connect_proxy({}):
                 self.fail("unavailable proxy unexpectedly started")
 
+    def test_claude_proxy_thread_failure_closes_server(self) -> None:
+        server = mock.Mock()
+        thread = mock.Mock()
+        thread.start.side_effect = RuntimeError("thread unavailable")
+
+        with (
+            mock.patch.object(
+                providers,
+                "_ClaudeProxyServer",
+                return_value=server,
+            ),
+            mock.patch.object(providers.threading, "Thread", return_value=thread),
+            self.assertRaisesRegex(
+                providers.ClaudeLoopbackUnavailable,
+                "CONNECT proxy cannot start",
+            ),
+        ):
+            with providers._claude_connect_proxy({}):
+                self.fail("unavailable proxy unexpectedly started")
+
+        server.shutdown.assert_not_called()
+        server.server_close.assert_called_once_with()
+        thread.join.assert_not_called()
+
     def test_claude_upstream_proxy_respects_bypass_environment(self) -> None:
         for key in ("NO_PROXY", "no_proxy"):
             with self.subTest(key=key):
