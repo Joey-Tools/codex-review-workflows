@@ -101,6 +101,8 @@ Fallback classification uses stderr plus explicit structured CLI error events an
 
 Each attempt records runtime, requested/effective model, requested/effective effort when observable, category, exit status, and log paths. For Codex, the helper resolves the emitted thread ID to its persisted rollout and requires matching `turn_context` model and effort before accepting the final artifact. Missing verification on a successful result is `runtime-unverified`; any observed model, effort, or permission mismatch overrides even an otherwise entitlement-shaped failed attempt and stops the lane. None of those conditions is entitlement evidence, so none enters the fallback path.
 
+Claude Code executable trust is anchored to the complete SHA-256 digests published by the official Homebrew Cask for the pinned `downloads.claude.ai` 2.1.187 macOS arm64 and x86_64 artifacts. A native binary that self-reports the expected version/help text but does not match the architecture-specific digest is rejected before any probe, Keychain warmup, or review process starts.
+
 ## Deliberate Omissions
 
 The helper no longer supports generic `auto` lanes, OpenCode, Cursor Agent, `gh-copilot`, `codex-parallel`, live working-tree snapshots, reviewer-visible Git shims, arbitrary child argv, report sinks, or legacy helper names. These surfaces caused ambiguous review counting, model drift, or unnecessary runtime code exposure.

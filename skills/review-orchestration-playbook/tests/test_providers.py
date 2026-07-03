@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import pathlib
@@ -75,6 +76,12 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
         )
         self.native_dependency_patcher.start()
+        self.require_trusted_claude_digest = providers._require_trusted_claude_digest
+        self.trusted_digest_patcher = mock.patch.object(
+            providers,
+            "_require_trusted_claude_digest",
+        )
+        self.trusted_digest = self.trusted_digest_patcher.start()
         self.prepare_claude_keychain_broker = (
             providers._prepare_claude_keychain_broker
         )
@@ -105,6 +112,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.warmup_patcher.stop()
         self.keychain_runtime_patcher.stop()
         self.keychain_broker_patcher.stop()
+        self.trusted_digest_patcher.stop()
         self.native_dependency_patcher.stop()
         self.temporary.cleanup()
 
@@ -198,6 +206,40 @@ class ProviderPolicyTest(unittest.TestCase):
             dependencies,
             tuple(dict.fromkeys((executable.absolute(), executable.resolve()))),
         )
+
+    def test_claude_digest_accepts_pinned_release_artifact(self) -> None:
+        executable = self.review.source_root / "claude"
+        payload = b"trusted Claude release fixture"
+        executable.write_bytes(payload)
+        expected = hashlib.sha256(payload).hexdigest()
+
+        with (
+            mock.patch.object(
+                providers,
+                "CLAUDE_TRUSTED_SHA256_BY_MACHINE",
+                {"arm64": expected},
+            ),
+            mock.patch.object(providers.platform, "machine", return_value="arm64"),
+        ):
+            self.require_trusted_claude_digest(executable)
+
+    def test_claude_digest_rejects_unpinned_native_binary(self) -> None:
+        executable = self.review.source_root / "claude"
+        executable.write_bytes(b"untrusted native fixture")
+
+        with (
+            mock.patch.object(
+                providers,
+                "CLAUDE_TRUSTED_SHA256_BY_MACHINE",
+                {"arm64": "00" * 32},
+            ),
+            mock.patch.object(providers.platform, "machine", return_value="arm64"),
+            self.assertRaisesRegex(
+                providers.InvalidReviewerExecutable,
+                "trusted arm64 release digest",
+            ),
+        ):
+            self.require_trusted_claude_digest(executable)
 
     def test_claude_keychain_broker_compiles_and_rejects_other_queries(self) -> None:
         if (

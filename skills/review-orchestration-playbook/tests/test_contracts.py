@@ -72,6 +72,8 @@ class RepositoryContractTest(unittest.TestCase):
             helper_contract,
         )
         self.assertNotIn("safe mode with `dontAsk` permissions", helper_contract)
+        self.assertIn("complete SHA-256 digests", helper_contract)
+        self.assertIn("downloads.claude.ai", helper_contract)
         self.assertIn("separate default-deny `sandbox-exec` profile", helper_contract)
         self.assertIn("ordinary macOS OAuth/keychain login", helper_contract)
         self.assertIn("localhost CONNECT proxy", helper_contract)

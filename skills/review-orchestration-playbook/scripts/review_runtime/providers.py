@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import hashlib
 import hmac
 import itertools
 import json
 import math
 import os
 import pathlib
+import platform
 import re
 import secrets
 import select
@@ -49,6 +51,13 @@ CODEX_MODELS = ("gpt-5.6-sol", "gpt-5.5")
 CODEX_REASONING_EFFORT = "xhigh"
 CLAUDE_MODELS = ("claude-opus-4-8", "claude-opus-4-7")
 CLAUDE_SUPPORTED_VERSION = "2.1.187"
+CLAUDE_TRUSTED_SHA256_BY_MACHINE = {
+    # Homebrew Cask 2.1.187 points these digests at the corresponding
+    # downloads.claude.ai release artifacts.
+    "arm64": "a59a16ba4922adab7a145728f215d042184d349f5f7e72cddb7fc114250a4ce3",
+    "x86_64": "7f57b6935b4246d03cb7acee90dc22153083483a267da589c5c920dd04744c36",
+}
+CLAUDE_TRUSTED_HASH_CHUNK_BYTES = 1024 * 1024
 # GitHub's supported-models matrix lists all pinned IDs for Copilot CLI. The
 # shorter command-reference examples can lag product availability.
 COPILOT_MODELS = ("claude-opus-4.8", "claude-opus-4.7")
@@ -339,6 +348,29 @@ def _native_macho_dependencies(
             f"{label} must be a native Mach-O executable, not a script or wrapper"
         )
     return tuple(dict.fromkeys(candidates))
+
+
+def _require_trusted_claude_digest(path: pathlib.Path) -> None:
+    machine = platform.machine()
+    expected = CLAUDE_TRUSTED_SHA256_BY_MACHINE.get(machine)
+    if expected is None:
+        raise InvalidReviewerExecutable(
+            f"Claude Code {CLAUDE_SUPPORTED_VERSION} has no trusted digest for {machine}"
+        )
+    digest = hashlib.sha256()
+    try:
+        with path.resolve().open("rb") as handle:
+            while chunk := handle.read(CLAUDE_TRUSTED_HASH_CHUNK_BYTES):
+                digest.update(chunk)
+    except OSError as error:
+        raise InvalidReviewerExecutable(
+            f"cannot hash Claude Code executable: {error}"
+        ) from error
+    if not hmac.compare_digest(digest.hexdigest(), expected):
+        raise InvalidReviewerExecutable(
+            f"Claude Code {CLAUDE_SUPPORTED_VERSION} does not match the trusted "
+            f"{machine} release digest"
+        )
 
 
 def _claude_keychain_account() -> str:
@@ -2431,6 +2463,7 @@ def _resolve_validated_claude_executable(
         candidate_env = dict(probe_env)
         candidate_env["PATH"] = reviewer_executable_path(candidate)
         _native_macho_dependencies(candidate, label="Claude Code")
+        _require_trusted_claude_digest(candidate)
         _require_claude_identity(candidate, candidate_env)
         _require_claude_safe_mode(candidate, candidate_env)
 
