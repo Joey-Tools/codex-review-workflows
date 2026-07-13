@@ -118,7 +118,10 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("--output-last-message <task-scoped-file>", contracts)
         self.assertIn("file byte or line counts", contracts)
         self.assertIn("read only the separate final-message file", contracts)
-        self.assertIn("missing trustworthy final-message file is `inconclusive`", contracts)
+        self.assertIn("read one bounded stderr error tail", contracts)
+        self.assertIn("runtime-verification failure as `blocked`", contracts)
+        self.assertIn("otherwise report `inconclusive`", contracts)
+        self.assertIn("Never read the complete stderr", contracts)
         self.assertIn(
             "Remove task-scoped process logs and the final-message file",
             contracts,

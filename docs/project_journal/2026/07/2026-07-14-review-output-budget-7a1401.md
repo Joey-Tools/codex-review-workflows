@@ -20,6 +20,7 @@ superseded_by:
 
 - The PR-readiness gate requires stdout and stderr capture instead of streaming reviewer traces into the parent transcript.
 - The Codex CLI invocation writes its terminal artifact with `--output-last-message` so the final result never has to be recovered from stdout.
+- A missing final-message file permits one bounded stderr tail so deterministic authentication, permission, configuration, or runtime-verification failures remain classified as blocked.
 - The shared review-lane contract limits polling to process state, counts, or a short error tail and classifies a missing terminal artifact as inconclusive.
 - Repository contract tests pin the process-output budget and cleanup language.
 
