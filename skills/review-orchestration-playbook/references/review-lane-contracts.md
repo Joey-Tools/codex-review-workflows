@@ -23,10 +23,10 @@ Use this contract for helper-backed review, a clean-context `reviewer` fallback,
 
 ## Parent-Process Output Budget
 
-- When a parent workflow launches a fresh Codex CLI review process, capture the complete stdout and stderr in task-scoped files; do not stream either process output into the parent transcript.
+- When a parent workflow launches a fresh Codex CLI review process, capture the complete stdout and stderr in task-scoped files; do not stream either process output into the parent transcript. Also pass `--output-last-message <task-scoped-file>` so the terminal artifact is written separately from those process logs.
 - While the process runs, use only bounded status probes such as PID/name state, file byte or line counts, or a short error tail. Do not repeatedly relay complete logs, growing tails, internal tool traces, or keepalives.
-- After the process exits, read only its terminal final artifact. Retained process logs are recovery evidence, not review findings; a missing trustworthy terminal artifact is `inconclusive` even when the trace appears clean.
-- Remove task-scoped process logs after recording the terminal result unless they are intentionally retained for a reported blocker or recovery handoff.
+- After the process exits, read only the separate final-message file. Retained stdout and stderr are recovery evidence, not review findings; a missing trustworthy final-message file is `inconclusive` even when the trace appears clean.
+- Remove task-scoped process logs and the final-message file after recording the terminal result unless they are intentionally retained for a reported blocker or recovery handoff.
 
 ## Clean-Context Codex Fallback
 

@@ -111,12 +111,14 @@ class RepositoryContractTest(unittest.TestCase):
         )
 
         self.assertIn("complete stdout and stderr in task-scoped files", readiness)
+        self.assertIn("--output-last-message <task-scoped-file>", readiness)
         self.assertIn("Poll only with bounded status probes", readiness)
         self.assertIn("Parent-Process Output Budget", readiness)
         self.assertIn("do not stream either process output", contracts)
+        self.assertIn("--output-last-message <task-scoped-file>", contracts)
         self.assertIn("file byte or line counts", contracts)
-        self.assertIn("read only its terminal final artifact", contracts)
-        self.assertIn("missing trustworthy terminal artifact is `inconclusive`", contracts)
+        self.assertIn("read only the separate final-message file", contracts)
+        self.assertIn("missing trustworthy final-message file is `inconclusive`", contracts)
 
     def test_review_prompts_do_not_use_unbounded_only_matching_samples(self) -> None:
         forbidden = "rg -o --max-count 80"

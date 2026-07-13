@@ -14,11 +14,12 @@ superseded_by:
 
 ## Summary
 
-- Independent Codex PR reviews now keep complete process output in task-scoped files and expose only bounded status probes plus the terminal final artifact to the parent workflow.
+- Independent Codex PR reviews now keep complete process output in task-scoped files and expose only bounded status probes plus a separate final-message artifact to the parent workflow.
 
 ## Current State
 
 - The PR-readiness gate requires stdout and stderr capture instead of streaming reviewer traces into the parent transcript.
+- The Codex CLI invocation writes its terminal artifact with `--output-last-message` so the final result never has to be recovered from stdout.
 - The shared review-lane contract limits polling to process state, counts, or a short error tail and classifies a missing terminal artifact as inconclusive.
 - Repository contract tests pin the process-output budget and cleanup language.
 
