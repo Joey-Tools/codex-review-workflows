@@ -102,6 +102,22 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertIn("Require its retained `preflight.json`", readiness)
 
+    def test_independent_codex_process_output_is_task_scoped_and_bounded(self) -> None:
+        readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("complete stdout and stderr in task-scoped files", readiness)
+        self.assertIn("Poll only with bounded status probes", readiness)
+        self.assertIn("Parent-Process Output Budget", readiness)
+        self.assertIn("do not stream either process output", contracts)
+        self.assertIn("file byte or line counts", contracts)
+        self.assertIn("read only its terminal final artifact", contracts)
+        self.assertIn("missing trustworthy terminal artifact is `inconclusive`", contracts)
+
     def test_review_prompts_do_not_use_unbounded_only_matching_samples(self) -> None:
         forbidden = "rg -o --max-count 80"
         candidates = [SKILL_ROOT / "SKILL.md", SKILL_ROOT / "scripts/review_runtime/prompt.py"]

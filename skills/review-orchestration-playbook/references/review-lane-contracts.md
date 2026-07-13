@@ -21,13 +21,20 @@ Use this contract for helper-backed review, a clean-context `reviewer` fallback,
 - If there are no actionable findings, reply exactly `No findings.`
 - Intermediate reasoning, file reads, progress, and keepalives are not final artifacts.
 
+## Parent-Process Output Budget
+
+- When a parent workflow launches a fresh Codex CLI review process, capture the complete stdout and stderr in task-scoped files; do not stream either process output into the parent transcript.
+- While the process runs, use only bounded status probes such as PID/name state, file byte or line counts, or a short error tail. Do not repeatedly relay complete logs, growing tails, internal tool traces, or keepalives.
+- After the process exits, read only its terminal final artifact. Retained process logs are recovery evidence, not review findings; a missing trustworthy terminal artifact is `inconclusive` even when the trace appears clean.
+- Remove task-scoped process logs after recording the terminal result unless they are intentionally retained for a reported blocker or recovery handoff.
+
 ## Clean-Context Codex Fallback
 
 If the helper-backed Codex reviewer runtime is deterministically unavailable after the helper has written a matching successful `preflight.json`, `stateful final` retains the immutable frozen workspace and reports it through `fallback_workspace_retained`. Use only that retained scope with the `reviewer` agent and the complete diff/evidence and output contracts, then run `stateful cleanup --state-dir <dir>`. If the helper cannot complete that preflight, stop instead of bypassing it. The fallback's pinned configuration is `gpt-5.6-sol` with `xhigh`. Do not use an inherited-context/default coding agent. A `gpt-5.5` fallback is allowed only after explicit model entitlement/policy denial.
 
 ## PR Readiness Codex Gates
 
-`independent-codex-pr-review` is a fresh Codex CLI review-only session, separate from the helper. Launch it only after the offline helper has retained successful preflight evidence for the same frozen range. Its prompt must identify the parent PR readiness workflow, bind the exact PR and frozen range, include every rule in **Scope And Evidence Budget**, disable project-instruction injection, and forbid PR actions, fixes, other reviewers, and CI waiting. Only its final `LGTM` or no-findings artifact is evidence.
+`independent-codex-pr-review` is a fresh Codex CLI review-only session, separate from the helper. Launch it only after the offline helper has retained successful preflight evidence for the same frozen range. Its prompt must identify the parent PR readiness workflow, bind the exact PR and frozen range, include every rule in **Scope And Evidence Budget** and **Parent-Process Output Budget**, disable project-instruction injection, and forbid PR actions, fixes, other reviewers, and CI waiting. Only its final `LGTM` or no-findings artifact is evidence.
 
 `offline-frozen-diff-review` is the first stateful helper-backed pinned Codex lane over the same range. Its retained preflight evidence gates the later independent Codex session. Its terminal artifact, or the **Clean-Context Codex Fallback** artifact when only the helper-backed reviewer runtime is deterministically unavailable after preflight, is separate required evidence. GitHub Codex cannot replace either local PR-readiness gate.
 
