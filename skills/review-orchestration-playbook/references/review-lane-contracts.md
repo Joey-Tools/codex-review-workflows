@@ -23,9 +23,9 @@ Use this contract for helper-backed review, a clean-context `reviewer` fallback,
 
 ## Parent-Process Output Budget
 
-- When a parent workflow launches a fresh Codex CLI review process, capture the complete stdout and stderr in task-scoped files; do not stream either process output into the parent transcript. Also pass `--output-last-message <task-scoped-file>` so the terminal artifact is written separately from those process logs.
+- When a parent workflow launches a fresh Codex CLI review process, capture the complete stdout and stderr in task-scoped files; do not stream either process output into the parent transcript. Also pass `--output-last-message <task-scoped-file>` with a unique path that does not exist before the attempt so the terminal artifact is written separately from those process logs.
 - While the process runs, use only bounded status probes such as PID/name state, file byte or line counts, or a short error tail. Do not repeatedly relay complete logs, growing tails, internal tool traces, or keepalives.
-- After the process exits successfully, read only the separate final-message file. If it is missing, read one bounded stderr error tail and classify an explicit authentication, permission, configuration, or runtime-verification failure as `blocked`; otherwise report `inconclusive`. Never read the complete stderr or reconstruct a clean result from stdout. Retained stdout and stderr are recovery evidence, not review findings.
+- Accept the separate final-message file only when the attempt exits zero and creates it as a nonempty file. On a nonzero exit or a missing/empty file, reject any stale or partial result, read one bounded stderr error tail, and classify an explicit authentication, permission, configuration, or runtime-verification failure as `blocked`; otherwise report `inconclusive`. Never read the complete stderr or reconstruct a clean result from stdout. Retained stdout and stderr are recovery evidence, not review findings.
 - Remove task-scoped process logs and the final-message file after recording the terminal result unless they are intentionally retained for a reported blocker or recovery handoff.
 
 ## Clean-Context Codex Fallback
