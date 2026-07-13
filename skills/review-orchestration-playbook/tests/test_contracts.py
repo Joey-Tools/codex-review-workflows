@@ -119,6 +119,11 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("file byte or line counts", contracts)
         self.assertIn("read only the separate final-message file", contracts)
         self.assertIn("missing trustworthy final-message file is `inconclusive`", contracts)
+        self.assertIn(
+            "Remove task-scoped process logs and the final-message file",
+            contracts,
+        )
+        self.assertIn("reported blocker or recovery handoff", contracts)
 
     def test_review_prompts_do_not_use_unbounded_only_matching_samples(self) -> None:
         forbidden = "rg -o --max-count 80"
