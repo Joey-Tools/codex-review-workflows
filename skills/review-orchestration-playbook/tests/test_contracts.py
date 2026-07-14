@@ -156,7 +156,11 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("remove the artifact", contracts)
         self.assertIn("reject any stale or partial result", contracts)
         self.assertIn("On a nonzero exit or a missing/empty file", contracts)
-        self.assertIn("read one bounded stderr error tail", contracts)
+        self.assertIn("read at most the final 8 KiB of stderr", contracts)
+        self.assertIn("byte-count-limited read", contracts)
+        self.assertIn("truncates before inserting text", contracts)
+        self.assertIn("line-count-only command", contracts)
+        self.assertIn("single long JSON or trace line", contracts)
         self.assertIn("runtime-verification failure as `blocked`", contracts)
         self.assertIn("otherwise report `inconclusive`", contracts)
         self.assertIn("Never read the complete stderr", contracts)
@@ -166,6 +170,8 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertIn("reported blocker or recovery handoff", contracts)
         self.assertIn("remove the oversized log", contracts)
+        self.assertIn("read at most the final 8 KiB of stderr", readiness)
+        self.assertIn("line-count-only tail is not bounded", readiness)
 
     def test_review_prompts_do_not_use_unbounded_only_matching_samples(self) -> None:
         forbidden = "rg -o --max-count 80"
