@@ -26,6 +26,7 @@ superseded_by:
 - Independent review attempts default to a 30-minute wall-clock deadline and 16 MiB per stdout/stderr file; hitting either limit terminates the process, rejects its final-message artifact, and retains only bounded diagnostics.
 - The final-message artifact has a separate 64 KiB limit checked before reading; an oversized artifact is rejected as inconclusive and removed after recording only its byte count.
 - Deadline expiry follows the same TERM/grace/KILL path as a process-log limit, and both logs are statted again after exit so a final-write race cannot bypass the caps.
+- The reviewer runs in a dedicated process group with write-time log enforcement; acceptance waits for every group member and inherited sink to close, preventing descendant writers from escaping cleanup.
 - Repository contract tests pin the process-output budget and cleanup language.
 
 ## Next Steps
