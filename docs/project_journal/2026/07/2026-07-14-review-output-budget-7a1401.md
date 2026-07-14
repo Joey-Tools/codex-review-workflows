@@ -23,6 +23,7 @@ superseded_by:
 - A missing final-message file permits one bounded stderr tail so deterministic authentication, permission, configuration, or runtime-verification failures remain classified as blocked.
 - Every attempt uses a fresh final-message path and accepts it only after a zero exit with a newly created nonempty file, preventing stale or partial clean results from crossing retries.
 - The shared review-lane contract limits polling to process state, counts, or a short error tail and classifies a missing terminal artifact as inconclusive.
+- Independent review attempts default to a 30-minute wall-clock deadline and 16 MiB per stdout/stderr file; hitting either limit terminates the process, rejects its final-message artifact, and retains only bounded diagnostics.
 - Repository contract tests pin the process-output budget and cleanup language.
 
 ## Next Steps

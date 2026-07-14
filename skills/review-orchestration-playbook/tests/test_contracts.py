@@ -112,11 +112,20 @@ class RepositoryContractTest(unittest.TestCase):
 
         self.assertIn("complete stdout and stderr in task-scoped files", readiness)
         self.assertIn("--output-last-message <task-scoped-file>", readiness)
+        self.assertIn("finite wall-clock deadline and per-log byte limit", readiness)
+        self.assertIn("default 30-minute / 16-MiB limits", readiness)
+        self.assertIn("terminate the process when either limit is reached", readiness)
+        self.assertIn("limit-terminated attempt is inconclusive", readiness)
         self.assertIn("Poll only with bounded status probes", readiness)
         self.assertIn("Parent-Process Output Budget", readiness)
         self.assertIn("do not stream either process output", contracts)
         self.assertIn("--output-last-message <task-scoped-file>", contracts)
         self.assertIn("unique path that does not exist before the attempt", contracts)
+        self.assertIn("finite wall-clock deadline and a byte limit", contracts)
+        self.assertIn("30-minute deadline and 16 MiB", contracts)
+        self.assertIn("send `TERM`", contracts)
+        self.assertIn("use `KILL` only if it is still alive", contracts)
+        self.assertIn("Do not accept a final-message artifact", contracts)
         self.assertIn("file byte or line counts", contracts)
         self.assertIn("attempt exits zero", contracts)
         self.assertIn("creates it as a nonempty file", contracts)
@@ -131,6 +140,7 @@ class RepositoryContractTest(unittest.TestCase):
             contracts,
         )
         self.assertIn("reported blocker or recovery handoff", contracts)
+        self.assertIn("remove the oversized log", contracts)
 
     def test_review_prompts_do_not_use_unbounded_only_matching_samples(self) -> None:
         forbidden = "rg -o --max-count 80"

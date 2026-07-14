@@ -24,9 +24,10 @@ Use this contract for helper-backed review, a clean-context `reviewer` fallback,
 ## Parent-Process Output Budget
 
 - When a parent workflow launches a fresh Codex CLI review process, capture the complete stdout and stderr in task-scoped files; do not stream either process output into the parent transcript. Also pass `--output-last-message <task-scoped-file>` with a unique path that does not exist before the attempt so the terminal artifact is written separately from those process logs.
+- Before launch, record a finite wall-clock deadline and a byte limit for each process log. Unless a stricter repo-local contract applies, use a 30-minute deadline and 16 MiB per stdout/stderr file. During bounded polling, terminate the process when either limit is reached; send `TERM`, allow one bounded grace interval, then use `KILL` only if it is still alive. Classify the attempt as `inconclusive` unless the bounded evidence proves a deterministic blocker. Do not accept a final-message artifact from a limit-terminated attempt.
 - While the process runs, use only bounded status probes such as PID/name state, file byte or line counts, or a short error tail. Do not repeatedly relay complete logs, growing tails, internal tool traces, or keepalives.
 - Accept the separate final-message file only when the attempt exits zero and creates it as a nonempty file. On a nonzero exit or a missing/empty file, reject any stale or partial result, read one bounded stderr error tail, and classify an explicit authentication, permission, configuration, or runtime-verification failure as `blocked`; otherwise report `inconclusive`. Never read the complete stderr or reconstruct a clean result from stdout. Retained stdout and stderr are recovery evidence, not review findings.
-- Remove task-scoped process logs and the final-message file after recording the terminal result unless they are intentionally retained for a reported blocker or recovery handoff.
+- Remove task-scoped process logs and the final-message file after recording the terminal result unless they are intentionally retained for a reported blocker or recovery handoff. When a limit fires, retain only bounded diagnostic evidence and remove the oversized log instead of handing it off intact.
 
 ## Clean-Context Codex Fallback
 
