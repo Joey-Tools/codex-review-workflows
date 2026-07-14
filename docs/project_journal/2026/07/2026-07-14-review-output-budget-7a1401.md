@@ -30,6 +30,7 @@ superseded_by:
 - Failure diagnosis reads at most the final 8 KiB of stderr by bytes, so a single long JSON or trace line cannot bypass the parent-transcript budget.
 - Process cleanup requires OS containment; a fully self-contained artifact-only review may instead use a verified kernel no-child policy, while process-group or descendant polling never substitutes for containment.
 - The final-message artifact is written through a bounded FIFO/pipe sink or quota-bounded target so its 64 KiB cap is enforced while the reviewer runs, not only after exit.
+- FIFO mode uses two paths: a freshly created transport target and a distinct fresh ordinary artifact written by the bounded reader; only the ordinary artifact is statted and accepted.
 - Repository contract tests pin the process-output budget and cleanup language.
 
 ## Next Steps
