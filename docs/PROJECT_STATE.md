@@ -7,7 +7,7 @@
 
 ## Recovery Pointers
 
-- Latest workstream: `docs/project_journal/2026/07/2026-07-03-claude-local-login-b4e9d1.md`
+- Latest workstream: `docs/project_journal/2026/07/2026-07-14-review-output-budget-7a1401.md`
 
 ## Global Blockers
 
