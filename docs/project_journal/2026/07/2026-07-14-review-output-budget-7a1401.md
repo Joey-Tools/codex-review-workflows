@@ -28,6 +28,7 @@ superseded_by:
 - Deadline expiry follows the same TERM/grace/KILL path as a process-log limit, and both logs are statted again after exit so a final-write race cannot bypass the caps.
 - The reviewer runs in a dedicated process group with write-time log enforcement; acceptance waits for every group member and inherited sink to close, preventing descendant writers from escaping cleanup.
 - Failure diagnosis reads at most the final 8 KiB of stderr by bytes, so a single long JSON or trace line cannot bypass the parent-transcript budget.
+- Process cleanup uses OS containment or PID-plus-start-identity descendant tracking rather than trusting a bare PGID, and sink closure has its own 10-second deadline.
 - Repository contract tests pin the process-output budget and cleanup language.
 
 ## Next Steps
