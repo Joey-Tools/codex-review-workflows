@@ -191,6 +191,7 @@ MAX_DIFF_BYTES = 128 * 1024 * 1024
 MAX_CHANGED_METADATA_BYTES = 128 * 1024 * 1024
 MAX_CHANGED_ENTRIES = 100_000
 MAX_CHANGED_BLOB_SCAN_BYTES = 512 * 1024 * 1024
+MAX_SECRET_SCAN_EVENTS = 1_000_000
 MAX_REVIEW_PROMPT_BYTES = 64 * 1024
 MAX_SYNTHETIC_EVIDENCE_BYTES = 64 * 1024
 MAX_SYNTHETIC_EVIDENCE_ENTRIES = 512
@@ -242,6 +243,31 @@ class SecretScanResult:
         self.accepted_counts.update(other.accepted_counts)
         for accepted, values in other.accepted_candidates.items():
             self.accepted_candidates.setdefault(accepted, set()).update(values)
+
+
+@dataclass
+class SecretScanBudget:
+    remaining: int
+
+    @classmethod
+    def default(cls) -> "SecretScanBudget":
+        return cls(MAX_SECRET_SCAN_EVENTS)
+
+    def consume(self) -> None:
+        if self.remaining <= 0:
+            raise ReviewError(
+                "external review content exceeds the sensitive scanner event limit"
+            )
+        self.remaining -= 1
+
+
+@dataclass
+class AcceptedValueIndex:
+    exact: dict[tuple[str, bytes], list[AcceptedSyntheticValue]]
+    digests: dict[
+        tuple[str, int], dict[str, list[AcceptedSyntheticValue]]
+    ]
+    rules: frozenset[str]
 
 
 def _git_environment(*, object_directory: pathlib.Path | None = None) -> dict[str, str]:
@@ -1034,6 +1060,8 @@ def _scan_batch_blob(
     scanned_bytes: int,
     accepted_values: Iterable[AcceptedSyntheticValue] = (),
     capture_accepted_candidates: bool = False,
+    accepted_index: AcceptedValueIndex | None = None,
+    event_budget: SecretScanBudget | None = None,
 ) -> tuple[SecretScanResult, int]:
     cat_input.write(object_id.encode("ascii") + b"\n")
     cat_input.flush()
@@ -1057,6 +1085,8 @@ def _scan_batch_blob(
         size=size,
         accepted_values=accepted_values,
         capture_accepted_candidates=capture_accepted_candidates,
+        _accepted_index=accepted_index,
+        _event_budget=event_budget,
     )
     if cat_output.read(1) != b"\n":
         raise ReviewError("missing delimiter after scanned git cat-file blob")
@@ -1072,6 +1102,8 @@ def _scan_frozen_tree_values(
     capture_accepted_candidates: bool = False,
 ) -> SecretScanResult:
     accepted = tuple(accepted_values)
+    accepted_index = _index_accepted_values(accepted)
+    event_budget = SecretScanBudget.default()
     result = SecretScanResult.empty()
     environment = _git_environment(object_directory=object_directory)
     with (
@@ -1135,6 +1167,8 @@ def _scan_frozen_tree_values(
                     scanned_bytes=scanned_bytes,
                     accepted_values=accepted,
                     capture_accepted_candidates=capture_accepted_candidates,
+                    accepted_index=accepted_index,
+                    event_budget=event_budget,
                 )
                 result.merge(scan)
             _close_pipe(tree_process.stdout)
@@ -1283,6 +1317,8 @@ def _write_changed_blob_findings(
     accepted_values: Iterable[AcceptedSyntheticValue],
 ) -> None:
     accepted = tuple(accepted_values)
+    accepted_index = _index_accepted_values(accepted)
+    event_budget = SecretScanBudget.default()
     accepted_evidence: Counter[
         tuple[AcceptedSyntheticValue, str, str]
     ] = Counter()
@@ -1355,6 +1391,8 @@ def _write_changed_blob_findings(
                         object_id=object_id,
                         scanned_bytes=scanned_bytes,
                         accepted_values=accepted,
+                        accepted_index=accepted_index,
+                        event_budget=event_budget,
                     )
                     if scan.blocking_rule:
                         findings_output.write(
@@ -1669,6 +1707,9 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     )
     authoring_values = accepted_authoring_values(catalog)
     accepted_values = authoring_values + legacy_values
+    accepted_index = _index_accepted_values(accepted_values)
+    authoring_index = _index_accepted_values(authoring_values)
+    event_budget = SecretScanBudget.default()
     for candidate in review.workspace_root.rglob("*"):
         if not candidate.is_symlink():
             continue
@@ -1727,7 +1768,10 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     try:
         with changed_paths_file.open("rb") as handle:
             for raw_path in _iter_nul_records(handle):
-                path_secret_rule = _value_secret_rule(raw_path)
+                path_secret_rule = _value_secret_rule(
+                    raw_path,
+                    event_budget=event_budget,
+                )
                 if path_secret_rule:
                     record_finding(
                         f"<redacted changed path> "
@@ -1779,7 +1823,10 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
             continue
         relative = relative_path.as_posix()
         raw_relative = os.fsencode(relative)
-        path_secret_rule = _value_secret_rule(raw_relative)
+        path_secret_rule = _value_secret_rule(
+            raw_relative,
+            event_budget=event_budget,
+        )
         if path_secret_rule:
             record_finding(
                 f"<redacted snapshot path> ({path_secret_rule}; path-name)"
@@ -1801,6 +1848,8 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
             target_scan = _scan_secret_value(
                 os.fsencode(target),
                 accepted_values=accepted_values,
+                _accepted_index=accepted_index,
+                _event_budget=event_budget,
             )
             record_scan(
                 target_scan,
@@ -1816,7 +1865,12 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
             continue
         if not candidate.is_file():
             continue
-        scan = _file_secret_scan(candidate, accepted_values=accepted_values)
+        scan = _file_secret_scan(
+            candidate,
+            accepted_values=accepted_values,
+            accepted_index=accepted_index,
+            event_budget=event_budget,
+        )
         record_scan(
             scan,
             surface="frozen-head",
@@ -1837,7 +1891,12 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
                 f"actual={actual_head_count}"
             )
 
-    diff_scan = _file_secret_scan(review.diff_file, accepted_values=accepted_values)
+    diff_scan = _file_secret_scan(
+        review.diff_file,
+        accepted_values=accepted_values,
+        accepted_index=accepted_index,
+        event_budget=event_budget,
+    )
     record_scan(
         diff_scan,
         surface="frozen-diff",
@@ -1848,6 +1907,8 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     prompt_scan = _file_secret_scan(
         review.prompt_file,
         accepted_values=authoring_values,
+        accepted_index=authoring_index,
+        event_budget=event_budget,
     )
     record_scan(
         prompt_scan,
@@ -1950,6 +2011,8 @@ def _file_secret_scan(
     *,
     accepted_values: Iterable[AcceptedSyntheticValue] = (),
     capture_accepted_candidates: bool = False,
+    accepted_index: AcceptedValueIndex | None = None,
+    event_budget: SecretScanBudget | None = None,
 ) -> SecretScanResult:
     try:
         with path.open("rb") as handle:
@@ -1957,6 +2020,8 @@ def _file_secret_scan(
                 handle,
                 accepted_values=accepted_values,
                 capture_accepted_candidates=capture_accepted_candidates,
+                _accepted_index=accepted_index,
+                _event_budget=event_budget,
             )
     except OSError as error:
         path_display = _redact_secret_path(os.fspath(path), "snapshot path")
@@ -1966,39 +2031,140 @@ def _file_secret_scan(
         ) from error
 
 
-def _file_secret_rule(path: pathlib.Path) -> str | None:
-    return _file_secret_scan(path).blocking_rule
+def _file_secret_rule(
+    path: pathlib.Path,
+    *,
+    event_budget: SecretScanBudget | None = None,
+) -> str | None:
+    return _file_secret_scan(path, event_budget=event_budget).blocking_rule
+
+
+def _starts_quoted_literal(value: bytes) -> bool:
+    prefixes = (b"", b"r", b"u", b"b", b"f", b"br", b"rb", b"fr", b"rf")
+    lowered = value[:3].lower()
+    return any(
+        lowered.startswith(prefix + quote)
+        for prefix in prefixes
+        for quote in (b"'", b'"')
+    )
+
+
+def _quoted_assignment_may_accept(value: bytes, match: re.Match[bytes]) -> bool:
+    tail = value[match.end() :]
+
+    def trim_space(candidate: bytes) -> bytes:
+        return candidate.lstrip(b" \t")
+
+    tail = trim_space(tail)
+    while tail.startswith((b")", b"]", b"}")):
+        tail = trim_space(tail[1:])
+    if not tail or tail.startswith((b"\r", b"\n", b"#", b"//")):
+        return True
+    if tail.startswith(b";"):
+        return True
+    if tail.startswith(b","):
+        prefix = value[match.start() : match.start(2)]
+        separator_is_assignment = prefix.rfind(b"=") > prefix.rfind(b":")
+        return not (
+            separator_is_assignment
+            and _starts_quoted_literal(trim_space(tail[1:]))
+        )
+    return False
 
 
 def _iter_secret_events(
     value: bytes,
-) -> Iterator[tuple[str, bytes | None, int, bool]]:
+) -> Iterator[tuple[str, bytes | None, int, bool, int | None, int | None]]:
     for rule, pattern in SECRET_PATTERNS:
         for match in pattern.finditer(value):
-            yield rule, match.group(0), match.end(), True
+            start, candidate_end = match.span(0)
+            yield rule, match.group(0), match.end(), True, start, candidate_end
     for rule, pattern in (
         ("aws-secret-key", OVERSIZED_AWS_SECRET_KEY_GAP),
         ("jwt", OVERSIZED_JWT_PATTERN),
         ("generic-secret-assignment", OVERSIZED_SECRET_ASSIGNMENT_GAP),
     ):
         for match in pattern.finditer(value):
-            yield rule, None, match.end(), False
+            yield rule, None, match.end(), False, None, None
     for pattern in (
         OVERSIZED_QUOTED_SECRET_ASSIGNMENT,
         OVERSIZED_UNQUOTED_SECRET_ASSIGNMENT,
     ):
         for match in pattern.finditer(value):
-            yield "generic-secret-assignment", None, match.end(), False
+            yield (
+                "generic-secret-assignment",
+                None,
+                match.end(),
+                False,
+                None,
+                None,
+            )
     for match in QUOTED_SECRET_ASSIGNMENT.finditer(value):
         candidate = match.group(2)
-        if not _is_placeholder_secret(candidate.lower()):
-            yield "generic-secret-assignment", candidate, match.end(), True
+        may_accept = _quoted_assignment_may_accept(value, match)
+        if not may_accept or not _is_placeholder_secret(candidate.lower()):
+            start, candidate_end = match.span(2)
+            yield (
+                "generic-secret-assignment",
+                candidate,
+                match.end(),
+                may_accept,
+                start,
+                candidate_end,
+            )
     for match in UNQUOTED_SECRET_ASSIGNMENT.finditer(value):
         candidate = match.group(1)
         if not _is_placeholder_secret(
             candidate.lower()
         ) and _looks_like_unquoted_secret(candidate):
-            yield "generic-secret-assignment", candidate, match.end(), True
+            start, candidate_end = match.span(1)
+            yield (
+                "generic-secret-assignment",
+                candidate,
+                match.end(),
+                True,
+                start,
+                candidate_end,
+            )
+
+
+def _index_accepted_values(
+    accepted_values: tuple[AcceptedSyntheticValue, ...],
+) -> AcceptedValueIndex:
+    exact: dict[tuple[str, bytes], list[AcceptedSyntheticValue]] = {}
+    digests: dict[
+        tuple[str, int], dict[str, list[AcceptedSyntheticValue]]
+    ] = {}
+    rules: set[str] = set()
+    for accepted in accepted_values:
+        rules.add(accepted.rule)
+        if accepted.value is not None:
+            exact.setdefault((accepted.rule, accepted.value), []).append(accepted)
+            continue
+        by_digest = digests.setdefault(
+            (accepted.rule, accepted.value_length),
+            {},
+        )
+        by_digest.setdefault(accepted.value_sha256, []).append(accepted)
+    return AcceptedValueIndex(exact=exact, digests=digests, rules=frozenset(rules))
+
+
+def _matching_accepted_values(
+    *,
+    rule: str,
+    candidate: bytes,
+    accepted_index: AcceptedValueIndex,
+) -> list[AcceptedSyntheticValue]:
+    matches = list(accepted_index.exact.get((rule, candidate), ()))
+    by_digest = accepted_index.digests.get((rule, len(candidate)))
+    if by_digest:
+        candidate_digest = hashlib.sha256(candidate).hexdigest()
+        for digest, accepted_values in by_digest.items():
+            if hmac.compare_digest(candidate_digest, digest):
+                matches.extend(accepted_values)
+    if len(matches) > 1:
+        raise ReviewError("synthetic token catalog produced an ambiguous scanner match")
+    return matches
 
 
 def _scan_secret_value(
@@ -2008,35 +2174,57 @@ def _scan_secret_value(
     minimum_end: int = 0,
     maximum_end: int | None = None,
     capture_accepted_candidates: bool = False,
+    _accepted_index: AcceptedValueIndex | None = None,
+    _event_budget: SecretScanBudget | None = None,
 ) -> SecretScanResult:
     result = SecretScanResult.empty()
     upper = len(value) if maximum_end is None else maximum_end
-    for rule, candidate, end, may_accept in _iter_secret_events(value):
+    accepted_index = _accepted_index or _index_accepted_values(accepted_values)
+    event_budget = _event_budget or SecretScanBudget.default()
+    accepted_specific_spans: set[tuple[int, int, bytes]] = set()
+    accepted_specific_rules = {
+        rule
+        for rule in accepted_index.rules
+        if rule != "generic-secret-assignment"
+    }
+    for rule, pattern in SECRET_PATTERNS:
+        if rule not in accepted_specific_rules:
+            continue
+        for match in pattern.finditer(value):
+            event_budget.consume()
+            candidate = match.group(0)
+            if _matching_accepted_values(
+                rule=rule,
+                candidate=candidate,
+                accepted_index=accepted_index,
+            ):
+                start, candidate_end = match.span(0)
+                accepted_specific_spans.add((start, candidate_end, candidate))
+
+    for rule, candidate, end, may_accept, start, candidate_end in _iter_secret_events(
+        value
+    ):
+        event_budget.consume()
         if not minimum_end < end <= upper:
             continue
-        matches: list[AcceptedSyntheticValue] = []
-        if may_accept and candidate is not None:
-            candidate_digest: str | None = None
-            for accepted in accepted_values:
-                if accepted.rule != rule:
-                    continue
-                if accepted.value is not None:
-                    matches_exactly = candidate == accepted.value
-                elif len(candidate) == accepted.value_length:
-                    if candidate_digest is None:
-                        candidate_digest = hashlib.sha256(candidate).hexdigest()
-                    matches_exactly = hmac.compare_digest(
-                        candidate_digest,
-                        accepted.value_sha256,
-                    )
-                else:
-                    matches_exactly = False
-                if matches_exactly:
-                    matches.append(accepted)
-        if len(matches) > 1:
-            raise ReviewError(
-                "synthetic token catalog produced an ambiguous scanner match"
+        if (
+            rule == "generic-secret-assignment"
+            and may_accept
+            and candidate is not None
+            and start is not None
+            and candidate_end is not None
+            and (start, candidate_end, candidate) in accepted_specific_spans
+        ):
+            continue
+        matches = (
+            _matching_accepted_values(
+                rule=rule,
+                candidate=candidate,
+                accepted_index=accepted_index,
             )
+            if may_accept and candidate is not None
+            else []
+        )
         if matches:
             accepted = matches[0]
             result.accepted_counts[accepted] += 1
@@ -2044,6 +2232,7 @@ def _scan_secret_value(
                 result.accepted_candidates.setdefault(accepted, set()).add(candidate)
         elif result.blocking_rule is None:
             result.blocking_rule = rule
+            return result
     return result
 
 
@@ -2053,15 +2242,20 @@ def _stream_secret_scan(
     size: int | None = None,
     accepted_values: Iterable[AcceptedSyntheticValue] = (),
     capture_accepted_candidates: bool = False,
+    _accepted_index: AcceptedValueIndex | None = None,
+    _event_budget: SecretScanBudget | None = None,
 ) -> SecretScanResult:
     overlap = STREAM_SCAN_OVERLAP
     accepted = tuple(accepted_values)
+    accepted_index = _accepted_index or _index_accepted_values(accepted)
+    event_budget = _event_budget or SecretScanBudget.default()
     pending = b""
     pending_offset = 0
     total_read = 0
     committed_end = 0
     remaining = size
     result = SecretScanResult.empty()
+    blocked = False
     while True:
         if remaining == 0:
             chunk = b""
@@ -2074,9 +2268,13 @@ def _stream_secret_scan(
             raise ReviewError("unexpected end of Git blob during sensitive scan")
         if remaining is not None:
             remaining -= len(chunk)
-        pending += chunk
         total_read += len(chunk)
         at_end = not chunk or remaining == 0
+        if blocked:
+            if at_end:
+                break
+            continue
+        pending += chunk
         next_committed_end = total_read if at_end else max(0, total_read - overlap)
         local_minimum = max(0, committed_end - pending_offset)
         local_maximum = max(0, next_committed_end - pending_offset)
@@ -2087,8 +2285,13 @@ def _stream_secret_scan(
                 minimum_end=local_minimum,
                 maximum_end=local_maximum,
                 capture_accepted_candidates=capture_accepted_candidates,
+                _accepted_index=accepted_index,
+                _event_budget=event_budget,
             )
         )
+        if result.blocking_rule is not None:
+            blocked = True
+            pending = b""
         committed_end = next_committed_end
         if at_end:
             break
@@ -2102,8 +2305,12 @@ def _stream_secret_rule(stream: BinaryIO, *, size: int | None = None) -> str | N
     return _stream_secret_scan(stream, size=size).blocking_rule
 
 
-def _value_secret_rule(value: bytes) -> str | None:
-    return _scan_secret_value(value).blocking_rule
+def _value_secret_rule(
+    value: bytes,
+    *,
+    event_budget: SecretScanBudget | None = None,
+) -> str | None:
+    return _scan_secret_value(value, _event_budget=event_budget).blocking_rule
 
 
 def _is_placeholder_secret(candidate: bytes) -> bool:

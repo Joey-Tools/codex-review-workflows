@@ -35,6 +35,7 @@ PUBLIC_VALUES = (
 )
 LEGACY_A = "HistoricalFixtureAccessA9Z8Y7"
 LEGACY_B = "HistoricalFixtureRefreshB8Y7X6"
+GITHUB_LEGACY = "ghp_" + "A" * 36
 HIGH_ENTROPY = b"Aa9!" + b"Bb8@" + b"Cc7#" + b"Dd6$" + b"Ee5%"
 
 
@@ -61,7 +62,11 @@ def catalog_payload() -> dict[str, object]:
     return json.loads(synthetic_tokens.CATALOG_PATH.read_text(encoding="utf-8"))
 
 
-def legacy_catalog(*, values: tuple[str, ...] = (LEGACY_A, LEGACY_B)):
+def legacy_catalog(
+    *,
+    values: tuple[str, ...] = (LEGACY_A, LEGACY_B),
+    rule: str = "generic-secret-assignment",
+):
     payload = catalog_payload()
     payload["legacy_exemptions"] = [
         {
@@ -72,7 +77,7 @@ def legacy_catalog(*, values: tuple[str, ...] = (LEGACY_A, LEGACY_B)):
             "values": [
                 {
                     "id": f"historical-{index}",
-                    "rule": "generic-secret-assignment",
+                    "rule": rule,
                     "value_sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
                     "value_length": len(value.encode("utf-8")),
                     "containing_commit": "b" * 40,
@@ -84,6 +89,20 @@ def legacy_catalog(*, values: tuple[str, ...] = (LEGACY_A, LEGACY_B)):
     ]
     return synthetic_tokens.parse_catalog_bytes(
         json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    )
+
+
+def accepted_legacy_value(value: str, *, rule: str):
+    encoded = value.encode("ascii")
+    return synthetic_tokens.AcceptedSyntheticValue(
+        kind="legacy",
+        catalog_version="test-v1",
+        identifier="historical-value",
+        rule=rule,
+        value=None,
+        value_sha256=hashlib.sha256(encoded).hexdigest(),
+        value_length=len(encoded),
+        exemption_id="historical-fixtures",
     )
 
 
@@ -130,7 +149,7 @@ class PublicPoolScannerTest(unittest.TestCase):
             accepted_values=self.accepted,
         )
         self.assertEqual(scan.blocking_rule, "github-token")
-        self.assertEqual(scan.accepted_counts[self.accepted[0]], 1)
+        self.assertFalse(scan.accepted_counts)
 
     def test_mutated_pool_values_remain_blocked(self) -> None:
         original = PUBLIC_VALUES[0]
@@ -201,6 +220,128 @@ class PublicPoolScannerTest(unittest.TestCase):
         )
         self.assertIsNone(exact.blocking_rule)
         self.assertEqual(exact.accepted_counts[accepted], 1)
+
+    def test_provider_specific_legacy_acceptance_suppresses_duplicate_assignment(self) -> None:
+        accepted = accepted_legacy_value(GITHUB_LEGACY, rule="github-token")
+        scan = workspace._scan_secret_value(
+            assignment_bytes(b"access_token", GITHUB_LEGACY.encode("ascii")),
+            accepted_values=(accepted,),
+        )
+        self.assertIsNone(scan.blocking_rule)
+        self.assertEqual(scan.accepted_counts[accepted], 1)
+
+        adjacent = workspace._scan_secret_value(
+            assignment_bytes(
+                b"access_token",
+                GITHUB_LEGACY.encode("ascii") + b".adjacent",
+            ),
+            accepted_values=(accepted,),
+        )
+        self.assertEqual(adjacent.blocking_rule, "generic-secret-assignment")
+        self.assertEqual(adjacent.accepted_counts[accepted], 1)
+
+    def test_provider_specific_legacy_acceptance_survives_stream_boundary(self) -> None:
+        accepted = accepted_legacy_value(GITHUB_LEGACY, rule="github-token")
+        candidate = GITHUB_LEGACY.encode("ascii")
+        assignment_prefix = b'access_token = "'
+        first_read = 1024 * 1024
+        committed_end = first_read - workspace.STREAM_SCAN_OVERLAP
+        candidate_start = committed_end - len(candidate)
+        payload = (
+            b"x" * (candidate_start - len(assignment_prefix))
+            + assignment_prefix
+            + candidate
+            + b'"\n'
+            + b"x" * workspace.STREAM_SCAN_OVERLAP
+        )
+        scan = workspace._stream_secret_scan(
+            io.BytesIO(payload),
+            size=len(payload),
+            accepted_values=(accepted,),
+        )
+        self.assertIsNone(scan.blocking_rule)
+        self.assertEqual(scan.accepted_counts[accepted], 1)
+
+    def test_accepted_quoted_value_requires_a_complete_rhs(self) -> None:
+        accepted = self.accepted[0]
+        exact_assignment = assignment_bytes(b"access_token", accepted.value)
+        adjacent_secret = b'"ActualOpaqueSecretA9Z8Y7"'
+        cases = (
+            ("implicit-concatenation", exact_assignment + b" " + adjacent_secret),
+            ("explicit-concatenation", exact_assignment + b" + " + adjacent_secret),
+            ("conditional-fallback", exact_assignment + b" or " + adjacent_secret),
+            ("tuple-continuation", exact_assignment + b", " + adjacent_secret),
+            (
+                "placeholder-concatenation",
+                b'access_token = "placeholder_token" ' + adjacent_secret,
+            ),
+        )
+        for label, payload in cases:
+            with self.subTest(case=label):
+                scan = workspace._scan_secret_value(
+                    payload,
+                    accepted_values=self.accepted,
+                )
+                self.assertEqual(scan.blocking_rule, "generic-secret-assignment")
+
+        json_value = workspace._scan_secret_value(
+            b'{"access_token": "'
+            + accepted.value
+            + b'", "state": "expired"}',
+            accepted_values=self.accepted,
+        )
+        self.assertIsNone(json_value.blocking_rule)
+        self.assertEqual(json_value.accepted_counts[accepted], 1)
+
+        keyword_argument = workspace._scan_secret_value(
+            b'configure(access_token = "'
+            + accepted.value
+            + b'", state = "expired")',
+            accepted_values=self.accepted,
+        )
+        self.assertIsNone(keyword_argument.blocking_rule)
+        self.assertEqual(keyword_argument.accepted_counts[accepted], 1)
+
+        github_accepted = accepted_legacy_value(GITHUB_LEGACY, rule="github-token")
+        github_continuation = workspace._scan_secret_value(
+            assignment_bytes(b"access_token", GITHUB_LEGACY.encode("ascii"))
+            + b" "
+            + adjacent_secret,
+            accepted_values=(github_accepted,),
+        )
+        self.assertEqual(
+            github_continuation.blocking_rule,
+            "generic-secret-assignment",
+        )
+        self.assertEqual(github_continuation.accepted_counts[github_accepted], 1)
+
+    def test_dense_accepted_surface_fails_closed_at_the_event_limit(self) -> None:
+        accepted = self.accepted[0]
+        payload = b"\n".join(
+            assignment_bytes(b"access_token", accepted.value) for _ in range(3)
+        )
+        with (
+            mock.patch.object(workspace, "MAX_SECRET_SCAN_EVENTS", 2),
+            self.assertRaisesRegex(ReviewError, "scanner event limit"),
+        ):
+            workspace._scan_secret_value(
+                payload,
+                accepted_values=self.accepted,
+            )
+
+    def test_blocking_event_stops_scanning_the_remaining_surface(self) -> None:
+        budget = workspace.SecretScanBudget(1)
+        payload = (
+            assignment_bytes(b"access_token", b"UnknownSecretValueA9Z8Y7")
+            + b"\n"
+            + assignment_bytes(b"refresh_token", b"UnknownSecretValueB8Y7X6")
+        )
+        scan = workspace._scan_secret_value(
+            payload,
+            _event_budget=budget,
+        )
+        self.assertEqual(scan.blocking_rule, "generic-secret-assignment")
+        self.assertEqual(budget.remaining, 0)
 
     def test_oversized_provider_token_crossing_stream_boundary_is_blocked(self) -> None:
         boundary = 1024 * 1024
@@ -581,6 +722,28 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                 self.assertEqual(len(legacy_counts), 2)
                 self.assertNotIn(LEGACY_A, json.dumps(evidence, sort_keys=True))
                 self.assertNotIn(LEGACY_B, json.dumps(evidence, sort_keys=True))
+
+    def test_github_legacy_assignment_uses_the_provider_specific_exemption(self) -> None:
+        catalog = legacy_catalog(values=(GITHUB_LEGACY,), rule="github-token")
+        repo, base = self.new_repo(
+            {"fixture.cfg": assignment_text("access_token", GITHUB_LEGACY)}
+        )
+        (repo / "README.md").write_text("head\n", encoding="utf-8")
+        head = self.commit(repo)
+        review = self.prepare(
+            repo=repo,
+            base=base,
+            head=head,
+            catalog=catalog,
+            exemptions=("historical-fixtures",),
+        )
+        evidence = self.validate(review, catalog=catalog)
+        counts = evidence["synthetic_tokens"]["legacy_counts"]
+        self.assertEqual(len(counts), 1)
+        self.assertEqual(counts[0]["rule"], "github-token")
+        self.assertEqual(counts[0]["base_count"], 1)
+        self.assertEqual(counts[0]["head_count"], 1)
+        self.assertNotIn(GITHUB_LEGACY, json.dumps(evidence, sort_keys=True))
 
     def test_multi_value_legacy_move_and_rename_pass(self) -> None:
         catalog = legacy_catalog()
