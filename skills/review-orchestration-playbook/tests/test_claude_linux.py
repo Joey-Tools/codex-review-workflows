@@ -1,0 +1,2523 @@
+from __future__ import annotations
+
+import dataclasses
+import json
+import os
+import pathlib
+import shutil
+import signal
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from types import SimpleNamespace
+from unittest import mock
+
+
+SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
+sys.path.insert(0, str(SCRIPTS))
+
+from review_runtime import claude_linux  # noqa: E402
+
+
+_AMBIENT_TOOL_ENV_POISON = {
+    "BASH_ENV": "/tmp/attacker-bash-env",
+    "COMPILER_PATH": "/tmp/attacker-compiler",
+    "CPATH": "/tmp/attacker-headers",
+    "C_INCLUDE_PATH": "/tmp/attacker-c-headers",
+    "ENV": "/tmp/attacker-sh-env",
+    "GCC_EXEC_PREFIX": "/tmp/attacker-gcc/",
+    "LD_LIBRARY_PATH": "/tmp/attacker-libraries",
+    "LD_PRELOAD": "/tmp/attacker-preload.so",
+    "LIBRARY_PATH": "/tmp/attacker-linker",
+    "PATH": "/tmp/attacker-bin",
+}
+
+
+def _write_elf(
+    path: pathlib.Path,
+    *,
+    arch: str = "x64",
+    interpreter: str | None = "/lib64/ld-linux-x86-64.so.2",
+) -> pathlib.Path:
+    machine = {"x64": 62, "arm64": 183}[arch]
+    program_count = 1 if interpreter is not None else 0
+    header = bytearray(64)
+    header[:7] = b"\x7fELF\x02\x01\x01"
+    struct.pack_into(
+        "<HHIQQQIHHHHHH",
+        header,
+        16,
+        3,
+        machine,
+        1,
+        0,
+        64,
+        0,
+        0,
+        64,
+        56,
+        program_count,
+        0,
+        0,
+        0,
+    )
+    payload = bytearray(header)
+    if interpreter is not None:
+        encoded = interpreter.encode("utf-8") + b"\x00"
+        payload.extend(
+            struct.pack("<IIQQQQQQ", 3, 4, 120, 0, 0, len(encoded), len(encoded), 1)
+        )
+        payload.extend(encoded)
+    path.write_bytes(payload)
+    path.chmod(0o755)
+    return path
+
+
+def _capture(returncode: int = 0, stdout: bytes = b"", stderr: bytes = b""):
+    return SimpleNamespace(
+        returncode=returncode,
+        stdout=bytearray(stdout),
+        stderr=bytearray(stderr),
+    )
+
+
+def _linux_review_arguments() -> tuple[str, ...]:
+    settings = json.dumps(
+        {
+            "disableAllHooks": True,
+            "permissions": {
+                "deny": list(claude_linux.CLAUDE_LINUX_FILE_TOOL_DENY_RULES)
+            },
+        },
+        separators=(",", ":"),
+    )
+    return (
+        "--safe-mode",
+        "--print",
+        "--permission-mode",
+        claude_linux.CLAUDE_LINUX_REVIEW_PERMISSION_MODE,
+        "--setting-sources",
+        "",
+        "--settings",
+        settings,
+        "--tools",
+        claude_linux.CLAUDE_LINUX_REVIEW_VISIBLE_TOOLS,
+        "--allowedTools",
+        claude_linux.CLAUDE_LINUX_REVIEW_ALLOWED_TOOLS,
+        "--disallowedTools",
+        claude_linux.CLAUDE_LINUX_REVIEW_DISALLOWED_TOOLS,
+    )
+
+
+class _ForbiddenConnectProxy:
+    def __init__(self, path: pathlib.Path) -> None:
+        self.path = path
+        self.requests: list[bytes] = []
+        self.errors: list[str] = []
+        self._stop = threading.Event()
+        self._listener: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> "_ForbiddenConnectProxy":
+        if len(os.fsencode(self.path)) >= 100:
+            raise AssertionError(
+                f"test proxy path exceeds AF_UNIX safety margin: {self.path}"
+            )
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(self.path))
+        self.path.chmod(0o600)
+        listener.listen(8)
+        listener.settimeout(0.1)
+        self._listener = listener
+        thread = threading.Thread(
+            target=self._serve,
+            name="claude-linux-test-proxy",
+            daemon=False,
+        )
+        self._thread = thread
+        thread.start()
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self._stop.set()
+        if self._listener is not None:
+            self._listener.close()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            if self._thread.is_alive():
+                raise AssertionError("test proxy thread did not terminate")
+
+    def _serve(self) -> None:
+        assert self._listener is not None
+        while not self._stop.is_set():
+            try:
+                connection, _address = self._listener.accept()
+            except TimeoutError:
+                continue
+            except OSError as error:
+                if not self._stop.is_set():
+                    self.errors.append(f"proxy accept failed: {error}")
+                return
+            with connection:
+                connection.settimeout(1.0)
+                request = bytearray()
+                try:
+                    while len(request) < 4096 and b"\r\n\r\n" not in request:
+                        chunk = connection.recv(4096 - len(request))
+                        if not chunk:
+                            break
+                        request.extend(chunk)
+                except TimeoutError:
+                    if request:
+                        self.errors.append("proxy request headers timed out")
+                    continue
+                if not request:
+                    # The launcher readiness connection intentionally sends no data.
+                    continue
+                payload = bytes(request)
+                self.requests.append(payload)
+                if not payload.startswith(b"CONNECT example.invalid:443 HTTP/1.1\r\n"):
+                    self.errors.append("proxy received an unexpected CONNECT target")
+                    continue
+                try:
+                    connection.sendall(
+                        b"HTTP/1.1 403 Forbidden\r\n"
+                        b"Content-Length: 0\r\n"
+                        b"Connection: close\r\n\r\n"
+                    )
+                except OSError as error:
+                    self.errors.append(f"proxy response failed: {error}")
+
+
+class HostDetectionTest(unittest.TestCase):
+    def test_detects_native_linux_and_supported_architecture(self) -> None:
+        host = claude_linux.detect_host(
+            system="Linux",
+            machine="x86_64",
+            kernel_release="6.8.0-generic",
+            proc_version="#1 SMP",
+            env={},
+            run_wsl_exists=False,
+            binfmt_wslinterop_exists=False,
+        )
+
+        self.assertEqual(host.kind, claude_linux.LinuxHostKind.LINUX)
+        self.assertEqual(host.arch, "x64")
+        self.assertTrue(host.supported)
+
+    def test_detects_wsl2_and_wsl1_separately(self) -> None:
+        wsl2 = claude_linux.detect_host(
+            system="Linux",
+            machine="aarch64",
+            kernel_release="5.15.153.1-microsoft-standard-WSL2",
+            proc_version="Microsoft",
+            env={},
+            run_wsl_exists=False,
+            binfmt_wslinterop_exists=False,
+        )
+        wsl1 = claude_linux.detect_host(
+            system="Linux",
+            machine="x86_64",
+            kernel_release="4.4.0-19041-Microsoft",
+            proc_version="Microsoft",
+            env={"WSL_DISTRO_NAME": "Ubuntu"},
+            run_wsl_exists=False,
+            binfmt_wslinterop_exists=True,
+        )
+
+        self.assertEqual(wsl2.kind, claude_linux.LinuxHostKind.WSL2)
+        self.assertEqual(wsl2.arch, "arm64")
+        self.assertEqual(wsl1.kind, claude_linux.LinuxHostKind.WSL1)
+        with self.assertRaisesRegex(claude_linux.LinuxUnsupportedHost, "WSL1"):
+            claude_linux.require_supported_host(wsl1)
+
+    def test_detects_wsl2_custom_kernel_from_strong_runtime_markers(self) -> None:
+        run_directory = claude_linux.detect_host(
+            system="Linux",
+            machine="x86_64",
+            kernel_release="6.6.36-custom-acme",
+            proc_version="#1 SMP PREEMPT_DYNAMIC",
+            env={"WSL_DISTRO_NAME": "Ubuntu"},
+            run_wsl_exists=True,
+            binfmt_wslinterop_exists=True,
+        )
+        interop_endpoint = claude_linux.detect_host(
+            system="Linux",
+            machine="x86_64",
+            kernel_release="6.6.36-custom-acme",
+            proc_version="#1 SMP PREEMPT_DYNAMIC",
+            env={
+                "WSL_DISTRO_NAME": "Ubuntu",
+                "WSL_INTEROP": "/run/WSL/42_interop",
+            },
+            run_wsl_exists=False,
+            interop_path_exists=True,
+            binfmt_wslinterop_exists=True,
+        )
+
+        self.assertEqual(run_directory.kind, claude_linux.LinuxHostKind.WSL2)
+        self.assertEqual(interop_endpoint.kind, claude_linux.LinuxHostKind.WSL2)
+
+    def test_ambiguous_or_spoofed_wsl_environment_fails_closed_as_wsl1(self) -> None:
+        ambiguous = claude_linux.detect_host(
+            system="Linux",
+            machine="x86_64",
+            kernel_release="6.8.0-generic",
+            proc_version="#1 SMP",
+            env={
+                "WSL_DISTRO_NAME": "spoofed",
+                "WSL_INTEROP": "/tmp/not-a-wsl-interop-endpoint",
+            },
+            run_wsl_exists=False,
+            interop_path_exists=True,
+            binfmt_wslinterop_exists=False,
+        )
+        binfmt_only = claude_linux.detect_host(
+            system="Linux",
+            machine="x86_64",
+            kernel_release="6.8.0-generic",
+            proc_version="#1 SMP",
+            env={},
+            run_wsl_exists=False,
+            binfmt_wslinterop_exists=True,
+        )
+
+        self.assertEqual(ambiguous.kind, claude_linux.LinuxHostKind.WSL1)
+        self.assertEqual(binfmt_only.kind, claude_linux.LinuxHostKind.WSL1)
+
+    def test_rejects_native_windows_with_wsl2_guidance(self) -> None:
+        host = claude_linux.detect_host(system="Windows", machine="AMD64")
+
+        self.assertEqual(host.kind, claude_linux.LinuxHostKind.NATIVE_WINDOWS)
+        with self.assertRaisesRegex(claude_linux.LinuxUnsupportedHost, "WSL2"):
+            claude_linux.require_supported_host(host)
+
+    def test_rejects_wsl_windows_drive_runtime_path(self) -> None:
+        host = claude_linux.LinuxHost(
+            claude_linux.LinuxHostKind.WSL2, "x64", "microsoft-standard-WSL2"
+        )
+
+        with (
+            mock.patch.object(claude_linux, "_read_mountinfo") as read_mountinfo,
+            self.assertRaisesRegex(claude_linux.LinuxRuntimeUnsafe, "Windows drive"),
+        ):
+            claude_linux.reject_wsl_windows_path(
+                pathlib.Path("/mnt/c/Users/user/claude"), host
+            )
+
+        read_mountinfo.assert_not_called()
+
+
+class WslWindowsFilesystemProvenanceTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.wsl2 = claude_linux.LinuxHost(
+            claude_linux.LinuxHostKind.WSL2,
+            "x64",
+            "microsoft-standard-WSL2",
+        )
+
+    @staticmethod
+    def _root_mount() -> str:
+        return "24 1 0:22 / / rw,relatime - ext4 /dev/sda rw"
+
+    @staticmethod
+    def _mount(
+        mount_point: pathlib.Path | str,
+        *,
+        file_system: str,
+        source: str,
+        super_options: str = "rw",
+        mount_id: int = 52,
+    ) -> str:
+        return (
+            f"{mount_id} 24 0:41 / {mount_point} rw,relatime - "
+            f"{file_system} {source} {super_options}"
+        )
+
+    def test_rejects_custom_automount_root_and_bind_alias(self) -> None:
+        custom_automount = "\n".join(
+            (
+                self._root_mount(),
+                self._mount(
+                    "/windows/c",
+                    file_system="9p",
+                    source=r"C:\134",
+                    super_options=r"rw,aname=drvfs;path=C:\134",
+                ),
+            )
+        )
+        bind_alias = "\n".join(
+            (
+                self._root_mount(),
+                self._mount(
+                    "/home/reviewer/windows-alias",
+                    file_system="9p",
+                    source="drvfs",
+                    super_options="rw,aname=drvfs",
+                ),
+            )
+        )
+
+        with self.assertRaisesRegex(claude_linux.LinuxRuntimeUnsafe, "filesystem"):
+            claude_linux.reject_wsl_windows_path(
+                pathlib.Path("/windows/c/Users/reviewer/claude"),
+                self.wsl2,
+                mountinfo_text=custom_automount,
+            )
+        with self.assertRaisesRegex(claude_linux.LinuxRuntimeUnsafe, "filesystem"):
+            claude_linux.reject_wsl_windows_path(
+                pathlib.Path("/home/reviewer/windows-alias/claude"),
+                self.wsl2,
+                mountinfo_text=bind_alias,
+            )
+
+    def test_resolved_symlink_alias_cannot_hide_drvfs_mount(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            windows_root = root / "windows-volume"
+            windows_root.mkdir()
+            alias = root / "apparently-linux"
+            alias.symlink_to(windows_root, target_is_directory=True)
+            mountinfo = "\n".join(
+                (
+                    self._root_mount(),
+                    self._mount(
+                        windows_root,
+                        file_system="9p",
+                        source=r"C:\134",
+                        super_options=r"rw,aname=drvfs;path=C:\134",
+                    ),
+                )
+            )
+
+            with self.assertRaisesRegex(claude_linux.LinuxRuntimeUnsafe, "filesystem"):
+                claude_linux.reject_wsl_windows_path(
+                    alias / "claude",
+                    self.wsl2,
+                    mountinfo_text=mountinfo,
+                )
+
+    def test_accepts_proven_local_native_filesystems(self) -> None:
+        cases = (
+            ("/home/reviewer/project", self._root_mount()),
+            (
+                "/run/review/project",
+                "\n".join(
+                    (
+                        self._root_mount(),
+                        self._mount(
+                            "/run/review", file_system="tmpfs", source="tmpfs"
+                        ),
+                    )
+                ),
+            ),
+        )
+
+        for path, mountinfo in cases:
+            with self.subTest(path=path):
+                claude_linux.reject_wsl_windows_path(
+                    pathlib.Path(path), self.wsl2, mountinfo_text=mountinfo
+                )
+
+    def test_unproven_layered_shared_and_loop_filesystems_are_inconclusive(
+        self,
+    ) -> None:
+        cases = (
+            ("overlay", "overlay", "rw,lowerdir=/mnt/c/base,upperdir=/upper"),
+            ("fuse.bindfs", "bindfs", "rw"),
+            ("9p", "linux-share", "rw"),
+            ("virtiofs", "linux-share", "rw"),
+            ("ext4", "/dev/loop0", "rw"),
+        )
+
+        for file_system, source, super_options in cases:
+            with (
+                self.subTest(file_system=file_system, source=source),
+                self.assertRaisesRegex(
+                    claude_linux.LinuxRuntimeInspectionInconclusive,
+                    "cannot prove.*local native Linux filesystem",
+                ),
+            ):
+                claude_linux.reject_wsl_windows_path(
+                    pathlib.Path("/review-state/runtime"),
+                    self.wsl2,
+                    mountinfo_text="\n".join(
+                        (
+                            self._root_mount(),
+                            self._mount(
+                                "/review-state",
+                                file_system=file_system,
+                                source=source,
+                                super_options=super_options,
+                            ),
+                        )
+                    ),
+                )
+
+    def test_ext4_requires_wsl_sd_block_source(self) -> None:
+        accepted = self._mount(
+            "/review-state",
+            file_system="ext4",
+            source="/dev/sdb1",
+        )
+        claude_linux.reject_wsl_windows_path(
+            pathlib.Path("/review-state/runtime"),
+            self.wsl2,
+            mountinfo_text="\n".join((self._root_mount(), accepted)),
+        )
+
+        for source in (
+            "/dev/dm-0",
+            "/dev/mapper/review",
+            "/dev/nbd0",
+            "/dev/md0",
+            "UUID=01234567-89ab-cdef-0123-456789abcdef",
+            "LABEL=review",
+            "relative-device",
+        ):
+            with (
+                self.subTest(source=source),
+                self.assertRaises(
+                    claude_linux.LinuxRuntimeInspectionInconclusive
+                ),
+            ):
+                claude_linux.reject_wsl_windows_path(
+                    pathlib.Path("/review-state/runtime"),
+                    self.wsl2,
+                    mountinfo_text="\n".join(
+                        (
+                            self._root_mount(),
+                            self._mount(
+                                "/review-state",
+                                file_system="ext4",
+                                source=source,
+                            ),
+                        )
+                    ),
+                )
+
+    def test_mountinfo_decodes_option_escapes_once(self) -> None:
+        mountinfo = "\n".join(
+            (
+                self._root_mount(),
+                self._mount(
+                    "/unrelated-overlay",
+                    file_system="overlay",
+                    source="overlay",
+                    super_options=r"rw,lowerdir=/layers/a\054b\072c\134054",
+                ),
+            )
+        )
+
+        entries = claude_linux._parse_mountinfo(mountinfo)
+
+        self.assertEqual(
+            entries[1].super_options,
+            r"rw,lowerdir=/layers/a,b:c\054",
+        )
+        claude_linux.reject_wsl_windows_path(
+            pathlib.Path("/home/reviewer/project"),
+            self.wsl2,
+            mountinfo_text=mountinfo,
+        )
+
+    def test_same_depth_mounts_preserve_windows_before_unknown_tristate(self) -> None:
+        windows = self._mount(
+            "/review-state",
+            file_system="9p",
+            source="drvfs",
+            super_options="rw,aname=drvfs",
+            mount_id=52,
+        )
+        unknown = self._mount(
+            "/review-state",
+            file_system="overlay",
+            source="overlay",
+            super_options="rw,lowerdir=/lower",
+            mount_id=53,
+        )
+        native = self._mount(
+            "/review-state",
+            file_system="ext4",
+            source="/dev/sdb",
+            mount_id=54,
+        )
+
+        with self.assertRaises(claude_linux.LinuxRuntimeUnsafe):
+            claude_linux.reject_wsl_windows_path(
+                pathlib.Path("/review-state/runtime"),
+                self.wsl2,
+                mountinfo_text="\n".join((self._root_mount(), windows, unknown)),
+            )
+        with self.assertRaises(
+            claude_linux.LinuxRuntimeInspectionInconclusive
+        ):
+            claude_linux.reject_wsl_windows_path(
+                pathlib.Path("/review-state/runtime"),
+                self.wsl2,
+                mountinfo_text="\n".join((self._root_mount(), native, unknown)),
+            )
+
+    def test_rejects_virtiofs_only_with_explicit_windows_provenance(self) -> None:
+        mountinfo = "\n".join(
+            (
+                self._root_mount(),
+                self._mount(
+                    "/windows/d",
+                    file_system="virtiofs",
+                    source=r"D:\134",
+                ),
+            )
+        )
+
+        with self.assertRaisesRegex(claude_linux.LinuxRuntimeUnsafe, "filesystem"):
+            claude_linux.reject_wsl_windows_path(
+                pathlib.Path("/windows/d/review"),
+                self.wsl2,
+                mountinfo_text=mountinfo,
+            )
+
+    def test_batch_rejects_drvfs_ancestor_below_linux_submount(self) -> None:
+        parent = pathlib.Path("/review-state")
+        candidate = parent / "gpg-tmp"
+        mountinfo = "\n".join(
+            (
+                self._root_mount(),
+                self._mount(
+                    parent,
+                    file_system="9p",
+                    source="drvfs",
+                    super_options="rw,aname=drvfs",
+                    mount_id=52,
+                ),
+                self._mount(
+                    candidate,
+                    file_system="ext4",
+                    source="/dev/sdb",
+                    mount_id=53,
+                ),
+            )
+        )
+
+        with (
+            mock.patch.object(
+                claude_linux,
+                "_read_mountinfo",
+                return_value=mountinfo,
+            ) as read_mountinfo,
+            self.assertRaisesRegex(
+                claude_linux.LinuxRuntimeUnsafe,
+                "filesystem",
+            ),
+        ):
+            claude_linux.reject_wsl_windows_paths(
+                (candidate, parent),
+                self.wsl2,
+            )
+
+        read_mountinfo.assert_called_once()
+
+    def test_fails_closed_for_malformed_oversized_or_unavailable_mountinfo(
+        self,
+    ) -> None:
+        malformed = "24 1 0:22 / / rw,relatime ext4 /dev/sda rw"
+        oversized = "x" * (claude_linux.MOUNTINFO_LIMIT_BYTES + 1)
+        invalid_escape = self._mount(
+            "/review-state",
+            file_system="overlay",
+            source="overlay",
+            super_options=r"rw,lowerdir=/layers/a\777b",
+        )
+
+        for payload in (malformed, oversized, invalid_escape, ""):
+            with (
+                self.subTest(payload_length=len(payload)),
+                self.assertRaisesRegex(
+                    claude_linux.LinuxRuntimeInspectionInconclusive,
+                    "mountinfo",
+                ),
+            ):
+                claude_linux.reject_wsl_windows_path(
+                    pathlib.Path("/home/reviewer/project"),
+                    self.wsl2,
+                    mountinfo_text=payload,
+                )
+        with tempfile.TemporaryDirectory() as temporary:
+            unavailable = pathlib.Path(temporary) / "missing-mountinfo"
+            with self.assertRaisesRegex(
+                claude_linux.LinuxRuntimeInspectionInconclusive,
+                "cannot read WSL2 mountinfo",
+            ):
+                claude_linux.reject_wsl_windows_path(
+                    pathlib.Path("/home/reviewer/project"),
+                    self.wsl2,
+                    mountinfo_path=unavailable,
+                )
+
+    def test_native_linux_does_not_depend_on_wsl_mountinfo(self) -> None:
+        native = claude_linux.LinuxHost(
+            claude_linux.LinuxHostKind.LINUX, "x64", "6.8.0-generic"
+        )
+
+        claude_linux.reject_wsl_windows_path(
+            pathlib.Path("/mnt/c/Users/reviewer/project"),
+            native,
+            mountinfo_path=pathlib.Path("/definitely/missing/mountinfo"),
+        )
+
+
+class ElfInspectionTest(unittest.TestCase):
+    def test_maps_glibc_and_musl_x64_and_arm64_platform_keys(self) -> None:
+        cases = (
+            ("x64", "/lib64/ld-linux-x86-64.so.2", "linux-x64"),
+            ("arm64", "/lib/ld-linux-aarch64.so.1", "linux-arm64"),
+            ("x64", "/lib/ld-musl-x86_64.so.1", "linux-x64-musl"),
+            ("arm64", "/lib/ld-musl-aarch64.so.1", "linux-arm64-musl"),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            for index, (arch, interpreter, expected) in enumerate(cases):
+                with self.subTest(expected=expected):
+                    path = _write_elf(
+                        root / f"claude-{index}",
+                        arch=arch,
+                        interpreter=interpreter,
+                    )
+
+                    info = claude_linux.inspect_elf(path)
+
+                    self.assertEqual(info.arch, arch)
+                    self.assertEqual(info.manifest_platform_key, expected)
+
+    def test_rejects_script_wrapper_and_static_unknown_libc(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            wrapper = root / "claude"
+            wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            wrapper.chmod(0o755)
+            static_elf = _write_elf(root / "static", interpreter=None)
+
+            with self.assertRaisesRegex(
+                claude_linux.LinuxRuntimeError,
+                "truncated ELF header",
+            ):
+                claude_linux.inspect_elf(wrapper)
+            with self.assertRaisesRegex(claude_linux.LinuxRuntimeError, "libc"):
+                _ = claude_linux.inspect_elf(static_elf).manifest_platform_key
+
+    def test_rejects_architecture_mismatch(self) -> None:
+        host = claude_linux.LinuxHost(claude_linux.LinuxHostKind.LINUX, "arm64", "6.8")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = _write_elf(pathlib.Path(temporary) / "claude", arch="x64")
+
+            with self.assertRaisesRegex(
+                claude_linux.LinuxRuntimeError, "does not match"
+            ):
+                claude_linux.validate_claude_executable(path, host)
+
+    def test_elf_descriptor_io_failures_are_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = _write_elf(pathlib.Path(temporary) / "claude")
+            real_close = os.close
+
+            def close_then_fail(fd: int) -> None:
+                real_close(fd)
+                raise OSError("close raced")
+
+            cases = (
+                (
+                    "open",
+                    mock.patch.object(
+                        claude_linux.os,
+                        "open",
+                        side_effect=OSError("open raced"),
+                    ),
+                ),
+                (
+                    "fstat",
+                    mock.patch.object(
+                        claude_linux.os,
+                        "fstat",
+                        side_effect=OSError("fstat raced"),
+                    ),
+                ),
+                (
+                    "pread",
+                    mock.patch.object(
+                        claude_linux.os,
+                        "pread",
+                        side_effect=OSError("pread raced"),
+                    ),
+                ),
+                (
+                    "close",
+                    mock.patch.object(
+                        claude_linux.os,
+                        "close",
+                        side_effect=close_then_fail,
+                    ),
+                ),
+            )
+
+            for operation, failure in cases:
+                with (
+                    self.subTest(operation=operation),
+                    failure,
+                    self.assertRaisesRegex(
+                        claude_linux.LinuxRuntimeInspectionInconclusive,
+                        operation,
+                    ),
+                ):
+                    claude_linux.inspect_elf(path)
+
+    def test_elf_close_failure_does_not_replace_primary_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = _write_elf(pathlib.Path(temporary) / "claude")
+            real_close = os.close
+
+            def close_then_fail(fd: int) -> None:
+                real_close(fd)
+                raise OSError("close raced")
+
+            interrupt = KeyboardInterrupt("inspection cancelled")
+            cases = (
+                (
+                    "format",
+                    mock.patch.object(
+                        claude_linux.os,
+                        "pread",
+                        return_value=(
+                            b"not-elf"
+                            + b"\x00" * (claude_linux.ELF_HEADER_SIZE - 7)
+                        ),
+                    ),
+                    claude_linux.LinuxRuntimeError,
+                    "native ELF",
+                    None,
+                ),
+                (
+                    "interrupt",
+                    mock.patch.object(
+                        claude_linux.os,
+                        "fstat",
+                        side_effect=interrupt,
+                    ),
+                    KeyboardInterrupt,
+                    "inspection cancelled",
+                    interrupt,
+                ),
+            )
+
+            for operation, primary, error_type, message, expected in cases:
+                with (
+                    self.subTest(operation=operation),
+                    primary,
+                    mock.patch.object(
+                        claude_linux.os,
+                        "close",
+                        side_effect=close_then_fail,
+                    ),
+                    self.assertRaisesRegex(error_type, message) as raised,
+                ):
+                    claude_linux.inspect_elf(path)
+
+                if expected is not None:
+                    self.assertIs(raised.exception, expected)
+                notes = getattr(raised.exception, "__notes__", ())
+                if notes:
+                    self.assertTrue(
+                        any("ELF descriptor cleanup" in note for note in notes)
+                    )
+                else:
+                    diagnostic = raised.exception.__cause__
+                    self.assertIsInstance(
+                        diagnostic,
+                        claude_linux.LinuxRuntimeInspectionCleanupDiagnostic,
+                    )
+                    assert diagnostic is not None
+                    self.assertIn("ELF descriptor cleanup", str(diagnostic))
+
+    def test_elf_short_read_and_metadata_race_are_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            path = _write_elf(root / "claude")
+
+            with (
+                mock.patch.object(
+                    claude_linux.os,
+                    "pread",
+                    return_value=b"not-elf",
+                ),
+                self.assertRaisesRegex(
+                    claude_linux.LinuxRuntimeInspectionInconclusive,
+                    "short read",
+                ),
+            ):
+                claude_linux.inspect_elf(path)
+
+            before = path.stat()
+            after = SimpleNamespace(
+                **{
+                    field: getattr(before, field)
+                    for field in claude_linux._ELF_STABLE_METADATA_FIELDS
+                }
+            )
+            after.st_mtime_ns += 1
+            with (
+                mock.patch.object(
+                    claude_linux.os,
+                    "fstat",
+                    side_effect=(before, after),
+                ),
+                self.assertRaisesRegex(
+                    claude_linux.LinuxRuntimeInspectionInconclusive,
+                    "changed during inspection",
+                ),
+            ):
+                claude_linux.inspect_elf(path)
+
+            truncated = root / "truncated"
+            truncated.write_bytes(b"\x7fELF")
+            with self.assertRaisesRegex(
+                claude_linux.LinuxRuntimeError,
+                "truncated ELF header",
+            ):
+                claude_linux.inspect_elf(truncated)
+
+            oversized_offset = _write_elf(root / "oversized-offset")
+            payload = bytearray(oversized_offset.read_bytes())
+            struct.pack_into(
+                "<Q",
+                payload,
+                claude_linux.ELF_HEADER_SIZE + 8,
+                2**64 - 1,
+            )
+            oversized_offset.write_bytes(payload)
+            with self.assertRaisesRegex(
+                claude_linux.LinuxRuntimeError,
+                "truncated ELF interpreter metadata",
+            ):
+                claude_linux.inspect_elf(oversized_offset)
+
+
+class ToolchainDiscoveryTest(unittest.TestCase):
+    def test_discovers_native_tools_and_runs_real_shape_bwrap_probe(self) -> None:
+        host = claude_linux.LinuxHost(claude_linux.LinuxHostKind.LINUX, "x64", "6.8")
+        calls: list[tuple[tuple[str, ...], dict[str, str]]] = []
+
+        def runner(argv, **kwargs):
+            command = tuple(argv)
+            calls.append((command, kwargs["env"]))
+            name = pathlib.Path(command[0]).name
+            if name == "bwrap" and "--unshare-net" in command:
+                return _capture(stdout=b"ripgrep 14.1.0\n")
+            outputs = {
+                "bwrap": b"bubblewrap 0.11.0\n",
+                "socat": b"socat version 1.8.0\n",
+                "rg": b"ripgrep 14.1.0\n",
+                "cc": b"gcc (GCC) 14.1.0\n",
+            }
+            return _capture(stdout=outputs[name])
+
+        with tempfile.TemporaryDirectory(
+            dir=pathlib.Path(__file__).parent
+        ) as temporary:
+            root = pathlib.Path(temporary)
+            root.chmod(0o700)
+            candidates = {}
+            for name in ("bwrap", "socat", "rg", "cc"):
+                candidates[name] = (_write_elf(root / name),)
+
+            with mock.patch.dict(os.environ, _AMBIENT_TOOL_ENV_POISON, clear=False):
+                toolchain = claude_linux.discover_native_toolchain(
+                    host,
+                    runner=runner,
+                    candidates=candidates,
+                    trusted_roots=(root,),
+                    trusted_owner_uids=frozenset({os.getuid()}),
+                )
+
+        self.assertEqual(toolchain.bwrap.name, "bwrap")
+        expected_env = claude_linux.fixed_host_tool_environment()
+        self.assertTrue(calls)
+        for _command, environment in calls:
+            self.assertEqual(environment, expected_env)
+            self.assertEqual(environment["PATH"], "/usr/bin:/bin")
+            for key in _AMBIENT_TOOL_ENV_POISON.keys() - {"PATH"}:
+                self.assertNotIn(key, environment)
+        bwrap_probe = next(call for call, _env in calls if "--unshare-net" in call)
+        for required in (
+            "--unshare-user",
+            "--unshare-pid",
+            "--unshare-net",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--unshare-cgroup",
+            "--disable-userns",
+        ):
+            self.assertIn(required, bwrap_probe)
+        self.assertIn(("--cap-drop", "ALL"), tuple(zip(bwrap_probe, bwrap_probe[1:])))
+
+    def test_compiler_and_ldd_probes_ignore_ambient_environment(self) -> None:
+        host = claude_linux.LinuxHost(claude_linux.LinuxHostKind.LINUX, "x64", "6.8")
+        toolchain = claude_linux.NativeToolchain(
+            pathlib.Path("/usr/bin/bwrap"),
+            pathlib.Path("/usr/bin/socat"),
+            pathlib.Path("/usr/bin/rg"),
+            pathlib.Path("/usr/bin/cc"),
+        )
+        calls: list[tuple[tuple[str, ...], dict[str, str]]] = []
+
+        def runner(argv, **kwargs):
+            command = tuple(argv)
+            calls.append((command, kwargs["env"]))
+            if command[0] == str(toolchain.cc):
+                _write_elf(pathlib.Path(command[-1]))
+                return _capture()
+            return _capture(stdout=b"statically linked\n")
+
+        with tempfile.TemporaryDirectory(
+            dir=pathlib.Path(__file__).parent
+        ) as temporary:
+            root = pathlib.Path(temporary)
+            root.chmod(0o700)
+            source = root / "launcher.c"
+            source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+            ldd = root / "ldd"
+            ldd.write_text("test-only\n", encoding="utf-8")
+            ldd.chmod(0o500)
+            with mock.patch.dict(os.environ, _AMBIENT_TOOL_ENV_POISON, clear=False):
+                launcher = claude_linux.compile_launcher(
+                    host,
+                    toolchain,
+                    root / "launcher",
+                    source_path=source,
+                    runner=runner,
+                )
+                libraries = claude_linux.collect_runtime_libraries(
+                    host,
+                    (launcher,),
+                    runner=runner,
+                    ldd_path=ldd,
+                    ldd_trusted_roots=(root,),
+                    trusted_owner_uids=frozenset({0, os.getuid()}),
+                )
+
+        self.assertEqual(libraries, ())
+        self.assertEqual(
+            tuple(pathlib.Path(command[0]).name for command, _env in calls),
+            ("cc", "ldd"),
+        )
+        expected_env = claude_linux.fixed_host_tool_environment()
+        for _command, environment in calls:
+            self.assertEqual(environment, expected_env)
+            for key in _AMBIENT_TOOL_ENV_POISON.keys() - {"PATH"}:
+                self.assertNotIn(key, environment)
+
+    def test_fails_closed_when_bwrap_namespace_probe_fails(self) -> None:
+        host = claude_linux.LinuxHost(
+            claude_linux.LinuxHostKind.WSL2, "x64", "microsoft-standard-WSL2"
+        )
+        tools = claude_linux.NativeToolchain(
+            pathlib.Path("/usr/bin/bwrap"),
+            pathlib.Path("/usr/bin/socat"),
+            pathlib.Path("/usr/bin/rg"),
+            pathlib.Path("/usr/bin/cc"),
+        )
+
+        with self.assertRaisesRegex(
+            claude_linux.LinuxIsolationUnavailable, "cannot create"
+        ):
+            claude_linux.probe_bwrap(
+                host,
+                tools,
+                runner=lambda *_args, **_kwargs: _capture(
+                    returncode=1, stderr=b"user namespaces disabled"
+                ),
+            )
+
+
+class RuntimeLibraryTrustTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.host = claude_linux.LinuxHost(
+            claude_linux.LinuxHostKind.LINUX, "x64", "6.8"
+        )
+        self.trusted_owners = frozenset({0, os.getuid()})
+
+    def test_accepts_and_revalidates_safe_system_path(self) -> None:
+        candidate = next(
+            path
+            for path in (pathlib.Path("/usr/bin/env"), pathlib.Path("/bin/true"))
+            if path.exists()
+        )
+
+        identity = claude_linux._capture_trusted_path_identity(candidate)
+
+        self.assertEqual(
+            claude_linux._revalidate_trusted_path_identity(identity),
+            candidate.resolve(strict=True),
+        )
+        self.assertEqual(identity.components[-1].uid, 0)
+        self.assertTrue(all(not (item.mode & 0o022) for item in identity.components))
+
+    def test_rejects_writable_parent_as_unsafe(self) -> None:
+        with tempfile.TemporaryDirectory(
+            dir=pathlib.Path(__file__).parent
+        ) as temporary:
+            root = pathlib.Path(temporary)
+            writable = root / "writable"
+            writable.mkdir(mode=0o700)
+            library = writable / "libunsafe.so"
+            library.write_bytes(b"library")
+            library.chmod(0o644)
+            writable.chmod(0o777)
+
+            with self.assertRaisesRegex(
+                claude_linux.LinuxRuntimeUnsafe, "writable"
+            ):
+                claude_linux._capture_trusted_path_identity(
+                    library,
+                    trusted_owner_uids=self.trusted_owners,
+                )
+
+    def test_rejects_replace_after_collect_as_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory(
+            dir=pathlib.Path(__file__).parent
+        ) as temporary:
+            root = pathlib.Path(temporary)
+            root.chmod(0o700)
+            ldd = root / "ldd"
+            ldd.write_text("test-only\n", encoding="utf-8")
+            ldd.chmod(0o500)
+            library = root / "libstable.so"
+            library.write_bytes(b"AAAA")
+            library.chmod(0o444)
+            executable = root / "program"
+            executable.write_bytes(b"program")
+
+            with mock.patch.object(
+                claude_linux,
+                "_parse_ldd_output",
+                return_value=(
+                    claude_linux.RuntimeMount(
+                        library,
+                        pathlib.PurePosixPath("/lib/libstable.so"),
+                    ),
+                ),
+            ):
+                mounts = claude_linux.collect_runtime_libraries(
+                    self.host,
+                    (executable,),
+                    runner=lambda *_args, **_kwargs: _capture(stdout=b"fixture\n"),
+                    ldd_path=ldd,
+                    ldd_trusted_roots=(root,),
+                    trusted_owner_uids=self.trusted_owners,
+                )
+            replacement = root / "replacement.so"
+            replacement.write_bytes(b"BBBB")
+            replacement.chmod(0o444)
+            os.replace(replacement, library)
+
+            with self.assertRaisesRegex(
+                claude_linux.LinuxRuntimeInspectionInconclusive,
+                "changed after inspection",
+            ):
+                claude_linux._validate_runtime_mount(mounts[0], self.host)
+
+    def test_classifies_missing_ldd_and_probe_failure(self) -> None:
+        with tempfile.TemporaryDirectory(
+            dir=pathlib.Path(__file__).parent
+        ) as temporary:
+            root = pathlib.Path(temporary)
+            root.chmod(0o700)
+            executable = root / "program"
+            executable.write_bytes(b"program")
+            with self.assertRaises(claude_linux.LinuxHostDependencyUnavailable):
+                claude_linux.collect_runtime_libraries(
+                    self.host,
+                    (executable,),
+                    ldd_path=root / "missing-ldd",
+                    ldd_trusted_roots=(root,),
+                    trusted_owner_uids=self.trusted_owners,
+                )
+
+            ldd = root / "ldd"
+            ldd.write_text("test-only\n", encoding="utf-8")
+            ldd.chmod(0o500)
+            with self.assertRaises(
+                claude_linux.LinuxRuntimeInspectionInconclusive
+            ):
+                claude_linux.collect_runtime_libraries(
+                    self.host,
+                    (executable,),
+                    runner=lambda *_args, **_kwargs: _capture(
+                        returncode=1, stderr=b"temporary inspection failure"
+                    ),
+                    ldd_path=ldd,
+                    ldd_trusted_roots=(root,),
+                    trusted_owner_uids=self.trusted_owners,
+                )
+
+        self.assertTrue(
+            issubclass(
+                claude_linux.LinuxHostDependencyUnavailable,
+                claude_linux.LinuxIsolationUnavailable,
+            )
+        )
+        self.assertFalse(
+            issubclass(
+                claude_linux.LinuxRuntimeInspectionInconclusive,
+                claude_linux.LinuxIsolationUnavailable,
+            )
+        )
+
+
+class CredentialStagingTest(unittest.TestCase):
+    def _credential(self, path: pathlib.Path, *, expires_at_ms: float) -> pathlib.Path:
+        path.write_text(
+            json.dumps(
+                {
+                    "claudeAiOauth": {
+                        "accessToken": "not-a-real-token",
+                        "refreshToken": "not-a-real-token",
+                        "expiresAt": expires_at_ms,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
+        return path
+
+    def test_stages_private_fresh_copy_and_cleans_it(self) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+            source = self._credential(
+                root / ".credentials.json", expires_at_ms=(now + 7200) * 1000
+            )
+            source_payload = source.read_bytes()
+
+            with claude_linux.stage_claude_credentials(
+                source, helper, now=now, required_validity_seconds=3600
+            ) as staged:
+                staged_dir = staged.config_dir
+                self.assertEqual(staged.credential_path.read_bytes(), source_payload)
+                self.assertEqual(
+                    stat.S_IMODE(staged.credential_path.stat().st_mode), 0o600
+                )
+                self.assertEqual(stat.S_IMODE(staged.config_dir.stat().st_mode), 0o700)
+
+            self.assertFalse(staged_dir.exists())
+            self.assertEqual(source.read_bytes(), source_payload)
+
+    def test_cleanup_note_is_visible_on_python_310_fallback(self) -> None:
+        class LegacyError(FileNotFoundError):
+            add_note = None
+
+        body_error = LegacyError(2, "missing", "/tmp/test-only")
+        cleanup_error = OSError("cleanup failed")
+        previous_cause = ValueError("previous cause")
+        body_error.__cause__ = previous_cause
+
+        claude_linux._add_cleanup_note(body_error, cleanup_error)
+
+        diagnostic = body_error.__cause__
+        self.assertIsInstance(
+            diagnostic,
+            claude_linux.LinuxCredentialCleanupDiagnostic,
+        )
+        assert diagnostic is not None
+        self.assertIn("credential cleanup also failed", str(diagnostic).lower())
+        self.assertIn("cleanup failed", str(diagnostic))
+        self.assertIs(diagnostic.__cause__, previous_cause)
+
+    def test_source_close_failure_zeroes_successful_read(self) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            source = self._credential(
+                pathlib.Path(temporary) / ".credentials.json",
+                expires_at_ms=(now + 7200) * 1000,
+            )
+            captured_payloads: list[bytearray] = []
+            real_loads = json.loads
+
+            def capture_loads(payload: bytearray) -> object:
+                captured_payloads.append(payload)
+                return real_loads(payload)
+
+            with (
+                mock.patch.object(
+                    claude_linux.json,
+                    "loads",
+                    side_effect=capture_loads,
+                ),
+                mock.patch.object(
+                    claude_linux.os,
+                    "close",
+                    side_effect=OSError("injected source close failure"),
+                ),
+                self.assertRaisesRegex(
+                    claude_linux.LinuxCredentialUnsafe,
+                    "cannot close Claude credential source",
+                ),
+            ):
+                claude_linux._read_valid_credential(
+                    source,
+                    owner_uid=os.getuid(),
+                    now=now,
+                    required_validity_seconds=3600,
+                )
+
+            self.assertEqual(len(captured_payloads), 1)
+            self.assertEqual(set(captured_payloads[0]), {0})
+
+    def test_source_close_failure_does_not_mask_validation_error(self) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            source = self._credential(
+                pathlib.Path(temporary) / ".credentials.json",
+                expires_at_ms=(now + 7200) * 1000,
+            )
+            source.chmod(0o644)
+
+            with (
+                mock.patch.object(
+                    claude_linux.os,
+                    "close",
+                    side_effect=OSError("injected source close failure"),
+                ),
+                self.assertRaisesRegex(
+                    claude_linux.LinuxCredentialUnsafe,
+                    "mode must be exactly 0600",
+                ) as raised,
+            ):
+                claude_linux._read_valid_credential(
+                    source,
+                    owner_uid=os.getuid(),
+                    now=now,
+                    required_validity_seconds=3600,
+                )
+
+            notes = getattr(raised.exception, "__notes__", ())
+            if notes:
+                self.assertTrue(
+                    any("source close failure" in note for note in notes),
+                    notes,
+                )
+            else:
+                diagnostic = raised.exception.__cause__
+                self.assertIsInstance(
+                    diagnostic,
+                    claude_linux.LinuxCredentialCleanupDiagnostic,
+                )
+                assert diagnostic is not None
+                self.assertIn("source close failure", str(diagnostic))
+
+    def test_source_close_interruption_remains_control_flow(self) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            source = self._credential(
+                pathlib.Path(temporary) / ".credentials.json",
+                expires_at_ms=(now + 7200) * 1000,
+            )
+
+            with (
+                mock.patch.object(
+                    claude_linux.os,
+                    "close",
+                    side_effect=KeyboardInterrupt,
+                ),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                claude_linux._read_valid_credential(
+                    source,
+                    owner_uid=os.getuid(),
+                    now=now,
+                    required_validity_seconds=3600,
+                )
+
+    def test_removes_partial_credential_after_write_failure(self) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+            source = self._credential(
+                root / ".credentials.json", expires_at_ms=(now + 7200) * 1000
+            )
+            real_write = os.write
+            writes = 0
+
+            def fail_after_partial_write(fd: int, payload: bytes) -> int:
+                nonlocal writes
+                writes += 1
+                if writes == 1:
+                    return real_write(fd, payload[:8])
+                raise OSError("injected write failure")
+
+            with (
+                mock.patch.object(
+                    claude_linux.os,
+                    "write",
+                    side_effect=fail_after_partial_write,
+                ),
+                self.assertRaisesRegex(
+                    claude_linux.LinuxCredentialUnsafe,
+                    "cannot write staged Claude credential",
+                ),
+            ):
+                with claude_linux.stage_claude_credentials(source, helper, now=now):
+                    pass
+
+            self.assertEqual(list(helper.iterdir()), [])
+
+    def test_removes_partial_credential_after_write_interruption(self) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+            source = self._credential(
+                root / ".credentials.json", expires_at_ms=(now + 7200) * 1000
+            )
+            real_write = os.write
+            writes = 0
+
+            def interrupt_after_partial_write(fd: int, payload: bytes) -> int:
+                nonlocal writes
+                writes += 1
+                if writes == 1:
+                    return real_write(fd, payload[:8])
+                raise KeyboardInterrupt
+
+            with (
+                mock.patch.object(
+                    claude_linux.os,
+                    "write",
+                    side_effect=interrupt_after_partial_write,
+                ),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                with claude_linux.stage_claude_credentials(source, helper, now=now):
+                    pass
+
+            self.assertEqual(list(helper.iterdir()), [])
+
+    def test_removes_complete_credential_after_close_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / ".credentials.json"
+            payload = bytearray(b"test-only credential payload")
+            real_close = os.close
+            closes = 0
+
+            def close_then_fail(fd: int) -> None:
+                nonlocal closes
+                closes += 1
+                real_close(fd)
+                if closes == 1:
+                    raise OSError("injected close failure")
+
+            with (
+                mock.patch.object(
+                    claude_linux.os,
+                    "close",
+                    side_effect=close_then_fail,
+                ),
+                self.assertRaisesRegex(
+                    claude_linux.LinuxCredentialUnsafe,
+                    "cannot close staged Claude credential",
+                ),
+            ):
+                claude_linux._write_private_file(path, payload)
+
+            self.assertFalse(path.exists())
+
+    def test_removes_partial_credential_after_finalize_failure(self) -> None:
+        now = time.time()
+        for operation in ("fsync", "fchmod"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary)
+                helper = root / "helper"
+                helper.mkdir(mode=0o700)
+                source = self._credential(
+                    root / ".credentials.json", expires_at_ms=(now + 7200) * 1000
+                )
+
+                with (
+                    mock.patch.object(
+                        claude_linux.os,
+                        operation,
+                        side_effect=OSError(f"injected {operation} failure"),
+                    ),
+                    self.assertRaisesRegex(
+                        claude_linux.LinuxCredentialUnsafe,
+                        "cannot finalize staged Claude credential",
+                    ),
+                ):
+                    with claude_linux.stage_claude_credentials(
+                        source,
+                        helper,
+                        now=now,
+                    ):
+                        pass
+
+                self.assertEqual(list(helper.iterdir()), [])
+
+    def test_zeroes_partial_credential_when_unlink_fails(self) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+            source = self._credential(
+                root / ".credentials.json", expires_at_ms=(now + 7200) * 1000
+            )
+
+            with (
+                mock.patch.object(
+                    claude_linux.os,
+                    "fchmod",
+                    side_effect=OSError("injected finalize failure"),
+                ),
+                mock.patch.object(
+                    pathlib.Path,
+                    "unlink",
+                    side_effect=OSError("injected unlink failure"),
+                ),
+                self.assertRaisesRegex(
+                    claude_linux.LinuxCredentialUnsafe,
+                    "cannot remove partial staged Claude credential",
+                ),
+            ):
+                with claude_linux.stage_claude_credentials(source, helper, now=now):
+                    pass
+
+            staged_directories = list(helper.iterdir())
+            self.assertEqual(len(staged_directories), 1)
+            staged_credential = staged_directories[0] / ".credentials.json"
+            self.assertGreater(staged_credential.stat().st_size, 0)
+            self.assertEqual(set(staged_credential.read_bytes()), {0})
+            staged_credential.unlink()
+            staged_directories[0].rmdir()
+
+    def test_cleanup_preserves_body_exception_when_close_fails(self) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+            source = self._credential(
+                root / ".credentials.json", expires_at_ms=(now + 7200) * 1000
+            )
+            real_close = os.close
+            close_patch = None
+            closes = 0
+            staged_dir: pathlib.Path | None = None
+
+            def close_then_fail(fd: int) -> None:
+                nonlocal closes
+                closes += 1
+                real_close(fd)
+                if closes == 1:
+                    raise OSError("injected cleanup close failure")
+
+            try:
+                with self.assertRaisesRegex(ValueError, "injected body failure"):
+                    with claude_linux.stage_claude_credentials(
+                        source,
+                        helper,
+                        now=now,
+                    ) as staged:
+                        staged_dir = staged.config_dir
+                        close_patch = mock.patch.object(
+                            claude_linux.os,
+                            "close",
+                            side_effect=close_then_fail,
+                        )
+                        close_patch.start()
+                        raise ValueError("injected body failure")
+            finally:
+                if close_patch is not None:
+                    close_patch.stop()
+
+            assert staged_dir is not None
+            self.assertFalse(staged_dir.exists())
+
+    def test_generator_close_unlinks_after_scrub_interruption(self) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+            source = self._credential(
+                root / ".credentials.json", expires_at_ms=(now + 7200) * 1000
+            )
+            manager = claude_linux.stage_claude_credentials(source, helper, now=now)
+            staged = manager.__enter__()
+
+            with mock.patch.object(
+                claude_linux.os,
+                "write",
+                side_effect=KeyboardInterrupt,
+            ):
+                manager.gen.close()
+
+            self.assertFalse(staged.config_dir.exists())
+
+    def test_normal_cleanup_rethrows_scrub_interruption_after_unlink(self) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+            source = self._credential(
+                root / ".credentials.json", expires_at_ms=(now + 7200) * 1000
+            )
+            manager = claude_linux.stage_claude_credentials(source, helper, now=now)
+            staged = manager.__enter__()
+
+            with (
+                mock.patch.object(
+                    claude_linux.os,
+                    "write",
+                    side_effect=KeyboardInterrupt,
+                ),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                manager.__exit__(None, None, None)
+
+            self.assertFalse(staged.config_dir.exists())
+
+    def test_normal_cleanup_preserves_unlink_interruption(self) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+            source = self._credential(
+                root / ".credentials.json", expires_at_ms=(now + 7200) * 1000
+            )
+            manager = claude_linux.stage_claude_credentials(source, helper, now=now)
+            staged = manager.__enter__()
+
+            with (
+                mock.patch.object(
+                    pathlib.Path,
+                    "unlink",
+                    side_effect=KeyboardInterrupt,
+                ),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                manager.__exit__(None, None, None)
+
+            self.assertTrue(staged.credential_path.exists())
+            staged.credential_path.unlink()
+            staged.config_dir.rmdir()
+
+    def test_cleanup_interruption_overrides_ordinary_body_error(self) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+            source = self._credential(
+                root / ".credentials.json", expires_at_ms=(now + 7200) * 1000
+            )
+
+            manager = claude_linux.stage_claude_credentials(
+                source,
+                helper,
+                now=now,
+            )
+            manager.__enter__()
+            body_error = ValueError("injected body failure")
+            with (
+                mock.patch.object(
+                    claude_linux.os,
+                    "write",
+                    side_effect=KeyboardInterrupt,
+                ),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                manager.__exit__(ValueError, body_error, None)
+
+            self.assertEqual(list(helper.iterdir()), [])
+
+    def test_unlink_failure_is_primary_after_scrub_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / ".credentials.json"
+            path.write_bytes(b"test-only credential payload")
+            path.chmod(0o600)
+            unlink_error = OSError("injected unlink failure")
+
+            with (
+                mock.patch.object(
+                    claude_linux.os,
+                    "fsync",
+                    side_effect=OSError("injected scrub failure"),
+                ),
+                mock.patch.object(
+                    pathlib.Path,
+                    "unlink",
+                    side_effect=unlink_error,
+                ),
+            ):
+                cleanup_error = claude_linux._discard_private_file(path, None)
+
+            self.assertIs(cleanup_error, unlink_error)
+            path.unlink()
+
+    def test_rejects_stale_permissive_and_symlink_credentials(self) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+            stale = self._credential(
+                root / "stale.json", expires_at_ms=(now + 60) * 1000
+            )
+            permissive = self._credential(
+                root / "permissive.json", expires_at_ms=(now + 7200) * 1000
+            )
+            permissive.chmod(0o644)
+            target = self._credential(
+                root / "target.json", expires_at_ms=(now + 7200) * 1000
+            )
+            symlink = root / "link.json"
+            symlink.symlink_to(target)
+
+            with self.assertRaisesRegex(
+                claude_linux.LinuxCredentialUnavailable, "cover"
+            ):
+                with claude_linux.stage_claude_credentials(
+                    stale, helper, now=now, required_validity_seconds=3600
+                ):
+                    pass
+            with self.assertRaisesRegex(claude_linux.LinuxCredentialUnsafe, "0600"):
+                with claude_linux.stage_claude_credentials(permissive, helper, now=now):
+                    pass
+            with self.assertRaises(claude_linux.LinuxCredentialUnsafe):
+                with claude_linux.stage_claude_credentials(symlink, helper, now=now):
+                    pass
+
+    def test_classifies_missing_login_as_unavailable_and_malformed_as_unsafe(
+        self,
+    ) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+            missing_token = root / "missing-token.json"
+            missing_token.write_text(
+                json.dumps({"claudeAiOauth": {"expiresAt": (now + 7200) * 1000}}),
+                encoding="utf-8",
+            )
+            missing_token.chmod(0o600)
+            malformed = root / "malformed.json"
+            malformed.write_text("{", encoding="utf-8")
+            malformed.chmod(0o600)
+
+            with self.assertRaises(claude_linux.LinuxCredentialUnavailable):
+                with claude_linux.stage_claude_credentials(
+                    root / "absent.json", helper, now=now
+                ):
+                    pass
+            with self.assertRaises(claude_linux.LinuxCredentialUnavailable):
+                with claude_linux.stage_claude_credentials(
+                    missing_token, helper, now=now
+                ):
+                    pass
+            with self.assertRaises(claude_linux.LinuxCredentialUnsafe):
+                with claude_linux.stage_claude_credentials(malformed, helper, now=now):
+                    pass
+
+
+class SandboxCommandTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(dir="/tmp")
+        self.root = pathlib.Path(self.temporary.name)
+        self.workspace = self.root / "workspace"
+        self.workspace.mkdir()
+        (self.workspace / "README.md").write_text("probe\n", encoding="utf-8")
+        self.helper = self.root / "helper"
+        self.helper.mkdir(mode=0o700)
+        self.home = self.helper / "home"
+        self.tmp = self.helper / "tmp"
+        self.config = self.helper / "config"
+        for directory in (self.home, self.tmp, self.config):
+            directory.mkdir(mode=0o700)
+        self.proxy_path = self.helper / "proxy.sock"
+        self.proxy_path.touch()
+        self.proxy_path.chmod(0o600)
+        self.socket_validation = mock.patch.object(
+            claude_linux,
+            "_validate_private_socket",
+            return_value=self.proxy_path.resolve(),
+        )
+        self.socket_validation.start()
+        self.claude = _write_elf(self.root / "claude")
+        self.launcher = _write_elf(self.helper / "launcher")
+        self.tools = claude_linux.NativeToolchain(
+            _write_elf(self.root / "bwrap"),
+            _write_elf(self.root / "socat"),
+            _write_elf(self.root / "rg"),
+            _write_elf(self.root / "cc"),
+        )
+        self.library = next(
+            path.resolve(strict=True)
+            for path in (pathlib.Path("/usr/bin/env"), pathlib.Path("/bin/true"))
+            if path.exists()
+        )
+        library_identity = claude_linux._capture_trusted_path_identity(self.library)
+        self.host = claude_linux.LinuxHost(
+            claude_linux.LinuxHostKind.LINUX, "x64", "6.8"
+        )
+        self.spec = claude_linux.SandboxSpec(
+            host=self.host,
+            toolchain=self.tools,
+            claude=self.claude,
+            launcher=self.launcher,
+            workspace=self.workspace,
+            helper_root=self.helper,
+            helper_home=self.home,
+            helper_tmp=self.tmp,
+            config_dir=self.config,
+            proxy_socket=self.proxy_path,
+            runtime_libraries=(
+                claude_linux.RuntimeMount(
+                    self.library,
+                    pathlib.PurePosixPath("/lib/libexample.so"),
+                    library_identity,
+                ),
+            ),
+        )
+
+    def tearDown(self) -> None:
+        self.socket_validation.stop()
+        self.temporary.cleanup()
+
+    def test_builds_synthetic_root_no_shell_review_command(self) -> None:
+        review_arguments = _linux_review_arguments()
+        sandbox_command = claude_linux.build_sandbox_command(
+            self.spec,
+            review_arguments,
+            auth_env={"ANTHROPIC_API_KEY": "test-only"},
+        )
+        command = sandbox_command.argv
+
+        for required in (
+            "--unshare-user",
+            "--unshare-pid",
+            "--unshare-net",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--unshare-cgroup",
+            "--remount-ro",
+        ):
+            self.assertIn(required, command)
+        self.assertIn(
+            ("--ro-bind", str(self.workspace.resolve()), "/workspace"),
+            tuple(zip(command, command[1:], command[2:])),
+        )
+        self.assertIn(
+            ("--bind", str(self.home.resolve()), "/home/reviewer"),
+            tuple(zip(command, command[1:], command[2:])),
+        )
+        self.assertIn(
+            ("--ro-bind", str(self.config.resolve()), "/config"),
+            tuple(zip(command, command[1:], command[2:])),
+        )
+        self.assertNotIn("sh", {pathlib.Path(item).name for item in command})
+        self.assertNotIn("/mnt", command)
+        self.assertNotIn("/etc/claude-code", command)
+        self.assertNotIn("test-only", command)
+        self.assertEqual(sandbox_command.env, {"ANTHROPIC_API_KEY": "test-only"})
+        self.assertNotIn("--clearenv", command)
+        environment_triples = tuple(zip(command, command[1:], command[2:]))
+        for key in (
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+            "CLAUDE_CODE_SAFE_MODE",
+            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB",
+        ):
+            self.assertIn(("--setenv", key, "1"), environment_triples)
+        workload = (
+            "/opt/codex-review/bin/claude-linux-launcher",
+            "--proxy",
+            "/run/codex-review/proxy.sock",
+            "--socat",
+            "/opt/codex-review/bin/socat",
+            "--",
+            "/opt/codex-review/bin/claude",
+            *review_arguments,
+        )
+        self.assertEqual(command[-len(workload) :], workload)
+        settings = json.loads(
+            review_arguments[review_arguments.index("--settings") + 1]
+        )
+        self.assertEqual(
+            review_arguments[review_arguments.index("--permission-mode") + 1],
+            "dontAsk",
+        )
+        self.assertEqual(
+            review_arguments[review_arguments.index("--tools") + 1], "Read"
+        )
+        self.assertIn("Read(//config/**)", settings["permissions"]["deny"])
+        self.assertIn("Read(//proc/**)", settings["permissions"]["deny"])
+        self.assertNotIn(
+            "Grep", review_arguments[review_arguments.index("--tools") + 1]
+        )
+        self.assertIn(
+            "Grep",
+            review_arguments[review_arguments.index("--disallowedTools") + 1].split(
+                ","
+            ),
+        )
+
+    def test_rejects_workspace_symlinks_to_authentication_carriers(self) -> None:
+        link = self.workspace / "leak"
+        for target in ("/config/.credentials.json", "/proc/self/environ"):
+            with self.subTest(target=target):
+                link.symlink_to(target)
+                try:
+                    with self.assertRaisesRegex(
+                        claude_linux.LinuxRuntimeUnsafe,
+                        "symlink escapes.*workspace",
+                    ):
+                        claude_linux.build_sandbox_command(
+                            self.spec,
+                            _linux_review_arguments(),
+                            auth_env={"ANTHROPIC_API_KEY": "test-only"},
+                        )
+                finally:
+                    link.unlink()
+
+    def test_accepts_workspace_symlink_that_resolves_inside_workspace(self) -> None:
+        (self.workspace / "README-link.md").symlink_to("README.md")
+
+        command = claude_linux.build_sandbox_command(
+            self.spec,
+            _linux_review_arguments(),
+        )
+
+        self.assertIn(str(self.workspace.resolve()), command.argv)
+
+    def test_workspace_symlink_limit_does_not_count_intermediate_directories(
+        self,
+    ) -> None:
+        current = self.workspace
+        for index in range(8):
+            current = current / f"level-{index}"
+            current.mkdir()
+        internal_target = pathlib.Path(*([".."] * 8)) / "README.md"
+        (current / "README-link.md").symlink_to(internal_target)
+
+        with mock.patch.object(claude_linux, "WORKSPACE_SYMLINK_LIMIT", 1):
+            claude_linux.build_sandbox_command(
+                self.spec,
+                _linux_review_arguments(),
+            )
+            (self.workspace / "second-link.md").symlink_to("README.md")
+            with self.assertRaisesRegex(
+                claude_linux.LinuxRuntimeInspectionInconclusive,
+                "symlink inspection limit",
+            ):
+                claude_linux.build_sandbox_command(
+                    self.spec,
+                    _linux_review_arguments(),
+                )
+
+    def test_mounts_private_ca_bundle_with_captured_path_identity(self) -> None:
+        with tempfile.TemporaryDirectory(
+            dir=pathlib.Path(__file__).parent
+        ) as temporary:
+            bundle = pathlib.Path(temporary) / "bundle.pem"
+            bundle.write_bytes(b"test-only CA material\n")
+            bundle.chmod(0o600)
+
+            command = claude_linux.build_sandbox_command(
+                dataclasses.replace(self.spec, ca_bundle=bundle),
+                _linux_review_arguments(),
+            ).argv
+
+        self.assertIn(
+            (
+                "--ro-bind",
+                str(bundle.resolve()),
+                str(claude_linux.SANDBOX_CA_BUNDLE),
+            ),
+            tuple(zip(command, command[1:], command[2:])),
+        )
+
+    def test_rejects_ca_bundle_path_replacement_after_validation(self) -> None:
+        with tempfile.TemporaryDirectory(
+            dir=pathlib.Path(__file__).parent
+        ) as temporary:
+            root = pathlib.Path(temporary)
+            bundle = root / "bundle.pem"
+            replacement = root / "replacement.pem"
+            bundle.write_bytes(b"original CA material\n")
+            replacement.write_bytes(b"replacement material\n")
+            bundle.chmod(0o600)
+            replacement.chmod(0o600)
+            original_mount_directories = claude_linux._mount_directories
+
+            def replace_bundle(*args, **kwargs):
+                os.replace(replacement, bundle)
+                return original_mount_directories(*args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    claude_linux,
+                    "_mount_directories",
+                    side_effect=replace_bundle,
+                ),
+                self.assertRaisesRegex(
+                    claude_linux.LinuxRuntimeInspectionInconclusive,
+                    "changed after inspection",
+                ),
+            ):
+                claude_linux.build_sandbox_command(
+                    dataclasses.replace(self.spec, ca_bundle=bundle),
+                    _linux_review_arguments(),
+                )
+
+    def test_rejects_ca_bundle_in_place_mutation_after_validation(self) -> None:
+        with tempfile.TemporaryDirectory(
+            dir=pathlib.Path(__file__).parent
+        ) as temporary:
+            bundle = pathlib.Path(temporary) / "bundle.pem"
+            bundle.write_bytes(b"original CA material\n")
+            bundle.chmod(0o600)
+            original_mount_directories = claude_linux._mount_directories
+
+            def mutate_bundle(*args, **kwargs):
+                previous = bundle.stat()
+                bundle.write_bytes(b"modified CA material\n")
+                os.utime(
+                    bundle,
+                    ns=(previous.st_atime_ns, previous.st_mtime_ns + 1_000_000_000),
+                )
+                return original_mount_directories(*args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    claude_linux,
+                    "_mount_directories",
+                    side_effect=mutate_bundle,
+                ),
+                self.assertRaisesRegex(
+                    claude_linux.LinuxRuntimeInspectionInconclusive,
+                    "changed after inspection",
+                ),
+            ):
+                claude_linux.build_sandbox_command(
+                    dataclasses.replace(self.spec, ca_bundle=bundle),
+                    _linux_review_arguments(),
+                )
+
+    def test_ca_symlink_retarget_does_not_change_captured_mount_source(self) -> None:
+        with tempfile.TemporaryDirectory(
+            dir=pathlib.Path(__file__).parent
+        ) as temporary:
+            root = pathlib.Path(temporary)
+            targets = root / "targets"
+            aliases = root / "aliases"
+            targets.mkdir(mode=0o700)
+            aliases.mkdir(mode=0o700)
+            first = targets / "first.pem"
+            second = targets / "second.pem"
+            first.write_bytes(b"first CA material\n")
+            second.write_bytes(b"second CA material\n")
+            first.chmod(0o600)
+            second.chmod(0o600)
+            bundle = aliases / "bundle.pem"
+            bundle.symlink_to(first)
+            original_mount_directories = claude_linux._mount_directories
+
+            def retarget_bundle(*args, **kwargs):
+                bundle.unlink()
+                bundle.symlink_to(second)
+                return original_mount_directories(*args, **kwargs)
+
+            with mock.patch.object(
+                claude_linux,
+                "_mount_directories",
+                side_effect=retarget_bundle,
+            ):
+                command = claude_linux.build_sandbox_command(
+                    dataclasses.replace(self.spec, ca_bundle=bundle),
+                    _linux_review_arguments(),
+                ).argv
+
+        triples = tuple(zip(command, command[1:], command[2:]))
+        self.assertIn(
+            (
+                "--ro-bind",
+                str(first.resolve()),
+                str(claude_linux.SANDBOX_CA_BUNDLE),
+            ),
+            triples,
+        )
+        self.assertNotIn(
+            (
+                "--ro-bind",
+                str(second.resolve()),
+                str(claude_linux.SANDBOX_CA_BUNDLE),
+            ),
+            triples,
+        )
+
+    def test_rejects_ca_bundle_below_writable_path_component(self) -> None:
+        with tempfile.TemporaryDirectory(
+            dir=pathlib.Path(__file__).parent
+        ) as temporary:
+            writable = pathlib.Path(temporary) / "writable"
+            writable.mkdir()
+            bundle = writable / "bundle.pem"
+            bundle.write_bytes(b"test-only CA material\n")
+            bundle.chmod(0o600)
+            writable.chmod(0o777)
+
+            with self.assertRaisesRegex(
+                claude_linux.LinuxRuntimeUnsafe,
+                "writable",
+            ):
+                claude_linux.build_sandbox_command(
+                    dataclasses.replace(self.spec, ca_bundle=bundle),
+                    _linux_review_arguments(),
+                )
+
+    def test_rejects_empty_ca_bundle(self) -> None:
+        with tempfile.TemporaryDirectory(
+            dir=pathlib.Path(__file__).parent
+        ) as temporary:
+            bundle = pathlib.Path(temporary) / "bundle.pem"
+            bundle.touch()
+            bundle.chmod(0o600)
+
+            with self.assertRaisesRegex(
+                claude_linux.LinuxRuntimeError,
+                "non-empty regular file",
+            ):
+                claude_linux.build_sandbox_command(
+                    dataclasses.replace(self.spec, ca_bundle=bundle),
+                    _linux_review_arguments(),
+                )
+
+    def test_mounts_available_system_ca_bundle(self) -> None:
+        bundle = next(
+            (
+                path
+                for path in (
+                    pathlib.Path("/etc/ssl/certs/ca-certificates.crt"),
+                    pathlib.Path("/etc/ssl/cert.pem"),
+                    pathlib.Path("/etc/pki/tls/certs/ca-bundle.crt"),
+                )
+                if path.is_file()
+            ),
+            None,
+        )
+        if bundle is None:
+            self.skipTest("a default system CA bundle is unavailable")
+
+        command = claude_linux.build_sandbox_command(
+            dataclasses.replace(self.spec, ca_bundle=bundle),
+            _linux_review_arguments(),
+        ).argv
+
+        self.assertIn(
+            (
+                "--ro-bind",
+                str(bundle.resolve()),
+                str(claude_linux.SANDBOX_CA_BUNDLE),
+            ),
+            tuple(zip(command, command[1:], command[2:])),
+        )
+
+    def test_bootstrap_probe_has_no_proxy_or_auxiliary_tools(self) -> None:
+        library_root = pathlib.Path("/usr/lib")
+        if not library_root.is_dir() or library_root.stat().st_uid != 0:
+            self.skipTest("a root-owned /usr/lib is unavailable")
+        command = claude_linux.build_probe_command(
+            self.host,
+            self.tools,
+            self.claude,
+            self.home,
+            self.spec.runtime_libraries,
+            ("--version",),
+            library_roots=(library_root,),
+        )
+
+        self.assertIn("--unshare-net", command)
+        self.assertIn(
+            ("--ro-bind", str(self.home.resolve()), "/home/reviewer"),
+            tuple(zip(command, command[1:], command[2:])),
+        )
+        self.assertNotIn("--proxy", command)
+        self.assertNotIn("/opt/codex-review/bin/socat", command)
+        self.assertNotIn("/opt/codex-review/bin/rg", command)
+        self.assertIn(
+            ("--ro-bind", str(library_root.resolve()), "/usr/lib"),
+            tuple(zip(command, command[1:], command[2:])),
+        )
+        self.assertEqual(
+            command[-3:],
+            ("/opt/codex-review/bin/claude", "--safe-mode", "--version"),
+        )
+
+    def test_isolation_probe_uses_same_launcher_and_checks_fixed_paths(self) -> None:
+        calls: list[tuple[str, ...]] = []
+
+        def runner(argv, **_kwargs):
+            calls.append(tuple(argv))
+            return _capture(stdout=claude_linux.PROBE_SUCCESS)
+
+        hidden_home = self.root / "host-home"
+        hidden_home.mkdir()
+        claude_linux.run_isolation_probe(
+            self.spec,
+            self.workspace / "README.md",
+            host_home=hidden_home,
+            runner=runner,
+        )
+
+        command = calls[0]
+        probe_index = command.index("--probe")
+        self.assertEqual(
+            command[probe_index - 1], "/opt/codex-review/bin/claude-linux-launcher"
+        )
+        self.assertEqual(command[probe_index + 1], "/workspace/README.md")
+        self.assertEqual(
+            command[probe_index + 2 : probe_index + 5],
+            ("/workspace", "/home/reviewer", "/tmp"),
+        )
+        self.assertEqual(command[probe_index + 5], str(hidden_home.resolve()))
+
+    def test_rejects_unexpected_auth_environment(self) -> None:
+        with self.assertRaisesRegex(claude_linux.LinuxRuntimeError, "unsupported"):
+            claude_linux.build_sandbox_command(
+                self.spec, ("--version",), auth_env={"PATH": "/untrusted"}
+            )
+
+    def test_local_login_command_clears_inherited_environment(self) -> None:
+        command = claude_linux.build_sandbox_command(
+            self.spec, _linux_review_arguments()
+        )
+
+        self.assertIn("--clearenv", command.argv)
+        self.assertEqual(command.env, {})
+
+    def test_rejects_incomplete_linux_file_tool_boundary(self) -> None:
+        arguments = list(_linux_review_arguments())
+        settings_index = arguments.index("--settings") + 1
+        settings = json.loads(arguments[settings_index])
+        settings["permissions"]["deny"].remove("Read(//proc/**)")
+        arguments[settings_index] = json.dumps(settings, separators=(",", ":"))
+
+        with self.assertRaisesRegex(
+            claude_linux.LinuxRuntimeUnsafe,
+            "omit synthetic-root file-tool denies",
+        ):
+            claude_linux.build_sandbox_command(self.spec, tuple(arguments))
+
+    def test_rejects_cli_boundary_that_exposes_search_tools(self) -> None:
+        arguments = list(_linux_review_arguments())
+        tools_index = arguments.index("--tools") + 1
+        arguments[tools_index] = "Read,Grep,Glob"
+
+        with self.assertRaisesRegex(
+            claude_linux.LinuxRuntimeUnsafe,
+            "unexpected built-in tool set",
+        ):
+            claude_linux.build_sandbox_command(self.spec, tuple(arguments))
+
+    def test_rejects_separate_mount_below_allowed_workspace(self) -> None:
+        with self.assertRaisesRegex(
+            claude_linux.LinuxRuntimeUnsafe,
+            "separate mount below the allowed workspace",
+        ):
+            claude_linux._validate_linux_review_tool_boundary(
+                _linux_review_arguments(),
+                (
+                    pathlib.PurePosixPath("/workspace"),
+                    pathlib.PurePosixPath("/workspace/secret"),
+                ),
+            )
+
+
+class ProxySocketValidationTest(unittest.TestCase):
+    def test_accepts_short_private_tmp_socket_and_rejects_nonprivate_parent(
+        self,
+    ) -> None:
+        host = claude_linux.LinuxHost(claude_linux.LinuxHostKind.LINUX, "x64", "6.8")
+        with tempfile.TemporaryDirectory(dir="/tmp") as temporary:
+            root = pathlib.Path(temporary)
+            root.chmod(0o700)
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+            private_parent = root / "proxy-private"
+            private_parent.mkdir(mode=0o700)
+            private_path = private_parent / "p.sock"
+            private_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                try:
+                    private_socket.bind(str(private_path))
+                except PermissionError as error:
+                    self.skipTest(f"local sandbox blocks Unix socket creation: {error}")
+                private_path.chmod(0o600)
+
+                accepted = claude_linux._validate_private_socket(
+                    private_path,
+                    helper_root=helper.resolve(),
+                    owner_uid=os.getuid(),
+                    host=host,
+                )
+
+                self.assertEqual(accepted, private_path.resolve())
+            finally:
+                private_socket.close()
+            real_parent = root / "proxy-real"
+            real_parent.mkdir(mode=0o700)
+            symlink_parent = root / "proxy-link"
+            symlink_parent.symlink_to(real_parent, target_is_directory=True)
+            real_path = real_parent / "p.sock"
+            alias_path = symlink_parent / "p.sock"
+            symlink_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                symlink_socket.bind(str(real_path))
+                real_path.chmod(0o600)
+                with self.assertRaisesRegex(
+                    claude_linux.LinuxRuntimeError,
+                    "parent path must not contain symlinks",
+                ):
+                    claude_linux._validate_private_socket(
+                        alias_path,
+                        helper_root=helper.resolve(),
+                        owner_uid=os.getuid(),
+                        host=host,
+                    )
+            finally:
+                symlink_socket.close()
+            nonprivate_parent = root / "proxy-shared"
+            nonprivate_parent.mkdir(mode=0o755)
+            nonprivate_path = nonprivate_parent / "p.sock"
+            nonprivate_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                nonprivate_socket.bind(str(nonprivate_path))
+                nonprivate_path.chmod(0o600)
+                with self.assertRaisesRegex(claude_linux.LinuxRuntimeError, "0700"):
+                    claude_linux._validate_private_socket(
+                        nonprivate_path,
+                        helper_root=helper.resolve(),
+                        owner_uid=os.getuid(),
+                        host=host,
+                    )
+            finally:
+                nonprivate_socket.close()
+
+
+class LauncherSignalCancellationTest(unittest.TestCase):
+    def test_source_contract_guards_fork_publication_and_child_exec(self) -> None:
+        source = claude_linux.LAUNCHER_SOURCE.read_text(encoding="utf-8")
+
+        self.assertIn("sigprocmask(SIG_BLOCK", source)
+        self.assertIn("pending_forwarded_signal()", source)
+        self.assertIn("establish_child_process_group(child)", source)
+        self.assertIn("prepare_child_signal_state(restore_mask)", source)
+        self.assertIn("raise(SIGSTOP)", source)
+        self.assertIn("release_child_process_group(workload)", source)
+        self.assertLess(source.index("proxy_pid = proxy;"), source.index("signal restore after proxy launch"))
+        self.assertLess(
+            source.index("workload_pid = workload;"),
+            source.index("signal restore after workload launch"),
+        )
+
+    def test_signal_during_proxy_readiness_cannot_launch_workload(self) -> None:
+        compiler = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
+        if compiler is None:
+            self.skipTest("a C11 compiler is unavailable")
+        listener_guard = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            listener_guard.bind(("127.0.0.1", 3128))
+        except OSError as error:
+            listener_guard.close()
+            self.skipTest(f"launcher test proxy port is unavailable: {error}")
+        listener_guard.close()
+
+        with tempfile.TemporaryDirectory(prefix="claude-launcher-signal-") as temporary:
+            root = pathlib.Path(temporary)
+            launcher = root / "launcher"
+            completed = subprocess.run(
+                (
+                    compiler,
+                    "-std=c11",
+                    "-O2",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-D_POSIX_C_SOURCE=200809L",
+                    str(claude_linux.LAUNCHER_SOURCE),
+                    "-o",
+                    str(launcher),
+                ),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
+            proxy_started = root / "proxy-started"
+            workload_started = root / "workload-started"
+            fake_socat = root / "fake-socat"
+            fake_socat.write_text(
+                '#!/bin/sh\n: > "$FAKE_PROXY_STARTED"\nexec /bin/sleep 30\n',
+                encoding="utf-8",
+            )
+            fake_socat.chmod(0o500)
+            workload = root / "workload"
+            workload.write_text(
+                '#!/bin/sh\n: > "$FAKE_WORKLOAD_STARTED"\n',
+                encoding="utf-8",
+            )
+            workload.chmod(0o500)
+            environment = dict(os.environ)
+            environment["FAKE_PROXY_STARTED"] = str(proxy_started)
+            environment["FAKE_WORKLOAD_STARTED"] = str(workload_started)
+            process = subprocess.Popen(
+                (
+                    str(launcher),
+                    "--proxy",
+                    str(root / "unused-proxy.sock"),
+                    "--socat",
+                    str(fake_socat),
+                    "--",
+                    str(workload),
+                ),
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                deadline = time.monotonic() + 5.0
+                while not proxy_started.exists() and time.monotonic() < deadline:
+                    if process.poll() is not None:
+                        break
+                    time.sleep(0.01)
+                self.assertTrue(proxy_started.exists(), "proxy child did not start")
+                process.send_signal(signal.SIGTERM)
+                _stdout, stderr = process.communicate(timeout=5.0)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate(timeout=5.0)
+
+            self.assertEqual(process.returncode, 128 + signal.SIGTERM, stderr.decode())
+            self.assertFalse(workload_started.exists())
+
+
+@unittest.skipUnless(
+    sys.platform.startswith("linux")
+    and os.environ.get("CODEX_REVIEW_RUN_LINUX_ISOLATION_INTEGRATION") == "1",
+    "set CODEX_REVIEW_RUN_LINUX_ISOLATION_INTEGRATION=1 on Linux",
+)
+class LinuxIsolationIntegrationTest(unittest.TestCase):
+    def test_real_synthetic_root_proxy_and_negative_isolation(self) -> None:
+        host = claude_linux.detect_host()
+        claude_linux.require_supported_host(host)
+        toolchain = claude_linux.discover_native_toolchain(host)
+
+        with tempfile.TemporaryDirectory(prefix="cc-li-", dir="/tmp") as temporary:
+            root = pathlib.Path(temporary)
+            root.chmod(0o700)
+            workspace = root / "workspace"
+            workspace.mkdir(mode=0o700)
+            marker = workspace / "probe.txt"
+            marker.write_text("workspace read marker\n", encoding="utf-8")
+            original_workspace_entries = tuple(
+                sorted(path.name for path in workspace.iterdir())
+            )
+
+            helper_root = root / "helper"
+            helper_root.mkdir(mode=0o700)
+            helper_home = helper_root / "home"
+            helper_tmp = helper_root / "tmp"
+            config_dir = helper_root / "config"
+            launcher_dir = helper_root / "bin"
+            for directory in (
+                helper_home,
+                helper_tmp,
+                config_dir,
+                launcher_dir,
+            ):
+                directory.mkdir(mode=0o700)
+            launcher = claude_linux.compile_launcher(
+                host,
+                toolchain,
+                launcher_dir / "claude-linux-launcher",
+            )
+            # The isolation probe never executes the Claude slot. A discovered,
+            # root-owned native rg binary supplies a real ELF of the host ABI.
+            claude_executable = toolchain.rg
+            runtime_libraries = claude_linux.collect_runtime_libraries(
+                host,
+                (
+                    claude_executable,
+                    launcher,
+                    toolchain.socat,
+                    toolchain.rg,
+                ),
+            )
+            hidden_host_path = root / "host-secret.txt"
+            hidden_host_path.write_text("must stay outside sandbox\n", encoding="utf-8")
+            proxy_dir = root / "proxy"
+            proxy_dir.mkdir(mode=0o700)
+            proxy_path = proxy_dir / "p.sock"
+
+            with _ForbiddenConnectProxy(proxy_path) as proxy:
+                spec = claude_linux.SandboxSpec(
+                    host=host,
+                    toolchain=toolchain,
+                    claude=claude_executable,
+                    launcher=launcher,
+                    workspace=workspace,
+                    helper_root=helper_root,
+                    helper_home=helper_home,
+                    helper_tmp=helper_tmp,
+                    config_dir=config_dir,
+                    proxy_socket=proxy_path,
+                    runtime_libraries=runtime_libraries,
+                )
+                claude_linux.run_isolation_probe(
+                    spec,
+                    marker,
+                    host_home=hidden_host_path,
+                )
+
+            self.assertEqual(proxy.errors, [])
+            self.assertEqual(len(proxy.requests), 1)
+            self.assertTrue(
+                proxy.requests[0].startswith(
+                    b"CONNECT example.invalid:443 HTTP/1.1\r\n"
+                )
+            )
+            self.assertEqual(
+                tuple(sorted(path.name for path in workspace.iterdir())),
+                original_workspace_entries,
+            )
+            self.assertEqual(tuple(helper_home.iterdir()), ())
+            self.assertEqual(tuple(helper_tmp.iterdir()), ())
+
+
+if __name__ == "__main__":
+    unittest.main()

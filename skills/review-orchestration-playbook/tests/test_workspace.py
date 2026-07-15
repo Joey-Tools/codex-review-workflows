@@ -24,6 +24,7 @@ from review_runtime.workspace import (  # noqa: E402
     _value_secret_rule,
     cleanup_workspace,
     prepare_workspace as _prepare_workspace,
+    symlink_target_stays_within_workspace,
     validate_external_workspace,
 )
 
@@ -172,6 +173,9 @@ class WorkspaceTest(unittest.TestCase):
         self.assertIn("+two", review.diff_file.read_text(encoding="utf-8"))
         prompt = review.prompt_file.read_text(encoding="utf-8")
         self.assertIn(f"{self.base}..{self.head}", prompt)
+        self.assertIn("Primary diff file: .codex-review/review.diff", prompt)
+        self.assertIn("If `Read` is the only file tool", prompt)
+        self.assertNotIn(str(review.workspace_root), prompt)
         self.assertNotIn("Source repository:", prompt)
         self.assertFalse((review.workspace_root / ".git").exists())
         self.assertEqual(review.container_dir.stat().st_mode & 0o777, 0o700)
@@ -834,6 +838,42 @@ class WorkspaceTest(unittest.TestCase):
         (review.workspace_root / "escape").symlink_to(self.repo / "example.txt")
         with self.assertRaises(ReviewError):
             validate_external_workspace(review)
+
+    def test_frozen_tree_rejects_sandbox_authentication_symlink(self) -> None:
+        (self.repo / "leak").symlink_to("/config/.credentials.json")
+        git(self.repo, "add", "leak")
+        git(self.repo, "commit", "-m", "Add sandbox authentication symlink")
+        link_head = git(self.repo, "rev-parse", "HEAD")
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "frozen Git tree symlink escapes workspace",
+        ):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.head,
+                head_ref=link_head,
+            )
+
+    def test_symlink_target_boundary_rejects_magic_and_transient_escape(self) -> None:
+        cases = (
+            (pathlib.PurePosixPath("leak"), "/proc/self/environ", False),
+            (pathlib.PurePosixPath("leak"), "/proc/self/fd/3", False),
+            (
+                pathlib.PurePosixPath("a/x"),
+                "../../workspace/file",
+                False,
+            ),
+            (pathlib.PurePosixPath("a/x"), "../README.md", True),
+            (pathlib.PurePosixPath("a/x"), "missing.md", True),
+        )
+
+        for link, target, expected in cases:
+            with self.subTest(link=link, target=target):
+                self.assertEqual(
+                    symlink_target_stays_within_workspace(link, target),
+                    expected,
+                )
 
     def test_escaping_secret_symlink_target_is_redacted(self) -> None:
         secret = "sk-" + "A" * 40

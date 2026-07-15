@@ -10,10 +10,11 @@
 #include <unistd.h>
 
 // This executable is exposed to Claude Code as `security`, but it supports only
-// the exact local-login lookup Claude Code 2.1.187 performs. The parent helper
-// refreshes stale authentication through a separate fixed-input Claude warmup,
-// then serves the bounded credential once over a capability-protected
-// loopback-only socket. All Keychain update commands are rejected.
+// the fixed local-login account/service lookup accepted by the helper's
+// capability contract. The parent helper refreshes stale authentication through
+// a separate fixed-input Claude warmup, then serves the bounded credential once
+// over a capability-protected loopback-only socket. All Keychain update commands
+// are rejected.
 static const char *const kService = "Claude Code-credentials";
 static const char *const kPortEnvironment = "CODEX_CLAUDE_KEYCHAIN_BROKER_PORT";
 static const char *const kCapabilityEnvironment =
