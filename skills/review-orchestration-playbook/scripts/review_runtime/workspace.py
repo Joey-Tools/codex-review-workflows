@@ -4,6 +4,7 @@ import ast
 import base64
 import hashlib
 import json
+import math
 import os
 import pathlib
 import re
@@ -1324,10 +1325,19 @@ def _write_bounded_json(
     label: str,
     accepted_values: Iterable[AcceptedSyntheticValue] = (),
 ) -> None:
-    encoded = (
-        json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
-        + "\n"
-    )
+    try:
+        encoded = (
+            json.dumps(
+                value,
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        )
+    except (TypeError, ValueError) as error:
+        raise ReviewError(f"{label} is not safely JSON serializable") from error
     if len(encoded.encode("utf-8")) > MAX_SYNTHETIC_EVIDENCE_BYTES:
         raise ReviewError(f"{label} exceeds the audit evidence size limit")
     _reject_raw_values_in_evidence(
@@ -1351,7 +1361,15 @@ def _iter_evidence_strings(value: Any) -> Iterator[bytes]:
         for item in value:
             yield from _iter_evidence_strings(item)
         return
+    if type(value) is float and not math.isfinite(value):
+        raise ReviewError("synthetic-token evidence contains a non-finite number")
     if value is None or type(value) in {bool, int, float}:
+        yield json.dumps(
+            value,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("ascii")
         return
     raise ReviewError("synthetic-token evidence contains an unsupported value")
 
@@ -1902,7 +1920,8 @@ def _secure_file_reader(
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
-        raise ReviewError(f"cannot open {label}: {error}") from error
+        error_code = f" (errno {error.errno})" if error.errno is not None else ""
+        raise ReviewError(f"cannot open {label}{error_code}") from error
     try:
         initial = os.fstat(descriptor)
         if not stat.S_ISREG(initial.st_mode) or initial.st_nlink != 1:
@@ -1949,7 +1968,8 @@ def _secure_file_reader(
         if expected_artifact is not None and reader.sha256 != expected_artifact.sha256:
             raise ReviewError(f"{label} does not match helper-private control state")
     except OSError as error:
-        raise ReviewError(f"cannot read {label}: {error}") from error
+        error_code = f" (errno {error.errno})" if error.errno is not None else ""
+        raise ReviewError(f"cannot read {label}{error_code}") from error
     finally:
         if handle is not None:
             handle.close()
@@ -2710,6 +2730,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
             occurrence_budget=occurrence_budget,
             max_bytes=MAX_SNAPSHOT_BLOB_BYTES,
             byte_budget=snapshot_byte_budget,
+            diagnostic_path=path_display,
         )
         record_scan(
             scan,
@@ -2893,8 +2914,13 @@ def _file_secret_scan(
     max_bytes: int | None = None,
     byte_budget: FileScanByteBudget | None = None,
     expected_artifact: ControlArtifactEvidence | None = None,
+    diagnostic_path: str | None = None,
 ) -> SecretScanResult:
-    path_display = _redact_secret_path(os.fspath(path), "snapshot path")
+    path_display = (
+        diagnostic_path
+        if diagnostic_path is not None
+        else _redact_secret_path(os.fspath(path), "snapshot path")
+    )
     with _secure_file_reader(
         path,
         label=f"external review content {path_display}",

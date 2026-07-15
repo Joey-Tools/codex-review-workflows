@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import errno
 import hashlib
 import io
 import json
@@ -2050,6 +2051,76 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         self.assertNotIn(raw_value, str(caught.exception))
         self.assertNotIn(legacy_value_base64(raw_value), str(caught.exception))
 
+    def test_evidence_cannot_expose_a_numeric_synthetic_value(self) -> None:
+        integer_raw = "12345678" + "90123456"
+        float_raw = "1.23456789" + "0123456"
+        cases = (
+            ("integer-key", integer_raw, {int(integer_raw): "metadata"}),
+            ("integer-value", integer_raw, {"inode": int(integer_raw)}),
+            ("float-value", float_raw, {"ratio": float(float_raw)}),
+        )
+        for label, raw_value, evidence in cases:
+            with self.subTest(case=label):
+                accepted = (
+                    accepted_legacy_value(
+                        raw_value,
+                        rule="generic-secret-assignment",
+                    ),
+                )
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "would expose a raw synthetic value",
+                ) as caught:
+                    workspace._reject_raw_values_in_evidence(
+                        evidence,
+                        accepted_values=accepted,
+                        label="test evidence",
+                    )
+                self.assertNotIn(raw_value, str(caught.exception))
+
+                destination = self.root / f"numeric-evidence-{label}.json"
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "would expose a raw synthetic value",
+                ):
+                    workspace._write_bounded_json(
+                        destination,
+                        evidence,
+                        label="test evidence",
+                        accepted_values=accepted,
+                    )
+                self.assertFalse(destination.exists())
+
+    def test_non_finite_evidence_numbers_fail_closed(self) -> None:
+        for label, value in (
+            ("nan", float("nan")),
+            ("negative-infinity", float("-inf")),
+            ("positive-infinity", float("inf")),
+        ):
+            with self.subTest(case=label):
+                destination = self.root / f"non-finite-{label}.json"
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "not safely JSON serializable",
+                ):
+                    workspace._write_bounded_json(
+                        destination,
+                        {"value": value},
+                        label="test evidence",
+                    )
+                self.assertFalse(destination.exists())
+
+        destination = self.root / "ordinary-scalars.json"
+        workspace._write_bounded_json(
+            destination,
+            {"enabled": True, "missing": None},
+            label="test evidence",
+        )
+        self.assertEqual(
+            json.loads(destination.read_text(encoding="utf-8")),
+            {"enabled": True, "missing": None},
+        )
+
     def test_review_range_cannot_expose_an_unused_authoring_value(self) -> None:
         repo, base = self.new_repo({"README.md": "base\n"})
         (repo / "README.md").write_text("head\n", encoding="utf-8")
@@ -2443,6 +2514,98 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         ) as caught:
             self.validate(review, catalog=catalog)
         self.assertNotIn(LEGACY_A, str(caught.exception))
+
+    def test_catalog_legacy_paths_stay_redacted_in_file_reader_errors(self) -> None:
+        raw_value = "archived_" + "fixture_0001"
+        catalog = legacy_catalog(values=(raw_value,))
+        representations = (raw_value, legacy_value_base64(raw_value))
+        variants = ["hardlink", "open-error", "writable"]
+        if hasattr(os, "mkfifo"):
+            variants.append("fifo")
+
+        for representation in representations:
+            for variant in variants:
+                with self.subTest(representation=representation, variant=variant):
+                    repo, base = self.new_repo(
+                        {
+                            "fixture.cfg": assignment_text(
+                                "access_token",
+                                raw_value,
+                            ),
+                            "safe.txt": "safe\n",
+                        }
+                    )
+                    (repo / "README.md").write_text("head\n", encoding="utf-8")
+                    head = self.commit(repo)
+                    review = self.prepare(
+                        repo=repo,
+                        base=base,
+                        head=head,
+                        catalog=catalog,
+                        exemptions=("historical-fixtures",),
+                    )
+                    target = review.workspace_root / f"moved-{representation}.txt"
+                    (review.workspace_root / "safe.txt").rename(target)
+                    patch_open = contextlib.nullcontext()
+                    if variant == "hardlink":
+                        os.link(
+                            target,
+                            review.workspace_root / f"peer-{representation}.txt",
+                        )
+                    elif variant == "open-error":
+                        real_open = os.open
+
+                        def fail_target_open(path, flags, *args, **kwargs):
+                            if os.fspath(path) == os.fspath(target):
+                                raise OSError(
+                                    errno.EIO,
+                                    f"synthetic failure at {target}",
+                                )
+                            return real_open(path, flags, *args, **kwargs)
+
+                        patch_open = mock.patch.object(
+                            workspace.os,
+                            "open",
+                            side_effect=fail_target_open,
+                        )
+                    elif variant == "writable":
+                        target.chmod(0o664)
+                    else:
+                        target.unlink()
+                        os.mkfifo(target, mode=0o600)
+
+                    with patch_open, self.assertRaises(ReviewError) as caught:
+                        self.validate(review, catalog=catalog)
+                    message = str(caught.exception)
+                    self.assertIn("<redacted snapshot path>", message)
+                    self.assertNotIn(raw_value, message)
+                    self.assertNotIn(legacy_value_base64(raw_value), message)
+
+    def test_catalog_legacy_path_stays_redacted_after_a_read_error(self) -> None:
+        raw_value = "archived_" + "fixture_0001"
+        for representation in (raw_value, legacy_value_base64(raw_value)):
+            with self.subTest(representation=representation):
+                target = self.root / f"moved-{representation}.txt"
+                target.write_text("safe\n", encoding="utf-8")
+                with (
+                    mock.patch.object(
+                        workspace,
+                        "_stream_secret_scan",
+                        side_effect=OSError(
+                            errno.EIO,
+                            f"synthetic failure at {target}",
+                        ),
+                    ),
+                    self.assertRaises(ReviewError) as caught,
+                ):
+                    workspace._file_secret_scan(
+                        target,
+                        diagnostic_path="<redacted snapshot path>",
+                    )
+                message = str(caught.exception)
+                self.assertIn("<redacted snapshot path>", message)
+                self.assertNotIn(raw_value, message)
+                self.assertNotIn(legacy_value_base64(raw_value), message)
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "requires FIFO support")
     def test_frozen_head_fifo_tampering_fails_without_blocking(self) -> None:
