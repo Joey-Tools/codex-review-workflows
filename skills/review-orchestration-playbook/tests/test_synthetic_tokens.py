@@ -1670,6 +1670,80 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             )
         )
 
+    def test_selected_legacy_value_cannot_move_from_content_into_a_path(self) -> None:
+        catalog = legacy_catalog(values=(LEGACY_A,))
+        repo, base = self.new_repo(
+            {"fixture.cfg": assignment_text("access_token", LEGACY_A)}
+        )
+        (repo / "fixture.cfg").unlink()
+        (repo / f"moved-{LEGACY_A}.txt").write_text("head\n", encoding="utf-8")
+        head = self.commit(repo)
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "not allowed in repository paths",
+        ) as caught:
+            self.prepare(
+                repo=repo,
+                base=base,
+                head=head,
+                catalog=catalog,
+                exemptions=("historical-fixtures",),
+            )
+        self.assertNotIn(LEGACY_A, str(caught.exception))
+
+    def test_selected_legacy_value_cannot_be_copied_from_content_into_a_path(
+        self,
+    ) -> None:
+        catalog = legacy_catalog(values=(LEGACY_A,))
+        repo, base = self.new_repo(
+            {"fixture.cfg": assignment_text("access_token", LEGACY_A)}
+        )
+        (repo / f"copied-{LEGACY_A}.txt").write_text("head\n", encoding="utf-8")
+        head = self.commit(repo)
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "not allowed in repository paths",
+        ) as caught:
+            self.prepare(
+                repo=repo,
+                base=base,
+                head=head,
+                catalog=catalog,
+                exemptions=("historical-fixtures",),
+            )
+        self.assertNotIn(LEGACY_A, str(caught.exception))
+
+    def test_legacy_storage_encoding_cannot_appear_in_a_path(self) -> None:
+        catalog = legacy_catalog(values=(LEGACY_A,))
+        storage = legacy_value_base64(LEGACY_A)
+        repo, base = self.new_repo({"README.md": "base\n"})
+        (repo / f"fixture-{storage}.txt").write_text("head\n", encoding="utf-8")
+        head = self.commit(repo)
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "not allowed in repository paths",
+        ) as caught:
+            self.prepare(repo=repo, base=base, head=head, catalog=catalog)
+        message = str(caught.exception)
+        self.assertNotIn(storage, message)
+        self.assertNotIn(LEGACY_A, message)
+
+    def test_unselected_legacy_value_cannot_appear_in_a_path(self) -> None:
+        catalog = legacy_catalog(values=(LEGACY_A,))
+        repo, base = self.new_repo({"README.md": "base\n"})
+        (repo / f"fixture-{LEGACY_A}.txt").write_text("head\n", encoding="utf-8")
+        head = self.commit(repo)
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "not allowed in repository paths",
+        ) as caught:
+            self.prepare(repo=repo, base=base, head=head, catalog=catalog)
+        self.assertNotIn(LEGACY_A, str(caught.exception))
+
     def test_legacy_add_and_copy_fail_count_gate(self) -> None:
         catalog = legacy_catalog(values=(LEGACY_A,))
         cases = {
@@ -1779,6 +1853,34 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             "count changed after preparation",
         ):
             self.validate(review, catalog=catalog)
+
+    def test_snapshot_path_rename_to_legacy_value_fails_revalidation(self) -> None:
+        catalog = legacy_catalog(values=(LEGACY_A,))
+        repo, base = self.new_repo(
+            {
+                "fixture.cfg": assignment_text("access_token", LEGACY_A),
+                "safe.txt": "safe\n",
+            }
+        )
+        (repo / "README.md").write_text("head\n", encoding="utf-8")
+        head = self.commit(repo)
+        review = self.prepare(
+            repo=repo,
+            base=base,
+            head=head,
+            catalog=catalog,
+            exemptions=("historical-fixtures",),
+        )
+        (review.workspace_root / "safe.txt").rename(
+            review.workspace_root / f"moved-{LEGACY_A}.txt"
+        )
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "legacy-synthetic-value",
+        ) as caught:
+            self.validate(review, catalog=catalog)
+        self.assertNotIn(LEGACY_A, str(caught.exception))
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "requires FIFO support")
     def test_frozen_head_fifo_tampering_fails_without_blocking(self) -> None:

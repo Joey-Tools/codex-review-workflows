@@ -13,7 +13,7 @@ import subprocess
 import tempfile
 import time
 import uuid
-from collections import Counter
+from collections import Counter, deque
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from typing import Any, BinaryIO, Callable, Iterable, Iterator
@@ -374,6 +374,24 @@ class ExactValueIndex:
     containers: dict[bytes, tuple[tuple[bytes, int], ...]]
 
 
+@dataclass(frozen=True)
+class LegacyPathMatcher:
+    transitions: tuple[dict[int, int], ...]
+    failures: tuple[int, ...]
+    identifiers: tuple[str | None, ...]
+
+    def match(self, raw_path: bytes) -> str | None:
+        state = 0
+        for byte in raw_path:
+            while state and byte not in self.transitions[state]:
+                state = self.failures[state]
+            state = self.transitions[state].get(byte, 0)
+            identifier = self.identifiers[state]
+            if identifier is not None:
+                return identifier
+        return None
+
+
 def _git_environment(*, object_directory: pathlib.Path | None = None) -> dict[str, str]:
     env = {
         "GIT_ATTR_NOSYSTEM": "1",
@@ -723,6 +741,116 @@ def _parse_tree_record(record: bytes) -> tuple[str, str, str, pathlib.PurePosixP
     return mode, object_type, object_id, relative
 
 
+def _legacy_path_matcher(
+    legacy_values: Iterable[AcceptedSyntheticValue],
+) -> LegacyPathMatcher:
+    needles: dict[bytes, str] = {}
+    for descriptor in legacy_values:
+        if descriptor.kind != "legacy" or descriptor.value is None:
+            raise ReviewError(
+                "legacy path validation requires exact catalog-backed values"
+            )
+        for needle in (descriptor.value, base64.b64encode(descriptor.value)):
+            previous = needles.get(needle)
+            if previous is None or descriptor.identifier < previous:
+                needles[needle] = descriptor.identifier
+
+    transitions: list[dict[int, int]] = [{}]
+    failures = [0]
+    identifiers: list[str | None] = [None]
+    for needle, identifier in sorted(needles.items()):
+        state = 0
+        for byte in needle:
+            next_state = transitions[state].get(byte)
+            if next_state is None:
+                next_state = len(transitions)
+                transitions[state][byte] = next_state
+                transitions.append({})
+                failures.append(0)
+                identifiers.append(None)
+            state = next_state
+        current = identifiers[state]
+        identifiers[state] = identifier if current is None else min(current, identifier)
+
+    pending: deque[int] = deque()
+    for state in transitions[0].values():
+        pending.append(state)
+    while pending:
+        state = pending.popleft()
+        for byte, next_state in transitions[state].items():
+            pending.append(next_state)
+            fallback = failures[state]
+            while fallback and byte not in transitions[fallback]:
+                fallback = failures[fallback]
+            failures[next_state] = transitions[fallback].get(byte, 0)
+            inherited = identifiers[failures[next_state]]
+            current = identifiers[next_state]
+            if inherited is not None:
+                identifiers[next_state] = (
+                    inherited if current is None else min(current, inherited)
+                )
+    return LegacyPathMatcher(
+        transitions=tuple(transitions),
+        failures=tuple(failures),
+        identifiers=tuple(identifiers),
+    )
+
+
+def _reject_legacy_values_in_frozen_tree_paths(
+    *,
+    git_view: pathlib.Path,
+    object_directory: pathlib.Path,
+    commit: str,
+    legacy_values: Iterable[AcceptedSyntheticValue],
+) -> None:
+    matcher = _legacy_path_matcher(legacy_values)
+    if len(matcher.transitions) == 1:
+        return
+    with tempfile.TemporaryFile() as tree_stderr:
+        process = subprocess.Popen(
+            _frozen_command(
+                git_view=git_view,
+                args=("ls-tree", "-rz", "--full-tree", "-r", commit),
+            ),
+            env=_git_environment(object_directory=object_directory),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=tree_stderr,
+        )
+        if process.stdout is None:
+            _stop_process(process)
+            raise ReviewError("failed to create frozen Git path validation pipe")
+        try:
+            for record in _iter_nul_records(
+                process.stdout,
+                byte_limit=MAX_TREE_METADATA_BYTES,
+                record_limit=MAX_SNAPSHOT_ENTRIES,
+                label="frozen Git path validation metadata",
+            ):
+                _metadata, separator, raw_path = record.partition(b"\t")
+                if not separator:
+                    raise ReviewError("malformed record from git ls-tree")
+                identifier = matcher.match(raw_path)
+                if identifier is not None:
+                    raise ReviewError(
+                        "legacy synthetic fixture values and storage encodings "
+                        "are not allowed in repository paths: "
+                        f"{identifier}"
+                    )
+                _parse_tree_record(record)
+            _close_pipe(process.stdout)
+            returncode = process.wait()
+        except BaseException:
+            _close_pipe(process.stdout)
+            _stop_process(process)
+            raise
+        if returncode != 0:
+            raise ReviewError(
+                "cannot enumerate frozen Git paths for legacy synthetic-token "
+                f"validation: {_process_stderr(tree_stderr)}"
+            )
+
+
 def _read_exact(stream: BinaryIO, size: int) -> bytes:
     value = bytearray()
     while len(value) < size:
@@ -999,6 +1127,22 @@ def _materialize_frozen_tree(
             )
 
 
+def _open_new_private_binary(path: pathlib.Path) -> BinaryIO:
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        return os.fdopen(descriptor, "wb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def _write_frozen_diff(
     *,
     git_view: pathlib.Path,
@@ -1007,7 +1151,10 @@ def _write_frozen_diff(
     head_sha: str,
     destination: pathlib.Path,
 ) -> None:
-    with destination.open("xb") as output, tempfile.TemporaryFile() as error_output:
+    with (
+        _open_new_private_binary(destination) as output,
+        tempfile.TemporaryFile() as error_output,
+    ):
         process = subprocess.Popen(
             _frozen_command(
                 git_view=git_view,
@@ -1094,7 +1241,10 @@ def _write_frozen_changed_paths(
     head_sha: str,
     destination: pathlib.Path,
 ) -> None:
-    with destination.open("xb") as output, tempfile.TemporaryFile() as error_output:
+    with (
+        _open_new_private_binary(destination) as output,
+        tempfile.TemporaryFile() as error_output,
+    ):
         _write_limited_diff_metadata(
             git_view=git_view,
             object_directory=object_directory,
@@ -1496,7 +1646,7 @@ def _write_changed_blob_findings(
         tempfile.TemporaryFile() as raw_output,
         tempfile.TemporaryFile() as raw_error,
         tempfile.TemporaryFile() as cat_error,
-        destination.open("xb") as findings_output,
+        _open_new_private_binary(destination) as findings_output,
     ):
         _write_limited_diff_metadata(
             git_view=git_view,
@@ -2238,6 +2388,9 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     control_dir = workspace_root / ".codex-review"
     catalog = load_catalog()
     validate_authoring_catalog_scanner_contract(catalog)
+    catalog_legacy_path_matcher = _legacy_path_matcher(
+        accepted_legacy_values(catalog, catalog.legacy_exemptions)
+    )
     control_state = _load_control_artifact_state(
         container_dir=review.container_dir,
     )
@@ -2319,6 +2472,13 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
             label="external review changed paths",
         ):
             changed_path_count += 1
+            legacy_path_token_id = catalog_legacy_path_matcher.match(raw_path)
+            if legacy_path_token_id is not None:
+                record_finding(
+                    "<redacted changed path> "
+                    "(legacy-synthetic-value; changed-path-name)"
+                )
+                continue
             path_secret_rule = _value_secret_rule(
                 raw_path,
                 event_budget=event_budget,
@@ -2367,9 +2527,14 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
                     "external review changed-blob findings are malformed"
                 ) from error
             changed_blob_record_count += 3
-            path_display = _redact_secret_path(
-                os.fsdecode(raw_path),
-                "changed blob path",
+            legacy_path_token_id = catalog_legacy_path_matcher.match(raw_path)
+            path_display = (
+                "<redacted changed blob path>"
+                if legacy_path_token_id is not None
+                else _redact_secret_path(
+                    os.fsdecode(raw_path),
+                    "changed blob path",
+                )
             )
             record_finding(f"{path_display} ({rule}; {side}-blob)")
     if changed_blob_record_count != changed_blob_artifact.record_count:
@@ -2387,13 +2552,22 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
             raise ReviewError("frozen workspace exceeds the review entry-count limit")
         relative = relative_path.as_posix()
         raw_relative = os.fsencode(relative)
+        legacy_path_token_id = catalog_legacy_path_matcher.match(raw_relative)
+        if legacy_path_token_id is not None:
+            record_finding(
+                "<redacted snapshot path> (legacy-synthetic-value; path-name)"
+            )
         path_secret_rule = _value_secret_rule(
             raw_relative,
             event_budget=event_budget,
         )
         if path_secret_rule:
             record_finding(f"<redacted snapshot path> ({path_secret_rule}; path-name)")
-        path_display = _redact_secret_path(relative, "snapshot path")
+        path_display = (
+            "<redacted snapshot path>"
+            if legacy_path_token_id is not None
+            else _redact_secret_path(relative, "snapshot path")
+        )
         path_rule = _sensitive_path_rule(relative)
         if path_rule:
             record_finding(f"{path_display} ({path_rule})")
@@ -3536,6 +3710,10 @@ def audit_legacy_exemption(
     if catalog.legacy_exemption(exemption.identifier) != exemption:
         raise ReviewError("legacy exemption changed while the audit was prepared")
     accepted = accepted_legacy_values(catalog, (exemption,))
+    catalog_legacy_values = accepted_legacy_values(
+        catalog,
+        catalog.legacy_exemptions,
+    )
     authoring_accepted = accepted_authoring_values(catalog)
     scan_accepted = authoring_accepted + accepted
     descriptors = {item.identifier: item for item in accepted}
@@ -3564,6 +3742,13 @@ def audit_legacy_exemption(
                 )
             by_commit.setdefault(token.containing_commit, []).append(
                 descriptors[token.identifier]
+            )
+        for commit in sorted({tip, *by_commit}):
+            _reject_legacy_values_in_frozen_tree_paths(
+                git_view=git_view,
+                object_directory=object_directory,
+                commit=commit,
+                legacy_values=catalog_legacy_values,
             )
         for commit, commit_descriptors in sorted(by_commit.items()):
             scan = _scan_frozen_tree_values(
@@ -3654,6 +3839,10 @@ def prepare_workspace(
         catalog,
         selected_exemptions,
     )
+    catalog_legacy_values = accepted_legacy_values(
+        catalog,
+        catalog.legacy_exemptions,
+    )
     evidence_sensitive_values = _all_catalog_sensitive_values(catalog)
     container, handoff_mask = _new_container(source_root)
     ownership_transferred = False
@@ -3676,6 +3865,12 @@ def prepare_workspace(
                 raise ReviewError(
                     f"the frozen {label} uses the reserved top-level .codex-review path"
                 )
+            _reject_legacy_values_in_frozen_tree_paths(
+                git_view=git_view,
+                object_directory=object_directory,
+                commit=commit,
+                legacy_values=catalog_legacy_values,
+            )
         _materialize_frozen_tree(
             git_view=git_view,
             object_directory=object_directory,

@@ -183,6 +183,57 @@ class WorkspaceTest(unittest.TestCase):
         cleanup_workspace(review, keep_container=False)
         self.assertFalse(review.container_dir.exists())
 
+    def test_prepare_uses_private_control_modes_under_permissive_umask(self) -> None:
+        for mask in (0o002, 0o000):
+            with self.subTest(mask=oct(mask)):
+                previous = os.umask(mask)
+                try:
+                    review = prepare_workspace(
+                        repo=self.repo,
+                        base_ref=self.base,
+                        head_ref=self.head,
+                    )
+                finally:
+                    os.umask(previous)
+                self.reviews.append(review)
+
+                control_dir = review.workspace_root / ".codex-review"
+                self.assertEqual(review.container_dir.stat().st_mode & 0o777, 0o700)
+                self.assertEqual(control_dir.stat().st_mode & 0o777, 0o700)
+                for name in workspace_runtime.CONTROL_ARTIFACT_SPECS:
+                    self.assertEqual(
+                        (control_dir / name).stat().st_mode & 0o777,
+                        0o600,
+                        name,
+                    )
+                for name in (
+                    workspace_runtime.SYNTHETIC_PRIVATE_MANIFEST_NAME,
+                    workspace_runtime.CONTROL_ARTIFACT_STATE_NAME,
+                ):
+                    self.assertEqual(
+                        (review.container_dir / name).stat().st_mode & 0o777,
+                        0o600,
+                        name,
+                    )
+                self.assertEqual(
+                    (review.workspace_root / "example.txt").stat().st_mode & 0o777,
+                    0o644,
+                )
+                validate_external_workspace(review)
+
+    def test_external_workspace_rejects_group_writable_control_artifact(self) -> None:
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(review)
+        changed_paths = review.workspace_root / ".codex-review/changed-paths.z"
+        changed_paths.chmod(0o660)
+
+        with self.assertRaisesRegex(ReviewError, "group or other writable"):
+            validate_external_workspace(review)
+
     def test_prompt_override_replaces_only_review_scope_placeholders(self) -> None:
         template = pathlib.Path(self.temporary.name) / "prompt.txt"
         template.write_text(
