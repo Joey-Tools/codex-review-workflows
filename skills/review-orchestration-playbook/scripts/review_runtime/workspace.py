@@ -2629,6 +2629,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
             try:
                 initial_link = os.lstat(candidate)
                 target = os.readlink(candidate)
+                raw_target = os.fsencode(target)
                 resolved_target = (candidate.parent / target).resolve(strict=False)
                 final_link = os.lstat(candidate)
                 if target != os.readlink(candidate) or (
@@ -2659,15 +2660,21 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
                     f"cannot inspect external review symlink {path_display}{error_code}"
                 ) from error
             if not is_relative_to(resolved_target, workspace_root):
-                target_display = _redact_secret_path(
-                    os.fspath(resolved_target),
-                    "symlink target",
+                raw_resolved_target = os.fsencode(os.fspath(resolved_target))
+                target_display = (
+                    "<redacted symlink target>"
+                    if catalog_legacy_path_matcher.match(raw_target) is not None
+                    or catalog_legacy_path_matcher.match(raw_resolved_target)
+                    is not None
+                    else _redact_secret_path(
+                        os.fspath(resolved_target),
+                        "symlink target",
+                    )
                 )
                 raise ReviewError(
                     "external review symlink escapes the frozen workspace: "
                     f"{path_display} -> {target_display}"
                 )
-            raw_target = os.fsencode(target)
             snapshot_byte_budget.consume(len(raw_target))
             target_scan = _scan_secret_value(
                 raw_target,

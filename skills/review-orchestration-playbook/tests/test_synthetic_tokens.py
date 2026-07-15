@@ -1938,6 +1938,36 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                 self.assertNotIn(LEGACY_A, message)
                 self.assertNotIn(legacy_value_base64(LEGACY_A), message)
 
+    def test_tampered_escaping_legacy_symlink_target_is_redacted_during_validation(
+        self,
+    ) -> None:
+        catalog = legacy_catalog(values=(LEGACY_A,))
+        for label, sensitive_target in (
+            ("raw", LEGACY_A),
+            ("storage", legacy_value_base64(LEGACY_A)),
+        ):
+            with self.subTest(target=label):
+                repo, base = self.new_repo({"target.txt": "safe\n"})
+                (repo / "artifact").symlink_to("target.txt")
+                head = self.commit(repo)
+                review = self.prepare(
+                    repo=repo,
+                    base=base,
+                    head=head,
+                    catalog=catalog,
+                )
+                frozen_link = review.workspace_root / "artifact"
+                frozen_link.unlink()
+                frozen_link.symlink_to("../../../../" + sensitive_target)
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "<redacted symlink target>",
+                ) as caught:
+                    self.validate(review, catalog=catalog)
+                message = str(caught.exception)
+                self.assertNotIn(LEGACY_A, message)
+                self.assertNotIn(legacy_value_base64(LEGACY_A), message)
+
     def test_evidence_cannot_expose_legacy_storage_encoding(self) -> None:
         raw_value = "jgajgajgajgajgajga"
         catalog = legacy_catalog(values=(raw_value,))
