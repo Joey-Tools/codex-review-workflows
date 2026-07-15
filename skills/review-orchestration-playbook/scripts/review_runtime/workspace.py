@@ -140,11 +140,7 @@ OVERSIZED_QUOTED_SECRET_ASSIGNMENT = re.compile(
     SECRET_KEY_PATTERN + rb"(['\"])[^\r\n'\"]{513}"
 )
 UNQUOTED_SECRET_ASSIGNMENT = re.compile(
-    SECRET_KEY_PATTERN
-    + rb"((?:"
-    + GENERIC_SECRET_VALUE_BYTE_CLASS
-    + rb"){16,512})(?=[ \t]*(?:[#;]|\r?$))",
-    re.MULTILINE,
+    SECRET_KEY_PATTERN + rb"((?:" + GENERIC_SECRET_VALUE_BYTE_CLASS + rb"){16,512})",
 )
 OVERSIZED_UNQUOTED_SECRET_ASSIGNMENT = re.compile(
     SECRET_KEY_PATTERN + rb"(?:" + GENERIC_SECRET_VALUE_BYTE_CLASS + rb"){513}"
@@ -3206,6 +3202,210 @@ def _quoted_assignment_may_accept(
     return False
 
 
+def _unquoted_assignment_may_accept(
+    value: bytes,
+    match: re.Match[bytes],
+    *,
+    diff_surface: bool = False,
+) -> bool:
+    cursor = match.end()
+    inspected = 0
+
+    def advance(count: int) -> bool:
+        nonlocal cursor, inspected
+        if inspected + count > MAX_SECRET_ASSIGNMENT_TRAILING_BYTES:
+            return False
+        inspected += count
+        cursor += count
+        return True
+
+    def trim_horizontal_space(*, indentation: bool = False) -> tuple[bool, int]:
+        width = 0
+        while cursor < len(value) and value[cursor] in (0x20, 0x09):
+            if indentation and value[cursor] == 0x09:
+                return False, width
+            if not advance(1):
+                return False, width
+            width += 1
+        return True, width
+
+    def consume_line_break() -> bool:
+        if value.startswith(b"\r\n", cursor):
+            return advance(2)
+        if value.startswith((b"\r", b"\n"), cursor):
+            return advance(1)
+        return False
+
+    def consume_comment() -> bool:
+        while cursor < len(value) and value[cursor] not in (0x0A, 0x0D):
+            if not advance(1):
+                return False
+        return True
+
+    def starts_named_assignment() -> bool:
+        limit = min(
+            len(value),
+            cursor + MAX_SECRET_ASSIGNMENT_TRAILING_BYTES - inspected + 1,
+        )
+        index = cursor
+
+        def skip_space(position: int) -> int:
+            while position < limit and value[position] in (0x20, 0x09):
+                position += 1
+            return position
+
+        def skip_identifier(position: int) -> int:
+            if position >= limit or not (
+                0x41 <= value[position] <= 0x5A
+                or 0x61 <= value[position] <= 0x7A
+                or value[position] == 0x5F
+            ):
+                return position
+            position += 1
+            while position < limit and (
+                0x30 <= value[position] <= 0x39
+                or 0x41 <= value[position] <= 0x5A
+                or 0x61 <= value[position] <= 0x7A
+                or value[position] in (0x2D, 0x2E, 0x5F)
+            ):
+                position += 1
+            return position
+
+        while (
+            index + 1 < limit
+            and value[index] in (0x2D, 0x3F)
+            and value[index + 1] in (0x20, 0x09)
+        ):
+            index = skip_space(index + 1)
+        if index < limit and value[index] in (0x22, 0x27):
+            quote = value[index]
+            index += 1
+            while index < limit:
+                if value[index] == 0x5C:
+                    index += 2
+                    continue
+                if value[index] == quote:
+                    index += 1
+                    break
+                index += 1
+            else:
+                return False
+            index = skip_space(index)
+            return index < limit and value[index] == 0x3A
+
+        identifier_start = index
+        index = skip_identifier(index)
+        if index == identifier_start:
+            return False
+        first_identifier = value[identifier_start:index].lower()
+        index = skip_space(index)
+        if first_identifier in (b"const", b"let", b"var"):
+            next_identifier = index
+            index = skip_identifier(index)
+            if index == next_identifier:
+                return False
+            index = skip_space(index)
+        if index >= limit or value[index] not in (0x3A, 0x3D):
+            return False
+        if index + 1 < len(value) and value[index + 1] in (0x3A, 0x3D, 0x3E):
+            return False
+        return True
+
+    lookbehind_start = max(
+        0,
+        match.start() - MAX_SECRET_ASSIGNMENT_TRAILING_BYTES,
+    )
+    last_line_break = max(
+        value.rfind(b"\n", lookbehind_start, match.start()),
+        value.rfind(b"\r", lookbehind_start, match.start()),
+    )
+    if last_line_break < 0 and lookbehind_start > 0:
+        return False
+    line_start = last_line_break + 1
+    content_start = line_start
+    if (
+        diff_surface
+        and content_start < len(value)
+        and value[content_start] in (0x20, 0x2B, 0x2D)
+    ):
+        content_start += 1
+    key_start = content_start
+    while key_start < match.start() and value[key_start] == 0x20:
+        key_start += 1
+    if key_start < match.start() and value[key_start] == 0x09:
+        return False
+    while (
+        key_start + 1 < match.start()
+        and value[key_start] in (0x2D, 0x3F)
+        and value[key_start + 1] in (0x20, 0x09)
+    ):
+        key_start += 1
+        while key_start < match.start() and value[key_start] == 0x20:
+            key_start += 1
+        if key_start < match.start() and value[key_start] == 0x09:
+            return False
+    key_indentation = key_start - content_start
+
+    trimmed, _width = trim_horizontal_space()
+    if not trimmed:
+        return False
+    if cursor == len(value):
+        return True
+    if value[cursor] in (0x23, 0x3B):
+        return False
+    if not consume_line_break():
+        return False
+
+    diff_boundaries = (
+        b"@@ -",
+        b"@@@ -",
+        b"diff --git ",
+        b"\\ No newline at end of file",
+    )
+    while True:
+        if cursor == len(value):
+            return True
+        if diff_surface and any(
+            value.startswith(marker, cursor) for marker in diff_boundaries
+        ):
+            return True
+        if (
+            diff_surface
+            and cursor < len(value)
+            and value[cursor] in (0x20, 0x2B, 0x2D)
+            and not advance(1)
+        ):
+            return False
+        trimmed, indentation = trim_horizontal_space(indentation=True)
+        if not trimmed:
+            return False
+        if cursor == len(value):
+            return True
+        if value[cursor] == 0x23:
+            if not consume_comment():
+                return False
+            if cursor == len(value):
+                return True
+            if not consume_line_break():
+                return False
+            continue
+        if value.startswith((b"\r", b"\n"), cursor):
+            if not consume_line_break():
+                return False
+            continue
+        if indentation > key_indentation:
+            return False
+        if value.startswith((b"---", b"..."), cursor):
+            marker_end = cursor + 3
+            return marker_end == len(value) or value[marker_end] in (
+                0x09,
+                0x0A,
+                0x0D,
+                0x20,
+            )
+        return starts_named_assignment()
+
+
 def _iter_secret_events(
     value: bytes,
     *,
@@ -3261,15 +3461,21 @@ def _iter_secret_events(
     for match in UNQUOTED_SECRET_ASSIGNMENT.finditer(value):
         event_budget.consume()
         candidate = match.group(1)
-        if not _is_placeholder_secret(
-            candidate.lower()
-        ) and _looks_like_unquoted_secret(candidate):
+        may_accept = _unquoted_assignment_may_accept(
+            value,
+            match,
+            diff_surface=diff_surface,
+        )
+        placeholder = _is_placeholder_secret(candidate.lower())
+        if (not placeholder and _looks_like_unquoted_secret(candidate)) or (
+            placeholder and not may_accept
+        ):
             start, candidate_end = match.span(1)
             yield (
                 "generic-secret-assignment",
                 candidate,
                 match.end(),
-                True,
+                may_accept,
                 start,
                 candidate_end,
             )

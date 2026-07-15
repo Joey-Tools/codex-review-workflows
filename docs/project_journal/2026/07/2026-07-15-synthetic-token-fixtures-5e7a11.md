@@ -29,6 +29,7 @@ superseded_by:
 - The six reviewer-visible control files and their exact directory entry set are bound to helper-private size, digest, record-count, identity, mode, and stable-metadata evidence; added files, nested directories, symlinks, FIFOs, and post-prepare mutations fail closed.
 - All six control files are created as `0600` even under permissive caller umasks, while the existing reader continues to reject group- or other-writable artifacts.
 - Accepted assignments use bounded continuation inspection, and catalog value uniqueness plus exact authoring/legacy overlap checks are rule-independent.
+- Unquoted acceptance rejects YAML/INI indentation folding, operator continuations, quote/backslash/backtick/parameter-expansion concatenation, tabs, ambiguous inline comment/semicolon suffixes, and any next content that is not a bounded same-or-shallower named statement or explicit metadata boundary.
 - `$synthetic-token-fixtures` uses the helper CLI and placeholder-only templates rather than duplicating catalog literals.
 
 ## Next Steps
@@ -37,8 +38,8 @@ superseded_by:
 
 ## Evidence
 
-- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py' -v` (`374` tests passed; `2` loopback-dependent tests skipped)
-- `python3 -m unittest skills.review-orchestration-playbook.tests.test_synthetic_tokens -q` (`72` tests passed)
+- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py' -v` (`376` tests passed; `2` loopback-dependent tests skipped)
+- `python3 -m unittest skills.review-orchestration-playbook.tests.test_synthetic_tokens -q` (`74` tests passed)
 - `python3 -m unittest skills.review-orchestration-playbook.tests.test_workspace -q` (`56` tests passed)
 - `python3 -m py_compile skills/review-orchestration-playbook/scripts/isolated_review skills/review-orchestration-playbook/scripts/review_runtime/*.py`
 - `ruff check` and `ruff format --check` passed for the finding-repair runtime and test files.

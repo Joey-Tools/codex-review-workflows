@@ -419,8 +419,10 @@ class WorkspaceTest(unittest.TestCase):
                     _value_secret_rule(payload),
                     "generic-secret-assignment",
                 )
-        self.assertIsNone(
-            _value_secret_rule(b"password: example-test-secret # placeholder")
+        self.assertIsNone(_value_secret_rule(b"password: example-test-secret"))
+        self.assertEqual(
+            _value_secret_rule(b"password: example-test-secret # placeholder"),
+            "generic-secret-assignment",
         )
 
     def test_oversized_secret_assignments_fail_closed(self) -> None:

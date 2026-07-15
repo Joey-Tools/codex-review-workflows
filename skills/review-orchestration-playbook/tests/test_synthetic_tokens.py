@@ -180,8 +180,6 @@ class PublicPoolScannerTest(unittest.TestCase):
                 key + b" = " + token.value,
                 key + b" = " + token.value + b"\n",
                 key + b" = " + token.value + b"\r\n",
-                key + b" = " + token.value + b" \t# comment\n",
-                key + b" = " + token.value + b"\t; comment\r\n",
             )
             for index, probe in enumerate(probes):
                 with self.subTest(token=token.identifier, probe=index):
@@ -194,6 +192,198 @@ class PublicPoolScannerTest(unittest.TestCase):
                         scan.accepted_counts,
                         Counter({accepted: 1}),
                     )
+
+    def test_unquoted_pool_value_requires_a_complete_logical_rhs(self) -> None:
+        accepted = self.accepted[0]
+        value = accepted.value
+        adjacent = b"ActualOpaqueSecretA9Z8Y7"
+        blocking_cases = (
+            (
+                "yaml-continuation",
+                b"api_key: " + value + b"\n  " + adjacent + b"\n",
+                False,
+            ),
+            (
+                "nested-yaml-continuation",
+                b"fixtures:\n  api_key: " + value + b"\n    " + adjacent + b"\n",
+                False,
+            ),
+            (
+                "sequence-yaml-continuation",
+                b"- api_key: " + value + b"\n    " + adjacent + b"\n",
+                False,
+            ),
+            (
+                "commented-yaml-continuation",
+                b"api_key: " + value + b" # fixture\n  " + adjacent + b"\n",
+                False,
+            ),
+            (
+                "ambiguous-inline-comment",
+                b"api_key: " + value + b" # fixture\n",
+                False,
+            ),
+            (
+                "blank-line-yaml-continuation",
+                b"api_key: " + value + b"\n\n  " + adjacent + b"\n",
+                False,
+            ),
+            (
+                "crlf-yaml-continuation",
+                b"api_key: " + value + b"\r\n  " + adjacent + b"\r\n",
+                False,
+            ),
+            (
+                "same-indent-operator-continuation",
+                b"configure(\n    api_key = "
+                + value
+                + b"\n    + "
+                + adjacent
+                + b"\n)\n",
+                False,
+            ),
+            (
+                "shell-line-continuation",
+                b"access_token=" + value + b"\\\n" + adjacent + b"\n",
+                False,
+            ),
+            (
+                "shell-crlf-continuation",
+                b"access_token=" + value + b"\\\r\n" + adjacent + b"\r\n",
+                False,
+            ),
+            (
+                "double-quoted-word-concatenation",
+                b"access_token=" + value + b'"' + adjacent + b'"\n',
+                False,
+            ),
+            (
+                "single-quoted-word-concatenation",
+                b"access_token=" + value + b"'" + adjacent + b"'\n",
+                False,
+            ),
+            (
+                "parameter-expansion-concatenation",
+                b"access_token=" + value + b"${ACTUAL_SECRET}\n",
+                False,
+            ),
+            (
+                "command-substitution-concatenation",
+                b"access_token=" + value + b"`read_actual_secret`\n",
+                False,
+            ),
+            (
+                "diff-yaml-continuation",
+                b"+api_key: " + value + b"\n+  " + adjacent + b"\n",
+                True,
+            ),
+            (
+                "diff-operator-continuation",
+                b"+    api_key = " + value + b"\n+    + " + adjacent + b"\n",
+                True,
+            ),
+            (
+                "diff-shell-continuation",
+                b"+access_token=" + value + b"\\\n+" + adjacent + b"\n",
+                True,
+            ),
+            (
+                "ambiguous-semicolon",
+                b"api_key: " + value + b" ; " + adjacent + b"\n",
+                False,
+            ),
+            (
+                "tab-indentation",
+                b"api_key: " + value + b"\n\t" + adjacent + b"\n",
+                False,
+            ),
+            (
+                "bounded-comment-inspection",
+                b"api_key: "
+                + value
+                + b" #"
+                + b"x" * (workspace.MAX_SECRET_ASSIGNMENT_TRAILING_BYTES + 1)
+                + b"\nstate: expired\n",
+                False,
+            ),
+        )
+        for label, payload, diff_surface in blocking_cases:
+            with self.subTest(case=label):
+                scan = workspace._scan_secret_value(
+                    payload,
+                    accepted_values=(accepted,),
+                    diff_surface=diff_surface,
+                )
+                self.assertEqual(scan.blocking_rule, "generic-secret-assignment")
+                self.assertFalse(scan.accepted_counts)
+
+        safe_cases = (
+            ("next-root-key", b"api_key: " + value + b"\nstate: expired\n", False),
+            (
+                "next-nested-key",
+                b"fixtures:\n  api_key: " + value + b"\n  state: expired\n",
+                False,
+            ),
+            (
+                "next-sequence-key",
+                b"- api_key: " + value + b"\n  state: expired\n",
+                False,
+            ),
+            (
+                "diff-next-key",
+                b"+api_key: " + value + b"\n+state: expired\n",
+                True,
+            ),
+            (
+                "diff-metadata-boundary",
+                b"+api_key: " + value + b"\n@@ -1 +1 @@\n",
+                True,
+            ),
+        )
+        for label, payload, diff_surface in safe_cases:
+            with self.subTest(case=label):
+                scan = workspace._scan_secret_value(
+                    payload,
+                    accepted_values=(accepted,),
+                    diff_surface=diff_surface,
+                )
+                self.assertIsNone(scan.blocking_rule)
+                self.assertEqual(scan.accepted_counts, Counter({accepted: 1}))
+
+    def test_unquoted_continuation_is_blocked_across_stream_boundary(
+        self,
+    ) -> None:
+        accepted = self.accepted[0]
+        assignment_prefix = b"api_key: "
+        first_read = 1024 * 1024
+        committed_end = first_read - workspace.STREAM_SCAN_OVERLAP
+        candidate_end = committed_end - 16
+        line_start = candidate_end - len(assignment_prefix) - len(accepted.value)
+        prefix = b"x\n" * (line_start // 2)
+        if len(prefix) < line_start:
+            prefix += b"\n"
+        self.assertEqual(len(prefix), line_start)
+        for label, continuation in (
+            ("yaml", b"\n  ActualOpaqueSecretA9Z8Y7\n"),
+            ("shell", b"\\\nActualOpaqueSecretA9Z8Y7\n"),
+        ):
+            with self.subTest(case=label):
+                payload = (
+                    prefix
+                    + assignment_prefix
+                    + accepted.value
+                    + continuation
+                    + b"x" * workspace.STREAM_SCAN_OVERLAP
+                )
+
+                scan = workspace._stream_secret_scan(
+                    io.BytesIO(payload),
+                    size=len(payload),
+                    accepted_values=(accepted,),
+                )
+
+                self.assertEqual(scan.blocking_rule, "generic-secret-assignment")
+                self.assertFalse(scan.accepted_counts)
 
     def test_runtime_python_sources_pass_their_own_secret_scanner(self) -> None:
         runtime_root = pathlib.Path(workspace.__file__).resolve().parent
