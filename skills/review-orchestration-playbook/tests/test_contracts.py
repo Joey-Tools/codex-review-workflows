@@ -3,8 +3,12 @@ from __future__ import annotations
 import pathlib
 import subprocess
 import sys
-import tomllib
 import unittest
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - exercised by Python 3.10 CI
+    import tomli as tomllib
 
 
 SKILL_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -144,6 +148,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn(guard, entrypoint)
         self.assertLess(entrypoint.index(guard), entrypoint.index("from review_runtime"))
         self.assertIn('python-version: "3.10"', workflow)
+        self.assertIn("tomli==2.2.1", workflow)
         self.assertIn("requires Python 3.10 or later", readme)
 
     def test_full_pr_readiness_retains_both_local_codex_gates(self) -> None:

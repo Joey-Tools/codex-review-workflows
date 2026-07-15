@@ -13,9 +13,13 @@ import sys
 import tempfile
 import threading
 import time
-import tomllib
 import unittest
 from unittest import mock
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - exercised by Python 3.10 CI
+    import tomli as tomllib
 
 
 SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"

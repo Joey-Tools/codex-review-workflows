@@ -1985,15 +1985,35 @@ def _validate_private_socket(
         raise LinuxRuntimeError(
             "proxy socket must be current-user-owned with mode 0600"
         )
-    lexical_parent = path.absolute().parent
-    if lexical_parent.resolve(strict=True) != lexical_parent:
-        raise LinuxRuntimeError("proxy socket parent path must not contain symlinks")
     parent = resolved.parent
-    temporary_root = pathlib.Path("/tmp")
+    lexical_parent = path.absolute().parent
+    temporary_alias = pathlib.Path("/tmp").absolute()
     try:
-        temporary_root = temporary_root.resolve(strict=True)
+        temporary_root = temporary_alias.resolve(strict=True)
     except OSError:
-        pass
+        temporary_root = temporary_alias
+    try:
+        if temporary_root != temporary_alias and _is_relative_to(
+            lexical_parent,
+            temporary_alias,
+        ):
+            alias_relative = lexical_parent.relative_to(temporary_alias)
+            canonical_parent = temporary_root.joinpath(alias_relative)
+            if (
+                canonical_parent.resolve(strict=True) != canonical_parent
+                or canonical_parent != parent
+            ):
+                raise LinuxRuntimeError(
+                    "proxy socket parent path must not contain symlinks"
+                )
+        elif lexical_parent.resolve(strict=True) != lexical_parent:
+            raise LinuxRuntimeError(
+                "proxy socket parent path must not contain symlinks"
+            )
+    except OSError as error:
+        raise LinuxRuntimeError(
+            f"cannot inspect proxy socket parent path {lexical_parent}: {error}"
+        ) from error
     stop = (
         helper_root
         if _is_relative_to(parent, helper_root)

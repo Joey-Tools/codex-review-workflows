@@ -2286,6 +2286,28 @@ class ProxySocketValidationTest(unittest.TestCase):
                 self.assertEqual(accepted, private_path.resolve())
             finally:
                 private_socket.close()
+            real_parent = root / "proxy-real"
+            real_parent.mkdir(mode=0o700)
+            symlink_parent = root / "proxy-link"
+            symlink_parent.symlink_to(real_parent, target_is_directory=True)
+            real_path = real_parent / "p.sock"
+            alias_path = symlink_parent / "p.sock"
+            symlink_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                symlink_socket.bind(str(real_path))
+                real_path.chmod(0o600)
+                with self.assertRaisesRegex(
+                    claude_linux.LinuxRuntimeError,
+                    "parent path must not contain symlinks",
+                ):
+                    claude_linux._validate_private_socket(
+                        alias_path,
+                        helper_root=helper.resolve(),
+                        owner_uid=os.getuid(),
+                        host=host,
+                    )
+            finally:
+                symlink_socket.close()
             nonprivate_parent = root / "proxy-shared"
             nonprivate_parent.mkdir(mode=0o755)
             nonprivate_path = nonprivate_parent / "p.sock"

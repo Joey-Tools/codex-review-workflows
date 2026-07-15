@@ -506,6 +506,19 @@ superseded_by:
   `--help` under the exact minimal environment. The focused regression tests,
   `ruff`, `compileall`, and `git diff --check` passed; the complete local suite
   passed all 512 tests in 65.624 seconds with nine environment-gated skips.
+- PR #45's first Python 3.10 CI run exposed two deterministic portability gaps.
+  Both platform jobs imported the Python 3.11+ `tomllib` module directly from
+  tests even though the helper deliberately supports and tests Python 3.10; CI
+  now installs pinned `tomli==2.2.1`, and the tests use it only as the pre-3.11
+  fallback. The macOS job also proved that `/tmp` is the root-owned system alias
+  for `/private/tmp`: the private proxy-socket validator now accepts only that
+  exact root alias while still rejecting every symlink below it. Regression
+  coverage exercises the accepted private `/tmp` socket, a private child
+  symlink rejection, and the existing non-private-parent rejection. The focused
+  macOS socket test passed outside the parent sandbox, the contract and Linux
+  suites passed 83 tests locally, and the complete suite passed all 512 tests
+  in 67.901 seconds with nine environment-gated skips. `ruff`, `actionlint`,
+  and `git diff --check` also passed before the CI-fix commit.
 - Anthropic installation, signed-manifest, release-key fingerprint, and platform
   signature documentation: https://code.claude.com/docs/en/installation
 - Anthropic Seatbelt, `bubblewrap`, `socat`, WSL2, and WSL1 sandboxing
