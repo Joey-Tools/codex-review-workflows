@@ -496,7 +496,7 @@ def _is_windows_drive_mount(path: pathlib.Path | pathlib.PurePosixPath) -> bool:
 @dataclass(frozen=True)
 class _MountInfoEntry:
     mount_id: int
-    root: pathlib.PurePosixPath
+    root: pathlib.PurePosixPath | str
     mount_point: pathlib.PurePosixPath
     file_system: str
     source: str
@@ -511,6 +511,12 @@ _MOUNTINFO_ESCAPES = {
     "072": ":",
     "134": "\\",
 }
+
+_NSFS_ROOT = re.compile(
+    r"(?P<namespace>[a-z][a-z0-9_]{0,31}):"
+    r"\[(?P<inode>[1-9][0-9]{0,19})\]"
+)
+_MAX_NSFS_INODE = (1 << 64) - 1
 
 
 def _decode_mountinfo_field(value: str) -> str:
@@ -543,6 +549,26 @@ def _mountinfo_path(value: str) -> pathlib.PurePosixPath:
     return path
 
 
+def _mountinfo_root(
+    value: str,
+    *,
+    file_system: str,
+) -> pathlib.PurePosixPath | str:
+    decoded = _decode_mountinfo_field(value)
+    path = pathlib.PurePosixPath(decoded)
+    if (
+        path.is_absolute()
+        and "." not in path.parts
+        and ".." not in path.parts
+        and str(path) == decoded
+    ):
+        return path
+    match = _NSFS_ROOT.fullmatch(decoded) if file_system == "nsfs" else None
+    if match is not None and int(match.group("inode")) <= _MAX_NSFS_INODE:
+        return decoded
+    raise LinuxRuntimeError("mountinfo contains a non-canonical root")
+
+
 def _parse_mountinfo(payload: str) -> tuple[_MountInfoEntry, ...]:
     encoded_size = len(payload.encode("utf-8", errors="surrogateescape"))
     if not payload or encoded_size > MOUNTINFO_LIMIT_BYTES:
@@ -573,16 +599,17 @@ def _parse_mountinfo(payload: str) -> tuple[_MountInfoEntry, ...]:
             raise LinuxRuntimeError("Linux mountinfo has an invalid mount identifier")
         if re.fullmatch(r"[0-9]+:[0-9]+", fields[2]) is None:
             raise LinuxRuntimeError("Linux mountinfo has an invalid device identifier")
-        root = _mountinfo_path(fields[3])
-        mount_point = _mountinfo_path(fields[4])
         if not fields[5] or not fields[separator + 1] or not fields[separator + 3]:
             raise LinuxRuntimeError("Linux mountinfo has an empty required field")
+        file_system = _decode_mountinfo_field(fields[separator + 1])
+        root = _mountinfo_root(fields[3], file_system=file_system)
+        mount_point = _mountinfo_path(fields[4])
         entries.append(
             _MountInfoEntry(
                 mount_id=int(fields[0]),
                 root=root,
                 mount_point=mount_point,
-                file_system=_decode_mountinfo_field(fields[separator + 1]),
+                file_system=file_system,
                 source=_decode_mountinfo_field(fields[separator + 2]),
                 super_options=_decode_mountinfo_field(fields[separator + 3]),
             )
