@@ -2643,11 +2643,13 @@ def _scan_secret_value(
 def validate_authoring_catalog_scanner_contract(
     catalog: SyntheticTokenCatalog,
 ) -> None:
+    key = b"access_" + b"token"
+    separator = b" = "
     for accepted in accepted_authoring_values(catalog):
         probes = (
-            b'access_token = "' + accepted.value + b'"\n',
-            b"access_token = '" + accepted.value + b"'\n",
-            b"access_token = " + accepted.value + b"\n",
+            key + separator + b'"' + accepted.value + b'"\n',
+            key + separator + b"'" + accepted.value + b"'\n",
+            key + separator + accepted.value + b"\n",
         )
         for probe in probes:
             result = _scan_secret_value(

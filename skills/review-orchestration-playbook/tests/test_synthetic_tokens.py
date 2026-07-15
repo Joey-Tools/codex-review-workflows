@@ -185,6 +185,16 @@ class PublicPoolScannerTest(unittest.TestCase):
                         Counter({accepted: 1}),
                     )
 
+    def test_runtime_python_sources_pass_their_own_secret_scanner(self) -> None:
+        runtime_root = pathlib.Path(workspace.__file__).resolve().parent
+        for path in sorted(runtime_root.glob("*.py")):
+            with self.subTest(path=path.name):
+                scan = workspace._scan_secret_value(
+                    path.read_bytes(),
+                    accepted_values=self.accepted,
+                )
+                self.assertIsNone(scan.blocking_rule)
+
     def test_mutated_pool_values_remain_blocked(self) -> None:
         original = PUBLIC_VALUES[0]
         variants = {

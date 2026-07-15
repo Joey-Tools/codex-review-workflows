@@ -33,7 +33,7 @@ superseded_by:
 
 ## Evidence
 
-- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py' -v` (`345` tests passed; `2` loopback-dependent tests skipped)
+- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py' -v` (`346` tests passed; `2` loopback-dependent tests skipped)
 - `python3 -m py_compile skills/review-orchestration-playbook/scripts/review_runtime/*.py skills/review-orchestration-playbook/tests/test_*.py`
 - `ruff check --ignore F401` passed for every changed runtime and test module.
 - `uv run --offline --with pyyaml python .../quick_validate.py <skill>` passed for both skills using the locally cached PyYAML runtime.
