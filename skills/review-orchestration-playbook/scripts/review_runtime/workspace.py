@@ -3000,9 +3000,8 @@ def _quoted_assignment_may_accept(
             elif value.startswith((b"\r", b"\n"), cursor):
                 if not advance(1):
                     return False
-            elif value.startswith((b"#", b"//"), cursor):
-                marker_length = 1 if value.startswith(b"#", cursor) else 2
-                if not advance(marker_length):
+            elif value.startswith(b"#", cursor):
+                if not advance(1):
                     return False
                 while cursor < len(value) and value[cursor] not in (0x0A, 0x0D):
                     if not advance(1):
@@ -3020,7 +3019,7 @@ def _quoted_assignment_may_accept(
         return True
 
     def starts_trivia() -> bool:
-        return value.startswith((b"\r", b"\n", b"#", b"//", b"/*"), cursor)
+        return value.startswith((b"\r", b"\n", b"#", b"/*"), cursor)
 
     def starts_literal() -> bool:
         return _starts_quoted_literal(value[cursor : cursor + 16])

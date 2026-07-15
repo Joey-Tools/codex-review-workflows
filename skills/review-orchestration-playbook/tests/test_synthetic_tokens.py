@@ -25,7 +25,7 @@ from review_runtime import cli, synthetic_tokens, workspace  # noqa: E402
 from review_runtime.common import ReviewError  # noqa: E402
 
 
-PUBLIC_VALUES = (
+EXPECTED_PUBLIC_VALUES = (
     "codex_public_synth_v1_access_a",
     "codex_public_synth_v1_access_b",
     "codex_public_synth_v1_access_expired",
@@ -36,6 +36,10 @@ PUBLIC_VALUES = (
     "codex_public_synth_v1_id_b",
     "codex_public_synth_v1_api_key_a",
     "codex_public_synth_v1_bearer_a",
+)
+AUTHORING_VALUES = tuple(
+    token.value.decode("ascii")
+    for token in synthetic_tokens.load_catalog().authoring_tokens
 )
 LEGACY_A = "HistoricalFixtureAccessA9Z8Y7"
 LEGACY_B = "HistoricalFixtureRefreshB8Y7X6"
@@ -120,13 +124,15 @@ class PublicPoolScannerTest(unittest.TestCase):
         cls.accepted = synthetic_tokens.accepted_authoring_values(cls.catalog)
 
     def test_public_v1_pool_is_exactly_the_ten_documented_values(self) -> None:
+        if self.catalog.pool_version != "public-example-v1":
+            self.skipTest("active downstream catalog replaces the public example pool")
         self.assertEqual(self.catalog.schema_version, 1)
         self.assertEqual(self.catalog.pool_version, "public-example-v1")
         self.assertEqual(
             tuple(
                 token.value.decode("ascii") for token in self.catalog.authoring_tokens
             ),
-            PUBLIC_VALUES,
+            EXPECTED_PUBLIC_VALUES,
         )
         self.assertEqual(
             len({token.identifier for token in self.catalog.authoring_tokens}), 10
@@ -396,7 +402,7 @@ class PublicPoolScannerTest(unittest.TestCase):
                 self.assertIsNone(scan.blocking_rule)
 
     def test_mutated_pool_values_remain_blocked(self) -> None:
-        original = PUBLIC_VALUES[0]
+        original = AUTHORING_VALUES[0]
         variants = {
             "suffix": original + "_extra",
             "prefix": "extra_" + original,
@@ -641,6 +647,22 @@ class PublicPoolScannerTest(unittest.TestCase):
             (
                 "newline-operator-concatenation",
                 b"configure(" + exact_assignment + b"\n + " + adjacent_secret + b")",
+            ),
+            (
+                "floor-division-concatenation",
+                exact_assignment + b" // " + adjacent_secret,
+            ),
+            (
+                "newline-floor-division-concatenation",
+                b"configure(" + exact_assignment + b"\n // " + adjacent_secret + b")",
+            ),
+            (
+                "diff-floor-division-concatenation",
+                b"+configure(\n+    "
+                + exact_assignment
+                + b"\n+    // "
+                + adjacent_secret
+                + b"\n+)\n",
             ),
             (
                 "unknown-operator-concatenation",
@@ -1675,9 +1697,10 @@ class SyntheticTokenCliTest(unittest.TestCase):
         returncode, output, error = self.run_cli("list", "--json")
         self.assertEqual((returncode, error), (0, ""))
         payload = json.loads(output)
+        catalog = synthetic_tokens.load_catalog()
         self.assertEqual(set(payload), {"pool_version", "tokens"})
-        self.assertEqual(payload["pool_version"], "public-example-v1")
-        self.assertEqual(len(payload["tokens"]), 10)
+        self.assertEqual(payload["pool_version"], catalog.pool_version)
+        self.assertEqual(len(payload["tokens"]), len(catalog.authoring_tokens))
         self.assertEqual(
             [token["id"] for token in payload["tokens"]],
             sorted(token["id"] for token in payload["tokens"]),
@@ -1690,8 +1713,10 @@ class SyntheticTokenCliTest(unittest.TestCase):
             )
         )
         self.assertTrue(all("value" not in token for token in payload["tokens"]))
-        for raw in PUBLIC_VALUES:
-            self.assertNotIn(raw, output)
+        output_bytes = output.encode("utf-8")
+        self.assertFalse(
+            any(raw.encode("ascii") in output_bytes for raw in AUTHORING_VALUES)
+        )
 
     def test_thin_skill_templates_resolve_through_stable_metadata(self) -> None:
         returncode, output, error = self.run_cli("list", "--json")
@@ -1760,17 +1785,55 @@ class SyntheticTokenCliTest(unittest.TestCase):
         self.assertNotIn("placeholder_test_token", error)
 
     def test_get_returns_only_the_explicitly_selected_raw_value(self) -> None:
-        returncode, output, error = self.run_cli("get", "access-a", "--json")
+        catalog = synthetic_tokens.load_catalog()
+        selected = sorted(catalog.authoring_tokens, key=lambda token: token.identifier)[
+            0
+        ]
+        returncode, output, error = self.run_cli(
+            "get",
+            selected.identifier,
+            "--json",
+        )
         self.assertEqual((returncode, error), (0, ""))
         payload = json.loads(output)
-        self.assertEqual(payload["token"]["value"], PUBLIC_VALUES[0])
-        for raw in PUBLIC_VALUES[1:]:
-            self.assertNotIn(raw, output)
+        returned_value = payload["token"]["value"].encode("ascii")
+        self.assertEqual(
+            hashlib.sha256(returned_value).hexdigest(),
+            selected.value_sha256,
+        )
+        output_bytes = output.encode("utf-8")
+        self.assertFalse(
+            any(
+                token.value in output_bytes
+                for token in catalog.authoring_tokens
+                if token.identifier != selected.identifier
+            )
+        )
 
     def test_list_exemptions_and_unknown_get(self) -> None:
         returncode, output, error = self.run_cli("list-exemptions", "--json")
         self.assertEqual((returncode, error), (0, ""))
-        self.assertEqual(json.loads(output)["exemptions"], [])
+        catalog = synthetic_tokens.load_catalog()
+        exemptions = json.loads(output)["exemptions"]
+        self.assertEqual(
+            [item["id"] for item in exemptions],
+            sorted(item.identifier for item in catalog.legacy_exemptions),
+        )
+        output_bytes = output.encode("utf-8")
+        catalog_legacy_values = synthetic_tokens.accepted_legacy_values(
+            catalog,
+            catalog.legacy_exemptions,
+        )
+        self.assertFalse(
+            any(
+                descriptor.value is not None
+                and (
+                    descriptor.value in output_bytes
+                    or base64.b64encode(descriptor.value) in output_bytes
+                )
+                for descriptor in catalog_legacy_values
+            )
+        )
 
         catalog = legacy_catalog(values=(LEGACY_A,))
         with mock.patch.object(cli, "load_catalog", return_value=catalog):
@@ -1860,14 +1923,14 @@ class SyntheticWorkspaceTest(unittest.TestCase):
     def test_authoring_value_passes_and_evidence_never_contains_raw_value(self) -> None:
         repo, base = self.new_repo({"README.md": "base\n"})
         (repo / "fixture.cfg").write_text(
-            assignment_text("access_token", PUBLIC_VALUES[0]),
+            assignment_text("access_token", AUTHORING_VALUES[0]),
             encoding="utf-8",
         )
         head = self.commit(repo)
         review = self.prepare(repo=repo, base=base, head=head)
         evidence = self.validate(review)
         encoded = json.dumps(evidence, sort_keys=True)
-        self.assertNotIn(PUBLIC_VALUES[0], encoded)
+        self.assertFalse(AUTHORING_VALUES[0] in encoded)
         accepted = evidence["synthetic_tokens"]["accepted"]
         self.assertTrue(accepted)
         self.assertTrue(all("value_sha256" in entry for entry in accepted))
@@ -2022,7 +2085,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
     def test_pool_value_in_credential_path_remains_blocked(self) -> None:
         repo, base = self.new_repo({"README.md": "base\n"})
         (repo / "auth.json").write_text(
-            json.dumps({"access_token": PUBLIC_VALUES[0]}),
+            json.dumps({"access_token": AUTHORING_VALUES[0]}),
             encoding="utf-8",
         )
         head = self.commit(repo)
@@ -2081,9 +2144,9 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         self,
     ) -> None:
         catalog = legacy_catalog(values=(LEGACY_A,))
-        fixture = assignment_text("access_token", PUBLIC_VALUES[0]) + assignment_text(
-            "refresh_token", LEGACY_A
-        )
+        fixture = assignment_text(
+            "access_token", AUTHORING_VALUES[0]
+        ) + assignment_text("refresh_token", LEGACY_A)
         repo, base = self.new_repo({"fixture.cfg": fixture})
         (repo / "README.md").write_text("head\n", encoding="utf-8")
         head = self.commit(repo)
@@ -2410,7 +2473,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                     {
                         "auth.json": assignment_text(
                             "access_token",
-                            PUBLIC_VALUES[0],
+                            AUTHORING_VALUES[0],
                         ),
                         "fixture.cfg": assignment_text(
                             "password",
@@ -2425,7 +2488,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                 private_state = (
                     review.container_dir / workspace.CONTROL_ARTIFACT_STATE_NAME
                 ).read_text(encoding="utf-8")
-                self.assertNotIn(PUBLIC_VALUES[0], private_state)
+                self.assertFalse(AUTHORING_VALUES[0] in private_state)
                 artifact = review.workspace_root / ".codex-review" / artifact_name
                 artifact.write_bytes(replacement)
                 with self.assertRaisesRegex(
@@ -2607,7 +2670,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                     )
 
     def test_observed_legacy_value_must_not_overlap_authoring_pool(self) -> None:
-        overlapping = PUBLIC_VALUES[0] + "_suffix"
+        overlapping = AUTHORING_VALUES[0] + "_suffix"
         with self.assertRaisesRegex(ReviewError, "overlapping values"):
             legacy_catalog(values=(overlapping,))
 
@@ -2681,14 +2744,14 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         repo, first_commit = self.new_repo(
             {
                 "fixture.cfg": (
-                    assignment_text("access_token", PUBLIC_VALUES[0])
+                    assignment_text("access_token", AUTHORING_VALUES[0])
                     + assignment_text("refresh_token", LEGACY_A)
                 ),
                 "notes.txt": f"historical literal: {LEGACY_A}\n",
             }
         )
         (repo / "fixture.cfg").write_text(
-            assignment_text("access_token", PUBLIC_VALUES[0])
+            assignment_text("access_token", AUTHORING_VALUES[0])
             + assignment_text("refresh_token", LEGACY_A)
             + assignment_text("id_token", LEGACY_B),
             encoding="utf-8",
@@ -2849,7 +2912,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         repo, base = self.new_repo({"README.md": "base\n"})
         for index in range(3):
             (repo / f"fixture-{index}.cfg").write_text(
-                assignment_text("access_token", PUBLIC_VALUES[0]),
+                assignment_text("access_token", AUTHORING_VALUES[0]),
                 encoding="utf-8",
             )
         head = self.commit(repo)
@@ -2862,8 +2925,8 @@ class SyntheticWorkspaceTest(unittest.TestCase):
     def test_external_evidence_budget_reserves_changed_blob_entries(self) -> None:
         repo, base = self.new_repo(
             {
-                "deleted.cfg": assignment_text("access_token", PUBLIC_VALUES[0]),
-                "unchanged.cfg": assignment_text("access_token", PUBLIC_VALUES[0]),
+                "deleted.cfg": assignment_text("access_token", AUTHORING_VALUES[0]),
+                "unchanged.cfg": assignment_text("access_token", AUTHORING_VALUES[0]),
             }
         )
         (repo / "deleted.cfg").unlink()
