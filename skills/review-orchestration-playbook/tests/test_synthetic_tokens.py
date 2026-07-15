@@ -878,7 +878,8 @@ class PublicPoolScannerTest(unittest.TestCase):
 
         declaration_with_adjacent_secret = workspace._scan_secret_value(
             exact_assignment
-            + b'\ndef test_fixture(access_token="UnknownSecretValueA9Z8Y7"):\n'
+            + b'\ndef test_fixture(access_token="UnknownSecret'
+            + b'ValueA9Z8Y7"):\n'
             + b"    pass\n",
             accepted_values=self.accepted,
         )
