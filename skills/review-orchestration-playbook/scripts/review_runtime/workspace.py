@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import base64
 import hashlib
 import json
@@ -191,6 +192,8 @@ MAX_LEGACY_OCCURRENCE_EVENTS = 1_000_000
 MAX_LEGACY_SEARCH_BYTES = 16 * 1024 * 1024 * 1024
 MAX_LEGACY_CONTAINMENT_CHECKS = 10_000_000
 MAX_SECRET_ASSIGNMENT_TRAILING_BYTES = 256
+MAX_SECRET_PREFIX_PROOF_BYTES = 4 * 1024 * 1024
+MAX_SECRET_PREFIX_PROOF_TOTAL_BYTES = 64 * 1024 * 1024
 MAX_REVIEW_PROMPT_BYTES = 64 * 1024
 MAX_SYNTHETIC_EVIDENCE_BYTES = 64 * 1024
 MAX_SYNTHETIC_EVIDENCE_ENTRIES = 512
@@ -313,6 +316,7 @@ class SecretScanResult:
 @dataclass
 class SecretScanBudget:
     remaining: int
+    remaining_prefix_proof_bytes: int = MAX_SECRET_PREFIX_PROOF_TOTAL_BYTES
 
     @classmethod
     def default(cls) -> "SecretScanBudget":
@@ -324,6 +328,17 @@ class SecretScanBudget:
                 "external review content exceeds the sensitive scanner event limit"
             )
         self.remaining -= 1
+
+    def consume_prefix_proof(self, byte_count: int) -> bool:
+        if byte_count > MAX_SECRET_PREFIX_PROOF_BYTES:
+            return False
+        if byte_count > self.remaining_prefix_proof_bytes:
+            raise ReviewError(
+                "external review content exceeds the sensitive scanner prefix "
+                "proof limit"
+            )
+        self.remaining_prefix_proof_bytes -= byte_count
+        return True
 
 
 @dataclass
@@ -2942,14 +2957,22 @@ def _quoted_assignment_may_accept(
     match: re.Match[bytes],
     *,
     diff_surface: bool = False,
+    prefix_context_complete: bool = True,
+    event_budget: SecretScanBudget,
 ) -> bool:
     cursor = match.end()
     inspected = 0
+    crossed_line_boundary = False
 
     def advance(count: int) -> bool:
-        nonlocal cursor, inspected
+        nonlocal crossed_line_boundary, cursor, inspected
         if inspected + count > MAX_SECRET_ASSIGNMENT_TRAILING_BYTES:
             return False
+        if (
+            b"\n" in value[cursor : cursor + count]
+            or b"\r" in value[cursor : cursor + count]
+        ):
+            crossed_line_boundary = True
         inspected += count
         cursor += count
         return True
@@ -3207,6 +3230,139 @@ def _quoted_assignment_may_accept(
             index += 1
         return index < limit and value[index] == 0x28
 
+    def starts_top_level_python_declaration() -> bool:
+        if not crossed_line_boundary:
+            return False
+        line_start = (
+            max(
+                value.rfind(b"\n", 0, cursor),
+                value.rfind(b"\r", 0, cursor),
+            )
+            + 1
+        )
+        prefix = value[line_start:cursor]
+        if diff_surface and prefix[:1] in (b"+", b"-", b" "):
+            prefix = prefix[1:]
+        if prefix:
+            return False
+
+        limit = min(
+            len(value),
+            cursor + MAX_SECRET_ASSIGNMENT_TRAILING_BYTES - inspected + 1,
+        )
+        index = cursor
+
+        def skip_horizontal_space(position: int) -> int:
+            while position < limit and value[position] in (0x20, 0x09):
+                position += 1
+            return position
+
+        def skip_identifier(position: int) -> int:
+            if position >= limit or not (
+                0x41 <= value[position] <= 0x5A
+                or 0x61 <= value[position] <= 0x7A
+                or value[position] == 0x5F
+            ):
+                return position
+            position += 1
+            while position < limit and (
+                0x30 <= value[position] <= 0x39
+                or 0x41 <= value[position] <= 0x5A
+                or 0x61 <= value[position] <= 0x7A
+                or value[position] == 0x5F
+            ):
+                position += 1
+            return position
+
+        def consume_keyword(position: int, keyword: bytes) -> int | None:
+            end = position + len(keyword)
+            if (
+                end >= limit
+                or not value.startswith(keyword, position)
+                or value[end] not in (0x20, 0x09)
+            ):
+                return None
+            return skip_horizontal_space(end)
+
+        async_end = consume_keyword(index, b"async")
+        if async_end is not None:
+            index = async_end
+        declaration = b"def" if value.startswith(b"def", index) else b"class"
+        if async_end is not None and declaration != b"def":
+            return False
+        declaration_end = consume_keyword(index, declaration)
+        if declaration_end is None:
+            return False
+        identifier_end = skip_identifier(declaration_end)
+        if identifier_end == declaration_end:
+            return False
+        index = skip_horizontal_space(identifier_end)
+        if declaration == b"def":
+            return index < limit and value[index] == 0x28
+        return index < limit and value[index] in (0x28, 0x3A)
+
+    def diff_head_prefix() -> bytes | None:
+        lower_bound = max(0, cursor - MAX_SECRET_PREFIX_PROOF_BYTES)
+        markers = (
+            value.rfind(b"\n@@ ", lower_bound, cursor),
+            value.rfind(b"\n@@@ ", lower_bound, cursor),
+        )
+        marker = max(markers)
+        if marker >= 0:
+            hunk_start = value.find(b"\n", marker + 1, cursor)
+            if hunk_start < 0:
+                return None
+            hunk_start += 1
+        elif lower_bound == 0 and value.startswith((b"@@ ", b"@@@ ")):
+            hunk_start = value.find(b"\n", 0, cursor)
+            if hunk_start < 0:
+                return None
+            hunk_start += 1
+        elif lower_bound == 0:
+            hunk_start = 0
+        else:
+            return None
+        raw_prefix = value[hunk_start:cursor]
+        if not event_budget.consume_prefix_proof(len(raw_prefix)):
+            return None
+        head_lines: list[bytes] = []
+        for line in raw_prefix.splitlines(keepends=True):
+            if line.startswith((b"+", b" ")):
+                if line.startswith(b"+++ "):
+                    return None
+                head_lines.append(line[1:])
+            elif line.startswith(b"-"):
+                if line.startswith(b"--- "):
+                    return None
+            elif line.startswith(b"\\ No newline at end of file"):
+                continue
+            elif line:
+                return None
+        return b"".join(head_lines)
+
+    def python_prefix_is_complete() -> bool:
+        if not prefix_context_complete:
+            return False
+        if diff_surface:
+            prefix = diff_head_prefix()
+            if prefix is None:
+                return False
+        else:
+            prefix = value[:cursor]
+            if not event_budget.consume_prefix_proof(len(prefix)):
+                return False
+        try:
+            compile(
+                prefix,
+                "<synthetic-token-prefix>",
+                "exec",
+                flags=ast.PyCF_ONLY_AST,
+                dont_inherit=True,
+            )
+        except (SyntaxError, UnicodeDecodeError, ValueError):
+            return False
+        return True
+
     if not trim_space():
         return False
     source_literal_wrapper = False
@@ -3217,6 +3373,10 @@ def _quoted_assignment_may_accept(
                 return False
             source_literal_wrapper = True
     crossed_boundary = False
+
+    def starts_proven_python_declaration() -> bool:
+        return starts_top_level_python_declaration() and python_prefix_is_complete()
+
     while True:
         while value.startswith((b")", b"]", b"}"), cursor):
             if not advance(1):
@@ -3243,6 +3403,7 @@ def _quoted_assignment_may_accept(
             cursor == len(value)
             or starts_diff_metadata_boundary()
             or starts_named_assignment()
+            or starts_proven_python_declaration()
         )
     if value.startswith(b",", cursor):
         if not advance(1) or not trim_space():
@@ -3275,14 +3436,19 @@ def _quoted_assignment_may_accept(
                 cursor == len(value)
                 or starts_diff_metadata_boundary()
                 or starts_named_assignment()
+                or starts_proven_python_declaration()
             )
-        return starts_named_assignment()
+        return starts_named_assignment() or starts_proven_python_declaration()
     if crossed_boundary:
         if starts_diff_metadata_boundary():
             return True
         if source_literal_wrapper:
-            return starts_named_assignment() or starts_python_call_statement()
-        return starts_named_assignment()
+            return (
+                starts_named_assignment()
+                or starts_python_call_statement()
+                or starts_proven_python_declaration()
+            )
+        return starts_named_assignment() or starts_proven_python_declaration()
     return False
 
 
@@ -3514,6 +3680,7 @@ def _iter_secret_events(
     value: bytes,
     *,
     diff_surface: bool = False,
+    prefix_context_complete: bool = True,
     _event_budget: SecretScanBudget | None = None,
 ) -> Iterator[tuple[str, bytes | None, int, bool, int | None, int | None]]:
     event_budget = _event_budget or SecretScanBudget.default()
@@ -3551,6 +3718,8 @@ def _iter_secret_events(
             value,
             match,
             diff_surface=diff_surface,
+            prefix_context_complete=prefix_context_complete,
+            event_budget=event_budget,
         )
         if not may_accept or not _is_placeholder_secret(candidate.lower()):
             start, candidate_end = match.span(2)
@@ -3715,6 +3884,7 @@ def _scan_secret_value(
     maximum_end: int | None = None,
     capture_accepted_candidates: bool = False,
     diff_surface: bool = False,
+    prefix_context_complete: bool = True,
     _accepted_index: AcceptedValueIndex | None = None,
     _event_budget: SecretScanBudget | None = None,
     _exact_index: ExactValueIndex | None = None,
@@ -3756,6 +3926,7 @@ def _scan_secret_value(
     for rule, candidate, end, may_accept, start, candidate_end in _iter_secret_events(
         value,
         diff_surface=diff_surface,
+        prefix_context_complete=prefix_context_complete,
         _event_budget=event_budget,
     ):
         if not minimum_end < end <= upper:
@@ -3848,8 +4019,15 @@ def _stream_secret_scan(
         if remaining == 0:
             chunk = b""
         else:
+            preferred_read_size = (
+                MAX_SECRET_PREFIX_PROOF_BYTES + overlap
+                if total_read == 0
+                else 1024 * 1024
+            )
             read_size = (
-                1024 * 1024 if remaining is None else min(1024 * 1024, remaining)
+                preferred_read_size
+                if remaining is None
+                else min(preferred_read_size, remaining)
             )
             chunk = stream.read(read_size)
         if not chunk and remaining not in (None, 0):
@@ -3886,6 +4064,12 @@ def _stream_secret_scan(
                 break
             continue
         pending += chunk
+        if (
+            pending_offset == 0
+            and not at_end
+            and total_read < MAX_SECRET_PREFIX_PROOF_BYTES + overlap
+        ):
+            continue
         next_committed_end = total_read if at_end else max(0, total_read - overlap)
         local_minimum = max(0, committed_end - pending_offset)
         local_maximum = max(0, next_committed_end - pending_offset)
@@ -3897,6 +4081,7 @@ def _stream_secret_scan(
                 maximum_end=local_maximum,
                 capture_accepted_candidates=capture_accepted_candidates,
                 diff_surface=diff_surface,
+                prefix_context_complete=pending_offset == 0,
                 _accepted_index=accepted_index,
                 _event_budget=event_budget,
             )

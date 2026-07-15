@@ -676,12 +676,81 @@ class PublicPoolScannerTest(unittest.TestCase):
                 "plain-source-string-concatenation",
                 b"payload = '" + exact_assignment + b"' + " + adjacent_secret,
             ),
+            (
+                "unclosed-call-before-declaration",
+                b"configure(" + exact_assignment + b"\ndef test_fixture():\n    pass\n",
+            ),
+            (
+                "multiline-unclosed-call-before-declaration",
+                b"configure(\n"
+                + exact_assignment
+                + b",\ndef test_fixture():\n    pass\n",
+            ),
+            (
+                "spaced-multiline-unclosed-call-before-declaration",
+                b"configure(\n "
+                + exact_assignment
+                + b",\ndef test_fixture():\n    pass\n",
+            ),
+            (
+                "tabbed-multiline-unclosed-call-before-declaration",
+                b"configure(\n\t"
+                + exact_assignment
+                + b",\ndef test_fixture():\n    pass\n",
+            ),
+            (
+                "unclosed-mapping-before-declaration",
+                b'{"access_token": "'
+                + accepted.value
+                + b'"\ndef test_fixture():\n    pass\n',
+            ),
+            (
+                "unclosed-source-wrapper-before-declaration",
+                b"payload = (\nb'"
+                + exact_assignment
+                + b"',\ndef test_fixture():\n    pass\n",
+            ),
+            (
+                "diff-unclosed-call-before-declaration",
+                b"+configure(\n+"
+                + exact_assignment
+                + b",\n+def test_fixture():\n+    pass\n",
+            ),
+            (
+                "diff-unclosed-source-wrapper-before-declaration",
+                b"+payload = (\n+b'"
+                + exact_assignment
+                + b"',\n+def test_fixture():\n+    pass\n",
+            ),
+            (
+                "indented-declaration",
+                b'{"access_token": "'
+                + accepted.value
+                + b'"}\n    def nested_fixture():\n        pass\n',
+            ),
+            (
+                "same-line-declaration",
+                b'{"access_token": "'
+                + accepted.value
+                + b'"} def test_fixture():\n    pass\n',
+            ),
+            (
+                "decorator-is-not-a-proven-boundary",
+                b'{"access_token": "'
+                + accepted.value
+                + b'"}\n@pytest.mark.fixture\ndef test_fixture():\n    pass\n',
+            ),
+            (
+                "identifier-prefix-is-not-def",
+                exact_assignment + b"\ndefinitely(test_fixture)\n",
+            ),
         )
         for label, payload in cases:
             with self.subTest(case=label):
                 scan = workspace._scan_secret_value(
                     payload,
                     accepted_values=self.accepted,
+                    diff_surface=label.startswith("diff-"),
                 )
                 self.assertEqual(scan.blocking_rule, "generic-secret-assignment")
 
@@ -749,6 +818,137 @@ class PublicPoolScannerTest(unittest.TestCase):
         )
         self.assertIsNone(next_statement.blocking_rule)
         self.assertEqual(next_statement.accepted_counts[accepted], 1)
+
+        for label, payload, diff_surface in (
+            (
+                "standalone-def",
+                exact_assignment + b"\ndef test_fixture():\n    pass\n",
+                False,
+            ),
+            (
+                "closed-dict-def",
+                b'FIXTURE = {\n    "access_token": "'
+                + accepted.value
+                + b'"\n}\ndef test_fixture():\n    pass\n',
+                False,
+            ),
+            (
+                "closed-dict-trailing-comma-class",
+                b'FIXTURE = {\n    "access_token": "'
+                + accepted.value
+                + b'",\n}\nclass FixtureTest:\n    pass\n',
+                False,
+            ),
+            (
+                "source-wrapper-async-def",
+                b"payload = b'"
+                + exact_assignment
+                + b"'\n\n# fixture boundary\nasync def test_fixture():\n    pass\n",
+                False,
+            ),
+            (
+                "diff-closed-dict-def",
+                b'+FIXTURE = {\n+    "access_token": "'
+                + accepted.value
+                + b'",\n+}\n+def test_fixture():\n+    pass\n',
+                True,
+            ),
+            (
+                "diff-standalone-def",
+                b"+" + exact_assignment + b"\n+def test_fixture():\n+    pass\n",
+                True,
+            ),
+            (
+                "diff-hunk-closed-dict-def",
+                b"@@ -10,3 +10,6 @@ fixture\n"
+                b'+FIXTURE = {\n+    "access_token": "'
+                + accepted.value
+                + b'",\n+}\n+class FixtureTest:\n+    pass\n',
+                True,
+            ),
+        ):
+            with self.subTest(declaration_boundary=label):
+                declaration = workspace._scan_secret_value(
+                    payload,
+                    accepted_values=self.accepted,
+                    diff_surface=diff_surface,
+                )
+                self.assertIsNone(declaration.blocking_rule)
+                self.assertEqual(declaration.accepted_counts[accepted], 1)
+
+        declaration_with_adjacent_secret = workspace._scan_secret_value(
+            exact_assignment
+            + b'\ndef test_fixture(access_token="UnknownSecretValueA9Z8Y7"):\n'
+            + b"    pass\n",
+            accepted_values=self.accepted,
+        )
+        self.assertEqual(
+            declaration_with_adjacent_secret.blocking_rule,
+            "generic-secret-assignment",
+        )
+
+        declaration_payload = exact_assignment + b"\ndef test_fixture():\n    pass\n"
+        incomplete_prefix = workspace._scan_secret_value(
+            declaration_payload,
+            accepted_values=self.accepted,
+            prefix_context_complete=False,
+        )
+        self.assertEqual(
+            incomplete_prefix.blocking_rule,
+            "generic-secret-assignment",
+        )
+        with mock.patch.object(
+            workspace,
+            "MAX_SECRET_PREFIX_PROOF_BYTES",
+            len(exact_assignment),
+        ):
+            oversized_prefix = workspace._scan_secret_value(
+                declaration_payload,
+                accepted_values=self.accepted,
+            )
+        self.assertEqual(
+            oversized_prefix.blocking_rule,
+            "generic-secret-assignment",
+        )
+        exhausted_budget = workspace.SecretScanBudget(
+            workspace.MAX_SECRET_SCAN_EVENTS,
+            remaining_prefix_proof_bytes=0,
+        )
+        with self.assertRaisesRegex(ReviewError, "prefix proof limit"):
+            workspace._scan_secret_value(
+                declaration_payload,
+                accepted_values=self.accepted,
+                _event_budget=exhausted_budget,
+            )
+
+        for label, padding_size in (
+            ("after-old-first-read", 1024 * 1024 + 512),
+            ("inside-old-deferred-overlap", 1024 * 1024 - 128),
+        ):
+            with self.subTest(stream_declaration_boundary=label):
+                padding = b"#" + b"x" * padding_size + b"\n"
+                stream_payload = padding + declaration_payload
+                stream_scan = workspace._stream_secret_scan(
+                    io.BytesIO(stream_payload),
+                    size=len(stream_payload),
+                    accepted_values=self.accepted,
+                )
+                self.assertIsNone(stream_scan.blocking_rule)
+                self.assertEqual(stream_scan.accepted_counts[accepted], 1)
+
+        class ShortReadStream(io.BytesIO):
+            def read(self, size: int = -1) -> bytes:
+                return super().read(min(size, 256 * 1024))
+
+        short_read_padding = b"#" + b"x" * (1024 * 1024 + 512) + b"\n"
+        short_read_payload = short_read_padding + declaration_payload
+        short_read_scan = workspace._stream_secret_scan(
+            ShortReadStream(short_read_payload),
+            size=len(short_read_payload),
+            accepted_values=self.accepted,
+        )
+        self.assertIsNone(short_read_scan.blocking_rule)
+        self.assertEqual(short_read_scan.accepted_counts[accepted], 1)
 
         source_wrapper = workspace._scan_secret_value(
             b"payload = b'" + exact_assignment + b"'\nstate = 1\n",
