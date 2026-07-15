@@ -145,6 +145,7 @@ def start(
     prompt_file: pathlib.Path | None,
     keep_workspace: bool,
     egress_consent: str | None,
+    synthetic_secret_exemptions: tuple[str, ...] = (),
     publisher: Callable[[pathlib.Path], None] | None = None,
 ) -> pathlib.Path:
     process: subprocess.Popen[bytes] | None = None
@@ -185,6 +186,7 @@ def start(
             base_ref=base_ref,
             head_ref=head_ref,
             ownership_handoff=accept_workspace,
+            synthetic_secret_exemptions=synthetic_secret_exemptions,
             prompt_override=prompt_file,
         )
         if review is None:
@@ -199,6 +201,7 @@ def start(
             "workspace": review.to_json(),
             "keep_workspace": keep_workspace,
             "egress_consent": egress_consent,
+            "synthetic_secret_exemptions": list(synthetic_secret_exemptions),
             "stdout_path": str(stdout_path),
             "stderr_path": str(stderr_path),
             "final_path": str(state_dir / "final.txt"),

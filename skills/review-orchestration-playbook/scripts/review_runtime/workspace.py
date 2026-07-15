@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import os
 import pathlib
 import re
@@ -10,8 +13,9 @@ import subprocess
 import tempfile
 import time
 import uuid
+from collections import Counter
 from dataclasses import asdict, dataclass
-from typing import BinaryIO, Callable, Iterator
+from typing import Any, BinaryIO, Callable, Iterable, Iterator
 
 from .common import (
     TRUSTED_PATH,
@@ -26,8 +30,39 @@ from .common import (
     write_text_atomic,
 )
 from .prompt import build_review_prompt
+from .synthetic_tokens import (
+    AcceptedSyntheticValue,
+    LegacyExemption,
+    SyntheticTokenCatalog,
+    accepted_authoring_values,
+    accepted_legacy_values,
+    load_catalog,
+    resolve_legacy_exemptions,
+)
 
 
+# Provider patterns with variable-length bodies capture a complete value through 512
+# bytes, then use a 513-byte prefix branch for oversized values. Keeping every event
+# end below this overlap prevents a match start from being discarded at a read boundary.
+STREAM_SCAN_OVERLAP = 8192
+AWS_SECRET_KEY_NAME_PATTERN = rb"(?i)aws_secret_access_key"
+AWS_SECRET_KEY_PATTERN = re.compile(
+    AWS_SECRET_KEY_NAME_PATTERN
+    + rb"\s{0,256}[:=]\s{0,256}['\"]?"
+    + rb"[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])"
+)
+OVERSIZED_AWS_SECRET_KEY_GAP = re.compile(
+    AWS_SECRET_KEY_NAME_PATTERN
+    + rb"(?:\s{257}|\s{0,256}[:=]\s{257})"
+)
+OVERSIZED_JWT_PATTERN = re.compile(
+    rb"\b(?:"
+    rb"eyJ[A-Za-z0-9_-]{2049}"
+    rb"|eyJ[A-Za-z0-9_-]{8,2048}\.[A-Za-z0-9_-]{2049}"
+    rb"|eyJ[A-Za-z0-9_-]{8,2048}\.[A-Za-z0-9_-]{8,2048}\."
+    rb"[A-Za-z0-9_-]{2049}"
+    rb")"
+)
 SECRET_PATTERNS = (
     (
         "pgp-private-key",
@@ -42,28 +77,64 @@ SECRET_PATTERNS = (
     ("aws-access-key", re.compile(rb"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
     (
         "aws-secret-key",
+        AWS_SECRET_KEY_PATTERN,
+    ),
+    (
+        "anthropic-key",
         re.compile(
-            rb"(?i)aws_secret_access_key\s*[:=]\s*['\"]?"
-            rb"[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])"
+            rb"\bsk-ant-(?:[A-Za-z0-9_-]{32,512}\b|[A-Za-z0-9_-]{513})"
         ),
     ),
-    ("anthropic-key", re.compile(rb"\bsk-ant-[A-Za-z0-9_-]{32,}\b")),
-    ("openai-key", re.compile(rb"\bsk-(?:proj-)?[A-Za-z0-9_-]{32,}\b")),
+    (
+        "openai-key",
+        re.compile(
+            rb"\bsk-(?:proj-)?(?:[A-Za-z0-9_-]{32,512}\b|[A-Za-z0-9_-]{513})"
+        ),
+    ),
     (
         "github-token",
-        re.compile(rb"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{20,})\b"),
+        re.compile(
+            rb"\b(?:"
+            rb"gh[pousr]_(?:[A-Za-z0-9]{36,512}\b|[A-Za-z0-9]{513})"
+            rb"|github_pat_(?:[A-Za-z0-9_]{20,512}\b|[A-Za-z0-9_]{513})"
+            rb")"
+        ),
     ),
-    ("gitlab-token", re.compile(rb"\bglpat-[A-Za-z0-9_-]{20,}\b")),
+    (
+        "gitlab-token",
+        re.compile(rb"\bglpat-(?:[A-Za-z0-9_-]{20,512}\b|[A-Za-z0-9_-]{513})"),
+    ),
     ("google-api-key", re.compile(rb"\bAIza[0-9A-Za-z_-]{35}\b")),
     ("npm-token", re.compile(rb"\bnpm_[A-Za-z0-9]{36}\b")),
-    ("pypi-token", re.compile(rb"\bpypi-[A-Za-z0-9_-]{50,}\b")),
-    ("slack-token", re.compile(rb"\bxox[baprs]-[A-Za-z0-9-]{20,}\b")),
-    ("stripe-live-key", re.compile(rb"\bsk_live_[A-Za-z0-9]{16,}\b")),
+    (
+        "pypi-token",
+        re.compile(rb"\bpypi-(?:[A-Za-z0-9_-]{50,512}\b|[A-Za-z0-9_-]{513})"),
+    ),
+    (
+        "slack-token",
+        re.compile(rb"\bxox[baprs]-(?:[A-Za-z0-9-]{20,512}\b|[A-Za-z0-9-]{513})"),
+    ),
+    (
+        "stripe-live-key",
+        re.compile(rb"\bsk_live_(?:[A-Za-z0-9]{16,512}\b|[A-Za-z0-9]{513})"),
+    ),
+    (
+        "jwt",
+        re.compile(
+            rb"\beyJ[A-Za-z0-9_-]{8,2048}\.[A-Za-z0-9_-]{8,2048}\."
+            rb"[A-Za-z0-9_-]{8,2048}\b"
+        ),
+    ),
 )
-SECRET_KEY_PATTERN = (
+SECRET_KEY_NAME_PATTERN = (
     rb"(?i)(?:api[_-]?(?:key|token)|access[_-]?token|auth[_-]?token|"
-    rb"bearer[_-]?token|client[_-]?secret|password|passwd|private[_-]?token|"
-    rb"refresh[_-]?token|secret[_-]?(?:key|token))['\"]?\s*[:=]\s*"
+    rb"bearer[_-]?token|client[_-]?secret|id[_-]?token|password|passwd|"
+    rb"private[_-]?token|"
+    rb"refresh[_-]?token|secret[_-]?(?:key|token))['\"]?"
+)
+SECRET_KEY_PATTERN = SECRET_KEY_NAME_PATTERN + rb"\s{0,256}[:=]\s{0,256}"
+OVERSIZED_SECRET_ASSIGNMENT_GAP = re.compile(
+    SECRET_KEY_NAME_PATTERN + rb"(?:\s{257}|\s{0,256}[:=]\s{257})"
 )
 QUOTED_SECRET_ASSIGNMENT = re.compile(
     SECRET_KEY_PATTERN + rb"(['\"])([^\r\n'\"]{16,512})\1"
@@ -93,6 +164,7 @@ PLACEHOLDER_SECRET_PATTERN = re.compile(
 SENSITIVE_ANYWHERE_NAMES = {
     ".git-credentials",
     ".netrc",
+    "auth.json",
     "service-account.json",
     "service_account.json",
     "token.json",
@@ -120,6 +192,10 @@ MAX_CHANGED_METADATA_BYTES = 128 * 1024 * 1024
 MAX_CHANGED_ENTRIES = 100_000
 MAX_CHANGED_BLOB_SCAN_BYTES = 512 * 1024 * 1024
 MAX_REVIEW_PROMPT_BYTES = 64 * 1024
+MAX_SYNTHETIC_EVIDENCE_BYTES = 64 * 1024
+MAX_SYNTHETIC_EVIDENCE_ENTRIES = 512
+SYNTHETIC_MANIFEST_NAME = "synthetic-secret-manifest.json"
+SYNTHETIC_CHANGED_EVIDENCE_NAME = "synthetic-changed-evidence.json"
 LONG_ALPHANUMERIC_SECRET = re.compile(rb"[A-Za-z0-9]{24,512}")
 LONG_NUMERIC_SECRET = re.compile(rb"[0-9]{16,512}")
 
@@ -148,6 +224,24 @@ class ReviewWorkspace:
             diff_file=pathlib.Path(value["diff_file"]),
             prompt_file=pathlib.Path(value["prompt_file"]),
         )
+
+
+@dataclass
+class SecretScanResult:
+    blocking_rule: str | None
+    accepted_counts: Counter[AcceptedSyntheticValue]
+    accepted_candidates: dict[AcceptedSyntheticValue, set[bytes]]
+
+    @classmethod
+    def empty(cls) -> "SecretScanResult":
+        return cls(None, Counter(), {})
+
+    def merge(self, other: "SecretScanResult") -> None:
+        if self.blocking_rule is None:
+            self.blocking_rule = other.blocking_rule
+        self.accepted_counts.update(other.accepted_counts)
+        for accepted, values in other.accepted_candidates.items():
+            self.accepted_candidates.setdefault(accepted, set()).update(values)
 
 
 def _git_environment(*, object_directory: pathlib.Path | None = None) -> dict[str, str]:
@@ -893,13 +987,54 @@ def _write_frozen_changed_paths(
         )
 
 
+def _write_bounded_json(
+    path: pathlib.Path,
+    value: dict[str, Any],
+    *,
+    label: str,
+) -> None:
+    encoded = (
+        json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    )
+    if len(encoded.encode("utf-8")) > MAX_SYNTHETIC_EVIDENCE_BYTES:
+        raise ReviewError(f"{label} exceeds the audit evidence size limit")
+    write_text_atomic(path, encoded)
+
+
+def _accepted_evidence_entry(
+    accepted: AcceptedSyntheticValue,
+    *,
+    surface: str,
+    side: str,
+    path_sha256: str,
+    occurrence_count: int,
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "catalog_version": accepted.catalog_version,
+        "kind": accepted.kind,
+        "occurrence_count": occurrence_count,
+        "path": {"sha256": path_sha256},
+        "rule": accepted.rule,
+        "side": side,
+        "surface": surface,
+        "token_id": accepted.identifier,
+        "value_sha256": accepted.value_sha256,
+    }
+    if accepted.exemption_id is not None:
+        entry["exemption_id"] = accepted.exemption_id
+    return entry
+
+
 def _scan_batch_blob(
     *,
     cat_input: BinaryIO,
     cat_output: BinaryIO,
     object_id: str,
     scanned_bytes: int,
-) -> tuple[str | None, int]:
+    accepted_values: Iterable[AcceptedSyntheticValue] = (),
+    capture_accepted_candidates: bool = False,
+) -> tuple[SecretScanResult, int]:
     cat_input.write(object_id.encode("ascii") + b"\n")
     cat_input.flush()
     header = cat_output.readline()
@@ -917,10 +1052,224 @@ def _scan_batch_blob(
         raise ReviewError("changed Git blob exceeds the per-file review scan limit")
     if size > MAX_CHANGED_BLOB_SCAN_BYTES - scanned_bytes:
         raise ReviewError("changed Git blobs exceed the total review scan limit")
-    rule = _stream_secret_rule(cat_output, size=size)
+    scan = _stream_secret_scan(
+        cat_output,
+        size=size,
+        accepted_values=accepted_values,
+        capture_accepted_candidates=capture_accepted_candidates,
+    )
     if cat_output.read(1) != b"\n":
         raise ReviewError("missing delimiter after scanned git cat-file blob")
-    return rule, scanned_bytes + size
+    return scan, scanned_bytes + size
+
+
+def _scan_frozen_tree_values(
+    *,
+    git_view: pathlib.Path,
+    object_directory: pathlib.Path,
+    commit: str,
+    accepted_values: Iterable[AcceptedSyntheticValue],
+    capture_accepted_candidates: bool = False,
+) -> SecretScanResult:
+    accepted = tuple(accepted_values)
+    result = SecretScanResult.empty()
+    environment = _git_environment(object_directory=object_directory)
+    with (
+        tempfile.TemporaryFile() as tree_stderr,
+        tempfile.TemporaryFile() as cat_stderr,
+    ):
+        tree_process = subprocess.Popen(
+            _frozen_command(
+                git_view=git_view,
+                args=("ls-tree", "-rz", "--full-tree", "-r", commit),
+            ),
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=tree_stderr,
+        )
+        try:
+            cat_process = subprocess.Popen(
+                _frozen_command(git_view=git_view, args=("cat-file", "--batch")),
+                env=environment,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=cat_stderr,
+            )
+        except BaseException:
+            _close_pipe(tree_process.stdout)
+            _stop_process(tree_process)
+            raise
+        if (
+            tree_process.stdout is None
+            or cat_process.stdin is None
+            or cat_process.stdout is None
+        ):
+            _stop_process(tree_process)
+            _stop_process(cat_process)
+            raise ReviewError("failed to create pipes for frozen Git tree scanning")
+        scanned_bytes = 0
+        scanned_entries = 0
+        try:
+            for record in _iter_nul_records(
+                tree_process.stdout,
+                byte_limit=MAX_TREE_METADATA_BYTES,
+                label="frozen Git tree scan metadata",
+            ):
+                scanned_entries += 1
+                if scanned_entries > MAX_SNAPSHOT_ENTRIES:
+                    raise ReviewError(
+                        "frozen Git tree scan exceeds the review entry-count limit"
+                    )
+                mode, object_type, object_id, _relative = _parse_tree_record(record)
+                if mode == "160000" and object_type == "commit":
+                    continue
+                if object_type != "blob":
+                    raise ReviewError(
+                        f"unsupported object in frozen Git tree scan: {object_type}"
+                    )
+                scan, scanned_bytes = _scan_batch_blob(
+                    cat_input=cat_process.stdin,
+                    cat_output=cat_process.stdout,
+                    object_id=object_id,
+                    scanned_bytes=scanned_bytes,
+                    accepted_values=accepted,
+                    capture_accepted_candidates=capture_accepted_candidates,
+                )
+                result.merge(scan)
+            _close_pipe(tree_process.stdout)
+            tree_returncode = tree_process.wait()
+            _close_pipe(cat_process.stdin)
+            _close_pipe(cat_process.stdout)
+            cat_returncode = cat_process.wait()
+        except BaseException:
+            _close_pipe(cat_process.stdin)
+            _close_pipe(tree_process.stdout)
+            _close_pipe(cat_process.stdout)
+            _stop_process(tree_process)
+            _stop_process(cat_process)
+            raise
+        if tree_returncode != 0:
+            raise ReviewError(
+                "cannot enumerate frozen Git tree for synthetic-token counts: "
+                f"{_process_stderr(tree_stderr)}"
+            )
+        if cat_returncode != 0:
+            raise ReviewError(
+                "cannot scan frozen Git blobs for synthetic-token counts: "
+                f"{_process_stderr(cat_stderr)}"
+            )
+    return result
+
+
+def _legacy_count_manifest(
+    *,
+    git_view: pathlib.Path,
+    object_directory: pathlib.Path,
+    base_sha: str,
+    head_sha: str,
+    catalog: SyntheticTokenCatalog,
+    exemptions: tuple[LegacyExemption, ...],
+) -> dict[str, Any]:
+    accepted = accepted_legacy_values(catalog, exemptions)
+    if accepted:
+        base_scan = _scan_frozen_tree_values(
+            git_view=git_view,
+            object_directory=object_directory,
+            commit=base_sha,
+            accepted_values=accepted,
+            capture_accepted_candidates=True,
+        )
+        head_scan = _scan_frozen_tree_values(
+            git_view=git_view,
+            object_directory=object_directory,
+            commit=head_sha,
+            accepted_values=accepted,
+            capture_accepted_candidates=True,
+        )
+    else:
+        base_scan = SecretScanResult.empty()
+        head_scan = SecretScanResult.empty()
+    _reject_overlapping_legacy_candidates(
+        base_scan.accepted_candidates,
+        head_scan.accepted_candidates,
+    )
+    entries: list[dict[str, Any]] = []
+    for exemption in exemptions:
+        envelope_used = False
+        for token in exemption.values:
+            descriptor = next(
+                item
+                for item in accepted
+                if item.exemption_id == exemption.identifier
+                and item.identifier == token.identifier
+            )
+            base_count = base_scan.accepted_counts[descriptor]
+            head_count = head_scan.accepted_counts[descriptor]
+            envelope_used = envelope_used or base_count > 0 or head_count > 0
+            if head_count > base_count:
+                raise ReviewError(
+                    "legacy synthetic fixture count increased for "
+                    f"{token.identifier}: base={base_count}, head={head_count}"
+                )
+            entries.append(
+                {
+                    "base_count": base_count,
+                    "exemption_id": exemption.identifier,
+                    "head_count": head_count,
+                    "rule": token.rule,
+                    "token_id": token.identifier,
+                    "value_length": token.value_length,
+                    "value_sha256": token.value_sha256,
+                }
+            )
+        if not envelope_used:
+            raise ReviewError(
+                f"selected synthetic secret exemption is unused: {exemption.identifier}"
+            )
+    if len(entries) > MAX_SYNTHETIC_EVIDENCE_ENTRIES:
+        raise ReviewError("legacy synthetic fixture evidence has too many entries")
+    return {
+        "catalog_schema_version": catalog.schema_version,
+        "entries": entries,
+        "pool_version": catalog.pool_version,
+        "schema_version": 1,
+        "selected_exemptions": [item.identifier for item in exemptions],
+    }
+
+
+def _reject_overlapping_legacy_candidates(
+    *candidate_maps: dict[AcceptedSyntheticValue, set[bytes]],
+) -> None:
+    recovered: dict[AcceptedSyntheticValue, set[bytes]] = {}
+    for candidate_map in candidate_maps:
+        for descriptor, candidates in candidate_map.items():
+            if descriptor.kind != "legacy":
+                continue
+            recovered.setdefault(descriptor, set()).update(candidates)
+
+    exact_values: list[tuple[AcceptedSyntheticValue, bytes]] = []
+    for descriptor, candidates in recovered.items():
+        if len(candidates) > 1:
+            raise ReviewError(
+                "legacy synthetic fixture digest matched multiple exact values for "
+                f"{descriptor.identifier}"
+            )
+        if candidates:
+            candidate = next(iter(candidates))
+            if any(byte < 0x21 or byte > 0x7E for byte in candidate):
+                raise ReviewError(
+                    "legacy synthetic fixture value must use visible ASCII bytes for "
+                    f"{descriptor.identifier}"
+                )
+            exact_values.append((descriptor, candidate))
+    for index, (descriptor, value) in enumerate(exact_values):
+        for other_descriptor, other_value in exact_values[index + 1 :]:
+            if value in other_value or other_value in value:
+                raise ReviewError(
+                    "legacy synthetic fixture values overlap: "
+                    f"{descriptor.identifier}, {other_descriptor.identifier}"
+                )
 
 
 def _write_changed_blob_findings(
@@ -930,7 +1279,13 @@ def _write_changed_blob_findings(
     base_sha: str,
     head_sha: str,
     destination: pathlib.Path,
+    accepted_destination: pathlib.Path,
+    accepted_values: Iterable[AcceptedSyntheticValue],
 ) -> None:
+    accepted = tuple(accepted_values)
+    accepted_evidence: Counter[
+        tuple[AcceptedSyntheticValue, str, str]
+    ] = Counter()
     environment = _git_environment(object_directory=object_directory)
     with (
         tempfile.TemporaryFile() as raw_output,
@@ -994,21 +1349,27 @@ def _write_changed_blob_findings(
                         raise ReviewError(
                             f"invalid changed Git object id: {raw_object!r}"
                         ) from error
-                    rule, scanned_bytes = _scan_batch_blob(
+                    scan, scanned_bytes = _scan_batch_blob(
                         cat_input=cat_process.stdin,
                         cat_output=cat_process.stdout,
                         object_id=object_id,
                         scanned_bytes=scanned_bytes,
+                        accepted_values=accepted,
                     )
-                    if rule:
+                    if scan.blocking_rule:
                         findings_output.write(
                             side.encode("ascii")
                             + b"\0"
                             + raw_path
                             + b"\0"
-                            + rule.encode("ascii")
+                            + scan.blocking_rule.encode("ascii")
                             + b"\0"
                         )
+                    path_sha256 = hashlib.sha256(raw_path).hexdigest()
+                    for accepted_value, count in scan.accepted_counts.items():
+                        accepted_evidence[
+                            (accepted_value, side, path_sha256)
+                        ] += count
             _close_pipe(cat_process.stdin)
             _close_pipe(cat_process.stdout)
             cat_returncode = cat_process.wait()
@@ -1021,6 +1382,30 @@ def _write_changed_blob_findings(
             raise ReviewError(
                 f"cannot scan changed Git blobs: {_process_stderr(cat_error)}"
             )
+    _write_bounded_json(
+        accepted_destination,
+        {
+            "entries": [
+                _accepted_evidence_entry(
+                    accepted_value,
+                    surface="changed-blob",
+                    side=side,
+                    path_sha256=path_sha256,
+                    occurrence_count=count,
+                )
+                for (accepted_value, side, path_sha256), count in sorted(
+                    accepted_evidence.items(),
+                    key=lambda item: (
+                        item[0][1],
+                        item[0][2],
+                        item[0][0].identifier,
+                    ),
+                )
+            ],
+            "schema_version": 1,
+        },
+        label="synthetic changed-blob evidence",
+    )
 
 
 def validate_workspace_layout(review: ReviewWorkspace) -> None:
@@ -1049,9 +1434,241 @@ def validate_workspace_layout(review: ReviewWorkspace) -> None:
         )
 
 
-def validate_external_workspace(review: ReviewWorkspace) -> None:
+def _reject_duplicate_json_object(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ReviewError(f"synthetic audit evidence has duplicate key: {key}")
+        value[key] = item
+    return value
+
+
+def _read_bounded_json(path: pathlib.Path, *, label: str) -> dict[str, Any]:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ReviewError(f"cannot open {label}: {error}") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ReviewError(f"{label} must be one regular file")
+        if metadata.st_uid != os.getuid():
+            raise ReviewError(f"{label} must be owned by the current user")
+        if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise ReviewError(f"{label} must not be group or other writable")
+        if metadata.st_size > MAX_SYNTHETIC_EVIDENCE_BYTES:
+            raise ReviewError(f"{label} exceeds the audit evidence size limit")
+        chunks: list[bytes] = []
+        remaining = MAX_SYNTHETIC_EVIDENCE_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        encoded = b"".join(chunks)
+        if len(encoded) > MAX_SYNTHETIC_EVIDENCE_BYTES:
+            raise ReviewError(f"{label} exceeds the audit evidence size limit")
+        final_metadata = os.fstat(descriptor)
+        if (
+            len(encoded) != metadata.st_size
+            or (metadata.st_dev, metadata.st_ino, metadata.st_mtime_ns)
+            != (
+                final_metadata.st_dev,
+                final_metadata.st_ino,
+                final_metadata.st_mtime_ns,
+            )
+        ):
+            raise ReviewError(f"{label} changed while it was read")
+    finally:
+        os.close(descriptor)
+    try:
+        value = json.loads(
+            encoded.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_object,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReviewError(f"{label} is not valid JSON") from error
+    if not isinstance(value, dict):
+        raise ReviewError(f"{label} must be a JSON object")
+    return value
+
+
+def _load_legacy_manifest(
+    *,
+    control_dir: pathlib.Path,
+    catalog: SyntheticTokenCatalog,
+) -> tuple[
+    tuple[LegacyExemption, ...],
+    tuple[AcceptedSyntheticValue, ...],
+    dict[AcceptedSyntheticValue, tuple[int, int]],
+    list[dict[str, Any]],
+]:
+    manifest_path = control_dir / SYNTHETIC_MANIFEST_NAME
+    if not manifest_path.exists():
+        return (), (), {}, []
+    manifest = _read_bounded_json(
+        manifest_path,
+        label="synthetic secret manifest",
+    )
+    if set(manifest) != {
+        "catalog_schema_version",
+        "entries",
+        "pool_version",
+        "schema_version",
+        "selected_exemptions",
+    }:
+        raise ReviewError("synthetic secret manifest fields are invalid")
+    if (
+        type(manifest["schema_version"]) is not int
+        or manifest["schema_version"] != 1
+        or type(manifest["catalog_schema_version"]) is not int
+        or manifest["catalog_schema_version"] != catalog.schema_version
+        or manifest["pool_version"] != catalog.pool_version
+    ):
+        raise ReviewError("synthetic secret manifest catalog version is invalid")
+    selected_ids = manifest["selected_exemptions"]
+    if not isinstance(selected_ids, list) or not all(
+        isinstance(item, str) for item in selected_ids
+    ):
+        raise ReviewError("synthetic secret manifest selection is invalid")
+    exemptions = resolve_legacy_exemptions(catalog, selected_ids)
+    accepted = accepted_legacy_values(catalog, exemptions)
+    expected = {
+        (item.exemption_id, item.identifier): item
+        for item in accepted
+    }
+    raw_entries = manifest["entries"]
+    if not isinstance(raw_entries, list) or len(raw_entries) > MAX_SYNTHETIC_EVIDENCE_ENTRIES:
+        raise ReviewError("synthetic secret manifest entries are invalid")
+    counts: dict[AcceptedSyntheticValue, tuple[int, int]] = {}
+    evidence: list[dict[str, Any]] = []
+    for raw_entry in raw_entries:
+        if not isinstance(raw_entry, dict) or set(raw_entry) != {
+            "base_count",
+            "exemption_id",
+            "head_count",
+            "rule",
+            "token_id",
+            "value_length",
+            "value_sha256",
+        }:
+            raise ReviewError("synthetic secret manifest entry is malformed")
+        key = (raw_entry["exemption_id"], raw_entry["token_id"])
+        descriptor = expected.get(key)
+        if descriptor is None or descriptor in counts:
+            raise ReviewError("synthetic secret manifest entry is unknown or duplicate")
+        base_count = raw_entry["base_count"]
+        head_count = raw_entry["head_count"]
+        if (
+            type(base_count) is not int
+            or type(head_count) is not int
+            or base_count < 0
+            or head_count < 0
+            or head_count > base_count
+            or raw_entry["rule"] != descriptor.rule
+            or raw_entry["value_sha256"] != descriptor.value_sha256
+            or raw_entry["value_length"] != descriptor.value_length
+        ):
+            raise ReviewError("synthetic secret manifest entry is inconsistent")
+        counts[descriptor] = (base_count, head_count)
+        evidence.append(dict(raw_entry))
+    if set(counts) != set(accepted):
+        raise ReviewError("synthetic secret manifest does not cover its selection")
+    for exemption in exemptions:
+        if not any(
+            base_count or head_count
+            for descriptor, (base_count, head_count) in counts.items()
+            if descriptor.exemption_id == exemption.identifier
+        ):
+            raise ReviewError(
+                f"selected synthetic secret exemption is unused: {exemption.identifier}"
+            )
+    return exemptions, accepted, counts, evidence
+
+
+def _load_changed_synthetic_evidence(
+    *,
+    control_dir: pathlib.Path,
+    accepted_values: tuple[AcceptedSyntheticValue, ...],
+    required: bool,
+) -> list[dict[str, Any]]:
+    evidence_path = control_dir / SYNTHETIC_CHANGED_EVIDENCE_NAME
+    if not evidence_path.exists():
+        if required:
+            raise ReviewError("synthetic changed-blob evidence is missing")
+        return []
+    payload = _read_bounded_json(
+        evidence_path,
+        label="synthetic changed-blob evidence",
+    )
+    if set(payload) != {"entries", "schema_version"} or payload.get(
+        "schema_version"
+    ) != 1:
+        raise ReviewError("synthetic changed-blob evidence fields are invalid")
+    entries = payload["entries"]
+    if not isinstance(entries, list) or len(entries) > MAX_SYNTHETIC_EVIDENCE_ENTRIES:
+        raise ReviewError("synthetic changed-blob evidence entries are invalid")
+    descriptors = {
+        (item.kind, item.identifier, item.exemption_id): item
+        for item in accepted_values
+    }
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ReviewError("synthetic changed-blob evidence entry is malformed")
+        optional = {"exemption_id"} if "exemption_id" in entry else set()
+        if set(entry) != {
+            "catalog_version",
+            "kind",
+            "occurrence_count",
+            "path",
+            "rule",
+            "side",
+            "surface",
+            "token_id",
+            "value_sha256",
+        } | optional:
+            raise ReviewError("synthetic changed-blob evidence entry fields are invalid")
+        descriptor = descriptors.get(
+            (entry["kind"], entry["token_id"], entry.get("exemption_id"))
+        )
+        path_value = entry["path"]
+        if (
+            descriptor is None
+            or entry["catalog_version"] != descriptor.catalog_version
+            or entry["rule"] != descriptor.rule
+            or entry["value_sha256"] != descriptor.value_sha256
+            or entry["side"] not in {"base", "head"}
+            or entry["surface"] != "changed-blob"
+            or type(entry["occurrence_count"]) is not int
+            or entry["occurrence_count"] <= 0
+            or not isinstance(path_value, dict)
+            or set(path_value) != {"sha256"}
+            or not isinstance(path_value["sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", path_value["sha256"]) is None
+        ):
+            raise ReviewError("synthetic changed-blob evidence entry is inconsistent")
+    return [dict(entry) for entry in entries]
+
+
+def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     validate_workspace_layout(review)
     workspace_root = review.workspace_root.resolve(strict=True)
+    control_dir = workspace_root / ".codex-review"
+    catalog = load_catalog()
+    _exemptions, legacy_values, legacy_counts, legacy_evidence = (
+        _load_legacy_manifest(control_dir=control_dir, catalog=catalog)
+    )
+    authoring_values = accepted_authoring_values(catalog)
+    accepted_values = authoring_values + legacy_values
     for candidate in review.workspace_root.rglob("*"):
         if not candidate.is_symlink():
             continue
@@ -1075,12 +1692,36 @@ def validate_external_workspace(review: ReviewWorkspace) -> None:
 
     sensitive_findings: list[str] = []
     sensitive_finding_count = 0
+    accepted_evidence_counts: Counter[
+        tuple[AcceptedSyntheticValue, str, str, str]
+    ] = Counter()
+    frozen_head_legacy_counts: Counter[AcceptedSyntheticValue] = Counter()
 
     def record_finding(value: str) -> None:
         nonlocal sensitive_finding_count
         sensitive_finding_count += 1
         if len(sensitive_findings) < 10:
             sensitive_findings.append(value)
+
+    def record_scan(
+        scan: SecretScanResult,
+        *,
+        surface: str,
+        side: str,
+        path_bytes: bytes,
+        finding_label: str,
+        diagnostic_surface: str | None = None,
+    ) -> None:
+        if scan.blocking_rule:
+            suffix = (
+                f"; {diagnostic_surface}" if diagnostic_surface is not None else ""
+            )
+            record_finding(f"{finding_label} ({scan.blocking_rule}{suffix})")
+        path_sha256 = hashlib.sha256(path_bytes).hexdigest()
+        for accepted, count in scan.accepted_counts.items():
+            accepted_evidence_counts[
+                (accepted, surface, side, path_sha256)
+            ] += count
 
     changed_paths_file = review.workspace_root / ".codex-review/changed-paths.z"
     try:
@@ -1127,19 +1768,26 @@ def validate_external_workspace(review: ReviewWorkspace) -> None:
         raise ReviewError(
             f"cannot validate external review changed blobs: {error}"
         ) from error
+    changed_accepted_evidence = _load_changed_synthetic_evidence(
+        control_dir=control_dir,
+        accepted_values=accepted_values,
+        required=(control_dir / SYNTHETIC_MANIFEST_NAME).exists(),
+    )
     for candidate in review.workspace_root.rglob("*"):
-        relative = candidate.relative_to(review.workspace_root).as_posix()
-        path_secret_rule = _value_secret_rule(os.fsencode(relative))
+        relative_path = candidate.relative_to(review.workspace_root)
+        if relative_path.parts and relative_path.parts[0] == ".codex-review":
+            continue
+        relative = relative_path.as_posix()
+        raw_relative = os.fsencode(relative)
+        path_secret_rule = _value_secret_rule(raw_relative)
         if path_secret_rule:
             record_finding(
                 f"<redacted snapshot path> ({path_secret_rule}; path-name)"
             )
-            continue
         path_display = _redact_secret_path(relative, "snapshot path")
         path_rule = _sensitive_path_rule(relative)
         if path_rule:
             record_finding(f"{path_display} ({path_rule})")
-            continue
         if candidate.is_symlink():
             try:
                 target = os.readlink(candidate)
@@ -1150,18 +1798,64 @@ def validate_external_workspace(review: ReviewWorkspace) -> None:
                 raise ReviewError(
                     f"cannot inspect external review symlink {path_display}{error_code}"
                 ) from error
-            target_secret_rule = _value_secret_rule(os.fsencode(target))
-            if target_secret_rule:
-                record_finding(
-                    f"{path_display} -> <redacted symlink target> "
-                    f"({target_secret_rule}; symlink-target)"
-                )
+            target_scan = _scan_secret_value(
+                os.fsencode(target),
+                accepted_values=accepted_values,
+            )
+            record_scan(
+                target_scan,
+                surface="symlink-target",
+                side="head",
+                path_bytes=raw_relative,
+                finding_label=f"{path_display} -> <redacted symlink target>",
+                diagnostic_surface="symlink-target",
+            )
+            for accepted, count in target_scan.accepted_counts.items():
+                if accepted.kind == "legacy":
+                    frozen_head_legacy_counts[accepted] += count
             continue
         if not candidate.is_file():
             continue
-        secret_rule = _file_secret_rule(candidate)
-        if secret_rule:
-            record_finding(f"{path_display} ({secret_rule})")
+        scan = _file_secret_scan(candidate, accepted_values=accepted_values)
+        record_scan(
+            scan,
+            surface="frozen-head",
+            side="head",
+            path_bytes=raw_relative,
+            finding_label=path_display,
+        )
+        for accepted, count in scan.accepted_counts.items():
+            if accepted.kind == "legacy":
+                frozen_head_legacy_counts[accepted] += count
+
+    for accepted, (_base_count, expected_head_count) in legacy_counts.items():
+        actual_head_count = frozen_head_legacy_counts[accepted]
+        if actual_head_count != expected_head_count:
+            raise ReviewError(
+                "frozen head legacy synthetic fixture count changed after preparation "
+                f"for {accepted.identifier}: expected={expected_head_count}, "
+                f"actual={actual_head_count}"
+            )
+
+    diff_scan = _file_secret_scan(review.diff_file, accepted_values=accepted_values)
+    record_scan(
+        diff_scan,
+        surface="frozen-diff",
+        side="range",
+        path_bytes=b".codex-review/review.diff",
+        finding_label="review.diff",
+    )
+    prompt_scan = _file_secret_scan(
+        review.prompt_file,
+        accepted_values=authoring_values,
+    )
+    record_scan(
+        prompt_scan,
+        surface="review-prompt",
+        side="generated",
+        path_bytes=b".codex-review/review.prompt",
+        finding_label="review.prompt",
+    )
     if sensitive_finding_count:
         summary = ", ".join(sensitive_findings)
         if sensitive_finding_count > len(sensitive_findings):
@@ -1170,6 +1864,45 @@ def validate_external_workspace(review: ReviewWorkspace) -> None:
             "sensitive content preflight blocked external review; remove or narrow "
             f"these paths before egress: {summary}"
         )
+
+    accepted_evidence = list(changed_accepted_evidence)
+    accepted_evidence.extend(
+        _accepted_evidence_entry(
+            accepted,
+            surface=surface,
+            side=side,
+            path_sha256=path_sha256,
+            occurrence_count=count,
+        )
+        for (accepted, surface, side, path_sha256), count in sorted(
+            accepted_evidence_counts.items(),
+            key=lambda item: (
+                item[0][1],
+                item[0][2],
+                item[0][3],
+                item[0][0].identifier,
+            ),
+        )
+    )
+    if len(accepted_evidence) > MAX_SYNTHETIC_EVIDENCE_ENTRIES:
+        raise ReviewError("accepted synthetic-token evidence has too many entries")
+    evidence = {
+        "synthetic_tokens": {
+            "accepted": accepted_evidence,
+            "catalog_schema_version": catalog.schema_version,
+            "legacy_counts": legacy_evidence,
+            "pool_version": catalog.pool_version,
+        }
+    }
+    encoded_evidence = json.dumps(
+        evidence,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    if len(encoded_evidence) > MAX_SYNTHETIC_EVIDENCE_BYTES:
+        raise ReviewError("synthetic-token preflight evidence exceeds the size limit")
+    return evidence
 
 
 def _redact_secret_path(value: str, label: str) -> str:
@@ -1212,10 +1945,19 @@ def _sensitive_path_rule(relative: str) -> str | None:
     return None
 
 
-def _file_secret_rule(path: pathlib.Path) -> str | None:
+def _file_secret_scan(
+    path: pathlib.Path,
+    *,
+    accepted_values: Iterable[AcceptedSyntheticValue] = (),
+    capture_accepted_candidates: bool = False,
+) -> SecretScanResult:
     try:
         with path.open("rb") as handle:
-            return _stream_secret_rule(handle)
+            return _stream_secret_scan(
+                handle,
+                accepted_values=accepted_values,
+                capture_accepted_candidates=capture_accepted_candidates,
+            )
     except OSError as error:
         path_display = _redact_secret_path(os.fspath(path), "snapshot path")
         error_code = f" (errno {error.errno})" if error.errno is not None else ""
@@ -1224,45 +1966,144 @@ def _file_secret_rule(path: pathlib.Path) -> str | None:
         ) from error
 
 
-def _stream_secret_rule(stream: BinaryIO, *, size: int | None = None) -> str | None:
-    overlap = 4096
-    pending = b""
-    remaining = size
-    finding: str | None = None
-    while remaining is None or remaining > 0:
-        read_size = 1024 * 1024 if remaining is None else min(1024 * 1024, remaining)
-        chunk = stream.read(read_size)
-        if not chunk:
-            if remaining not in (None, 0):
-                raise ReviewError("unexpected end of Git blob during sensitive scan")
-            break
-        if remaining is not None:
-            remaining -= len(chunk)
-        if finding is None:
-            finding = _value_secret_rule(pending + chunk)
-        pending = (pending + chunk)[-overlap:]
-    return finding
+def _file_secret_rule(path: pathlib.Path) -> str | None:
+    return _file_secret_scan(path).blocking_rule
 
 
-def _value_secret_rule(value: bytes) -> str | None:
+def _iter_secret_events(
+    value: bytes,
+) -> Iterator[tuple[str, bytes | None, int, bool]]:
     for rule, pattern in SECRET_PATTERNS:
-        if pattern.search(value):
-            return rule
-    if OVERSIZED_QUOTED_SECRET_ASSIGNMENT.search(
-        value
-    ) or OVERSIZED_UNQUOTED_SECRET_ASSIGNMENT.search(value):
-        return "generic-secret-assignment"
+        for match in pattern.finditer(value):
+            yield rule, match.group(0), match.end(), True
+    for rule, pattern in (
+        ("aws-secret-key", OVERSIZED_AWS_SECRET_KEY_GAP),
+        ("jwt", OVERSIZED_JWT_PATTERN),
+        ("generic-secret-assignment", OVERSIZED_SECRET_ASSIGNMENT_GAP),
+    ):
+        for match in pattern.finditer(value):
+            yield rule, None, match.end(), False
+    for pattern in (
+        OVERSIZED_QUOTED_SECRET_ASSIGNMENT,
+        OVERSIZED_UNQUOTED_SECRET_ASSIGNMENT,
+    ):
+        for match in pattern.finditer(value):
+            yield "generic-secret-assignment", None, match.end(), False
     for match in QUOTED_SECRET_ASSIGNMENT.finditer(value):
-        candidate = match.group(2).lower()
-        if not _is_placeholder_secret(candidate):
-            return "generic-secret-assignment"
+        candidate = match.group(2)
+        if not _is_placeholder_secret(candidate.lower()):
+            yield "generic-secret-assignment", candidate, match.end(), True
     for match in UNQUOTED_SECRET_ASSIGNMENT.finditer(value):
         candidate = match.group(1)
         if not _is_placeholder_secret(
             candidate.lower()
         ) and _looks_like_unquoted_secret(candidate):
-            return "generic-secret-assignment"
-    return None
+            yield "generic-secret-assignment", candidate, match.end(), True
+
+
+def _scan_secret_value(
+    value: bytes,
+    *,
+    accepted_values: tuple[AcceptedSyntheticValue, ...] = (),
+    minimum_end: int = 0,
+    maximum_end: int | None = None,
+    capture_accepted_candidates: bool = False,
+) -> SecretScanResult:
+    result = SecretScanResult.empty()
+    upper = len(value) if maximum_end is None else maximum_end
+    for rule, candidate, end, may_accept in _iter_secret_events(value):
+        if not minimum_end < end <= upper:
+            continue
+        matches: list[AcceptedSyntheticValue] = []
+        if may_accept and candidate is not None:
+            candidate_digest: str | None = None
+            for accepted in accepted_values:
+                if accepted.rule != rule:
+                    continue
+                if accepted.value is not None:
+                    matches_exactly = candidate == accepted.value
+                elif len(candidate) == accepted.value_length:
+                    if candidate_digest is None:
+                        candidate_digest = hashlib.sha256(candidate).hexdigest()
+                    matches_exactly = hmac.compare_digest(
+                        candidate_digest,
+                        accepted.value_sha256,
+                    )
+                else:
+                    matches_exactly = False
+                if matches_exactly:
+                    matches.append(accepted)
+        if len(matches) > 1:
+            raise ReviewError(
+                "synthetic token catalog produced an ambiguous scanner match"
+            )
+        if matches:
+            accepted = matches[0]
+            result.accepted_counts[accepted] += 1
+            if capture_accepted_candidates:
+                result.accepted_candidates.setdefault(accepted, set()).add(candidate)
+        elif result.blocking_rule is None:
+            result.blocking_rule = rule
+    return result
+
+
+def _stream_secret_scan(
+    stream: BinaryIO,
+    *,
+    size: int | None = None,
+    accepted_values: Iterable[AcceptedSyntheticValue] = (),
+    capture_accepted_candidates: bool = False,
+) -> SecretScanResult:
+    overlap = STREAM_SCAN_OVERLAP
+    accepted = tuple(accepted_values)
+    pending = b""
+    pending_offset = 0
+    total_read = 0
+    committed_end = 0
+    remaining = size
+    result = SecretScanResult.empty()
+    while True:
+        if remaining == 0:
+            chunk = b""
+        else:
+            read_size = (
+                1024 * 1024 if remaining is None else min(1024 * 1024, remaining)
+            )
+            chunk = stream.read(read_size)
+        if not chunk and remaining not in (None, 0):
+            raise ReviewError("unexpected end of Git blob during sensitive scan")
+        if remaining is not None:
+            remaining -= len(chunk)
+        pending += chunk
+        total_read += len(chunk)
+        at_end = not chunk or remaining == 0
+        next_committed_end = total_read if at_end else max(0, total_read - overlap)
+        local_minimum = max(0, committed_end - pending_offset)
+        local_maximum = max(0, next_committed_end - pending_offset)
+        result.merge(
+            _scan_secret_value(
+                pending,
+                accepted_values=accepted,
+                minimum_end=local_minimum,
+                maximum_end=local_maximum,
+                capture_accepted_candidates=capture_accepted_candidates,
+            )
+        )
+        committed_end = next_committed_end
+        if at_end:
+            break
+        retain_from = max(pending_offset, committed_end - overlap)
+        pending = pending[retain_from - pending_offset :]
+        pending_offset = retain_from
+    return result
+
+
+def _stream_secret_rule(stream: BinaryIO, *, size: int | None = None) -> str | None:
+    return _stream_secret_scan(stream, size=size).blocking_rule
+
+
+def _value_secret_rule(value: bytes) -> str | None:
+    return _scan_secret_value(value).blocking_rule
 
 
 def _is_placeholder_secret(candidate: bytes) -> bool:
@@ -1314,12 +2155,142 @@ def _validate_prompt_size(prompt: str) -> None:
         )
 
 
+def _canonical_github_repository(remote_url: str) -> str | None:
+    patterns = (
+        r"https://github\.com/([^/]+/[^/]+?)(?:\.git)?/?$",
+        r"git@github\.com:([^/]+/[^/]+?)(?:\.git)?$",
+        r"ssh://git@github\.com/([^/]+/[^/]+?)(?:\.git)?/?$",
+    )
+    for pattern in patterns:
+        match = re.fullmatch(pattern, remote_url.strip())
+        if match:
+            return match.group(1)
+    return None
+
+
+def audit_legacy_exemption(
+    *,
+    repo: pathlib.Path,
+    ref: str,
+    exemption: LegacyExemption,
+) -> dict[str, Any]:
+    source_root = resolve_repo_root(repo)
+    tip = resolve_commit(source_root, ref, label="audited master ref")
+    if tip != exemption.verified_master_tip:
+        raise ReviewError(
+            "audited master ref does not match the catalog's verified master tip"
+        )
+    origin_result = _git(
+        source_root,
+        "config",
+        "--get",
+        "remote.origin.url",
+        check=False,
+    )
+    if origin_result.returncode != 0:
+        raise ReviewError("cannot verify the audited repository origin")
+    try:
+        origin_url = origin_result.stdout.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise ReviewError("audited repository origin is not valid UTF-8") from error
+    origin = _canonical_github_repository(origin_url)
+    if origin != exemption.repository:
+        raise ReviewError(
+            "audited repository origin does not match the catalog provenance"
+        )
+
+    catalog = load_catalog()
+    if catalog.legacy_exemption(exemption.identifier) != exemption:
+        raise ReviewError("legacy exemption changed while the audit was prepared")
+    accepted = accepted_legacy_values(catalog, (exemption,))
+    descriptors = {item.identifier: item for item in accepted}
+    evidence: list[dict[str, Any]] = []
+    candidate_maps: list[dict[AcceptedSyntheticValue, set[bytes]]] = []
+
+    with tempfile.TemporaryDirectory(prefix="synthetic-token-master-audit-") as raw:
+        container = pathlib.Path(raw)
+        git_view, object_directory = _create_sanitized_git_view(
+            source_root=source_root,
+            container=container,
+        )
+        by_commit: dict[str, list[AcceptedSyntheticValue]] = {}
+        for token in exemption.values:
+            ancestor = _git(
+                source_root,
+                "merge-base",
+                "--is-ancestor",
+                token.containing_commit,
+                tip,
+                check=False,
+            )
+            if ancestor.returncode != 0:
+                raise ReviewError(
+                    "legacy provenance commit is not an ancestor of the verified master tip: "
+                    f"{token.identifier}"
+                )
+            by_commit.setdefault(token.containing_commit, []).append(
+                descriptors[token.identifier]
+            )
+        for commit, commit_descriptors in sorted(by_commit.items()):
+            scan = _scan_frozen_tree_values(
+                git_view=git_view,
+                object_directory=object_directory,
+                commit=commit,
+                accepted_values=commit_descriptors,
+                capture_accepted_candidates=True,
+            )
+            candidate_maps.append(scan.accepted_candidates)
+            for descriptor in sorted(
+                commit_descriptors,
+                key=lambda item: item.identifier,
+            ):
+                token = next(
+                    item
+                    for item in exemption.values
+                    if item.identifier == descriptor.identifier
+                )
+                count = scan.accepted_counts[descriptor]
+                captured = scan.accepted_candidates.get(descriptor, set())
+                if count != token.source_occurrences or len(captured) != 1:
+                    raise ReviewError(
+                        "legacy master provenance occurrence evidence does not match "
+                        f"the catalog for {token.identifier}"
+                    )
+                evidence.append(
+                    {
+                        "containing_commit": commit,
+                        "rule": token.rule,
+                        "source_occurrences": count,
+                        "token_id": token.identifier,
+                        "value_length": token.value_length,
+                        "value_sha256": token.value_sha256,
+                    }
+                )
+    _reject_overlapping_legacy_candidates(*candidate_maps)
+    if len(evidence) > MAX_SYNTHETIC_EVIDENCE_ENTRIES:
+        raise ReviewError("legacy master audit evidence has too many entries")
+    result = {
+        "exemption_id": exemption.identifier,
+        "match": exemption.match,
+        "repository": exemption.repository,
+        "status": "verified",
+        "values": sorted(evidence, key=lambda item: item["token_id"]),
+        "verified_master_tip": tip,
+    }
+    if len(
+        json.dumps(result, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ) > MAX_SYNTHETIC_EVIDENCE_BYTES:
+        raise ReviewError("legacy master audit evidence exceeds the size limit")
+    return result
+
+
 def prepare_workspace(
     *,
     repo: pathlib.Path,
     base_ref: str,
     head_ref: str,
     ownership_handoff: Callable[[ReviewWorkspace], None],
+    synthetic_secret_exemptions: tuple[str, ...] = (),
     prompt_override: pathlib.Path | None = None,
 ) -> ReviewWorkspace:
     source_root = resolve_repo_root(repo)
@@ -1329,6 +2300,15 @@ def prepare_workspace(
         source_root,
         base_sha=base_sha,
         head_sha=head_sha,
+    )
+    catalog = load_catalog()
+    selected_exemptions = resolve_legacy_exemptions(
+        catalog,
+        synthetic_secret_exemptions,
+    )
+    accepted_values = accepted_authoring_values(catalog) + accepted_legacy_values(
+        catalog,
+        selected_exemptions,
     )
     container, handoff_mask = _new_container(source_root)
     ownership_transferred = False
@@ -1364,6 +2344,19 @@ def prepare_workspace(
                 "the frozen head uses the reserved top-level .codex-review path"
             )
         control_dir.mkdir()
+        synthetic_manifest = _legacy_count_manifest(
+            git_view=git_view,
+            object_directory=object_directory,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            catalog=catalog,
+            exemptions=selected_exemptions,
+        )
+        _write_bounded_json(
+            control_dir / SYNTHETIC_MANIFEST_NAME,
+            synthetic_manifest,
+            label="synthetic secret manifest",
+        )
         changed_paths_file = control_dir / "changed-paths.z"
         _write_frozen_changed_paths(
             git_view=git_view,
@@ -1379,6 +2372,8 @@ def prepare_workspace(
             base_sha=base_sha,
             head_sha=head_sha,
             destination=changed_blob_findings,
+            accepted_destination=control_dir / SYNTHETIC_CHANGED_EVIDENCE_NAME,
+            accepted_values=accepted_values,
         )
         diff_file = control_dir / "review.diff"
         _write_frozen_diff(

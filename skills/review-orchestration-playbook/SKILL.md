@@ -42,6 +42,7 @@ Capacity, overload, rate limits, timeouts, network errors, 5xx responses, missin
 
 3. Run local lanes.
 - Use `$HOME/.codex/skills/review-orchestration-playbook/scripts/isolated_review`.
+- When source or tests need credential-shaped fixtures, use `$synthetic-token-fixtures` to select an exact authoring token from the helper-owned catalog. Canonical tokens suppress only their declared scanner rule; credential-like paths and every other rule remain blocking.
 - Start one stateful helper run per logical reviewer: `--reviewer codex` and, for double/triple review, `--reviewer claude`.
 - A Claude-family run must also pass `--egress-consent double-review`, `--egress-consent triple-review`, or `--egress-consent explicit-claude-review`, matching the user's request. This makes the authorization visible in the command and saved state.
 - `explicit-claude-review` authorizes only Anthropic Claude Code. Only `double-review` and `triple-review` authorize GitHub Copilot fallback when Claude Code is unavailable, has no usable local/API authentication, or all pinned Claude models are entitlement-blocked.
@@ -84,6 +85,7 @@ Read [helper-contract.md](references/helper-contract.md) before modifying or deb
 - [github-pr-probes.md](references/github-pr-probes.md): bounded `gh` probes.
 - [egress-consent.md](references/egress-consent.md): scoped review egress rules.
 - [cbth-agent-delivery.md](references/cbth-agent-delivery.md): long-running task recovery.
+- [synthetic-token-fixtures.md](references/synthetic-token-fixtures.md): catalog authority, threat model, legacy migration, and bounded evidence.
 
 ## Guardrails
 
@@ -95,4 +97,5 @@ Read [helper-contract.md](references/helper-contract.md) before modifying or deb
 - Do not let model aliases or global defaults override the pinned policy.
 - Do not start another reviewer from a findings-only review child.
 - Do not claim a clean result without a terminal artifact for every requested logical lane.
+- Do not invent token variants or use a legacy exemption for new fixtures. `--synthetic-secret-exemption` is an explicit, count-monotonic migration bridge for master-proven historical values only.
 - Do not restore compatibility skill aliases. This migration intentionally removes the old skill entrypoints; update repository and release call sites to `review-orchestration-playbook` instead of relying on discovery-time redirection.

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Synthetic Token Fixtures"
+  short_description: "Choose exact review-safe synthetic credential fixtures"
+  default_prompt: "Use $synthetic-token-fixtures to choose exact helper-approved values for credential-like test fixtures."

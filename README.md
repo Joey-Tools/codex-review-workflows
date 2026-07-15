@@ -1,8 +1,10 @@
 # Codex Review Workflows
 
-Public review orchestration and local delivery gate skills.
+Public review orchestration, synthetic fixture selection, and local delivery gate skills.
 
 `review-orchestration-playbook` is the single entrypoint for pinned local Codex review, Claude-family double review, GitHub Codex triple review, and PR readiness.
+
+`synthetic-token-fixtures` selects exact authoring values from the review helper's fixed finite catalog. The helper catalog remains the only enforcement authority; skill templates contain placeholders only.
 
 ## Test
 
