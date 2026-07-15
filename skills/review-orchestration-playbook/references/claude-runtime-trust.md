@@ -36,9 +36,11 @@ is supported only when every applicable gate below passes.
   dependency. It verifies the Anthropic signature but is not itself evidence of
   Anthropic publisher provenance. Retain its stable descriptor, copy it into a
   fresh private GPG home below an explicit helper-owned `0700` root, and run all
-  GPG operations only through the resulting mode-`0500` execution snapshot. On
-  WSL2, prove that root and its complete path chain are Linux-native before
-  creating the home and before every GPG call.
+  GPG operations only through the resulting mode-`0500` execution snapshot.
+  Copying the main executable does not freeze the dynamic libraries loaded by
+  that snapshot, so capture every non-sealed runtime dependency branch once and
+  revalidate it before every GPG call. On WSL2, prove the private root,
+  complete root path chain, loader, and dependency paths are Linux-native.
 - Run GPG and Linux security-sensitive host tools with explicit minimal
   environments. Do not inherit loader, shell-startup, compiler, or toolchain
   override variables from the caller.
@@ -85,10 +87,12 @@ explicitly configured Claude Code candidate:
    fresh private execution snapshot below a helper-owned root. On WSL2, reject
    Windows-backed provenance for the root, its resolved target, and every parent
    before creation and recheck the same identities and mount provenance before
-   every GPG call. Use only the snapshot to decode the key, list its fingerprint,
-   and verify the detached signature. Strictly parse the signed manifest and
-   compare the installed binary's SHA-256 with the checksum for the detected
-   platform and architecture.
+   every GPG call. Capture the GPG snapshot's recursive dynamic dependency
+   closure under the platform-specific host-tool policy and revalidate the
+   complete closure before each call. Use only the snapshot to decode the key,
+   list its fingerprint, and verify the detached signature. Strictly parse the
+   signed manifest and compare the installed binary's SHA-256 with the checksum
+   for the detected platform and architecture.
 6. Copy the verified source into a helper-owned, current-user-only snapshot,
    rehash the copy against the signed size and SHA-256, publish it atomically as
    a checksum-keyed `0500` executable, and revalidate it before reuse. The source
@@ -149,21 +153,23 @@ Verify the detached signature before trusting any manifest field. Parse the
 bounded JSON with duplicate-key rejection, select one exact platform entry, and
 compare the local binary's size and SHA-256 with that signed entry.
 
-The signature verifier is resolved only from fixed native paths:
+The signature verifier is resolved only from fixed native paths. Linux and
+WSL2 accept only root-owned system GPG; macOS may additionally accept a
+same-user Homebrew installation:
 
 ```text
-/usr/bin/gpg{,2}
-/usr/local/bin/gpg{,2}
-/opt/homebrew/bin/gpg{,2}
+Linux/WSL2: /usr/bin/gpg{,2}
+macOS:      /usr/bin/gpg{,2}, /usr/local/bin/gpg{,2}, /opt/homebrew/bin/gpg{,2}
 ```
 
 The resolved source must be a native executable regular file owned by root or
-the current user and must not itself be group- or world-writable. Its file
-identity and complete parent path identity must remain stable across inspection,
-and world-writable parents are rejected. Group-writable parent directories are
-deliberately permitted for current-user Homebrew layouts; this is an explicit
-same-user host-tool trust boundary, not a claim that the GPG program came from
-Anthropic.
+the current user on macOS, or root on Linux/WSL2, and must not itself be group-
+or world-writable. Its file identity and complete parent path identity must
+remain stable across inspection. Every parent must be owned by root or the
+current user, and group/world-writable parents are rejected except for canonical
+macOS Homebrew directories owned by root or the current user and group-writable
+only by the exact `admin` group. Homebrew `admin` membership is therefore an
+explicit macOS host TCB boundary, not evidence that GPG came from Anthropic.
 
 The helper does not execute that replaceable source path. It opens the validated
 source with no-follow semantics, keeps the stable descriptor, and copies from
@@ -180,6 +186,48 @@ one snapshot. The selected fixed source path, not the ephemeral snapshot, is
 recorded as `gpg_verifier`, alongside `gpg_verifier_trust:
 fixed-path-native-host-tool` and separately from `publisher_provenance:
 anthropic-signed-manifest`.
+
+The execution snapshot freezes the inspected main GPG file but does not freeze
+what the platform dynamic loader opens later. On macOS, fixed root-owned
+`/usr/bin/otool` recursively inspects the snapshot's Mach-O dependency closure.
+Sealed `/usr/lib/**` and `/System/Library/**` endpoints remain part of the macOS
+platform TCB. The main executable must contain exactly one
+`LC_LOAD_DYLINKER` naming `/usr/lib/dyld`, and dependency images may not contain
+that command. Every non-sealed endpoint must remain below canonical
+`/opt/homebrew/{opt,Cellar}` or `/usr/local/{opt,Cellar}` roots; unresolved
+dyld-relative references, `LC_RPATH`, `LC_DYLD_ENVIRONMENT`, path escapes, an
+untrusted owner, and group/world-writable dependency files are rejected. Both
+the lexical symlink chain and resolved file chain are captured. Homebrew parent
+directories may use only the explicit `admin` group-write exception above.
+After the fixed tool passes its metadata prerequisite, an `otool` launch error
+or nonzero inspection result is inconclusive and cannot authorize fallback.
+
+On Linux and WSL2, the private snapshot copied from the root-owned fixed-path GPG
+source is inspected only after that source is trusted. Stable-descriptor ELF64
+inspection requires the loader-visible `PT_DYNAMIC` address, memory, and file-
+backed ranges to map consistently through exactly one `PT_LOAD` at byte and
+loader-page granularity. Every load must keep its file/virtual page offsets
+congruent, and no other page-rounded load mapping may cover the dynamic table.
+Only then does the helper reject `DT_RPATH`, `DT_RUNPATH`, `DT_AUDIT`, and
+`DT_DEPAUDIT` in the snapshot and every dependency. This prevents a malformed
+alternate or page-overlaid dynamic table, redirected loader search, or ELF audit
+modules from adding code outside the captured closure. The static dynamic-table
+check completes before fixed root-owned `ldd` may collect the exact loader/shared-
+library closure. The
+helper captures both each loader-visible lexical symlink chain and its resolved
+root-owned, non-group/world-writable endpoint. Before every call it first
+revalidates every old identity, then reruns `ldd`, reparses the complete ELF
+closure, and requires the refreshed closure to equal the original structure.
+Only the private snapshot identity may traverse a root-owned exact-`01777`
+system-temp ancestor. Its non-final directory identities retain stable
+device/inode/type/mode/owner/group anchors but deliberately ignore entry-count
+and timestamp churn while the same GPG operation creates keyrings, locks, and
+other sibling files. The final snapshot executable retains its complete
+identity; `ldd` and dependency chains also retain complete identities and may
+not traverse writable ancestors. WSL2 proves the old and refreshed snapshot,
+`ldd`, lexical, and resolved paths have Linux-native mount provenance. A changed
+or unreadable identity/closure is inconclusive, while a stable unsafe owner,
+mode, path, or load-command policy is blocked.
 
 Each GPG call receives only its isolated home, fixed locale, and fixed system
 path. Inherited `LD_*`, `DYLD_*`, shell-startup, compiler, and toolchain override
@@ -256,6 +304,21 @@ handling. Reject negated, duplicated, internally contradictory, or weakened
 semantics. Accept harmless wording, wrapping, punctuation, and ordering changes
 when those required and forbidden meanings remain unambiguous.
 
+The customization-disablement evidence is a bounded whole-sentence positive
+grammar, not unordered keyword presence. The accepted claim must state that all
+of the enumerated customizations start, are, remain, or stay disabled, optionally
+for a bounded whole-review/session duration. The exact upstream
+troubleshooting-purpose suffix remains accepted because it does not add a
+runtime predicate. Temporal transitions such as executing before disablement
+or restoring after startup are rejected even when the same sentence also
+contains every required noun and the word `disabled`. Every sentence in the
+option block is default-denied unless it independently matches one bounded
+grammar for customization disablement, managed-policy preservation, runtime
+preservation, the exact environment assignment, a positive safe-mode self or
+anaphoric claim, or a bounded documentation/information topic that remains
+available online. This avoids relying on open-ended lists of customization names
+or unsafe verbs such as `restore`, `honor`, or `enable`.
+
 Treat each required meaning as a bounded positive claim rather than a bag of
 substrings. Required terms use token or phrase boundaries; unrelated sentences
 may use harmless negation, but a relevant sentence fails closed on negation,
@@ -289,15 +352,24 @@ The Claude lane supports only these helper enforcement shapes:
 - **Linux:** a native ELF Claude Code binary inside a helper-generated
   `bubblewrap` sandbox, with `socat` available for the helper-controlled network
   relay.
-- **WSL2:** the Linux ELF and `bubblewrap`/`socat` path, after positively
-  identifying WSL2 from a WSL2 kernel marker, `/run/WSL`, or a validated
-  `WSL_INTEROP` endpoint. Environment strings and the generic binfmt marker are
-  only weak signals and cannot authorize WSL2 support by themselves. The
-  runtime-marker alternatives preserve detection when a WSL2 `customKernel`
-  supplies a user-chosen release string.
+- **WSL2:** the Linux ELF and `bubblewrap`/`socat` path, only after the kernel
+  release or version contains an explicit `wsl2` or `microsoft-standard`
+  identity marker. `/run/WSL`, any nonempty `WSL_INTEROP` value (including an
+  invalid or missing endpoint), distro environment, the generic binfmt marker,
+  and a generic `microsoft` kernel identity are conservative weak WSL-presence
+  evidence. They cannot authorize WSL2 support, and ambiguous or spoofed state
+  may therefore fail closed as unsupported WSL1. A custom kernel without a
+  recognizable WSL2 marker is unsupported whenever one of those weak signals
+  remains. If a
+  guest also removes every weak signal, it is observationally indistinguishable
+  from native Linux and follows that classification. The shared Linux/WSL mount
+  guard therefore rejects positive DrvFS/Windows provenance independently of
+  WSL classification; positively identified WSL2 additionally requires proven
+  local native Linux backing.
 
 Native executable-shape checks reject interpreter wrappers and incompatible
-artifacts; they do not prove publisher identity. Linux reads ELF metadata from a
+artifacts; they do not prove publisher identity or distinguish every possible
+native launcher from the publisher artifact. Linux reads ELF metadata from a
 no-follow descriptor with exact-size reads and compares descriptor metadata
 before and after parsing. A stable malformed or truncated artifact is invalid,
 while an in-range short read, descriptor I/O error, or metadata change is
@@ -308,9 +380,9 @@ and SHA-256.
 WSL1 and native Windows are unsupported because this helper contract does not
 provide an enforceable outer sandbox for them. Do not silently run Claude Code
 without the outer sandbox. Missing Seatbelt, `bubblewrap`, `socat`, required
-namespace support, or another enforcement prerequisite is runtime unavailability
-for an automatically discovered candidate and a configuration error for an
-explicit override.
+namespace support, trusted GPG, trusted `rg`, or another secure-runtime
+prerequisite is runtime unavailability for an automatically discovered candidate
+and a blocked configuration error for an explicit override.
 
 WSL2 must keep the discovered Claude executable, local-login credential source,
 frozen review/state container, and helper runtime state on the WSL Linux
@@ -510,9 +582,9 @@ described as an enforced final launch.
 | Condition | Terminal classification | Copilot fallback |
 | --- | --- | --- |
 | No automatic candidate, supported platform unavailable, accepted-range candidate lacks a required non-security capability, or usable local/API authentication is absent | `runtime-unavailable` or `auth-unavailable` | Only for explicit double/triple-review consent |
-| Explicit override has the wrong version, platform, binary shape, or capability contract | `blocked` configuration error | No |
+| Explicit override has the wrong version, platform, binary shape, capability contract, or lacks trusted GPG, probe sandbox, or trusted review tool prerequisites | `blocked` configuration error | No |
 | Wrong publisher fingerprint, invalid signature, checksum mismatch, contradictory safe-mode semantics, unsafe credential metadata, or an isolation-boundary mismatch | `blocked` security error | No |
-| Manifest/probe timeout, output overflow, I/O failure, file race, transient network failure, capacity error, or missing trustworthy terminal artifact | `inconclusive` | No |
+| Manifest/probe timeout, output overflow, executable resolve/stat I/O failure, other inspection I/O failure, file race, transient network failure, capacity error, or missing trustworthy terminal artifact | `inconclusive` | No |
 | Explicit model entitlement or organization-policy denial after runtime verification | Existing same-lane model/backend fallback policy | Only as already authorized by the lane contract |
 
 An unsupported future patch inside the version range may be treated as automatic
@@ -566,3 +638,22 @@ metadata that can act as a bearer secret, or unbounded probe output.
   sources, and per-superblock options.
 - [Microsoft WSL disk-space documentation](https://learn.microsoft.com/en-us/windows/wsl/disk-space):
   WSL2 distro VHD storage and its default ext4 filesystem.
+- [Microsoft WSL interop technical documentation](https://wsl.dev/technical-documentation/interop/):
+  `/run/WSL` and `WSL_INTEROP` select an interop server for both WSL1 and WSL2,
+  so their presence cannot identify the sandbox-capable generation.
+- [Microsoft WSL custom-kernel guide](https://learn.microsoft.com/en-us/community/content/wsl-user-msft-kernel-v6):
+  the documented custom-kernel verification output retains an explicit
+  `WSL2-Microsoft` kernel identity marker.
+- [Apple linker documentation](https://developer.apple.com/forums/tags/linker):
+  third-party executables use `/usr/lib/dyld`, selected by
+  `LC_LOAD_DYLINKER`; custom dynamic-linker support is vestigial and unsupported.
+- [GNU C Library dynamic-linker hardening](https://www.sourceware.org/glibc/manual/latest/html_node/Dynamic-Linker-Hardening.html):
+  `DT_AUDIT` and `DT_DEPAUDIT` can introduce audit-module callbacks and hooking,
+  so the host-tool closure rejects them before loader-based discovery.
+- [Linux ELF loader source](https://github.com/torvalds/linux/blob/master/fs/binfmt_elf.c):
+  `PT_LOAD` file offsets, virtual addresses, and sizes are rounded with the
+  architecture/page alignment before mapping, so dynamic-table identity must be
+  proven at page granularity rather than only over raw segment intervals.
+- [System V ELF program-header specification](https://refspecs.linuxfoundation.org/elf/gabi4%2B/ch5.pheader.html):
+  loadable segment file offsets and virtual addresses must be congruent modulo
+  the page size, and `p_filesz` may not exceed `p_memsz`.
