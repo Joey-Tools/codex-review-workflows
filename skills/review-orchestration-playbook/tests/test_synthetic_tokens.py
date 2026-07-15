@@ -44,6 +44,7 @@ AUTHORING_VALUES = tuple(
 )
 LEGACY_A = "HistoricalFixtureAccessA9Z8Y7"
 LEGACY_B = "HistoricalFixtureRefreshB8Y7X6"
+LEGACY_PRINTABLE = "Historical fixture(v1)|" + r"value,with`\punctuation"
 GITHUB_LEGACY = "ghp_" + "A" * 36
 HIGH_ENTROPY = b"Aa9!" + b"Bb8@" + b"Cc7#" + b"Dd6$" + b"Ee5%"
 
@@ -1648,6 +1649,31 @@ class CatalogValidationTest(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(ReviewError):
                 self.parse(malformed)
 
+    def test_legacy_values_accept_only_bounded_printable_ascii(self) -> None:
+        catalog = legacy_catalog(values=(LEGACY_PRINTABLE,))
+        value = catalog.legacy_exemption("historical-fixtures").values[0]
+        self.assertEqual(value.value, LEGACY_PRINTABLE.encode("ascii"))
+
+        authoring = catalog_payload()
+        authoring["authoring_pool"]["tokens"][0]["value"] = LEGACY_PRINTABLE
+        with self.assertRaisesRegex(ReviewError, "visible ASCII"):
+            self.parse(authoring)
+
+        for label, candidate in (
+            ("short", "x" * 15),
+            ("long", "x" * 513),
+            ("tab", "Historical\tFixtureValueA9Z8Y7"),
+            ("carriage-return", "Historical\rFixtureValueA9Z8Y7"),
+            ("newline", "Historical\nFixtureValueA9Z8Y7"),
+            ("null", "Historical\x00FixtureValueA9Z8Y7"),
+            ("unit-separator", "Historical\x1fFixtureValueA9Z8Y7"),
+            ("delete", "Historical\x7fFixtureValueA9Z8Y7"),
+            ("single-quote", "Historical'FixtureValueA9Z8Y7"),
+            ("double-quote", 'Historical"FixtureValueA9Z8Y7'),
+        ):
+            with self.subTest(case=label), self.assertRaises(ReviewError):
+                legacy_catalog(values=(candidate,))
+
     def test_secure_loader_rejects_symlink_hardlink_fifo_and_writable_file(
         self,
     ) -> None:
@@ -2210,6 +2236,40 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                 self.assertEqual(len(legacy_counts), 2)
                 self.assertNotIn(LEGACY_A, json.dumps(evidence, sort_keys=True))
                 self.assertNotIn(LEGACY_B, json.dumps(evidence, sort_keys=True))
+
+    def test_printable_legacy_value_passes_only_when_selected(self) -> None:
+        catalog = legacy_catalog(values=(LEGACY_PRINTABLE,))
+        repo, base = self.new_repo(
+            {"fixture.cfg": assignment_text("access_token", LEGACY_PRINTABLE)}
+        )
+        (repo / "README.md").write_text("head\n", encoding="utf-8")
+        head = self.commit(repo)
+
+        review = self.prepare(
+            repo=repo,
+            base=base,
+            head=head,
+            catalog=catalog,
+            exemptions=("historical-fixtures",),
+        )
+        evidence = self.validate(review, catalog=catalog)
+        counts = evidence["synthetic_tokens"]["legacy_counts"]
+        self.assertEqual(
+            (counts[0]["base_count"], counts[0]["head_count"]),
+            (1, 1),
+        )
+        serialized = json.dumps(evidence, sort_keys=True)
+        self.assertNotIn(LEGACY_PRINTABLE, serialized)
+        self.assertNotIn(legacy_value_base64(LEGACY_PRINTABLE), serialized)
+
+        unselected_review = self.prepare(
+            repo=repo,
+            base=base,
+            head=head,
+            catalog=catalog,
+        )
+        with self.assertRaisesRegex(ReviewError, "generic-secret-assignment"):
+            self.validate(unselected_review, catalog=catalog)
 
     def test_legacy_counts_accept_authoring_values_but_not_unknown_secrets(
         self,
@@ -2908,14 +2968,14 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             {
                 "fixture.cfg": (
                     assignment_text("access_token", AUTHORING_VALUES[0])
-                    + assignment_text("refresh_token", LEGACY_A)
+                    + assignment_text("refresh_token", LEGACY_PRINTABLE)
                 ),
-                "notes.txt": f"historical literal: {LEGACY_A}\n",
+                "notes.txt": f"historical literal: {LEGACY_PRINTABLE}\n",
             }
         )
         (repo / "fixture.cfg").write_text(
             assignment_text("access_token", AUTHORING_VALUES[0])
-            + assignment_text("refresh_token", LEGACY_A)
+            + assignment_text("refresh_token", LEGACY_PRINTABLE)
             + assignment_text("id_token", LEGACY_B),
             encoding="utf-8",
         )
@@ -2932,7 +2992,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                     {
                         "id": "historical-1",
                         "rule": "generic-secret-assignment",
-                        "value_base64": legacy_value_base64(LEGACY_A),
+                        "value_base64": legacy_value_base64(LEGACY_PRINTABLE),
                         "containing_commit": first_commit,
                         "source_occurrences": 2,
                     },
@@ -2974,7 +3034,8 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         self.assertEqual(evidence["status"], "verified")
         self.assertEqual(evidence["values"][0]["source_occurrences"], 2)
         self.assertEqual(len(evidence["values"]), 2)
-        self.assertNotIn(LEGACY_A, stdout.getvalue())
+        self.assertNotIn(LEGACY_PRINTABLE, stdout.getvalue())
+        self.assertNotIn(legacy_value_base64(LEGACY_PRINTABLE), stdout.getvalue())
         self.assertNotIn(LEGACY_B, stdout.getvalue())
 
         bad_payload = json.loads(json.dumps(payload))

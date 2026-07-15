@@ -3,7 +3,7 @@ id: 20260715-5e7a11
 title: Enforce Exact Synthetic Token Fixtures
 status: completed
 created: 2026-07-15
-updated: 2026-07-15
+updated: 2026-07-16
 branch: codex/synthetic-token-v1
 pr: 44
 supersedes: []
@@ -22,6 +22,7 @@ superseded_by:
 - Public authoring tokens cover access, refresh, ID, API-key, and bearer roles plus expired and consumed states.
 - Exact complete scanner captures may suppress only `generic-secret-assignment`; provider credentials, JWTs, private keys, adjacent values, high-entropy assignments, and credential paths remain blocking.
 - Named legacy envelopes store exact values as strict canonical Base64 plus rules and pinned master provenance. Runtime decodes exact ASCII bytes in memory, while metadata and evidence expose only digests and lengths.
+- Authoring entries retain the restricted scanner-compatible byte class, while legacy migration entries accept bounded printable ASCII so an exact historical quoted capture may include spaces or punctuation. Control bytes, newlines, non-ASCII values, and inexact scanner matches remain blocked.
 - Selected legacy entries pass only when both the complete-tree raw-byte count and the count not embedded inside a longer value from the same envelope are monotonic. The stateful runner recomputes both materialized-head counts before egress, while cross-envelope overlaps fail closed.
 - Every complete-catalog legacy raw value and canonical Base64 storage encoding is independently forbidden in base, head, and materialized repository paths through a finite linear byte matcher; diagnostics never expose the matched path or value.
 - The helper exposes read-only validate, metadata list, single-value get, exemption list, and pinned-master audit commands.
@@ -47,3 +48,7 @@ superseded_by:
 - `python3 -m py_compile skills/review-orchestration-playbook/scripts/isolated_review skills/review-orchestration-playbook/scripts/review_runtime/*.py`
 - `ruff check` and `ruff format --check` passed for the finding-repair runtime and test files.
 - `uv run --with pyyaml python /Users/hoteng/.codex/skills/.system/skill-creator/scripts/quick_validate.py <skill-path>` passed independently for both skills.
+- Printable-legacy follow-up: three focused catalog, preflight, and provenance-audit regressions passed.
+- Printable-legacy follow-up: `python3 -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py' -v` passed (`605` tests, `9` skipped).
+- Printable-legacy follow-up: `python3 -m py_compile` passed for the changed runtime and test modules; `ruff check` and `ruff format --check` passed for both files.
+- Printable-legacy follow-up: both skill validators, `isolated_review synthetic-tokens validate`, and `git diff --check` passed.
