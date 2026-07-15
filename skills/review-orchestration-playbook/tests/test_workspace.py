@@ -419,9 +419,17 @@ class WorkspaceTest(unittest.TestCase):
                     _value_secret_rule(payload),
                     "generic-secret-assignment",
                 )
-        self.assertIsNone(_value_secret_rule(b"password: example-test-secret"))
+        placeholder = b"".join((b"example-", b"test-", b"secret"))
+        self.assertIsNone(_value_secret_rule(b"password: " + placeholder))
+        self.assertIsNone(
+            _value_secret_rule(b"password: example-test-secret # placeholder")
+        )
         self.assertEqual(
-            _value_secret_rule(b"password: example-test-secret # placeholder"),
+            _value_secret_rule(
+                b"password: "
+                + placeholder
+                + b" # fixture\n  ActualOpaqueSecretA9Z8Y7\n"
+            ),
             "generic-secret-assignment",
         )
 

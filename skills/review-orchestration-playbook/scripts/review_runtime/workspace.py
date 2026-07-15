@@ -3207,6 +3207,7 @@ def _unquoted_assignment_may_accept(
     match: re.Match[bytes],
     *,
     diff_surface: bool = False,
+    allow_inline_hash_comment: bool = False,
 ) -> bool:
     cursor = match.end()
     inspected = 0
@@ -3351,9 +3352,16 @@ def _unquoted_assignment_may_accept(
         return False
     if cursor == len(value):
         return True
-    if value[cursor] in (0x23, 0x3B):
+    if value[cursor] == 0x23:
+        if not allow_inline_hash_comment or not consume_comment():
+            return False
+        if cursor == len(value):
+            return True
+        if not consume_line_break():
+            return False
+    elif value[cursor] == 0x3B:
         return False
-    if not consume_line_break():
+    elif not consume_line_break():
         return False
 
     diff_boundaries = (
@@ -3393,6 +3401,18 @@ def _unquoted_assignment_may_accept(
             if not consume_line_break():
                 return False
             continue
+        # Placeholder-only parsing may finish at source/container closers after a
+        # consumed hash comment. Canonical synthetic values never enable this path.
+        if allow_inline_hash_comment and value[cursor] in (0x29, 0x5D, 0x7D):
+            while cursor < len(value) and value[cursor] in (0x29, 0x5D, 0x7D):
+                if not advance(1):
+                    return False
+            trimmed, _width = trim_horizontal_space()
+            if not trimmed:
+                return False
+            if cursor == len(value):
+                return True
+            return consume_line_break()
         if indentation > key_indentation:
             return False
         if value.startswith((b"---", b"..."), cursor):
@@ -3467,6 +3487,13 @@ def _iter_secret_events(
             diff_surface=diff_surface,
         )
         placeholder = _is_placeholder_secret(candidate.lower())
+        if placeholder and not may_accept:
+            may_accept = _unquoted_assignment_may_accept(
+                value,
+                match,
+                diff_surface=diff_surface,
+                allow_inline_hash_comment=True,
+            )
         if (not placeholder and _looks_like_unquoted_secret(candidate)) or (
             placeholder and not may_accept
         ):
