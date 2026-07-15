@@ -1,26 +1,38 @@
 from __future__ import annotations
 
 import contextlib
-import hashlib
+import itertools
 import json
 import os
 import pathlib
 import socket
 import socketserver
 import ssl
+import stat
 import sys
 import tempfile
 import threading
 import time
-import tomllib
 import unittest
 from unittest import mock
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - exercised by Python 3.10 CI
+    import tomli as tomllib
 
 
 SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from review_runtime import common, providers, workspace as workspace_runtime  # noqa: E402
+from review_runtime import (  # noqa: E402
+    claude_capabilities,
+    claude_linux,
+    claude_provenance,
+    common,
+    providers,
+    workspace as workspace_runtime,
+)
 from review_runtime.common import Completed, ReviewError  # noqa: E402
 from review_runtime.workspace import ReviewWorkspace  # noqa: E402
 
@@ -36,15 +48,44 @@ def oauth_credential_fixture(*, expires_in_seconds: float = 7200) -> bytes:
     return json.dumps(payload).encode()
 
 
+CLAUDE_SAFE_MODE_DESCRIPTION = (
+    "Start with all customizations (CLAUDE.md, skills, plugins, hooks, MCP "
+    "servers, custom commands and agents, output styles, workflows, custom "
+    "themes, keybindings, and more) disabled. Admin-managed (policy) settings "
+    "still apply. Auth, model selection, built-in tools, and permissions work "
+    "normally. Sets CLAUDE_CODE_SAFE_MODE=1."
+)
+
+
+def claude_help_fixture(*, safe_mode: str | None = None) -> bytes:
+    safe_mode = safe_mode or CLAUDE_SAFE_MODE_DESCRIPTION
+    lines = ["Usage: claude [options]", "", "Options:"]
+    for option in claude_capabilities.CLAUDE_REQUIRED_OPTIONS:
+        if option == "--safe-mode":
+            description = safe_mode
+        elif option == "--permission-mode":
+            description = "Permission mode (choices: default, dontAsk, plan)."
+        else:
+            description = "Supported option."
+        lines.append(f"  {option} <value>  {description}")
+    return ("\n".join(lines) + "\n").encode()
+
+
 class ProviderPolicyTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         root = pathlib.Path(self.temporary.name)
+        # Security fixtures must not inherit a permissive host or CI umask.
         source_root = root / "source"
-        container = source_root / ".codex-tmp" / "isolated-review-test"
+        source_root.mkdir(mode=0o700)
+        codex_tmp = source_root / ".codex-tmp"
+        codex_tmp.mkdir(mode=0o700)
+        container = codex_tmp / "isolated-review-test"
+        container.mkdir(mode=0o700)
         workspace = container / "workspace"
+        workspace.mkdir(mode=0o700)
         control = workspace / ".codex-review"
-        control.mkdir(parents=True)
+        control.mkdir(mode=0o700)
         diff_file = control / "review.diff"
         diff_file.write_text("diff --git a/a b/a\n", encoding="utf-8")
         (control / "changed-paths.z").write_bytes(b"")
@@ -87,16 +128,17 @@ class ProviderPolicyTest(unittest.TestCase):
         self.claude_broker = (
             container / "claude-runtime" / "keychain-broker" / "security"
         )
-        self.claude_broker.parent.mkdir(parents=True)
+        self.claude_broker.parent.parent.mkdir(mode=0o700)
+        self.claude_broker.parent.mkdir(mode=0o700)
         self.claude_broker.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 32)
         self.claude_broker.chmod(0o700)
         self.claude_keychain_client = root / "host-tools" / "security"
         self.claude_ripgrep = root / "host-tools" / "rg"
+        self.claude_keychain_client.parent.mkdir(mode=0o700)
         for fixture in (
             self.claude_keychain_client,
             self.claude_ripgrep,
         ):
-            fixture.parent.mkdir(parents=True, exist_ok=True)
             fixture.write_bytes(b"fixture")
             fixture.chmod(0o700)
         self.host_dependency_patchers = (
@@ -122,12 +164,35 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
         )
         self.native_dependency_patcher.start()
-        self.require_trusted_claude_digest = providers._require_trusted_claude_digest
-        self.trusted_digest_patcher = mock.patch.object(
+        self.claude_macos_platform_key = providers._claude_macos_platform_key
+        self.macos_platform_patcher = mock.patch.object(
             providers,
-            "_require_trusted_claude_digest",
+            "_claude_macos_platform_key",
+            return_value="darwin-arm64",
         )
-        self.trusted_digest = self.trusted_digest_patcher.start()
+        self.macos_platform_patcher.start()
+        # Generic provider-policy tests exercise the macOS lane. Dedicated Linux
+        # tests opt into the Linux runtime explicitly at their narrow call site.
+        self.claude_linux_platform_patcher = mock.patch.object(
+            providers,
+            "_is_claude_linux_host",
+            return_value=False,
+        )
+        self.claude_macos_platform_patcher = mock.patch.object(
+            providers,
+            "_is_claude_macos_host",
+            return_value=True,
+        )
+        self.claude_linux_platform_patcher.start()
+        self.claude_macos_platform_patcher.start()
+        self.require_trusted_claude_release = (
+            providers._require_trusted_claude_release
+        )
+        self.trusted_release_patcher = mock.patch.object(
+            providers,
+            "_require_trusted_claude_release",
+        )
+        self.trusted_release = self.trusted_release_patcher.start()
         self.prepare_claude_keychain_broker = (
             providers._prepare_claude_keychain_broker
         )
@@ -169,7 +234,10 @@ class ProviderPolicyTest(unittest.TestCase):
         self.warmup_patcher.stop()
         self.keychain_runtime_patcher.stop()
         self.keychain_broker_patcher.stop()
-        self.trusted_digest_patcher.stop()
+        self.trusted_release_patcher.stop()
+        self.claude_macos_platform_patcher.stop()
+        self.claude_linux_platform_patcher.stop()
+        self.macos_platform_patcher.stop()
         self.native_dependency_patcher.stop()
         for patcher in reversed(self.host_dependency_patchers):
             patcher.stop()
@@ -236,12 +304,96 @@ class ProviderPolicyTest(unittest.TestCase):
                 return blocks[0] + b"\n"
         self.skipTest("no system PEM CA certificate is available")
 
+    def stable_system_ca_file(self) -> tuple[pathlib.Path, bytes]:
+        defaults = ssl.get_default_verify_paths()
+        for raw in (
+            "/etc/ssl/cert.pem",
+            "/etc/ssl/certs/ca-certificates.crt",
+            defaults.cafile,
+        ):
+            if not raw:
+                continue
+            try:
+                path = pathlib.Path(raw).resolve(strict=True)
+                material = providers._read_ca_source(
+                    path,
+                    source="test system CA",
+                )
+            except (OSError, ReviewError):
+                continue
+            return path, material
+        self.skipTest("no stable system PEM CA file is available")
+
+    def write_private_source(self, path: pathlib.Path, payload: bytes) -> None:
+        path.write_bytes(payload)
+        path.chmod(0o600)
+
+    @staticmethod
+    def host_ca_safety_rejection(error: ReviewError, *, source: str) -> bool:
+        detail = str(error)
+        return any(
+            detail.startswith(prefix)
+            and detail.removeprefix(prefix).startswith(source)
+            for prefix in (
+                "Claude review CA source has an unsafe owner: ",
+                "Claude review CA source is group- or world-writable: ",
+                "Claude review CA directory has an unsafe owner: ",
+                "Claude review CA directory is group- or world-writable: ",
+                "Claude review CA directory symlink has an unsafe owner: ",
+            )
+        )
+
     def test_capacity_wins_over_unavailable_wording(self) -> None:
         category = providers.classify_failure(
             "",
             "Selected model is temporarily unavailable because it is at capacity",
         )
         self.assertEqual(category, "transient")
+
+    def test_host_ca_skip_guard_requires_expected_source_and_safety_error(
+        self,
+    ) -> None:
+        unsafe_host_source = ReviewError(
+            "Claude review CA directory is group- or world-writable: "
+            "SSL_CERT_DIR:deadbeef.0"
+        )
+        unsafe_destination = ReviewError(
+            "Claude review CA directory is group- or world-writable: "
+            "private destination"
+        )
+        unrelated_host_failure = ReviewError(
+            "Claude review CA symlink path contains a loop: "
+            "SSL_CERT_DIR:deadbeef.0"
+        )
+        adversarial_host_failure = ReviewError(
+            "Claude review CA symlink path contains a loop: "
+            "SSL_CERT_DIR:unsafe owner.pem"
+        )
+
+        self.assertTrue(
+            self.host_ca_safety_rejection(
+                unsafe_host_source,
+                source="SSL_CERT_DIR:",
+            )
+        )
+        self.assertFalse(
+            self.host_ca_safety_rejection(
+                unsafe_destination,
+                source="SSL_CERT_DIR:",
+            )
+        )
+        self.assertFalse(
+            self.host_ca_safety_rejection(
+                unrelated_host_failure,
+                source="SSL_CERT_DIR:",
+            )
+        )
+        self.assertFalse(
+            self.host_ca_safety_rejection(
+                adversarial_host_failure,
+                source="SSL_CERT_DIR:",
+            )
+        )
 
     def test_native_macho_dependencies_rejects_interpreter_wrapper(self) -> None:
         wrapper = self.review.source_root / "rg-wrapper"
@@ -266,34 +418,74 @@ class ProviderPolicyTest(unittest.TestCase):
             tuple(dict.fromkeys((executable.absolute(), executable.resolve()))),
         )
 
-    def test_claude_digest_accepts_pinned_release_across_helper_architectures(
+    def test_claude_macho_platform_key_uses_artifact_architecture(self) -> None:
+        executable = self.review.source_root / "claude"
+        for cpu_type, expected in (
+            (0x0100000C, "darwin-arm64"),
+            (0x01000007, "darwin-x64"),
+        ):
+            with self.subTest(expected=expected):
+                executable.write_bytes(
+                    b"\xcf\xfa\xed\xfe"
+                    + cpu_type.to_bytes(4, byteorder="little")
+                    + b"\x00" * 24
+                )
+                self.assertEqual(
+                    self.claude_macos_platform_key(executable),
+                    expected,
+                )
+
+    def test_claude_macho_platform_key_rejects_wrapper_or_fat_binary(self) -> None:
+        executable = self.review.source_root / "claude"
+        executable.write_bytes(b"\xca\xfe\xba\xbe" + b"\x00" * 28)
+
+        with self.assertRaisesRegex(
+            providers.InvalidReviewerExecutable,
+            "thin 64-bit Mach-O",
+        ):
+            self.claude_macos_platform_key(executable)
+
+    def test_claude_release_provenance_maps_invalid_candidate(self) -> None:
+        with (
+            mock.patch.object(
+                providers,
+                "verify_claude_release",
+                side_effect=providers.ClaudeProvenanceInvalid("bad signature"),
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudePublisherProvenanceInvalid,
+                "bad signature",
+            ),
+        ):
+            self.require_trusted_claude_release(
+                pathlib.Path("/bin/claude"),
+                version="2.1.202",
+                platform_key="darwin-arm64",
+                gpg_temp_root=self.review.container_dir,
+            )
+
+    def test_claude_safe_mode_security_failure_is_not_candidate_unavailability(
         self,
     ) -> None:
-        executable = self.review.source_root / "claude"
-        payload = b"trusted Claude release fixture"
-        executable.write_bytes(payload)
-        expected = hashlib.sha256(payload).hexdigest()
-
         with mock.patch.object(
             providers,
-            "CLAUDE_TRUSTED_SHA256_BY_MACHINE",
-            {"arm64": "00" * 32, "x86_64": expected},
-        ):
-            self.require_trusted_claude_digest(executable)
-
-    def test_claude_digest_rejects_unpinned_native_binary(self) -> None:
-        executable = self.review.source_root / "claude"
-        executable.write_bytes(b"untrusted native fixture")
-
-        with mock.patch.object(
-            providers,
-            "CLAUDE_TRUSTED_SHA256_BY_MACHINE",
-            {"arm64": "00" * 32, "x86_64": "11" * 32},
-        ), self.assertRaisesRegex(
-            providers.InvalidReviewerExecutable,
-            "trusted macOS release digests",
-        ):
-            self.require_trusted_claude_digest(executable)
+            "_run_claude_probe",
+            return_value=Completed(
+                argv=("claude", "--help"),
+                returncode=0,
+                stdout=claude_help_fixture(
+                    safe_mode=CLAUDE_SAFE_MODE_DESCRIPTION.replace(
+                        "hooks, MCP",
+                        "hooks still load, MCP",
+                    )
+                ),
+                stderr=b"",
+            ),
+        ), self.assertRaises(providers.ClaudeSafeModeContractInvalid):
+            providers._require_claude_safe_mode(
+                pathlib.Path("/bin/claude"),
+                {"HOME": str(self.review.container_dir)},
+            )
 
     def test_native_executable_inspection_race_is_inconclusive(self) -> None:
         missing = self.review.source_root / "disappeared-claude"
@@ -1943,6 +2135,157 @@ class ProviderPolicyTest(unittest.TestCase):
             providers.CODEX_ENV_KEYS,
         )
 
+    def test_linux_rejects_prompt_file_mentions_before_authentication(self) -> None:
+        self.review.prompt_file.write_text(
+            "Review @/config/runtime-state.json\n",
+            encoding="utf-8",
+        )
+        self._refresh_control_artifact_state()
+        with (
+            mock.patch.object(
+                providers,
+                "_is_claude_linux_host",
+                return_value=True,
+            ),
+            mock.patch.object(
+                providers,
+                "_resolve_validated_claude_executable",
+            ) as resolve,
+        ):
+            outcome = providers.run_review(
+                review=self.review,
+                reviewer="claude",
+                egress_consent="explicit-claude-review",
+            )
+
+        self.assertEqual(outcome.returncode, 2)
+        resolve.assert_not_called()
+        self.assertIn(
+            "ASCII @ file mentions are not allowed",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    def test_linux_prompt_guard_does_not_scan_frozen_diff(self) -> None:
+        self.review.diff_file.write_text(
+            "diff --git a/example.py b/example.py\n+@decorator\n",
+            encoding="utf-8",
+        )
+        self._refresh_control_artifact_state()
+        with (
+            mock.patch.object(providers, "child_environment", return_value={}),
+            mock.patch.object(
+                providers,
+                "_is_claude_linux_host",
+                return_value=True,
+            ),
+            mock.patch.object(
+                providers,
+                "_resolve_validated_claude_executable",
+                return_value=(None, {}),
+            ) as resolve,
+        ):
+            outcome = providers.run_review(
+                review=self.review,
+                reviewer="claude",
+                egress_consent="explicit-claude-review",
+            )
+
+        self.assertEqual(outcome.returncode, 2)
+        resolve.assert_called_once()
+        self.assertNotIn(
+            "ASCII @ file mentions are not allowed",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    def test_linux_prompt_projects_host_paths_and_read_only_guidance(self) -> None:
+        host_prompt = (
+            f"Workspace={self.review.workspace_root}\n"
+            f"Diff={self.review.diff_file}\n"
+        ).encode()
+
+        projected = providers._claude_review_prompt(
+            self.review,
+            host_prompt,
+            linux=True,
+        )
+
+        self.assertNotIn(str(self.review.workspace_root).encode(), projected)
+        self.assertIn(b"Workspace=/workspace\n", projected)
+        self.assertIn(
+            b"Diff=/workspace/.codex-review/review.diff\n",
+            projected,
+        )
+        self.assertIn(b"Only Read is available", projected)
+        self.assertIn(b"Every Read `file_path` must be absolute", projected)
+
+    def test_linux_prompt_rejects_ambiguous_host_path_prefixes(self) -> None:
+        for ambiguous in (
+            f"Workspace={self.review.workspace_root}-backup\n",
+            f"Workspace=copy{self.review.workspace_root}\n",
+            f"Diff={self.review.diff_file}.sig\n",
+            f"Escaping={self.review.workspace_root}/../outside.py\n",
+            f"Noncanonical={self.review.workspace_root}//source.py\n",
+            f'Path="{self.review.workspace_root}/safe /../../etc/passwd"\n',
+            f"Phrase {self.review.workspace_root}/safe /../../etc/passwd\n",
+        ):
+            with (
+                self.subTest(ambiguous=ambiguous),
+                self.assertRaisesRegex(ReviewError, "ambiguous host .* path"),
+            ):
+                providers._claude_review_prompt(
+                    self.review,
+                    ambiguous.encode(),
+                    linux=True,
+                )
+
+    def test_linux_prompt_projects_canonical_workspace_descendant(self) -> None:
+        cases = (
+            (
+                f"Nested={self.review.workspace_root}/src/source.py\n",
+                b"Nested=/workspace/src/source.py\n",
+            ),
+            (
+                f'Path="{self.review.workspace_root}/src dir/source.py"\n',
+                b'Path="/workspace/src dir/source.py"\n',
+            ),
+        )
+        for prompt, expected in cases:
+            with self.subTest(prompt=prompt):
+                projected = providers._claude_review_prompt(
+                    self.review,
+                    prompt.encode(),
+                    linux=True,
+                )
+                self.assertIn(expected, projected)
+
+    def test_macos_prompt_projects_default_paths_to_host_absolutes(self) -> None:
+        default_prompt = (
+            b"- Workspace: .\n"
+            b"- Primary diff file: .codex-review/review.diff\n"
+        )
+
+        projected = providers._claude_review_prompt(
+            self.review,
+            default_prompt,
+            linux=False,
+        )
+
+        self.assertIn(str(self.review.workspace_root).encode(), projected)
+        self.assertIn(str(self.review.diff_file).encode(), projected)
+        self.assertNotIn(b"Linux/WSL2 runtime tool boundary", projected)
+
+    def test_linux_prompt_projection_rechecks_size_limit(self) -> None:
+        with self.assertRaisesRegex(ReviewError, "projected review prompt exceeds"):
+            providers._claude_review_prompt(
+                self.review,
+                b"x" * providers.MAX_REVIEW_PROMPT_BYTES,
+                linux=True,
+            )
+
     def test_model_chain_persists_each_completed_attempt(self) -> None:
         first = self.attempt("codex", "gpt-5.6-sol", "entitlement")
         runner = mock.Mock(side_effect=(first, RuntimeError("interrupted fallback")))
@@ -2105,6 +2448,152 @@ class ProviderPolicyTest(unittest.TestCase):
             [call.kwargs["passthrough_keys"] for call in _environment.call_args_list],
             [providers.CLAUDE_ENV_KEYS, providers.COPILOT_ENV_KEYS],
         )
+
+    def test_claude_model_chain_reuses_preflight_verified_executable(
+        self,
+    ) -> None:
+        source = self.review.source_root / "claude-source"
+        source.write_bytes(b"source")
+        snapshot = self.review.container_dir / "verified-claude"
+        snapshot.write_bytes(b"snapshot")
+        seen_executables: list[pathlib.Path | None] = []
+
+        def resolve_once(
+            *,
+            review: ReviewWorkspace,
+            env: dict[str, str],
+        ) -> tuple[pathlib.Path, dict[str, str]]:
+            self.assertIs(review, self.review)
+            self.assertIsInstance(env, dict)
+            source.unlink()
+            return snapshot, {"ANTHROPIC_API_KEY": "secret"}
+
+        def attempt_with_snapshot(**kwargs) -> providers.Attempt:
+            seen_executables.append(kwargs.get("executable"))
+            self.assertFalse(source.exists())
+            return self.attempt(
+                "claude",
+                kwargs["model"],
+                "entitlement",
+            )
+
+        with (
+            mock.patch.object(providers, "child_environment", return_value={}),
+            mock.patch.object(
+                providers,
+                "_resolve_validated_claude_executable",
+                side_effect=resolve_once,
+            ) as resolve_claude,
+            mock.patch.object(
+                providers,
+                "_with_claude_review_tool_path",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_prepare_claude_tls_environment",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_attempt",
+                side_effect=attempt_with_snapshot,
+            ) as claude_attempt,
+            mock.patch.object(providers, "_copilot_attempt") as copilot_attempt,
+        ):
+            outcome = providers.run_review(
+                review=self.review,
+                reviewer="claude",
+                egress_consent="explicit-claude-review",
+            )
+
+        self.assertEqual(outcome.returncode, 2)
+        resolve_claude.assert_called_once()
+        self.assertEqual(claude_attempt.call_count, len(providers.CLAUDE_MODELS))
+        self.assertEqual(
+            seen_executables,
+            [snapshot] * len(providers.CLAUDE_MODELS),
+        )
+        copilot_attempt.assert_not_called()
+
+    def test_claude_supervision_failures_finalize_runtime_report(self) -> None:
+        snapshot = self.review.container_dir / "verified-claude"
+        snapshot.write_bytes(b"snapshot")
+        cases = (
+            (providers.ReviewTimeoutError, "timeout"),
+            (providers.ReviewOutputLimitError, "output-limit"),
+            (providers.ReviewOutputDrainError, "output-drain"),
+            (providers.ReviewProcessLeakError, "process-leak"),
+        )
+
+        for error_type, failure_class in cases:
+            with self.subTest(failure_class=failure_class):
+                diagnostic = f"private diagnostic for {failure_class}"
+                providers.write_json(
+                    self.review.container_dir / "claude-runtime.json",
+                    {
+                        "phase": "runtime-launching",
+                        "outer_sandbox": {"status": "profile-generated"},
+                        "gpg_verifier_trust": "fixed-path-native-host-tool",
+                    },
+                )
+                with (
+                    mock.patch.object(
+                        providers,
+                        "child_environment",
+                        return_value={},
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_resolve_validated_claude_executable",
+                        return_value=(
+                            snapshot,
+                            {"ANTHROPIC_API_KEY": "secret"},
+                        ),
+                    ) as resolve_claude,
+                    mock.patch.object(
+                        providers,
+                        "_with_claude_review_tool_path",
+                        side_effect=lambda _review, env: dict(env),
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_prepare_claude_tls_environment",
+                        side_effect=lambda _review, env: dict(env),
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_claude_attempt",
+                        side_effect=error_type(diagnostic),
+                    ),
+                    mock.patch.object(providers, "_copilot_attempt") as copilot_attempt,
+                ):
+                    outcome = providers.run_review(
+                        review=self.review,
+                        reviewer="claude",
+                        egress_consent="double-review",
+                    )
+
+                self.assertEqual(outcome.returncode, 75)
+                self.assertEqual(len(outcome.attempts), 1)
+                self.assertEqual(outcome.attempts[0].category, "inconclusive")
+                resolve_claude.assert_called_once()
+                copilot_attempt.assert_not_called()
+                report_text = (
+                    self.review.container_dir / "claude-runtime.json"
+                ).read_text(encoding="utf-8")
+                report = json.loads(report_text)
+                self.assertEqual(report["phase"], "attempt-inconclusive")
+                self.assertEqual(report["attempt"]["category"], "inconclusive")
+                self.assertEqual(
+                    report["attempt"]["failure_class"],
+                    failure_class,
+                )
+                self.assertEqual(
+                    report["gpg_verifier_trust"],
+                    "fixed-path-native-host-tool",
+                )
+                self.assertNotIn(diagnostic, report_text)
 
     @mock.patch.object(
         providers,
@@ -3523,8 +4012,51 @@ class ProviderPolicyTest(unittest.TestCase):
                         pathlib.Path("/isolated/probe-home"),
                     )
 
+    def test_claude_preflight_probe_environment_ignores_ambient_secrets(
+        self,
+    ) -> None:
+        with mock.patch.dict(
+            providers.os.environ,
+            {
+                "ALL_PROXY": "http://user:secret@proxy.invalid:8080",
+                "ANTHROPIC_API_KEY": "secret-api-key",
+                "CURL_CA_BUNDLE": "/secret/curl-ca.pem",
+                "HTTPS_PROXY": "http://user:secret@proxy.invalid:8080",
+                "HTTP_PROXY": "http://user:secret@proxy.invalid:8080",
+                "REQUESTS_CA_BUNDLE": "/secret/requests-ca.pem",
+                "SECRET_SENTINEL": "must-not-cross-preflight-boundary",
+                "SSL_CERT_DIR": "/secret/certs",
+                "SSL_CERT_FILE": "/secret/ssl-ca.pem",
+                "all_proxy": "http://lower:secret@proxy.invalid:8080",
+                "http_proxy": "http://lower:secret@proxy.invalid:8080",
+                "https_proxy": "http://lower:secret@proxy.invalid:8080",
+            },
+            clear=True,
+        ):
+            environment = providers._claude_preflight_probe_environment(
+                home=pathlib.Path("/isolated/probe-home"),
+                tmp=pathlib.Path("/isolated/tmp"),
+            )
+
+        self.assertEqual(
+            environment,
+            {
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                "CLAUDE_CODE_SAFE_MODE": "1",
+                "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
+                "HOME": "/isolated/probe-home",
+                "LANG": "C",
+                "LC_ALL": "C",
+                "NO_COLOR": "1",
+                "PATH": "/usr/bin:/bin",
+                "TEMP": "/isolated/tmp",
+                "TMP": "/isolated/tmp",
+                "TMPDIR": "/isolated/tmp",
+            },
+        )
+
     @mock.patch.object(providers, "_run_claude_probe")
-    def test_claude_identity_requires_exact_supported_version(
+    def test_claude_identity_accepts_floating_supported_version(
         self,
         run_probe: mock.Mock,
     ) -> None:
@@ -3535,14 +4067,37 @@ class ProviderPolicyTest(unittest.TestCase):
             stderr=b"",
         )
 
-        with self.assertRaisesRegex(
-            providers.InvalidReviewerExecutable,
-            "supported Claude Code 2.1.187",
+        version = providers._require_claude_identity(
+            pathlib.Path("/bin/claude"),
+            {"HOME": "/isolated/probe-home"},
+        )
+
+        self.assertEqual(version.text, "2.1.188")
+
+    @mock.patch.object(providers, "_run_claude_probe")
+    def test_claude_identity_rejects_old_or_next_major_version(
+        self,
+        run_probe: mock.Mock,
+    ) -> None:
+        for output in (
+            b"2.1.186 (Claude Code)\n",
+            b"3.0.0 (Claude Code)\n",
         ):
-            providers._require_claude_identity(
-                pathlib.Path("/bin/claude"),
-                {"HOME": "/isolated/probe-home"},
-            )
+            with self.subTest(output=output):
+                run_probe.return_value = Completed(
+                    argv=("claude", "--version"),
+                    returncode=0,
+                    stdout=output,
+                    stderr=b"",
+                )
+                with self.assertRaisesRegex(
+                    providers.InvalidReviewerExecutable,
+                    "supported >=2.1.187,<3 range",
+                ):
+                    providers._require_claude_identity(
+                        pathlib.Path("/bin/claude"),
+                        {"HOME": "/isolated/probe-home"},
+                    )
 
     def test_real_resolver_types_rejected_automatic_claude_candidate(
         self,
@@ -3596,6 +4151,711 @@ class ProviderPolicyTest(unittest.TestCase):
             providers._resolve_validated_claude_executable(
                 review=self.review,
                 env={"HOME": str(self.review.container_dir / "home")},
+            )
+
+    def test_claude_linux_probe_uses_synthetic_root_backend(self) -> None:
+        host = mock.Mock()
+        executable = pathlib.Path("/opt/claude")
+        info = mock.Mock(path=executable)
+        toolchain = mock.Mock()
+        library_roots = (pathlib.Path("/lib"), pathlib.Path("/usr/lib"))
+        with (
+            mock.patch.object(providers, "_is_claude_linux_host", return_value=True),
+            mock.patch.object(providers, "_claude_linux_host", return_value=host),
+            mock.patch.object(
+                providers,
+                "validate_claude_linux_executable",
+                return_value=info,
+            ),
+            mock.patch.object(
+                providers,
+                "discover_claude_linux_toolchain",
+                return_value=toolchain,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_linux_bootstrap_library_roots",
+                return_value=library_roots,
+            ),
+            mock.patch.object(
+                providers,
+                "build_claude_linux_probe_command",
+                return_value=("/usr/bin/bwrap", "--probe"),
+            ) as build_probe,
+        ):
+            command = providers._claude_probe_command(
+                executable,
+                self.review.container_dir,
+                "--version",
+            )
+
+        self.assertEqual(command, ("/usr/bin/bwrap", "--probe"))
+        build_probe.assert_called_once_with(
+            host,
+            toolchain,
+            executable,
+            self.review.container_dir,
+            (),
+            ("--version",),
+            library_roots=library_roots,
+        )
+
+    def test_claude_linux_runtime_dependency_error_mapping(self) -> None:
+        host = mock.Mock()
+        executable = pathlib.Path("/verified/claude")
+        info = mock.Mock(path=executable)
+        toolchain = mock.Mock(
+            socat=pathlib.Path("/usr/bin/socat"),
+            rg=pathlib.Path("/usr/bin/rg"),
+        )
+        runtime_root = self.review.container_dir / "claude-runtime" / "linux"
+        cases = (
+            (
+                providers.LinuxHostDependencyUnavailable("missing trusted ldd"),
+                providers.ClaudeProbeSandboxUnavailable,
+            ),
+            (
+                providers.LinuxRuntimeInspectionInconclusive("ldd output raced"),
+                providers.ClaudeExecutableInspectionInconclusive,
+            ),
+            (
+                providers.LinuxRuntimeUnsafe("writable library parent"),
+                providers.LinuxRuntimeUnsafe,
+            ),
+        )
+
+        for failure, expected in cases:
+            with (
+                self.subTest(failure=type(failure).__name__),
+                mock.patch.object(
+                    providers, "_claude_linux_host", return_value=host
+                ),
+                mock.patch.object(
+                    providers,
+                    "validate_claude_linux_executable",
+                    return_value=info,
+                ),
+                mock.patch.object(
+                    providers,
+                    "discover_claude_linux_toolchain",
+                    return_value=toolchain,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_claude_linux_runtime_root",
+                    return_value=runtime_root,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_claude_linux_private_directory",
+                    return_value=runtime_root / "private",
+                ),
+                mock.patch.object(
+                    providers,
+                    "compile_claude_linux_launcher",
+                    return_value=runtime_root / "launcher",
+                ),
+                mock.patch.object(
+                    providers,
+                    "collect_claude_linux_runtime_libraries",
+                    side_effect=failure,
+                ),
+                self.assertRaises(expected),
+            ):
+                with providers._claude_linux_review_runtime(
+                    self.review,
+                    executable,
+                    {},
+                    ("--print", "review"),
+                ):
+                    pass
+
+    def test_claude_linux_final_workspace_inspection_is_inconclusive(self) -> None:
+        host = mock.Mock()
+        executable = pathlib.Path("/verified/claude")
+        info = mock.Mock(path=executable)
+        toolchain = mock.Mock(
+            socat=pathlib.Path("/usr/bin/socat"),
+            rg=pathlib.Path("/usr/bin/rg"),
+        )
+        runtime_root = self.review.container_dir / "claude-runtime" / "linux"
+        failure = providers.LinuxRuntimeInspectionInconclusive(
+            "workspace symlink changed during inspection"
+        )
+
+        with (
+            mock.patch.object(providers, "_claude_linux_host", return_value=host),
+            mock.patch.object(
+                providers,
+                "validate_claude_linux_executable",
+                return_value=info,
+            ),
+            mock.patch.object(
+                providers,
+                "discover_claude_linux_toolchain",
+                return_value=toolchain,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_linux_runtime_root",
+                return_value=runtime_root,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_linux_private_directory",
+                side_effect=lambda _review, name: runtime_root / name,
+            ),
+            mock.patch.object(
+                providers,
+                "compile_claude_linux_launcher",
+                return_value=runtime_root / "bin/launcher",
+            ),
+            mock.patch.object(
+                providers,
+                "collect_claude_linux_runtime_libraries",
+                return_value=(),
+            ),
+            mock.patch.object(providers, "_claude_linux_ca_bundle", return_value=None),
+            mock.patch.object(
+                providers,
+                "_claude_unix_connect_proxy",
+                return_value=contextlib.nullcontext(runtime_root / "proxy.sock"),
+            ),
+            mock.patch.object(providers, "run_claude_linux_isolation_probe"),
+            mock.patch.object(providers, "_update_claude_runtime_report"),
+            mock.patch.object(
+                providers,
+                "build_claude_linux_sandbox_command",
+                side_effect=failure,
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "workspace symlink",
+            ),
+        ):
+            with providers._claude_linux_review_runtime(
+                self.review,
+                executable,
+                {"ANTHROPIC_API_KEY": "test-only"},
+                ("--print", "review"),
+            ):
+                pass
+
+    def test_claude_linux_launcher_error_mapping(self) -> None:
+        host = mock.Mock()
+        executable = pathlib.Path("/verified/claude")
+        info = mock.Mock(path=executable)
+        toolchain = mock.Mock()
+        runtime_root = self.review.container_dir / "claude-runtime" / "linux"
+        cases = (
+            (
+                providers.LinuxIsolationUnavailable("compiler rejected launcher"),
+                providers.ClaudeProbeSandboxUnavailable,
+            ),
+            (
+                providers.LinuxRuntimeInspectionInconclusive("compiler path raced"),
+                providers.ClaudeExecutableInspectionInconclusive,
+            ),
+            (
+                providers.LinuxRuntimeUnsafe("unsafe compiler path"),
+                providers.LinuxRuntimeUnsafe,
+            ),
+        )
+
+        for failure, expected in cases:
+            with (
+                self.subTest(failure=type(failure).__name__),
+                mock.patch.object(
+                    providers, "_claude_linux_host", return_value=host
+                ),
+                mock.patch.object(
+                    providers,
+                    "validate_claude_linux_executable",
+                    return_value=info,
+                ),
+                mock.patch.object(
+                    providers,
+                    "discover_claude_linux_toolchain",
+                    return_value=toolchain,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_claude_linux_runtime_root",
+                    return_value=runtime_root,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_claude_linux_private_directory",
+                    return_value=runtime_root / "private",
+                ),
+                mock.patch.object(
+                    providers,
+                    "compile_claude_linux_launcher",
+                    side_effect=failure,
+                ),
+                self.assertRaises(expected),
+            ):
+                with providers._claude_linux_review_runtime(
+                    self.review,
+                    executable,
+                    {},
+                    ("--print", "review"),
+                ):
+                    pass
+
+    def test_claude_linux_runtime_root_rejects_symlink_without_chmod(self) -> None:
+        victim = self.review.source_root / "runtime-victim"
+        victim.mkdir(mode=0o755)
+        victim.chmod(0o755)
+        victim_mode = stat.S_IMODE(victim.stat().st_mode)
+        runtime_root = self.review.container_dir / "claude-runtime" / "linux"
+        runtime_root.symlink_to(victim, target_is_directory=True)
+
+        with (
+            mock.patch.object(providers, "_claude_linux_host", return_value=mock.Mock()),
+            mock.patch.object(providers, "reject_claude_wsl_windows_path"),
+            self.assertRaisesRegex(ReviewError, "real directory"),
+        ):
+            providers._claude_linux_runtime_root(self.review)
+
+        self.assertTrue(runtime_root.is_symlink())
+        self.assertEqual(stat.S_IMODE(victim.stat().st_mode), victim_mode)
+
+    def test_claude_linux_private_directory_rejects_symlink_without_chmod(
+        self,
+    ) -> None:
+        victim = self.review.source_root / "private-victim"
+        victim.mkdir(mode=0o755)
+        victim.chmod(0o755)
+        victim_mode = stat.S_IMODE(victim.stat().st_mode)
+
+        with (
+            mock.patch.object(providers, "_claude_linux_host", return_value=mock.Mock()),
+            mock.patch.object(providers, "reject_claude_wsl_windows_path"),
+        ):
+            runtime_root = providers._claude_linux_runtime_root(self.review)
+            private_path = runtime_root / "home"
+            private_path.symlink_to(victim, target_is_directory=True)
+            with self.assertRaisesRegex(ReviewError, "real directory"):
+                providers._claude_linux_private_directory(self.review, "home")
+
+        self.assertTrue(private_path.is_symlink())
+        self.assertEqual(stat.S_IMODE(victim.stat().st_mode), victim_mode)
+
+    def test_claude_linux_runtime_root_rejects_unsafe_mode_without_chmod(
+        self,
+    ) -> None:
+        runtime_root = self.review.container_dir / "claude-runtime" / "linux"
+        runtime_root.mkdir(mode=0o755)
+        runtime_root.chmod(0o755)
+
+        with (
+            mock.patch.object(providers, "_claude_linux_host", return_value=mock.Mock()),
+            mock.patch.object(providers, "reject_claude_wsl_windows_path"),
+            self.assertRaisesRegex(ReviewError, "must be 0700"),
+        ):
+            providers._claude_linux_runtime_root(self.review)
+
+        self.assertEqual(stat.S_IMODE(runtime_root.stat().st_mode), 0o755)
+
+    def test_claude_linux_runtime_root_preserves_mountinfo_inconclusive(
+        self,
+    ) -> None:
+        failure = providers.LinuxRuntimeInspectionInconclusive(
+            "cannot read WSL2 mountinfo"
+        )
+
+        with (
+            mock.patch.object(providers, "_claude_linux_host", return_value=mock.Mock()),
+            mock.patch.object(
+                providers,
+                "reject_claude_wsl_windows_path",
+                side_effect=failure,
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "mountinfo",
+            ),
+        ):
+            providers._claude_linux_runtime_root(self.review)
+
+    def test_claude_linux_runtime_root_blocks_windows_filesystem(self) -> None:
+        failure = providers.LinuxRuntimeUnsafe("runtime root is on DrvFS")
+
+        with (
+            mock.patch.object(providers, "_claude_linux_host", return_value=mock.Mock()),
+            mock.patch.object(
+                providers,
+                "reject_claude_wsl_windows_path",
+                side_effect=failure,
+            ),
+            self.assertRaisesRegex(providers.LinuxRuntimeUnsafe, "DrvFS"),
+        ):
+            providers._claude_linux_runtime_root(self.review)
+
+    def test_claude_linux_credential_source_preserves_mountinfo_inconclusive(
+        self,
+    ) -> None:
+        failure = providers.LinuxRuntimeInspectionInconclusive(
+            "cannot parse WSL2 mountinfo"
+        )
+
+        with (
+            mock.patch.object(providers, "_claude_linux_host", return_value=mock.Mock()),
+            mock.patch.object(
+                providers,
+                "reject_claude_wsl_windows_path",
+                side_effect=failure,
+            ),
+            mock.patch.dict(
+                providers.os.environ,
+                {"HOME": str(self.review.container_dir)},
+                clear=True,
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "mountinfo",
+            ),
+        ):
+            providers._claude_linux_credential_source()
+
+    def test_claude_wsl2_rejects_review_state_on_windows_drive(self) -> None:
+        root = pathlib.Path("/mnt/c/review-source")
+        review = ReviewWorkspace(
+            source_root=root,
+            container_dir=root / ".codex-tmp" / "review",
+            workspace_root=root / ".codex-tmp" / "review" / "workspace",
+            base_ref="a" * 40,
+            head_ref="b" * 40,
+            diff_file=root / "review.diff",
+            prompt_file=root / "review.prompt",
+        )
+        host = providers.LinuxHost(
+            claude_linux.LinuxHostKind.WSL2,
+            "x64",
+            "microsoft-standard-WSL2",
+        )
+
+        with (
+            mock.patch.object(providers, "_is_claude_linux_host", return_value=True),
+            mock.patch.object(providers, "_claude_linux_host", return_value=host),
+            self.assertRaisesRegex(
+                providers.LinuxRuntimeUnsafe,
+                "Windows drive",
+            ),
+        ):
+            providers._resolve_validated_claude_executable(
+                review=review,
+                env={},
+            )
+
+    def test_claude_wsl2_review_state_mountinfo_failure_is_inconclusive(
+        self,
+    ) -> None:
+        host = providers.LinuxHost(
+            claude_linux.LinuxHostKind.WSL2,
+            "x64",
+            "microsoft-standard-WSL2",
+        )
+        failure = providers.LinuxRuntimeInspectionInconclusive(
+            "cannot read WSL2 mountinfo"
+        )
+
+        with (
+            mock.patch.object(providers, "_is_claude_linux_host", return_value=True),
+            mock.patch.object(providers, "_claude_linux_host", return_value=host),
+            mock.patch.object(
+                providers,
+                "reject_claude_wsl_windows_path",
+                side_effect=failure,
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "mountinfo",
+            ),
+        ):
+            providers._resolve_validated_claude_executable(
+                review=self.review,
+                env={},
+            )
+
+        self.assertFalse((self.review.container_dir / "claude-home").exists())
+
+    def test_claude_gpg_temp_root_does_not_repair_existing_mode(self) -> None:
+        temp_root = self.review.container_dir / "claude-runtime" / "gpg-tmp"
+        temp_root.mkdir(mode=0o700)
+        temp_root.chmod(0o755)
+
+        with self.assertRaisesRegex(ReviewError, "must be 0700"):
+            providers._resolve_validated_claude_executable(
+                review=self.review,
+                env={},
+            )
+
+        self.assertEqual(stat.S_IMODE(temp_root.stat().st_mode), 0o755)
+
+    def test_claude_wsl2_rejects_drvfs_gpg_temp_root_as_invalid(self) -> None:
+        host = providers.LinuxHost(
+            claude_linux.LinuxHostKind.WSL2,
+            "x64",
+            "microsoft-standard-WSL2",
+        )
+        validator = providers._claude_gpg_temp_root_validator(host)
+        mountinfo = (
+            "24 1 0:22 / / rw,relatime - 9p drvfs rw,aname=drvfs"
+        )
+
+        with (
+            mock.patch.object(
+                claude_linux,
+                "_read_mountinfo",
+                return_value=mountinfo,
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeProvenanceInvalid,
+                "Linux-native filesystem",
+            ),
+        ):
+            validator((self.review.container_dir,))
+
+    def test_claude_wsl2_gpg_temp_mountinfo_failure_is_inconclusive(self) -> None:
+        host = providers.LinuxHost(
+            claude_linux.LinuxHostKind.WSL2,
+            "x64",
+            "microsoft-standard-WSL2",
+        )
+        validator = providers._claude_gpg_temp_root_validator(host)
+
+        with (
+            mock.patch.object(
+                claude_linux,
+                "_read_mountinfo",
+                side_effect=claude_linux.LinuxRuntimeError(
+                    "cannot read WSL2 mountinfo"
+                ),
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeProvenanceInconclusive,
+                "cannot prove",
+            ),
+        ):
+            validator((self.review.container_dir,))
+
+    def test_claude_wsl2_gpg_verifier_fails_before_creating_private_home(
+        self,
+    ) -> None:
+        host = providers.LinuxHost(
+            claude_linux.LinuxHostKind.WSL2,
+            "x64",
+            "microsoft-standard-WSL2",
+        )
+        temp_root = self.review.container_dir / "claude-runtime" / "gpg-tmp"
+        temp_root.mkdir(parents=True)
+        temp_root.chmod(0o700)
+        temp_root = temp_root.resolve(strict=True)
+        bundle = claude_provenance.SignedClaudeManifest(
+            version="2.1.202",
+            manifest_url="https://downloads.claude.ai/manifest.json",
+            signature_url="https://downloads.claude.ai/manifest.json.sig",
+            manifest=b"{}",
+            signature=b"signature",
+        )
+        cases = (
+            (
+                "24 1 0:22 / / rw,relatime - 9p drvfs rw,aname=drvfs",
+                providers.ClaudeProvenanceInvalid,
+                "Linux-native filesystem",
+            ),
+            (
+                "",
+                providers.ClaudeProvenanceInconclusive,
+                "cannot prove",
+            ),
+        )
+
+        for mountinfo, error_type, message in cases:
+            with (
+                self.subTest(message=message),
+                mock.patch.object(
+                    claude_linux,
+                    "_read_mountinfo",
+                    return_value=mountinfo,
+                ),
+                mock.patch.object(
+                    claude_provenance,
+                    "_run_gpg",
+                ) as run_gpg,
+                mock.patch.object(
+                    claude_provenance.tempfile,
+                    "TemporaryDirectory",
+                ) as temporary_home,
+                self.assertRaisesRegex(error_type, message),
+            ):
+                claude_provenance.verify_manifest_signature(
+                    bundle,
+                    temp_root=temp_root,
+                    temp_root_validator=(
+                        providers._claude_gpg_temp_root_validator(host)
+                    ),
+                    gpg_candidates=(),
+                )
+
+            run_gpg.assert_not_called()
+            temporary_home.assert_not_called()
+
+    def test_claude_resolver_uses_linux_manifest_platform(self) -> None:
+        candidate = self.review.source_root / "claude"
+        candidate.write_bytes(b"fixture")
+        candidate.chmod(0o700)
+        host = mock.Mock()
+        info = mock.Mock(path=candidate, manifest_platform_key="linux-x64")
+        snapshot = self.review.container_dir / "verified-claude"
+        self.trusted_release.return_value = providers.VerifiedClaudeExecutable(
+            executable=snapshot,
+            artifact=claude_provenance.ClaudeReleaseArtifact(
+                version="2.1.202",
+                platform_key="linux-x64",
+                binary="claude",
+                checksum="a" * 64,
+                size=123,
+            ),
+            manifest_url="https://downloads.claude.ai/manifest.json",
+            signature_url="https://downloads.claude.ai/manifest.json.sig",
+            gpg_path=pathlib.Path("/usr/bin/gpg"),
+        )
+
+        def resolve_and_validate(_name: str, **kwargs) -> pathlib.Path:
+            kwargs["candidate_validator"](candidate)
+            return candidate
+
+        with (
+            mock.patch.object(providers, "_is_claude_linux_host", return_value=True),
+            mock.patch.object(providers, "_claude_linux_host", return_value=host),
+            mock.patch.object(
+                providers,
+                "validate_claude_linux_executable",
+                return_value=info,
+            ),
+            mock.patch.object(
+                providers,
+                "_require_claude_identity",
+                return_value=providers.ClaudeVersion("2.1.202", (2, 1, 202)),
+            ),
+            mock.patch.object(providers, "_require_claude_safe_mode"),
+            mock.patch.object(
+                providers,
+                "resolve_reviewer_executable",
+                side_effect=resolve_and_validate,
+            ),
+        ):
+            executable, _env = providers._resolve_validated_claude_executable(
+                review=self.review,
+                env={},
+            )
+
+        self.assertEqual(executable, snapshot)
+        self.trusted_release.assert_called_once_with(
+            candidate,
+            version="2.1.202",
+            platform_key="linux-x64",
+            gpg_temp_root=(
+                self.review.container_dir / "claude-runtime" / "gpg-tmp"
+            ),
+            gpg_temp_root_validator=mock.ANY,
+            cache_dir=(
+                self.review.container_dir
+                / "claude-runtime"
+                / "provenance-cache"
+            ),
+            snapshot_dir=(
+                self.review.container_dir
+                / "claude-runtime"
+                / "verified-executables"
+            ),
+        )
+        report = json.loads(
+            (self.review.container_dir / "claude-runtime.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(report["source_executable"], str(candidate.absolute()))
+        self.assertEqual(report["verified_executable"], str(snapshot))
+        self.assertEqual(
+            report["gpg_verifier_trust"],
+            "fixed-path-native-host-tool",
+        )
+        self.assertEqual(
+            report["phase"],
+            "publisher-and-capabilities-verified",
+        )
+
+    def test_claude_linux_candidate_mountinfo_failure_is_inconclusive(self) -> None:
+        candidate = self.review.source_root / "claude"
+        candidate.write_bytes(b"fixture")
+        candidate.chmod(0o700)
+        host = mock.Mock()
+
+        def resolve_and_validate(_name: str, **kwargs) -> pathlib.Path:
+            kwargs["candidate_validator"](candidate)
+            return candidate
+
+        with (
+            mock.patch.object(providers, "_is_claude_linux_host", return_value=True),
+            mock.patch.object(providers, "_claude_linux_host", return_value=host),
+            mock.patch.object(providers, "reject_claude_wsl_windows_path"),
+            mock.patch.object(
+                providers,
+                "validate_claude_linux_executable",
+                side_effect=providers.LinuxRuntimeInspectionInconclusive(
+                    "mountinfo changed during inspection"
+                ),
+            ),
+            mock.patch.object(
+                providers,
+                "resolve_reviewer_executable",
+                side_effect=resolve_and_validate,
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "mountinfo",
+            ),
+        ):
+            providers._resolve_validated_claude_executable(
+                review=self.review,
+                env={},
+            )
+
+    def test_claude_linux_candidate_windows_filesystem_is_blocked(self) -> None:
+        candidate = self.review.source_root / "claude"
+        candidate.write_bytes(b"fixture")
+        candidate.chmod(0o700)
+        host = mock.Mock()
+
+        def resolve_and_validate(_name: str, **kwargs) -> pathlib.Path:
+            kwargs["candidate_validator"](candidate)
+            return candidate
+
+        with (
+            mock.patch.object(providers, "_is_claude_linux_host", return_value=True),
+            mock.patch.object(providers, "_claude_linux_host", return_value=host),
+            mock.patch.object(providers, "reject_claude_wsl_windows_path"),
+            mock.patch.object(
+                providers,
+                "validate_claude_linux_executable",
+                side_effect=providers.LinuxRuntimeUnsafe(
+                    "Claude executable is on DrvFS"
+                ),
+            ),
+            mock.patch.object(
+                providers,
+                "resolve_reviewer_executable",
+                side_effect=resolve_and_validate,
+            ),
+            self.assertRaisesRegex(providers.LinuxRuntimeUnsafe, "DrvFS"),
+        ):
+            providers._resolve_validated_claude_executable(
+                review=self.review,
+                env={},
             )
 
     def test_claude_review_path_pins_broker_and_trusted_ripgrep(self) -> None:
@@ -3698,6 +4958,58 @@ class ProviderPolicyTest(unittest.TestCase):
                 proxy_port=43210,
             )
 
+    def test_claude_linux_arguments_confine_file_tools_to_workspace(self) -> None:
+        settings = providers._claude_review_settings(linux=True)
+        arguments = providers._claude_review_arguments(
+            model="claude-opus-4-8",
+            settings=settings,
+            linux=True,
+        )
+
+        self.assertEqual(
+            arguments[arguments.index("--permission-mode") + 1], "dontAsk"
+        )
+        self.assertEqual(arguments[arguments.index("--tools") + 1], "Read")
+        self.assertEqual(
+            arguments[arguments.index("--allowedTools") + 1], "Read(./**)"
+        )
+        cli_denies = set(
+            arguments[arguments.index("--disallowedTools") + 1].split(",")
+        )
+        self.assertTrue(
+            set(providers.CLAUDE_LINUX_FILE_TOOL_DENY_RULES).issubset(cli_denies)
+        )
+        self.assertTrue({"Grep", "Glob"}.issubset(cli_denies))
+        settings_denies = set(json.loads(settings)["permissions"]["deny"])
+        self.assertTrue(
+            set(providers.CLAUDE_LINUX_FILE_TOOL_DENY_RULES).issubset(
+                settings_denies
+            )
+        )
+        self.assertIn("Read(//config/**)", settings_denies)
+        self.assertIn("Read(//proc/**)", settings_denies)
+        self.assertNotIn("Read(/config/**)", settings_denies)
+
+    def test_claude_macos_arguments_preserve_search_tools_and_default_mode(
+        self,
+    ) -> None:
+        settings = providers._claude_review_settings(linux=False)
+        arguments = providers._claude_review_arguments(
+            model="claude-opus-4-8",
+            settings=settings,
+            linux=False,
+        )
+
+        self.assertEqual(
+            arguments[arguments.index("--permission-mode") + 1], "default"
+        )
+        self.assertEqual(
+            arguments[arguments.index("--tools") + 1], "Read,Grep,Glob"
+        )
+        self.assertNotIn(
+            "Read(//config/**)", json.loads(settings)["permissions"]["deny"]
+        )
+
     @mock.patch.object(
         providers,
         "resolve_reviewer_executable",
@@ -3751,11 +5063,7 @@ class ProviderPolicyTest(unittest.TestCase):
             Completed(
                 argv=("claude", "--help"),
                 returncode=0,
-                stdout=(
-                    "Options:\n  "
-                    + providers.CLAUDE_SAFE_MODE_HELP_FORM
-                    + "\n  --betas <betas...> Beta headers\n"
-                ).encode(),
+                stdout=claude_help_fixture(),
                 stderr=b"",
             ),
             Completed(
@@ -3770,11 +5078,19 @@ class ProviderPolicyTest(unittest.TestCase):
             model="claude-opus-4-8",
             index=1,
             env={
+                "ALL_PROXY": "http://all-user:all-secret@proxy.invalid:8080",
                 "HOME": "/Users/reviewer",
+                "HTTPS_PROXY": "http://https-user:https-secret@proxy.invalid:8080",
+                "HTTP_PROXY": "http://http-user:http-secret@proxy.invalid:8080",
+                "NO_PROXY": "credential-bearing-no-proxy.invalid",
                 "XDG_CONFIG_HOME": "/Users/reviewer/.config",
                 "TMPDIR": str(self.review.container_dir / "tmp"),
                 "PATH": str(self.claude_broker.parent),
                 "CODEX_ISOLATED_REVIEW_RANGE": "base..head",
+                "all_proxy": "http://lower-all:secret@proxy.invalid:8080",
+                "http_proxy": "http://lower-http:secret@proxy.invalid:8080",
+                "https_proxy": "http://lower-https:secret@proxy.invalid:8080",
+                "no_proxy": "lower-no-proxy.invalid",
             },
         )
         argv = run_command.call_args_list[2].args[0]
@@ -3827,10 +5143,21 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertNotIn("ANTHROPIC_API_KEY", probe_env)
         self.assertNotIn("CODEX_ISOLATED_REVIEW_RANGE", probe_env)
         self.assertEqual(
-            probe_env["HOME"],
-            str(self.review.container_dir / "claude-probe-home"),
+            probe_env,
+            {
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                "CLAUDE_CODE_SAFE_MODE": "1",
+                "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
+                "HOME": str(self.review.container_dir / "claude-probe-home"),
+                "LANG": "C",
+                "LC_ALL": "C",
+                "NO_COLOR": "1",
+                "PATH": "/usr/bin:/bin",
+                "TEMP": str(self.review.container_dir / "tmp"),
+                "TMP": str(self.review.container_dir / "tmp"),
+                "TMPDIR": str(self.review.container_dir / "tmp"),
+            },
         )
-        self.assertNotIn("XDG_CONFIG_HOME", probe_env)
         self.assertEqual(
             run_command.call_args_list[1].args[0][-3:],
             ("/bin/claude", "--safe-mode", "--help"),
@@ -3872,6 +5199,16 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(review_env["HTTPS_PROXY"], "http://127.0.0.1:43210")
         self.assertEqual(review_env["HTTP_PROXY"], review_env["HTTPS_PROXY"])
         self.assertEqual(review_env["ALL_PROXY"], review_env["HTTPS_PROXY"])
+        _proxy.assert_called_once()
+        upstream_proxy_env = _proxy.call_args.args[0]
+        self.assertEqual(
+            upstream_proxy_env["HTTPS_PROXY"],
+            "http://https-user:https-secret@proxy.invalid:8080",
+        )
+        self.assertEqual(
+            upstream_proxy_env["https_proxy"],
+            "http://lower-https:secret@proxy.invalid:8080",
+        )
         self.assertEqual(review_env["NO_PROXY"], "")
         self.assertEqual(
             run_command.call_args_list[2].kwargs["timeout_seconds"],
@@ -3880,6 +5217,141 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(
             run_command.call_args_list[2].kwargs["output_file_limit_bytes"],
             providers.REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
+        )
+
+    def test_claude_profile_failure_does_not_claim_runtime_launch(self) -> None:
+        executable = self.review.container_dir / "verified-claude"
+        executable.write_bytes(b"snapshot")
+        providers.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {
+                "phase": "authentication-preflight-complete",
+                "outer_sandbox": {"status": "pending-runtime-launch"},
+                "gpg_verifier_trust": "fixed-path-native-host-tool",
+            },
+        )
+
+        with (
+            mock.patch.object(providers, "_is_claude_linux_host", return_value=False),
+            mock.patch.object(
+                providers,
+                "_resolve_validated_claude_executable",
+            ) as resolve_claude,
+            mock.patch.object(
+                providers,
+                "_with_claude_review_tool_path",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_prepare_claude_tls_environment",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_connect_proxy",
+                return_value=contextlib.nullcontext(43210),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_review_sandbox_profile",
+                side_effect=ReviewError("profile construction failed"),
+            ),
+            mock.patch.object(providers, "run") as run_command,
+            self.assertRaisesRegex(ReviewError, "profile construction failed"),
+        ):
+            providers._claude_attempt(
+                review=self.review,
+                model="claude-opus-4-8",
+                index=1,
+                env={"ANTHROPIC_API_KEY": "secret"},
+                executable=executable,
+            )
+
+        report = json.loads(
+            (self.review.container_dir / "claude-runtime.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(report["phase"], "authentication-preflight-complete")
+        self.assertEqual(
+            report["outer_sandbox"]["status"],
+            "pending-runtime-launch",
+        )
+        self.assertEqual(
+            report["gpg_verifier_trust"],
+            "fixed-path-native-host-tool",
+        )
+        resolve_claude.assert_not_called()
+        run_command.assert_not_called()
+
+    def test_claude_malformed_result_finalizes_runtime_report(self) -> None:
+        executable = self.review.container_dir / "verified-claude"
+        executable.write_bytes(b"snapshot")
+        providers.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {
+                "phase": "runtime-launching",
+                "outer_sandbox": {"status": "profile-generated"},
+                "gpg_verifier_trust": "fixed-path-native-host-tool",
+            },
+        )
+        completed = Completed(
+            argv=("claude",),
+            returncode=0,
+            stdout=(
+                b'{"type":"result","subtype":"success","is_error":false,'
+                b'"result":"No findings."}'
+            ),
+            stderr=b"",
+        )
+
+        with (
+            mock.patch.object(providers, "_is_claude_linux_host", return_value=False),
+            mock.patch.object(
+                providers,
+                "_with_claude_review_tool_path",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_prepare_claude_tls_environment",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_connect_proxy",
+                return_value=contextlib.nullcontext(43210),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_review_sandbox_profile",
+                return_value="(version 1)",
+            ),
+            mock.patch.object(providers, "run", return_value=completed),
+        ):
+            attempt = providers._claude_attempt(
+                review=self.review,
+                model="claude-opus-4-8",
+                index=1,
+                env={"ANTHROPIC_API_KEY": "secret"},
+                executable=executable,
+            )
+
+        self.assertEqual(attempt.category, "other")
+        self.assertIsNone(attempt.final_text)
+        report = json.loads(
+            (self.review.container_dir / "claude-runtime.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(report["phase"], "attempt-complete")
+        self.assertEqual(report["attempt"]["category"], "other")
+        self.assertEqual(report["attempt"]["returncode"], 0)
+        self.assertIsNone(report["attempt"]["effective_model"])
+        self.assertEqual(
+            report["gpg_verifier_trust"],
+            "fixed-path-native-host-tool",
         )
 
     def test_claude_review_sandbox_rejects_host_home(self) -> None:
@@ -3959,10 +5431,10 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         certificate = self.sample_ca_certificate()
         ca_file = self.review.source_root / "corporate-ca.pem"
-        ca_file.write_bytes(certificate)
+        self.write_private_source(ca_file, certificate)
         ca_dir = self.review.source_root / "certs"
-        ca_dir.mkdir()
-        (ca_dir / "12345678.0").write_bytes(certificate)
+        ca_dir.mkdir(mode=0o700)
+        self.write_private_source(ca_dir / "12345678.0", certificate)
 
         prepared_env = providers._prepare_claude_tls_environment(
             self.review,
@@ -4090,9 +5562,9 @@ class ProviderPolicyTest(unittest.TestCase):
 
     def test_claude_tls_preparation_rejects_non_certificate_file(self) -> None:
         source = self.review.source_root / ".netrc"
-        source.write_text(
-            "machine example.test login user password secret\n",
-            encoding="utf-8",
+        self.write_private_source(
+            source,
+            b"machine example.test login user password secret\n",
         )
 
         with self.assertRaisesRegex(ReviewError, "contains no PEM certificate"):
@@ -4103,10 +5575,11 @@ class ProviderPolicyTest(unittest.TestCase):
 
     def test_claude_tls_preparation_rejects_private_key_material(self) -> None:
         source = self.review.source_root / "combined.pem"
-        source.write_bytes(
+        self.write_private_source(
+            source,
             self.sample_ca_certificate()
             + b"-----BEGIN "
-            + b"PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n"
+            + b"PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n",
         )
 
         with self.assertRaisesRegex(ReviewError, "contains a private key"):
@@ -4115,13 +5588,129 @@ class ProviderPolicyTest(unittest.TestCase):
                 {"SSL_CERT_FILE": str(source)},
             )
 
+    def test_claude_tls_source_rejects_symlink_and_fifo(self) -> None:
+        certificate = self.sample_ca_certificate()
+        target = self.review.source_root / "target-ca.pem"
+        self.write_private_source(target, certificate)
+        symlink = self.review.source_root / "symlink-ca.pem"
+        symlink.symlink_to(target)
+        fifo = self.review.source_root / "fifo-ca.pem"
+        os.mkfifo(fifo)
+
+        for source in (symlink, fifo):
+            with (
+                self.subTest(source=source.name),
+                self.assertRaisesRegex(ReviewError, "not a regular file"),
+            ):
+                providers._read_ca_source(source, source="SSL_CERT_FILE")
+
+    def test_claude_tls_source_requires_safe_file_mode(self) -> None:
+        source = self.review.source_root / "writable-ca.pem"
+        source.write_bytes(self.sample_ca_certificate())
+        source.chmod(0o666)
+
+        with self.assertRaisesRegex(ReviewError, "group- or world-writable"):
+            providers._read_ca_source(source, source="SSL_CERT_FILE")
+
+    def test_claude_tls_source_uses_only_bounded_descriptor_reads(self) -> None:
+        source = self.review.source_root / "corporate-ca.pem"
+        certificate = self.sample_ca_certificate()
+        self.write_private_source(source, certificate)
+        original_read = os.read
+        requested_sizes: list[int] = []
+
+        def record_read(descriptor: int, size: int) -> bytes:
+            requested_sizes.append(size)
+            return original_read(descriptor, size)
+
+        with (
+            mock.patch.object(providers.os, "read", side_effect=record_read),
+            mock.patch.object(
+                pathlib.Path,
+                "read_bytes",
+                side_effect=AssertionError("path read must not be used"),
+            ),
+        ):
+            material = providers._read_ca_source(source, source="SSL_CERT_FILE")
+
+        self.assertEqual(material, certificate)
+        self.assertTrue(requested_sizes)
+        self.assertLessEqual(
+            max(requested_sizes),
+            providers.CLAUDE_CA_FILE_LIMIT_BYTES + 1,
+        )
+
+    def test_claude_tls_source_rejects_path_replacement_as_inconclusive(
+        self,
+    ) -> None:
+        certificate = self.sample_ca_certificate()
+        source = self.review.source_root / "corporate-ca.pem"
+        self.write_private_source(source, certificate)
+        replacement = self.review.source_root / "replacement-ca.pem"
+        self.write_private_source(replacement, certificate)
+        original_read = os.read
+        replaced = False
+
+        def replace_before_read(descriptor: int, size: int) -> bytes:
+            nonlocal replaced
+            if not replaced:
+                replaced = True
+                os.replace(replacement, source)
+            return original_read(descriptor, size)
+
+        with (
+            mock.patch.object(providers.os, "read", side_effect=replace_before_read),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "changed while being read",
+            ),
+        ):
+            providers._read_ca_source(source, source="SSL_CERT_FILE")
+
+    def test_claude_tls_source_rejects_in_place_mutation_as_inconclusive(
+        self,
+    ) -> None:
+        certificate = self.sample_ca_certificate()
+        source = self.review.source_root / "corporate-ca.pem"
+        self.write_private_source(source, certificate)
+        initial = source.stat()
+        original_read = os.read
+        mutated = False
+
+        def mutate_before_read(descriptor: int, size: int) -> bytes:
+            nonlocal mutated
+            if not mutated:
+                mutated = True
+                with source.open("r+b") as handle:
+                    handle.seek(0)
+                    handle.write(b"X")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                # Some Linux filesystems can retain the same timestamp for two
+                # writes in one clock tick. Force a distinct metadata identity
+                # so this test deterministically exercises the race detector.
+                os.utime(
+                    source,
+                    ns=(initial.st_atime_ns, initial.st_mtime_ns + 1_000_000_000),
+                )
+            return original_read(descriptor, size)
+
+        with (
+            mock.patch.object(providers.os, "read", side_effect=mutate_before_read),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "changed while being read",
+            ),
+        ):
+            providers._read_ca_source(source, source="SSL_CERT_FILE")
+
     def test_claude_tls_preparation_preserves_same_named_ca_entries(self) -> None:
         certificate = self.sample_ca_certificate()
         source_dirs = []
         for name in ("first", "second"):
             source_dir = self.review.source_root / name
-            source_dir.mkdir()
-            (source_dir / "deadbeef.0").write_bytes(certificate)
+            source_dir.mkdir(mode=0o700)
+            self.write_private_source(source_dir / "deadbeef.0", certificate)
             source_dirs.append(source_dir)
 
         prepared = providers._prepare_claude_tls_environment(
@@ -4137,11 +5726,307 @@ class ProviderPolicyTest(unittest.TestCase):
         for prepared_dir in prepared_dirs:
             self.assertEqual((prepared_dir / "deadbeef.0").read_bytes(), certificate)
 
+    def test_claude_tls_preparation_materializes_hash_symlink_name(self) -> None:
+        certificate = self.sample_ca_certificate()
+        source_dir = self.review.source_root / "hashed-ca-dir"
+        source_dir.mkdir(mode=0o700)
+        target = source_dir / "certificate.pem"
+        self.write_private_source(target, certificate)
+        hash_entry = source_dir / "deadbeef.0"
+        hash_entry.symlink_to(target.name)
+
+        prepared = providers._prepare_claude_tls_environment(
+            self.review,
+            {"SSL_CERT_DIR": str(source_dir)},
+        )
+
+        prepared_dir = pathlib.Path(prepared["SSL_CERT_DIR"])
+        materialized_hash = prepared_dir / hash_entry.name
+        self.assertFalse(materialized_hash.is_symlink())
+        self.assertTrue(stat.S_ISREG(materialized_hash.lstat().st_mode))
+        self.assertEqual(stat.S_IMODE(materialized_hash.stat().st_mode), 0o600)
+        self.assertEqual(materialized_hash.read_bytes(), certificate)
+
+    def test_claude_tls_preparation_accepts_symlinked_ca_directory(self) -> None:
+        certificate = self.sample_ca_certificate()
+        source_dir = self.review.source_root / "real-ca-dir"
+        source_dir.mkdir(mode=0o700)
+        self.write_private_source(source_dir / "certificate.pem", certificate)
+        directory_link = self.review.source_root / "configured-ca-dir"
+        directory_link.symlink_to(source_dir.name)
+
+        prepared = providers._prepare_claude_tls_environment(
+            self.review,
+            {"SSL_CERT_DIR": str(directory_link)},
+        )
+
+        prepared_dir = pathlib.Path(prepared["SSL_CERT_DIR"])
+        self.assertEqual(
+            (prepared_dir / "certificate.pem").read_bytes(),
+            certificate,
+        )
+
+    def test_claude_tls_preparation_accepts_linux_system_hashed_directory(
+        self,
+    ) -> None:
+        if not sys.platform.startswith("linux"):
+            self.skipTest("Linux system CA directory test")
+        source_dir = pathlib.Path("/etc/ssl/certs")
+        if not source_dir.is_dir():
+            self.skipTest("Linux system CA directory is unavailable")
+
+        try:
+            prepared = providers._prepare_claude_tls_environment(
+                self.review,
+                {"SSL_CERT_DIR": str(source_dir)},
+            )
+        except ReviewError as error:
+            if not self.host_ca_safety_rejection(error, source="SSL_CERT_DIR:"):
+                raise
+            self.skipTest(f"host system CA directory is not immutable: {error}")
+
+        prepared_dir = pathlib.Path(prepared["SSL_CERT_DIR"])
+        hash_entries = list(prepared_dir.glob("????????.[0-9]*"))
+        self.assertTrue(hash_entries)
+        self.assertTrue(all(not path.is_symlink() for path in hash_entries))
+
+    def test_claude_tls_directory_symlink_supports_ubuntu_two_hop_chain(
+        self,
+    ) -> None:
+        system_ca, expected = self.stable_system_ca_file()
+        source_dir = self.review.source_root / "ubuntu-ca-dir"
+        source_dir.mkdir(mode=0o700)
+        hash_entry = source_dir / "002c0b4f.0"
+        named_entry = source_dir / "GlobalSign_Root_R46.pem"
+        hash_entry.symlink_to(named_entry.name)
+        named_entry.symlink_to(system_ca)
+
+        material, _source_size = providers._read_ca_path_from_parent_with_size(
+            hash_entry,
+            source=f"SSL_CERT_DIR:{hash_entry.name}",
+        )
+
+        self.assertEqual(material, expected)
+
+    def test_claude_tls_directory_symlink_supports_safe_parent_traversal(
+        self,
+    ) -> None:
+        certificate = self.sample_ca_certificate()
+        source_dir = self.review.source_root / "etc" / "ssl" / "certs"
+        source_dir.mkdir(mode=0o700, parents=True)
+        target_dir = self.review.source_root / "usr" / "share" / "ca-certificates"
+        target_dir.mkdir(mode=0o700, parents=True)
+        for directory in (
+            self.review.source_root / "etc",
+            self.review.source_root / "etc" / "ssl",
+            source_dir,
+            self.review.source_root / "usr",
+            self.review.source_root / "usr" / "share",
+            target_dir,
+        ):
+            directory.chmod(0o700)
+        target = target_dir / "certificate.crt"
+        self.write_private_source(target, certificate)
+        hash_entry = source_dir / "deadbeef.0"
+        named_entry = source_dir / "certificate.pem"
+        hash_entry.symlink_to(named_entry.name)
+        named_entry.symlink_to("../../../usr/share/ca-certificates/certificate.crt")
+
+        material, _source_size = providers._read_ca_path_from_parent_with_size(
+            hash_entry,
+            source=f"SSL_CERT_DIR:{hash_entry.name}",
+        )
+
+        self.assertEqual(material, certificate)
+
+    def test_claude_tls_directory_symlink_rejects_unsafe_parent(self) -> None:
+        source_dir = self.review.source_root / "unsafe-parent-source"
+        source_dir.mkdir(mode=0o700)
+        unsafe_parent = self.review.source_root / "unsafe-parent"
+        unsafe_parent.mkdir(mode=0o700)
+        unsafe_parent.chmod(0o777)
+        target = unsafe_parent / "certificate.pem"
+        self.write_private_source(target, self.sample_ca_certificate())
+        hash_entry = source_dir / "deadbeef.0"
+        hash_entry.symlink_to("../unsafe-parent/certificate.pem")
+
+        with self.assertRaisesRegex(ReviewError, "group- or world-writable"):
+            providers._read_ca_path_from_parent_with_size(
+                hash_entry,
+                source=f"SSL_CERT_DIR:{hash_entry.name}",
+            )
+
+    def test_claude_tls_directory_symlink_rejects_link_chain_and_loop(
+        self,
+    ) -> None:
+        source_dir = self.review.source_root / "loop-ca-dir"
+        source_dir.mkdir(mode=0o700)
+        self_link = source_dir / "cafebabe.0"
+        self_link.symlink_to(self_link.name)
+        with self.assertRaisesRegex(ReviewError, "contains a loop"):
+            providers._read_ca_path_from_parent_with_size(
+                self_link,
+                source=f"SSL_CERT_DIR:{self_link.name}",
+            )
+
+        hash_entry = source_dir / "deadbeef.0"
+        intermediate = source_dir / "certificate.pem"
+        hash_entry.symlink_to(intermediate.name)
+        intermediate.symlink_to(hash_entry.name)
+
+        with self.assertRaisesRegex(ReviewError, "contains a loop"):
+            providers._read_ca_path_from_parent_with_size(
+                hash_entry,
+                source=f"SSL_CERT_DIR:{hash_entry.name}",
+            )
+
+    def test_claude_tls_directory_symlink_enforces_depth_limit(self) -> None:
+        source_dir = self.review.source_root / "deep-link-ca-dir"
+        source_dir.mkdir(mode=0o700)
+        target = source_dir / "certificate.pem"
+        self.write_private_source(target, self.sample_ca_certificate())
+        links = [
+            source_dir / f"link-{index:02d}"
+            for index in range(providers.CLAUDE_CA_SYMLINK_LIMIT)
+        ]
+        hash_entry = source_dir / "deadbeef.0"
+        hash_entry.symlink_to(links[0].name)
+        for current, following in zip(links, links[1:]):
+            current.symlink_to(following.name)
+        links[-1].symlink_to(target.name)
+
+        with self.assertRaisesRegex(ReviewError, "exceeds the depth limit"):
+            providers._read_ca_path_from_parent_with_size(
+                hash_entry,
+                source=f"SSL_CERT_DIR:{hash_entry.name}",
+            )
+
+    def test_claude_tls_directory_open_wraps_post_open_disappearance(
+        self,
+    ) -> None:
+        source_dir = self.review.source_root / "directory-race-ca-dir"
+        source_dir.mkdir(mode=0o700)
+        original_lstat = pathlib.Path.lstat
+        inspected = 0
+
+        def disappear_after_open(path: pathlib.Path) -> os.stat_result:
+            nonlocal inspected
+            if path == source_dir:
+                inspected += 1
+                if inspected == 2:
+                    raise FileNotFoundError(path)
+            return original_lstat(path)
+
+        with (
+            mock.patch.object(pathlib.Path, "lstat", new=disappear_after_open),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "cannot validate a stable Claude review CA directory",
+            ),
+        ):
+            providers._open_stable_ca_directory(
+                source_dir,
+                source="SSL_CERT_DIR",
+            )
+
+    def test_claude_tls_directory_symlink_preserves_target_mode_checks(
+        self,
+    ) -> None:
+        source_dir = self.review.source_root / "unsafe-target-ca-dir"
+        source_dir.mkdir(mode=0o700)
+        target = source_dir / "certificate.pem"
+        target.write_bytes(self.sample_ca_certificate())
+        target.chmod(0o666)
+        hash_entry = source_dir / "deadbeef.0"
+        hash_entry.symlink_to(target.name)
+
+        with self.assertRaisesRegex(ReviewError, "group- or world-writable"):
+            providers._read_ca_path_from_parent_with_size(
+                hash_entry,
+                source=f"SSL_CERT_DIR:{hash_entry.name}",
+            )
+
+    def test_claude_tls_directory_symlink_rejects_link_replacement(
+        self,
+    ) -> None:
+        certificate = self.sample_ca_certificate()
+        source_dir = self.review.source_root / "link-race-ca-dir"
+        source_dir.mkdir(mode=0o700)
+        target = source_dir / "certificate.pem"
+        replacement_target = source_dir / "replacement.pem"
+        self.write_private_source(target, certificate)
+        self.write_private_source(replacement_target, certificate)
+        hash_entry = source_dir / "deadbeef.0"
+        intermediate = source_dir / "named-certificate.pem"
+        hash_entry.symlink_to(intermediate.name)
+        intermediate.symlink_to(target.name)
+        original_read = os.read
+        replaced = False
+
+        def replace_link_before_read(descriptor: int, size: int) -> bytes:
+            nonlocal replaced
+            if not replaced:
+                replaced = True
+                intermediate.unlink()
+                intermediate.symlink_to(replacement_target.name)
+            return original_read(descriptor, size)
+
+        with (
+            mock.patch.object(providers.os, "read", side_effect=replace_link_before_read),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "symlink changed while being read",
+            ),
+        ):
+            providers._read_ca_path_from_parent_with_size(
+                hash_entry,
+                source=f"SSL_CERT_DIR:{hash_entry.name}",
+            )
+
+    def test_claude_tls_directory_symlink_rejects_target_replacement(
+        self,
+    ) -> None:
+        certificate = self.sample_ca_certificate()
+        source_dir = self.review.source_root / "target-race-ca-dir"
+        source_dir.mkdir(mode=0o700)
+        target = source_dir / "certificate.pem"
+        replacement = source_dir / "replacement.pem"
+        self.write_private_source(target, certificate)
+        self.write_private_source(replacement, certificate)
+        hash_entry = source_dir / "deadbeef.0"
+        hash_entry.symlink_to(target.name)
+        original_read = os.read
+        replaced = False
+
+        def replace_target_before_read(descriptor: int, size: int) -> bytes:
+            nonlocal replaced
+            if not replaced:
+                replaced = True
+                os.replace(replacement, target)
+            return original_read(descriptor, size)
+
+        with (
+            mock.patch.object(
+                providers.os,
+                "read",
+                side_effect=replace_target_before_read,
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "source changed while being read",
+            ),
+        ):
+            providers._read_ca_path_from_parent_with_size(
+                hash_entry,
+                source=f"SSL_CERT_DIR:{hash_entry.name}",
+            )
+
     def test_claude_tls_preparation_bounds_directory_enumeration_before_sort(
         self,
     ) -> None:
         source_dir = self.review.source_root / "large-ca-dir"
-        source_dir.mkdir()
+        source_dir.mkdir(mode=0o700)
+        source_dir.chmod(0o700)
         consumed = 0
 
         def entries():
@@ -4151,7 +6036,11 @@ class ProviderPolicyTest(unittest.TestCase):
                 yield source_dir / f"entry-{index:05d}"
 
         with (
-            mock.patch.object(pathlib.Path, "iterdir", return_value=entries()),
+            mock.patch.object(
+                providers.os,
+                "scandir",
+                return_value=contextlib.nullcontext(entries()),
+            ),
             self.assertRaisesRegex(ReviewError, "too many entries"),
         ):
             providers._prepare_claude_tls_environment(
@@ -4160,6 +6049,180 @@ class ProviderPolicyTest(unittest.TestCase):
             )
 
         self.assertEqual(consumed, providers.CLAUDE_CA_DIR_ENTRY_LIMIT + 1)
+
+    def test_claude_tls_preparation_counts_non_certificate_directory_input(
+        self,
+    ) -> None:
+        source_dir = self.review.source_root / "non-certificate-ca-dir"
+        source_dir.mkdir(mode=0o700)
+        for name in ("first", "second"):
+            self.write_private_source(source_dir / name, b"x")
+
+        with (
+            mock.patch.object(providers, "CLAUDE_CA_DIR_LIMIT_BYTES", 1),
+            mock.patch.object(
+                providers,
+                "_read_ca_directory_entry_at_with_size",
+                return_value=(b"x", 1),
+            ) as read_entry,
+            self.assertRaisesRegex(ReviewError, "directory exceeds the size limit"),
+        ):
+            providers._prepare_claude_tls_environment(
+                self.review,
+                {"SSL_CERT_DIR": str(source_dir)},
+            )
+
+        self.assertEqual(read_entry.call_count, 2)
+
+    def test_claude_absolute_ca_reader_preserves_relative_symlink_base(
+        self,
+    ) -> None:
+        candidates: list[pathlib.Path] = []
+        system_dir = pathlib.Path("/etc/ssl/certs")
+        if system_dir.is_dir():
+            candidates.extend(itertools.islice(system_dir.iterdir(), 256))
+        defaults = ssl.get_default_verify_paths()
+        if defaults.cafile:
+            candidates.append(pathlib.Path(defaults.cafile))
+        for candidate in candidates:
+            try:
+                if not candidate.is_symlink():
+                    continue
+                raw_target = os.readlink(candidate)
+                if pathlib.Path(raw_target).is_absolute():
+                    continue
+                expected = providers._read_ca_source(
+                    candidate.resolve(strict=True),
+                    source="test resolved CA",
+                )
+                material, _source_size = providers._read_absolute_ca_path_with_size(
+                    candidate,
+                    source="test absolute CA",
+                )
+            except (OSError, ReviewError):
+                continue
+            self.assertEqual(material, expected)
+            return
+        self.skipTest("no safe system CA with a relative symlink is available")
+
+    def test_claude_linux_ca_bundle_bounds_streamed_input(self) -> None:
+        certificate = self.sample_ca_certificate()
+        oversized_half = providers.CLAUDE_CA_DIR_LIMIT_BYTES // 2 + 1
+        env = {
+            "CURL_CA_BUNDLE": "/first.pem",
+            "SSL_CERT_FILE": "/second.pem",
+        }
+
+        with (
+            mock.patch.object(
+                providers,
+                "_read_ca_path_from_parent_with_size",
+                return_value=(certificate, oversized_half),
+            ) as read_source,
+            self.assertRaisesRegex(ReviewError, "input exceeds the size limit"),
+        ):
+            providers._claude_linux_ca_bundle(self.review, env)
+
+        self.assertEqual(read_source.call_count, 2)
+
+    def test_claude_linux_ca_bundle_shares_entry_limit_across_directories(
+        self,
+    ) -> None:
+        source_dirs: list[pathlib.Path] = []
+        for name in ("first-linux-ca", "second-linux-ca"):
+            source_dir = self.review.source_root / name
+            source_dir.mkdir(mode=0o700)
+            self.write_private_source(
+                source_dir / "ignored.txt",
+                b"not a certificate\n",
+            )
+            source_dirs.append(source_dir)
+
+        with (
+            mock.patch.object(providers, "CLAUDE_CA_DIR_ENTRY_LIMIT", 1),
+            self.assertRaisesRegex(ReviewError, "directories have too many entries"),
+        ):
+            providers._claude_linux_ca_bundle(
+                self.review,
+                {
+                    "SSL_CERT_DIR": os.pathsep.join(
+                        str(path) for path in source_dirs
+                    )
+                },
+            )
+
+    def test_claude_linux_ca_bundle_uses_capath_without_cafile(self) -> None:
+        certificate = self.sample_ca_certificate()
+        source_dir = self.review.source_root / "default-capath"
+        source_dir.mkdir(mode=0o700)
+        target = source_dir / "certificate.pem"
+        self.write_private_source(target, certificate)
+        hash_entry = source_dir / "deadbeef.0"
+        hash_entry.symlink_to(target.name)
+        destination_dir = self.review.container_dir / "capath-bundle"
+        destination_dir.mkdir(mode=0o700)
+
+        def missing_default_file(*_args: object, **_kwargs: object) -> None:
+            try:
+                raise FileNotFoundError("missing default CA file")
+            except FileNotFoundError as error:
+                raise providers.ClaudeExecutableInspectionInconclusive(
+                    "missing default CA file"
+                ) from error
+
+        with (
+            mock.patch.object(
+                providers.ssl,
+                "get_default_verify_paths",
+                return_value=mock.Mock(cafile=None, capath=str(source_dir)),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_absolute_ca_path_with_size",
+                side_effect=missing_default_file,
+            ),
+            mock.patch.object(
+                providers,
+                "_read_ca_directory_entry_at_with_size",
+                wraps=providers._read_ca_directory_entry_at_with_size,
+            ) as read_entry,
+            mock.patch.object(
+                providers,
+                "_claude_linux_private_directory",
+                return_value=destination_dir,
+            ),
+        ):
+            bundle = providers._claude_linux_ca_bundle(self.review, {})
+
+        self.assertEqual(bundle.read_bytes(), certificate)
+        self.assertEqual(
+            {call.args[1] for call in read_entry.call_args_list},
+            {target.name, hash_entry.name},
+        )
+
+    def test_claude_linux_ca_bundle_reads_default_symlink_stably(self) -> None:
+        if not sys.platform.startswith("linux"):
+            self.skipTest("Linux default CA bundle test")
+        destination_dir = self.review.container_dir / "linux-ca-bundle"
+        destination_dir.mkdir(mode=0o700)
+
+        try:
+            with mock.patch.object(
+                providers,
+                "_claude_linux_private_directory",
+                return_value=destination_dir,
+            ):
+                bundle = providers._claude_linux_ca_bundle(self.review, {})
+        except ReviewError as error:
+            if not self.host_ca_safety_rejection(
+                error,
+                source="Linux default CA directory:",
+            ):
+                raise
+            self.skipTest(f"host system CA directory is not immutable: {error}")
+
+        self.assertEqual(bundle, destination_dir / "bundle.pem")
+        self.assertTrue(providers.CLAUDE_CERTIFICATE_BLOCK.search(bundle.read_bytes()))
 
     @mock.patch.object(providers.ssl, "create_default_context")
     def test_proxy_ssl_context_honors_git_ca_bundle(
@@ -4234,6 +6297,30 @@ class ProviderPolicyTest(unittest.TestCase):
             target.shutdown()
             target.server_close()
             target_thread.join(timeout=5.0)
+
+    def test_claude_unix_connect_proxy_is_private_and_enforces_targets(self) -> None:
+        if not hasattr(socket, "AF_UNIX"):
+            self.skipTest("Unix sockets are unavailable")
+        try:
+            context = providers._claude_unix_connect_proxy(
+                self.review,
+                {},
+                allowed_targets=frozenset({("api.anthropic.com", 443)}),
+            )
+            with context as socket_path:
+                self.assertEqual(stat.S_IMODE(socket_path.stat().st_mode), 0o600)
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                    client.connect(str(socket_path))
+                    client.sendall(
+                        b"CONNECT example.com:443 HTTP/1.1\r\n"
+                        b"Host: example.com:443\r\n\r\n"
+                    )
+                    self.assertIn(b"403 Forbidden", client.recv(4096))
+        except providers.ClaudeLoopbackUnavailable as error:
+            if "Operation not permitted" in str(error):
+                self.skipTest("Unix socket bind is blocked by the current sandbox")
+            raise
+        self.assertFalse(socket_path.exists())
 
     def test_https_proxy_tunnel_drains_decrypted_pending_data(self) -> None:
         class PlainSocket:
@@ -4463,7 +6550,7 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
         )
 
-        with self.assertRaisesRegex(ReviewError, "uniquely verifiable --safe-mode"):
+        with self.assertRaisesRegex(ReviewError, "required review option"):
             providers._claude_attempt(
                 review=self.review,
                 model="claude-opus-4-8",
@@ -4479,18 +6566,14 @@ class ProviderPolicyTest(unittest.TestCase):
         pathlib.Path("/usr/bin/true"),
     )
     @mock.patch.object(providers, "run")
-    def test_claude_accepts_exact_safe_mode_option_block(
+    def test_claude_accepts_semantic_safe_mode_option_block(
         self,
         run_command: mock.Mock,
     ) -> None:
         run_command.return_value = Completed(
             argv=("claude", "--help"),
             returncode=0,
-            stdout=(
-                "Usage: claude [options]\nOptions:\n  "
-                + providers.CLAUDE_SAFE_MODE_HELP_FORM
-                + "\n  --betas <betas...> Beta headers\n"
-            ).encode(),
+            stdout=claude_help_fixture(),
             stderr=b"",
         )
 
@@ -4509,26 +6592,22 @@ class ProviderPolicyTest(unittest.TestCase):
         self,
         run_command: mock.Mock,
     ) -> None:
-        form = providers.CLAUDE_SAFE_MODE_HELP_FORM
+        form = CLAUDE_SAFE_MODE_DESCRIPTION
         for mutated_form in (
-            form.replace("plugins, hooks", "plugins with hooks", 1),
-            form.replace("auth, model selection", "model selection", 1),
-            form.replace("claude_code_safe_mode=1", "claude_code_safe_mode=0", 1),
+            form.replace("plugins, hooks", "plugins", 1),
+            form.replace("Auth, model selection", "Model selection", 1),
+            form.replace("CLAUDE_CODE_SAFE_MODE=1", "CLAUDE_CODE_SAFE_MODE=0", 1),
             form.replace("all customizations", "some customizations", 1),
         ):
             with self.subTest(mutated_form=mutated_form):
                 run_command.return_value = Completed(
                     argv=("claude", "--help"),
                     returncode=0,
-                    stdout=(
-                        "Options:\n  "
-                        + mutated_form
-                        + "\n  --betas <betas...> Beta headers\n"
-                    ).encode(),
+                    stdout=claude_help_fixture(safe_mode=mutated_form),
                     stderr=b"",
                 )
 
-                with self.assertRaisesRegex(ReviewError, "uniquely verifiable --safe-mode"):
+                with self.assertRaisesRegex(ReviewError, "safe-mode semantics"):
                     providers._require_claude_safe_mode(
                         pathlib.Path("/bin/claude"),
                         {"HOME": str(self.review.container_dir)},
@@ -4544,25 +6623,25 @@ class ProviderPolicyTest(unittest.TestCase):
         self,
         run_command: mock.Mock,
     ) -> None:
-        form = providers.CLAUDE_SAFE_MODE_HELP_FORM
         for help_text in (
-            "Options:\n  " + form + "\n  --safe-mode hooks still load\n",
-            "Options:\n  "
-            + form
-            + "\n  hooks still load\n  --betas <betas...> Beta headers\n",
-            "Options:\n  "
-            + form
-            + "\n  --betas <betas...> Unlike --safe-mode, hooks still load\n",
+            claude_help_fixture()
+            + b"  --safe-mode hooks still load\n",
+            claude_help_fixture(
+                safe_mode=CLAUDE_SAFE_MODE_DESCRIPTION.replace(
+                    "plugins, hooks, MCP",
+                    "plugins, hooks still load, MCP",
+                )
+            ),
         ):
             with self.subTest(help_text=help_text):
                 run_command.return_value = Completed(
                     argv=("claude", "--help"),
                     returncode=0,
-                    stdout=help_text.encode(),
+                    stdout=help_text,
                     stderr=b"",
                 )
 
-                with self.assertRaisesRegex(ReviewError, "uniquely verifiable --safe-mode"):
+                with self.assertRaises(ReviewError):
                     providers._require_claude_safe_mode(
                         pathlib.Path("/bin/claude"),
                         {"HOME": str(self.review.container_dir)},

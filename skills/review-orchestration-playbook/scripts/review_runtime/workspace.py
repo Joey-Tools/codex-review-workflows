@@ -215,6 +215,26 @@ LONG_ALPHANUMERIC_SECRET = re.compile(rb"[A-Za-z0-9]{24,512}")
 LONG_NUMERIC_SECRET = re.compile(rb"[0-9]{16,512}")
 
 
+def symlink_target_stays_within_workspace(
+    link_relative_path: pathlib.PurePosixPath,
+    target_text: str,
+) -> bool:
+    """Return whether a relative symlink target stays inside the frozen root."""
+
+    target = pathlib.PurePosixPath(target_text)
+    if target.is_absolute():
+        return False
+    depth = len(link_relative_path.parent.parts)
+    for component in target.parts:
+        if component == "..":
+            if depth == 0:
+                return False
+            depth -= 1
+        elif component not in {"", "."}:
+            depth += 1
+    return True
+
+
 @dataclass(frozen=True)
 class ReviewWorkspace:
     source_root: pathlib.Path
@@ -950,6 +970,22 @@ def _materialize_blob(
                 f"NUL in frozen Git tree symlink target: {destination_display}"
             )
         target_text = os.fsdecode(target_bytes)
+        link_relative_path = pathlib.PurePosixPath(
+            destination.relative_to(workspace_root).as_posix()
+        )
+        if not symlink_target_stays_within_workspace(
+            link_relative_path,
+            target_text,
+        ):
+            target_display = (
+                "<redacted symlink target>"
+                if legacy_value_matcher.match(target_bytes) is not None
+                else _redact_secret_path(target_text, "symlink target")
+            )
+            raise ReviewError(
+                "frozen Git tree symlink escapes workspace: "
+                f"{destination_display} -> {target_display}"
+            )
         try:
             target = (destination.parent / target_text).resolve(strict=False)
         except RuntimeError as error:
