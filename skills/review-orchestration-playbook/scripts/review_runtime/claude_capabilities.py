@@ -6,9 +6,14 @@ from dataclasses import dataclass
 
 CLAUDE_MINIMUM_VERSION = (2, 1, 187)
 CLAUDE_NEXT_MAJOR_VERSION = (3, 0, 0)
+CLAUDE_VERSION_COMPONENT_MAX_DIGITS = 9
+_CLAUDE_VERSION_COMPONENT = (
+    rf"(?:0|[1-9][0-9]{{0,{CLAUDE_VERSION_COMPONENT_MAX_DIGITS - 1}}})"
+)
 CLAUDE_VERSION_LINE = re.compile(
-    r"^(?P<major>0|[1-9][0-9]*)\.(?P<minor>0|[1-9][0-9]*)\."
-    r"(?P<patch>0|[1-9][0-9]*) \(Claude Code\)$"
+    rf"^(?P<major>{_CLAUDE_VERSION_COMPONENT})\."
+    rf"(?P<minor>{_CLAUDE_VERSION_COMPONENT})\."
+    rf"(?P<patch>{_CLAUDE_VERSION_COMPONENT}) \(Claude Code\)$"
 )
 CLAUDE_HELP_OPTION_START = re.compile(
     r"^  (?:-[A-Za-z], )?(--[A-Za-z0-9][A-Za-z0-9-]*)\b"
@@ -89,6 +94,7 @@ CLAUDE_SAFE_MODE_CLAIM_AMBIGUITY = re.compile(
     r"|\b(?:may|might|can|could|should|would|must|perhaps|possibly)\b"
     r"|\b(?:if|when|whenever|once|until|provided|assuming|depending|otherwise)\b"
     r"|\b(?:only|default|initially|temporarily|eventually|later|briefly)\b"
+    r"|\b(?:before|after|during|then|subsequently|thereafter|afterwards?)\b"
     r"|\b(?:sometimes|usually|generally|typically|mostly|partly|partially)\b"
     r"|\b(?:subject\s+to|for\s+now|at\s+first|where\s+possible)\b"
     r"|\b[a-z]+n['\N{RIGHT SINGLE QUOTATION MARK}]t\b"
@@ -107,7 +113,85 @@ CLAUDE_SAFE_MODE_ANAPHORIC_REFERENCE = re.compile(
 CLAUDE_SAFE_MODE_CUSTOMIZATION_FORBIDDEN_STATE = re.compile(
     r"\b(?:enabled?|enables|enabling|active|available)\b"
     r"|\b(?:load|loads|loaded|loading|run|runs|running)\b"
-    r"|\b(?:apply|applies|applied|applying)\b"
+    r"|\b(?:apply|applies|applied|applying|execute|executes|executed|executing)\b"
+    r"|\b(?:restore(?:d|s|ing)?|re-?enable(?:d|s|ing)?|"
+    r"reactivate(?:d|s|ing)?|resume(?:d|s|ing)?|reinstate(?:d|s|ing)?)\b"
+)
+_CLAUDE_SAFE_MODE_CUSTOMIZATION_ITEM = (
+    r"(?:claude\.md|skills|plugins|hooks|mcp(?:\s+servers)?|"
+    r"custom\s+commands|agents|output\s+styles|workflows|"
+    r"(?:custom\s+)?themes|keybindings|more)"
+)
+_CLAUDE_SAFE_MODE_CUSTOMIZATION_LIST = (
+    _CLAUDE_SAFE_MODE_CUSTOMIZATION_ITEM
+    + r"(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)"
+    + _CLAUDE_SAFE_MODE_CUSTOMIZATION_ITEM
+    + r")*"
+)
+_CLAUDE_SAFE_MODE_CUSTOMIZATION_DURATION = (
+    r"(?:"
+    r"(?:throughout|during)\s+(?:the\s+)?"
+    r"(?:review(?:\s+session)?|session|run|invocation|safe\s+mode)"
+    r"|for\s+(?:the\s+)?(?:entire\s+)?"
+    r"(?:review(?:\s+session)?|session|run|invocation|"
+    r"duration\s+of\s+(?:the\s+)?review(?:\s+session)?)"
+    r")"
+)
+_CLAUDE_SAFE_MODE_CUSTOMIZATION_BENIGN_PURPOSE = (
+    r"—\s+useful\s+for\s+troubleshooting\s+a\s+broken\s+configuration"
+)
+CLAUDE_SAFE_MODE_CUSTOMIZATION_POSITIVE_CLAIM = re.compile(
+    r"^(?:"
+    r"start(?:s)?\s+with\s+all\s+customizations\s*\(\s*"
+    + _CLAUDE_SAFE_MODE_CUSTOMIZATION_LIST
+    + r"\s*\)\s+disabled"
+    r"|all\s+customizations\s*\(\s*"
+    + _CLAUDE_SAFE_MODE_CUSTOMIZATION_LIST
+    + r"\s*\)\s+(?:are|remain|stay)\s+disabled"
+    r")"
+    r"(?:\s+(?:"
+    + _CLAUDE_SAFE_MODE_CUSTOMIZATION_DURATION
+    + r"|"
+    + _CLAUDE_SAFE_MODE_CUSTOMIZATION_BENIGN_PURPOSE
+    + r"))?[.!?]?$"
+)
+CLAUDE_SAFE_MODE_POSITIVE_CUSTOMIZATION_ANAPHOR = re.compile(
+    r"^they\s+(?:are|remain|stay)\s+disabled[.!?]?$"
+)
+_CLAUDE_SAFE_MODE_POLICY_SUBJECT = (
+    r"(?:admin-managed(?:\s+\(policy\))?(?:\s+policy)?\s+settings"
+    r"|managed\s+policy\s+settings|policy\s+settings)"
+)
+CLAUDE_SAFE_MODE_POLICY_POSITIVE_CLAIM = re.compile(
+    r"^"
+    + _CLAUDE_SAFE_MODE_POLICY_SUBJECT
+    + r"\s+(?:still\s+appl(?:y|ies)|remain(?:s)?\s+active)[.!?]?$"
+)
+_CLAUDE_SAFE_MODE_RUNTIME_TARGET = (
+    r"(?:auth(?:entication)?|model\s+selection|built-in\s+tools|permissions)"
+)
+_CLAUDE_SAFE_MODE_RUNTIME_TARGETS = (
+    _CLAUDE_SAFE_MODE_RUNTIME_TARGET
+    + r"(?:\s*(?:,\s*(?:(?:and|or)\s+)?|(?:and|or)\s+)"
+    + _CLAUDE_SAFE_MODE_RUNTIME_TARGET
+    + r")*"
+)
+CLAUDE_SAFE_MODE_RUNTIME_POSITIVE_CLAIM = re.compile(
+    r"^"
+    + _CLAUDE_SAFE_MODE_RUNTIME_TARGETS
+    + r"\s+(?:work\s+normally|remain\s+available|still\s+work)[.!?]?$"
+)
+CLAUDE_SAFE_MODE_ENVIRONMENT_POSITIVE_CLAIM = re.compile(
+    r"^(?:sets\s+)?claude_code_safe_mode=1[.!?]?$"
+)
+_CLAUDE_SAFE_MODE_INFORMATION_TOPIC = (
+    r"(?:safe(?:\s+|-)mode|customizations|project\s+instructions)"
+)
+CLAUDE_SAFE_MODE_HARMLESS_INFORMATION = re.compile(
+    r"^(?:documentation|information)"
+    r"\s+about\s+"
+    + _CLAUDE_SAFE_MODE_INFORMATION_TOPIC
+    + r"\s+(?:is|remains)\s+available\s+online[.!?]?$"
 )
 CLAUDE_SAFE_MODE_POLICY_FORBIDDEN_STATE = re.compile(
     r"\b(?:disabled|inactive|ignored|unavailable|blocked|overridden|bypassed)\b"
@@ -355,7 +439,14 @@ def parse_claude_version(output: str) -> ClaudeVersion:
         raise ClaudeCapabilityError(
             "Claude Code version output is not a stable three-component release"
         )
-    parts = tuple(int(match.group(name)) for name in ("major", "minor", "patch"))
+    try:
+        parts = tuple(
+            int(match.group(name)) for name in ("major", "minor", "patch")
+        )
+    except (ValueError, OverflowError) as error:
+        raise ClaudeCapabilityError(
+            "Claude Code version contains an invalid numeric component"
+        ) from error
     assert len(parts) == 3
     typed_parts = (parts[0], parts[1], parts[2])
     if not CLAUDE_MINIMUM_VERSION <= typed_parts < CLAUDE_NEXT_MAJOR_VERSION:
@@ -409,16 +500,44 @@ def _has_positive_safe_mode_claim(
     required_terms: tuple[tuple[str, ...], ...],
     subject_terms: tuple[tuple[str, ...], ...],
     forbidden_state: re.Pattern[str],
+    *,
+    positive_claim: re.Pattern[str] | None = None,
 ) -> bool:
+    claim_sentences = tuple(
+        (
+            CLAUDE_SAFE_MODE_DECLARATION_PREFIX.sub("", sentence, count=1)
+            if index == 0
+            else sentence
+        )
+        for index, sentence in enumerate(sentences)
+    )
     relevant_sentences = tuple(
         sentence
-        for sentence in sentences
+        for sentence in claim_sentences
         if any(
             _has_semantic_term(sentence, term)
             for alternatives in subject_terms
             for term in alternatives
         )
     )
+    if positive_claim is not None:
+        primary_claims = tuple(
+            sentence
+            for sentence in relevant_sentences
+            if positive_claim.fullmatch(sentence) is not None
+        )
+        return bool(primary_claims) and all(
+            positive_claim.fullmatch(sentence) is not None
+            or _is_allowed_safe_mode_self_claim(sentence)
+            or CLAUDE_SAFE_MODE_HARMLESS_INFORMATION.fullmatch(sentence) is not None
+            for sentence in relevant_sentences
+        ) and any(
+            all(
+                any(_has_semantic_term(sentence, term) for term in alternatives)
+                for alternatives in required_terms
+            )
+            for sentence in primary_claims
+        )
     unsafe_relevant_sentences = tuple(
         sentence
         for sentence in relevant_sentences
@@ -462,12 +581,61 @@ def _is_allowed_safe_mode_self_claim(sentence: str) -> bool:
     return any(
         pattern.fullmatch(sentence) is not None
         for pattern in (
+            CLAUDE_SAFE_MODE_CUSTOMIZATION_POSITIVE_CLAIM,
             CLAUDE_SAFE_MODE_POSITIVE_SELF_CLAIM,
             CLAUDE_SAFE_MODE_PRESERVED_SCOPE_CLAIM,
             CLAUDE_SAFE_MODE_DIRECT_REQUIRED_ACTION_CLAIM,
             CLAUDE_SAFE_MODE_PREVENTED_WEAKENING_CLAIM,
         )
     )
+
+
+def _safe_mode_claim_sentences(sentences: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(
+        (
+            CLAUDE_SAFE_MODE_DECLARATION_PREFIX.sub("", sentence, count=1)
+            if index == 0
+            else sentence
+        )
+        for index, sentence in enumerate(sentences)
+    )
+
+
+def _has_only_allowed_safe_mode_sentences(sentences: tuple[str, ...]) -> bool:
+    """Require every sentence to match one bounded positive grammar."""
+    customization_antecedent_active = False
+    self_antecedent_active = False
+    for sentence in _safe_mode_claim_sentences(sentences):
+        if not sentence:
+            return False
+        if CLAUDE_SAFE_MODE_CUSTOMIZATION_POSITIVE_CLAIM.fullmatch(sentence):
+            customization_antecedent_active = True
+            continue
+        if (
+            customization_antecedent_active
+            and CLAUDE_SAFE_MODE_POSITIVE_CUSTOMIZATION_ANAPHOR.fullmatch(sentence)
+        ):
+            customization_antecedent_active = False
+            continue
+        customization_antecedent_active = False
+        if CLAUDE_SAFE_MODE_POLICY_POSITIVE_CLAIM.fullmatch(sentence):
+            continue
+        if CLAUDE_SAFE_MODE_RUNTIME_POSITIVE_CLAIM.fullmatch(sentence):
+            continue
+        if CLAUDE_SAFE_MODE_ENVIRONMENT_POSITIVE_CLAIM.fullmatch(sentence):
+            continue
+        if _is_allowed_safe_mode_self_claim(sentence):
+            self_antecedent_active = True
+            continue
+        if CLAUDE_SAFE_MODE_HARMLESS_INFORMATION.fullmatch(sentence):
+            continue
+        if self_antecedent_active and (
+            CLAUDE_SAFE_MODE_POSITIVE_ANAPHORIC_CLAIM.fullmatch(sentence)
+            or CLAUDE_SAFE_MODE_POSITIVE_ANAPHORIC_OBJECT_CLAIM.fullmatch(sentence)
+        ):
+            continue
+        return False
+    return True
 
 
 def _has_unsafe_safe_mode_self_reference(sentences: tuple[str, ...]) -> bool:
@@ -477,7 +645,10 @@ def _has_unsafe_safe_mode_self_reference(sentences: tuple[str, ...]) -> bool:
             candidate = CLAUDE_SAFE_MODE_DECLARATION_PREFIX.sub("", candidate, count=1)
         if CLAUDE_SAFE_MODE_SELF_REFERENCE.search(candidate) is None:
             continue
-        if _is_allowed_safe_mode_self_claim(candidate):
+        if (
+            _is_allowed_safe_mode_self_claim(candidate)
+            or CLAUDE_SAFE_MODE_HARMLESS_INFORMATION.fullmatch(candidate)
+        ):
             continue
         return True
     return False
@@ -591,24 +762,27 @@ def validate_claude_help(help_text: str) -> tuple[tuple[str, ...], str]:
     )
     missing_claims = tuple(
         label
-        for label, required_terms, subject_terms, forbidden_state in (
+        for label, required_terms, subject_terms, forbidden_state, positive_claim in (
             (
                 "customizations disabled",
                 CLAUDE_SAFE_MODE_CUSTOMIZATION_CLAIM,
                 CLAUDE_SAFE_MODE_CUSTOMIZATION_CLAIM[:-1],
                 CLAUDE_SAFE_MODE_CUSTOMIZATION_FORBIDDEN_STATE,
+                CLAUDE_SAFE_MODE_CUSTOMIZATION_POSITIVE_CLAIM,
             ),
             (
                 "managed policy remains active",
                 CLAUDE_SAFE_MODE_POLICY_CLAIM,
                 CLAUDE_SAFE_MODE_POLICY_CLAIM[:1],
                 CLAUDE_SAFE_MODE_POLICY_FORBIDDEN_STATE,
+                None,
             ),
             (
                 "review runtime remains available",
                 CLAUDE_SAFE_MODE_RUNTIME_CLAIM,
                 CLAUDE_SAFE_MODE_RUNTIME_CLAIM[:-1],
                 CLAUDE_SAFE_MODE_RUNTIME_FORBIDDEN_STATE,
+                None,
             ),
         )
         if not _has_positive_safe_mode_claim(
@@ -616,10 +790,13 @@ def validate_claude_help(help_text: str) -> tuple[tuple[str, ...], str]:
             required_terms,
             subject_terms,
             forbidden_state,
+            positive_claim=positive_claim,
         )
     )
     if not _has_unambiguous_safe_mode_environment_claim(block, sentences):
         missing_claims = (*missing_claims, "safe-mode environment enabled")
+    if not _has_only_allowed_safe_mode_sentences(sentences):
+        missing_claims = (*missing_claims, "every safe-mode sentence remains bounded")
     if any(CLAUDE_SAFE_MODE_LEADING_CONTRAST.search(sentence) for sentence in sentences):
         missing_claims = (*missing_claims, "unambiguous safe-mode continuation")
     if _has_unsafe_safe_mode_continuation(sentences):

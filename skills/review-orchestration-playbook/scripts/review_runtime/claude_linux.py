@@ -4,6 +4,7 @@ import contextlib
 import enum
 import json
 import math
+import mmap
 import os
 import pathlib
 import platform
@@ -90,6 +91,10 @@ class ElfInfo:
     arch: str
     interpreter: str | None
     libc: str | None
+    has_rpath: bool = False
+    has_runpath: bool = False
+    has_audit: bool = False
+    has_depaudit: bool = False
 
     @property
     def manifest_platform_key(self) -> str:
@@ -100,6 +105,14 @@ class ElfInfo:
         raise LinuxRuntimeError(
             f"cannot determine Claude Linux libc from ELF interpreter: {self.path}"
         )
+
+
+@dataclass(frozen=True)
+class _ElfProgramSegment:
+    file_offset: int
+    virtual_address: int
+    file_size: int
+    memory_size: int
 
 
 @dataclass(frozen=True)
@@ -127,6 +140,8 @@ class PathComponentIdentity:
 class TrustedPathIdentity:
     path: pathlib.Path
     components: tuple[PathComponentIdentity, ...]
+    allow_root_sticky_temp_ancestor: bool = False
+    ignore_parent_directory_content_changes: bool = False
 
 
 @dataclass(frozen=True)
@@ -134,6 +149,25 @@ class RuntimeMount:
     source: pathlib.Path
     destination: pathlib.PurePosixPath
     identity: TrustedPathIdentity | None = None
+
+
+@dataclass(frozen=True)
+class HostRuntimeDependency:
+    lexical_path: pathlib.Path
+    destination: pathlib.PurePosixPath
+    lexical_components: tuple[PathComponentIdentity, ...]
+    resolved_identity: TrustedPathIdentity
+
+
+@dataclass(frozen=True)
+class HostRuntimeClosure:
+    host: LinuxHost
+    executable_identity: TrustedPathIdentity
+    ldd_identity: TrustedPathIdentity
+    interpreter: str | None
+    dependencies: tuple[HostRuntimeDependency, ...]
+    trusted_owner_uids: frozenset[int]
+    executable_owner_uids: frozenset[int]
 
 
 @dataclass(frozen=True)
@@ -184,6 +218,14 @@ ELF_HEADER_SIZE = 64
 ELF_MAX_PROGRAM_HEADER_OFFSET = 1024 * 1024
 ELF_MAX_PROGRAM_HEADERS = 128
 ELF_MAX_INTERPRETER_BYTES = 4096
+ELF_MAX_DYNAMIC_SEGMENT_BYTES = 1024 * 1024
+ELF_UINT64_MAX = (1 << 64) - 1
+ELF_DYNAMIC_ENTRY_BYTES = 16
+ELF_DYNAMIC_NULL = 0
+ELF_DYNAMIC_RPATH = 15
+ELF_DYNAMIC_RUNPATH = 29
+ELF_DYNAMIC_DEPAUDIT = 0x6FFFFEFB
+ELF_DYNAMIC_AUDIT = 0x6FFFFEFC
 CREDENTIAL_LIMIT_BYTES = 1024 * 1024
 DEFAULT_CREDENTIAL_VALIDITY_SECONDS = 32 * 60.0
 PROBE_TIMEOUT_SECONDS = 20.0
@@ -401,14 +443,18 @@ def detect_host(
     kernel_wsl = bool(_WSL_MARKER.search(combined))
     kernel_wsl2 = bool(_WSL2_MARKER.search(combined))
     any_wsl_signal = bool(
-        kernel_wsl or interop_value or distro_value or run_wsl_marker or binfmt_marker
+        kernel_wsl
+        or interop_value
+        or interop_marker
+        or distro_value
+        or run_wsl_marker
+        or binfmt_marker
     )
-    # WSL1 can expose Microsoft kernel and environment markers, so those are
-    # intentionally weak. WSL2 is accepted only with an explicit WSL2 kernel
-    # marker or the WSL2 runtime directory/a verified interop endpoint. The
-    # latter covers WSL2 customKernel configurations whose release string is
-    # entirely user-selected.
-    positively_wsl2 = kernel_wsl2 or run_wsl_marker or interop_marker
+    # WSL1 and WSL2 both expose /run/WSL interop endpoints, so runtime and
+    # environment markers prove only WSL presence. Without an explicit WSL2
+    # kernel marker, custom-kernel state cannot be distinguished safely from
+    # WSL1 inside the guest and remains unsupported.
+    positively_wsl2 = kernel_wsl2
     if positively_wsl2:
         kind = LinuxHostKind.WSL2
     elif any_wsl_signal:
@@ -500,10 +546,10 @@ def _mountinfo_path(value: str) -> pathlib.PurePosixPath:
 def _parse_mountinfo(payload: str) -> tuple[_MountInfoEntry, ...]:
     encoded_size = len(payload.encode("utf-8", errors="surrogateescape"))
     if not payload or encoded_size > MOUNTINFO_LIMIT_BYTES:
-        raise LinuxRuntimeError("WSL2 mountinfo is empty or exceeds its size limit")
+        raise LinuxRuntimeError("Linux mountinfo is empty or exceeds its size limit")
     lines = payload.splitlines()
     if not lines or len(lines) > MOUNTINFO_ENTRY_LIMIT:
-        raise LinuxRuntimeError("WSL2 mountinfo has an invalid entry count")
+        raise LinuxRuntimeError("Linux mountinfo has an invalid entry count")
     entries: list[_MountInfoEntry] = []
     for line in lines:
         if (
@@ -511,26 +557,26 @@ def _parse_mountinfo(payload: str) -> tuple[_MountInfoEntry, ...]:
             or len(line.encode("utf-8", errors="surrogateescape"))
             > MOUNTINFO_LINE_LIMIT_BYTES
         ):
-            raise LinuxRuntimeError("WSL2 mountinfo contains an invalid line")
+            raise LinuxRuntimeError("Linux mountinfo contains an invalid line")
         fields = line.split(" ")
         if "" in fields:
-            raise LinuxRuntimeError("WSL2 mountinfo contains malformed spacing")
+            raise LinuxRuntimeError("Linux mountinfo contains malformed spacing")
         try:
             separator = fields.index("-", 6)
         except (ValueError, IndexError) as error:
             raise LinuxRuntimeError(
-                "WSL2 mountinfo is missing its field separator"
+                "Linux mountinfo is missing its field separator"
             ) from error
         if separator < 6 or len(fields) != separator + 4:
-            raise LinuxRuntimeError("WSL2 mountinfo has an invalid field shape")
+            raise LinuxRuntimeError("Linux mountinfo has an invalid field shape")
         if not fields[0].isdigit() or not fields[1].isdigit():
-            raise LinuxRuntimeError("WSL2 mountinfo has an invalid mount identifier")
+            raise LinuxRuntimeError("Linux mountinfo has an invalid mount identifier")
         if re.fullmatch(r"[0-9]+:[0-9]+", fields[2]) is None:
-            raise LinuxRuntimeError("WSL2 mountinfo has an invalid device identifier")
+            raise LinuxRuntimeError("Linux mountinfo has an invalid device identifier")
         root = _mountinfo_path(fields[3])
         mount_point = _mountinfo_path(fields[4])
         if not fields[5] or not fields[separator + 1] or not fields[separator + 3]:
-            raise LinuxRuntimeError("WSL2 mountinfo has an empty required field")
+            raise LinuxRuntimeError("Linux mountinfo has an empty required field")
         entries.append(
             _MountInfoEntry(
                 mount_id=int(fields[0]),
@@ -550,10 +596,10 @@ def _read_mountinfo(path: pathlib.Path) -> str:
             payload = handle.read(MOUNTINFO_LIMIT_BYTES + 1)
     except OSError as error:
         raise LinuxRuntimeError(
-            f"cannot read WSL2 mountinfo {path}: {error}"
+            f"cannot read Linux mountinfo {path}: {error}"
         ) from error
     if len(payload) > MOUNTINFO_LIMIT_BYTES:
-        raise LinuxRuntimeError("WSL2 mountinfo exceeds its size limit")
+        raise LinuxRuntimeError("Linux mountinfo exceeds its size limit")
     return payload.decode("utf-8", errors="surrogateescape")
 
 
@@ -606,7 +652,7 @@ def _deepest_mounts(
     )
     if not matching:
         raise LinuxRuntimeError(
-            f"WSL2 mountinfo does not cover runtime path: {candidate}"
+            f"Linux mountinfo does not cover runtime path: {candidate}"
         )
     depth = max(len(entry.mount_point.parts) for entry in matching)
     return tuple(entry for entry in matching if len(entry.mount_point.parts) == depth)
@@ -614,12 +660,14 @@ def _deepest_mounts(
 
 def _wsl_runtime_path_candidates(
     path: pathlib.Path,
+    *,
+    reject_literal_windows_drive: bool = True,
 ) -> tuple[pathlib.PurePosixPath, ...]:
     lexical = pathlib.Path(os.path.abspath(path))
     candidates = [lexical]
     # Preserve the cheap, deterministic /mnt/<drive> rejection before touching
     # procfs so a missing mountinfo file cannot obscure the decisive finding.
-    if _is_windows_drive_mount(lexical):
+    if reject_literal_windows_drive and _is_windows_drive_mount(lexical):
         raise LinuxRuntimeUnsafe(
             f"WSL2 runtime files must not come from a Windows drive mount: {path}"
         )
@@ -629,7 +677,9 @@ def _wsl_runtime_path_candidates(
         raise LinuxRuntimeInspectionInconclusive(
             f"cannot resolve WSL2 runtime path {path}: {error}"
         ) from error
-    if any(_is_windows_drive_mount(candidate) for candidate in candidates):
+    if reject_literal_windows_drive and any(
+        _is_windows_drive_mount(candidate) for candidate in candidates
+    ):
         raise LinuxRuntimeUnsafe(
             f"WSL2 runtime files must not come from a Windows drive mount: {path}"
         )
@@ -645,12 +695,31 @@ def reject_wsl_windows_paths(
     mountinfo_path: pathlib.Path = MOUNTINFO_PATH,
     mountinfo_text: str | None = None,
 ) -> None:
-    if host.kind != LinuxHostKind.WSL2:
+    if host.kind not in {LinuxHostKind.LINUX, LinuxHostKind.WSL2}:
         return
     candidates_by_path = tuple(
-        (path, _wsl_runtime_path_candidates(path)) for path in paths
+        (
+            path,
+            _wsl_runtime_path_candidates(
+                path,
+                reject_literal_windows_drive=host.kind == LinuxHostKind.WSL2,
+            ),
+        )
+        for path in paths
     )
     if not candidates_by_path:
+        return
+    # Production Linux always has procfs available before this helper can build
+    # its namespace sandbox. Keep synthetic Linux-host unit tests runnable on a
+    # non-Linux test runner while requiring mount provenance in every real Linux
+    # or WSL process. This also protects a markerless WSL2 guest that is otherwise
+    # observationally indistinguishable from native Linux.
+    if (
+        host.kind == LinuxHostKind.LINUX
+        and mountinfo_text is None
+        and mountinfo_path == MOUNTINFO_PATH
+        and platform.system().lower() != "linux"
+    ):
         return
     try:
         payload = (
@@ -669,9 +738,14 @@ def reject_wsl_windows_paths(
                 raise LinuxRuntimeInspectionInconclusive(str(error)) from error
             if any(_mount_has_windows_provenance(entry) for entry in selected):
                 raise LinuxRuntimeUnsafe(
-                    "WSL2 runtime files must not come from a Windows drive "
+                    "Linux review runtime files must not come from a Windows drive "
                     f"filesystem: {path}"
                 )
+            if host.kind != LinuxHostKind.WSL2:
+                # Native Linux permits its normal filesystem variety. The common
+                # guard exists only to reject positive Windows/DrvFS provenance
+                # even when a markerless WSL2 guest was classified as Linux.
+                continue
             unproven = tuple(
                 entry
                 for entry in selected
@@ -737,6 +811,64 @@ def _pread_exact(
     return payload
 
 
+def _checked_elf_range_end(
+    start: int,
+    length: int,
+    *,
+    path: pathlib.Path,
+    label: str,
+) -> int:
+    if start > ELF_UINT64_MAX - length:
+        raise LinuxRuntimeError(f"ELF {label} range overflows: {path}")
+    return start + length
+
+
+def _parse_elf_program_segment(entry: bytes) -> _ElfProgramSegment:
+    file_offset, virtual_address = struct.unpack_from("<QQ", entry, 8)
+    file_size, memory_size = struct.unpack_from("<QQ", entry, 32)
+    return _ElfProgramSegment(
+        file_offset=file_offset,
+        virtual_address=virtual_address,
+        file_size=file_size,
+        memory_size=memory_size,
+    )
+
+
+def _require_elf_page_size(path: pathlib.Path) -> int:
+    page_size = mmap.PAGESIZE
+    if (
+        not isinstance(page_size, int)
+        or isinstance(page_size, bool)
+        or page_size <= 0
+        or page_size > ELF_UINT64_MAX
+        or page_size & (page_size - 1)
+    ):
+        raise LinuxRuntimeInspectionInconclusive(
+            f"host ELF page size is not a bounded power of two: {path}"
+        )
+    return page_size
+
+
+def _elf_page_interval(
+    start: int,
+    length: int,
+    *,
+    page_size: int,
+    path: pathlib.Path,
+    label: str,
+) -> tuple[int, int]:
+    end = _checked_elf_range_end(start, length, path=path, label=label)
+    page_mask = page_size - 1
+    page_start = start & ~page_mask
+    if length == 0:
+        return page_start, page_start
+    if end & page_mask:
+        if end > ELF_UINT64_MAX - page_mask:
+            raise LinuxRuntimeError(f"ELF {label} page range overflows: {path}")
+        end = (end + page_mask) & ~page_mask
+    return page_start, end
+
+
 def _require_stable_elf_metadata(
     before: os.stat_result,
     after: os.stat_result,
@@ -772,7 +904,7 @@ def inspect_elf(path: pathlib.Path) -> ElfInfo:
         resolved = path.resolve(strict=True)
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(resolved, flags)
-    except OSError as error:
+    except (OSError, RuntimeError) as error:
         raise LinuxRuntimeInspectionInconclusive(
             f"cannot open ELF executable {path}: {error}"
         ) from error
@@ -809,6 +941,7 @@ def inspect_elf(path: pathlib.Path) -> ElfInfo:
         )
         if arch is None:
             raise LinuxRuntimeError(f"unsupported ELF machine {machine}: {path}")
+        page_size = _require_elf_page_size(path)
         program_offset = struct.unpack_from("<Q", header, 32)[0]
         program_entry_size = struct.unpack_from("<H", header, 54)[0]
         program_count = struct.unpack_from("<H", header, 56)[0]
@@ -821,6 +954,13 @@ def inspect_elf(path: pathlib.Path) -> ElfInfo:
         ):
             raise LinuxRuntimeError(f"ELF program-header table is invalid: {path}")
         interpreter: str | None = None
+        has_rpath = False
+        has_runpath = False
+        has_audit = False
+        has_depaudit = False
+        dynamic_segment: _ElfProgramSegment | None = None
+        load_segments: list[_ElfProgramSegment] = []
+        load_page_intervals: list[tuple[int, int]] = []
         for index in range(program_count):
             entry = _pread_exact(
                 fd,
@@ -829,8 +969,82 @@ def inspect_elf(path: pathlib.Path) -> ElfInfo:
                 known_size=metadata.st_size,
                 label="program-header entry",
             )
-            if struct.unpack_from("<I", entry, 0)[0] != 3:
+            program_type = struct.unpack_from("<I", entry, 0)[0]
+            if program_type == 1:
+                load_segment = _parse_elf_program_segment(entry)
+                load_file_end = _checked_elf_range_end(
+                    load_segment.file_offset,
+                    load_segment.file_size,
+                    path=path,
+                    label="PT_LOAD file",
+                )
+                _checked_elf_range_end(
+                    load_segment.virtual_address,
+                    load_segment.memory_size,
+                    path=path,
+                    label="PT_LOAD memory",
+                )
+                if (
+                    load_segment.file_size > load_segment.memory_size
+                    or load_file_end > metadata.st_size
+                ):
+                    raise LinuxRuntimeError(
+                        f"ELF PT_LOAD segment metadata is invalid: {path}"
+                    )
+                if (
+                    load_segment.file_offset % page_size
+                    != load_segment.virtual_address % page_size
+                ):
+                    raise LinuxRuntimeError(
+                        "ELF PT_LOAD offset and virtual address are not congruent "
+                        f"at the host page size: {path}"
+                    )
+                load_segments.append(load_segment)
+                load_page_intervals.append(
+                    _elf_page_interval(
+                        load_segment.virtual_address,
+                        load_segment.memory_size,
+                        page_size=page_size,
+                        path=path,
+                        label="PT_LOAD memory mapping",
+                    )
+                )
                 continue
+            if program_type == 2:
+                if dynamic_segment is not None:
+                    raise LinuxRuntimeError(
+                        f"ELF has duplicate dynamic segments: {path}"
+                    )
+                dynamic_segment = _parse_elf_program_segment(entry)
+                if (
+                    dynamic_segment.file_size <= 0
+                    or dynamic_segment.file_size > ELF_MAX_DYNAMIC_SEGMENT_BYTES
+                    or dynamic_segment.memory_size > ELF_MAX_DYNAMIC_SEGMENT_BYTES
+                    or dynamic_segment.file_size % ELF_DYNAMIC_ENTRY_BYTES != 0
+                    or dynamic_segment.file_size > dynamic_segment.memory_size
+                ):
+                    raise LinuxRuntimeError(
+                        f"ELF dynamic segment metadata is invalid: {path}"
+                    )
+                _checked_elf_range_end(
+                    dynamic_segment.file_offset,
+                    dynamic_segment.file_size,
+                    path=path,
+                    label="dynamic-segment file",
+                )
+                _checked_elf_range_end(
+                    dynamic_segment.virtual_address,
+                    dynamic_segment.memory_size,
+                    path=path,
+                    label="dynamic-segment memory",
+                )
+                continue
+            if program_type != 3:
+                continue
+            if interpreter is not None:
+                raise LinuxRuntimeError(
+                    f"ELF has duplicate interpreter metadata: {path}"
+                )
             data_offset = struct.unpack_from("<Q", entry, 8)[0]
             data_size = struct.unpack_from("<Q", entry, 32)[0]
             if data_size <= 1 or data_size > ELF_MAX_INTERPRETER_BYTES:
@@ -845,7 +1059,118 @@ def inspect_elf(path: pathlib.Path) -> ElfInfo:
             if not raw_interpreter.endswith(b"\x00") or b"\x00" in raw_interpreter[:-1]:
                 raise LinuxRuntimeError(f"ELF interpreter is malformed: {path}")
             interpreter = raw_interpreter[:-1].decode("utf-8", errors="strict")
-            break
+        if dynamic_segment is not None:
+            dynamic_memory_end = _checked_elf_range_end(
+                dynamic_segment.virtual_address,
+                dynamic_segment.memory_size,
+                path=path,
+                label="dynamic-segment memory",
+            )
+            covering_load_indexes = tuple(
+                index
+                for index, load_segment in enumerate(load_segments)
+                if load_segment.virtual_address <= dynamic_segment.virtual_address
+                and dynamic_memory_end
+                <= load_segment.virtual_address + load_segment.memory_size
+            )
+            if len(covering_load_indexes) != 1:
+                raise LinuxRuntimeError(
+                    "ELF dynamic segment does not have exactly one covering "
+                    f"PT_LOAD: {path}"
+                )
+            covering_load_index = covering_load_indexes[0]
+            covering_load = load_segments[covering_load_index]
+            address_delta = (
+                dynamic_segment.virtual_address - covering_load.virtual_address
+            )
+            mapped_file_offset = _checked_elf_range_end(
+                covering_load.file_offset,
+                address_delta,
+                path=path,
+                label="dynamic-segment PT_LOAD mapping",
+            )
+            if mapped_file_offset != dynamic_segment.file_offset:
+                raise LinuxRuntimeError(
+                    "ELF dynamic segment PT_LOAD offset mapping is inconsistent: "
+                    f"{path}"
+                )
+            dynamic_file_virtual_end = _checked_elf_range_end(
+                dynamic_segment.virtual_address,
+                dynamic_segment.file_size,
+                path=path,
+                label="dynamic-segment file-backed memory",
+            )
+            load_file_virtual_end = _checked_elf_range_end(
+                covering_load.virtual_address,
+                covering_load.file_size,
+                path=path,
+                label="PT_LOAD file-backed memory",
+            )
+            dynamic_file_end = _checked_elf_range_end(
+                dynamic_segment.file_offset,
+                dynamic_segment.file_size,
+                path=path,
+                label="dynamic-segment file",
+            )
+            load_file_end = _checked_elf_range_end(
+                covering_load.file_offset,
+                covering_load.file_size,
+                path=path,
+                label="PT_LOAD file",
+            )
+            if (
+                dynamic_segment.file_offset < covering_load.file_offset
+                or dynamic_file_end > load_file_end
+                or dynamic_file_virtual_end > load_file_virtual_end
+            ):
+                raise LinuxRuntimeError(
+                    "ELF dynamic segment is not fully file-backed by its "
+                    f"PT_LOAD: {path}"
+                )
+            dynamic_file_page_start, dynamic_file_page_end = _elf_page_interval(
+                dynamic_segment.virtual_address,
+                dynamic_segment.file_size,
+                page_size=page_size,
+                path=path,
+                label="dynamic-segment file mapping",
+            )
+            for index, (load_page_start, load_page_end) in enumerate(
+                load_page_intervals
+            ):
+                if index == covering_load_index:
+                    continue
+                if (
+                    load_page_start < load_page_end
+                    and load_page_start < dynamic_file_page_end
+                    and dynamic_file_page_start < load_page_end
+                ):
+                    raise LinuxRuntimeError(
+                        "ELF PT_LOAD page-rounded mapping overlaps the "
+                        f"PT_DYNAMIC file-byte pages: {path}"
+                    )
+            raw_dynamic = _pread_exact(
+                fd,
+                dynamic_segment.file_size,
+                dynamic_segment.file_offset,
+                known_size=metadata.st_size,
+                label="dynamic segment",
+            )
+            terminated = False
+            for dynamic_offset in range(
+                0,
+                len(raw_dynamic),
+                ELF_DYNAMIC_ENTRY_BYTES,
+            ):
+                dynamic_tag = struct.unpack_from("<q", raw_dynamic, dynamic_offset)[0]
+                if dynamic_tag == ELF_DYNAMIC_NULL:
+                    terminated = True
+                    break
+                has_rpath = has_rpath or dynamic_tag == ELF_DYNAMIC_RPATH
+                has_runpath = has_runpath or dynamic_tag == ELF_DYNAMIC_RUNPATH
+                has_audit = has_audit or dynamic_tag == ELF_DYNAMIC_AUDIT
+                has_depaudit = has_depaudit or dynamic_tag == ELF_DYNAMIC_DEPAUDIT
+            if not terminated:
+                raise LinuxRuntimeError(f"ELF dynamic segment is unterminated: {path}")
         final_metadata = os.fstat(fd)
         _require_stable_elf_metadata(metadata, final_metadata, path)
     except LinuxRuntimeInspectionInconclusive as error:
@@ -896,13 +1221,23 @@ def inspect_elf(path: pathlib.Path) -> ElfInfo:
             libc = "musl"
         elif "ld-linux" in interpreter or "ld64.so" in interpreter:
             libc = "glibc"
-    return ElfInfo(resolved, arch, interpreter, libc)
+    return ElfInfo(
+        resolved,
+        arch,
+        interpreter,
+        libc,
+        has_rpath=has_rpath,
+        has_runpath=has_runpath,
+        has_audit=has_audit,
+        has_depaudit=has_depaudit,
+    )
 
 
 def validate_claude_executable(path: pathlib.Path, host: LinuxHost) -> ElfInfo:
     require_supported_host(host)
     reject_wsl_windows_path(path, host)
     info = inspect_elf(path)
+    _require_no_elf_audit_modules(info)
     if info.arch != host.arch:
         raise LinuxRuntimeError(
             f"Claude ELF architecture {info.arch} does not match host {host.arch}"
@@ -1618,6 +1953,24 @@ def _path_component_identity(
     )
 
 
+def _path_component_anchor_identity(
+    path: pathlib.Path, metadata: os.stat_result
+) -> PathComponentIdentity:
+    """Track directory replacement and policy metadata, not entry churn."""
+
+    return PathComponentIdentity(
+        path=path,
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        mode=metadata.st_mode,
+        uid=metadata.st_uid,
+        gid=metadata.st_gid,
+        size=0,
+        mtime_ns=0,
+        ctime_ns=0,
+    )
+
+
 def _capture_trusted_path_identity(
     path: pathlib.Path,
     *,
@@ -1625,6 +1978,8 @@ def _capture_trusted_path_identity(
     expected_kind: str = "file",
     require_executable: bool = False,
     missing_is_unavailable: bool = False,
+    allow_root_sticky_temp_ancestor: bool = False,
+    ignore_parent_directory_content_changes: bool = False,
 ) -> TrustedPathIdentity:
     """Capture immutable metadata for every resolved path component."""
 
@@ -1660,11 +2015,18 @@ def _capture_trusted_path_identity(
             raise LinuxRuntimeUnsafe(
                 f"trusted runtime path has an untrusted owner: {component}"
             )
-        if metadata.st_mode & 0o022:
+        is_final = index == len(components) - 1
+        trusted_sticky_ancestor = (
+            allow_root_sticky_temp_ancestor
+            and not is_final
+            and stat.S_ISDIR(metadata.st_mode)
+            and metadata.st_uid == 0
+            and stat.S_IMODE(metadata.st_mode) == 0o1777
+        )
+        if metadata.st_mode & 0o022 and not trusted_sticky_ancestor:
             raise LinuxRuntimeUnsafe(
                 f"trusted runtime path is group- or world-writable: {component}"
             )
-        is_final = index == len(components) - 1
         if not is_final and not stat.S_ISDIR(metadata.st_mode):
             raise LinuxRuntimeUnsafe(
                 f"trusted runtime parent is not a directory: {component}"
@@ -1685,12 +2047,23 @@ def _capture_trusted_path_identity(
                 raise LinuxRuntimeUnsafe(
                     f"trusted runtime path unexpectedly has set-id mode: {component}"
                 )
-        captured.append(_path_component_identity(component, metadata))
+        captured.append(
+            _path_component_anchor_identity(component, metadata)
+            if ignore_parent_directory_content_changes and not is_final
+            else _path_component_identity(component, metadata)
+        )
     if require_executable and not os.access(resolved, os.X_OK):
         raise LinuxRuntimeUnsafe(
             f"trusted runtime tool is not executable: {resolved}"
         )
-    identity = TrustedPathIdentity(resolved, tuple(captured))
+    identity = TrustedPathIdentity(
+        resolved,
+        tuple(captured),
+        allow_root_sticky_temp_ancestor=allow_root_sticky_temp_ancestor,
+        ignore_parent_directory_content_changes=(
+            ignore_parent_directory_content_changes
+        ),
+    )
     _revalidate_trusted_path_identity(identity)
     return identity
 
@@ -1709,11 +2082,20 @@ def _revalidate_trusted_path_identity(
             raise LinuxRuntimeInspectionInconclusive(
                 f"trusted runtime path disappeared during validation: {expected.path}"
             ) from error
-        if metadata.st_uid != expected.uid or metadata.st_mode & 0o022:
+        is_final = index == len(identity.components) - 1
+        trusted_sticky_ancestor = (
+            identity.allow_root_sticky_temp_ancestor
+            and not is_final
+            and stat.S_ISDIR(metadata.st_mode)
+            and metadata.st_uid == 0
+            and stat.S_IMODE(metadata.st_mode) == 0o1777
+        )
+        if metadata.st_uid != expected.uid or (
+            metadata.st_mode & 0o022 and not trusted_sticky_ancestor
+        ):
             raise LinuxRuntimeUnsafe(
                 f"trusted runtime path became unsafe: {expected.path}"
             )
-        is_final = index == len(identity.components) - 1
         expected_type = stat.S_IFMT(expected.mode)
         if stat.S_IFMT(metadata.st_mode) != expected_type or (
             not is_final and not stat.S_ISDIR(metadata.st_mode)
@@ -1721,12 +2103,148 @@ def _revalidate_trusted_path_identity(
             raise LinuxRuntimeUnsafe(
                 f"trusted runtime path type changed: {expected.path}"
             )
-        current = _path_component_identity(expected.path, metadata)
+        current = (
+            _path_component_anchor_identity(expected.path, metadata)
+            if identity.ignore_parent_directory_content_changes and not is_final
+            else _path_component_identity(expected.path, metadata)
+        )
         if current != expected:
             raise LinuxRuntimeInspectionInconclusive(
                 f"trusted runtime path changed after inspection: {expected.path}"
             )
     return identity.path
+
+
+def _capture_host_runtime_dependency(
+    path: pathlib.Path,
+    destination: pathlib.PurePosixPath,
+    *,
+    trusted_owner_uids: frozenset[int],
+) -> HostRuntimeDependency:
+    """Capture both the loader-visible lexical chain and its resolved file."""
+
+    if not path.is_absolute():
+        raise LinuxRuntimeUnsafe(
+            f"host runtime dependency is not absolute: {path}"
+        )
+    if (
+        not destination.is_absolute()
+        or "." in destination.parts
+        or ".." in destination.parts
+        or not any(
+            _pure_is_relative_to(destination, root)
+            for root in _ALLOWED_LIBRARY_DESTINATIONS
+        )
+    ):
+        raise LinuxRuntimeUnsafe(
+            f"host runtime dependency has an unsafe destination: {destination}"
+        )
+    try:
+        resolved_before = path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise LinuxRuntimeInspectionInconclusive(
+            f"cannot resolve host runtime dependency {path}: {error}"
+        ) from error
+
+    lexical_components: list[PathComponentIdentity] = []
+    components = _path_components(path)
+    for index, component in enumerate(components):
+        try:
+            metadata = component.lstat()
+        except OSError as error:
+            raise LinuxRuntimeInspectionInconclusive(
+                f"cannot inspect host runtime dependency {component}: {error}"
+            ) from error
+        if metadata.st_uid not in trusted_owner_uids:
+            raise LinuxRuntimeUnsafe(
+                f"host runtime dependency has an untrusted owner: {component}"
+            )
+        if not stat.S_ISLNK(metadata.st_mode) and metadata.st_mode & 0o022:
+            raise LinuxRuntimeUnsafe(
+                "host runtime dependency is group- or world-writable: "
+                f"{component}"
+            )
+        is_final = index == len(components) - 1
+        if is_final:
+            if not (
+                stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
+            ):
+                raise LinuxRuntimeUnsafe(
+                    f"host runtime dependency is not a file or symlink: {component}"
+                )
+        elif not (
+            stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
+        ):
+            raise LinuxRuntimeUnsafe(
+                f"host runtime dependency parent is not a directory: {component}"
+            )
+        lexical_components.append(_path_component_identity(component, metadata))
+
+    resolved_identity = _capture_trusted_path_identity(
+        path,
+        trusted_owner_uids=trusted_owner_uids,
+    )
+    try:
+        resolved_after = path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise LinuxRuntimeInspectionInconclusive(
+            f"host runtime dependency changed while resolving {path}: {error}"
+        ) from error
+    if (
+        resolved_before != resolved_after
+        or resolved_after != resolved_identity.path
+    ):
+        raise LinuxRuntimeInspectionInconclusive(
+            f"host runtime dependency changed while capturing: {path}"
+        )
+    dependency = HostRuntimeDependency(
+        lexical_path=path,
+        destination=destination,
+        lexical_components=tuple(lexical_components),
+        resolved_identity=resolved_identity,
+    )
+    _revalidate_host_runtime_dependency(dependency)
+    return dependency
+
+
+def _revalidate_host_runtime_dependency(
+    dependency: HostRuntimeDependency,
+) -> pathlib.Path:
+    """Revalidate a host loader path without collapsing its symlink chain."""
+
+    if not dependency.lexical_components:
+        raise LinuxRuntimeUnsafe("host runtime dependency identity is malformed")
+    for expected in dependency.lexical_components:
+        try:
+            metadata = expected.path.lstat()
+        except OSError as error:
+            raise LinuxRuntimeInspectionInconclusive(
+                "host runtime dependency disappeared during validation: "
+                f"{expected.path}"
+            ) from error
+        if metadata.st_uid != expected.uid or (
+            not stat.S_ISLNK(metadata.st_mode) and metadata.st_mode & 0o022
+        ):
+            raise LinuxRuntimeUnsafe(
+                f"host runtime dependency became unsafe: {expected.path}"
+            )
+        if _path_component_identity(expected.path, metadata) != expected:
+            raise LinuxRuntimeInspectionInconclusive(
+                f"host runtime dependency changed after inspection: {expected.path}"
+            )
+    try:
+        resolved = dependency.lexical_path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise LinuxRuntimeInspectionInconclusive(
+            "host runtime dependency changed while resolving: "
+            f"{dependency.lexical_path}: {error}"
+        ) from error
+    if resolved != dependency.resolved_identity.path:
+        raise LinuxRuntimeInspectionInconclusive(
+            "host runtime dependency resolved target changed: "
+            f"{dependency.lexical_path}"
+        )
+    return _revalidate_trusted_path_identity(dependency.resolved_identity)
 
 
 def _trusted_ldd(
@@ -1763,7 +2281,11 @@ def _trusted_ldd(
     raise LinuxHostDependencyUnavailable("no trusted system ldd is available")
 
 
-def _parse_ldd_output(output: str) -> tuple[RuntimeMount, ...]:
+def _parse_ldd_output(
+    output: str,
+    *,
+    reject_unrecognized: bool = False,
+) -> tuple[RuntimeMount, ...]:
     mounts: dict[pathlib.PurePosixPath, pathlib.Path] = {}
     for raw_line in output.splitlines():
         line = raw_line.strip()
@@ -1778,6 +2300,10 @@ def _parse_ldd_output(output: str) -> tuple[RuntimeMount, ...]:
         if candidate in {"statically linked", "not a dynamic executable"}:
             continue
         if not candidate.startswith("/"):
+            if reject_unrecognized:
+                raise LinuxRuntimeInspectionInconclusive(
+                    f"cannot prove host runtime dependency from ldd output: {line}"
+                )
             continue
         destination = pathlib.PurePosixPath(candidate)
         source = pathlib.Path(candidate)
@@ -1786,6 +2312,267 @@ def _parse_ldd_output(output: str) -> tuple[RuntimeMount, ...]:
         RuntimeMount(source, destination)
         for destination, source in sorted(mounts.items(), key=lambda item: str(item[0]))
     )
+
+
+def _resolve_host_runtime_ldd(
+    host: LinuxHost,
+    *,
+    ldd_path: pathlib.Path | None,
+    ldd_trusted_roots: Sequence[pathlib.Path],
+    trusted_owner_uids: frozenset[int],
+) -> TrustedPathIdentity:
+    if ldd_path is None:
+        return _trusted_ldd(host, trusted_owner_uids=trusted_owner_uids)
+    identity = _capture_trusted_path_identity(
+        ldd_path,
+        trusted_owner_uids=trusted_owner_uids,
+        require_executable=True,
+        missing_is_unavailable=True,
+    )
+    if not any(
+        _is_relative_to(identity.path, root)
+        for root in _resolve_trusted_roots(ldd_trusted_roots)
+    ):
+        raise LinuxRuntimeUnsafe(
+            f"trusted ldd resolves outside configured roots: {ldd_path}"
+        )
+    return identity
+
+
+def _require_no_elf_audit_modules(info: ElfInfo) -> None:
+    if not info.has_audit and not info.has_depaudit:
+        return
+    labels = ", ".join(
+        label
+        for present, label in (
+            (info.has_audit, "DT_AUDIT"),
+            (info.has_depaudit, "DT_DEPAUDIT"),
+        )
+        if present
+    )
+    raise LinuxRuntimeUnsafe(
+        f"ELF uses an embedded dynamic-loader audit module ({labels}): {info.path}"
+    )
+
+
+def _require_safe_host_elf_loader_policy(info: ElfInfo) -> None:
+    _require_no_elf_audit_modules(info)
+    if info.has_rpath or info.has_runpath:
+        labels = ", ".join(
+            label
+            for present, label in (
+                (info.has_rpath, "DT_RPATH"),
+                (info.has_runpath, "DT_RUNPATH"),
+            )
+            if present
+        )
+        raise LinuxRuntimeUnsafe(
+            f"host GPG ELF uses a mutable loader search path ({labels}): {info.path}"
+        )
+    if info.interpreter is None:
+        return
+    interpreter = pathlib.PurePosixPath(info.interpreter)
+    if (
+        not interpreter.is_absolute()
+        or "." in interpreter.parts
+        or ".." in interpreter.parts
+        or not any(
+            _pure_is_relative_to(interpreter, root)
+            for root in _ALLOWED_LIBRARY_DESTINATIONS
+        )
+    ):
+        raise LinuxRuntimeUnsafe(
+            f"host GPG ELF has an unsafe interpreter: {info.interpreter}"
+        )
+
+
+def _collect_host_runtime_closure_with_ldd(
+    host: LinuxHost,
+    executable: pathlib.Path,
+    ldd_identity: TrustedPathIdentity,
+    *,
+    runner: Runner,
+    trusted_owner_uids: frozenset[int],
+    executable_owner_uids: frozenset[int],
+) -> HostRuntimeClosure:
+    executable_identity = _capture_trusted_path_identity(
+        executable,
+        trusted_owner_uids=executable_owner_uids,
+        require_executable=True,
+        allow_root_sticky_temp_ancestor=True,
+        ignore_parent_directory_content_changes=True,
+    )
+    info = inspect_elf(executable_identity.path)
+    _require_safe_host_elf_loader_policy(info)
+    if info.path != executable_identity.path:
+        raise LinuxRuntimeInspectionInconclusive(
+            "host GPG executable changed during ELF inspection"
+        )
+    if info.arch != host.arch:
+        raise LinuxRuntimeUnsafe(
+            f"host GPG architecture {info.arch} does not match {host.arch}"
+        )
+
+    ldd = _revalidate_trusted_path_identity(ldd_identity)
+    reject_wsl_windows_paths(
+        (executable_identity.path, ldd),
+        host,
+    )
+    try:
+        result = _run_tool_probe(runner, (str(ldd), str(executable_identity.path)))
+    except LinuxRuntimeInspectionInconclusive:
+        raise
+    except ReviewError as error:
+        raise LinuxRuntimeInspectionInconclusive(
+            f"host runtime dependency inspection failed for {executable}: {error}"
+        ) from error
+    _revalidate_trusted_path_identity(executable_identity)
+    _revalidate_trusted_path_identity(ldd_identity)
+    if result.returncode != 0:
+        detail = bytes(result.stderr).decode("utf-8", errors="replace").strip()
+        raise LinuxRuntimeInspectionInconclusive(
+            f"cannot resolve host runtime libraries for {executable}: {detail}"
+        )
+    try:
+        parsed = _parse_ldd_output(
+            bytes(result.stdout).decode("utf-8", errors="strict"),
+            reject_unrecognized=True,
+        )
+    except UnicodeDecodeError as error:
+        raise LinuxRuntimeInspectionInconclusive(
+            f"cannot parse host runtime libraries for {executable}: {error}"
+        ) from error
+
+    requested: dict[pathlib.PurePosixPath, pathlib.Path] = {
+        mount.destination: mount.source for mount in parsed
+    }
+    if info.interpreter is not None:
+        interpreter = pathlib.PurePosixPath(info.interpreter)
+        interpreter_path = pathlib.Path(info.interpreter)
+        previous = requested.get(interpreter)
+        if previous is not None and previous != interpreter_path:
+            raise LinuxRuntimeUnsafe(
+                "host runtime interpreter resolves to conflicting sources: "
+                f"{interpreter}"
+            )
+        requested[interpreter] = interpreter_path
+
+    captured_dependencies: list[HostRuntimeDependency] = []
+    for destination, source in sorted(
+        requested.items(), key=lambda item: str(item[0])
+    ):
+        dependency = _capture_host_runtime_dependency(
+            source,
+            destination,
+            trusted_owner_uids=trusted_owner_uids,
+        )
+        dependency_info = inspect_elf(dependency.resolved_identity.path)
+        _require_safe_host_elf_loader_policy(dependency_info)
+        if dependency_info.arch != host.arch:
+            raise LinuxRuntimeUnsafe(
+                "host runtime dependency architecture does not match the host: "
+                f"{dependency.lexical_path}"
+            )
+        captured_dependencies.append(dependency)
+    dependencies = tuple(captured_dependencies)
+    reject_wsl_windows_paths(
+        (
+            executable_identity.path,
+            ldd_identity.path,
+            *(dependency.lexical_path for dependency in dependencies),
+            *(
+                dependency.resolved_identity.path
+                for dependency in dependencies
+            ),
+        ),
+        host,
+    )
+    for dependency in dependencies:
+        _revalidate_host_runtime_dependency(dependency)
+    _revalidate_trusted_path_identity(executable_identity)
+    _revalidate_trusted_path_identity(ldd_identity)
+    return HostRuntimeClosure(
+        host=host,
+        executable_identity=executable_identity,
+        ldd_identity=ldd_identity,
+        interpreter=info.interpreter,
+        dependencies=dependencies,
+        trusted_owner_uids=trusted_owner_uids,
+        executable_owner_uids=executable_owner_uids,
+    )
+
+
+def collect_host_runtime_closure(
+    host: LinuxHost,
+    executable: pathlib.Path,
+    *,
+    runner: Runner = run_bounded_capture,
+    ldd_path: pathlib.Path | None = None,
+    ldd_trusted_roots: Sequence[pathlib.Path] = _TRUSTED_TOOL_ROOTS,
+    trusted_owner_uids: frozenset[int] = frozenset({0}),
+    executable_owner_uids: frozenset[int] | None = None,
+) -> HostRuntimeClosure:
+    """Capture the exact host loader closure for one trusted GPG snapshot."""
+
+    require_supported_host(host)
+    selected_executable_owners = (
+        frozenset({0, os.geteuid()})
+        if executable_owner_uids is None
+        else executable_owner_uids
+    )
+    ldd_identity = _resolve_host_runtime_ldd(
+        host,
+        ldd_path=ldd_path,
+        ldd_trusted_roots=ldd_trusted_roots,
+        trusted_owner_uids=trusted_owner_uids,
+    )
+    return _collect_host_runtime_closure_with_ldd(
+        host,
+        executable,
+        ldd_identity,
+        runner=runner,
+        trusted_owner_uids=trusted_owner_uids,
+        executable_owner_uids=selected_executable_owners,
+    )
+
+
+def revalidate_host_runtime_closure(
+    closure: HostRuntimeClosure,
+    *,
+    runner: Runner = run_bounded_capture,
+) -> HostRuntimeClosure:
+    """Re-resolve and require an identical host GPG loader closure."""
+
+    require_supported_host(closure.host)
+    _revalidate_trusted_path_identity(closure.executable_identity)
+    _revalidate_trusted_path_identity(closure.ldd_identity)
+    reject_wsl_windows_paths(
+        (
+            closure.executable_identity.path,
+            closure.ldd_identity.path,
+            *(dependency.lexical_path for dependency in closure.dependencies),
+            *(
+                dependency.resolved_identity.path
+                for dependency in closure.dependencies
+            ),
+        ),
+        closure.host,
+    )
+    for dependency in closure.dependencies:
+        _revalidate_host_runtime_dependency(dependency)
+    refreshed = _collect_host_runtime_closure_with_ldd(
+        closure.host,
+        closure.executable_identity.path,
+        closure.ldd_identity,
+        runner=runner,
+        trusted_owner_uids=closure.trusted_owner_uids,
+        executable_owner_uids=closure.executable_owner_uids,
+    )
+    if refreshed != closure:
+        raise LinuxRuntimeInspectionInconclusive(
+            "host GPG runtime closure changed before execution"
+        )
+    return refreshed
 
 
 def collect_runtime_libraries(
@@ -1821,6 +2608,7 @@ def collect_runtime_libraries(
     mounts: dict[pathlib.PurePosixPath, RuntimeMount] = {}
     for executable in executables:
         reject_wsl_windows_path(executable, host)
+        _require_no_elf_audit_modules(inspect_elf(executable))
         ldd = _revalidate_trusted_path_identity(ldd_identity)
         try:
             result = _run_tool_probe(runner, (str(ldd), str(executable)))
@@ -1958,6 +2746,16 @@ def _validate_runtime_mount(mount: RuntimeMount, host: LinuxHost) -> RuntimeMoun
         )
     source = _revalidate_trusted_path_identity(mount.identity)
     return RuntimeMount(source, mount.destination, mount.identity)
+
+
+def revalidate_runtime_libraries(
+    host: LinuxHost,
+    libraries: Sequence[RuntimeMount],
+) -> tuple[RuntimeMount, ...]:
+    """Revalidate one previously captured loader/library closure."""
+
+    require_supported_host(host)
+    return tuple(_validate_runtime_mount(mount, host) for mount in libraries)
 
 
 def _validate_private_socket(
@@ -2663,6 +3461,8 @@ __all__ = [
     "CLAUDE_LINUX_REVIEW_PERMISSION_MODE",
     "CLAUDE_LINUX_REVIEW_VISIBLE_TOOLS",
     "ElfInfo",
+    "HostRuntimeClosure",
+    "HostRuntimeDependency",
     "LAUNCHER_SOURCE",
     "LinuxCredentialError",
     "LinuxCredentialUnavailable",
@@ -2684,6 +3484,7 @@ __all__ = [
     "TrustedPathIdentity",
     "build_probe_command",
     "build_sandbox_command",
+    "collect_host_runtime_closure",
     "collect_runtime_libraries",
     "compile_launcher",
     "detect_host",
@@ -2691,6 +3492,8 @@ __all__ = [
     "fixed_host_tool_environment",
     "inspect_elf",
     "probe_bwrap",
+    "revalidate_host_runtime_closure",
+    "revalidate_runtime_libraries",
     "reject_wsl_windows_path",
     "reject_wsl_windows_paths",
     "require_supported_host",

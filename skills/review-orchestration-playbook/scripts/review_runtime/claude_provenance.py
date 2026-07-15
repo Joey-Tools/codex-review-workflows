@@ -12,13 +12,14 @@ import signal
 import ssl
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, replace
-from typing import Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Callable, Mapping, Sequence
 
 from .common import (
     ReviewOutputDrainError,
@@ -27,6 +28,9 @@ from .common import (
     ReviewTimeoutError,
     run_bounded_capture,
 )
+
+if TYPE_CHECKING:
+    from .claude_linux import HostRuntimeClosure
 
 
 CLAUDE_RELEASE_BASE_URL = "https://downloads.claude.ai/claude-code-releases"
@@ -43,6 +47,8 @@ CLAUDE_FETCH_CHUNK_BYTES = 64 * 1024
 CLAUDE_GPG_TIMEOUT_SECONDS = 15.0
 CLAUDE_GPG_OUTPUT_MAX_BYTES = 64 * 1024
 CLAUDE_GPG_EXECUTABLE_MAX_BYTES = 256 * 1024 * 1024
+CLAUDE_GPG_DEPENDENCY_MAX_COUNT = 128
+TRUSTED_OTOOL = pathlib.Path("/usr/bin/otool")
 CLAUDE_SUPPORTED_PLATFORM_BINARIES: Mapping[str, str] = {
     "darwin-arm64": "claude",
     "darwin-x64": "claude",
@@ -58,6 +64,25 @@ TRUSTED_GPG_CANDIDATES = (
     pathlib.Path("/usr/local/bin/gpg2"),
     pathlib.Path("/opt/homebrew/bin/gpg"),
     pathlib.Path("/opt/homebrew/bin/gpg2"),
+)
+_TRUSTED_LINUX_GPG_CANDIDATES = (
+    pathlib.Path("/usr/bin/gpg"),
+    pathlib.Path("/usr/bin/gpg2"),
+)
+_TRUSTED_DARWIN_GPG_CANDIDATES = TRUSTED_GPG_CANDIDATES
+_DARWIN_SEALED_LIBRARY_ROOTS = (
+    pathlib.PurePosixPath("/usr/lib"),
+    pathlib.PurePosixPath("/System/Library"),
+)
+_DARWIN_HOMEBREW_ROOTS = (
+    pathlib.PurePosixPath("/opt/homebrew"),
+    pathlib.PurePosixPath("/usr/local"),
+)
+_DARWIN_HOMEBREW_DEPENDENCY_ROOTS = (
+    pathlib.PurePosixPath("/opt/homebrew/opt"),
+    pathlib.PurePosixPath("/opt/homebrew/Cellar"),
+    pathlib.PurePosixPath("/usr/local/opt"),
+    pathlib.PurePosixPath("/usr/local/Cellar"),
 )
 
 _RELEASE_VERSION = re.compile(
@@ -127,6 +152,18 @@ class _TrustedGpgSource:
     identity: tuple[int, ...]
     size: int
     checksum: str
+
+
+@dataclass(frozen=True)
+class _TrustedGpgDependency:
+    path: pathlib.Path
+    identities: tuple[tuple[pathlib.Path, tuple[int, ...]], ...]
+
+
+@dataclass(frozen=True)
+class _TrustedGpgRuntime:
+    darwin_dependencies: tuple[_TrustedGpgDependency, ...] = ()
+    linux_closure: HostRuntimeClosure | None = None
 
 
 @dataclass(frozen=True)
@@ -605,6 +642,55 @@ def parse_signed_manifest_artifact(
     )
 
 
+def _pure_path_is_relative_to(
+    path: pathlib.PurePosixPath,
+    root: pathlib.PurePosixPath,
+) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _darwin_admin_gid() -> int | None:
+    if sys.platform != "darwin":
+        return None
+    try:
+        import grp
+
+        return grp.getgrnam("admin").gr_gid
+    except (ImportError, KeyError):
+        return None
+
+
+def _darwin_homebrew_path(path: pathlib.Path) -> bool:
+    pure = pathlib.PurePosixPath(str(path))
+    return any(_pure_path_is_relative_to(pure, root) for root in _DARWIN_HOMEBREW_ROOTS)
+
+
+def _darwin_homebrew_dependency_path(path: pathlib.Path) -> bool:
+    pure = pathlib.PurePosixPath(str(path))
+    return any(
+        _pure_path_is_relative_to(pure, root)
+        for root in _DARWIN_HOMEBREW_DEPENDENCY_ROOTS
+    )
+
+
+def _allows_trusted_gpg_group_write(
+    path: pathlib.Path,
+    metadata: os.stat_result,
+) -> bool:
+    admin_gid = _darwin_admin_gid()
+    return (
+        admin_gid is not None
+        and _darwin_homebrew_path(path)
+        and metadata.st_uid in {0, os.geteuid()}
+        and metadata.st_gid == admin_gid
+        and not metadata.st_mode & stat.S_IWOTH
+    )
+
+
 def _gpg_parent_identities(
     path: pathlib.Path,
 ) -> tuple[tuple[pathlib.Path, tuple[int, ...]], ...] | None:
@@ -614,7 +700,12 @@ def _gpg_parent_identities(
         metadata = current.stat(follow_symlinks=False)
         if not stat.S_ISDIR(metadata.st_mode):
             return None
-        if metadata.st_mode & stat.S_IWOTH:
+        if metadata.st_uid not in {0, os.geteuid()} or (
+            metadata.st_mode & stat.S_IWOTH
+        ) or (
+            metadata.st_mode & stat.S_IWGRP
+            and not _allows_trusted_gpg_group_write(current, metadata)
+        ):
             return None
         identities.append((current, _stat_identity(metadata)))
         if current.parent == current:
@@ -889,6 +980,8 @@ def _stable_trusted_gpg_candidate(
 
 def _resolve_trusted_gpg_source(
     candidates: Sequence[pathlib.Path],
+    *,
+    require_root_owner: bool = False,
 ) -> _TrustedGpgSource:
     for candidate in candidates:
         if not candidate.is_absolute():
@@ -897,19 +990,35 @@ def _resolve_trusted_gpg_source(
         # current-user Homebrew installations. The retained source descriptor,
         # rather than this replaceable path, is the snapshot trust anchor.
         source = _stable_trusted_gpg_candidate(candidate)
-        if source is not None:
+        if source is not None and (
+            not require_root_owner or os.fstat(source.descriptor).st_uid == 0
+        ):
             return source
+        if source is not None:
+            os.close(source.descriptor)
     raise ClaudeProvenanceUnavailable(
         "no trusted native GPG executable is available for Claude Code provenance"
     )
 
 
 def resolve_trusted_gpg(
-    candidates: Sequence[pathlib.Path] = TRUSTED_GPG_CANDIDATES,
+    candidates: Sequence[pathlib.Path] | None = None,
 ) -> pathlib.Path:
     """Resolve GPG from fixed paths inside the same-user host trust boundary."""
 
-    source = _resolve_trusted_gpg_source(candidates)
+    selected = candidates
+    require_root_owner = False
+    if selected is None:
+        if sys.platform.startswith("linux"):
+            selected = _TRUSTED_LINUX_GPG_CANDIDATES
+            require_root_owner = True
+        else:
+            selected = _TRUSTED_DARWIN_GPG_CANDIDATES
+    source = (
+        _resolve_trusted_gpg_source(selected, require_root_owner=True)
+        if require_root_owner
+        else _resolve_trusted_gpg_source(selected)
+    )
     try:
         return source.path
     finally:
@@ -1193,6 +1302,385 @@ def _materialize_trusted_gpg_snapshot(
         os.close(home_descriptor)
 
 
+def _clean_absolute_dependency_path(raw: str) -> pathlib.Path:
+    if (
+        not raw.startswith("/")
+        or raw.endswith("/")
+        or "\x00" in raw
+        or any(part in {"", ".", ".."} for part in raw.split("/")[1:])
+    ):
+        raise ClaudeProvenanceInvalid(
+            f"GPG has an unsafe dynamic dependency path: {raw!r}"
+        )
+    return pathlib.Path(raw)
+
+
+def _darwin_sealed_dependency(path: pathlib.Path) -> bool:
+    pure = pathlib.PurePosixPath(str(path))
+    return any(
+        _pure_path_is_relative_to(pure, root)
+        for root in _DARWIN_SEALED_LIBRARY_ROOTS
+    )
+
+
+def _capture_gpg_dependency_chain(
+    path: pathlib.Path,
+) -> _TrustedGpgDependency:
+    if not _darwin_homebrew_dependency_path(path):
+        raise ClaudeProvenanceInvalid(
+            f"GPG dynamic dependency is outside sealed or Homebrew roots: {path}"
+        )
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ClaudeProvenanceInconclusive(
+            f"cannot resolve GPG dynamic dependency {path}: {error}"
+        ) from error
+    if not _darwin_homebrew_dependency_path(resolved):
+        raise ClaudeProvenanceInvalid(
+            f"GPG dynamic dependency escapes the Homebrew prefix: {path}"
+        )
+
+    captured: dict[pathlib.Path, tuple[int, ...]] = {}
+    for candidate in (path, resolved):
+        current = pathlib.Path(candidate.anchor)
+        components = candidate.parts[1:]
+        for index, part in enumerate(components):
+            current /= part
+            try:
+                metadata = current.lstat()
+            except OSError as error:
+                raise ClaudeProvenanceInconclusive(
+                    f"cannot inspect GPG dynamic dependency {current}: {error}"
+                ) from error
+            is_final = index == len(components) - 1
+            if metadata.st_uid not in {0, os.geteuid()}:
+                raise ClaudeProvenanceInvalid(
+                    f"GPG dynamic dependency has an untrusted owner: {current}"
+                )
+            writable_regular_or_directory = (
+                not stat.S_ISLNK(metadata.st_mode)
+                and (
+                    metadata.st_mode & stat.S_IWOTH
+                    or metadata.st_mode & stat.S_IWGRP
+                    and (
+                        not stat.S_ISDIR(metadata.st_mode)
+                        or not _allows_trusted_gpg_group_write(current, metadata)
+                    )
+                )
+            )
+            if writable_regular_or_directory:
+                raise ClaudeProvenanceInvalid(
+                    f"GPG dynamic dependency has an untrusted writable path: {current}"
+                )
+            if is_final:
+                if candidate == resolved and not stat.S_ISREG(metadata.st_mode):
+                    raise ClaudeProvenanceInvalid(
+                        f"GPG dynamic dependency is not a regular file: {current}"
+                    )
+                if candidate != resolved and not (
+                    stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
+                ):
+                    raise ClaudeProvenanceInvalid(
+                        f"GPG dynamic dependency is not a file or symlink: {current}"
+                    )
+            elif not (
+                stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
+            ):
+                raise ClaudeProvenanceInvalid(
+                    f"GPG dynamic dependency parent is not a directory: {current}"
+                )
+            captured[current] = _stat_identity(metadata)
+    dependency = _TrustedGpgDependency(path, tuple(captured.items()))
+    _revalidate_gpg_dependency(dependency)
+    return dependency
+
+
+def _revalidate_gpg_dependency(dependency: _TrustedGpgDependency) -> None:
+    for path, expected in dependency.identities:
+        try:
+            current = path.lstat()
+        except OSError as error:
+            raise ClaudeProvenanceInconclusive(
+                f"GPG dynamic dependency changed before execution: {path}: {error}"
+            ) from error
+        if _stat_identity(current) != expected:
+            raise ClaudeProvenanceInconclusive(
+                f"GPG dynamic dependency changed before execution: {path}"
+            )
+
+
+def _run_otool(path: pathlib.Path, option: str) -> str:
+    if option not in {"-L", "-l"}:
+        raise ValueError(f"unsupported otool option: {option}")
+    try:
+        metadata = TRUSTED_OTOOL.stat(follow_symlinks=False)
+    except OSError as error:
+        raise ClaudeProvenanceUnavailable(
+            f"trusted macOS otool is unavailable: {error}"
+        ) from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or not os.access(TRUSTED_OTOOL, os.X_OK)
+    ):
+        raise ClaudeProvenanceUnavailable(
+            "trusted macOS otool has unsafe filesystem metadata"
+        )
+    try:
+        result = run_bounded_capture(
+            (str(TRUSTED_OTOOL), option, str(path)),
+            env={
+                "HOME": "/var/empty",
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PATH": "/usr/bin:/bin",
+            },
+            timeout_seconds=CLAUDE_GPG_TIMEOUT_SECONDS,
+            stdout_limit_bytes=CLAUDE_GPG_OUTPUT_MAX_BYTES,
+            stderr_limit_bytes=CLAUDE_GPG_OUTPUT_MAX_BYTES,
+        )
+    except (
+        ReviewTimeoutError,
+        ReviewOutputLimitError,
+        ReviewOutputDrainError,
+        ReviewProcessLeakError,
+    ) as error:
+        raise ClaudeProvenanceInconclusive(
+            f"bounded macOS GPG dependency inspection failed: {error}"
+        ) from error
+    except OSError as error:
+        raise ClaudeProvenanceInconclusive(
+            f"cannot start bounded macOS GPG dependency inspection: {error}"
+        ) from error
+    if result.returncode != 0:
+        detail = bytes(result.stderr).decode("utf-8", errors="replace").strip()
+        raise ClaudeProvenanceInconclusive(
+            f"macOS otool could not inspect the GPG runtime: {detail}"
+        )
+    try:
+        return bytes(result.stdout).decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise ClaudeProvenanceInvalid(
+            "macOS otool returned non-UTF-8 GPG dependency metadata"
+        ) from error
+
+
+def _parse_otool_dependencies(path: pathlib.Path, output: str) -> tuple[pathlib.Path, ...]:
+    lines = output.splitlines()
+    if not lines or lines[0] != f"{path}:":
+        raise ClaudeProvenanceInvalid(
+            "macOS otool returned malformed GPG dependency metadata"
+        )
+    dependencies: list[pathlib.Path] = []
+    for raw_line in lines[1:]:
+        line = raw_line.strip()
+        if not line:
+            continue
+        dependency, marker, _detail = line.rpartition(" (compatibility version ")
+        if not marker:
+            raise ClaudeProvenanceInvalid(
+                "macOS otool returned malformed GPG dependency metadata"
+            )
+        if dependency.startswith("@"):
+            raise ClaudeProvenanceInvalid(
+                f"GPG uses an unsupported dyld-relative dependency: {dependency}"
+            )
+        dependencies.append(_clean_absolute_dependency_path(dependency))
+    return tuple(dependencies)
+
+
+def _parse_otool_load_commands(
+    path: pathlib.Path,
+    output: str,
+) -> tuple[tuple[str, str | None], ...]:
+    lines = output.splitlines()
+    if not lines or lines[0] != f"{path}:":
+        raise ClaudeProvenanceInvalid(
+            "macOS otool returned malformed GPG load-command metadata"
+        )
+    blocks: list[list[str]] = []
+    current: list[str] | None = None
+    for raw_line in lines[1:]:
+        line = raw_line.strip()
+        if re.fullmatch(r"Load command [0-9]+", line) is not None:
+            if current is not None:
+                blocks.append(current)
+            current = []
+            continue
+        if not line:
+            continue
+        if current is None:
+            raise ClaudeProvenanceInvalid(
+                "macOS otool returned malformed GPG load-command metadata"
+            )
+        current.append(line)
+    if current is not None:
+        blocks.append(current)
+    if not blocks:
+        raise ClaudeProvenanceInvalid(
+            "macOS otool returned no GPG load-command metadata"
+        )
+
+    commands: list[tuple[str, str | None]] = []
+    for block in blocks:
+        command_lines = tuple(
+            match.group(1)
+            for line in block
+            if (match := re.fullmatch(r"cmd ([A-Z0-9_]+)", line)) is not None
+        )
+        if len(command_lines) != 1:
+            raise ClaudeProvenanceInvalid(
+                "macOS otool returned malformed GPG load-command metadata"
+            )
+        command = command_lines[0]
+        name: str | None = None
+        if command == "LC_LOAD_DYLINKER":
+            names = tuple(
+                match.group(1)
+                for line in block
+                if (
+                    match := re.fullmatch(
+                        r"name (.+) \(offset [0-9]+\)",
+                        line,
+                    )
+                )
+                is not None
+            )
+            if len(names) != 1:
+                raise ClaudeProvenanceInvalid(
+                    "macOS otool returned malformed GPG dynamic-linker metadata"
+                )
+            name = names[0]
+        commands.append((command, name))
+    return tuple(commands)
+
+
+def _validate_darwin_gpg_load_commands(
+    path: pathlib.Path,
+    output: str,
+    *,
+    main_executable: bool,
+) -> None:
+    commands = _parse_otool_load_commands(path, output)
+    if any(
+        command in {"LC_RPATH", "LC_DYLD_ENVIRONMENT"}
+        for command, _name in commands
+    ):
+        raise ClaudeProvenanceInvalid(
+            "GPG uses an unsupported mutable dyld search path"
+        )
+    dynamic_linkers = tuple(
+        name for command, name in commands if command == "LC_LOAD_DYLINKER"
+    )
+    if main_executable:
+        if dynamic_linkers != ("/usr/lib/dyld",):
+            raise ClaudeProvenanceInvalid(
+                "GPG main executable must use exactly one sealed /usr/lib/dyld loader"
+            )
+    elif dynamic_linkers:
+        raise ClaudeProvenanceInvalid(
+            "GPG dynamic dependency unexpectedly declares LC_LOAD_DYLINKER"
+        )
+
+
+def _collect_darwin_gpg_dependencies(
+    executable: pathlib.Path,
+) -> tuple[_TrustedGpgDependency, ...]:
+    pending = [executable]
+    visited: set[pathlib.Path] = set()
+    captured: dict[pathlib.Path, _TrustedGpgDependency] = {}
+    while pending:
+        current = pending.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        if len(visited) > CLAUDE_GPG_DEPENDENCY_MAX_COUNT:
+            raise ClaudeProvenanceInvalid(
+                "macOS GPG dynamic dependency closure is too large"
+            )
+        current_identity = captured.get(current)
+        if current != executable and current_identity is None:
+            current_identity = _capture_gpg_dependency_chain(current)
+            captured[current] = current_identity
+        if current_identity is not None:
+            _revalidate_gpg_dependency(current_identity)
+        _validate_darwin_gpg_load_commands(
+            current,
+            _run_otool(current, "-l"),
+            main_executable=current == executable,
+        )
+        for dependency in _parse_otool_dependencies(
+            current,
+            _run_otool(current, "-L"),
+        ):
+            if _darwin_sealed_dependency(dependency):
+                continue
+            identity = captured.get(dependency)
+            if identity is None:
+                identity = _capture_gpg_dependency_chain(dependency)
+                captured[dependency] = identity
+            _revalidate_gpg_dependency(identity)
+            pending.append(dependency)
+        if current_identity is not None:
+            _revalidate_gpg_dependency(current_identity)
+    return tuple(captured[path] for path in sorted(captured, key=str))
+
+
+def _prepare_trusted_gpg_runtime(executable: pathlib.Path) -> _TrustedGpgRuntime:
+    if sys.platform == "darwin":
+        return _TrustedGpgRuntime(
+            darwin_dependencies=_collect_darwin_gpg_dependencies(executable)
+        )
+    if sys.platform.startswith("linux"):
+        from . import claude_linux
+
+        host = claude_linux.detect_host()
+        try:
+            closure = claude_linux.collect_host_runtime_closure(
+                host,
+                executable,
+                executable_owner_uids=frozenset({0, os.geteuid()}),
+            )
+        except claude_linux.LinuxRuntimeInspectionInconclusive as error:
+            raise ClaudeProvenanceInconclusive(
+                f"cannot inspect the trusted Linux GPG runtime: {error}"
+            ) from error
+        except claude_linux.LinuxHostDependencyUnavailable as error:
+            raise ClaudeProvenanceUnavailable(
+                f"trusted Linux GPG runtime dependency is unavailable: {error}"
+            ) from error
+        except claude_linux.LinuxRuntimeError as error:
+            raise ClaudeProvenanceInvalid(
+                f"trusted Linux GPG runtime dependency is unsafe: {error}"
+            ) from error
+        return _TrustedGpgRuntime(
+            linux_closure=closure,
+        )
+    raise ClaudeProvenanceUnavailable(
+        f"GPG provenance verification is unsupported on {sys.platform}"
+    )
+
+
+def _revalidate_trusted_gpg_runtime(runtime: _TrustedGpgRuntime) -> None:
+    for dependency in runtime.darwin_dependencies:
+        _revalidate_gpg_dependency(dependency)
+    if runtime.linux_closure is not None:
+        from . import claude_linux
+
+        try:
+            claude_linux.revalidate_host_runtime_closure(runtime.linux_closure)
+        except claude_linux.LinuxRuntimeInspectionInconclusive as error:
+            raise ClaudeProvenanceInconclusive(
+                f"trusted Linux GPG runtime changed before execution: {error}"
+            ) from error
+        except claude_linux.LinuxRuntimeError as error:
+            raise ClaudeProvenanceInvalid(
+                f"trusted Linux GPG runtime became unsafe: {error}"
+            ) from error
+
+
 def _run_gpg(
     argv: Sequence[str],
     *,
@@ -1272,7 +1760,7 @@ def verify_manifest_signature(
     *,
     temp_root: pathlib.Path,
     temp_root_validator: Callable[[tuple[pathlib.Path, ...]], None] | None = None,
-    gpg_candidates: Sequence[pathlib.Path] = TRUSTED_GPG_CANDIDATES,
+    gpg_candidates: Sequence[pathlib.Path] | None = None,
     timeout_seconds: float = CLAUDE_GPG_TIMEOUT_SECONDS,
 ) -> pathlib.Path:
     """Verify a detached manifest signature in a fresh, isolated GPG home."""
@@ -1295,7 +1783,22 @@ def verify_manifest_signature(
         home.chmod(0o700)
         home = home.resolve(strict=True)
         _require_stable_trusted_gpg_temp_root(trusted_temp_root)
-        gpg_source = _resolve_trusted_gpg_source(gpg_candidates)
+        selected_gpg_candidates = gpg_candidates
+        require_root_owner = False
+        if selected_gpg_candidates is None:
+            if sys.platform.startswith("linux"):
+                selected_gpg_candidates = _TRUSTED_LINUX_GPG_CANDIDATES
+                require_root_owner = True
+            else:
+                selected_gpg_candidates = _TRUSTED_DARWIN_GPG_CANDIDATES
+        gpg_source = (
+            _resolve_trusted_gpg_source(
+                selected_gpg_candidates,
+                require_root_owner=True,
+            )
+            if require_root_owner
+            else _resolve_trusted_gpg_source(selected_gpg_candidates)
+        )
         try:
             gpg_path = gpg_source.path
             gpg_execution_path = _materialize_trusted_gpg_snapshot(
@@ -1304,6 +1807,7 @@ def verify_manifest_signature(
             )
         finally:
             os.close(gpg_source.descriptor)
+        gpg_runtime = _prepare_trusted_gpg_runtime(gpg_execution_path)
         home_identity = _private_gpg_home_identity(home, trusted_temp_root)
         key_path = home / "claude-code-release.asc"
         keyring_path = home / "claude-code-release.gpg"
@@ -1325,6 +1829,7 @@ def verify_manifest_signature(
         }
         base = _gpg_base_argv(gpg_execution_path, home)
         _require_stable_private_gpg_home(home, home_identity, trusted_temp_root)
+        _revalidate_trusted_gpg_runtime(gpg_runtime)
         dearmored = _run_gpg(
             [*base, "--dearmor", "--output", str(keyring_path), str(key_path)],
             env=env,
@@ -1347,6 +1852,7 @@ def verify_manifest_signature(
             str(keyring_path),
         ]
         _require_stable_private_gpg_home(home, home_identity, trusted_temp_root)
+        _revalidate_trusted_gpg_runtime(gpg_runtime)
         listed = _run_gpg(
             [
                 *release_keyring,
@@ -1367,6 +1873,7 @@ def verify_manifest_signature(
                 "vendored Claude Code release key fingerprint does not match the pin"
             )
         _require_stable_private_gpg_home(home, home_identity, trusted_temp_root)
+        _revalidate_trusted_gpg_runtime(gpg_runtime)
         verified = _run_gpg(
             [
                 *release_keyring,
@@ -1607,14 +2114,14 @@ def verify_release_executable(
 
     try:
         resolved = executable.expanduser().resolve(strict=True)
-    except OSError as error:
-        raise ClaudeProvenanceUnavailable(
+    except (OSError, RuntimeError) as error:
+        raise ClaudeProvenanceInconclusive(
             f"cannot resolve Claude Code executable {executable}: {error}"
         ) from error
     try:
         before = resolved.stat(follow_symlinks=False)
     except OSError as error:
-        raise ClaudeProvenanceUnavailable(
+        raise ClaudeProvenanceInconclusive(
             f"cannot stat Claude Code executable {resolved}: {error}"
         ) from error
     if not stat.S_ISREG(before.st_mode):
@@ -2095,7 +2602,7 @@ def verify_claude_release(
     gpg_temp_root_validator: Callable[[tuple[pathlib.Path, ...]], None] | None = None,
     fetcher: ClaudeReleaseFetcher | None = None,
     cache_dir: pathlib.Path | None = None,
-    gpg_candidates: Sequence[pathlib.Path] = TRUSTED_GPG_CANDIDATES,
+    gpg_candidates: Sequence[pathlib.Path] | None = None,
     fetch_timeout_seconds: float = CLAUDE_FETCH_TIMEOUT_SECONDS,
     gpg_timeout_seconds: float = CLAUDE_GPG_TIMEOUT_SECONDS,
 ) -> VerifiedClaudeExecutable:
