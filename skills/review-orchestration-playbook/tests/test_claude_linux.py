@@ -1643,14 +1643,17 @@ class RuntimeLibraryTrustTest(unittest.TestCase):
                 claude_linux.fixed_host_tool_environment(),
             )
 
-    def test_host_runtime_rejects_dependency_interpreter_after_trace(self) -> None:
+    def test_host_runtime_rejects_noncanonical_dependency_interpreter(self) -> None:
         with tempfile.TemporaryDirectory(
             dir=pathlib.Path(__file__).parent
         ) as temporary:
             root = pathlib.Path(temporary)
             root.chmod(0o700)
             executable = _write_elf(root / "gpg")
-            library = _write_elf(root / "lib-with-interpreter.so")
+            library = _write_elf(
+                root / "lib-with-interpreter.so",
+                interpreter="/lib/ld-musl-x86_64.so.1",
+            )
             loader = self._glibc_loader_fixture(root)
             runner = mock.Mock(side_effect=self._glibc_runner())
             with (
@@ -1671,7 +1674,7 @@ class RuntimeLibraryTrustTest(unittest.TestCase):
                 ),
                 self.assertRaisesRegex(
                     claude_linux.LinuxRuntimeUnsafe,
-                    "names an interpreter",
+                    "noncanonical interpreter",
                 ),
             ):
                 claude_linux.collect_host_runtime_closure(
@@ -1682,6 +1685,48 @@ class RuntimeLibraryTrustTest(unittest.TestCase):
                     executable_owner_uids=self.trusted_owners,
                 )
             self.assertEqual(runner.call_count, 2)
+
+    def test_host_runtime_allows_canonical_dependency_interpreter(self) -> None:
+        with tempfile.TemporaryDirectory(
+            dir=pathlib.Path(__file__).parent
+        ) as temporary:
+            root = pathlib.Path(temporary)
+            root.chmod(0o700)
+            executable = _write_elf(root / "gpg")
+            libc = _write_elf(root / "libc.so.6")
+            loader = self._glibc_loader_fixture(root)
+            with (
+                mock.patch.object(
+                    claude_linux,
+                    "_capture_glibc_loader",
+                    return_value=loader,
+                ),
+                mock.patch.object(
+                    claude_linux,
+                    "_parse_ldd_output",
+                    return_value=(
+                        claude_linux.RuntimeMount(
+                            libc,
+                            pathlib.PurePosixPath("/lib/libc.so.6"),
+                        ),
+                    ),
+                ),
+            ):
+                closure = claude_linux.collect_host_runtime_closure(
+                    self.host,
+                    executable,
+                    runner=self._glibc_runner(list_stdout=b"fixture\n"),
+                    trusted_owner_uids=self.trusted_owners,
+                    executable_owner_uids=self.trusted_owners,
+                )
+
+            self.assertTrue(
+                any(
+                    dependency.destination
+                    == pathlib.PurePosixPath("/lib/libc.so.6")
+                    for dependency in closure.dependencies
+                )
+            )
 
     def test_accepts_and_revalidates_safe_system_path(self) -> None:
         candidate = next(

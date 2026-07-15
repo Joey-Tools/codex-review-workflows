@@ -226,9 +226,12 @@ floating range `>=2.27,<3.0`. The helper then invokes that captured loader
 directly as `loader --list <gpg-snapshot>`; it never delegates this boundary to
 an implementation-variable `ldd` script. The pinned glibc list path may map
 dependencies but exits before application relocation, constructors, or entry
-code. The helper immediately rejects mutable loader paths, audit tags, a nested
-interpreter, non-`ET_DYN` type, incompatible architecture, or unsafe provenance
-in every reported dependency before any real GPG operation. This ordering
+code. The helper immediately rejects mutable loader paths, audit tags, a
+noncanonical interpreter, non-`ET_DYN` type, incompatible architecture, or
+unsafe provenance in every reported dependency before any real GPG operation.
+A dependency such as glibc's executable `libc.so.6` may carry only the same
+already-proven canonical interpreter; arbitrary or musl interpreters remain
+invalid. This ordering
 prevents a malformed alternate/page-overlaid main dynamic table from activating
 audit code while still allowing the proven loader to report the exact dependency
 graph. Before every call the helper revalidates every old identity, reruns the

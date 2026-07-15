@@ -797,6 +797,15 @@ superseded_by:
   `/lib64/ld-linux-x86-64.so.2`, Ubuntu glibc `2.39`, no loader `PT_INTERP`, and
   a directly listable `/usr/bin/gpg` closure. This is host/runtime capability
   evidence, not publisher provenance for Claude Code or GPG.
+- The first real direct-loader GPG smoke on the follow-up implementation found a
+  Linux compatibility error that synthetic tests had missed: glibc's
+  `libc.so.6` is an executable `ET_DYN` dependency and legitimately carries a
+  `PT_INTERP` naming the same canonical glibc loader. Rejecting every dependency
+  interpreter therefore blocked the real Ubuntu GPG closure. The corrected rule
+  permits only that already-proven canonical interpreter on dependencies and
+  still rejects musl, custom, relative, or inconsistent interpreters; the loader
+  itself must continue to have no second `PT_INTERP`. Positive `libc.so.6`-shape
+  and negative musl-interpreter regressions pin the distinction.
 - After the fallback-classification and direct-loader repairs, the focused
   provenance/provider/Linux modules passed all 414 tests with nine
   environment-gated skips. The complete local suite passed all 584 tests in
@@ -805,6 +814,13 @@ superseded_by:
   `git diff --check` passed. Python 3.10 grammar parsing across 20 files, the
   isolated PyYAML skill validator, and project-journal validation had also
   passed on the same implementation/docs set before this evidence-only entry.
+- After merging current `master` (`8f336c5`) and repairing the real
+  `libc.so.6` interpreter compatibility issue, the focused
+  provenance/provider/Linux modules passed all 415 tests with nine skips. The
+  merged complete local suite passed all 668 tests in 125.832 seconds with nine
+  skips. Full runtime/test `ruff`, `compileall`, both workflow actionlint checks,
+  strict Clang checks for both C helpers, `git diff --check`, and project-journal
+  validation passed before committing the compatibility repair.
 - Anthropic installation, signed-manifest, release-key fingerprint, and platform
   signature documentation: https://code.claude.com/docs/en/installation
 - Anthropic Seatbelt, `bubblewrap`, `socat`, WSL2, and WSL1 sandboxing

@@ -2541,15 +2541,22 @@ def _require_safe_host_gpg_loader_policy(
     return expected
 
 
-def _require_safe_host_dependency_loader_policy(info: ElfInfo) -> None:
+def _require_safe_host_dependency_loader_policy(
+    info: ElfInfo,
+    host: LinuxHost,
+) -> None:
     _require_safe_host_elf_loader_policy(info)
     if info.elf_type != 3:
         raise LinuxRuntimeUnsafe(
             f"host runtime library is not an ET_DYN image: {info.path}"
         )
-    if info.interpreter is not None:
+    if (
+        info.interpreter is not None
+        and info.interpreter != str(_canonical_glibc_loader(host))
+    ):
         raise LinuxRuntimeUnsafe(
-            f"host runtime library unexpectedly names an interpreter: {info.path}"
+            "host runtime library names a noncanonical interpreter: "
+            f"{info.path}"
         )
 
 
@@ -2662,7 +2669,7 @@ def _collect_host_runtime_closure_with_loader(
                 trusted_owner_uids=trusted_owner_uids,
             )
         dependency_info = inspect_elf(dependency.resolved_identity.path)
-        _require_safe_host_dependency_loader_policy(dependency_info)
+        _require_safe_host_dependency_loader_policy(dependency_info, host)
         if dependency_info.arch != host.arch:
             raise LinuxRuntimeUnsafe(
                 "host runtime dependency architecture does not match the host: "
