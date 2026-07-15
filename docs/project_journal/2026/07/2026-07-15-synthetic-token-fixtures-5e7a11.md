@@ -26,6 +26,7 @@ superseded_by:
 - Selected legacy entries pass only when both the complete-tree raw-byte count and the count not embedded inside a longer value from the same envelope are monotonic. The stateful runner recomputes both materialized-head counts before egress, while cross-envelope overlaps fail closed.
 - Every complete-catalog legacy raw value and canonical Base64 storage encoding is independently forbidden in base, head, and materialized repository paths through a finite linear byte matcher; diagnostics never expose the matched path or value.
 - The helper exposes read-only validate, metadata list, single-value get, exemption list, and pinned-master audit commands.
+- Pinned-master audit scans bounded events exhaustively for provenance eligibility, so an unrelated earlier finding cannot hide a later exact capture. Runtime preflight still stops at and reports the first non-exempt finding.
 - Successful preflight records bounded IDs, digests, rules, surfaces, and counts without raw token values; the shared evidence-entry limit is enforced before each new key is inserted.
 - The six reviewer-visible control files and their exact directory entry set are bound to helper-private size, digest, record-count, identity, mode, and stable-metadata evidence; added files, nested directories, symlinks, FIFOs, and post-prepare mutations fail closed.
 - All six control files are created as `0600` even under permissive caller umasks, while the existing reader continues to reject group- or other-writable artifacts.
@@ -52,3 +53,6 @@ superseded_by:
 - Printable-legacy follow-up: `python3 -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py' -v` passed (`605` tests, `9` skipped).
 - Printable-legacy follow-up: `python3 -m py_compile` passed for the changed runtime and test modules; `ruff check` and `ruff format --check` passed for both files.
 - Printable-legacy follow-up: both skill validators, `isolated_review synthetic-tokens validate`, and `git diff --check` passed.
+- Exhaustive-audit follow-up: four focused scanner, provenance-audit, runtime-blocking, and catalog-neutral tree-metadata regressions passed.
+- Exhaustive-audit follow-up: `python3 -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py' -v` passed (`606` tests, `9` skipped).
+- Exhaustive-audit follow-up: `python3 -m py_compile`, `ruff check`, `ruff format --check`, both skill validators, `isolated_review synthetic-tokens validate`, and `git diff --check` passed.

@@ -1294,6 +1294,61 @@ class PublicPoolScannerTest(unittest.TestCase):
         self.assertEqual(scan.blocking_rule, "generic-secret-assignment")
         self.assertEqual(budget.remaining, 0)
 
+        with self.assertRaisesRegex(ReviewError, "requires accepted-candidate capture"):
+            workspace._scan_secret_value(
+                payload,
+                _continue_after_blocking=True,
+            )
+
+        with self.assertRaisesRegex(ReviewError, "scanner event limit"):
+            workspace._scan_secret_value(
+                payload,
+                capture_accepted_candidates=True,
+                _event_budget=workspace.SecretScanBudget(1),
+                _continue_after_blocking=True,
+            )
+
+    def test_audit_scan_captures_after_a_blocker_across_stream_chunks(self) -> None:
+        accepted = accepted_legacy_value(LEGACY_A, rule="generic-secret-assignment")
+        blocking = assignment_bytes(b"password", b"UnknownSecretValueA9Z8Y7")
+        later = assignment_bytes(b"refresh_token", LEGACY_A.encode("ascii"))
+        first_read = (
+            workspace.MAX_SECRET_PREFIX_PROOF_BYTES + workspace.STREAM_SCAN_OVERLAP
+        )
+        payload = (
+            blocking + b"\n" + b"x" * (first_read + 128 - len(blocking)) + b"\n" + later
+        )
+
+        ordinary = workspace._stream_secret_scan(
+            io.BytesIO(payload),
+            size=len(payload),
+            accepted_values=(accepted,),
+            capture_accepted_candidates=True,
+        )
+        self.assertEqual(ordinary.blocking_rule, "generic-secret-assignment")
+        self.assertFalse(ordinary.accepted_counts)
+
+        audit = workspace._stream_secret_scan(
+            io.BytesIO(payload),
+            size=len(payload),
+            accepted_values=(accepted,),
+            capture_accepted_candidates=True,
+            _continue_after_blocking=True,
+        )
+        self.assertEqual(audit.blocking_rule, "generic-secret-assignment")
+        self.assertEqual(audit.accepted_counts[accepted], 1)
+        self.assertEqual(audit.accepted_candidates[accepted], {accepted.value})
+
+        unsafe = workspace._scan_secret_value(
+            assignment_bytes(b"refresh_token", accepted.value) + b' + "adjacent"\n',
+            accepted_values=(accepted,),
+            capture_accepted_candidates=True,
+            _continue_after_blocking=True,
+        )
+        self.assertEqual(unsafe.blocking_rule, "generic-secret-assignment")
+        self.assertFalse(unsafe.accepted_counts)
+        self.assertFalse(unsafe.accepted_candidates)
+
     def test_oversized_provider_token_crossing_stream_boundary_is_blocked(self) -> None:
         boundary = 1024 * 1024
         token_start = boundary - (workspace.STREAM_SCAN_OVERLAP * 3)
@@ -2964,17 +3019,20 @@ class SyntheticWorkspaceTest(unittest.TestCase):
     def test_audit_master_cli_verifies_pinned_provenance_without_raw_value(
         self,
     ) -> None:
+        unrelated = "sk-" + "Q" * 40
         repo, first_commit = self.new_repo(
             {
                 "fixture.cfg": (
-                    assignment_text("access_token", AUTHORING_VALUES[0])
+                    assignment_text("password", unrelated)
+                    + assignment_text("access_token", AUTHORING_VALUES[0])
                     + assignment_text("refresh_token", LEGACY_PRINTABLE)
                 ),
                 "notes.txt": f"historical literal: {LEGACY_PRINTABLE}\n",
             }
         )
         (repo / "fixture.cfg").write_text(
-            assignment_text("access_token", AUTHORING_VALUES[0])
+            assignment_text("password", unrelated)
+            + assignment_text("access_token", AUTHORING_VALUES[0])
             + assignment_text("refresh_token", LEGACY_PRINTABLE)
             + assignment_text("id_token", LEGACY_B),
             encoding="utf-8",
@@ -3037,6 +3095,19 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         self.assertNotIn(LEGACY_PRINTABLE, stdout.getvalue())
         self.assertNotIn(legacy_value_base64(LEGACY_PRINTABLE), stdout.getvalue())
         self.assertNotIn(LEGACY_B, stdout.getvalue())
+        self.assertNotIn(unrelated, stdout.getvalue())
+
+        (repo / "README.md").write_text("review head\n", encoding="utf-8")
+        review_head = self.commit(repo, "Review head")
+        review = self.prepare(
+            repo=repo,
+            base=tip,
+            head=review_head,
+            catalog=catalog,
+            exemptions=("historical-fixtures",),
+        )
+        with self.assertRaisesRegex(ReviewError, "openai-key"):
+            self.validate(review, catalog=catalog)
 
         bad_payload = json.loads(json.dumps(payload))
         bad_payload["legacy_exemptions"][0]["values"][0]["source_occurrences"] = 1
