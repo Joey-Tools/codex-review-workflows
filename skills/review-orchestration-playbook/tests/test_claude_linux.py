@@ -43,6 +43,7 @@ def _write_elf(
     path: pathlib.Path,
     *,
     arch: str = "x64",
+    elf_type: int = 3,
     interpreter: str | None = "/lib64/ld-linux-x86-64.so.2",
     dynamic_tags: tuple[int, ...] | None = None,
     dynamic_load_count: int = 1,
@@ -66,7 +67,7 @@ def _write_elf(
         "<HHIQQQIHHHHHH",
         header,
         16,
-        3,
+        elf_type,
         machine,
         1,
         0,
@@ -1419,6 +1420,269 @@ class RuntimeLibraryTrustTest(unittest.TestCase):
         )
         self.trusted_owners = frozenset({0, os.getuid()})
 
+    def _glibc_loader_fixture(
+        self,
+        root: pathlib.Path,
+        *,
+        arch: str = "x64",
+        interpreter: str | None = None,
+        dynamic_tags: tuple[int, ...] | None = None,
+    ) -> claude_linux.HostRuntimeDependency:
+        loader_path = _write_elf(
+            root / f"test-glibc-loader-{arch}",
+            arch=arch,
+            interpreter=interpreter,
+            dynamic_tags=dynamic_tags,
+        )
+        destination = claude_linux._CANONICAL_GLIBC_LOADERS[arch]
+        return claude_linux._capture_host_runtime_dependency(
+            loader_path,
+            destination,
+            trusted_owner_uids=self.trusted_owners,
+        )
+
+    @staticmethod
+    def _glibc_runner(
+        *,
+        list_stdout: bytes = b"statically linked\n",
+        list_returncode: int = 0,
+        list_stderr: bytes = b"",
+    ):
+        def runner(argv, **_kwargs):  # type: ignore[no-untyped-def]
+            command = tuple(argv)
+            if len(command) >= 2 and command[1] == "--version":
+                return _capture(
+                    stdout=(
+                        b"ld.so (Ubuntu GLIBC 2.39-0ubuntu8.7) "
+                        b"stable release version 2.39.\n"
+                    )
+                )
+            if len(command) >= 2 and command[1] == "--list":
+                return _capture(
+                    returncode=list_returncode,
+                    stdout=list_stdout,
+                    stderr=list_stderr,
+                )
+            raise AssertionError(f"unexpected glibc runner command: {command}")
+
+        return runner
+
+    def test_canonical_glibc_loader_paths_cover_supported_architectures(self) -> None:
+        self.assertEqual(
+            claude_linux._canonical_glibc_loader(self.host),
+            pathlib.PurePosixPath("/lib64/ld-linux-x86-64.so.2"),
+        )
+        arm_host = dataclasses.replace(self.host, arch="arm64")
+        self.assertEqual(
+            claude_linux._canonical_glibc_loader(arm_host),
+            pathlib.PurePosixPath("/lib/ld-linux-aarch64.so.1"),
+        )
+
+    def test_glibc_loader_version_window_is_floating_and_fail_closed(self) -> None:
+        for rendered, expected in (
+            (
+                "ld.so (GNU libc) stable release version 2.27.\n",
+                (2, 27),
+            ),
+            (
+                "ld.so (Ubuntu GLIBC 2.39-0ubuntu8.7) "
+                "stable release version 2.39.\n",
+                (2, 39),
+            ),
+        ):
+            with self.subTest(rendered=rendered):
+                self.assertEqual(
+                    claude_linux._parse_glibc_loader_version(rendered),
+                    expected,
+                )
+
+        for rendered in (
+            "ld.so (GNU libc) stable release version 2.26.\n",
+            "ld.so (GNU libc) stable release version 3.0.\n",
+            f"ld.so (GNU libc) stable release version {'9' * 10}.39.\n",
+            "musl libc (x86_64) Version 1.2.5\n",
+            "wrapper says GLIBC 2.39\n",
+        ):
+            with (
+                self.subTest(rendered=rendered),
+                self.assertRaises(claude_linux.LinuxHostDependencyUnavailable),
+            ):
+                claude_linux._parse_glibc_loader_version(rendered)
+
+    def test_host_gpg_requires_canonical_glibc_interpreter(self) -> None:
+        with tempfile.TemporaryDirectory(
+            dir=pathlib.Path(__file__).parent
+        ) as temporary:
+            root = pathlib.Path(temporary)
+            root.chmod(0o700)
+            glibc = claude_linux.inspect_elf(_write_elf(root / "glibc-gpg"))
+            self.assertEqual(
+                claude_linux._require_safe_host_gpg_loader_policy(
+                    glibc,
+                    self.host,
+                ),
+                pathlib.PurePosixPath("/lib64/ld-linux-x86-64.so.2"),
+            )
+            musl = claude_linux.inspect_elf(
+                _write_elf(
+                    root / "musl-gpg",
+                    interpreter="/lib/ld-musl-x86_64.so.1",
+                )
+            )
+            with self.assertRaisesRegex(
+                claude_linux.LinuxRuntimeUnsafe,
+                "canonical glibc loader",
+            ):
+                claude_linux._require_safe_host_gpg_loader_policy(
+                    musl,
+                    self.host,
+                )
+
+    def test_glibc_loader_static_identity_rejects_unsafe_images(self) -> None:
+        cases = (
+            ({"arch": "arm64"}, "architecture"),
+            (
+                {"interpreter": "/lib64/ld-linux-x86-64.so.2"},
+                "another interpreter",
+            ),
+            (
+                {"dynamic_tags": (claude_linux.ELF_DYNAMIC_RUNPATH,)},
+                "DT_RUNPATH",
+            ),
+            ({"elf_type": 2}, "ET_DYN"),
+        )
+        for index, (options, pattern) in enumerate(cases):
+            with (
+                self.subTest(options=options),
+                tempfile.TemporaryDirectory(
+                    dir=pathlib.Path(__file__).parent
+                ) as temporary,
+            ):
+                root = pathlib.Path(temporary)
+                root.chmod(0o700)
+                settings = {"interpreter": None, **options}
+                loader_path = _write_elf(
+                    root / f"unsafe-loader-{index}",
+                    **settings,
+                )
+                loader = claude_linux._capture_host_runtime_dependency(
+                    loader_path,
+                    claude_linux._CANONICAL_GLIBC_LOADERS["x64"],
+                    trusted_owner_uids=self.trusted_owners,
+                )
+                with self.assertRaisesRegex(
+                    claude_linux.LinuxRuntimeUnsafe,
+                    pattern,
+                ):
+                    claude_linux._require_safe_glibc_loader(loader, self.host)
+
+    def test_glibc_loader_must_be_executable(self) -> None:
+        with tempfile.TemporaryDirectory(
+            dir=pathlib.Path(__file__).parent
+        ) as temporary:
+            root = pathlib.Path(temporary)
+            root.chmod(0o700)
+            loader_path = _write_elf(
+                root / "non-executable-loader",
+                interpreter=None,
+            )
+            loader_path.chmod(0o400)
+            loader = claude_linux._capture_host_runtime_dependency(
+                loader_path,
+                claude_linux._CANONICAL_GLIBC_LOADERS["x64"],
+                trusted_owner_uids=self.trusted_owners,
+            )
+            with self.assertRaisesRegex(
+                claude_linux.LinuxRuntimeUnsafe,
+                "not executable",
+            ):
+                claude_linux._require_safe_glibc_loader(loader, self.host)
+
+    def test_host_runtime_uses_verified_loader_version_and_list_commands(self) -> None:
+        with tempfile.TemporaryDirectory(
+            dir=pathlib.Path(__file__).parent
+        ) as temporary:
+            root = pathlib.Path(temporary)
+            root.chmod(0o700)
+            executable = _write_elf(root / "gpg")
+            resolved_executable = str(executable.resolve(strict=True))
+            loader = self._glibc_loader_fixture(root)
+            calls: list[tuple[tuple[str, ...], dict[str, str]]] = []
+            delegate = self._glibc_runner()
+
+            def runner(argv, **kwargs):  # type: ignore[no-untyped-def]
+                calls.append((tuple(argv), kwargs["env"]))
+                return delegate(argv, **kwargs)
+
+            with mock.patch.object(
+                claude_linux,
+                "_capture_glibc_loader",
+                return_value=loader,
+            ):
+                closure = claude_linux.collect_host_runtime_closure(
+                    self.host,
+                    executable,
+                    runner=runner,
+                    trusted_owner_uids=self.trusted_owners,
+                    executable_owner_uids=self.trusted_owners,
+                )
+
+        resolved_loader = str(loader.resolved_identity.path)
+        self.assertEqual(
+            tuple(command for command, _environment in calls),
+            (
+                (resolved_loader, "--version"),
+                (resolved_loader, "--list", resolved_executable),
+            ),
+        )
+        self.assertEqual(closure.glibc_version, (2, 39))
+        self.assertEqual(closure.loader, loader)
+        for _command, environment in calls:
+            self.assertEqual(
+                environment,
+                claude_linux.fixed_host_tool_environment(),
+            )
+
+    def test_host_runtime_rejects_dependency_interpreter_after_trace(self) -> None:
+        with tempfile.TemporaryDirectory(
+            dir=pathlib.Path(__file__).parent
+        ) as temporary:
+            root = pathlib.Path(temporary)
+            root.chmod(0o700)
+            executable = _write_elf(root / "gpg")
+            library = _write_elf(root / "lib-with-interpreter.so")
+            loader = self._glibc_loader_fixture(root)
+            runner = mock.Mock(side_effect=self._glibc_runner())
+            with (
+                mock.patch.object(
+                    claude_linux,
+                    "_capture_glibc_loader",
+                    return_value=loader,
+                ),
+                mock.patch.object(
+                    claude_linux,
+                    "_parse_ldd_output",
+                    return_value=(
+                        claude_linux.RuntimeMount(
+                            library,
+                            pathlib.PurePosixPath("/lib/libunsafe.so"),
+                        ),
+                    ),
+                ),
+                self.assertRaisesRegex(
+                    claude_linux.LinuxRuntimeUnsafe,
+                    "names an interpreter",
+                ),
+            ):
+                claude_linux.collect_host_runtime_closure(
+                    self.host,
+                    executable,
+                    runner=runner,
+                    trusted_owner_uids=self.trusted_owners,
+                    executable_owner_uids=self.trusted_owners,
+                )
+            self.assertEqual(runner.call_count, 2)
+
     def test_accepts_and_revalidates_safe_system_path(self) -> None:
         candidate = next(
             path
@@ -1608,9 +1872,6 @@ class RuntimeLibraryTrustTest(unittest.TestCase):
         ) as temporary:
             root = pathlib.Path(temporary)
             root.chmod(0o700)
-            ldd = root / "ldd"
-            ldd.write_text("test-only\n", encoding="utf-8")
-            ldd.chmod(0o500)
 
             for tag, label in (
                 (claude_linux.ELF_DYNAMIC_RPATH, "DT_RPATH"),
@@ -1619,9 +1880,9 @@ class RuntimeLibraryTrustTest(unittest.TestCase):
                 with self.subTest(tag=label):
                     executable = _write_elf(
                         root / f"gpg-{tag}",
-                        interpreter=None,
                         dynamic_tags=(tag,),
                     )
+                    runner = mock.Mock(return_value=_capture())
                     with self.assertRaisesRegex(
                         claude_linux.LinuxRuntimeUnsafe,
                         label,
@@ -1629,14 +1890,13 @@ class RuntimeLibraryTrustTest(unittest.TestCase):
                         claude_linux.collect_host_runtime_closure(
                             self.host,
                             executable,
-                            runner=lambda *_args, **_kwargs: _capture(),
-                            ldd_path=ldd,
-                            ldd_trusted_roots=(root,),
+                            runner=runner,
                             trusted_owner_uids=self.trusted_owners,
                             executable_owner_uids=self.trusted_owners,
                         )
+                    runner.assert_not_called()
 
-    def test_elf_audit_tags_are_rejected_before_ldd_execution(self) -> None:
+    def test_elf_audit_tags_are_rejected_before_loader_execution(self) -> None:
         with tempfile.TemporaryDirectory(
             dir=pathlib.Path(__file__).parent
         ) as temporary:
@@ -1654,7 +1914,6 @@ class RuntimeLibraryTrustTest(unittest.TestCase):
                     with self.subTest(tag=label, collector=collector):
                         executable = _write_elf(
                             root / f"gpg-{collector}-{tag}",
-                            interpreter=None,
                             dynamic_tags=(tag,),
                         )
                         runner = mock.Mock(return_value=_capture())
@@ -1667,8 +1926,6 @@ class RuntimeLibraryTrustTest(unittest.TestCase):
                                     self.host,
                                     executable,
                                     runner=runner,
-                                    ldd_path=ldd,
-                                    ldd_trusted_roots=(root,),
                                     trusted_owner_uids=self.trusted_owners,
                                     executable_owner_uids=self.trusted_owners,
                                 )
@@ -1694,24 +1951,23 @@ class RuntimeLibraryTrustTest(unittest.TestCase):
         ):
             tools = pathlib.Path(raw_tools)
             tools.chmod(0o700)
-            ldd = tools / "ldd"
-            ldd.write_text("test-only\n", encoding="utf-8")
-            ldd.chmod(0o500)
             private = pathlib.Path(raw_private)
             private.chmod(0o700)
-            executable = _write_elf(private / "gpg", interpreter=None)
+            executable = _write_elf(private / "gpg")
+            loader = self._glibc_loader_fixture(tools)
 
-            closure = claude_linux.collect_host_runtime_closure(
-                self.host,
-                executable,
-                runner=lambda *_args, **_kwargs: _capture(
-                    stdout=b"statically linked\n"
-                ),
-                ldd_path=ldd,
-                ldd_trusted_roots=(tools,),
-                trusted_owner_uids=self.trusted_owners,
-                executable_owner_uids=self.trusted_owners,
-            )
+            with mock.patch.object(
+                claude_linux,
+                "_capture_glibc_loader",
+                return_value=loader,
+            ):
+                closure = claude_linux.collect_host_runtime_closure(
+                    self.host,
+                    executable,
+                    runner=self._glibc_runner(),
+                    trusted_owner_uids=self.trusted_owners,
+                    executable_owner_uids=self.trusted_owners,
+                )
 
             self.assertTrue(
                 closure.executable_identity.allow_root_sticky_temp_ancestor
@@ -1729,54 +1985,64 @@ class RuntimeLibraryTrustTest(unittest.TestCase):
             self.assertEqual(
                 claude_linux.revalidate_host_runtime_closure(
                     closure,
-                    runner=lambda *_args, **_kwargs: _capture(
-                        stdout=b"statically linked\n"
-                    ),
+                    runner=self._glibc_runner(),
                 ),
                 closure,
             )
 
-    def test_host_runtime_closure_rejects_dependency_runpath(self) -> None:
+    def test_host_runtime_closure_rejects_dependency_loader_policy_after_trace(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory(
             dir=pathlib.Path(__file__).parent
         ) as temporary:
             root = pathlib.Path(temporary)
             root.chmod(0o700)
-            ldd = root / "ldd"
-            ldd.write_text("test-only\n", encoding="utf-8")
-            ldd.chmod(0o500)
-            executable = _write_elf(root / "gpg", interpreter=None)
-            library = _write_elf(
-                root / "libunsafe.so",
-                interpreter=None,
-                dynamic_tags=(claude_linux.ELF_DYNAMIC_RUNPATH,),
-            )
-
-            with (
-                mock.patch.object(
-                    claude_linux,
-                    "_parse_ldd_output",
-                    return_value=(
-                        claude_linux.RuntimeMount(
-                            library,
-                            pathlib.PurePosixPath("/lib/libunsafe.so"),
-                        ),
-                    ),
-                ),
-                self.assertRaisesRegex(
-                    claude_linux.LinuxRuntimeUnsafe,
-                    "DT_RUNPATH",
-                ),
+            executable = _write_elf(root / "gpg")
+            for tag, label in (
+                (claude_linux.ELF_DYNAMIC_RPATH, "DT_RPATH"),
+                (claude_linux.ELF_DYNAMIC_RUNPATH, "DT_RUNPATH"),
+                (claude_linux.ELF_DYNAMIC_AUDIT, "DT_AUDIT"),
+                (claude_linux.ELF_DYNAMIC_DEPAUDIT, "DT_DEPAUDIT"),
             ):
-                claude_linux.collect_host_runtime_closure(
-                    self.host,
-                    executable,
-                    runner=lambda *_args, **_kwargs: _capture(stdout=b"fixture\n"),
-                    ldd_path=ldd,
-                    ldd_trusted_roots=(root,),
-                    trusted_owner_uids=self.trusted_owners,
-                    executable_owner_uids=self.trusted_owners,
-                )
+                with self.subTest(tag=label):
+                    library = _write_elf(
+                        root / f"libunsafe-{tag}.so",
+                        interpreter=None,
+                        dynamic_tags=(tag,),
+                    )
+                    loader = self._glibc_loader_fixture(root)
+                    runner = mock.Mock(side_effect=self._glibc_runner())
+
+                    with (
+                        mock.patch.object(
+                            claude_linux,
+                            "_capture_glibc_loader",
+                            return_value=loader,
+                        ),
+                        mock.patch.object(
+                            claude_linux,
+                            "_parse_ldd_output",
+                            return_value=(
+                                claude_linux.RuntimeMount(
+                                    library,
+                                    pathlib.PurePosixPath("/lib/libunsafe.so"),
+                                ),
+                            ),
+                        ),
+                        self.assertRaisesRegex(
+                            claude_linux.LinuxRuntimeUnsafe,
+                            label,
+                        ),
+                    ):
+                        claude_linux.collect_host_runtime_closure(
+                            self.host,
+                            executable,
+                            runner=runner,
+                            trusted_owner_uids=self.trusted_owners,
+                            executable_owner_uids=self.trusted_owners,
+                        )
+                    self.assertEqual(runner.call_count, 2)
 
     def test_host_runtime_closure_detects_snapshot_replacement(self) -> None:
         with tempfile.TemporaryDirectory(
@@ -1784,22 +2050,21 @@ class RuntimeLibraryTrustTest(unittest.TestCase):
         ) as temporary:
             root = pathlib.Path(temporary)
             root.chmod(0o700)
-            ldd = root / "ldd"
-            ldd.write_text("test-only\n", encoding="utf-8")
-            ldd.chmod(0o500)
-            executable = _write_elf(root / "gpg", interpreter=None)
-            closure = claude_linux.collect_host_runtime_closure(
-                self.host,
-                executable,
-                runner=lambda *_args, **_kwargs: _capture(
-                    stdout=b"statically linked\n"
-                ),
-                ldd_path=ldd,
-                ldd_trusted_roots=(root,),
-                trusted_owner_uids=self.trusted_owners,
-                executable_owner_uids=self.trusted_owners,
-            )
-            replacement = _write_elf(root / "replacement", interpreter=None)
+            executable = _write_elf(root / "gpg")
+            loader = self._glibc_loader_fixture(root)
+            with mock.patch.object(
+                claude_linux,
+                "_capture_glibc_loader",
+                return_value=loader,
+            ):
+                closure = claude_linux.collect_host_runtime_closure(
+                    self.host,
+                    executable,
+                    runner=self._glibc_runner(),
+                    trusted_owner_uids=self.trusted_owners,
+                    executable_owner_uids=self.trusted_owners,
+                )
+            replacement = _write_elf(root / "replacement")
             os.replace(replacement, executable)
 
             with self.assertRaisesRegex(
@@ -1808,9 +2073,7 @@ class RuntimeLibraryTrustTest(unittest.TestCase):
             ):
                 claude_linux.revalidate_host_runtime_closure(
                     closure,
-                    runner=lambda *_args, **_kwargs: _capture(
-                        stdout=b"statically linked\n"
-                    ),
+                    runner=self._glibc_runner(),
                 )
 
     def test_host_runtime_closure_detects_lexical_symlink_retarget(self) -> None:
@@ -1819,14 +2082,12 @@ class RuntimeLibraryTrustTest(unittest.TestCase):
         ) as temporary:
             root = pathlib.Path(temporary)
             root.chmod(0o700)
-            ldd = root / "ldd"
-            ldd.write_text("test-only\n", encoding="utf-8")
-            ldd.chmod(0o500)
-            executable = _write_elf(root / "gpg", interpreter=None)
+            executable = _write_elf(root / "gpg")
             first = _write_elf(root / "lib-first.so", interpreter=None)
             second = _write_elf(root / "lib-second.so", interpreter=None)
             lexical = root / "libcurrent.so"
             lexical.symlink_to(first.name)
+            loader = self._glibc_loader_fixture(root)
             parsed = (
                 claude_linux.RuntimeMount(
                     lexical,
@@ -1834,17 +2095,22 @@ class RuntimeLibraryTrustTest(unittest.TestCase):
                 ),
             )
 
-            with mock.patch.object(
-                claude_linux,
-                "_parse_ldd_output",
-                return_value=parsed,
+            with (
+                mock.patch.object(
+                    claude_linux,
+                    "_capture_glibc_loader",
+                    return_value=loader,
+                ),
+                mock.patch.object(
+                    claude_linux,
+                    "_parse_ldd_output",
+                    return_value=parsed,
+                ),
             ):
                 closure = claude_linux.collect_host_runtime_closure(
                     self.host,
                     executable,
-                    runner=lambda *_args, **_kwargs: _capture(stdout=b"fixture\n"),
-                    ldd_path=ldd,
-                    ldd_trusted_roots=(root,),
+                    runner=self._glibc_runner(list_stdout=b"fixture\n"),
                     trusted_owner_uids=self.trusted_owners,
                     executable_owner_uids=self.trusted_owners,
                 )
@@ -1856,9 +2122,7 @@ class RuntimeLibraryTrustTest(unittest.TestCase):
                 ):
                     claude_linux.revalidate_host_runtime_closure(
                         closure,
-                        runner=lambda *_args, **_kwargs: _capture(
-                            stdout=b"fixture\n"
-                        ),
+                        runner=self._glibc_runner(list_stdout=b"fixture\n"),
                     )
 
     def test_host_runtime_closure_is_recollected_before_execution(self) -> None:
@@ -1867,18 +2131,20 @@ class RuntimeLibraryTrustTest(unittest.TestCase):
         ) as temporary:
             root = pathlib.Path(temporary)
             root.chmod(0o700)
-            ldd = root / "ldd"
-            ldd.write_text("test-only\n", encoding="utf-8")
-            ldd.chmod(0o500)
-            executable = _write_elf(root / "gpg", interpreter=None)
+            executable = _write_elf(root / "gpg")
             first = _write_elf(root / "lib-first.so", interpreter=None)
             second = _write_elf(root / "lib-second.so", interpreter=None)
-            ldd_calls = 0
+            loader = self._glibc_loader_fixture(root)
+            list_calls = 0
 
-            def runner(*_args, **_kwargs):  # type: ignore[no-untyped-def]
-                nonlocal ldd_calls
-                ldd_calls += 1
-                return _capture(stdout=f"closure-{ldd_calls}\n".encode())
+            def runner(argv, **_kwargs):  # type: ignore[no-untyped-def]
+                nonlocal list_calls
+                command = tuple(argv)
+                if command[1] == "--version":
+                    return self._glibc_runner()(command)
+                self.assertEqual(command[1], "--list")
+                list_calls += 1
+                return _capture(stdout=f"closure-{list_calls}\n".encode())
 
             def parse(output, *, reject_unrecognized=False):  # type: ignore[no-untyped-def]
                 self.assertTrue(reject_unrecognized)
@@ -1890,17 +2156,22 @@ class RuntimeLibraryTrustTest(unittest.TestCase):
                     ),
                 )
 
-            with mock.patch.object(
-                claude_linux,
-                "_parse_ldd_output",
-                side_effect=parse,
+            with (
+                mock.patch.object(
+                    claude_linux,
+                    "_capture_glibc_loader",
+                    return_value=loader,
+                ),
+                mock.patch.object(
+                    claude_linux,
+                    "_parse_ldd_output",
+                    side_effect=parse,
+                ),
             ):
                 closure = claude_linux.collect_host_runtime_closure(
                     self.host,
                     executable,
                     runner=runner,
-                    ldd_path=ldd,
-                    ldd_trusted_roots=(root,),
                     trusted_owner_uids=self.trusted_owners,
                     executable_owner_uids=self.trusted_owners,
                 )
@@ -1913,31 +2184,38 @@ class RuntimeLibraryTrustTest(unittest.TestCase):
                         runner=runner,
                     )
 
-            self.assertEqual(ldd_calls, 2)
+            self.assertEqual(list_calls, 2)
 
-    def test_host_runtime_ldd_timeout_is_inspection_inconclusive(self) -> None:
+    def test_host_runtime_loader_trace_timeout_is_inspection_inconclusive(self) -> None:
         with tempfile.TemporaryDirectory(
             dir=pathlib.Path(__file__).parent
         ) as temporary:
             root = pathlib.Path(temporary)
             root.chmod(0o700)
-            ldd = root / "ldd"
-            ldd.write_text("test-only\n", encoding="utf-8")
-            ldd.chmod(0o500)
-            executable = _write_elf(root / "gpg", interpreter=None)
+            executable = _write_elf(root / "gpg")
+            loader = self._glibc_loader_fixture(root)
 
-            with self.assertRaisesRegex(
-                claude_linux.LinuxRuntimeInspectionInconclusive,
-                "host runtime dependency inspection failed",
+            def runner(argv, **_kwargs):  # type: ignore[no-untyped-def]
+                command = tuple(argv)
+                if command[1] == "--version":
+                    return self._glibc_runner()(command)
+                raise claude_linux.ReviewError("timeout fixture")
+
+            with (
+                mock.patch.object(
+                    claude_linux,
+                    "_capture_glibc_loader",
+                    return_value=loader,
+                ),
+                self.assertRaisesRegex(
+                    claude_linux.LinuxRuntimeInspectionInconclusive,
+                    "host runtime dependency inspection failed",
+                ),
             ):
                 claude_linux.collect_host_runtime_closure(
                     self.host,
                     executable,
-                    runner=mock.Mock(
-                        side_effect=claude_linux.ReviewError("timeout fixture")
-                    ),
-                    ldd_path=ldd,
-                    ldd_trusted_roots=(root,),
+                    runner=runner,
                     trusted_owner_uids=self.trusted_owners,
                     executable_owner_uids=self.trusted_owners,
                 )

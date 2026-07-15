@@ -4,8 +4,8 @@ title: Claude CLI Platform Capabilities
 status: completed
 created: 2026-07-15
 updated: 2026-07-16
-branch: codex/claude-cli-platform-capabilities
-pr: https://github.com/Joey-Tools/codex-review-workflows/pull/45
+branch: codex/claude-cli-trust-followup
+pr: https://github.com/Joey-Tools/codex-review-workflows/pull/46
 supersedes: []
 superseded_by:
 ---
@@ -33,8 +33,8 @@ superseded_by:
   `skills/review-orchestration-playbook/references/claude-runtime-trust.md` and
   summarized in the skill and helper contracts. The worktree implementation now
   contains the corresponding version, provenance, capability, Linux sandbox,
-  and credential paths; local and exact-archive Linux delivery validation is
-  complete.
+  and credential paths. The earlier exact-archive Linux validation is recorded
+  below; the final follow-up head is revalidated again before PR 46 merges.
 - Publisher provenance is based on Anthropic's fixed release-signing GPG
   fingerprint plus the signed per-version manifest and platform checksum.
   macOS code signing and notarization are not current acceptance gates; they may
@@ -66,21 +66,26 @@ superseded_by:
   loader-visible `PT_DYNAMIC` table maps consistently through exactly one file-
   backed `PT_LOAD` at byte and loader-page granularity, rejects other page-
   rounded mappings over that table, rejects `DT_RPATH`/`DT_RUNPATH` and
-  `DT_AUDIT`/`DT_DEPAUDIT` before `ldd` may run, captures both loader-visible
-  lexical symlink chains and resolved root-owned endpoints, then rebuilds the
-  trusted `ldd` closure for exact equality before every GPG call. Only the
+  `DT_AUDIT`/`DT_DEPAUDIT` in the main snapshot before a loader process may run,
+  and requires the canonical x64/arm64 glibc interpreter. The helper captures
+  the loader's lexical/resolved root-owned identity, proves native mount
+  provenance, matching architecture, `ET_DYN` type, no second interpreter or
+  unsafe tag, and a floating glibc version `>=2.27,<3.0`. It invokes that loader
+  directly with `--list`, rejects unsafe dependencies after the proven trace but
+  before GPG, and rebuilds the same loader version and closure for exact equality
+  before every GPG call. Musl and unknown host-GPG loaders are unavailable. Only the
   private snapshot may traverse
   a root-owned exact-`01777` system-temp ancestor. Its non-final directories use
   device/inode/type/mode/owner/group anchor identities so GPG may create sibling
   keyring/lock files without invalidating the closure; the executable itself,
-  `ldd`, and dependencies retain full identities. On WSL2, mountinfo proves both
-  old and refreshed snapshot, `ldd`, lexical dependency, and resolved endpoint
+  glibc loader, and dependencies retain full identities. On WSL2, mountinfo proves both
+  old and refreshed snapshot, loader, lexical dependency, and resolved endpoint
   paths are Linux-native. An already safe `otool` launch/nonzero failure is
   inconclusive. The runtime report records the fixed source path as
   `gpg_verifier`, separately from publisher provenance.
 - GPG and Linux security-sensitive host-tool calls use explicit minimal
   environments. Inherited dynamic-loader variables, shell startup state,
-  compiler flags, and toolchain overrides cannot influence GPG, `ldd`, tool
+  compiler flags, and toolchain overrides cannot influence GPG, loader/`ldd`, tool
   capability probes, or launcher compilation.
 - Native Mach-O/ELF shape, execute permission, architecture, and Linux libc
   target only exclude scripts, interpreter wrappers, and incompatible artifacts;
@@ -665,8 +670,9 @@ superseded_by:
   The repair default-denies all extra customization-surface sentences while
   preserving the exact upstream troubleshooting-purpose suffix, requires an
   explicit WSL2 kernel identity marker, requires one main
-  `LC_LOAD_DYLINKER=/usr/lib/dyld` and none in dependency images, and rejects
-  `DT_AUDIT`/`DT_DEPAUDIT` before any relevant `ldd` invocation.
+  `LC_LOAD_DYLINKER=/usr/lib/dyld` and none in dependency images, rejects main
+  `DT_AUDIT`/`DT_DEPAUDIT` tags before list-only `ldd`, and rejects dependency
+  tags after the trace but before any real GPG operation.
 - After that repair, the four focused capability/provenance/Linux/provider
   modules passed all 408 tests with nine environment-gated skips. The complete
   local suite passed all 552 tests in 75.275 seconds with nine skips. Full
@@ -764,6 +770,41 @@ superseded_by:
   `eb933c6dd5534db89b83ba09009d5c0932bd1395f7e3bb0f34ba37eec37bbade`,
   and materialized the expected digest-keyed mode-`0500` snapshot. No credential
   or review content was supplied.
+- Exact-range review of follow-up PR 46 found that the provider treated every
+  provenance-verifier runtime failure as if a deterministic dependency were
+  absent, which could authorize the automatic Copilot fallback. The repair adds
+  a dedicated dependency-unavailable subtype. Only proven absence or unsupported
+  platform/capability uses it; GPG launch failures, snapshot I/O errors, and
+  source-path inspection races are inconclusive and block fallback. Source-level
+  `EIO`, post-inspection `ENOENT`, GPG-launch, snapshot-creation, and provider
+  routing tests pin that classification boundary. A present wrapper, unsafe GPG
+  path/metadata, non-root Linux verifier, or unsafe macOS `otool` is invalid and
+  blocked rather than being relabeled as dependency absence.
+- The same review initially alleged that dependency audit tags could execute in
+  the first Linux `ldd` trace. Pinned glibc source disproved that exact mechanism:
+  audit tags are collected from the already-checked main map, and ordinary list
+  mode exits before normal relocation and application initialization. The audit
+  exposed a narrower real contract gap, however: proving only `/usr/bin/ldd`
+  ownership did not prove which implementation or loader semantics would run.
+  The final design removes `ldd` from the host-GPG provenance boundary. It
+  statically requires the architecture's canonical glibc interpreter, captures
+  both lexical and resolved identities, proves root ownership/mode/native mount,
+  matching architecture, `ET_DYN`, no nested interpreter or unsafe tags, accepts
+  floating glibc `>=2.27,<3.0`, and invokes only the captured loader's direct
+  `--list` interface. Musl and unknown host-GPG loaders are unavailable. Every
+  real GPG call rechecks loader identity/version and exact closure equality.
+- A read-only probe on `codex-hoteng-srv-01` confirmed the production x64 path
+  `/lib64/ld-linux-x86-64.so.2`, Ubuntu glibc `2.39`, no loader `PT_INTERP`, and
+  a directly listable `/usr/bin/gpg` closure. This is host/runtime capability
+  evidence, not publisher provenance for Claude Code or GPG.
+- After the fallback-classification and direct-loader repairs, the focused
+  provenance/provider/Linux modules passed all 414 tests with nine
+  environment-gated skips. The complete local suite passed all 584 tests in
+  66.277 seconds with nine skips. Full runtime/test `ruff`, `compileall`, both
+  workflow actionlint checks, strict Clang syntax checks for both C helpers, and
+  `git diff --check` passed. Python 3.10 grammar parsing across 20 files, the
+  isolated PyYAML skill validator, and project-journal validation had also
+  passed on the same implementation/docs set before this evidence-only entry.
 - Anthropic installation, signed-manifest, release-key fingerprint, and platform
   signature documentation: https://code.claude.com/docs/en/installation
 - Anthropic Seatbelt, `bubblewrap`, `socat`, WSL2, and WSL1 sandboxing
@@ -790,6 +831,9 @@ superseded_by:
 - GNU C Library dynamic-linker hardening guidance for `DT_AUDIT` and
   `DT_DEPAUDIT`:
   https://www.sourceware.org/glibc/manual/latest/html_node/Dynamic-Linker-Hardening.html
+- Pinned GNU C Library loader/list implementation used to justify the direct
+  `--list` contract:
+  https://github.com/bminor/glibc/blob/04e750e75b73957cf1c791535a3f4319534a52fc/elf/rtld.c
 - Linux kernel ELF mapping implementation:
   https://github.com/torvalds/linux/blob/master/fs/binfmt_elf.c
 - Linux kernel namespace-filesystem path implementation:

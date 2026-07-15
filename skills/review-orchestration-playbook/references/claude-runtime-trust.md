@@ -22,6 +22,11 @@ is supported only when every applicable gate below passes.
   provenance, platform, capability, credential, and isolation checks pass.
 - Do not pin the helper to `latest`, `stable`, or one current patch release. The
   helper never upgrades Claude Code and reviews the installed release it finds.
+- The former exact patch pin was a compact trust-and-compatibility shortcut for
+  the one CLI that receives local authentication and review data. It was not a
+  reliable wrapper detector: native Mach-O/ELF shape rejects scripts and
+  interpreter wrappers, while signed artifact verification separately proves
+  Anthropic publisher provenance and capability probes bound the CLI contract.
 - Reject prerelease, development, unparseable, and future-major versions unless
   this contract is deliberately revised.
 - Treat the fixed Anthropic release-signing key fingerprint and the signed
@@ -209,31 +214,43 @@ backed ranges to map consistently through exactly one `PT_LOAD` at byte and
 loader-page granularity. Every load must keep its file/virtual page offsets
 congruent, and no other page-rounded load mapping may cover the dynamic table.
 Only then does the helper reject `DT_RPATH`, `DT_RUNPATH`, `DT_AUDIT`, and
-`DT_DEPAUDIT` in the snapshot and every dependency. This prevents a malformed
-alternate or page-overlaid dynamic table, redirected loader search, or ELF audit
-modules from adding code outside the captured closure. The static dynamic-table
-check completes before fixed root-owned `ldd` may collect the exact loader/shared-
-library closure. The
-helper captures both each loader-visible lexical symlink chain and its resolved
-root-owned, non-group/world-writable endpoint. Before every call it first
-revalidates every old identity, then reruns `ldd`, reparses the complete ELF
-closure, and requires the refreshed closure to equal the original structure.
+`DT_DEPAUDIT` in the main snapshot before any loader process starts. Host GPG is
+then restricted to the architecture's canonical glibc interpreter
+(`/lib64/ld-linux-x86-64.so.2` on x64 or
+`/lib/ld-linux-aarch64.so.1` on arm64); musl and unknown interpreters are not
+supported for this host-trust dependency. The lexical and resolved loader paths
+must be root-owned, non-group/world-writable, Linux-native ELF64 `ET_DYN` images
+matching the host architecture, with no second `PT_INTERP`, mutable loader path,
+or audit tag. A credential-free `--version` probe must identify glibc in the
+floating range `>=2.27,<3.0`. The helper then invokes that captured loader
+directly as `loader --list <gpg-snapshot>`; it never delegates this boundary to
+an implementation-variable `ldd` script. The pinned glibc list path may map
+dependencies but exits before application relocation, constructors, or entry
+code. The helper immediately rejects mutable loader paths, audit tags, a nested
+interpreter, non-`ET_DYN` type, incompatible architecture, or unsafe provenance
+in every reported dependency before any real GPG operation. This ordering
+prevents a malformed alternate/page-overlaid main dynamic table from activating
+audit code while still allowing the proven loader to report the exact dependency
+graph. Before every call the helper revalidates every old identity, reruns the
+same loader version and list probes, reparses the complete ELF closure, and
+requires the refreshed structure and glibc version to equal the original.
 Only the private snapshot identity may traverse a root-owned exact-`01777`
 system-temp ancestor. Its non-final directory identities retain stable
 device/inode/type/mode/owner/group anchors but deliberately ignore entry-count
 and timestamp churn while the same GPG operation creates keyrings, locks, and
 other sibling files. The final snapshot executable retains its complete
-identity; `ldd` and dependency chains also retain complete identities and may
+identity; the glibc loader and dependency chains also retain complete identities and may
 not traverse writable ancestors. WSL2 proves the old and refreshed snapshot,
-`ldd`, lexical, and resolved paths have Linux-native mount provenance. A changed
+loader, lexical, and resolved paths have Linux-native mount provenance. A changed
 or unreadable identity/closure is inconclusive, while a stable unsafe owner,
 mode, path, or load-command policy is blocked.
 
 Each GPG call receives only its isolated home, fixed locale, and fixed system
 path. Inherited `LD_*`, `DYLD_*`, shell-startup, compiler, and toolchain override
-variables are absent. Linux `ldd`, `bubblewrap`, `socat`, `rg`, compiler probes,
-and launcher compilation use the same fixed-minimal-environment principle, with
-only the host-tool home, locale, path, and temporary directory provided.
+variables are absent. The Linux glibc-loader probes, post-provenance `ldd`,
+`bubblewrap`, `socat`, `rg`, compiler probes, and launcher compilation use the
+same fixed-minimal-environment principle, with only the host-tool home, locale,
+path, and temporary directory provided.
 
 Anthropic documents detached manifest signatures for releases from `2.1.89`
 onward, which covers the complete supported version range in this contract.
@@ -606,6 +623,14 @@ inconclusive inspection failure; so is a workspace-link identity race or I/O
 failure. Neither case is ordinary runtime unavailability, so neither can
 authorize Copilot fallback.
 
+A verifier dependency is `runtime-unavailable` only when its fixed source is
+deterministically absent or the supported platform/capability is not present.
+A present but non-native, untrusted-owner, writable, set-id, non-executable, or
+otherwise unsafe GPG/`otool`/glibc-loader candidate is a blocked security error.
+A resolve, stat, open, copy, launch, or refresh I/O failure is inconclusive. The
+generic provenance-operation exception therefore never authorizes Copilot
+fallback; only its dedicated deterministic-dependency subtype may do so.
+
 Persist the detected runtime version, platform and architecture, source and
 verified-snapshot paths, manifest and signature URLs, signing-key fingerprint,
 selected GPG verifier, verified checksum, required-option and safe-mode results,
@@ -659,7 +684,12 @@ metadata that can act as a bearer secret, or unbounded probe output.
   `LC_LOAD_DYLINKER`; custom dynamic-linker support is vestigial and unsupported.
 - [GNU C Library dynamic-linker hardening](https://www.sourceware.org/glibc/manual/latest/html_node/Dynamic-Linker-Hardening.html):
   `DT_AUDIT` and `DT_DEPAUDIT` can introduce audit-module callbacks and hooking,
-  so the host-tool closure rejects them before loader-based discovery.
+  so the host-tool closure rejects them before any real GPG execution.
+- [GNU C Library list-mode source](https://github.com/bminor/glibc/blob/04e750e75b73957cf1c791535a3f4319534a52fc/elf/rtld.c#L1766-L1792):
+  glibc collects embedded audit tags from the main map before dependency mapping.
+  The same pinned source's list branch prints the mapped closure and exits before
+  normal relocation or application initialization; the helper proves the
+  canonical loader identity before using only its direct `--list` interface.
 - [Linux ELF loader source](https://github.com/torvalds/linux/blob/master/fs/binfmt_elf.c):
   `PT_LOAD` file offsets, virtual addresses, and sizes are rounded with the
   architecture/page alignment before mapping, so dynamic-table identity must be

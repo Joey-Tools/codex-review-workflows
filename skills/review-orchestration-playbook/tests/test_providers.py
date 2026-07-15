@@ -428,6 +428,52 @@ class ProviderPolicyTest(unittest.TestCase):
                 gpg_temp_root=self.review.container_dir,
             )
 
+    def test_claude_release_provenance_maps_missing_verifier_dependency(
+        self,
+    ) -> None:
+        with (
+            mock.patch.object(
+                providers,
+                "verify_claude_release",
+                side_effect=providers.ClaudeProvenanceDependencyUnavailable(
+                    "missing trusted GPG"
+                ),
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeProvenanceVerifierUnavailable,
+                "missing trusted GPG",
+            ),
+        ):
+            self.require_trusted_claude_release(
+                pathlib.Path("/bin/claude"),
+                version="2.1.202",
+                platform_key="darwin-arm64",
+                gpg_temp_root=self.review.container_dir,
+            )
+
+    def test_claude_release_provenance_maps_runtime_io_to_inconclusive(
+        self,
+    ) -> None:
+        with (
+            mock.patch.object(
+                providers,
+                "verify_claude_release",
+                side_effect=providers.ClaudeProvenanceUnavailable(
+                    "cannot write verifier snapshot: ENOSPC"
+                ),
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "ENOSPC",
+            ),
+        ):
+            self.require_trusted_claude_release(
+                pathlib.Path("/bin/claude"),
+                version="2.1.202",
+                platform_key="darwin-arm64",
+                gpg_temp_root=self.review.container_dir,
+            )
+
     def test_claude_safe_mode_security_failure_is_not_candidate_unavailability(
         self,
     ) -> None:
@@ -2952,6 +2998,39 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(outcome.returncode, 0)
         copilot_attempt.assert_called_once()
         resolve.assert_called_once_with("copilot")
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        side_effect=providers.ClaudeExecutableInspectionInconclusive(
+            "GPG snapshot write failed: ENOSPC"
+        ),
+    )
+    @mock.patch.object(providers, "resolve_reviewer_executable")
+    @mock.patch.object(providers, "_copilot_attempt")
+    def test_automatic_claude_provenance_io_blocks_copilot_fallback(
+        self,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _resolve_claude: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
+
+        self.assertEqual(outcome.returncode, 75)
+        copilot_attempt.assert_not_called()
+        resolve.assert_not_called()
+        self.assertIn(
+            "ENOSPC",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
 
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(

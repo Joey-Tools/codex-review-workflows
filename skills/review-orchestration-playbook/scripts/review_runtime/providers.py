@@ -35,6 +35,7 @@ from .claude_capabilities import (
 )
 from .claude_provenance import (
     CLAUDE_RELEASE_KEY_FINGERPRINT,
+    ClaudeProvenanceDependencyUnavailable,
     ClaudeProvenanceInconclusive,
     ClaudeProvenanceInvalid,
     ClaudeProvenanceUnavailable,
@@ -621,8 +622,10 @@ def _require_trusted_claude_release(
         raise ClaudePublisherProvenanceInvalid(str(error)) from error
     except ClaudeProvenanceInconclusive as error:
         raise ClaudeExecutableInspectionInconclusive(str(error)) from error
-    except ClaudeProvenanceUnavailable as error:
+    except ClaudeProvenanceDependencyUnavailable as error:
         raise ClaudeProvenanceVerifierUnavailable(str(error)) from error
+    except ClaudeProvenanceUnavailable as error:
+        raise ClaudeExecutableInspectionInconclusive(str(error)) from error
 
 
 def _claude_gpg_temp_root_validator(

@@ -91,6 +91,7 @@ class ElfInfo:
     arch: str
     interpreter: str | None
     libc: str | None
+    elf_type: int
     has_rpath: bool = False
     has_runpath: bool = False
     has_audit: bool = False
@@ -163,7 +164,8 @@ class HostRuntimeDependency:
 class HostRuntimeClosure:
     host: LinuxHost
     executable_identity: TrustedPathIdentity
-    ldd_identity: TrustedPathIdentity
+    loader: HostRuntimeDependency
+    glibc_version: tuple[int, int]
     interpreter: str | None
     dependencies: tuple[HostRuntimeDependency, ...]
     trusted_owner_uids: frozenset[int]
@@ -330,6 +332,16 @@ _TOOL_CANDIDATES: Mapping[str, tuple[pathlib.Path, ...]] = {
     ),
 }
 _TRUSTED_LDD_CANDIDATES = (pathlib.Path("/usr/bin/ldd"), pathlib.Path("/bin/ldd"))
+_CANONICAL_GLIBC_LOADERS: Mapping[str, pathlib.PurePosixPath] = {
+    "x64": pathlib.PurePosixPath("/lib64/ld-linux-x86-64.so.2"),
+    "arm64": pathlib.PurePosixPath("/lib/ld-linux-aarch64.so.1"),
+}
+_MINIMUM_GLIBC_VERSION = (2, 27)
+_MAXIMUM_GLIBC_VERSION = (3, 0)
+_GLIBC_LOADER_VERSION = re.compile(
+    r"\Ald\.so \((?:GNU libc|[^()\r\n]*\bGLIBC\b[^()\r\n]*)\) "
+    r"stable release version ([0-9]{1,9})\.([0-9]{1,9})\.\r?\n"
+)
 _ALLOWED_LIBRARY_DESTINATIONS = (
     pathlib.PurePosixPath("/lib"),
     pathlib.PurePosixPath("/lib64"),
@@ -1253,6 +1265,7 @@ def inspect_elf(path: pathlib.Path) -> ElfInfo:
         arch,
         interpreter,
         libc,
+        elf_type,
         has_rpath=has_rpath,
         has_runpath=has_runpath,
         has_audit=has_audit,
@@ -2334,6 +2347,12 @@ def _parse_ldd_output(
             continue
         destination = pathlib.PurePosixPath(candidate)
         source = pathlib.Path(candidate)
+        previous = mounts.get(destination)
+        if previous is not None and previous != source:
+            raise LinuxRuntimeUnsafe(
+                "runtime dependency output maps one destination to conflicting "
+                f"sources: {destination}"
+            )
         mounts[destination] = source
     return tuple(
         RuntimeMount(source, destination)
@@ -2341,29 +2360,124 @@ def _parse_ldd_output(
     )
 
 
-def _resolve_host_runtime_ldd(
+def _canonical_glibc_loader(host: LinuxHost) -> pathlib.PurePosixPath:
+    try:
+        return _CANONICAL_GLIBC_LOADERS[host.arch]
+    except KeyError as error:
+        raise LinuxHostDependencyUnavailable(
+            f"no canonical glibc loader is defined for {host.arch}"
+        ) from error
+
+
+def _capture_glibc_loader(
+    host: LinuxHost,
+    interpreter: pathlib.PurePosixPath,
+    *,
+    trusted_owner_uids: frozenset[int],
+) -> HostRuntimeDependency:
+    expected = _canonical_glibc_loader(host)
+    if interpreter != expected:
+        raise LinuxRuntimeUnsafe(
+            "host GPG does not use the canonical glibc loader for "
+            f"{host.arch}: {interpreter}"
+        )
+    lexical = pathlib.Path(str(interpreter))
+    try:
+        lexical.lstat()
+    except (FileNotFoundError, NotADirectoryError) as error:
+        raise LinuxHostDependencyUnavailable(
+            f"canonical glibc loader is unavailable: {interpreter}"
+        ) from error
+    except OSError as error:
+        raise LinuxRuntimeInspectionInconclusive(
+            f"cannot inspect canonical glibc loader {interpreter}: {error}"
+        ) from error
+    reject_wsl_windows_path(lexical, host)
+    loader = _capture_host_runtime_dependency(
+        lexical,
+        interpreter,
+        trusted_owner_uids=trusted_owner_uids,
+    )
+    reject_wsl_windows_paths(
+        (loader.lexical_path, loader.resolved_identity.path),
+        host,
+    )
+    return loader
+
+
+def _parse_glibc_loader_version(output: str) -> tuple[int, int]:
+    match = _GLIBC_LOADER_VERSION.match(output)
+    if match is None:
+        raise LinuxHostDependencyUnavailable(
+            "canonical loader did not identify itself as a supported glibc ld.so"
+        )
+    version = (int(match.group(1)), int(match.group(2)))
+    if not (_MINIMUM_GLIBC_VERSION <= version < _MAXIMUM_GLIBC_VERSION):
+        raise LinuxHostDependencyUnavailable(
+            "canonical glibc loader version is outside the supported range "
+            f">={_MINIMUM_GLIBC_VERSION[0]}.{_MINIMUM_GLIBC_VERSION[1]},"
+            f"<{_MAXIMUM_GLIBC_VERSION[0]}.{_MAXIMUM_GLIBC_VERSION[1]}: "
+            f"{version[0]}.{version[1]}"
+        )
+    return version
+
+
+def _require_safe_glibc_loader(
+    loader: HostRuntimeDependency,
+    host: LinuxHost,
+) -> pathlib.Path:
+    if loader.destination != _canonical_glibc_loader(host):
+        raise LinuxRuntimeUnsafe(
+            f"glibc loader identity has an unexpected destination: {loader.destination}"
+        )
+    resolved = _revalidate_host_runtime_dependency(loader)
+    if not os.access(resolved, os.X_OK):
+        raise LinuxRuntimeUnsafe(
+            f"canonical glibc loader is not executable: {resolved}"
+        )
+    info = inspect_elf(resolved)
+    _require_safe_host_elf_loader_policy(info)
+    if info.elf_type != 3:
+        raise LinuxRuntimeUnsafe(f"glibc loader is not an ET_DYN image: {resolved}")
+    if info.interpreter is not None:
+        raise LinuxRuntimeUnsafe(
+            f"glibc loader unexpectedly names another interpreter: {resolved}"
+        )
+    if info.arch != host.arch:
+        raise LinuxRuntimeUnsafe(
+            f"glibc loader architecture {info.arch} does not match {host.arch}"
+        )
+    return resolved
+
+
+def _probe_glibc_loader_version(
+    loader: HostRuntimeDependency,
     host: LinuxHost,
     *,
-    ldd_path: pathlib.Path | None,
-    ldd_trusted_roots: Sequence[pathlib.Path],
-    trusted_owner_uids: frozenset[int],
-) -> TrustedPathIdentity:
-    if ldd_path is None:
-        return _trusted_ldd(host, trusted_owner_uids=trusted_owner_uids)
-    identity = _capture_trusted_path_identity(
-        ldd_path,
-        trusted_owner_uids=trusted_owner_uids,
-        require_executable=True,
-        missing_is_unavailable=True,
-    )
-    if not any(
-        _is_relative_to(identity.path, root)
-        for root in _resolve_trusted_roots(ldd_trusted_roots)
-    ):
-        raise LinuxRuntimeUnsafe(
-            f"trusted ldd resolves outside configured roots: {ldd_path}"
+    runner: Runner,
+) -> tuple[int, int]:
+    resolved = _require_safe_glibc_loader(loader, host)
+    try:
+        result = _run_tool_probe(runner, (str(resolved), "--version"))
+    except LinuxRuntimeInspectionInconclusive:
+        raise
+    except ReviewError as error:
+        raise LinuxRuntimeInspectionInconclusive(
+            f"glibc loader identity probe failed: {error}"
+        ) from error
+    _require_safe_glibc_loader(loader, host)
+    if result.returncode != 0:
+        detail = bytes(result.stderr).decode("utf-8", errors="replace").strip()
+        raise LinuxHostDependencyUnavailable(
+            f"canonical glibc loader does not support --version: {detail}"
         )
-    return identity
+    try:
+        output = bytes(result.stdout).decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise LinuxRuntimeInspectionInconclusive(
+            f"cannot parse canonical glibc loader version: {error}"
+        ) from error
+    return _parse_glibc_loader_version(output)
 
 
 def _require_no_elf_audit_modules(info: ElfInfo) -> None:
@@ -2413,14 +2527,41 @@ def _require_safe_host_elf_loader_policy(info: ElfInfo) -> None:
         )
 
 
-def _collect_host_runtime_closure_with_ldd(
+def _require_safe_host_gpg_loader_policy(
+    info: ElfInfo,
+    host: LinuxHost,
+) -> pathlib.PurePosixPath:
+    _require_safe_host_elf_loader_policy(info)
+    expected = _canonical_glibc_loader(host)
+    if info.interpreter != str(expected) or info.libc != "glibc":
+        raise LinuxRuntimeUnsafe(
+            "host GPG does not use the canonical glibc loader for "
+            f"{host.arch}: {info.interpreter or '<none>'}"
+        )
+    return expected
+
+
+def _require_safe_host_dependency_loader_policy(info: ElfInfo) -> None:
+    _require_safe_host_elf_loader_policy(info)
+    if info.elf_type != 3:
+        raise LinuxRuntimeUnsafe(
+            f"host runtime library is not an ET_DYN image: {info.path}"
+        )
+    if info.interpreter is not None:
+        raise LinuxRuntimeUnsafe(
+            f"host runtime library unexpectedly names an interpreter: {info.path}"
+        )
+
+
+def _collect_host_runtime_closure_with_loader(
     host: LinuxHost,
     executable: pathlib.Path,
-    ldd_identity: TrustedPathIdentity,
+    loader: HostRuntimeDependency,
     *,
     runner: Runner,
     trusted_owner_uids: frozenset[int],
     executable_owner_uids: frozenset[int],
+    expected_glibc_version: tuple[int, int] | None = None,
 ) -> HostRuntimeClosure:
     executable_identity = _capture_trusted_path_identity(
         executable,
@@ -2430,7 +2571,7 @@ def _collect_host_runtime_closure_with_ldd(
         ignore_parent_directory_content_changes=True,
     )
     info = inspect_elf(executable_identity.path)
-    _require_safe_host_elf_loader_policy(info)
+    interpreter = _require_safe_host_gpg_loader_policy(info, host)
     if info.path != executable_identity.path:
         raise LinuxRuntimeInspectionInconclusive(
             "host GPG executable changed during ELF inspection"
@@ -2440,13 +2581,34 @@ def _collect_host_runtime_closure_with_ldd(
             f"host GPG architecture {info.arch} does not match {host.arch}"
         )
 
-    ldd = _revalidate_trusted_path_identity(ldd_identity)
+    loader_path = _require_safe_glibc_loader(loader, host)
     reject_wsl_windows_paths(
-        (executable_identity.path, ldd),
+        (
+            executable_identity.path,
+            loader.lexical_path,
+            loader.resolved_identity.path,
+        ),
         host,
     )
+    glibc_version = _probe_glibc_loader_version(loader, host, runner=runner)
+    if (
+        expected_glibc_version is not None
+        and glibc_version != expected_glibc_version
+    ):
+        raise LinuxRuntimeInspectionInconclusive(
+            "canonical glibc loader changed its reported version"
+        )
+    # The host GPG has already been restricted to this canonical, statically
+    # inspected glibc loader. Its fixed --list trace path maps dependencies but
+    # exits before application relocation, constructors, or entry-point code.
+    # Dependency policy is checked immediately after the trace and before GPG.
+    # Do not add --verify, --list-diagnostics, or any relocation-bearing mode.
+    loader_path = _require_safe_glibc_loader(loader, host)
     try:
-        result = _run_tool_probe(runner, (str(ldd), str(executable_identity.path)))
+        result = _run_tool_probe(
+            runner,
+            (str(loader_path), "--list", str(executable_identity.path)),
+        )
     except LinuxRuntimeInspectionInconclusive:
         raise
     except ReviewError as error:
@@ -2454,7 +2616,7 @@ def _collect_host_runtime_closure_with_ldd(
             f"host runtime dependency inspection failed for {executable}: {error}"
         ) from error
     _revalidate_trusted_path_identity(executable_identity)
-    _revalidate_trusted_path_identity(ldd_identity)
+    _require_safe_glibc_loader(loader, host)
     if result.returncode != 0:
         detail = bytes(result.stderr).decode("utf-8", errors="replace").strip()
         raise LinuxRuntimeInspectionInconclusive(
@@ -2473,28 +2635,34 @@ def _collect_host_runtime_closure_with_ldd(
     requested: dict[pathlib.PurePosixPath, pathlib.Path] = {
         mount.destination: mount.source for mount in parsed
     }
-    if info.interpreter is not None:
-        interpreter = pathlib.PurePosixPath(info.interpreter)
-        interpreter_path = pathlib.Path(info.interpreter)
-        previous = requested.get(interpreter)
-        if previous is not None and previous != interpreter_path:
-            raise LinuxRuntimeUnsafe(
-                "host runtime interpreter resolves to conflicting sources: "
-                f"{interpreter}"
-            )
-        requested[interpreter] = interpreter_path
+    interpreter_path = loader.lexical_path
+    previous = requested.get(interpreter)
+    if previous is not None and previous != interpreter_path:
+        raise LinuxRuntimeUnsafe(
+            "host runtime interpreter resolves to conflicting sources: "
+            f"{interpreter}"
+        )
+    requested[interpreter] = interpreter_path
 
     captured_dependencies: list[HostRuntimeDependency] = []
     for destination, source in sorted(
         requested.items(), key=lambda item: str(item[0])
     ):
-        dependency = _capture_host_runtime_dependency(
-            source,
-            destination,
-            trusted_owner_uids=trusted_owner_uids,
-        )
+        if destination == interpreter:
+            if source != loader.lexical_path:
+                raise LinuxRuntimeUnsafe(
+                    "canonical glibc loader resolves to an unexpected source: "
+                    f"{source}"
+                )
+            dependency = loader
+        else:
+            dependency = _capture_host_runtime_dependency(
+                source,
+                destination,
+                trusted_owner_uids=trusted_owner_uids,
+            )
         dependency_info = inspect_elf(dependency.resolved_identity.path)
-        _require_safe_host_elf_loader_policy(dependency_info)
+        _require_safe_host_dependency_loader_policy(dependency_info)
         if dependency_info.arch != host.arch:
             raise LinuxRuntimeUnsafe(
                 "host runtime dependency architecture does not match the host: "
@@ -2505,7 +2673,8 @@ def _collect_host_runtime_closure_with_ldd(
     reject_wsl_windows_paths(
         (
             executable_identity.path,
-            ldd_identity.path,
+            loader.lexical_path,
+            loader.resolved_identity.path,
             *(dependency.lexical_path for dependency in dependencies),
             *(
                 dependency.resolved_identity.path
@@ -2517,11 +2686,12 @@ def _collect_host_runtime_closure_with_ldd(
     for dependency in dependencies:
         _revalidate_host_runtime_dependency(dependency)
     _revalidate_trusted_path_identity(executable_identity)
-    _revalidate_trusted_path_identity(ldd_identity)
+    _require_safe_glibc_loader(loader, host)
     return HostRuntimeClosure(
         host=host,
         executable_identity=executable_identity,
-        ldd_identity=ldd_identity,
+        loader=loader,
+        glibc_version=glibc_version,
         interpreter=info.interpreter,
         dependencies=dependencies,
         trusted_owner_uids=trusted_owner_uids,
@@ -2534,8 +2704,6 @@ def collect_host_runtime_closure(
     executable: pathlib.Path,
     *,
     runner: Runner = run_bounded_capture,
-    ldd_path: pathlib.Path | None = None,
-    ldd_trusted_roots: Sequence[pathlib.Path] = _TRUSTED_TOOL_ROOTS,
     trusted_owner_uids: frozenset[int] = frozenset({0}),
     executable_owner_uids: frozenset[int] | None = None,
 ) -> HostRuntimeClosure:
@@ -2547,16 +2715,25 @@ def collect_host_runtime_closure(
         if executable_owner_uids is None
         else executable_owner_uids
     )
-    ldd_identity = _resolve_host_runtime_ldd(
+    executable_identity = _capture_trusted_path_identity(
+        executable,
+        trusted_owner_uids=selected_executable_owners,
+        require_executable=True,
+        allow_root_sticky_temp_ancestor=True,
+        ignore_parent_directory_content_changes=True,
+    )
+    info = inspect_elf(executable_identity.path)
+    interpreter = _require_safe_host_gpg_loader_policy(info, host)
+    _revalidate_trusted_path_identity(executable_identity)
+    loader = _capture_glibc_loader(
         host,
-        ldd_path=ldd_path,
-        ldd_trusted_roots=ldd_trusted_roots,
+        interpreter,
         trusted_owner_uids=trusted_owner_uids,
     )
-    return _collect_host_runtime_closure_with_ldd(
+    return _collect_host_runtime_closure_with_loader(
         host,
         executable,
-        ldd_identity,
+        loader,
         runner=runner,
         trusted_owner_uids=trusted_owner_uids,
         executable_owner_uids=selected_executable_owners,
@@ -2572,11 +2749,12 @@ def revalidate_host_runtime_closure(
 
     require_supported_host(closure.host)
     _revalidate_trusted_path_identity(closure.executable_identity)
-    _revalidate_trusted_path_identity(closure.ldd_identity)
+    _require_safe_glibc_loader(closure.loader, closure.host)
     reject_wsl_windows_paths(
         (
             closure.executable_identity.path,
-            closure.ldd_identity.path,
+            closure.loader.lexical_path,
+            closure.loader.resolved_identity.path,
             *(dependency.lexical_path for dependency in closure.dependencies),
             *(
                 dependency.resolved_identity.path
@@ -2587,13 +2765,14 @@ def revalidate_host_runtime_closure(
     )
     for dependency in closure.dependencies:
         _revalidate_host_runtime_dependency(dependency)
-    refreshed = _collect_host_runtime_closure_with_ldd(
+    refreshed = _collect_host_runtime_closure_with_loader(
         closure.host,
         closure.executable_identity.path,
-        closure.ldd_identity,
+        closure.loader,
         runner=runner,
         trusted_owner_uids=closure.trusted_owner_uids,
         executable_owner_uids=closure.executable_owner_uids,
+        expected_glibc_version=closure.glibc_version,
     )
     if refreshed != closure:
         raise LinuxRuntimeInspectionInconclusive(

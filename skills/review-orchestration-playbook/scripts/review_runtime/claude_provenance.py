@@ -115,7 +115,11 @@ class ClaudeProvenanceInconclusive(ClaudeProvenanceError):
 
 
 class ClaudeProvenanceUnavailable(ClaudeProvenanceError):
-    """The host lacks a required local provenance-verification dependency."""
+    """A local provenance operation could not be completed."""
+
+
+class ClaudeProvenanceDependencyUnavailable(ClaudeProvenanceUnavailable):
+    """The host deterministically lacks a required provenance dependency."""
 
 
 @dataclass(frozen=True)
@@ -904,10 +908,19 @@ def _stable_trusted_gpg_candidate(
 ) -> _TrustedGpgSource | None:
     try:
         resolved = candidate.resolve(strict=True)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except (OSError, RuntimeError) as error:
+        raise ClaudeProvenanceInconclusive(
+            f"cannot resolve a trusted GPG candidate: {error}"
+        ) from error
+    try:
         before = resolved.stat(follow_symlinks=False)
         parent_identities = _gpg_parent_identities(resolved)
-    except OSError:
-        return None
+    except OSError as error:
+        raise ClaudeProvenanceInconclusive(
+            f"cannot inspect a trusted GPG candidate: {error}"
+        ) from error
     if (
         not stat.S_ISREG(before.st_mode)
         or before.st_uid not in {0, os.geteuid()}
@@ -917,15 +930,19 @@ def _stable_trusted_gpg_candidate(
         or not os.access(resolved, os.X_OK)
         or parent_identities is None
     ):
-        return None
+        raise ClaudeProvenanceInvalid(
+            "trusted GPG candidate has unsafe filesystem metadata"
+        )
 
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
         os, "O_NOFOLLOW", 0
     )
     try:
         descriptor = os.open(resolved, flags)
-    except OSError:
-        return None
+    except OSError as error:
+        raise ClaudeProvenanceInconclusive(
+            f"cannot open a trusted GPG candidate: {error}"
+        ) from error
     try:
         opened_before = os.fstat(descriptor)
         magic = os.read(descriptor, 4)
@@ -968,7 +985,9 @@ def _stable_trusted_gpg_candidate(
         )
     if magic not in _NATIVE_EXECUTABLE_MAGICS:
         os.close(descriptor)
-        return None
+        raise ClaudeProvenanceInvalid(
+            "trusted GPG candidate is not a native executable"
+        )
     return _TrustedGpgSource(
         path=resolved,
         descriptor=descriptor,
@@ -983,20 +1002,45 @@ def _resolve_trusted_gpg_source(
     *,
     require_root_owner: bool = False,
 ) -> _TrustedGpgSource:
+    invalid_candidates: list[ClaudeProvenanceInvalid] = []
     for candidate in candidates:
         if not candidate.is_absolute():
+            invalid_candidates.append(
+                ClaudeProvenanceInvalid(
+                    "trusted GPG candidate path is not absolute"
+                )
+            )
             continue
         # Group-writable parent directories are intentionally allowed for
         # current-user Homebrew installations. The retained source descriptor,
         # rather than this replaceable path, is the snapshot trust anchor.
-        source = _stable_trusted_gpg_candidate(candidate)
-        if source is not None and (
-            not require_root_owner or os.fstat(source.descriptor).st_uid == 0
-        ):
-            return source
-        if source is not None:
+        try:
+            source = _stable_trusted_gpg_candidate(candidate)
+        except ClaudeProvenanceInvalid as error:
+            invalid_candidates.append(error)
+            continue
+        if source is None:
+            continue
+        try:
+            source_owner = os.fstat(source.descriptor).st_uid
+        except OSError as error:
             os.close(source.descriptor)
-    raise ClaudeProvenanceUnavailable(
+            raise ClaudeProvenanceInconclusive(
+                f"cannot revalidate trusted GPG ownership: {error}"
+            ) from error
+        if not require_root_owner or source_owner == 0:
+            return source
+        os.close(source.descriptor)
+        invalid_candidates.append(
+            ClaudeProvenanceInvalid(
+                "trusted Linux GPG candidate is not root-owned"
+            )
+        )
+    if invalid_candidates:
+        raise ClaudeProvenanceInvalid(
+            "no candidate satisfies the trusted native GPG contract"
+        ) from invalid_candidates[0]
+    raise ClaudeProvenanceDependencyUnavailable(
         "no trusted native GPG executable is available for Claude Code provenance"
     )
 
@@ -1415,9 +1459,13 @@ def _run_otool(path: pathlib.Path, option: str) -> str:
         raise ValueError(f"unsupported otool option: {option}")
     try:
         metadata = TRUSTED_OTOOL.stat(follow_symlinks=False)
-    except OSError as error:
-        raise ClaudeProvenanceUnavailable(
+    except FileNotFoundError as error:
+        raise ClaudeProvenanceDependencyUnavailable(
             f"trusted macOS otool is unavailable: {error}"
+        ) from error
+    except OSError as error:
+        raise ClaudeProvenanceInconclusive(
+            f"cannot inspect trusted macOS otool: {error}"
         ) from error
     if (
         not stat.S_ISREG(metadata.st_mode)
@@ -1425,7 +1473,7 @@ def _run_otool(path: pathlib.Path, option: str) -> str:
         or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
         or not os.access(TRUSTED_OTOOL, os.X_OK)
     ):
-        raise ClaudeProvenanceUnavailable(
+        raise ClaudeProvenanceInvalid(
             "trusted macOS otool has unsafe filesystem metadata"
         )
     try:
@@ -1648,7 +1696,7 @@ def _prepare_trusted_gpg_runtime(executable: pathlib.Path) -> _TrustedGpgRuntime
                 f"cannot inspect the trusted Linux GPG runtime: {error}"
             ) from error
         except claude_linux.LinuxHostDependencyUnavailable as error:
-            raise ClaudeProvenanceUnavailable(
+            raise ClaudeProvenanceDependencyUnavailable(
                 f"trusted Linux GPG runtime dependency is unavailable: {error}"
             ) from error
         except claude_linux.LinuxRuntimeError as error:
@@ -1658,7 +1706,7 @@ def _prepare_trusted_gpg_runtime(executable: pathlib.Path) -> _TrustedGpgRuntime
         return _TrustedGpgRuntime(
             linux_closure=closure,
         )
-    raise ClaudeProvenanceUnavailable(
+    raise ClaudeProvenanceDependencyUnavailable(
         f"GPG provenance verification is unsupported on {sys.platform}"
     )
 
