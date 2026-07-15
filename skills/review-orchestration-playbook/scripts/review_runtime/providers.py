@@ -4567,7 +4567,7 @@ def run_review(
         return Outcome(2, None, tuple())
 
     try:
-        validate_external_workspace(review)
+        synthetic_evidence = validate_external_workspace(review) or {}
     except ReviewError as error:
         write_text_atomic(
             review.container_dir / "runner-error.txt",
@@ -4575,14 +4575,13 @@ def run_review(
         )
         return Outcome(2, None, tuple())
 
-    write_json(
-        review.container_dir / "preflight.json",
-        {
-            "review_range": f"{review.base_ref}..{review.head_ref}",
-            "scope": "frozen tracked workspace, diff, and review prompt",
-            "status": "sensitive-content and escaping-symlink checks passed",
-        },
-    )
+    preflight_evidence = {
+        "review_range": f"{review.base_ref}..{review.head_ref}",
+        "scope": "frozen tracked workspace, diff, and review prompt",
+        "status": "sensitive-content and escaping-symlink checks passed",
+    }
+    preflight_evidence.update(synthetic_evidence)
+    write_json(review.container_dir / "preflight.json", preflight_evidence)
 
     if reviewer == "claude":
         write_json(

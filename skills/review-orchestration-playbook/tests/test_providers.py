@@ -31,6 +31,7 @@ from review_runtime import (  # noqa: E402
     claude_provenance,
     common,
     providers,
+    workspace as workspace_runtime,
 )
 from review_runtime.common import Completed, ReviewError  # noqa: E402
 from review_runtime.workspace import ReviewWorkspace  # noqa: E402
@@ -89,6 +90,29 @@ class ProviderPolicyTest(unittest.TestCase):
         diff_file.write_text("diff --git a/a b/a\n", encoding="utf-8")
         (control / "changed-paths.z").write_bytes(b"")
         (control / "changed-blob-findings.z").write_bytes(b"")
+        catalog = workspace_runtime.load_catalog()
+        synthetic_manifest = {
+            "catalog_schema_version": catalog.schema_version,
+            "entries": [],
+            "pool_version": catalog.pool_version,
+            "schema_version": workspace_runtime.SYNTHETIC_MANIFEST_SCHEMA_VERSION,
+            "selected_exemptions": [],
+        }
+        workspace_runtime._write_bounded_json(
+            control / workspace_runtime.SYNTHETIC_MANIFEST_NAME,
+            synthetic_manifest,
+            label="synthetic secret manifest",
+        )
+        workspace_runtime._write_bounded_json(
+            container / workspace_runtime.SYNTHETIC_PRIVATE_MANIFEST_NAME,
+            synthetic_manifest,
+            label="synthetic secret helper-private state",
+        )
+        workspace_runtime._write_bounded_json(
+            control / workspace_runtime.SYNTHETIC_CHANGED_EVIDENCE_NAME,
+            {"entries": [], "schema_version": 1},
+            label="synthetic changed-blob evidence",
+        )
         prompt_file = control / "review.prompt"
         prompt_file.write_text("Review this diff.\n", encoding="utf-8")
         self.review = ReviewWorkspace(
@@ -100,6 +124,7 @@ class ProviderPolicyTest(unittest.TestCase):
             diff_file=diff_file,
             prompt_file=prompt_file,
         )
+        self._refresh_control_artifact_state()
         self.claude_broker = (
             container / "claude-runtime" / "keychain-broker" / "security"
         )
@@ -193,6 +218,17 @@ class ProviderPolicyTest(unittest.TestCase):
             "_warm_claude_local_login",
         )
         self.warmup = self.warmup_patcher.start()
+
+    def _refresh_control_artifact_state(self) -> None:
+        control_dir = self.review.workspace_root / ".codex-review"
+        state = workspace_runtime._build_control_artifact_state(
+            control_dir=control_dir,
+        )
+        workspace_runtime._write_bounded_json(
+            self.review.container_dir / workspace_runtime.CONTROL_ARTIFACT_STATE_NAME,
+            state,
+            label="helper-private review control state",
+        )
 
     def tearDown(self) -> None:
         self.warmup_patcher.stop()
@@ -2150,6 +2186,7 @@ class ProviderPolicyTest(unittest.TestCase):
             "Review @/config/runtime-state.json\n",
             encoding="utf-8",
         )
+        self._refresh_control_artifact_state()
         with (
             mock.patch.object(
                 providers,
@@ -2181,6 +2218,7 @@ class ProviderPolicyTest(unittest.TestCase):
             "diff --git a/example.py b/example.py\n+@decorator\n",
             encoding="utf-8",
         )
+        self._refresh_control_artifact_state()
         with (
             mock.patch.object(providers, "child_environment", return_value={}),
             mock.patch.object(
@@ -3670,7 +3708,9 @@ class ProviderPolicyTest(unittest.TestCase):
             stdout=json.dumps(
                 {
                     "type": "turn.failed",
-                    "error": {"message": "Model is not available for your account"},
+                    "error": {
+                        "message": "Model is not available for your account"
+                    },
                 }
             ).encode(),
             stderr=b"",
@@ -3719,9 +3759,7 @@ class ProviderPolicyTest(unittest.TestCase):
             stdout=json.dumps(
                 {
                     "type": "turn.failed",
-                    "error": {
-                        "message": "Model is not available for your account"
-                    },
+                    "error": {"message": "Model is not available for your account"},
                 }
             ).encode(),
             stderr=b"",
@@ -3794,6 +3832,7 @@ class ProviderPolicyTest(unittest.TestCase):
             "diff --git a/config b/config\n-AWS_KEY=" + secret + "\n",
             encoding="utf-8",
         )
+        self._refresh_control_artifact_state()
         outcome = providers.run_review(
             review=self.review,
             reviewer="codex",
@@ -3846,6 +3885,7 @@ class ProviderPolicyTest(unittest.TestCase):
             "diff --git a/config b/config\n-AUTH_TOKEN=" + token + "\n",
             encoding="utf-8",
         )
+        self._refresh_control_artifact_state()
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
@@ -3867,6 +3907,7 @@ class ProviderPolicyTest(unittest.TestCase):
         (self.review.workspace_root / ".codex-review/changed-paths.z").write_bytes(
             b"config/.env.production\0"
         )
+        self._refresh_control_artifact_state()
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",

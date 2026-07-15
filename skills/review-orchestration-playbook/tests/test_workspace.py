@@ -150,7 +150,7 @@ class WorkspaceTest(unittest.TestCase):
                 repo=partial,
                 base_ref=self.base,
                 head_ref=self.head,
-        )
+            )
 
         self.assertFalse(marker.exists())
         self.assertEqual(
@@ -186,6 +186,57 @@ class WorkspaceTest(unittest.TestCase):
 
         cleanup_workspace(review, keep_container=False)
         self.assertFalse(review.container_dir.exists())
+
+    def test_prepare_uses_private_control_modes_under_permissive_umask(self) -> None:
+        for mask in (0o002, 0o000):
+            with self.subTest(mask=oct(mask)):
+                previous = os.umask(mask)
+                try:
+                    review = prepare_workspace(
+                        repo=self.repo,
+                        base_ref=self.base,
+                        head_ref=self.head,
+                    )
+                finally:
+                    os.umask(previous)
+                self.reviews.append(review)
+
+                control_dir = review.workspace_root / ".codex-review"
+                self.assertEqual(review.container_dir.stat().st_mode & 0o777, 0o700)
+                self.assertEqual(control_dir.stat().st_mode & 0o777, 0o700)
+                for name in workspace_runtime.CONTROL_ARTIFACT_SPECS:
+                    self.assertEqual(
+                        (control_dir / name).stat().st_mode & 0o777,
+                        0o600,
+                        name,
+                    )
+                for name in (
+                    workspace_runtime.SYNTHETIC_PRIVATE_MANIFEST_NAME,
+                    workspace_runtime.CONTROL_ARTIFACT_STATE_NAME,
+                ):
+                    self.assertEqual(
+                        (review.container_dir / name).stat().st_mode & 0o777,
+                        0o600,
+                        name,
+                    )
+                self.assertEqual(
+                    (review.workspace_root / "example.txt").stat().st_mode & 0o777,
+                    0o644,
+                )
+                validate_external_workspace(review)
+
+    def test_external_workspace_rejects_group_writable_control_artifact(self) -> None:
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(review)
+        changed_paths = review.workspace_root / ".codex-review/changed-paths.z"
+        changed_paths.chmod(0o660)
+
+        with self.assertRaisesRegex(ReviewError, "group or other writable"):
+            validate_external_workspace(review)
 
     def test_prompt_override_replaces_only_review_scope_placeholders(self) -> None:
         template = pathlib.Path(self.temporary.name) / "prompt.txt"
@@ -264,6 +315,42 @@ class WorkspaceTest(unittest.TestCase):
             [],
         )
 
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "requires FIFO support")
+    def test_prompt_override_rejects_symlink_hardlink_fifo_and_writable_file(
+        self,
+    ) -> None:
+        root = pathlib.Path(self.temporary.name)
+        target = root / "prompt-target.txt"
+        target.write_text("Review {review_range}\n", encoding="utf-8")
+        target.chmod(0o600)
+        symlink = root / "prompt-symlink.txt"
+        symlink.symlink_to(target)
+        hardlink = root / "prompt-hardlink.txt"
+        os.link(target, hardlink)
+        fifo = root / "prompt.fifo"
+        os.mkfifo(fifo, mode=0o600)
+        writable = root / "prompt-writable.txt"
+        writable.write_text("Review {review_range}\n", encoding="utf-8")
+        writable.chmod(0o620)
+
+        for label, candidate in (
+            ("symlink", symlink),
+            ("hardlink", hardlink),
+            ("fifo", fifo),
+            ("writable", writable),
+        ):
+            with self.subTest(file_type=label), self.assertRaises(ReviewError):
+                prepare_workspace(
+                    repo=self.repo,
+                    base_ref=self.base,
+                    head_ref=self.head,
+                    prompt_override=candidate,
+                )
+        self.assertEqual(
+            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            [],
+        )
+
     def test_tree_record_diagnostics_redact_secret_paths_and_payloads(self) -> None:
         secret = "AKIA" + "A" * 16
         malformed = f"malformed-{secret}".encode()
@@ -306,18 +393,10 @@ class WorkspaceTest(unittest.TestCase):
         self.assertEqual(_value_secret_rule(marker), "pgp-private-key")
 
     def test_placeholder_secret_requires_a_complete_placeholder_value(self) -> None:
-        self.assertIsNone(
-            _value_secret_rule(b'password = "example-test-secret"')
-        )
-        self.assertIsNone(
-            _value_secret_rule(b'password = "${DATABASE_PASSWORD}"')
-        )
-        self.assertIsNone(
-            _value_secret_rule(b'password = "<DATABASE_PASSWORD>"')
-        )
-        self.assertIsNone(
-            _value_secret_rule(b'OPENAI_API_KEY = "parent-only-secret"')
-        )
+        self.assertIsNone(_value_secret_rule(b'password = "example-test-secret"'))
+        self.assertIsNone(_value_secret_rule(b'password = "${DATABASE_PASSWORD}"'))
+        self.assertIsNone(_value_secret_rule(b'password = "<DATABASE_PASSWORD>"'))
+        self.assertIsNone(_value_secret_rule(b'OPENAI_API_KEY = "parent-only-secret"'))
 
         credential = "".join(("example-", "ProdSecret", "ABC123!"))
         self.assertEqual(
@@ -344,8 +423,18 @@ class WorkspaceTest(unittest.TestCase):
                     _value_secret_rule(payload),
                     "generic-secret-assignment",
                 )
+        placeholder = b"".join((b"example-", b"test-", b"secret"))
+        self.assertIsNone(_value_secret_rule(b"password: " + placeholder))
         self.assertIsNone(
             _value_secret_rule(b"password: example-test-secret # placeholder")
+        )
+        self.assertEqual(
+            _value_secret_rule(
+                b"password: "
+                + placeholder
+                + b" # fixture\n  ActualOpaqueSecretA9Z8Y7\n"
+            ),
+            "generic-secret-assignment",
         )
 
     def test_oversized_secret_assignments_fail_closed(self) -> None:
