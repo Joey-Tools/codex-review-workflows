@@ -1,6 +1,6 @@
 # Codex Review Workflows
 
-Public review orchestration and local delivery gate skills.
+Public review orchestration, synthetic fixture selection, and local delivery gate skills.
 
 `review-orchestration-playbook` is the single entrypoint for policy-bound local Codex review, Claude-family double review, GitHub Codex triple review, and PR readiness. Claude Code model selection remains pinned, while CLI compatibility follows a publisher-verified release range and explicit macOS, Linux, and WSL2 capability contract documented in [Claude Runtime Trust And Platform Capabilities](skills/review-orchestration-playbook/references/claude-runtime-trust.md).
 
@@ -9,6 +9,8 @@ Publisher verification means the fixed Anthropic signing key, signed per-version
 The fixed-path native GPG source is a separately validated host-trust dependency, not evidence of Anthropic publisher provenance. The helper holds its stable file descriptor, copies it into a fresh current-user `0700` home below a trusted `/tmp`, publishes that copy as a `0500` execution snapshot, and uses the snapshot for all key conversion, fingerprint listing, and signature-verification calls. Security-sensitive host tools receive fixed minimal environments rather than inherited loader, shell, or compiler controls. WSL2 support uses multiple positive host signals, including custom-kernel-compatible runtime markers, and bounded `/proc/self/mountinfo` provenance checks; Windows-backed DrvFS paths are rejected even when mounted through a custom automount, bind mount, or alias rather than the literal `/mnt/<drive>` spelling.
 
 Linux and WSL2 use a separate inner file-tool boundary because the trusted Claude runtime must read either its staged `/config` credential or an API key while model-invoked tools must not. The helper uses `dontAsk`, exposes only `Read`, allows only `Read(./**)`, rejects file-mention syntax in the review prompt, and denies every non-workspace synthetic-root mount with absolute double-slash rules such as `Read(//config/**)` and `Read(//proc/**)`. Command construction fails closed if a future mount lacks deny coverage or is added below `/workspace`. The outer `bubblewrap` sandbox still enforces host filesystem, process, write, and network isolation; a read-only credential mount alone is not a confidentiality boundary from the Claude process that authenticates with it.
+
+`synthetic-token-fixtures` selects exact authoring values from the review helper's fixed finite catalog. The helper catalog remains the only enforcement authority; skill templates contain placeholders only.
 
 ## Test
 

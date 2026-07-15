@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "authoring_pool": {
+    "version": "public-example-v1",
+    "tokens": [
+      {
+        "id": "access-a",
+        "role": "access",
+        "state": "active",
+        "rule": "generic-secret-assignment",
+        "value": "codex_public_synth_v1_access_a"
+      },
+      {
+        "id": "access-b",
+        "role": "access",
+        "state": "active",
+        "rule": "generic-secret-assignment",
+        "value": "codex_public_synth_v1_access_b"
+      },
+      {
+        "id": "access-expired",
+        "role": "access",
+        "state": "expired",
+        "rule": "generic-secret-assignment",
+        "value": "codex_public_synth_v1_access_expired"
+      },
+      {
+        "id": "refresh-a",
+        "role": "refresh",
+        "state": "active",
+        "rule": "generic-secret-assignment",
+        "value": "codex_public_synth_v1_refresh_a"
+      },
+      {
+        "id": "refresh-b",
+        "role": "refresh",
+        "state": "active",
+        "rule": "generic-secret-assignment",
+        "value": "codex_public_synth_v1_refresh_b"
+      },
+      {
+        "id": "refresh-consumed",
+        "role": "refresh",
+        "state": "consumed",
+        "rule": "generic-secret-assignment",
+        "value": "codex_public_synth_v1_refresh_consumed"
+      },
+      {
+        "id": "id-a",
+        "role": "id",
+        "state": "active",
+        "rule": "generic-secret-assignment",
+        "value": "codex_public_synth_v1_id_a"
+      },
+      {
+        "id": "id-b",
+        "role": "id",
+        "state": "active",
+        "rule": "generic-secret-assignment",
+        "value": "codex_public_synth_v1_id_b"
+      },
+      {
+        "id": "api-key-a",
+        "role": "api-key",
+        "state": "active",
+        "rule": "generic-secret-assignment",
+        "value": "codex_public_synth_v1_api_key_a"
+      },
+      {
+        "id": "bearer-a",
+        "role": "bearer",
+        "state": "active",
+        "rule": "generic-secret-assignment",
+        "value": "codex_public_synth_v1_bearer_a"
+      }
+    ]
+  },
+  "legacy_exemptions": []
+}
