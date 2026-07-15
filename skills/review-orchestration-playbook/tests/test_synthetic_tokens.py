@@ -656,6 +656,26 @@ class PublicPoolScannerTest(unittest.TestCase):
                 + b" "
                 + adjacent_secret,
             ),
+            (
+                "json-object-array-unlabeled-value",
+                b'[{"access_token": "'
+                + accepted.value
+                + b'"}, {'
+                + adjacent_secret
+                + b"}]",
+            ),
+            (
+                "multiline-json-object-array-unlabeled-value",
+                b'[{"access_token": "'
+                + accepted.value
+                + b'"}, {\n  '
+                + adjacent_secret
+                + b"\n}]",
+            ),
+            (
+                "plain-source-string-concatenation",
+                b"payload = '" + exact_assignment + b"' + " + adjacent_secret,
+            ),
         )
         for label, payload in cases:
             with self.subTest(case=label):
@@ -671,6 +691,36 @@ class PublicPoolScannerTest(unittest.TestCase):
         )
         self.assertIsNone(json_value.blocking_rule)
         self.assertEqual(json_value.accepted_counts[accepted], 1)
+
+        json_object_array = workspace._scan_secret_value(
+            b'[{"access_token": "' + accepted.value + b'"}, {"name": "next"}]',
+            accepted_values=self.accepted,
+        )
+        self.assertIsNone(json_object_array.blocking_rule)
+        self.assertEqual(json_object_array.accepted_counts[accepted], 1)
+
+        for label, line_break, diff_prefix, diff_surface in (
+            ("lf", b"\n", b"", False),
+            ("crlf", b"\r\n", b"", False),
+            ("diff", b"\n", b"+", True),
+        ):
+            with self.subTest(json_object_array=label):
+                pretty_json = workspace._scan_secret_value(
+                    diff_prefix
+                    + b'[{"access_token": "'
+                    + accepted.value
+                    + b'"}, {'
+                    + line_break
+                    + diff_prefix
+                    + b'  "name": "next"'
+                    + line_break
+                    + diff_prefix
+                    + b"}]",
+                    accepted_values=self.accepted,
+                    diff_surface=diff_surface,
+                )
+                self.assertIsNone(pretty_json.blocking_rule)
+                self.assertEqual(pretty_json.accepted_counts[accepted], 1)
 
         keyword_argument = workspace._scan_secret_value(
             b'configure(access_token = "' + accepted.value + b'", state = "expired")',
@@ -706,6 +756,13 @@ class PublicPoolScannerTest(unittest.TestCase):
         )
         self.assertIsNone(source_wrapper.blocking_rule)
         self.assertEqual(source_wrapper.accepted_counts[accepted], 1)
+
+        plain_source_wrapper = workspace._scan_secret_value(
+            b"payload = '" + exact_assignment + b"'\nstate = 1\n",
+            accepted_values=self.accepted,
+        )
+        self.assertIsNone(plain_source_wrapper.blocking_rule)
+        self.assertEqual(plain_source_wrapper.accepted_counts[accepted], 1)
 
         bounded_source_wrapper = workspace._scan_secret_value(
             b"payload = b'"
@@ -1658,6 +1715,27 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         ) as caught:
             self.validate(review, catalog=catalog)
         self.assertNotIn(raw_value, str(caught.exception))
+
+    def test_escaping_legacy_symlink_target_is_redacted_during_materialization(
+        self,
+    ) -> None:
+        catalog = legacy_catalog(values=(LEGACY_A,))
+        for label, sensitive_target in (
+            ("raw", LEGACY_A),
+            ("storage", legacy_value_base64(LEGACY_A)),
+        ):
+            with self.subTest(target=label):
+                repo, base = self.new_repo({"README.md": "base\n"})
+                (repo / "artifact").symlink_to("../" + sensitive_target)
+                head = self.commit(repo)
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "<redacted symlink target>",
+                ) as caught:
+                    self.prepare(repo=repo, base=base, head=head, catalog=catalog)
+                message = str(caught.exception)
+                self.assertNotIn(LEGACY_A, message)
+                self.assertNotIn(legacy_value_base64(LEGACY_A), message)
 
     def test_evidence_cannot_expose_legacy_storage_encoding(self) -> None:
         raw_value = "jgajgajgajgajgajga"

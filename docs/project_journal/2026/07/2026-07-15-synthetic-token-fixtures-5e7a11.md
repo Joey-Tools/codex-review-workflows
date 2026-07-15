@@ -30,6 +30,9 @@ superseded_by:
 - All six control files are created as `0600` even under permissive caller umasks, while the existing reader continues to reject group- or other-writable artifacts.
 - Accepted assignments use bounded continuation inspection, and catalog value uniqueness plus exact authoring/legacy overlap checks are rule-independent.
 - Canonical unquoted acceptance rejects YAML/INI indentation folding, operator continuations, quote/backslash/backtick/parameter-expansion concatenation, tabs, ambiguous inline comment/semicolon suffixes, and any next content that is not a bounded same-or-shallower named statement or explicit metadata boundary. Existing harmless placeholders may consume an inline hash comment and source/container closers, but an indented continuation still blocks.
+- Quoted acceptance recognizes bounded JSON object/array openers after a completed object only when the next element begins with a named assignment; unlabeled adjacent values still block.
+- Bounded source-literal recognition covers plain and prefixed Python-style strings without accepting a quote truncated at the lookbehind boundary; concatenation after the outer literal still blocks.
+- Frozen-tree materialization redacts catalog legacy raw values and canonical storage encodings from escaping-symlink diagnostics before validation can report the target.
 - `$synthetic-token-fixtures` uses the helper CLI and placeholder-only templates rather than duplicating catalog literals.
 
 ## Next Steps
@@ -38,8 +41,8 @@ superseded_by:
 
 ## Evidence
 
-- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py' -v` (`376` tests passed; `2` loopback-dependent tests skipped)
-- `python3 -m unittest skills.review-orchestration-playbook.tests.test_synthetic_tokens -q` (`74` tests passed)
+- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py' -v` (`377` tests passed; `2` loopback-dependent tests skipped)
+- `python3 -m unittest skills.review-orchestration-playbook.tests.test_synthetic_tokens -q` (`75` tests passed)
 - `python3 -m unittest skills.review-orchestration-playbook.tests.test_workspace -q` (`56` tests passed)
 - `python3 -m py_compile skills/review-orchestration-playbook/scripts/isolated_review skills/review-orchestration-playbook/scripts/review_runtime/*.py`
 - `ruff check` and `ruff format --check` passed for the finding-repair runtime and test files.

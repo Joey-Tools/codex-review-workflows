@@ -900,6 +900,7 @@ def _materialize_blob(
     object_id: str,
     mode: str,
     materialized_bytes: int,
+    legacy_value_matcher: LegacyPathMatcher,
 ) -> int:
     destination_display = _redact_secret_path(
         os.fspath(destination),
@@ -956,7 +957,11 @@ def _materialize_blob(
                 f"symlink loop in frozen Git tree: {destination_display}"
             ) from error
         if not is_relative_to(target, workspace_root.resolve(strict=False)):
-            target_display = _redact_secret_path(target_text, "symlink target")
+            target_display = (
+                "<redacted symlink target>"
+                if legacy_value_matcher.match(target_bytes) is not None
+                else _redact_secret_path(target_text, "symlink target")
+            )
             raise ReviewError(
                 "frozen Git tree symlink escapes workspace: "
                 f"{destination_display} -> {target_display}"
@@ -1009,6 +1014,7 @@ def _materialize_frozen_tree(
     object_directory: pathlib.Path,
     head_sha: str,
     workspace_root: pathlib.Path,
+    legacy_value_matcher: LegacyPathMatcher,
 ) -> None:
     workspace_root.mkdir()
     environment = _git_environment(object_directory=object_directory)
@@ -1092,6 +1098,7 @@ def _materialize_frozen_tree(
                         object_id=object_id,
                         mode=mode,
                         materialized_bytes=materialized_bytes,
+                        legacy_value_matcher=legacy_value_matcher,
                     )
                 except OSError as error:
                     error_code = (
@@ -2987,11 +2994,33 @@ def _quoted_assignment_may_accept(
             value.rfind(b"\r", lookbehind_start, start),
         )
         line_start = max(lookbehind_start, last_line_break + 1)
+        prefix_was_truncated = lookbehind_start > 0 and last_line_break < 0
         prefix = value[line_start:start]
         lowered = prefix.lower()
-        for marker in (b"br'", b"rb'", b'br"', b'rb"', b"b'", b'b"'):
+        for marker in (
+            b"br'",
+            b"rb'",
+            b"fr'",
+            b"rf'",
+            b'br"',
+            b'rb"',
+            b'fr"',
+            b'rf"',
+            b"b'",
+            b"f'",
+            b"r'",
+            b"u'",
+            b'b"',
+            b'f"',
+            b'r"',
+            b'u"',
+            b"'",
+            b'"',
+        ):
             marker_index = lowered.rfind(marker)
             if marker_index < 0:
+                continue
+            if len(marker) == 1 and marker_index == 0 and prefix_was_truncated:
                 continue
             if marker_index > 0 and (
                 lowered[marker_index - 1 : marker_index].isalnum()
@@ -3017,6 +3046,22 @@ def _quoted_assignment_may_accept(
                 position += 1
             return position
 
+        def skip_json_space(position: int) -> int:
+            while position < limit:
+                if value[position] in (0x09, 0x0A, 0x0D, 0x20):
+                    position += 1
+                    continue
+                if (
+                    diff_surface
+                    and position > 0
+                    and value[position - 1] in (0x0A, 0x0D)
+                    and value[position] in (0x2B, 0x2D)
+                ):
+                    position += 1
+                    continue
+                break
+            return position
+
         def skip_identifier(position: int) -> int:
             if position >= limit or not (
                 0x41 <= value[position] <= 0x5A
@@ -3033,6 +3078,9 @@ def _quoted_assignment_may_accept(
             ):
                 position += 1
             return position
+
+        while index < limit and value[index] in (0x5B, 0x7B):
+            index = skip_json_space(index + 1)
 
         if index < limit and value[index] in (0x22, 0x27):
             quote = value[index]
@@ -4076,6 +4124,7 @@ def prepare_workspace(
         catalog,
         catalog.legacy_exemptions,
     )
+    catalog_legacy_value_matcher = _legacy_path_matcher(catalog_legacy_values)
     evidence_sensitive_values = _all_catalog_sensitive_values(catalog)
     container, handoff_mask = _new_container(source_root)
     ownership_transferred = False
@@ -4109,6 +4158,7 @@ def prepare_workspace(
             object_directory=object_directory,
             head_sha=head_sha,
             workspace_root=workspace_root,
+            legacy_value_matcher=catalog_legacy_value_matcher,
         )
         _reject_protected_review_path_aliases(workspace_root)
         control_dir = workspace_root / ".codex-review"
