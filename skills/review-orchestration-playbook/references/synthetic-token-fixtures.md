@@ -46,7 +46,7 @@ The version 1 root has exactly these fields:
 }
 ```
 
-Authoring roles are `access`, `refresh`, `id`, `api-key`, and `bearer`. States are `active`, `expired`, and `consumed`. IDs and values must be unique; values may not be equal, prefix-related, or substring-related. The helper also bounds catalog size and entry counts.
+Authoring roles are `access`, `refresh`, `id`, `api-key`, and `bearer`. States are `active`, `expired`, and `consumed`. IDs and values must be unique; values may not be equal, prefix-related, or substring-related. An authoring value also may not occur inside any public catalog metadata field, including token IDs, the pool version, or legacy provenance; this keeps metadata-only CLI output and preflight evidence structurally raw-free. Values use only the scanner-compatible ASCII byte set `A-Z`, `a-z`, `0-9`, and `-_./+=!@#$%^&*?~:;`. On every CLI or preflight load, the helper runs each entry through the real scanner in canonical quoted and unquoted assignments and requires exactly one acceptance under its declared rule. The helper also bounds catalog size and entry counts.
 
 A legacy envelope uses this illustrative shape:
 
@@ -129,7 +129,7 @@ isolated_review synthetic-tokens audit-master \
 
 ## Preflight Evidence
 
-Successful preflight evidence is bounded by entry count and serialized size. Accepted authoring findings record the catalog schema and pool version, stable token ID, scanner rule, path, side or surface, digest, and occurrence count. Selected legacy evidence additionally records the exemption ID plus base and head counts. Raw authoring and legacy values are never written to preflight evidence.
+Successful preflight evidence is bounded by entry count and serialized size. Accepted authoring findings record the catalog schema and pool version, stable token ID, scanner rule, path, side or surface, digest, and occurrence count. Selected legacy evidence additionally records the exemption ID plus base and head counts. Before writing evidence, the helper checks every string field, including dynamic path digests and the frozen review range, against exact authoring values and the length-plus-digest legacy set. Raw authoring and legacy values are never written to preflight evidence.
 
 Evidence is audit data, not a reusable allowlist. A later scan must load and validate the active fixed catalog again.
 

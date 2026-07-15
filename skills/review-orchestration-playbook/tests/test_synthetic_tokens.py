@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from collections import Counter
 from unittest import mock
 
 
@@ -150,6 +151,39 @@ class PublicPoolScannerTest(unittest.TestCase):
         )
         self.assertEqual(scan.blocking_rule, "github-token")
         self.assertFalse(scan.accepted_counts)
+
+    def test_each_pool_value_is_captured_once_in_supported_assignments(self) -> None:
+        keys = {
+            "access": b"access_token",
+            "refresh": b"refresh_token",
+            "id": b"id_token",
+            "api-key": b"api_key",
+            "bearer": b"bearer_token",
+        }
+        accepted_by_id = {item.identifier: item for item in self.accepted}
+        for token in self.catalog.authoring_tokens:
+            accepted = accepted_by_id[token.identifier]
+            key = keys[token.role]
+            probes = (
+                key + b' = "' + token.value + b'"\n',
+                key + b" = '" + token.value + b"'\r\n",
+                key + b" = " + token.value,
+                key + b" = " + token.value + b"\n",
+                key + b" = " + token.value + b"\r\n",
+                key + b" = " + token.value + b" \t# comment\n",
+                key + b" = " + token.value + b"\t; comment\r\n",
+            )
+            for index, probe in enumerate(probes):
+                with self.subTest(token=token.identifier, probe=index):
+                    scan = workspace._scan_secret_value(
+                        probe,
+                        accepted_values=(accepted,),
+                    )
+                    self.assertIsNone(scan.blocking_rule)
+                    self.assertEqual(
+                        scan.accepted_counts,
+                        Counter({accepted: 1}),
+                    )
 
     def test_mutated_pool_values_remain_blocked(self) -> None:
         original = PUBLIC_VALUES[0]
@@ -796,6 +830,18 @@ class CatalogValidationTest(unittest.TestCase):
         control = catalog_payload()
         control["authoring_pool"]["tokens"][0]["value"] = "synthetic credential value"
         cases["control"] = control
+        for label, value in (
+            ("double-quote", 'synthetic_value_with_"_quote'),
+            ("single-quote", "synthetic_value_with_'_quote"),
+            ("backslash", r"synthetic_value_with_\_escape"),
+            ("parenthesis", "synthetic_value_with_(delimiter"),
+            ("backtick", "synthetic_value_with_`_delimiter"),
+            ("pipe", "synthetic_value_with_|_delimiter"),
+            ("comma", "synthetic_value_with_,_delimiter"),
+        ):
+            malformed = catalog_payload()
+            malformed["authoring_pool"]["tokens"][0]["value"] = value
+            cases[label] = malformed
         rule = catalog_payload()
         rule["authoring_pool"]["tokens"][0]["rule"] = "github-token"
         cases["rule"] = rule
@@ -806,6 +852,76 @@ class CatalogValidationTest(unittest.TestCase):
         for label, payload in cases.items():
             with self.subTest(case=label), self.assertRaises(ReviewError):
                 self.parse(payload)
+
+    def test_authoring_entries_must_pass_the_real_scanner_contract(self) -> None:
+        cases = (
+            ("placeholder", "placeholder_test_token"),
+            ("provider", "ghp_" + "A" * 36),
+            ("unquoted-invisible", "lowercaseauthoringvalue"),
+        )
+        for label, value in cases:
+            payload = catalog_payload()
+            payload["authoring_pool"]["tokens"][0]["value"] = value
+            catalog = self.parse(payload)
+            with (
+                self.subTest(case=label),
+                self.assertRaisesRegex(ReviewError, "not captured exactly once"),
+            ):
+                workspace.validate_authoring_catalog_scanner_contract(catalog)
+
+    def test_current_authoring_pool_passes_the_real_scanner_contract(self) -> None:
+        workspace.validate_authoring_catalog_scanner_contract(
+            synthetic_tokens.load_catalog()
+        )
+
+    def test_authoring_values_cannot_overlap_public_metadata(self) -> None:
+        raw_value = "synthetic-token-123"
+        own_id = catalog_payload()
+        own_id["authoring_pool"]["tokens"][0].update(
+            {"id": raw_value, "value": raw_value}
+        )
+        pool_version = catalog_payload()
+        pool_version["authoring_pool"]["version"] = f"pool-{raw_value}"
+        pool_version["authoring_pool"]["tokens"][0]["value"] = raw_value
+        other_id = catalog_payload()
+        other_id["authoring_pool"]["tokens"][0]["value"] = raw_value
+        other_id["authoring_pool"]["tokens"][1]["id"] = f"other-{raw_value}"
+        legacy_metadata = catalog_payload()
+        legacy_metadata["authoring_pool"]["tokens"][0]["value"] = raw_value
+        legacy_metadata["legacy_exemptions"] = [
+            {
+                "id": "historical-fixtures",
+                "repository": f"example/{raw_value}",
+                "verified_master_tip": "a" * 40,
+                "match": "non-increasing-global-count",
+                "values": [
+                    {
+                        "id": "historical-1",
+                        "rule": "generic-secret-assignment",
+                        "value_sha256": hashlib.sha256(
+                            LEGACY_A.encode("ascii")
+                        ).hexdigest(),
+                        "value_length": len(LEGACY_A),
+                        "containing_commit": "b" * 40,
+                        "source_occurrences": 1,
+                    }
+                ],
+            }
+        ]
+
+        for label, payload in (
+            ("own-id", own_id),
+            ("pool-version", pool_version),
+            ("other-id", other_id),
+            ("legacy-metadata", legacy_metadata),
+        ):
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "authoring value overlaps public metadata",
+                ) as caught:
+                    self.parse(payload)
+                self.assertNotIn(raw_value, str(caught.exception))
 
     def test_duplicate_ids_values_and_overlaps_fail_closed(self) -> None:
         duplicate_id = catalog_payload()
@@ -953,6 +1069,21 @@ class SyntheticTokenCliTest(unittest.TestCase):
         for raw in PUBLIC_VALUES:
             self.assertNotIn(raw, output)
 
+    def test_validate_rejects_an_authoring_value_the_scanner_cannot_accept(self) -> None:
+        payload = catalog_payload()
+        payload["authoring_pool"]["tokens"][0]["value"] = (
+            "placeholder_test_token"
+        )
+        catalog = synthetic_tokens.parse_catalog_bytes(
+            json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        )
+        with mock.patch.object(cli, "load_catalog", return_value=catalog):
+            returncode, output, error = self.run_cli("validate")
+        self.assertEqual(returncode, 2)
+        self.assertEqual(output, "")
+        self.assertIn("not captured exactly once", error)
+        self.assertNotIn("placeholder_test_token", error)
+
     def test_get_returns_only_the_explicitly_selected_raw_value(self) -> None:
         returncode, output, error = self.run_cli("get", "access-a", "--json")
         self.assertEqual((returncode, error), (0, ""))
@@ -1055,6 +1186,68 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         self.assertTrue(accepted)
         self.assertTrue(all("value_sha256" in entry for entry in accepted))
         self.assertTrue(any(entry["token_id"] == "access-a" for entry in accepted))
+
+    def test_dynamic_path_digest_cannot_expose_an_authoring_value(self) -> None:
+        relative = "fixture.cfg"
+        raw_value = hashlib.sha256(relative.encode("ascii")).hexdigest()[:24]
+        payload = catalog_payload()
+        payload["authoring_pool"]["tokens"][0]["value"] = raw_value
+        catalog = synthetic_tokens.parse_catalog_bytes(
+            json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        )
+        repo, base = self.new_repo({"README.md": "base\n"})
+        (repo / relative).write_text(
+            assignment_text("access_token", raw_value),
+            encoding="utf-8",
+        )
+        head = self.commit(repo)
+        with self.assertRaisesRegex(
+            ReviewError,
+            "would expose a raw synthetic value",
+        ) as caught:
+            self.prepare(repo=repo, base=base, head=head, catalog=catalog)
+        self.assertNotIn(raw_value, str(caught.exception))
+
+    def test_dynamic_path_digest_cannot_expose_a_legacy_value(self) -> None:
+        relative = "fixture.cfg"
+        raw_value = hashlib.sha256(relative.encode("ascii")).hexdigest()[:24]
+        catalog = legacy_catalog(values=(raw_value,))
+        repo, base = self.new_repo(
+            {relative: assignment_text("access_token", raw_value)}
+        )
+        (repo / "README.md").write_text("head\n", encoding="utf-8")
+        head = self.commit(repo)
+        review = self.prepare(
+            repo=repo,
+            base=base,
+            head=head,
+            catalog=catalog,
+            exemptions=("historical-fixtures",),
+        )
+        with self.assertRaisesRegex(
+            ReviewError,
+            "would expose a raw synthetic value",
+        ) as caught:
+            self.validate(review, catalog=catalog)
+        self.assertNotIn(raw_value, str(caught.exception))
+
+    def test_review_range_cannot_expose_an_unused_authoring_value(self) -> None:
+        repo, base = self.new_repo({"README.md": "base\n"})
+        (repo / "README.md").write_text("head\n", encoding="utf-8")
+        head = self.commit(repo)
+        raw_value = f"{base}..{head}"
+        payload = catalog_payload()
+        payload["authoring_pool"]["tokens"][0]["value"] = raw_value
+        catalog = synthetic_tokens.parse_catalog_bytes(
+            json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        )
+        review = self.prepare(repo=repo, base=base, head=head, catalog=catalog)
+        with self.assertRaisesRegex(
+            ReviewError,
+            "would expose a raw synthetic value",
+        ) as caught:
+            self.validate(review, catalog=catalog)
+        self.assertNotIn(raw_value, str(caught.exception))
 
     def test_pool_value_in_credential_path_remains_blocked(self) -> None:
         repo, base = self.new_repo({"README.md": "base\n"})

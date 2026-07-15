@@ -31,6 +31,10 @@ REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 COMMIT_OID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 LEGACY_MATCH_MODE = "non-increasing-global-count"
+GENERIC_SECRET_VALUE_BYTE_CLASS = rb"[-A-Za-z0-9_./+=!@#$%^&*?~:;]"
+AUTHORING_VALUE = re.compile(
+    rb"(?:" + GENERIC_SECRET_VALUE_BYTE_CLASS + rb"){16,512}"
+)
 
 
 @dataclass(frozen=True)
@@ -167,6 +171,16 @@ def _require_ascii_value(value: Any, *, label: str) -> bytes:
     return encoded
 
 
+def _require_authoring_value(value: Any, *, label: str) -> bytes:
+    encoded = _require_ascii_value(value, label=label)
+    if AUTHORING_VALUE.fullmatch(encoded) is None:
+        raise ReviewError(
+            f"synthetic token catalog {label} value must use scanner-compatible "
+            "ASCII bytes"
+        )
+    return encoded
+
+
 def _require_string_choice(
     value: Any,
     choices: frozenset[str],
@@ -204,7 +218,10 @@ def _parse_authoring_tokens(value: Any) -> tuple[str, tuple[AuthoringToken, ...]
                 rule=_require_string_choice(
                     token["rule"], ALLOWED_AUTHORING_RULES, f"{label}.rule"
                 ),
-                value=_require_ascii_value(token["value"], label=identifier),
+                value=_require_authoring_value(
+                    token["value"],
+                    label=f"{label}.value",
+                ),
             )
         )
     return version, tuple(tokens)
@@ -319,6 +336,44 @@ def _validate_unique_entries(catalog: SyntheticTokenCatalog) -> None:
     identifiers: dict[str, str] = {}
     values: list[tuple[str, bytes]] = []
     legacy_digests: dict[tuple[str, int], str] = {}
+    public_metadata = {catalog.pool_version}
+    for token in catalog.authoring_tokens:
+        public_metadata.update(
+            (
+                token.identifier,
+                token.role,
+                token.state,
+                token.rule,
+                token.value_sha256,
+            )
+        )
+    for exemption in catalog.legacy_exemptions:
+        public_metadata.update(
+            (
+                exemption.identifier,
+                exemption.repository,
+                exemption.verified_master_tip,
+                exemption.match,
+            )
+        )
+        for token in exemption.values:
+            public_metadata.update(
+                (
+                    token.identifier,
+                    token.rule,
+                    token.value_sha256,
+                    token.containing_commit,
+                )
+            )
+    encoded_metadata = tuple(item.encode("ascii") for item in public_metadata)
+    if any(
+        token.value in metadata
+        for token in catalog.authoring_tokens
+        for metadata in encoded_metadata
+    ):
+        raise ReviewError(
+            "synthetic token catalog authoring value overlaps public metadata"
+        )
 
     def register(identifier: str, value: bytes, label: str) -> None:
         previous = identifiers.get(identifier)

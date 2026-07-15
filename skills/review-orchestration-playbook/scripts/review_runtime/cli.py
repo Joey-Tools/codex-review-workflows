@@ -24,7 +24,12 @@ from .synthetic_tokens import (
     legacy_metadata,
     load_catalog,
 )
-from .workspace import ReviewWorkspace, cleanup_workspace, prepare_workspace
+from .workspace import (
+    ReviewWorkspace,
+    cleanup_workspace,
+    prepare_workspace,
+    validate_authoring_catalog_scanner_contract,
+)
 
 
 def _add_review_arguments(parser: argparse.ArgumentParser) -> None:
@@ -121,6 +126,7 @@ def _build_synthetic_tokens_parser() -> argparse.ArgumentParser:
 def _run_synthetic_tokens(argv: list[str]) -> int:
     args = _build_synthetic_tokens_parser().parse_args(argv)
     catalog = load_catalog()
+    validate_authoring_catalog_scanner_contract(catalog)
     if args.action == "validate":
         print(
             json.dumps(

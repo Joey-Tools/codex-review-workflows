@@ -31,6 +31,7 @@ from .common import (
 from .prompt import build_review_prompt
 from .synthetic_tokens import (
     AcceptedSyntheticValue,
+    GENERIC_SECRET_VALUE_BYTE_CLASS,
     LegacyExemption,
     SyntheticTokenCatalog,
     accepted_authoring_values,
@@ -143,11 +144,16 @@ OVERSIZED_QUOTED_SECRET_ASSIGNMENT = re.compile(
 )
 UNQUOTED_SECRET_ASSIGNMENT = re.compile(
     SECRET_KEY_PATTERN
-    + rb"([-A-Za-z0-9_./+=!@#$%^&*?~:;]{16,512})(?=[ \t]*(?:[#;]|\r?$))",
+    + rb"((?:"
+    + GENERIC_SECRET_VALUE_BYTE_CLASS
+    + rb"){16,512})(?=[ \t]*(?:[#;]|\r?$))",
     re.MULTILINE,
 )
 OVERSIZED_UNQUOTED_SECRET_ASSIGNMENT = re.compile(
-    SECRET_KEY_PATTERN + rb"[-A-Za-z0-9_./+=!@#$%^&*?~:;]{513}"
+    SECRET_KEY_PATTERN
+    + rb"(?:"
+    + GENERIC_SECRET_VALUE_BYTE_CLASS
+    + rb"){513}"
 )
 PLACEHOLDER_SECRET_PATTERN = re.compile(
     rb"(?:"
@@ -1018,6 +1024,7 @@ def _write_bounded_json(
     value: dict[str, Any],
     *,
     label: str,
+    accepted_values: Iterable[AcceptedSyntheticValue] = (),
 ) -> None:
     encoded = (
         json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
@@ -1025,7 +1032,57 @@ def _write_bounded_json(
     )
     if len(encoded.encode("utf-8")) > MAX_SYNTHETIC_EVIDENCE_BYTES:
         raise ReviewError(f"{label} exceeds the audit evidence size limit")
+    _reject_raw_values_in_evidence(
+        value,
+        accepted_values=accepted_values,
+        label=label,
+    )
     write_text_atomic(path, encoded)
+
+
+def _iter_evidence_strings(value: Any) -> Iterator[bytes]:
+    if isinstance(value, str):
+        yield value.encode("utf-8")
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield from _iter_evidence_strings(key)
+            yield from _iter_evidence_strings(item)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_evidence_strings(item)
+        return
+    if value is None or type(value) in {bool, int, float}:
+        return
+    raise ReviewError("synthetic-token evidence contains an unsupported value")
+
+
+def _reject_raw_values_in_evidence(
+    value: Any,
+    *,
+    accepted_values: Iterable[AcceptedSyntheticValue],
+    label: str,
+) -> None:
+    exact_values: list[bytes] = []
+    digest_values: dict[int, set[str]] = {}
+    for accepted in accepted_values:
+        if accepted.value is not None:
+            exact_values.append(accepted.value)
+            continue
+        digest_values.setdefault(accepted.value_length, set()).add(
+            accepted.value_sha256
+        )
+    for metadata in set(_iter_evidence_strings(value)):
+        if any(raw_value in metadata for raw_value in exact_values):
+            raise ReviewError(f"{label} would expose a raw synthetic value")
+        for length, digests in digest_values.items():
+            if length > len(metadata):
+                continue
+            for start in range(len(metadata) - length + 1):
+                candidate = metadata[start : start + length]
+                if hashlib.sha256(candidate).hexdigest() in digests:
+                    raise ReviewError(f"{label} would expose a raw synthetic value")
 
 
 def _accepted_evidence_entry(
@@ -1451,6 +1508,7 @@ def _write_changed_blob_findings(
             "schema_version": 1,
         },
         label="synthetic changed-blob evidence",
+        accepted_values=accepted,
     )
 
 
@@ -1710,6 +1768,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     workspace_root = review.workspace_root.resolve(strict=True)
     control_dir = workspace_root / ".codex-review"
     catalog = load_catalog()
+    validate_authoring_catalog_scanner_contract(catalog)
     _exemptions, legacy_values, legacy_counts, legacy_evidence = (
         _load_legacy_manifest(control_dir=control_dir, catalog=catalog)
     )
@@ -1972,6 +2031,17 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     ).encode("utf-8")
     if len(encoded_evidence) > MAX_SYNTHETIC_EVIDENCE_BYTES:
         raise ReviewError("synthetic-token preflight evidence exceeds the size limit")
+    complete_preflight_evidence = {
+        "review_range": f"{review.base_ref}..{review.head_ref}",
+        "scope": "frozen tracked workspace, diff, and review prompt",
+        "status": "sensitive-content and escaping-symlink checks passed",
+    }
+    complete_preflight_evidence.update(evidence)
+    _reject_raw_values_in_evidence(
+        complete_preflight_evidence,
+        accepted_values=accepted_values,
+        label="synthetic-token preflight evidence",
+    )
     return evidence
 
 
@@ -2570,6 +2640,30 @@ def _scan_secret_value(
     return result
 
 
+def validate_authoring_catalog_scanner_contract(
+    catalog: SyntheticTokenCatalog,
+) -> None:
+    for accepted in accepted_authoring_values(catalog):
+        probes = (
+            b'access_token = "' + accepted.value + b'"\n',
+            b"access_token = '" + accepted.value + b"'\n",
+            b"access_token = " + accepted.value + b"\n",
+        )
+        for probe in probes:
+            result = _scan_secret_value(
+                probe,
+                accepted_values=(accepted,),
+            )
+            if (
+                result.blocking_rule is not None
+                or result.accepted_counts != Counter({accepted: 1})
+            ):
+                raise ReviewError(
+                    "synthetic token catalog authoring token is not captured "
+                    f"exactly once by its scanner rule: {accepted.identifier}"
+                )
+
+
 def _stream_secret_scan(
     stream: BinaryIO,
     *,
@@ -2743,6 +2837,7 @@ def audit_legacy_exemption(
         )
 
     catalog = load_catalog()
+    validate_authoring_catalog_scanner_contract(catalog)
     if catalog.legacy_exemption(exemption.identifier) != exemption:
         raise ReviewError("legacy exemption changed while the audit was prepared")
     accepted = accepted_legacy_values(catalog, (exemption,))
@@ -2829,6 +2924,11 @@ def audit_legacy_exemption(
         json.dumps(result, separators=(",", ":"), sort_keys=True).encode("utf-8")
     ) > MAX_SYNTHETIC_EVIDENCE_BYTES:
         raise ReviewError("legacy master audit evidence exceeds the size limit")
+    _reject_raw_values_in_evidence(
+        result,
+        accepted_values=scan_accepted,
+        label="legacy master audit evidence",
+    )
     return result
 
 
@@ -2850,6 +2950,7 @@ def prepare_workspace(
         head_sha=head_sha,
     )
     catalog = load_catalog()
+    validate_authoring_catalog_scanner_contract(catalog)
     selected_exemptions = resolve_legacy_exemptions(
         catalog,
         synthetic_secret_exemptions,
@@ -2904,6 +3005,7 @@ def prepare_workspace(
             control_dir / SYNTHETIC_MANIFEST_NAME,
             synthetic_manifest,
             label="synthetic secret manifest",
+            accepted_values=accepted_values,
         )
         changed_paths_file = control_dir / "changed-paths.z"
         _write_frozen_changed_paths(
