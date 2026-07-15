@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
 import os
 import pathlib
@@ -192,6 +191,7 @@ MAX_CHANGED_METADATA_BYTES = 128 * 1024 * 1024
 MAX_CHANGED_ENTRIES = 100_000
 MAX_CHANGED_BLOB_SCAN_BYTES = 512 * 1024 * 1024
 MAX_SECRET_SCAN_EVENTS = 1_000_000
+MAX_SECRET_ASSIGNMENT_TRAILING_BYTES = 256
 MAX_REVIEW_PROMPT_BYTES = 64 * 1024
 MAX_SYNTHETIC_EVIDENCE_BYTES = 64 * 1024
 MAX_SYNTHETIC_EVIDENCE_ENTRIES = 512
@@ -1205,20 +1205,22 @@ def _legacy_count_manifest(
     catalog: SyntheticTokenCatalog,
     exemptions: tuple[LegacyExemption, ...],
 ) -> dict[str, Any]:
-    accepted = accepted_legacy_values(catalog, exemptions)
-    if accepted:
+    legacy_accepted = accepted_legacy_values(catalog, exemptions)
+    authoring_accepted = accepted_authoring_values(catalog)
+    scan_accepted = authoring_accepted + legacy_accepted
+    if legacy_accepted:
         base_scan = _scan_frozen_tree_values(
             git_view=git_view,
             object_directory=object_directory,
             commit=base_sha,
-            accepted_values=accepted,
+            accepted_values=scan_accepted,
             capture_accepted_candidates=True,
         )
         head_scan = _scan_frozen_tree_values(
             git_view=git_view,
             object_directory=object_directory,
             commit=head_sha,
-            accepted_values=accepted,
+            accepted_values=scan_accepted,
             capture_accepted_candidates=True,
         )
     else:
@@ -1227,6 +1229,7 @@ def _legacy_count_manifest(
     _reject_overlapping_legacy_candidates(
         base_scan.accepted_candidates,
         head_scan.accepted_candidates,
+        authoring_values=authoring_accepted,
     )
     entries: list[dict[str, Any]] = []
     for exemption in exemptions:
@@ -1234,7 +1237,7 @@ def _legacy_count_manifest(
         for token in exemption.values:
             descriptor = next(
                 item
-                for item in accepted
+                for item in legacy_accepted
                 if item.exemption_id == exemption.identifier
                 and item.identifier == token.identifier
             )
@@ -1274,6 +1277,7 @@ def _legacy_count_manifest(
 
 def _reject_overlapping_legacy_candidates(
     *candidate_maps: dict[AcceptedSyntheticValue, set[bytes]],
+    authoring_values: tuple[AcceptedSyntheticValue, ...] = (),
 ) -> None:
     recovered: dict[AcceptedSyntheticValue, set[bytes]] = {}
     for candidate_map in candidate_maps:
@@ -1283,6 +1287,10 @@ def _reject_overlapping_legacy_candidates(
             recovered.setdefault(descriptor, set()).update(candidates)
 
     exact_values: list[tuple[AcceptedSyntheticValue, bytes]] = []
+    for descriptor in authoring_values:
+        if descriptor.kind != "authoring" or descriptor.value is None:
+            raise ReviewError("synthetic token authoring descriptor is invalid")
+        exact_values.append((descriptor, descriptor.value))
     for descriptor, candidates in recovered.items():
         if len(candidates) > 1:
             raise ReviewError(
@@ -2040,35 +2048,206 @@ def _file_secret_rule(
 
 
 def _starts_quoted_literal(value: bytes) -> bool:
-    prefixes = (b"", b"r", b"u", b"b", b"f", b"br", b"rb", b"fr", b"rf")
-    lowered = value[:3].lower()
+    prefixes = (
+        b"",
+        b"r",
+        b"u",
+        b"b",
+        b"f",
+        b"t",
+        b"l",
+        b"br",
+        b"rb",
+        b"fr",
+        b"rf",
+        b"lr",
+        b"rl",
+        b"u8",
+        b"ur",
+        b"u8r",
+        b"@",
+        b"$",
+        b"$@",
+        b"@$",
+    )
+    lowered = value[:5].lower()
     return any(
         lowered.startswith(prefix + quote)
         for prefix in prefixes
-        for quote in (b"'", b'"')
-    )
+        for quote in (b"'", b'"', b"`")
+    ) or re.match(rb"(?i)(?:br|r)#{1,8}['\"]", value) is not None
 
 
 def _quoted_assignment_may_accept(value: bytes, match: re.Match[bytes]) -> bool:
-    tail = value[match.end() :]
+    cursor = match.end()
+    inspected = 0
 
-    def trim_space(candidate: bytes) -> bytes:
-        return candidate.lstrip(b" \t")
+    def advance(count: int) -> bool:
+        nonlocal cursor, inspected
+        if inspected + count > MAX_SECRET_ASSIGNMENT_TRAILING_BYTES:
+            return False
+        inspected += count
+        cursor += count
+        return True
 
-    tail = trim_space(tail)
-    while tail.startswith((b")", b"]", b"}")):
-        tail = trim_space(tail[1:])
-    if not tail or tail.startswith((b"\r", b"\n", b"#", b"//")):
+    def trim_space() -> bool:
+        while cursor < len(value) and value[cursor] in (0x20, 0x09):
+            if not advance(1):
+                return False
         return True
-    if tail.startswith(b";"):
+
+    def trim_continuation_trivia() -> bool:
+        while cursor < len(value):
+            if not trim_space():
+                return False
+            if value.startswith(b"\r\n", cursor):
+                if not advance(2):
+                    return False
+            elif value.startswith((b"\r", b"\n"), cursor):
+                if not advance(1):
+                    return False
+            elif value.startswith((b"#", b"//"), cursor):
+                marker_length = 1 if value.startswith(b"#", cursor) else 2
+                if not advance(marker_length):
+                    return False
+                while cursor < len(value) and value[cursor] not in (0x0A, 0x0D):
+                    if not advance(1):
+                        return False
+            elif value.startswith(b"/*", cursor):
+                if not advance(2):
+                    return False
+                while cursor < len(value) and not value.startswith(b"*/", cursor):
+                    if not advance(1):
+                        return False
+                if cursor < len(value) and not advance(2):
+                    return False
+            else:
+                return True
         return True
-    if tail.startswith(b","):
-        prefix = value[match.start() : match.start(2)]
-        separator_is_assignment = prefix.rfind(b"=") > prefix.rfind(b":")
-        return not (
-            separator_is_assignment
-            and _starts_quoted_literal(trim_space(tail[1:]))
+
+    def starts_trivia() -> bool:
+        return value.startswith((b"\r", b"\n", b"#", b"//", b"/*"), cursor)
+
+    def starts_literal() -> bool:
+        return _starts_quoted_literal(value[cursor : cursor + 16])
+
+    def starts_named_assignment() -> bool:
+        limit = min(
+            len(value),
+            cursor + MAX_SECRET_ASSIGNMENT_TRAILING_BYTES - inspected + 1,
         )
+        index = cursor
+
+        def skip_space(position: int) -> int:
+            while position < limit and value[position] in (0x20, 0x09):
+                position += 1
+            return position
+
+        def skip_identifier(position: int) -> int:
+            if position >= limit or not (
+                0x41 <= value[position] <= 0x5A
+                or 0x61 <= value[position] <= 0x7A
+                or value[position] == 0x5F
+            ):
+                return position
+            position += 1
+            while position < limit and (
+                0x30 <= value[position] <= 0x39
+                or 0x41 <= value[position] <= 0x5A
+                or 0x61 <= value[position] <= 0x7A
+                or value[position] in (0x2D, 0x2E, 0x5F)
+            ):
+                position += 1
+            return position
+
+        if index < limit and value[index] in (0x2B, 0x2D):
+            index = skip_space(index + 1)
+
+        if index < limit and value[index] in (0x22, 0x27):
+            quote = value[index]
+            index += 1
+            while index < limit:
+                if value[index] == 0x5C:
+                    index += 2
+                    continue
+                if value[index] == quote:
+                    index += 1
+                    break
+                index += 1
+            else:
+                return False
+            index = skip_space(index)
+            return index < limit and value[index] == 0x3A
+
+        identifier_start = index
+        index = skip_identifier(index)
+        if index == identifier_start:
+            return False
+        first_identifier = value[identifier_start:index].lower()
+        index = skip_space(index)
+        if first_identifier in (b"const", b"let", b"var"):
+            next_identifier = index
+            index = skip_identifier(index)
+            if index == next_identifier:
+                return False
+            index = skip_space(index)
+        if index >= limit or value[index] not in (0x3A, 0x3D):
+            return False
+        if index + 1 < len(value) and value[index + 1] in (0x3A, 0x3D, 0x3E):
+            return False
+        return True
+
+    if not trim_space():
+        return False
+    crossed_boundary = False
+    while True:
+        while value.startswith((b")", b"]", b"}"), cursor):
+            if not advance(1):
+                return False
+            if not trim_space():
+                return False
+        if starts_trivia():
+            crossed_boundary = True
+            if not trim_continuation_trivia():
+                return False
+            continue
+        break
+    if cursor == len(value):
+        return True
+    if value.startswith(b";", cursor):
+        if not advance(1) or not trim_space():
+            return False
+        if starts_trivia():
+            if not trim_continuation_trivia():
+                return False
+        return cursor == len(value) or not starts_literal()
+    if value.startswith(b",", cursor):
+        if not advance(1) or not trim_space():
+            return False
+        while True:
+            while value.startswith((b")", b"]", b"}"), cursor):
+                if not advance(1) or not trim_space():
+                    return False
+            if starts_trivia():
+                if not trim_continuation_trivia():
+                    return False
+                continue
+            if value.startswith(b",", cursor):
+                if not advance(1) or not trim_space():
+                    return False
+                continue
+            break
+        if cursor == len(value):
+            return True
+        if value.startswith(b";", cursor):
+            if not advance(1) or not trim_space():
+                return False
+            if starts_trivia() and not trim_continuation_trivia():
+                return False
+            return cursor == len(value) or not starts_literal()
+        return starts_named_assignment()
+    if crossed_boundary:
+        return starts_named_assignment()
     return False
 
 
@@ -2159,9 +2338,7 @@ def _matching_accepted_values(
     by_digest = accepted_index.digests.get((rule, len(candidate)))
     if by_digest:
         candidate_digest = hashlib.sha256(candidate).hexdigest()
-        for digest, accepted_values in by_digest.items():
-            if hmac.compare_digest(candidate_digest, digest):
-                matches.extend(accepted_values)
+        matches.extend(by_digest.get(candidate_digest, ()))
     if len(matches) > 1:
         raise ReviewError("synthetic token catalog produced an ambiguous scanner match")
     return matches
@@ -2410,6 +2587,8 @@ def audit_legacy_exemption(
     if catalog.legacy_exemption(exemption.identifier) != exemption:
         raise ReviewError("legacy exemption changed while the audit was prepared")
     accepted = accepted_legacy_values(catalog, (exemption,))
+    authoring_accepted = accepted_authoring_values(catalog)
+    scan_accepted = authoring_accepted + accepted
     descriptors = {item.identifier: item for item in accepted}
     evidence: list[dict[str, Any]] = []
     candidate_maps: list[dict[AcceptedSyntheticValue, set[bytes]]] = []
@@ -2443,7 +2622,7 @@ def audit_legacy_exemption(
                 git_view=git_view,
                 object_directory=object_directory,
                 commit=commit,
-                accepted_values=commit_descriptors,
+                accepted_values=scan_accepted,
                 capture_accepted_candidates=True,
             )
             candidate_maps.append(scan.accepted_candidates)
@@ -2473,7 +2652,10 @@ def audit_legacy_exemption(
                         "value_sha256": token.value_sha256,
                     }
                 )
-    _reject_overlapping_legacy_candidates(*candidate_maps)
+    _reject_overlapping_legacy_candidates(
+        *candidate_maps,
+        authoring_values=authoring_accepted,
+    )
     if len(evidence) > MAX_SYNTHETIC_EVIDENCE_ENTRIES:
         raise ReviewError("legacy master audit evidence has too many entries")
     result = {

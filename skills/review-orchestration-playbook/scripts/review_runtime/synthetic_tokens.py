@@ -318,7 +318,7 @@ def _parse_legacy_exemptions(value: Any) -> tuple[LegacyExemption, ...]:
 def _validate_unique_entries(catalog: SyntheticTokenCatalog) -> None:
     identifiers: dict[str, str] = {}
     values: list[tuple[str, bytes]] = []
-    legacy_digests: dict[tuple[str, str, int], str] = {}
+    legacy_digests: dict[tuple[str, int], str] = {}
 
     def register(identifier: str, value: bytes, label: str) -> None:
         previous = identifiers.get(identifier)
@@ -347,7 +347,7 @@ def _validate_unique_entries(catalog: SyntheticTokenCatalog) -> None:
                     f"{token.identifier}: {previous}, {exemption.identifier}"
                 )
             identifiers[token.identifier] = exemption.identifier
-            digest_key = (token.rule, token.value_sha256, token.value_length)
+            digest_key = (token.value_sha256, token.value_length)
             previous_digest = legacy_digests.get(digest_key)
             if previous_digest is not None:
                 raise ReviewError(
@@ -357,7 +357,7 @@ def _validate_unique_entries(catalog: SyntheticTokenCatalog) -> None:
             legacy_digests[digest_key] = token.identifier
 
     for token in catalog.authoring_tokens:
-        digest_key = (token.rule, token.value_sha256, len(token.value))
+        digest_key = (token.value_sha256, len(token.value))
         previous_digest = legacy_digests.get(digest_key)
         if previous_digest is not None:
             raise ReviewError(

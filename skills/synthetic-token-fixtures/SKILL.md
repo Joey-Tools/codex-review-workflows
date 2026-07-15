@@ -22,6 +22,8 @@ review_helper="${CODEX_HOME:-$HOME/.codex}/skills/review-orchestration-playbook/
 
 Do not append counters, change case or whitespace, escape or encode the value, use a Unicode lookalike, or embed it inside another string. If the active catalog lacks the required role, state, or count, stop and request an explicit catalog update.
 
+Prefer a structured named fixture field or another unambiguously complete statement. If preflight cannot prove that the value is not continued by adjacent code, restructure the fixture rather than changing the token or requesting a broader exemption.
+
 ## Handle Historical Fixtures
 
 Use `"$review_helper" synthetic-tokens list-exemptions --json` only to inspect helper-owned legacy envelopes. A selected envelope is a migration bridge for values already proven in master history, not an authoring pool. Pass its ID with repeatable `--synthetic-secret-exemption <id>` only when reviewing the affected frozen range.

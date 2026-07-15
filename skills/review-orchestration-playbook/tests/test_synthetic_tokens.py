@@ -251,7 +251,7 @@ class PublicPoolScannerTest(unittest.TestCase):
             b"x" * (candidate_start - len(assignment_prefix))
             + assignment_prefix
             + candidate
-            + b'"\n'
+            + b'"\nstate = "expired"\n'
             + b"x" * workspace.STREAM_SCAN_OVERLAP
         )
         scan = workspace._stream_secret_scan(
@@ -271,6 +271,58 @@ class PublicPoolScannerTest(unittest.TestCase):
             ("explicit-concatenation", exact_assignment + b" + " + adjacent_secret),
             ("conditional-fallback", exact_assignment + b" or " + adjacent_secret),
             ("tuple-continuation", exact_assignment + b", " + adjacent_secret),
+            (
+                "wrapped-tuple-continuation",
+                exact_assignment + b", (" + adjacent_secret + b")",
+            ),
+            (
+                "wrapped-list-continuation",
+                exact_assignment + b", [" + adjacent_secret + b"]",
+            ),
+            (
+                "trailing-comma-closure-continuation",
+                b"identity(" + exact_assignment + b",) + " + adjacent_secret,
+            ),
+            (
+                "colon-unlabeled-argument",
+                b'configure(access_token: "'
+                + accepted.value
+                + b'", '
+                + adjacent_secret
+                + b")",
+            ),
+            (
+                "newline-concatenation",
+                b"configure(" + exact_assignment + b"\n " + adjacent_secret + b")",
+            ),
+            (
+                "line-comment-concatenation",
+                b"configure("
+                + exact_assignment
+                + b" # fixture\n r"
+                + adjacent_secret
+                + b")",
+            ),
+            (
+                "block-comment-concatenation",
+                exact_assignment + b" /* fixture */ " + adjacent_secret,
+            ),
+            (
+                "newline-operator-concatenation",
+                b"configure("
+                + exact_assignment
+                + b"\n + "
+                + adjacent_secret
+                + b")",
+            ),
+            (
+                "unknown-operator-concatenation",
+                exact_assignment + b"\n <> " + adjacent_secret,
+            ),
+            (
+                "macro-concatenation",
+                exact_assignment + b"\nOPAQUE_VALUE;",
+            ),
             (
                 "placeholder-concatenation",
                 b'access_token = "placeholder_token" ' + adjacent_secret,
@@ -302,6 +354,39 @@ class PublicPoolScannerTest(unittest.TestCase):
         self.assertIsNone(keyword_argument.blocking_rule)
         self.assertEqual(keyword_argument.accepted_counts[accepted], 1)
 
+        trailing_comma = workspace._scan_secret_value(
+            b"configure(" + exact_assignment + b",)",
+            accepted_values=self.accepted,
+        )
+        self.assertIsNone(trailing_comma.blocking_rule)
+        self.assertEqual(trailing_comma.accepted_counts[accepted], 1)
+
+        colon_keyword_argument = workspace._scan_secret_value(
+            b'configure(access_token: "'
+            + accepted.value
+            + b'", state: "expired")',
+            accepted_values=self.accepted,
+        )
+        self.assertIsNone(colon_keyword_argument.blocking_rule)
+        self.assertEqual(colon_keyword_argument.accepted_counts[accepted], 1)
+
+        next_statement = workspace._scan_secret_value(
+            exact_assignment + b'\nstate = "expired"\n',
+            accepted_values=self.accepted,
+        )
+        self.assertIsNone(next_statement.blocking_rule)
+        self.assertEqual(next_statement.accepted_counts[accepted], 1)
+
+        excessive_closers = workspace._scan_secret_value(
+            exact_assignment
+            + b")" * (workspace.MAX_SECRET_ASSIGNMENT_TRAILING_BYTES + 1),
+            accepted_values=self.accepted,
+        )
+        self.assertEqual(
+            excessive_closers.blocking_rule,
+            "generic-secret-assignment",
+        )
+
         github_accepted = accepted_legacy_value(GITHUB_LEGACY, rule="github-token")
         github_continuation = workspace._scan_secret_value(
             assignment_bytes(b"access_token", GITHUB_LEGACY.encode("ascii"))
@@ -314,6 +399,30 @@ class PublicPoolScannerTest(unittest.TestCase):
             "generic-secret-assignment",
         )
         self.assertEqual(github_continuation.accepted_counts[github_accepted], 1)
+
+        first_read = 1024 * 1024
+        committed_end = first_read - workspace.STREAM_SCAN_OVERLAP
+        for label, trivia in (
+            ("space", b" " * (workspace.STREAM_SCAN_OVERLAP + 1)),
+            ("newline", b"\n" + b" " * workspace.STREAM_SCAN_OVERLAP),
+            ("block-comment", b"/*" + b"x" * workspace.STREAM_SCAN_OVERLAP),
+        ):
+            with self.subTest(stream_trivia=label):
+                long_gap_payload = (
+                    b"x" * (committed_end - len(exact_assignment))
+                    + exact_assignment
+                    + trivia
+                    + adjacent_secret
+                )
+                long_gap = workspace._stream_secret_scan(
+                    io.BytesIO(long_gap_payload),
+                    size=len(long_gap_payload),
+                    accepted_values=self.accepted,
+                )
+                self.assertEqual(
+                    long_gap.blocking_rule,
+                    "generic-secret-assignment",
+                )
 
     def test_dense_accepted_surface_fails_closed_at_the_event_limit(self) -> None:
         accepted = self.accepted[0]
@@ -496,6 +605,41 @@ class CatalogValidationTest(unittest.TestCase):
         payload["legacy_exemptions"] = [envelope]
         with self.assertRaisesRegex(ReviewError, "duplicate legacy digest"):
             self.parse(payload)
+
+        cross_rule_duplicate = catalog_payload()
+        cross_rule_duplicate["legacy_exemptions"] = [
+            {
+                **envelope,
+                "values": [
+                    entry,
+                    {**entry, "id": "legacy-b", "rule": "github-token"},
+                ],
+            }
+        ]
+        with self.assertRaisesRegex(ReviewError, "duplicate legacy digest"):
+            self.parse(cross_rule_duplicate)
+
+        authoring_collision = catalog_payload()
+        authoring_value = authoring_collision["authoring_pool"]["tokens"][0][
+            "value"
+        ]
+        authoring_collision["legacy_exemptions"] = [
+            {
+                **envelope,
+                "values": [
+                    {
+                        **entry,
+                        "rule": "github-token",
+                        "value_sha256": hashlib.sha256(
+                            authoring_value.encode("ascii")
+                        ).hexdigest(),
+                        "value_length": len(authoring_value),
+                    }
+                ],
+            }
+        ]
+        with self.assertRaisesRegex(ReviewError, "authoring and legacy values collide"):
+            self.parse(authoring_collision)
 
         for field, value in (
             ("value_sha256", "not-a-digest"),
@@ -723,6 +867,45 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                 self.assertNotIn(LEGACY_A, json.dumps(evidence, sort_keys=True))
                 self.assertNotIn(LEGACY_B, json.dumps(evidence, sort_keys=True))
 
+    def test_legacy_counts_accept_authoring_values_but_not_unknown_secrets(self) -> None:
+        catalog = legacy_catalog(values=(LEGACY_A,))
+        fixture = (
+            assignment_text("access_token", PUBLIC_VALUES[0])
+            + assignment_text("refresh_token", LEGACY_A)
+        )
+        repo, base = self.new_repo({"fixture.cfg": fixture})
+        (repo / "README.md").write_text("head\n", encoding="utf-8")
+        head = self.commit(repo)
+        review = self.prepare(
+            repo=repo,
+            base=base,
+            head=head,
+            catalog=catalog,
+            exemptions=("historical-fixtures",),
+        )
+        evidence = self.validate(review, catalog=catalog)
+        counts = evidence["synthetic_tokens"]["legacy_counts"]
+        self.assertEqual(len(counts), 1)
+        self.assertEqual((counts[0]["base_count"], counts[0]["head_count"]), (1, 1))
+
+        unknown_repo, unknown_base = self.new_repo(
+            {
+                "fixture.cfg": fixture
+                + assignment_text("id_token", "UnknownSecretValueA9Z8Y7")
+            }
+        )
+        (unknown_repo / "README.md").write_text("head\n", encoding="utf-8")
+        unknown_head = self.commit(unknown_repo)
+        unknown_review = self.prepare(
+            repo=unknown_repo,
+            base=unknown_base,
+            head=unknown_head,
+            catalog=catalog,
+            exemptions=("historical-fixtures",),
+        )
+        with self.assertRaisesRegex(ReviewError, "generic-secret-assignment"):
+            self.validate(unknown_review, catalog=catalog)
+
     def test_github_legacy_assignment_uses_the_provider_specific_exemption(self) -> None:
         catalog = legacy_catalog(values=(GITHUB_LEGACY,), rule="github-token")
         repo, base = self.new_repo(
@@ -828,6 +1011,24 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                 exemptions=("historical-fixtures",),
             )
 
+    def test_observed_legacy_value_must_not_overlap_authoring_pool(self) -> None:
+        overlapping = PUBLIC_VALUES[0] + "_suffix"
+        catalog = legacy_catalog(values=(overlapping,))
+        repo, base = self.new_repo(
+            {"fixture.cfg": assignment_text("access_token", overlapping)}
+        )
+        (repo / "README.md").write_text("head\n", encoding="utf-8")
+        head = self.commit(repo)
+
+        with self.assertRaisesRegex(ReviewError, "values overlap"):
+            self.prepare(
+                repo=repo,
+                base=base,
+                head=head,
+                catalog=catalog,
+                exemptions=("historical-fixtures",),
+            )
+
     def test_non_ascii_legacy_value_fails_closed(self) -> None:
         non_ascii = LEGACY_A.replace("A", "\N{LATIN CAPITAL LETTER A WITH RING ABOVE}", 1)
         catalog = legacy_catalog(values=(non_ascii,))
@@ -905,9 +1106,21 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             self.validate(review, catalog=catalog)
 
     def test_audit_master_cli_verifies_pinned_provenance_without_raw_value(self) -> None:
-        repo, tip = self.new_repo(
-            {"fixture.cfg": f'access_token = "{LEGACY_A}"\n'}
+        repo, first_commit = self.new_repo(
+            {
+                "fixture.cfg": (
+                    assignment_text("access_token", PUBLIC_VALUES[0])
+                    + assignment_text("refresh_token", LEGACY_A)
+                )
+            }
         )
+        (repo / "fixture.cfg").write_text(
+            assignment_text("access_token", PUBLIC_VALUES[0])
+            + assignment_text("refresh_token", LEGACY_A)
+            + assignment_text("id_token", LEGACY_B),
+            encoding="utf-8",
+        )
+        tip = self.commit(repo)
         git(repo, "remote", "add", "origin", "https://github.com/example/project.git")
         payload = catalog_payload()
         payload["legacy_exemptions"] = [
@@ -924,6 +1137,16 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                             LEGACY_A.encode("ascii")
                         ).hexdigest(),
                         "value_length": len(LEGACY_A),
+                        "containing_commit": first_commit,
+                        "source_occurrences": 1,
+                    },
+                    {
+                        "id": "historical-2",
+                        "rule": "generic-secret-assignment",
+                        "value_sha256": hashlib.sha256(
+                            LEGACY_B.encode("ascii")
+                        ).hexdigest(),
+                        "value_length": len(LEGACY_B),
                         "containing_commit": tip,
                         "source_occurrences": 1,
                     }
@@ -957,7 +1180,9 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         evidence = json.loads(stdout.getvalue())
         self.assertEqual(evidence["status"], "verified")
         self.assertEqual(evidence["values"][0]["source_occurrences"], 1)
+        self.assertEqual(len(evidence["values"]), 2)
         self.assertNotIn(LEGACY_A, stdout.getvalue())
+        self.assertNotIn(LEGACY_B, stdout.getvalue())
 
     def test_audit_master_rejects_overlapping_provenance_values(self) -> None:
         longer = LEGACY_A + "Suffix"

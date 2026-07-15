@@ -19,6 +19,8 @@ The facility is intentionally finite and exact. It is not a regex namespace and 
 
 An authoring token suppresses only the scanner rule declared by its catalog entry. Version 1 authoring entries may declare only `generic-secret-assignment`. Provider-specific credentials, real JWTs, private keys, high-entropy values, adjacent secrets, and any other scanner rule continue to run. Credential-like path findings are independent: a catalog value in `auth.json`, a key file, or another blocked credential path still blocks review.
 
+Acceptance also requires an unambiguous complete right-hand side. The language-agnostic scanner inspects only a bounded continuation window across whitespace, comments, closers, commas, and line boundaries. It accepts explicit termination or a structurally clear next named assignment or mapping key; an unknown operator, identifier, wrapper, unlabeled argument, excessive trivia, or incomplete continuation fails closed. Prefer structured fixture fields or explicit complete statements. If ordinary code immediately after a bare assignment is ambiguous, restructure the fixture instead of weakening the scanner.
+
 The same classifier applies to changed base and head blobs, the frozen diff, the complete frozen head, and the rendered prompt. Legacy exemptions are narrower: they never apply to the prompt and do not weaken credential-path checks.
 
 ## Catalog Schema

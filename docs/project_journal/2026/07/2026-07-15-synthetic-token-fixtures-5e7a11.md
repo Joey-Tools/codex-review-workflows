@@ -5,7 +5,7 @@ status: completed
 created: 2026-07-15
 updated: 2026-07-15
 branch: wip/synthetic-token-v1
-pr:
+pr: 44
 supersedes: []
 superseded_by:
 ---
@@ -24,6 +24,7 @@ superseded_by:
 - Named legacy envelopes store only digests, lengths, rules, and pinned master provenance. Selected entries pass only when each complete captured value has `head_count <= base_count` across the full repository.
 - The helper exposes read-only validate, metadata list, single-value get, exemption list, and pinned-master audit commands.
 - Successful preflight records bounded IDs, digests, rules, surfaces, and counts without raw token values.
+- Accepted assignments use bounded continuation inspection, and catalog value uniqueness plus recovered legacy overlap checks are rule-independent.
 - `$synthetic-token-fixtures` uses the helper CLI and placeholder-only templates rather than duplicating catalog literals.
 
 ## Next Steps
@@ -32,7 +33,7 @@ superseded_by:
 
 ## Evidence
 
-- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py' -v` (`335` tests passed; `2` loopback-dependent tests skipped)
+- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py' -v` (`337` tests passed; `2` loopback-dependent tests skipped)
 - `python3 -m py_compile skills/review-orchestration-playbook/scripts/review_runtime/*.py skills/review-orchestration-playbook/tests/test_*.py`
 - `ruff check --ignore F401` passed for every changed runtime and test module.
-- Both skill validators passed with the locally cached PyYAML runtime.
+- `uv run --offline --with pyyaml python .../quick_validate.py <skill>` passed for both skills using the locally cached PyYAML runtime.
