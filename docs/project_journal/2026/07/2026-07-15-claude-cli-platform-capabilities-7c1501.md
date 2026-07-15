@@ -821,6 +821,27 @@ superseded_by:
   skips. Full runtime/test `ruff`, `compileall`, both workflow actionlint checks,
   strict Clang checks for both C helpers, `git diff --check`, and project-journal
   validation passed before committing the compatibility repair.
+- Compatibility repair commit `be86e4c` was exported as an exact Git archive
+  with SHA-256
+  `8d9b65322997813c5403b2617123e2e401c3bd8c4ea0f29390aa6aaf2cfa0d2d`;
+  the copied archive matched on `codex-hoteng-srv-01`. The remote account's
+  default `umask 0002` correctly triggered group-writable safety failures, while
+  `0077` made one deliberate `0755` negative fixture private; neither run is
+  counted as passing evidence. With the standard non-group-writable `0022`
+  test umask, the same archive passed all 668 tests in 90.044 seconds with three
+  platform/opt-in skips. Remote `compileall`, actionlint 1.7.12 on both
+  workflows, strict GCC with the launcher's production POSIX feature macro, and
+  strict GCC for the Keychain broker all passed.
+- The same exact Linux archive then rebuilt and revalidated the real root-owned
+  `/usr/bin/gpg` closure through glibc `2.39`: the canonical lexical loader was
+  `/lib64/ld-linux-x86-64.so.2`, its resolved endpoint was
+  `/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2`, and the captured closure had
+  13 dependencies. Three real GPG operations verified Anthropic's signed Claude
+  Code `2.1.196` `linux-x64` artifact at size `245373752` and SHA-256
+  `eb933c6dd5534db89b83ba09009d5c0932bd1395f7e3bb0f34ba37eec37bbade`,
+  then materialized a single-link mode-`0500` digest snapshot. No credential or
+  review content was supplied, and the smoke's temporary GPG/snapshot roots
+  were removed automatically.
 - Anthropic installation, signed-manifest, release-key fingerprint, and platform
   signature documentation: https://code.claude.com/docs/en/installation
 - Anthropic Seatbelt, `bubblewrap`, `socat`, WSL2, and WSL1 sandboxing
