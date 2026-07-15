@@ -292,12 +292,72 @@ class ProviderPolicyTest(unittest.TestCase):
         path.write_bytes(payload)
         path.chmod(0o600)
 
+    @staticmethod
+    def host_ca_safety_rejection(error: ReviewError, *, source: str) -> bool:
+        detail = str(error)
+        return any(
+            detail.startswith(prefix)
+            and detail.removeprefix(prefix).startswith(source)
+            for prefix in (
+                "Claude review CA source has an unsafe owner: ",
+                "Claude review CA source is group- or world-writable: ",
+                "Claude review CA directory has an unsafe owner: ",
+                "Claude review CA directory is group- or world-writable: ",
+                "Claude review CA directory symlink has an unsafe owner: ",
+            )
+        )
+
     def test_capacity_wins_over_unavailable_wording(self) -> None:
         category = providers.classify_failure(
             "",
             "Selected model is temporarily unavailable because it is at capacity",
         )
         self.assertEqual(category, "transient")
+
+    def test_host_ca_skip_guard_requires_expected_source_and_safety_error(
+        self,
+    ) -> None:
+        unsafe_host_source = ReviewError(
+            "Claude review CA directory is group- or world-writable: "
+            "SSL_CERT_DIR:deadbeef.0"
+        )
+        unsafe_destination = ReviewError(
+            "Claude review CA directory is group- or world-writable: "
+            "private destination"
+        )
+        unrelated_host_failure = ReviewError(
+            "Claude review CA symlink path contains a loop: "
+            "SSL_CERT_DIR:deadbeef.0"
+        )
+        adversarial_host_failure = ReviewError(
+            "Claude review CA symlink path contains a loop: "
+            "SSL_CERT_DIR:unsafe owner.pem"
+        )
+
+        self.assertTrue(
+            self.host_ca_safety_rejection(
+                unsafe_host_source,
+                source="SSL_CERT_DIR:",
+            )
+        )
+        self.assertFalse(
+            self.host_ca_safety_rejection(
+                unsafe_destination,
+                source="SSL_CERT_DIR:",
+            )
+        )
+        self.assertFalse(
+            self.host_ca_safety_rejection(
+                unrelated_host_failure,
+                source="SSL_CERT_DIR:",
+            )
+        )
+        self.assertFalse(
+            self.host_ca_safety_rejection(
+                adversarial_host_failure,
+                source="SSL_CERT_DIR:",
+            )
+        )
 
     def test_native_macho_dependencies_rejects_interpreter_wrapper(self) -> None:
         wrapper = self.review.source_root / "rg-wrapper"
@@ -2069,6 +2129,124 @@ class ProviderPolicyTest(unittest.TestCase):
                 encoding="utf-8"
             ),
         )
+
+    def test_linux_prompt_guard_does_not_scan_frozen_diff(self) -> None:
+        self.review.diff_file.write_text(
+            "diff --git a/example.py b/example.py\n+@decorator\n",
+            encoding="utf-8",
+        )
+        with (
+            mock.patch.object(providers, "child_environment", return_value={}),
+            mock.patch.object(
+                providers,
+                "_is_claude_linux_host",
+                return_value=True,
+            ),
+            mock.patch.object(
+                providers,
+                "_resolve_validated_claude_executable",
+                return_value=(None, {}),
+            ) as resolve,
+        ):
+            outcome = providers.run_review(
+                review=self.review,
+                reviewer="claude",
+                egress_consent="explicit-claude-review",
+            )
+
+        self.assertEqual(outcome.returncode, 2)
+        resolve.assert_called_once()
+        self.assertNotIn(
+            "ASCII @ file mentions are not allowed",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    def test_linux_prompt_projects_host_paths_and_read_only_guidance(self) -> None:
+        host_prompt = (
+            f"Workspace={self.review.workspace_root}\n"
+            f"Diff={self.review.diff_file}\n"
+        ).encode()
+
+        projected = providers._claude_review_prompt(
+            self.review,
+            host_prompt,
+            linux=True,
+        )
+
+        self.assertNotIn(str(self.review.workspace_root).encode(), projected)
+        self.assertIn(b"Workspace=/workspace\n", projected)
+        self.assertIn(
+            b"Diff=/workspace/.codex-review/review.diff\n",
+            projected,
+        )
+        self.assertIn(b"Only Read is available", projected)
+        self.assertIn(b"Every Read `file_path` must be absolute", projected)
+
+    def test_linux_prompt_rejects_ambiguous_host_path_prefixes(self) -> None:
+        for ambiguous in (
+            f"Workspace={self.review.workspace_root}-backup\n",
+            f"Workspace=copy{self.review.workspace_root}\n",
+            f"Diff={self.review.diff_file}.sig\n",
+            f"Escaping={self.review.workspace_root}/../outside.py\n",
+            f"Noncanonical={self.review.workspace_root}//source.py\n",
+            f'Path="{self.review.workspace_root}/safe /../../etc/passwd"\n',
+            f"Phrase {self.review.workspace_root}/safe /../../etc/passwd\n",
+        ):
+            with (
+                self.subTest(ambiguous=ambiguous),
+                self.assertRaisesRegex(ReviewError, "ambiguous host .* path"),
+            ):
+                providers._claude_review_prompt(
+                    self.review,
+                    ambiguous.encode(),
+                    linux=True,
+                )
+
+    def test_linux_prompt_projects_canonical_workspace_descendant(self) -> None:
+        cases = (
+            (
+                f"Nested={self.review.workspace_root}/src/source.py\n",
+                b"Nested=/workspace/src/source.py\n",
+            ),
+            (
+                f'Path="{self.review.workspace_root}/src dir/source.py"\n',
+                b'Path="/workspace/src dir/source.py"\n',
+            ),
+        )
+        for prompt, expected in cases:
+            with self.subTest(prompt=prompt):
+                projected = providers._claude_review_prompt(
+                    self.review,
+                    prompt.encode(),
+                    linux=True,
+                )
+                self.assertIn(expected, projected)
+
+    def test_macos_prompt_projects_default_paths_to_host_absolutes(self) -> None:
+        default_prompt = (
+            b"- Workspace: .\n"
+            b"- Primary diff file: .codex-review/review.diff\n"
+        )
+
+        projected = providers._claude_review_prompt(
+            self.review,
+            default_prompt,
+            linux=False,
+        )
+
+        self.assertIn(str(self.review.workspace_root).encode(), projected)
+        self.assertIn(str(self.review.diff_file).encode(), projected)
+        self.assertNotIn(b"Linux/WSL2 runtime tool boundary", projected)
+
+    def test_linux_prompt_projection_rechecks_size_limit(self) -> None:
+        with self.assertRaisesRegex(ReviewError, "projected review prompt exceeds"):
+            providers._claude_review_prompt(
+                self.review,
+                b"x" * providers.MAX_REVIEW_PROMPT_BYTES,
+                linux=True,
+            )
 
     def test_model_chain_persists_each_completed_attempt(self) -> None:
         first = self.attempt("codex", "gpt-5.6-sol", "entitlement")
@@ -5066,6 +5244,75 @@ class ProviderPolicyTest(unittest.TestCase):
         resolve_claude.assert_not_called()
         run_command.assert_not_called()
 
+    def test_claude_malformed_result_finalizes_runtime_report(self) -> None:
+        executable = self.review.container_dir / "verified-claude"
+        executable.write_bytes(b"snapshot")
+        providers.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {
+                "phase": "runtime-launching",
+                "outer_sandbox": {"status": "profile-generated"},
+                "gpg_verifier_trust": "fixed-path-native-host-tool",
+            },
+        )
+        completed = Completed(
+            argv=("claude",),
+            returncode=0,
+            stdout=(
+                b'{"type":"result","subtype":"success","is_error":false,'
+                b'"result":"No findings."}'
+            ),
+            stderr=b"",
+        )
+
+        with (
+            mock.patch.object(providers, "_is_claude_linux_host", return_value=False),
+            mock.patch.object(
+                providers,
+                "_with_claude_review_tool_path",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_prepare_claude_tls_environment",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_connect_proxy",
+                return_value=contextlib.nullcontext(43210),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_review_sandbox_profile",
+                return_value="(version 1)",
+            ),
+            mock.patch.object(providers, "run", return_value=completed),
+        ):
+            attempt = providers._claude_attempt(
+                review=self.review,
+                model="claude-opus-4-8",
+                index=1,
+                env={"ANTHROPIC_API_KEY": "secret"},
+                executable=executable,
+            )
+
+        self.assertEqual(attempt.category, "other")
+        self.assertIsNone(attempt.final_text)
+        report = json.loads(
+            (self.review.container_dir / "claude-runtime.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(report["phase"], "attempt-complete")
+        self.assertEqual(report["attempt"]["category"], "other")
+        self.assertEqual(report["attempt"]["returncode"], 0)
+        self.assertIsNone(report["attempt"]["effective_model"])
+        self.assertEqual(
+            report["gpg_verifier_trust"],
+            "fixed-path-native-host-tool",
+        )
+
     def test_claude_review_sandbox_rejects_host_home(self) -> None:
         with self.assertRaisesRegex(ReviewError, "helper-owned HOME and TMPDIR"):
             providers._claude_review_sandbox_profile(
@@ -5487,10 +5734,15 @@ class ProviderPolicyTest(unittest.TestCase):
         if not source_dir.is_dir():
             self.skipTest("Linux system CA directory is unavailable")
 
-        prepared = providers._prepare_claude_tls_environment(
-            self.review,
-            {"SSL_CERT_DIR": str(source_dir)},
-        )
+        try:
+            prepared = providers._prepare_claude_tls_environment(
+                self.review,
+                {"SSL_CERT_DIR": str(source_dir)},
+            )
+        except ReviewError as error:
+            if not self.host_ca_safety_rejection(error, source="SSL_CERT_DIR:"):
+                raise
+            self.skipTest(f"host system CA directory is not immutable: {error}")
 
         prepared_dir = pathlib.Path(prepared["SSL_CERT_DIR"])
         hash_entries = list(prepared_dir.glob("????????.[0-9]*"))
@@ -5913,12 +6165,20 @@ class ProviderPolicyTest(unittest.TestCase):
         destination_dir = self.review.container_dir / "linux-ca-bundle"
         destination_dir.mkdir(mode=0o700)
 
-        with mock.patch.object(
-            providers,
-            "_claude_linux_private_directory",
-            return_value=destination_dir,
-        ):
-            bundle = providers._claude_linux_ca_bundle(self.review, {})
+        try:
+            with mock.patch.object(
+                providers,
+                "_claude_linux_private_directory",
+                return_value=destination_dir,
+            ):
+                bundle = providers._claude_linux_ca_bundle(self.review, {})
+        except ReviewError as error:
+            if not self.host_ca_safety_rejection(
+                error,
+                source="Linux default CA directory:",
+            ):
+                raise
+            self.skipTest(f"host system CA directory is not immutable: {error}")
 
         self.assertEqual(bundle, destination_dir / "bundle.pem")
         self.assertTrue(providers.CLAUDE_CERTIFICATE_BLOCK.search(bundle.read_bytes()))

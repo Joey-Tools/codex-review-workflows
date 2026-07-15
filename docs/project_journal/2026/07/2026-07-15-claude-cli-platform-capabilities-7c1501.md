@@ -519,6 +519,47 @@ superseded_by:
   suites passed 83 tests locally, and the complete suite passed all 512 tests
   in 67.901 seconds with nine environment-gated skips. `ruff`, `actionlint`,
   and `git diff --check` also passed before the CI-fix commit.
+- The next Ubuntu job passed the Python 3.10 import boundary and all 512 test
+  bodies except two host-integration assertions. GitHub's runner exposes at
+  least one default hashed CA symlink through a group- or world-writable path;
+  the helper correctly rejects that mutable trust source. The two tests now
+  skip only for the existing unsafe-owner or writable-path safety errors while
+  continuing to fail for every other `ReviewError`. Synthetic tests still
+  require safe CA symlink traversal and explicitly verify rejection of writable
+  parents and targets, so CI portability does not weaken the runtime policy.
+- Initial PR-readiness reviews produced two false positives and one actionable
+  Linux prompt-path finding. ASCII `@` remains rejected only in the prompt bytes
+  sent through Claude's file-mention parser; the frozen diff is separate Read
+  input, so decorators, email addresses, npm scopes, and review mentions in
+  changed source remain supported. A regression test now proves that boundary.
+  Malformed Claude JSON already returns `(None, None)`, records a non-successful
+  attempt, and advances `claude-runtime.json` to `attempt-complete`; a direct
+  attempt test now proves that retained-state behavior. The actionable issue
+  was that the default prompt named host-absolute workspace/diff paths and
+  command-oriented probes even though Linux mounts the workspace at
+  `/workspace` and exposes only `Read` under the cwd-relative `Read(./**)`
+  permission rule. Default prompts now use `.` and `.codex-review/review.diff`
+  with tool-aware bounded-read guidance. Linux also
+  projects complete host path tokens in custom prompts to sandbox-visible
+  `/workspace` absolutes, preserves canonical workspace descendants, rejects
+  escaping/non-canonical components and ambiguous sibling/file suffixes,
+  appends an explicit Read-only boundary, and rechecks the 64-KiB prompt limit
+  before authentication and again at the attempt boundary. Claude's Read tool receives
+  absolute `file_path` values while `Read(./**)` remains the separate
+  cwd-relative permission rule.
+- After the host-CA guard and PR-review regressions, the complete local suite
+  passed all 520 tests in 65.259 seconds with nine host-gated skips. `ruff`,
+  `compileall`, actionlint, and `git diff --check` passed as well; project-journal
+  validation is rerun after each evidence update.
+- An exact `5915bf84` archive was also validated on `codex-hoteng-srv-01`
+  (Ubuntu x86_64, Python 3.12.3): its local and remote SHA-256 matched
+  `9cb891e680a60acfdb38674d57f664806c0d5f5213460a3ba55401a3b4367c79`,
+  all 512 tests passed in 41.933 seconds with three expected skips, and
+  `compileall` plus actionlint 1.7.12 passed. Both real system-CA integration
+  tests passed there. Its `002c0b4f.0` two-hop chain ends at a root-owned 0644
+  certificate through root-owned 0755 directories, confirming that the GitHub
+  runner result is a host trust-layout difference rather than a Linux-wide
+  regression. All local and remote validation artifacts were removed.
 - Anthropic installation, signed-manifest, release-key fingerprint, and platform
   signature documentation: https://code.claude.com/docs/en/installation
 - Anthropic Seatbelt, `bubblewrap`, `socat`, WSL2, and WSL1 sandboxing

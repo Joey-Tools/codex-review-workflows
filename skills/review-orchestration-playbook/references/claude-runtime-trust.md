@@ -386,6 +386,21 @@ The command builder derives top-level roots from the actual mount set and fails
 closed if any lacks deny coverage; it also rejects a separate mount below
 `/workspace`, where the allow rule would otherwise cover it.
 
+Prompt path rendering is platform-specific even though the stored default
+prompt remains portable and workspace-relative. Claude's `Read.file_path` input
+uses an absolute path: macOS receives the helper-owned host workspace and diff
+paths, while Linux and WSL2 receive `/workspace` and
+`/workspace/.codex-review/review.diff`. This is distinct from the
+`Read(./**)` permission pattern, whose `./` is anchored to the sandbox cwd.
+Linux custom-prompt host paths are projected only when they appear as complete,
+delimiter-bounded path tokens. Canonical descendants below the workspace are
+preserved beneath `/workspace`; `.`/`..`/empty path components, a sibling
+suffix, a diff-file extension, or an embedded-prefix occurrence are ambiguous
+and fail closed before authentication instead of being rewritten by a broad
+substring replacement.
+The projected prompt gets an explicit Read-only tool contract and is rechecked
+against the 64-KiB limit both before authentication and at the attempt boundary.
+
 The frozen Git materializer rejects absolute symlink targets and any relative
 target whose component walk leaves the workspace, even if later `..`/name
 components would return to it. The pre-egress workspace scan still validates the
@@ -537,6 +552,8 @@ metadata that can act as a bearer secret, or unbounded probe output.
 - [Claude Code permissions](https://code.claude.com/docs/en/permissions):
   absolute double-slash path syntax and the `2.1.208` boundary for propagating
   `Read` rules to other file-reading surfaces.
+- [Claude Code hooks reference](https://code.claude.com/docs/en/hooks#pretooluse-input):
+  the built-in `Read` tool's absolute `file_path` input contract.
 - [Claude Code permission modes](https://code.claude.com/docs/en/permission-modes):
   `dontAsk` denies actions that are not pre-approved in non-interactive runs.
 - [Claude Code tools reference](https://code.claude.com/docs/en/tools-reference):

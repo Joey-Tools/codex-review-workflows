@@ -89,7 +89,11 @@ from .common import (
     write_json,
     write_text_atomic,
 )
-from .workspace import ReviewWorkspace, validate_external_workspace
+from .workspace import (
+    MAX_REVIEW_PROMPT_BYTES,
+    ReviewWorkspace,
+    validate_external_workspace,
+)
 
 
 CODEX_MODELS = ("gpt-5.6-sol", "gpt-5.5")
@@ -100,6 +104,17 @@ CLAUDE_MODELS = ("claude-opus-4-8", "claude-opus-4-7")
 COPILOT_MODELS = ("claude-opus-4.8", "claude-opus-4.7")
 CLAUDE_REASONING_EFFORT = "max"
 COPILOT_REASONING_EFFORT = "max"
+CLAUDE_LINUX_PROMPT_GUIDANCE = b"""
+Linux/WSL2 runtime tool boundary:
+- The sandbox working directory is `/workspace`.
+- Read the primary diff at `/workspace/.codex-review/review.diff` using bounded Read windows.
+- Only Read is available; do not request shell, Git, Grep, Glob, LSP, or other tools.
+- Every Read `file_path` must be absolute and resolve beneath `/workspace`.
+"""
+CLAUDE_PROMPT_PATH_LEFT_BOUNDARIES = frozenset(b" \t\r\n=:'\"`([{<")
+CLAUDE_PROMPT_PATH_RIGHT_BOUNDARIES = frozenset(b" \t\r\n,;:)'\"`]}>")
+CLAUDE_PROMPT_PATH_QUOTES = frozenset(b"'\"`")
+CLAUDE_PROMPT_DESCENDANT_LEFT_BOUNDARIES = frozenset(b"=:")
 COPILOT_PERMISSION_HELP_FRAGMENTS = (
     "tool availability is controlled via the --available-tools and --excluded-tools options",
     "these filters decide which tools the model can see",
@@ -4046,11 +4061,128 @@ def _claude_review_settings(*, linux: bool) -> str:
 
 
 def _require_claude_linux_prompt_without_file_mentions(prompt: bytes) -> None:
+    """Reject file mentions only in bytes sent through Claude's stdin parser.
+
+    The frozen diff remains a separate Read-tool input and is intentionally not
+    scanned here; literal ``@`` bytes in reviewed source never reach this parser.
+    """
     if b"@" in prompt:
         raise ReviewError(
             "Claude Linux/WSL2 review supports releases whose file-mention "
             "boundary predates 2.1.208; ASCII @ file mentions are not allowed"
         )
+
+
+def _replace_claude_prompt_host_path(
+    prompt: bytes,
+    *,
+    source: bytes,
+    target: bytes,
+    label: str,
+    allow_descendants: bool = False,
+) -> bytes:
+    chunks: list[bytes] = []
+    cursor = 0
+    while True:
+        occurrence = prompt.find(source, cursor)
+        if occurrence < 0:
+            chunks.append(prompt[cursor:])
+            return b"".join(chunks)
+        end = occurrence + len(source)
+        left_ok = occurrence == 0 or prompt[occurrence - 1] in (
+            CLAUDE_PROMPT_PATH_LEFT_BOUNDARIES
+        )
+        right_ok = end == len(prompt) or prompt[end] in (
+            CLAUDE_PROMPT_PATH_RIGHT_BOUNDARIES
+        )
+        if not right_ok and allow_descendants and prompt[end : end + 1] == b"/":
+            preceding = prompt[occurrence - 1] if occurrence else None
+            quote = (
+                bytes((preceding,))
+                if preceding in CLAUDE_PROMPT_PATH_QUOTES
+                else b""
+            )
+            if quote:
+                token_end = prompt.find(quote, end)
+                right_ok = token_end >= 0 and b"\\" not in prompt[end:token_end]
+            elif occurrence == 0 or preceding in (
+                CLAUDE_PROMPT_DESCENDANT_LEFT_BOUNDARIES
+            ):
+                token_end = end
+                while token_end < len(prompt):
+                    current = prompt[token_end]
+                    if current in CLAUDE_PROMPT_PATH_RIGHT_BOUNDARIES:
+                        break
+                    if current == ord(".") and (
+                        token_end + 1 == len(prompt)
+                        or prompt[token_end + 1]
+                        in CLAUDE_PROMPT_PATH_RIGHT_BOUNDARIES
+                    ):
+                        break
+                    token_end += 1
+                right_ok = True
+            else:
+                token_end = end
+                right_ok = False
+            if right_ok:
+                components = prompt[end:token_end].split(b"/")[1:]
+                right_ok = bool(components) and all(
+                    component not in {b"", b".", b".."}
+                    and all(byte >= 0x20 and byte != 0x7F for byte in component)
+                    for component in components
+                )
+        if not right_ok and prompt[end : end + 1] == b".":
+            right_ok = end + 1 == len(prompt) or prompt[end + 1] in (
+                CLAUDE_PROMPT_PATH_RIGHT_BOUNDARIES
+            )
+        if not left_ok or not right_ok:
+            raise ReviewError(
+                f"Claude review prompt contains an ambiguous host {label} path"
+            )
+        chunks.extend((prompt[cursor:occurrence], target))
+        cursor = end
+
+
+def _claude_review_prompt(
+    review: ReviewWorkspace,
+    prompt: bytes,
+    *,
+    linux: bool,
+) -> bytes:
+    workspace = str(review.workspace_root).encode("utf-8")
+    diff_file = str(review.diff_file).encode("utf-8")
+    target_workspace = b"/workspace" if linux else workspace
+    target_diff = (
+        b"/workspace/.codex-review/review.diff" if linux else diff_file
+    )
+    projected = prompt.replace(
+        b"- Workspace: .\n",
+        b"- Workspace: " + target_workspace + b"\n",
+    ).replace(
+        b"- Primary diff file: .codex-review/review.diff\n",
+        b"- Primary diff file: " + target_diff + b"\n",
+    )
+    if linux:
+        projected = _replace_claude_prompt_host_path(
+            projected,
+            source=diff_file,
+            target=target_diff,
+            label="diff-file",
+        )
+        projected = _replace_claude_prompt_host_path(
+            projected,
+            source=workspace,
+            target=target_workspace,
+            label="workspace",
+            allow_descendants=True,
+        )
+        projected = projected.rstrip() + b"\n" + CLAUDE_LINUX_PROMPT_GUIDANCE
+    if len(projected) > MAX_REVIEW_PROMPT_BYTES:
+        raise ReviewError(
+            "Claude projected review prompt exceeds the "
+            f"{MAX_REVIEW_PROMPT_BYTES}-byte limit"
+        )
+    return projected
 
 
 def _claude_attempt(
@@ -4071,7 +4203,11 @@ def _claude_attempt(
             "claude is not available in a validated executable path"
         )
     linux_host = _is_claude_linux_host()
-    prompt = review.prompt_file.read_bytes()
+    prompt = _claude_review_prompt(
+        review,
+        review.prompt_file.read_bytes(),
+        linux=linux_host,
+    )
     if linux_host:
         _require_claude_linux_prompt_without_file_mentions(prompt)
     env = _with_claude_review_tool_path(review, env)
@@ -4511,9 +4647,15 @@ def run_review(
         },
     )
     try:
-        if _is_claude_linux_host():
+        linux_host = _is_claude_linux_host()
+        prompt = _claude_review_prompt(
+            review,
+            review.prompt_file.read_bytes(),
+            linux=linux_host,
+        )
+        if linux_host:
             _require_claude_linux_prompt_without_file_mentions(
-                review.prompt_file.read_bytes()
+                prompt
             )
         claude_executable, claude_env = _resolve_validated_claude_executable(
             review=review,
