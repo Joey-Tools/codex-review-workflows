@@ -748,6 +748,22 @@ superseded_by:
   validation passed. An independent security audit confirmed that the bounded
   root exception cannot affect mount coverage or DrvFS provenance and reported
   no P0-P2 findings.
+- Repair commit `289d9cbb0504e0db3690ffb52f2238f46c868536` was
+  exported as a 1484800-byte Git archive with SHA-256
+  `df720c67c78893f5dca211445d2b9ca760e778674c8ddcb8fc32105e215b0407`;
+  the copied archive matched on `codex-hoteng-srv-01`. An initial extraction
+  below `/tmp` was intentionally discarded because the real trusted-runtime
+  path check rejected the world-writable `/tmp` ancestor before fixture-specific
+  assertions. Re-extracting the same archive below a private `/home/codex`
+  directory exercised the real trust precondition and passed all 567 tests in
+  38.981 seconds with three platform/opt-in skips. Remote `compileall`, both
+  workflow actionlint 1.7.12 checks, and strict GCC syntax checks for both C
+  helpers passed. The real root-owned `/usr/bin/gpg` host closure passed the
+  loader-page and dynamic-table checks, verified Anthropic's signed Claude Code
+  `2.1.196` `linux-x64` artifact at size `245373752` and SHA-256
+  `eb933c6dd5534db89b83ba09009d5c0932bd1395f7e3bb0f34ba37eec37bbade`,
+  and materialized the expected digest-keyed mode-`0500` snapshot. No credential
+  or review content was supplied.
 - Anthropic installation, signed-manifest, release-key fingerprint, and platform
   signature documentation: https://code.claude.com/docs/en/installation
 - Anthropic Seatbelt, `bubblewrap`, `socat`, WSL2, and WSL1 sandboxing
@@ -776,5 +792,7 @@ superseded_by:
   https://www.sourceware.org/glibc/manual/latest/html_node/Dynamic-Linker-Hardening.html
 - Linux kernel ELF mapping implementation:
   https://github.com/torvalds/linux/blob/master/fs/binfmt_elf.c
+- Linux kernel namespace-filesystem path implementation:
+  https://github.com/torvalds/linux/blob/master/fs/nsfs.c
 - System V ELF program-header and page-congruence specification:
   https://refspecs.linuxfoundation.org/elf/gabi4%2B/ch5.pheader.html
