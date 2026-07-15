@@ -1,0 +1,551 @@
+# Claude Runtime Trust And Platform Capabilities
+
+This document defines the trust and compatibility contract enforced by the
+Claude Code runtime used by `isolated_review`. A documented platform or version
+is supported only when every applicable gate below passes.
+
+## Contents
+
+- [Policy Summary](#policy-summary)
+- [Acceptance Sequence](#acceptance-sequence)
+- [Publisher Provenance](#publisher-provenance)
+- [Capability Probes](#capability-probes)
+- [Supported Platforms And Outer Sandbox](#supported-platforms-and-outer-sandbox)
+- [Credentials](#credentials)
+- [Runtime Report](#runtime-report)
+- [Failure Classification And Fallback](#failure-classification-and-fallback)
+- [Official Sources](#official-sources)
+
+## Policy Summary
+
+- Accept installed Claude Code release versions `>=2.1.187,<3.0.0` after all
+  provenance, platform, capability, credential, and isolation checks pass.
+- Do not pin the helper to `latest`, `stable`, or one current patch release. The
+  helper never upgrades Claude Code and reviews the installed release it finds.
+- Reject prerelease, development, unparseable, and future-major versions unless
+  this contract is deliberately revised.
+- Treat the fixed Anthropic release-signing key fingerprint and the signed
+  per-version manifest as publisher provenance. A version string, executable
+  bit, native file format, install path, or self-reported identity is not
+  publisher provenance.
+- After the signed manifest, size, and SHA-256 checks pass, materialize a
+  helper-owned private executable snapshot and stop executing the source path.
+  Only the snapshot may run the help probe, dependency discovery, credential-
+  bearing preparation, or final review.
+- Treat the fixed-path native GPG source as a separately validated host
+  dependency. It verifies the Anthropic signature but is not itself evidence of
+  Anthropic publisher provenance. Retain its stable descriptor, copy it into a
+  fresh private GPG home below an explicit helper-owned `0700` root, and run all
+  GPG operations only through the resulting mode-`0500` execution snapshot. On
+  WSL2, prove that root and its complete path chain are Linux-native before
+  creating the home and before every GPG call.
+- Run GPG and Linux security-sensitive host tools with explicit minimal
+  environments. Do not inherit loader, shell-startup, compiler, or toolchain
+  override variables from the caller.
+- Run every candidate executable probe before publisher verification with a
+  fixed credential-free environment, not a denylist-filtered copy of the caller
+  environment. Inherited proxy URLs, custom CA paths, authentication material,
+  review metadata, and unrelated caller variables must be absent.
+- Use layered enforcement. The helper-owned outer sandbox enforces host
+  filesystem, process, write, and network isolation. On Linux and WSL2, the
+  signed Claude runtime's permission engine additionally separates files that
+  the runtime must read for authentication from files its model-visible `Read`
+  tool may access. Neither layer substitutes for the other.
+
+## Acceptance Sequence
+
+Fail closed and preserve this ordering for every automatically discovered or
+explicitly configured Claude Code candidate:
+
+1. Resolve the candidate to a stable regular file and revalidate the file around
+   inspection so a symlink or replacement race cannot switch the executable.
+2. Require the execute bit and a native binary. On macOS, require an official
+   thin 64-bit arm64 or x64 Mach-O artifact and select the manifest entry from
+   that artifact architecture. An x64 artifact may run through Rosetta on Apple
+   Silicon, so macOS does not require exact host-CPU equality; the bounded
+   bootstrap probe must still execute successfully. On Linux and WSL2, require
+   an ELF matching the host architecture and a libc target that maps to the
+   host release artifact. Reject scripts, interpreter wrappers, fat Mach-O
+   binaries, and incompatible artifacts. These checks exclude incompatible
+   execution shapes; they do not establish provenance.
+3. Before provenance is known, run only the identity and version probe in a
+   bootstrap sandbox with no review workspace, authentication material, host
+   configuration, writes, or network. macOS uses a deny-by-default Seatbelt
+   profile. Linux and WSL2 use a synthetic-root `bubblewrap` sandbox containing
+   the candidate, an isolated home and temporary directory, and only narrowly
+   selected root-owned, non-group/world-writable system library roots. Do not
+   run `ldd` on the unverified candidate. Pass only fixed safe-mode controls,
+   helper-owned home/temp paths, a fixed system-only `PATH`, a deterministic C
+   locale, and `NO_COLOR`; do not inherit proxy, CA, authentication, review, or
+   other caller state. Bound time and both output streams.
+4. Parse exactly one release version and require `>=2.1.187,<3.0.0`.
+5. Fetch the manifest and detached signature for that exact version through the
+   parent helper. Resolve GPG only from the fixed host paths, validate the source
+   path, retain a stable source descriptor, and copy from that descriptor into a
+   fresh private execution snapshot below a helper-owned root. On WSL2, reject
+   Windows-backed provenance for the root, its resolved target, and every parent
+   before creation and recheck the same identities and mount provenance before
+   every GPG call. Use only the snapshot to decode the key, list its fingerprint,
+   and verify the detached signature. Strictly parse the signed manifest and
+   compare the installed binary's SHA-256 with the checksum for the detected
+   platform and architecture.
+6. Copy the verified source into a helper-owned, current-user-only snapshot,
+   rehash the copy against the signed size and SHA-256, publish it atomically as
+   a checksum-keyed `0500` executable, and revalidate it before reuse. The source
+   candidate is not executed after this point, and the verified snapshot is
+   captured once for the complete Claude model-attempt chain.
+7. On Linux and WSL2, only after the signed checksum passes, allow trusted
+   root-owned `ldd` to collect the exact dynamic loader and shared-library files
+   needed by the verified snapshot and final sandbox. Require each dependency to
+   be root-owned and non-group/world-writable before mounting it read-only.
+   Capture each dependency and parent-component identity, then revalidate those
+   exact identities while building the sandbox command and immediately before
+   final mounting.
+8. Run the bounded help capability probe against only the verified snapshot
+   inside the outer sandbox. Do not expose local credentials or tracked review
+   content until provenance and capabilities pass.
+9. Establish the platform-specific file-tool contract before credentials are
+   exposed. macOS retains `Read`, `Grep`, and `Glob`. Linux and WSL2 require
+   `dontAsk`, expose only `Read`, allow only `Read(./**)`, reject prompt file
+   mentions, and deny every non-workspace synthetic-root mount with absolute
+   double-slash rules. Command construction must fail closed when a mount lacks
+   coverage or appears below `/workspace`.
+10. Prepare the platform-specific private credential carrier. macOS may run its
+   fixed no-tools authentication warmup when the Keychain credential is not
+   fresh. Linux and WSL2 never warm or refresh credentials: require the host
+   credential to remain valid for the full bounded review window, or use an
+   explicitly supplied API key.
+11. Launch only the one captured verified snapshot for every real model attempt
+    in a fresh outer sandbox; never rediscover or fall back to the mutable source
+    installation between Opus attempts. Validate structured output, effective
+    model, and terminal status before accepting text as review evidence. The
+    requested effort remains explicit in every real command.
+
+## Publisher Provenance
+
+Use Anthropic's Claude Code release-signing primary-key fingerprint as the fixed
+trust anchor:
+
+```text
+31DD DE24 DDFA B679 F42D 7BD2 BAA9 29FF 1A7E CACE
+```
+
+Anthropic publishes the release key at the fixed key URL below. The helper
+vendors a copy, pins its full primary fingerprint, and uses only these release
+endpoints for a detected version `<version>`:
+
+```text
+https://downloads.claude.ai/keys/claude-code.asc
+https://downloads.claude.ai/claude-code-releases/<version>/manifest.json
+https://downloads.claude.ai/claude-code-releases/<version>/manifest.json.sig
+```
+
+The helper uses an isolated keyring containing only its bundled public key and
+requires that key's primary fingerprint to exactly match the pinned value on
+every use. A matching email, key ID, signature status message, or key downloaded
+over TLS is insufficient. Update the bundled key only through an explicit policy
+change.
+Verify the detached signature before trusting any manifest field. Parse the
+bounded JSON with duplicate-key rejection, select one exact platform entry, and
+compare the local binary's size and SHA-256 with that signed entry.
+
+The signature verifier is resolved only from fixed native paths:
+
+```text
+/usr/bin/gpg{,2}
+/usr/local/bin/gpg{,2}
+/opt/homebrew/bin/gpg{,2}
+```
+
+The resolved source must be a native executable regular file owned by root or
+the current user and must not itself be group- or world-writable. Its file
+identity and complete parent path identity must remain stable across inspection,
+and world-writable parents are rejected. Group-writable parent directories are
+deliberately permitted for current-user Homebrew layouts; this is an explicit
+same-user host-tool trust boundary, not a claim that the GPG program came from
+Anthropic.
+
+The helper does not execute that replaceable source path. It opens the validated
+source with no-follow semantics, keeps the stable descriptor, and copies from
+that descriptor into the fresh current-user `0700` GPG home created directly
+below an explicit helper-owned private root inside the isolated review state.
+The root is not selected from ambient `TMPDIR`, `TMP`, or `TEMP`. Its requested
+path, resolved path, and full parent chains must remain identity-stable. WSL2
+additionally reads bounded mountinfo once per stability check and rejects any
+Windows-backed filesystem covering any member of that chain. The copy is
+bounded and rehashed, published as a single-link mode-`0500` execution snapshot,
+and revalidated against the stable source descriptor. Key dearmoring,
+fingerprint listing, and detached-signature verification all run through this
+one snapshot. The selected fixed source path, not the ephemeral snapshot, is
+recorded as `gpg_verifier`, alongside `gpg_verifier_trust:
+fixed-path-native-host-tool` and separately from `publisher_provenance:
+anthropic-signed-manifest`.
+
+Each GPG call receives only its isolated home, fixed locale, and fixed system
+path. Inherited `LD_*`, `DYLD_*`, shell-startup, compiler, and toolchain override
+variables are absent. Linux `ldd`, `bubblewrap`, `socat`, `rg`, compiler probes,
+and launcher compilation use the same fixed-minimal-environment principle, with
+only the host-tool home, locale, path, and temporary directory provided.
+
+Anthropic documents detached manifest signatures for releases from `2.1.89`
+onward, which covers the complete supported version range in this contract.
+One process-level absolute deadline covers DNS resolution, connection and TLS
+setup, response headers, body reads, and response teardown for each bounded
+manifest/signature fetch; per-socket timeouts are not the total-time boundary.
+The synchronous fetch fails closed before egress if that deadline cannot be
+installed without replacing an existing process timer or if `SIGALRM` is
+blocked in the calling thread. Handler and timer cleanup ownership is recorded
+before either process-level mutation. The previous handler is restored only
+after the helper has disarmed the timer or independently confirmed that it is
+clear; an indeterminate armed timer retains the guard handler and fails closed.
+Manifest download, signature, parse, or file-race failures must never be
+reinterpreted as model entitlement or authentication failures.
+
+The current helper does not use macOS code signing or notarization as an
+acceptance gate. Those checks may be added later as optional defense in depth,
+but they must never replace or weaken the signed-manifest and checksum gate. The
+signed manifest is the publisher-provenance mechanism on every supported
+platform.
+
+After the source binary matches the signed artifact, the helper copies it with
+no-follow, stable-descriptor checks into a current-user-owned `0700` snapshot
+directory. The digest-keyed snapshot is rehashed during the copy, published
+atomically with exact mode `0500`, and fully revalidated before reuse. This is
+the executable-stability boundary: the original installation path may be
+managed or replaced by a package manager, but it cannot be switched between
+provenance verification and the capability/final launches because those stages
+execute only the private snapshot.
+
+## Capability Probes
+
+Compatibility is capability-based within the accepted version range. Do not
+match the complete `--help` output or pin whitespace and unrelated wording from
+one release.
+
+The one leading `--safe-mode` declaration token is syntax, not a semantic
+claim. After removing it, any additional sentence that refers to safe mode
+itself fails closed unless the complete normalized sentence matches a bounded
+positive template: continued enforcement, a direct required action, no effect
+on the explicitly preserved auth/model/tool/permission or managed-policy
+subjects, or a clear prohibition on disabling or bypassing safe mode. Literal
+space-separated, hyphenated, and option-token names share one rule. Once such a
+self-reference appears, subject/object anaphora remains bound to it through the
+rest of the option block and must also match a positive template. Concrete
+customization, policy, runtime, and environment claims are still validated
+separately. This default-deny self-reference rule avoids treating an
+ever-growing list of negative auxiliaries as a semantic parser.
+
+Require every public option used by the macOS authentication warmup or final
+review command to appear exactly once in the bounded `--help` output from the
+verified executable snapshot. This includes print mode, model and effort
+selection, structured output, session non-persistence, safe mode, permission
+mode, settings and MCP isolation, browser and slash-command disablement, and
+the tool boundary. The permission-mode help must advertise `dontAsk` before a
+Linux/WSL2 credential can be exposed. macOS retains `Read`, `Grep`, and `Glob`;
+Linux and WSL2 expose only `Read`. Do not exact-match the complete help text,
+whitespace, descriptions, or unrelated options. Although upstream notes that
+general help can omit some supported flags, an omitted public option or
+required mode that this helper actually invokes is treated as incompatible and
+fails closed.
+
+For safe mode, require one unambiguous option and positive semantics that disable
+local customizations, including instructions, skills, plugins, hooks, MCP
+servers, custom commands and agents, and other user/project configuration, while
+preserving authentication, model selection, built-in tools, and permission
+handling. Reject negated, duplicated, internally contradictory, or weakened
+semantics. Accept harmless wording, wrapping, punctuation, and ordering changes
+when those required and forbidden meanings remain unambiguous.
+
+Treat each required meaning as a bounded positive claim rather than a bag of
+substrings. Required terms use token or phrase boundaries; unrelated sentences
+may use harmless negation, but a relevant sentence fails closed on negation,
+exceptions, conditions, contrasts, modality, temporary/default qualifiers, or
+the opposite state. Require exactly one complete
+`CLAUDE_CODE_SAFE_MODE=1` assignment, so longer values, prefixed names,
+duplicates, and conflicting assignments cannot satisfy the probe.
+
+The helper does not claim a credential-free fixed-input behavioral canary. The
+preflight capability evidence is the accepted release range, the required
+public options, and the parsed safe-mode semantics. Behavioral acceptance comes
+from the final real review invocation plus strict structured-output,
+effective-model, error-state, and terminal-artifact validation.
+
+The outer sandbox remains authoritative for host filesystem, process, write,
+and network isolation after these probes pass. It deliberately makes the
+platform credential carrier readable to the trusted Claude process, so the
+Linux/WSL2 permission policy is an additional publisher-runtime boundary for
+model-invoked file reads. A future CLI may preserve every documented flag while
+changing internal behavior; it must still satisfy both layers before receiving
+credentials or review data.
+
+## Supported Platforms And Outer Sandbox
+
+The Claude lane supports only these helper enforcement shapes:
+
+- **macOS:** an official thin arm64 or x64 Mach-O Claude Code artifact inside a
+  helper-generated Seatbelt profile, currently launched through
+  `/usr/bin/sandbox-exec`. The manifest platform key follows the artifact
+  architecture; an x64 artifact may run through Rosetta on Apple Silicon.
+- **Linux:** a native ELF Claude Code binary inside a helper-generated
+  `bubblewrap` sandbox, with `socat` available for the helper-controlled network
+  relay.
+- **WSL2:** the Linux ELF and `bubblewrap`/`socat` path, after positively
+  identifying WSL2 from a WSL2 kernel marker, `/run/WSL`, or a validated
+  `WSL_INTEROP` endpoint. Environment strings and the generic binfmt marker are
+  only weak signals and cannot authorize WSL2 support by themselves. The
+  runtime-marker alternatives preserve detection when a WSL2 `customKernel`
+  supplies a user-chosen release string.
+
+Native executable-shape checks reject interpreter wrappers and incompatible
+artifacts; they do not prove publisher identity. Linux reads ELF metadata from a
+no-follow descriptor with exact-size reads and compares descriptor metadata
+before and after parsing. A stable malformed or truncated artifact is invalid,
+while an in-range short read, descriptor I/O error, or metadata change is
+inconclusive and cannot authorize fallback. Publisher identity is established
+later and separately by the Anthropic-signed manifest plus exact artifact size
+and SHA-256.
+
+WSL1 and native Windows are unsupported because this helper contract does not
+provide an enforceable outer sandbox for them. Do not silently run Claude Code
+without the outer sandbox. Missing Seatbelt, `bubblewrap`, `socat`, required
+namespace support, or another enforcement prerequisite is runtime unavailability
+for an automatically discovered candidate and a configuration error for an
+explicit override.
+
+WSL2 must keep the discovered Claude executable, local-login credential source,
+frozen review/state container, and helper runtime state on the WSL Linux
+filesystem. Runtime state includes the provenance cache, verified executable
+snapshot, the dedicated private GPG temporary root, isolated home/temp/config
+directories, proxy socket, compiler output, and mounted runtime dependencies.
+The helper first rejects lexical or resolved literal paths such as `/mnt/c`,
+then strictly parses bounded `/proc/self/mountinfo` and checks the deepest mount
+covering each path. Known DrvFS or Windows-drive provenance in the filesystem
+type, source, or mount options is blocked. Only WSL's local ext4 storage with a
+`/dev/sdX` source and backing-free tmpfs are currently treated as proven by this
+inspection. Overlay, FUSE, 9p, virtiofs, loop/device-mapper/network-backed, and
+unknown filesystems are inspection-inconclusive: mountinfo path strings cannot
+prove their backing dentries, so the helper does not recursively guess at
+overlay layers. GPG root validation batches its complete path chain against one
+mountinfo snapshot per check, including ancestors hidden by a Linux submount.
+This also rejects a custom automount root, bind mount, or alias that hides the
+literal `/mnt/<drive>` name. Missing, unreadable, malformed, oversized,
+non-canonical, or non-covering mount information fails closed instead of
+assuming Linux ownership and mode semantics. This proof trusts the WSL kernel's
+`/proc/self/mountinfo` report and excludes a malicious WSL root from the threat
+model; a future broader storage policy needs device-identity or backing-object
+proof, not a larger filesystem-name allowlist.
+
+Linux/WSL2 runtime directories use create-or-validate semantics. The helper may
+create a missing directory with its required mode, but an existing directory
+must already be a real current-user-owned path, exact `0700` where private or
+otherwise non-group/world-writable, and stable across no-follow path/descriptor
+inspection. It never follows a symlink or repairs a pre-existing path with
+`chmod`.
+
+After provenance, each dynamic loader/library path and every parent component
+is captured with its owner, mode, device, inode, type, size, and timestamps.
+Those identities are revalidated when the sandbox command is assembled and
+again before mounting, so a root-library path cannot be swapped after `ldd`.
+The fixed no-shell proxy/reaper launcher also blocks `SIGTERM`, `SIGINT`,
+`SIGHUP`, and `SIGQUIT` across each fork/process-group handoff, checks pending
+signals before publishing child state, restores default child handlers, forwards
+cancellation to the proxy and workload groups, and terminates/reaps leftovers.
+
+The final sandbox exposes only the frozen review workspace, helper-owned control
+files, selected runtime files, validated certificate copies, the restricted
+review-tool path, and the platform credential carrier. Network traffic is routed
+through a helper-owned proxy with the same explicit Anthropic-target policy used
+by the review lane. Claude's built-in sandbox is not relied upon for the outer
+host boundary. On Linux and WSL2, however, the signed Claude permission engine
+is part of the trusted computing base for the narrower distinction between
+runtime authentication reads and model-invoked file reads.
+
+Custom TLS sources are copied rather than mounted from their original paths.
+`SSL_CERT_FILE` is read through a stable no-follow regular-file descriptor.
+`SSL_CERT_DIR` is enumerated through a fixed directory descriptor with bounded
+entry counts and supports normal OpenSSL hash links, including the multi-hop
+relative/absolute layout used by Ubuntu. Link depth and path components are
+bounded; every traversed link and directory plus the final no-follow regular
+file is owner/mode/identity checked and revalidated around a bounded read. Only
+PEM certificates are materialized, never private-key material. The helper keeps
+the original hash basename but writes a private `0600` regular file instead of
+recreating a symlink. Linux and WSL2 coalesce the validated certificates into a
+private bundle whose complete resolved path identity is captured and rechecked
+while the read-only `bubblewrap` command is serialized. Like the existing
+runtime-library mounts, this fixes the selected resolved source but does not
+claim an FD-bound, atomic path-to-mount handoff against another same-euid
+process.
+
+Linux and WSL2 fix cwd at `/workspace`, use `dontAsk`, expose only `Read`, and
+pre-approve only `Read(./**)`. Every other top-level path mounted into the
+synthetic root is denied both at the root and recursively with absolute
+double-slash rules, for example `Read(//config)`, `Read(//config/**)`,
+`Read(//proc)`, and `Read(//proc/**)`. A single leading slash would be relative
+to the settings source rather than the filesystem root and is not accepted.
+The command builder derives top-level roots from the actual mount set and fails
+closed if any lacks deny coverage; it also rejects a separate mount below
+`/workspace`, where the allow rule would otherwise cover it.
+
+The frozen Git materializer rejects absolute symlink targets and any relative
+target whose component walk leaves the workspace, even if later `..`/name
+components would return to it. The pre-egress workspace scan still validates the
+completed link graph. Linux and WSL2 additionally repeat a bounded no-follow
+link/identity scan immediately before every isolation-probe or final sandbox
+command is serialized. Stable relative links whose complete chains remain
+inside `/workspace` continue to work; `/config`, `/proc` magic links, absolute
+links, transient or final escapes, loops, link races, and inspection I/O failures
+all fail closed before the authenticated workload starts. As with the final
+path-to-mount handoff, this does not claim protection from a malicious same-euid
+host process after the last identity check.
+
+The supported range continues to start at `2.1.187` instead of forcing an
+upgrade to `2.1.208`. Anthropic documents reliable propagation of `Read` rules
+to `Grep`, `Glob`, LSP, and prompt file mentions only from `2.1.208`. Therefore
+Linux and WSL2 do not expose those search tools and reject ASCII `@` file-mention
+syntax in the complete review prompt before launch. The frozen diff remains
+available through the workspace-only `Read` tool. macOS keeps its existing
+`Read`/`Grep`/`Glob` contract because Seatbelt does not expose the Linux
+credential shape.
+
+## Credentials
+
+An explicitly supplied `ANTHROPIC_API_KEY` remains an optional override and does
+not require local-login credential access. Never pass Claude and Copilot
+credentials into the same child environment.
+
+On macOS, retain the capability-authenticated, one-shot Keychain broker. The
+parent may read the current Claude Code item once with Apple's trusted client;
+the final Claude process cannot execute `/usr/bin/security`, access Keychain
+services directly, update the host item, or refresh OAuth credentials during the
+review.
+
+On Linux and WSL2, validate the documented Claude Code credential file as a
+non-symlink regular file owned by the current user with exact mode `0600`. Copy
+it into a helper-owned `0700` directory as a private `0600` file and expose only
+that staged copy's config directory through a read-only mount at `/config`; the
+original host credential is never mounted. Parse the OAuth expiry and require
+the host credential to remain valid for the complete bounded review window plus
+its safety margin before launch. Linux and WSL2 perform no warmup, refresh, or
+host-credential write; a missing or insufficiently fresh credential is
+unavailable unless an explicit `ANTHROPIC_API_KEY` is supplied. Reject unsafe
+ownership, mode, symlink, path-race, size, or JSON structure, and never persist
+or print credential contents in review state. The source descriptor must close
+successfully before a validated payload is returned; close failure zeroes the
+in-memory copy, preserves any earlier validation/control-flow error, and fails
+closed without retrying the same numeric descriptor.
+
+Credential staging owns cleanup from the first successful create through the
+final close. Scrub, close, unlink, and directory removal are attempted in a
+bounded order even when the body exits through cancellation or generator
+closure. A cleanup-time `KeyboardInterrupt`, `SystemExit`, or other
+`BaseException` control-flow signal is never converted into an ordinary
+credential error; an already-active body exception remains primary and receives
+the cleanup diagnostic. Python 3.10 records that diagnostic in the preserved
+exception chain through a dedicated diagnostic cause because
+`BaseException.add_note()` is available only from Python 3.11.
+
+A read-only mount prevents mutation but does not hide a secret from the Claude
+process that must authenticate with it. The Linux/WSL2 inner permission policy
+therefore denies `/config` from model-visible `Read`. In API-key mode, it also
+denies `/proc` and `/dev` so `Read(//proc/self/environ)` and file-descriptor
+aliases cannot expose `ANTHROPIC_API_KEY`. This boundary trusts the
+publisher-verified Claude runtime to enforce its own tool permissions against
+prompt injection; `bubblewrap` cannot distinguish two reads made by the same
+process. Stronger isolation would require an external authentication proxy that
+injects credentials without ever placing the real secret in the Claude process.
+
+## Runtime Report
+
+The helper writes `claude-runtime.json` so retained state distinguishes the
+candidate that was discovered from the executable that was actually accepted.
+Its trust fields include `source_executable`, `verified_executable` (the private
+snapshot reused by the complete model chain), release version/platform,
+manifest and signature URLs, signed checksum, publisher fingerprint, and the
+separately trusted fixed source path in `gpg_verifier`. The ephemeral private
+GPG execution snapshot is deliberately not a durable trust identity; the report
+labels the source as `gpg_verifier_trust: fixed-path-native-host-tool` and keeps
+publisher provenance separate.
+
+The phase and nested status fields advance only as their enforcement point is
+reached:
+
+1. `publisher-and-capabilities-verified`: the signed release, private snapshot,
+   and safe-mode/help capability contract passed. `outer_sandbox.status` remains
+   `pending-runtime-launch` and `authentication.status` remains `pending`.
+2. `authentication-preflight-complete`: API-key configuration or local-login
+   freshness passed; authentication status becomes `configured` or
+   `freshness-verified`.
+3. Platform preparation: Linux/WSL2 reports `runtime-ready` only after its real
+   isolation probe, with `outer_sandbox.status: isolation-probe-verified` and
+   `authentication.status: sandbox-auth-staged`. macOS reports
+   `runtime-launching` with `outer_sandbox.status: profile-generated` only when
+   the final Seatbelt launch is prepared.
+4. `attempt-inconclusive`: a bounded supervisor timeout, output overflow, drain
+   failure, or retained descendant interrupted an attempted launch. The report
+   records `attempt.category: inconclusive` and a stable `failure_class` rather
+   than leaving an earlier readiness phase as the apparent terminal result.
+5. `attempt-complete`: the report records the final sandbox status, attempt
+   category and return code, and requested/effective model and effort.
+
+These records are evidence about which gates ran; an early phase must never be
+described as an enforced final launch.
+
+## Failure Classification And Fallback
+
+| Condition | Terminal classification | Copilot fallback |
+| --- | --- | --- |
+| No automatic candidate, supported platform unavailable, accepted-range candidate lacks a required non-security capability, or usable local/API authentication is absent | `runtime-unavailable` or `auth-unavailable` | Only for explicit double/triple-review consent |
+| Explicit override has the wrong version, platform, binary shape, or capability contract | `blocked` configuration error | No |
+| Wrong publisher fingerprint, invalid signature, checksum mismatch, contradictory safe-mode semantics, unsafe credential metadata, or an isolation-boundary mismatch | `blocked` security error | No |
+| Manifest/probe timeout, output overflow, I/O failure, file race, transient network failure, capacity error, or missing trustworthy terminal artifact | `inconclusive` | No |
+| Explicit model entitlement or organization-policy denial after runtime verification | Existing same-lane model/backend fallback policy | Only as already authorized by the lane contract |
+
+An unsupported future patch inside the version range may be treated as automatic
+runtime unavailability only when it cleanly lacks a required capability. Evidence
+of tampering, contradictory claims, or boundary failure is blocked, not converted
+into availability fallback. Capacity, rate limits, timeouts, and 5xx errors never
+authorize a model or backend switch. On WSL2, a path positively covered by a
+Windows-backed mount or a stable workspace-link escape is a blocked
+isolation-boundary mismatch. Mount information that cannot be bounded, strictly
+parsed, matched to a runtime path, or used to prove local native backing is an
+inconclusive inspection failure; so is a workspace-link identity race or I/O
+failure. Neither case is ordinary runtime unavailability, so neither can
+authorize Copilot fallback.
+
+Persist the detected runtime version, platform and architecture, source and
+verified-snapshot paths, manifest and signature URLs, signing-key fingerprint,
+selected GPG verifier, verified checksum, required-option and safe-mode results,
+outer-sandbox implementation and status, credential mode and status,
+requested/effective model and effort, and terminal category.
+Never persist the manifest signing private material, credential contents, token
+metadata that can act as a bearer secret, or unbounded probe output.
+
+## Official Sources
+
+- [Claude Code advanced setup](https://code.claude.com/docs/en/installation):
+  supported native platforms, version management, signed per-version manifests,
+  the fixed release-key fingerprint, checksums, and upstream platform-signature
+  information. Platform signatures are not a current helper acceptance gate.
+- [Claude Code sandboxing](https://code.claude.com/docs/en/sandboxing): Seatbelt
+  on macOS, `bubblewrap` plus `socat` on Linux and WSL2, and the WSL1 limitation.
+- [Claude Code authentication](https://code.claude.com/docs/en/authentication):
+  macOS Keychain storage and the Linux `0600` credential file.
+- [Claude Code CLI reference](https://code.claude.com/docs/en/cli-usage): the
+  supported command/flag surface and the upstream warning that general help may
+  omit flags; the helper still requires every public flag it invokes to be
+  declared by the installed release.
+- [Claude Code permissions](https://code.claude.com/docs/en/permissions):
+  absolute double-slash path syntax and the `2.1.208` boundary for propagating
+  `Read` rules to other file-reading surfaces.
+- [Claude Code permission modes](https://code.claude.com/docs/en/permission-modes):
+  `dontAsk` denies actions that are not pre-approved in non-interactive runs.
+- [Claude Code tools reference](https://code.claude.com/docs/en/tools-reference):
+  built-in tool names and file-access behavior.
+- [Linux OverlayFS documentation](https://docs.kernel.org/filesystems/overlayfs.html):
+  upper/lower/data-only layers, nesting, and mount-option forms that make a
+  mountinfo path string insufficient as backing-object identity proof.
+- [Linux proc mountinfo documentation](https://docs.kernel.org/filesystems/proc.html):
+  kernel-provided mount identifiers, roots, mount points, filesystem types,
+  sources, and per-superblock options.
+- [Microsoft WSL disk-space documentation](https://learn.microsoft.com/en-us/windows/wsl/disk-space):
+  WSL2 distro VHD storage and its default ext4 filesystem.

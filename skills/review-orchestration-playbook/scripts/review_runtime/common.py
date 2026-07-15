@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import io
 import json
 import os
 import pathlib
@@ -851,7 +850,11 @@ def resolve_reviewer_executable(
         ),
         "claude": (
             "CODEX_REVIEW_CLAUDE_PATH",
-            ("/opt/homebrew/bin/claude", "/usr/local/bin/claude"),
+            (
+                "/opt/homebrew/bin/claude",
+                "/usr/local/bin/claude",
+                "/usr/bin/claude",
+            ),
             ("claude code",),
             True,
         ),

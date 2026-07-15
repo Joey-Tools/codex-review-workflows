@@ -12,7 +12,7 @@ REPO_ROOT = SKILL_ROOT.parents[1]
 SCRIPTS = SKILL_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from review_runtime import providers  # noqa: E402
+from review_runtime import claude_linux, providers  # noqa: E402
 
 
 class RepositoryContractTest(unittest.TestCase):
@@ -68,22 +68,83 @@ class RepositoryContractTest(unittest.TestCase):
             helper_contract,
         )
         self.assertIn(
-            "noninteractive process cannot approve any unmatched access",
+            "helper-owned outer sandbox",
             helper_contract,
         )
         self.assertNotIn("safe mode with `dontAsk` permissions", helper_contract)
-        self.assertIn("complete SHA-256 digests", helper_contract)
+        self.assertIn("per-version signed manifest", helper_contract)
+        self.assertIn("manifest checksum", helper_contract)
         self.assertIn("downloads.claude.ai", helper_contract)
-        self.assertIn("separate default-deny `sandbox-exec` profile", helper_contract)
-        self.assertIn("ordinary macOS OAuth/keychain login", helper_contract)
-        self.assertIn("localhost CONNECT proxy", helper_contract)
+        self.assertIn("deny-by-default Seatbelt profile", helper_contract)
+        self.assertIn("current-account Keychain item", helper_contract)
+        self.assertIn("helper-controlled proxy", helper_contract)
+        self.assertIn(">=2.1.187,<3.0.0", helper_contract)
+        self.assertIn("Linux and WSL2", helper_contract)
         self.assertNotIn("requires `ANTHROPIC_API_KEY`", skill)
+
+    def test_claude_linux_file_tools_are_workspace_only_across_supported_versions(
+        self,
+    ) -> None:
+        self.assertEqual(claude_linux.CLAUDE_LINUX_REVIEW_VISIBLE_TOOLS, "Read")
+        self.assertEqual(
+            claude_linux.CLAUDE_LINUX_REVIEW_ALLOWED_TOOLS,
+            "Read(./**)",
+        )
+        self.assertEqual(
+            claude_linux.CLAUDE_LINUX_REVIEW_PERMISSION_MODE,
+            "dontAsk",
+        )
+        cli_denies = set(
+            claude_linux.CLAUDE_LINUX_REVIEW_DISALLOWED_TOOLS.split(",")
+        )
+        self.assertTrue({"Grep", "Glob"}.issubset(cli_denies))
+        self.assertIn(
+            "Read(//config/**)",
+            claude_linux.CLAUDE_LINUX_FILE_TOOL_DENY_RULES,
+        )
+        self.assertIn(
+            "Read(//proc/**)",
+            claude_linux.CLAUDE_LINUX_FILE_TOOL_DENY_RULES,
+        )
+        self.assertNotIn(
+            "Read(/config/**)",
+            claude_linux.CLAUDE_LINUX_FILE_TOOL_DENY_RULES,
+        )
 
     def test_ci_targets_only_the_canonical_runtime_and_tests(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self.assertIn("review-orchestration-playbook/tests", workflow)
         self.assertNotIn("external-review-playbook", workflow)
         self.assertNotIn("copilot-review-playbook", workflow)
+
+    def test_ci_preserves_the_required_test_status_context(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+
+        self.assertIn("\n  platform_tests:\n", workflow)
+        self.assertIn("name: platform-tests (${{ matrix.os }})", workflow)
+        self.assertIn("\n  test:\n", workflow)
+        self.assertIn("\n    name: test\n", workflow)
+        self.assertIn("if: ${{ always() }}", workflow)
+        self.assertIn("needs: platform_tests", workflow)
+        self.assertIn(
+            "PLATFORM_TESTS_RESULT: ${{ needs.platform_tests.result }}",
+            workflow,
+        )
+        self.assertIn(
+            'test "$PLATFORM_TESTS_RESULT" = "success"',
+            workflow,
+        )
+
+    def test_helper_declares_and_tests_its_minimum_python_runtime(self) -> None:
+        entrypoint = (SCRIPTS / "isolated_review").read_text(encoding="utf-8")
+        workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+
+        guard = "if sys.version_info < (3, 10):"
+        self.assertIn(guard, entrypoint)
+        self.assertLess(entrypoint.index(guard), entrypoint.index("from review_runtime"))
+        self.assertIn('python-version: "3.10"', workflow)
+        self.assertIn("requires Python 3.10 or later", readme)
 
     def test_full_pr_readiness_retains_both_local_codex_gates(self) -> None:
         readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
