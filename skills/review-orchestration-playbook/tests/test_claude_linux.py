@@ -646,6 +646,77 @@ class WslWindowsFilesystemProvenanceTest(unittest.TestCase):
             mountinfo_text=mountinfo,
         )
 
+    def test_nsfs_namespace_root_coexists_with_native_and_wsl_mounts(self) -> None:
+        nsfs = (
+            "71 24 0:65 net:[4026531840] /run/netns/review rw,relatime - "
+            "nsfs nsfs rw"
+        )
+        child_nsfs = (
+            "72 24 0:66 time_for_children:[4026531834] "
+            "/run/time-ns/review rw,relatime - nsfs nsfs rw"
+        )
+        mountinfo = "\n".join((self._root_mount(), nsfs, child_nsfs))
+        native = claude_linux.LinuxHost(
+            claude_linux.LinuxHostKind.LINUX,
+            "x64",
+            "6.8.0-generic",
+        )
+
+        entries = claude_linux._parse_mountinfo(mountinfo)
+
+        self.assertEqual(entries[1].root, "net:[4026531840]")
+        self.assertEqual(entries[2].root, "time_for_children:[4026531834]")
+        for host in (native, self.wsl2):
+            with self.subTest(host=host.kind.value):
+                claude_linux.reject_wsl_windows_path(
+                    pathlib.Path("/home/reviewer/project"),
+                    host,
+                    mountinfo_text=mountinfo,
+                )
+
+    def test_non_nsfs_opaque_root_fails_closed(self) -> None:
+        opaque_ext4 = (
+            "71 24 0:65 net:[4026531840] /unrelated rw,relatime - "
+            "ext4 /dev/sdb rw"
+        )
+
+        with self.assertRaisesRegex(
+            claude_linux.LinuxRuntimeInspectionInconclusive,
+            "non-canonical root",
+        ):
+            claude_linux.reject_wsl_windows_path(
+                pathlib.Path("/home/reviewer/project"),
+                self.wsl2,
+                mountinfo_text="\n".join((self._root_mount(), opaque_ext4)),
+            )
+
+    def test_malformed_nsfs_namespace_roots_fail_closed(self) -> None:
+        malformed_roots = (
+            "net:[]",
+            "net:[0123]",
+            "net:[18446744073709551616]",
+            "Net:[4026531840]",
+            "net/child:[4026531840]",
+        )
+
+        for root in malformed_roots:
+            mount = (
+                f"71 24 0:65 {root} /run/netns/review rw,relatime - "
+                "nsfs nsfs rw"
+            )
+            with (
+                self.subTest(root=root),
+                self.assertRaisesRegex(
+                    claude_linux.LinuxRuntimeInspectionInconclusive,
+                    "non-canonical root",
+                ),
+            ):
+                claude_linux.reject_wsl_windows_path(
+                    pathlib.Path("/home/reviewer/project"),
+                    self.wsl2,
+                    mountinfo_text="\n".join((self._root_mount(), mount)),
+                )
+
     def test_same_depth_mounts_preserve_windows_before_unknown_tristate(self) -> None:
         windows = self._mount(
             "/review-state",

@@ -725,6 +725,29 @@ superseded_by:
   closure, digest-keyed snapshot, and safe-mode help smoke also passed again
   without credential or review data. Final independent security and
   documentation/contract audits reported no remaining P0-P2 findings.
+- Exact commit `2ca3bb3` was exported as a 1484800-byte Git archive with
+  SHA-256 `172d4d37121562fcaf305c5eb1295595f70fbe5409a93693ef197a7d0fb6f79e`.
+  Its first authoritative run on `codex-hoteng-srv-01` exposed a real Linux
+  compatibility bug before GPG verification: eight unrelated `nsfs` mounts had
+  roots such as `mnt:[4026532676]` and `net:[4026532575]`, which the parser
+  incorrectly required to be absolute paths. This caused 37 errors and 14
+  failures through the common mount guard; that run is not counted as passing
+  evidence. Linux `nsfs_show_path` intentionally emits a namespace name plus
+  bracketed inode. The repair accepts that strict bounded grammar only for an
+  exact `nsfs` record, checks the inode against unsigned 64-bit range, and keeps
+  absolute canonical requirements for every ordinary filesystem root and every
+  mount point. Non-`nsfs` opaque roots and malformed namespace handles still
+  fail closed; the root field remains unused by path coverage and Windows-
+  provenance decisions.
+- After the `nsfs` repair, the four focused capability/provenance/Linux/provider
+  modules passed all 423 tests with nine environment-gated skips. The complete
+  local suite passed all 567 tests in 70.498 seconds with nine skips. Full
+  runtime/test `ruff`, `compileall`, Python 3.10 grammar parsing across 20 files,
+  both workflow actionlint checks, strict Clang syntax checks for both C helpers,
+  the isolated PyYAML skill validator, `git diff --check`, and project-journal
+  validation passed. An independent security audit confirmed that the bounded
+  root exception cannot affect mount coverage or DrvFS provenance and reported
+  no P0-P2 findings.
 - Anthropic installation, signed-manifest, release-key fingerprint, and platform
   signature documentation: https://code.claude.com/docs/en/installation
 - Anthropic Seatbelt, `bubblewrap`, `socat`, WSL2, and WSL1 sandboxing

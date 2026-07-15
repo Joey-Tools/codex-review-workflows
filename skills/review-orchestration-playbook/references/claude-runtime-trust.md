@@ -407,6 +407,13 @@ assuming Linux ownership and mode semantics. This proof trusts the WSL kernel's
 model; a future broader storage policy needs device-identity or backing-object
 proof, not a larger filesystem-name allowlist.
 
+Every mount point and every ordinary filesystem root must remain an absolute
+canonical path. The one bounded kernel-native exception is an exact `nsfs`
+record whose root matches a lowercase namespace name plus one unsigned 64-bit
+inode, such as `net:[4026531840]`; Linux `nsfs_show_path` emits this opaque form
+for namespace bind mounts. The opaque root is retained only as parsed metadata
+and never participates in path coverage or Windows-provenance decisions.
+
 Linux/WSL2 runtime directories use create-or-validate semantics. The helper may
 create a missing directory with its required mode, but an existing directory
 must already be a real current-user-owned path, exact `0700` where private or
@@ -636,6 +643,9 @@ metadata that can act as a bearer secret, or unbounded probe output.
 - [Linux proc mountinfo documentation](https://docs.kernel.org/filesystems/proc.html):
   kernel-provided mount identifiers, roots, mount points, filesystem types,
   sources, and per-superblock options.
+- [Linux nsfs source](https://github.com/torvalds/linux/blob/master/fs/nsfs.c):
+  `nsfs_show_path` emits namespace roots as a name plus bracketed inode rather
+  than an absolute path.
 - [Microsoft WSL disk-space documentation](https://learn.microsoft.com/en-us/windows/wsl/disk-space):
   WSL2 distro VHD storage and its default ext4 filesystem.
 - [Microsoft WSL interop technical documentation](https://wsl.dev/technical-documentation/interop/):
