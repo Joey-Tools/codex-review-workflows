@@ -149,7 +149,7 @@ class WorkspaceTest(unittest.TestCase):
                 repo=partial,
                 base_ref=self.base,
                 head_ref=self.head,
-        )
+            )
 
         self.assertFalse(marker.exists())
         self.assertEqual(
@@ -260,6 +260,42 @@ class WorkspaceTest(unittest.TestCase):
             [],
         )
 
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "requires FIFO support")
+    def test_prompt_override_rejects_symlink_hardlink_fifo_and_writable_file(
+        self,
+    ) -> None:
+        root = pathlib.Path(self.temporary.name)
+        target = root / "prompt-target.txt"
+        target.write_text("Review {review_range}\n", encoding="utf-8")
+        target.chmod(0o600)
+        symlink = root / "prompt-symlink.txt"
+        symlink.symlink_to(target)
+        hardlink = root / "prompt-hardlink.txt"
+        os.link(target, hardlink)
+        fifo = root / "prompt.fifo"
+        os.mkfifo(fifo, mode=0o600)
+        writable = root / "prompt-writable.txt"
+        writable.write_text("Review {review_range}\n", encoding="utf-8")
+        writable.chmod(0o620)
+
+        for label, candidate in (
+            ("symlink", symlink),
+            ("hardlink", hardlink),
+            ("fifo", fifo),
+            ("writable", writable),
+        ):
+            with self.subTest(file_type=label), self.assertRaises(ReviewError):
+                prepare_workspace(
+                    repo=self.repo,
+                    base_ref=self.base,
+                    head_ref=self.head,
+                    prompt_override=candidate,
+                )
+        self.assertEqual(
+            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            [],
+        )
+
     def test_tree_record_diagnostics_redact_secret_paths_and_payloads(self) -> None:
         secret = "AKIA" + "A" * 16
         malformed = f"malformed-{secret}".encode()
@@ -302,18 +338,10 @@ class WorkspaceTest(unittest.TestCase):
         self.assertEqual(_value_secret_rule(marker), "pgp-private-key")
 
     def test_placeholder_secret_requires_a_complete_placeholder_value(self) -> None:
-        self.assertIsNone(
-            _value_secret_rule(b'password = "example-test-secret"')
-        )
-        self.assertIsNone(
-            _value_secret_rule(b'password = "${DATABASE_PASSWORD}"')
-        )
-        self.assertIsNone(
-            _value_secret_rule(b'password = "<DATABASE_PASSWORD>"')
-        )
-        self.assertIsNone(
-            _value_secret_rule(b'OPENAI_API_KEY = "parent-only-secret"')
-        )
+        self.assertIsNone(_value_secret_rule(b'password = "example-test-secret"'))
+        self.assertIsNone(_value_secret_rule(b'password = "${DATABASE_PASSWORD}"'))
+        self.assertIsNone(_value_secret_rule(b'password = "<DATABASE_PASSWORD>"'))
+        self.assertIsNone(_value_secret_rule(b'OPENAI_API_KEY = "parent-only-secret"'))
 
         credential = "".join(("example-", "ProdSecret", "ABC123!"))
         self.assertEqual(

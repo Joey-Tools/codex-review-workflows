@@ -4,7 +4,7 @@ title: Enforce Exact Synthetic Token Fixtures
 status: completed
 created: 2026-07-15
 updated: 2026-07-15
-branch: wip/synthetic-token-v1
+branch: codex/synthetic-token-v1
 pr: 44
 supersedes: []
 superseded_by:
@@ -21,10 +21,12 @@ superseded_by:
 - The fixed helper-relative JSON catalog is the only runtime authority; reviewed repositories, environment variables, and caller configuration cannot replace or extend it.
 - Public authoring tokens cover access, refresh, ID, API-key, and bearer roles plus expired and consumed states.
 - Exact complete scanner captures may suppress only `generic-secret-assignment`; provider credentials, JWTs, private keys, adjacent values, high-entropy assignments, and credential paths remain blocking.
-- Named legacy envelopes store only digests, lengths, rules, and pinned master provenance. Selected entries pass only when each complete captured value has `head_count <= base_count` across the full repository.
+- Named legacy envelopes store exact values as strict canonical Base64 plus rules and pinned master provenance. Runtime decodes exact ASCII bytes in memory, while metadata and evidence expose only digests and lengths.
+- Selected legacy entries pass only when both the complete-tree raw-byte count and the count not embedded inside a longer value from the same envelope are monotonic. The stateful runner recomputes both materialized-head counts before egress, while cross-envelope overlaps fail closed.
 - The helper exposes read-only validate, metadata list, single-value get, exemption list, and pinned-master audit commands.
-- Successful preflight records bounded IDs, digests, rules, surfaces, and counts without raw token values.
-- Accepted assignments use bounded continuation inspection, and catalog value uniqueness plus recovered legacy overlap checks are rule-independent.
+- Successful preflight records bounded IDs, digests, rules, surfaces, and counts without raw token values; the shared evidence-entry limit is enforced before each new key is inserted.
+- The six reviewer-visible control files and their exact directory entry set are bound to helper-private size, digest, record-count, identity, mode, and stable-metadata evidence; added files, nested directories, symlinks, FIFOs, and post-prepare mutations fail closed.
+- Accepted assignments use bounded continuation inspection, and catalog value uniqueness plus exact authoring/legacy overlap checks are rule-independent.
 - `$synthetic-token-fixtures` uses the helper CLI and placeholder-only templates rather than duplicating catalog literals.
 
 ## Next Steps
@@ -33,7 +35,8 @@ superseded_by:
 
 ## Evidence
 
-- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py' -v` (`346` tests passed; `2` loopback-dependent tests skipped)
-- `python3 -m py_compile skills/review-orchestration-playbook/scripts/review_runtime/*.py skills/review-orchestration-playbook/tests/test_*.py`
-- `ruff check --ignore F401` passed for every changed runtime and test module.
-- `uv run --offline --with pyyaml python .../quick_validate.py <skill>` passed for both skills using the locally cached PyYAML runtime.
+- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py' -v` (`367` tests passed; `2` loopback-dependent tests skipped)
+- `python3 -m unittest skills.review-orchestration-playbook.tests.test_synthetic_tokens -q` (`67` tests passed after final formatting)
+- `python3 -m py_compile skills/review-orchestration-playbook/scripts/isolated_review skills/review-orchestration-playbook/scripts/review_runtime/*.py`
+- `ruff check` passed and `ruff format` completed for every changed runtime and test module.
+- `uv run --with pyyaml python codex_skill_validate.py skills/review-orchestration-playbook skills/synthetic-token-fixtures` passed for both skills.

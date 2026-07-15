@@ -28,8 +28,7 @@ session = TokenSession(
 ## Independent Credentials
 
 ```yaml
-primary_api_key: "<SYNTHETIC_PRIMARY_API_KEY>"
-secondary_api_key: "<SYNTHETIC_SECONDARY_API_KEY>"
+service_api_key: "<SYNTHETIC_API_KEY>"
 bearer_token: "<SYNTHETIC_BEARER_TOKEN>"
 fixture_state: "active"
 ```

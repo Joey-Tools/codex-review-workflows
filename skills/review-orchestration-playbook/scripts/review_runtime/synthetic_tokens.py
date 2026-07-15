@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -21,20 +23,15 @@ MAX_LEGACY_EXEMPTIONS = 64
 MAX_LEGACY_VALUES = 512
 MAX_SOURCE_OCCURRENCES = 100_000
 ALLOWED_AUTHORING_RULES = frozenset({"generic-secret-assignment"})
-ALLOWED_LEGACY_RULES = frozenset(
-    {"generic-secret-assignment", "github-token"}
-)
+ALLOWED_LEGACY_RULES = frozenset({"generic-secret-assignment", "github-token"})
 ALLOWED_ROLES = frozenset({"access", "refresh", "id", "api-key", "bearer"})
 ALLOWED_STATES = frozenset({"active", "expired", "consumed"})
 IDENTIFIER = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 COMMIT_OID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
-SHA256 = re.compile(r"^[0-9a-f]{64}$")
 LEGACY_MATCH_MODE = "non-increasing-global-count"
 GENERIC_SECRET_VALUE_BYTE_CLASS = rb"[-A-Za-z0-9_./+=!@#$%^&*?~:;]"
-AUTHORING_VALUE = re.compile(
-    rb"(?:" + GENERIC_SECRET_VALUE_BYTE_CLASS + rb"){16,512}"
-)
+AUTHORING_VALUE = re.compile(rb"(?:" + GENERIC_SECRET_VALUE_BYTE_CLASS + rb"){16,512}")
 
 
 @dataclass(frozen=True)
@@ -54,16 +51,20 @@ class AuthoringToken:
 class LegacyToken:
     identifier: str
     rule: str
-    value_sha256: str
-    value_length: int
+    value: bytes
     containing_commit: str
     source_occurrences: int
 
+    @property
+    def value_sha256(self) -> str:
+        return hashlib.sha256(self.value).hexdigest()
+
+    @property
+    def value_length(self) -> int:
+        return len(self.value)
+
     def matches(self, candidate: bytes) -> bool:
-        return len(candidate) == self.value_length and hmac.compare_digest(
-            hashlib.sha256(candidate).hexdigest(),
-            self.value_sha256,
-        )
+        return hmac.compare_digest(candidate, self.value)
 
 
 @dataclass(frozen=True)
@@ -181,6 +182,27 @@ def _require_authoring_value(value: Any, *, label: str) -> bytes:
     return encoded
 
 
+def _require_legacy_value(value: Any, *, label: str) -> bytes:
+    if not isinstance(value, str):
+        raise ReviewError(f"synthetic token catalog {label} must be canonical Base64")
+    try:
+        encoded = value.encode("ascii")
+        decoded = base64.b64decode(encoded, validate=True)
+    except (UnicodeEncodeError, binascii.Error, ValueError) as error:
+        raise ReviewError(
+            f"synthetic token catalog {label} must be canonical Base64"
+        ) from error
+    if base64.b64encode(decoded) != encoded:
+        raise ReviewError(f"synthetic token catalog {label} must be canonical Base64")
+    try:
+        raw_value = decoded.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise ReviewError(
+            f"synthetic token catalog {label} must encode exact ASCII"
+        ) from error
+    return _require_authoring_value(raw_value, label=label)
+
+
 def _require_string_choice(
     value: Any,
     choices: frozenset[str],
@@ -197,7 +219,9 @@ def _parse_authoring_tokens(value: Any) -> tuple[str, tuple[AuthoringToken, ...]
     version = _require_identifier(pool["version"], "authoring_pool.version")
     raw_tokens = pool["tokens"]
     if not isinstance(raw_tokens, list) or not raw_tokens:
-        raise ReviewError("synthetic token catalog authoring_pool.tokens must be non-empty")
+        raise ReviewError(
+            "synthetic token catalog authoring_pool.tokens must be non-empty"
+        )
     if len(raw_tokens) > MAX_AUTHORING_TOKENS:
         raise ReviewError("synthetic token catalog has too many authoring tokens")
     tokens: list[AuthoringToken] = []
@@ -245,9 +269,7 @@ def _parse_legacy_exemptions(value: Any) -> tuple[LegacyExemption, ...]:
         identifier = _require_identifier(exemption["id"], f"{label}.id")
         repository = exemption["repository"]
         if not isinstance(repository, str) or REPOSITORY.fullmatch(repository) is None:
-            raise ReviewError(
-                f"synthetic token catalog {label}.repository is invalid"
-            )
+            raise ReviewError(f"synthetic token catalog {label}.repository is invalid")
         verified_master_tip = exemption["verified_master_tip"]
         if (
             not isinstance(verified_master_tip, str)
@@ -260,7 +282,9 @@ def _parse_legacy_exemptions(value: Any) -> tuple[LegacyExemption, ...]:
             raise ReviewError(f"synthetic token catalog {label}.match is invalid")
         raw_values = exemption["values"]
         if not isinstance(raw_values, list) or not raw_values:
-            raise ReviewError(f"synthetic token catalog {label}.values must be non-empty")
+            raise ReviewError(
+                f"synthetic token catalog {label}.values must be non-empty"
+            )
         total_values += len(raw_values)
         if total_values > MAX_LEGACY_VALUES:
             raise ReviewError("synthetic token catalog has too many legacy values")
@@ -273,8 +297,7 @@ def _parse_legacy_exemptions(value: Any) -> tuple[LegacyExemption, ...]:
                 {
                     "id",
                     "rule",
-                    "value_sha256",
-                    "value_length",
+                    "value_base64",
                     "containing_commit",
                     "source_occurrences",
                 },
@@ -298,24 +321,16 @@ def _parse_legacy_exemptions(value: Any) -> tuple[LegacyExemption, ...]:
                 raise ReviewError(
                     f"synthetic token catalog {value_label}.source_occurrences is invalid"
                 )
-            value_sha256 = token["value_sha256"]
-            if not isinstance(value_sha256, str) or SHA256.fullmatch(value_sha256) is None:
-                raise ReviewError(
-                    f"synthetic token catalog {value_label}.value_sha256 is invalid"
-                )
-            value_length = token["value_length"]
-            if type(value_length) is not int or not 16 <= value_length <= 512:
-                raise ReviewError(
-                    f"synthetic token catalog {value_label}.value_length is invalid"
-                )
             values.append(
                 LegacyToken(
                     identifier=token_id,
                     rule=_require_string_choice(
                         token["rule"], ALLOWED_LEGACY_RULES, f"{value_label}.rule"
                     ),
-                    value_sha256=value_sha256,
-                    value_length=value_length,
+                    value=_require_legacy_value(
+                        token["value_base64"],
+                        label=f"{value_label}.value_base64",
+                    ),
                     containing_commit=containing_commit,
                     source_occurrences=source_occurrences,
                 )
@@ -335,7 +350,8 @@ def _parse_legacy_exemptions(value: Any) -> tuple[LegacyExemption, ...]:
 def _validate_unique_entries(catalog: SyntheticTokenCatalog) -> None:
     identifiers: dict[str, str] = {}
     values: list[tuple[str, bytes]] = []
-    legacy_digests: dict[tuple[str, int], str] = {}
+    legacy_value_envelopes: dict[str, str] = {}
+    legacy_storage_values: list[tuple[str, bytes]] = []
     public_metadata = {catalog.pool_version}
     for token in catalog.authoring_tokens:
         public_metadata.update(
@@ -365,15 +381,9 @@ def _validate_unique_entries(catalog: SyntheticTokenCatalog) -> None:
                     token.containing_commit,
                 )
             )
-    encoded_metadata = tuple(item.encode("ascii") for item in public_metadata)
-    if any(
-        token.value in metadata
-        for token in catalog.authoring_tokens
-        for metadata in encoded_metadata
-    ):
-        raise ReviewError(
-            "synthetic token catalog authoring value overlaps public metadata"
-        )
+            legacy_storage_values.append(
+                (token.identifier, base64.b64encode(token.value))
+            )
 
     def register(identifier: str, value: bytes, label: str) -> None:
         previous = identifiers.get(identifier)
@@ -395,30 +405,18 @@ def _validate_unique_entries(catalog: SyntheticTokenCatalog) -> None:
         exemption_ids.add(exemption.identifier)
         identifiers[exemption.identifier] = "legacy exemption"
         for token in exemption.values:
-            previous = identifiers.get(token.identifier)
-            if previous is not None:
-                raise ReviewError(
-                    "synthetic token catalog duplicate id "
-                    f"{token.identifier}: {previous}, {exemption.identifier}"
-                )
-            identifiers[token.identifier] = exemption.identifier
-            digest_key = (token.value_sha256, token.value_length)
-            previous_digest = legacy_digests.get(digest_key)
-            if previous_digest is not None:
-                raise ReviewError(
-                    "synthetic token catalog duplicate legacy digest: "
-                    f"{previous_digest}, {token.identifier}"
-                )
-            legacy_digests[digest_key] = token.identifier
+            register(token.identifier, token.value, exemption.identifier)
+            legacy_value_envelopes[token.identifier] = exemption.identifier
 
-    for token in catalog.authoring_tokens:
-        digest_key = (token.value_sha256, len(token.value))
-        previous_digest = legacy_digests.get(digest_key)
-        if previous_digest is not None:
-            raise ReviewError(
-                "synthetic token catalog authoring and legacy values collide: "
-                f"{token.identifier}, {previous_digest}"
-            )
+    encoded_metadata = tuple(item.encode("ascii") for item in public_metadata)
+    if any(
+        raw_value in metadata
+        for _identifier, raw_value in values
+        for metadata in encoded_metadata
+    ):
+        raise ReviewError(
+            "synthetic token catalog exact value overlaps public metadata"
+        )
 
     for index, (identifier, value) in enumerate(values):
         for other_id, other in values[index + 1 :]:
@@ -427,9 +425,32 @@ def _validate_unique_entries(catalog: SyntheticTokenCatalog) -> None:
                     f"synthetic token catalog duplicate value: {identifier}, {other_id}"
                 )
             if value in other or other in value:
+                if legacy_value_envelopes.get(
+                    identifier
+                ) is not None and legacy_value_envelopes.get(
+                    identifier
+                ) == legacy_value_envelopes.get(other_id):
+                    continue
                 raise ReviewError(
                     "synthetic token catalog overlapping values: "
                     f"{identifier}, {other_id}"
+                )
+
+    for _identifier, storage_value in legacy_storage_values:
+        if any(storage_value in metadata for metadata in encoded_metadata):
+            raise ReviewError(
+                "synthetic token catalog legacy storage encoding overlaps public metadata"
+            )
+        for _other_id, raw_value in values:
+            if storage_value in raw_value or raw_value in storage_value:
+                raise ReviewError(
+                    "synthetic token catalog legacy storage encoding overlaps an exact value"
+                )
+    for index, (_identifier, storage_value) in enumerate(legacy_storage_values):
+        for _other_id, other_storage in legacy_storage_values[index + 1 :]:
+            if storage_value in other_storage or other_storage in storage_value:
+                raise ReviewError(
+                    "synthetic token catalog legacy storage encodings overlap"
                 )
 
 
@@ -464,6 +485,14 @@ def parse_catalog_bytes(data: bytes) -> SyntheticTokenCatalog:
         legacy_exemptions=_parse_legacy_exemptions(root["legacy_exemptions"]),
     )
     _validate_unique_entries(catalog)
+    if any(
+        token.value in data
+        for exemption in catalog.legacy_exemptions
+        for token in exemption.values
+    ):
+        raise ReviewError(
+            "synthetic token catalog must not contain a raw legacy exact value"
+        )
     return catalog
 
 
@@ -480,20 +509,28 @@ def _read_catalog_file(path: pathlib.Path) -> bytes:
     try:
         directory_fd = os.open(path.parent, directory_flags)
     except OSError as error:
-        raise ReviewError(f"cannot open synthetic token catalog directory: {error}") from error
+        raise ReviewError(
+            f"cannot open synthetic token catalog directory: {error}"
+        ) from error
     try:
         try:
             descriptor = os.open(path.name, file_flags, dir_fd=directory_fd)
         except OSError as error:
-            raise ReviewError(f"cannot open synthetic token catalog: {error}") from error
+            raise ReviewError(
+                f"cannot open synthetic token catalog: {error}"
+            ) from error
         try:
             metadata = os.fstat(descriptor)
             if not stat.S_ISREG(metadata.st_mode):
                 raise ReviewError("synthetic token catalog must be a regular file")
             if metadata.st_nlink != 1:
-                raise ReviewError("synthetic token catalog must have exactly one hard link")
+                raise ReviewError(
+                    "synthetic token catalog must have exactly one hard link"
+                )
             if metadata.st_uid != os.getuid():
-                raise ReviewError("synthetic token catalog must be owned by the current user")
+                raise ReviewError(
+                    "synthetic token catalog must be owned by the current user"
+                )
             if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
                 raise ReviewError(
                     "synthetic token catalog must not be group or other writable"
@@ -512,24 +549,20 @@ def _read_catalog_file(path: pathlib.Path) -> bytes:
             if len(data) > MAX_CATALOG_BYTES:
                 raise ReviewError("synthetic token catalog exceeds the size limit")
             final_metadata = os.fstat(descriptor)
-            if (
-                len(data) != metadata.st_size
-                or (
-                    metadata.st_dev,
-                    metadata.st_ino,
-                    metadata.st_mode,
-                    metadata.st_size,
-                    metadata.st_mtime_ns,
-                    metadata.st_ctime_ns,
-                )
-                != (
-                    final_metadata.st_dev,
-                    final_metadata.st_ino,
-                    final_metadata.st_mode,
-                    final_metadata.st_size,
-                    final_metadata.st_mtime_ns,
-                    final_metadata.st_ctime_ns,
-                )
+            if len(data) != metadata.st_size or (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_mode,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                metadata.st_ctime_ns,
+            ) != (
+                final_metadata.st_dev,
+                final_metadata.st_ino,
+                final_metadata.st_mode,
+                final_metadata.st_size,
+                final_metadata.st_mtime_ns,
+                final_metadata.st_ctime_ns,
             ):
                 raise ReviewError("synthetic token catalog changed while it was read")
             return data
@@ -587,7 +620,7 @@ def accepted_legacy_values(
                     catalog_version=catalog.pool_version,
                     identifier=token.identifier,
                     rule=token.rule,
-                    value=None,
+                    value=token.value,
                     value_sha256=token.value_sha256,
                     value_length=token.value_length,
                     exemption_id=exemption.identifier,
