@@ -1902,6 +1902,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     diff_scan = _file_secret_scan(
         review.diff_file,
         accepted_values=accepted_values,
+        diff_surface=True,
         accepted_index=accepted_index,
         event_budget=event_budget,
     )
@@ -2019,6 +2020,7 @@ def _file_secret_scan(
     *,
     accepted_values: Iterable[AcceptedSyntheticValue] = (),
     capture_accepted_candidates: bool = False,
+    diff_surface: bool = False,
     accepted_index: AcceptedValueIndex | None = None,
     event_budget: SecretScanBudget | None = None,
 ) -> SecretScanResult:
@@ -2028,6 +2030,7 @@ def _file_secret_scan(
                 handle,
                 accepted_values=accepted_values,
                 capture_accepted_candidates=capture_accepted_candidates,
+                diff_surface=diff_surface,
                 _accepted_index=accepted_index,
                 _event_budget=event_budget,
             )
@@ -2078,7 +2081,12 @@ def _starts_quoted_literal(value: bytes) -> bool:
     ) or re.match(rb"(?i)(?:br|r)#{1,8}['\"]", value) is not None
 
 
-def _quoted_assignment_may_accept(value: bytes, match: re.Match[bytes]) -> bool:
+def _quoted_assignment_may_accept(
+    value: bytes,
+    match: re.Match[bytes],
+    *,
+    diff_surface: bool = False,
+) -> bool:
     cursor = match.end()
     inspected = 0
 
@@ -2131,6 +2139,63 @@ def _quoted_assignment_may_accept(value: bytes, match: re.Match[bytes]) -> bool:
     def starts_literal() -> bool:
         return _starts_quoted_literal(value[cursor : cursor + 16])
 
+    def trim_diff_record_prefix() -> bool:
+        if (
+            diff_surface
+            and cursor < len(value)
+            and value[cursor] in (0x2B, 0x2D)
+            and cursor > 0
+            and value[cursor - 1] == 0x0A
+        ):
+            if not advance(1) or not trim_space():
+                return False
+        return True
+
+    def starts_diff_metadata_boundary() -> bool:
+        if (
+            not diff_surface
+            or cursor == 0
+            or value[cursor - 1] != 0x0A
+        ):
+            return False
+        markers = (
+            b"@@ -",
+            b"@@@ -",
+            b"diff --git ",
+            b"\\ No newline at end of file",
+        )
+        return any(
+            inspected + len(marker) <= MAX_SECRET_ASSIGNMENT_TRAILING_BYTES
+            and value.startswith(marker, cursor)
+            for marker in markers
+        )
+
+    def source_literal_quote() -> int | None:
+        start = match.start()
+        lookbehind_start = max(0, start - MAX_SECRET_ASSIGNMENT_TRAILING_BYTES)
+        last_line_break = max(
+            value.rfind(b"\n", lookbehind_start, start),
+            value.rfind(b"\r", lookbehind_start, start),
+        )
+        line_start = max(lookbehind_start, last_line_break + 1)
+        prefix = value[line_start:start]
+        lowered = prefix.lower()
+        for marker in (b"br'", b"rb'", b'br"', b'rb"', b"b'", b'b"'):
+            marker_index = lowered.rfind(marker)
+            if marker_index < 0:
+                continue
+            if marker_index > 0 and (
+                lowered[marker_index - 1 : marker_index].isalnum()
+                or lowered[marker_index - 1] == 0x5F
+            ):
+                continue
+            quote = marker[-1]
+            content_prefix = prefix[marker_index + len(marker) :]
+            if bytes((quote,)) in content_prefix or b"\\" in content_prefix:
+                continue
+            return quote
+        return None
+
     def starts_named_assignment() -> bool:
         limit = min(
             len(value),
@@ -2159,9 +2224,6 @@ def _quoted_assignment_may_accept(value: bytes, match: re.Match[bytes]) -> bool:
             ):
                 position += 1
             return position
-
-        if index < limit and value[index] in (0x2B, 0x2D):
-            index = skip_space(index + 1)
 
         if index < limit and value[index] in (0x22, 0x27):
             quote = value[index]
@@ -2197,8 +2259,70 @@ def _quoted_assignment_may_accept(value: bytes, match: re.Match[bytes]) -> bool:
             return False
         return True
 
+    def starts_python_call_statement() -> bool:
+        limit = min(
+            len(value),
+            cursor + MAX_SECRET_ASSIGNMENT_TRAILING_BYTES - inspected + 1,
+        )
+        index = cursor
+
+        def skip_identifier(position: int) -> int:
+            if position >= limit or not (
+                0x41 <= value[position] <= 0x5A
+                or 0x61 <= value[position] <= 0x7A
+                or value[position] == 0x5F
+            ):
+                return position
+            position += 1
+            while position < limit and (
+                0x30 <= value[position] <= 0x39
+                or 0x41 <= value[position] <= 0x5A
+                or 0x61 <= value[position] <= 0x7A
+                or value[position] == 0x5F
+            ):
+                position += 1
+            return position
+
+        first_start = index
+        index = skip_identifier(index)
+        if index == first_start:
+            return False
+        first_identifier = value[first_start:index].lower()
+        if first_identifier in {
+            b"and",
+            b"as",
+            b"assert",
+            b"await",
+            b"else",
+            b"for",
+            b"if",
+            b"in",
+            b"is",
+            b"lambda",
+            b"not",
+            b"or",
+            b"return",
+            b"yield",
+        }:
+            return False
+        while index < limit and value[index] == 0x2E:
+            next_start = index + 1
+            index = skip_identifier(next_start)
+            if index == next_start:
+                return False
+        while index < limit and value[index] in (0x20, 0x09):
+            index += 1
+        return index < limit and value[index] == 0x28
+
     if not trim_space():
         return False
+    source_literal_wrapper = False
+    outer_quote = source_literal_quote()
+    if outer_quote is not None:
+        if cursor < len(value) and value[cursor] == outer_quote:
+            if not advance(1) or not trim_space():
+                return False
+            source_literal_wrapper = True
     crossed_boundary = False
     while True:
         while value.startswith((b")", b"]", b"}"), cursor):
@@ -2210,6 +2334,8 @@ def _quoted_assignment_may_accept(value: bytes, match: re.Match[bytes]) -> bool:
             crossed_boundary = True
             if not trim_continuation_trivia():
                 return False
+            if not trim_diff_record_prefix():
+                return False
             continue
         break
     if cursor == len(value):
@@ -2220,7 +2346,11 @@ def _quoted_assignment_may_accept(value: bytes, match: re.Match[bytes]) -> bool:
         if starts_trivia():
             if not trim_continuation_trivia():
                 return False
-        return cursor == len(value) or not starts_literal()
+        return (
+            cursor == len(value)
+            or starts_diff_metadata_boundary()
+            or starts_named_assignment()
+        )
     if value.startswith(b",", cursor):
         if not advance(1) or not trim_space():
             return False
@@ -2231,6 +2361,8 @@ def _quoted_assignment_may_accept(value: bytes, match: re.Match[bytes]) -> bool:
             if starts_trivia():
                 if not trim_continuation_trivia():
                     return False
+                if not trim_diff_record_prefix():
+                    return False
                 continue
             if value.startswith(b",", cursor):
                 if not advance(1) or not trim_space():
@@ -2239,23 +2371,38 @@ def _quoted_assignment_may_accept(value: bytes, match: re.Match[bytes]) -> bool:
             break
         if cursor == len(value):
             return True
+        if starts_diff_metadata_boundary():
+            return True
         if value.startswith(b";", cursor):
             if not advance(1) or not trim_space():
                 return False
             if starts_trivia() and not trim_continuation_trivia():
                 return False
-            return cursor == len(value) or not starts_literal()
+            return (
+                cursor == len(value)
+                or starts_diff_metadata_boundary()
+                or starts_named_assignment()
+            )
         return starts_named_assignment()
     if crossed_boundary:
+        if starts_diff_metadata_boundary():
+            return True
+        if source_literal_wrapper:
+            return starts_named_assignment() or starts_python_call_statement()
         return starts_named_assignment()
     return False
 
 
 def _iter_secret_events(
     value: bytes,
+    *,
+    diff_surface: bool = False,
+    _event_budget: SecretScanBudget | None = None,
 ) -> Iterator[tuple[str, bytes | None, int, bool, int | None, int | None]]:
+    event_budget = _event_budget or SecretScanBudget.default()
     for rule, pattern in SECRET_PATTERNS:
         for match in pattern.finditer(value):
+            event_budget.consume()
             start, candidate_end = match.span(0)
             yield rule, match.group(0), match.end(), True, start, candidate_end
     for rule, pattern in (
@@ -2264,12 +2411,14 @@ def _iter_secret_events(
         ("generic-secret-assignment", OVERSIZED_SECRET_ASSIGNMENT_GAP),
     ):
         for match in pattern.finditer(value):
+            event_budget.consume()
             yield rule, None, match.end(), False, None, None
     for pattern in (
         OVERSIZED_QUOTED_SECRET_ASSIGNMENT,
         OVERSIZED_UNQUOTED_SECRET_ASSIGNMENT,
     ):
         for match in pattern.finditer(value):
+            event_budget.consume()
             yield (
                 "generic-secret-assignment",
                 None,
@@ -2279,8 +2428,13 @@ def _iter_secret_events(
                 None,
             )
     for match in QUOTED_SECRET_ASSIGNMENT.finditer(value):
+        event_budget.consume()
         candidate = match.group(2)
-        may_accept = _quoted_assignment_may_accept(value, match)
+        may_accept = _quoted_assignment_may_accept(
+            value,
+            match,
+            diff_surface=diff_surface,
+        )
         if not may_accept or not _is_placeholder_secret(candidate.lower()):
             start, candidate_end = match.span(2)
             yield (
@@ -2292,6 +2446,7 @@ def _iter_secret_events(
                 candidate_end,
             )
     for match in UNQUOTED_SECRET_ASSIGNMENT.finditer(value):
+        event_budget.consume()
         candidate = match.group(1)
         if not _is_placeholder_secret(
             candidate.lower()
@@ -2351,6 +2506,7 @@ def _scan_secret_value(
     minimum_end: int = 0,
     maximum_end: int | None = None,
     capture_accepted_candidates: bool = False,
+    diff_surface: bool = False,
     _accepted_index: AcceptedValueIndex | None = None,
     _event_budget: SecretScanBudget | None = None,
 ) -> SecretScanResult:
@@ -2379,9 +2535,10 @@ def _scan_secret_value(
                 accepted_specific_spans.add((start, candidate_end, candidate))
 
     for rule, candidate, end, may_accept, start, candidate_end in _iter_secret_events(
-        value
+        value,
+        diff_surface=diff_surface,
+        _event_budget=event_budget,
     ):
-        event_budget.consume()
         if not minimum_end < end <= upper:
             continue
         if (
@@ -2419,6 +2576,7 @@ def _stream_secret_scan(
     size: int | None = None,
     accepted_values: Iterable[AcceptedSyntheticValue] = (),
     capture_accepted_candidates: bool = False,
+    diff_surface: bool = False,
     _accepted_index: AcceptedValueIndex | None = None,
     _event_budget: SecretScanBudget | None = None,
 ) -> SecretScanResult:
@@ -2462,6 +2620,7 @@ def _stream_secret_scan(
                 minimum_end=local_minimum,
                 maximum_end=local_maximum,
                 capture_accepted_candidates=capture_accepted_candidates,
+                diff_surface=diff_surface,
                 _accepted_index=accepted_index,
                 _event_budget=event_budget,
             )

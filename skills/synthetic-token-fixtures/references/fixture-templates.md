@@ -8,7 +8,8 @@ Resolve every placeholder through `isolated_review synthetic-tokens get <id> --j
 {
   "access_token": "<SYNTHETIC_ACCESS_TOKEN>",
   "refresh_token": "<SYNTHETIC_REFRESH_TOKEN>",
-  "id_token": "<SYNTHETIC_ID_TOKEN>"
+  "id_token": "<SYNTHETIC_ID_TOKEN>",
+  "fixture_state": "active"
 }
 ```
 
@@ -20,6 +21,7 @@ session = TokenSession(
     expired_access_token="<SYNTHETIC_EXPIRED_ACCESS_TOKEN>",
     active_refresh_token="<SYNTHETIC_ACTIVE_REFRESH_TOKEN>",
     consumed_refresh_token="<SYNTHETIC_CONSUMED_REFRESH_TOKEN>",
+    fixture_state="active",
 )
 ```
 
@@ -29,6 +31,7 @@ session = TokenSession(
 primary_api_key: "<SYNTHETIC_PRIMARY_API_KEY>"
 secondary_api_key: "<SYNTHETIC_SECONDARY_API_KEY>"
 bearer_token: "<SYNTHETIC_BEARER_TOKEN>"
+fixture_state: "active"
 ```
 
 Choose different catalog IDs for placeholders that model different credentials. Reuse one ID only when the fixture intentionally models the same credential appearing more than once.

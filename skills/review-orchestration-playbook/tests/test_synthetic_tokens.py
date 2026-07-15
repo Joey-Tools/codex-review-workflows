@@ -325,7 +325,9 @@ class PublicPoolScannerTest(unittest.TestCase):
             ),
             (
                 "placeholder-concatenation",
-                b'access_token = "placeholder_token" ' + adjacent_secret,
+                assignment_bytes(b"access_token", b"placeholder_token")
+                + b" "
+                + adjacent_secret,
             ),
         )
         for label, payload in cases:
@@ -377,6 +379,244 @@ class PublicPoolScannerTest(unittest.TestCase):
         self.assertIsNone(next_statement.blocking_rule)
         self.assertEqual(next_statement.accepted_counts[accepted], 1)
 
+        source_wrapper = workspace._scan_secret_value(
+            b"payload = b'" + exact_assignment + b"'\nstate = 1\n",
+            accepted_values=self.accepted,
+        )
+        self.assertIsNone(source_wrapper.blocking_rule)
+        self.assertEqual(source_wrapper.accepted_counts[accepted], 1)
+
+        bounded_source_wrapper = workspace._scan_secret_value(
+            b"payload = b'"
+            + b"x" * (workspace.MAX_SECRET_ASSIGNMENT_TRAILING_BYTES - 2)
+            + exact_assignment
+            + b"'\nstate = 1\n",
+            accepted_values=self.accepted,
+        )
+        self.assertIsNone(bounded_source_wrapper.blocking_rule)
+        self.assertEqual(bounded_source_wrapper.accepted_counts[accepted], 1)
+
+        oversized_source_wrapper = workspace._scan_secret_value(
+            b"payload = b'"
+            + b"x" * (workspace.MAX_SECRET_ASSIGNMENT_TRAILING_BYTES - 1)
+            + exact_assignment
+            + b"'\nstate = 1\n",
+            accepted_values=self.accepted,
+        )
+        self.assertEqual(
+            oversized_source_wrapper.blocking_rule,
+            "generic-secret-assignment",
+        )
+
+        for label, payload in (
+            (
+                "source-wrapper-literal",
+                b"payload = b'"
+                + exact_assignment
+                + b"' + b'"
+                + adjacent_secret
+                + b"'\n",
+            ),
+            (
+                "unproven-source-wrapper",
+                exact_assignment + b"' + adjacent_secret\n",
+            ),
+            (
+                "mismatched-source-wrapper",
+                b"payload = b'" + exact_assignment + b'"\n',
+            ),
+            (
+                "source-wrapper-identifier-continuation",
+                b"payload = b'"
+                + exact_assignment
+                + b"' + suffix + b'"
+                + adjacent_secret
+                + b"'\n",
+            ),
+            (
+                "source-wrapper-implicit-concatenation",
+                b"payload = (b'"
+                + exact_assignment
+                + b"'\n b'"
+                + adjacent_secret
+                + b"')\n",
+            ),
+            (
+                "source-wrapper-closed-context-continuation",
+                b"payload = ((b'"
+                + exact_assignment
+                + b"')\n + b'"
+                + adjacent_secret
+                + b"')\n",
+            ),
+            (
+                "source-wrapper-comparison-continuation",
+                b"payload = ((b'"
+                + exact_assignment
+                + b"')\n not in b'"
+                + adjacent_secret
+                + b"')\n",
+            ),
+            (
+                "source-wrapper-matrix-continuation",
+                b"payload = ((b'"
+                + exact_assignment
+                + b"')\n @ b'"
+                + adjacent_secret
+                + b"')\n",
+            ),
+            (
+                "source-wrapper-generator-continuation",
+                b"payload = ((b'"
+                + exact_assignment
+                + b"')\n for item in b'"
+                + adjacent_secret
+                + b"')\n",
+            ),
+            (
+                "source-wrapper-postfix-continuation",
+                b"payload = ((b'"
+                + exact_assignment
+                + b"')\n [b'"
+                + adjacent_secret
+                + b"'])\n",
+            ),
+            (
+                "source-wrapper-semicolon-continuation",
+                b"payload = b'"
+                + exact_assignment
+                + b"'; + b'"
+                + adjacent_secret
+                + b"'\n",
+            ),
+        ):
+            with self.subTest(case=label):
+                scan = workspace._scan_secret_value(
+                    payload,
+                    accepted_values=self.accepted,
+                )
+                self.assertEqual(
+                    scan.blocking_rule,
+                    "generic-secret-assignment",
+                )
+
+        frozen_diff_boundary = workspace._scan_secret_value(
+            b"+check(\n+    scan(b'"
+            + exact_assignment
+            + b"')\n+)\n+state = 1\n",
+            accepted_values=self.accepted,
+            diff_surface=True,
+        )
+        self.assertIsNone(frozen_diff_boundary.blocking_rule)
+        self.assertEqual(frozen_diff_boundary.accepted_counts[accepted], 1)
+
+        for boundary in (
+            b"@@ -10,2 +10,2 @@\n",
+            b"diff --git a/next b/next\n",
+            b"\\ No newline at end of file\n",
+        ):
+            with self.subTest(diff_boundary=boundary):
+                scan = workspace._scan_secret_value(
+                    b"+" + exact_assignment + b"\n" + boundary,
+                    accepted_values=self.accepted,
+                    diff_surface=True,
+                )
+                self.assertIsNone(scan.blocking_rule)
+                self.assertEqual(scan.accepted_counts[accepted], 1)
+
+                content = workspace._scan_secret_value(
+                    b"+" + exact_assignment + b"\n+" + boundary,
+                    accepted_values=self.accepted,
+                    diff_surface=True,
+                )
+                self.assertEqual(
+                    content.blocking_rule,
+                    "generic-secret-assignment",
+                )
+
+        lone_cr_metadata = workspace._scan_secret_value(
+            b"+"
+            + exact_assignment
+            + b"\r@@ -1 +1 @@ + "
+            + adjacent_secret
+            + b"\n",
+            accepted_values=self.accepted,
+            diff_surface=True,
+        )
+        self.assertEqual(
+            lone_cr_metadata.blocking_rule,
+            "generic-secret-assignment",
+        )
+
+        operator_assignment = b'+ state = "' + adjacent_secret + b'"\n'
+        for label, payload, diff_surface in (
+            (
+                "head-operator-assignment",
+                exact_assignment + b"\n" + operator_assignment,
+                False,
+            ),
+            (
+                "added-operator-assignment",
+                b"+" + exact_assignment + b"\n+" + operator_assignment,
+                True,
+            ),
+            (
+                "deleted-operator-assignment",
+                b"-" + exact_assignment + b"\n-" + operator_assignment,
+                True,
+            ),
+            (
+                "context-operator-assignment",
+                b" " + exact_assignment + b"\n " + operator_assignment,
+                True,
+            ),
+            (
+                "added-comma-operator-assignment",
+                b"+configure("
+                + exact_assignment
+                + b",\n+"
+                + operator_assignment
+                + b")\n",
+                True,
+            ),
+        ):
+            with self.subTest(case=label):
+                scan = workspace._scan_secret_value(
+                    payload,
+                    accepted_values=self.accepted,
+                    diff_surface=diff_surface,
+                )
+                self.assertEqual(
+                    scan.blocking_rule,
+                    "generic-secret-assignment",
+                )
+
+        for fence in (b"```", b"~~~"):
+            for label, payload in (
+                (
+                    "same-line-fence",
+                    exact_assignment + b"," + fence + b"\n",
+                ),
+                (
+                    "fence-prefix",
+                    exact_assignment
+                    + b"\n"
+                    + fence
+                    + b'python + "'
+                    + adjacent_secret
+                    + b'"\n',
+                ),
+            ):
+                with self.subTest(case=label, fence=fence):
+                    scan = workspace._scan_secret_value(
+                        payload,
+                        accepted_values=self.accepted,
+                    )
+                    self.assertEqual(
+                        scan.blocking_rule,
+                        "generic-secret-assignment",
+                    )
+
         excessive_closers = workspace._scan_secret_value(
             exact_assignment
             + b")" * (workspace.MAX_SECRET_ASSIGNMENT_TRAILING_BYTES + 1),
@@ -426,17 +666,22 @@ class PublicPoolScannerTest(unittest.TestCase):
 
     def test_dense_accepted_surface_fails_closed_at_the_event_limit(self) -> None:
         accepted = self.accepted[0]
-        payload = b"\n".join(
-            assignment_bytes(b"access_token", accepted.value) for _ in range(3)
-        )
-        with (
-            mock.patch.object(workspace, "MAX_SECRET_SCAN_EVENTS", 2),
-            self.assertRaisesRegex(ReviewError, "scanner event limit"),
+        for label, value in (
+            ("accepted", accepted.value),
+            ("placeholder", b"placeholder_token"),
         ):
-            workspace._scan_secret_value(
-                payload,
-                accepted_values=self.accepted,
-            )
+            with self.subTest(case=label):
+                payload = b"\n".join(
+                    assignment_bytes(b"access_token", value) for _ in range(3)
+                )
+                with (
+                    mock.patch.object(workspace, "MAX_SECRET_SCAN_EVENTS", 2),
+                    self.assertRaisesRegex(ReviewError, "scanner event limit"),
+                ):
+                    workspace._scan_secret_value(
+                        payload,
+                        accepted_values=self.accepted,
+                    )
 
     def test_blocking_event_stops_scanning_the_remaining_surface(self) -> None:
         budget = workspace.SecretScanBudget(1)
