@@ -396,6 +396,22 @@ class ClaudeCapabilitiesTest(unittest.TestCase):
                 with self.assertRaises(capabilities.ClaudeSafetyContractInvalid):
                     capabilities.validate_claude_help(help_text)
 
+    def test_help_rejects_disjunctive_runtime_guarantees(self) -> None:
+        base = supported_help()
+        for runtime_claim in (
+            "Auth or model selection or built-in tools or permissions work normally.",
+            "Auth, model selection, built-in tools, or permissions work normally.",
+            "Auth and model selection and built-in tools or permissions work normally.",
+        ):
+            with self.subTest(runtime_claim=runtime_claim):
+                help_text = base.replace(
+                    "Auth, model selection, built-in tools, and permissions work "
+                    "normally.",
+                    runtime_claim,
+                )
+                with self.assertRaises(capabilities.ClaudeSafetyContractInvalid):
+                    capabilities.validate_claude_help(help_text)
+
     def test_help_requires_bounded_terms_and_rejects_conflicting_states(self) -> None:
         base = supported_help()
         for label, help_text in (

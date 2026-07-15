@@ -842,6 +842,20 @@ superseded_by:
   then materialized a single-link mode-`0500` digest snapshot. No credential or
   review content was supplied, and the smoke's temporary GPG/snapshot roots
   were removed automatically.
+- The final independent Codex PR review of
+  `27b054c171516288226f92473aee882a7b0c2652..fe197f9ad7aea023738cd3c1b7c18d43cd6d48c8`
+  found one P1 in the bounded safe-mode help grammar: the required runtime
+  capability sentence accepted `or` between authentication, model selection,
+  built-in tools, and permissions, so a disjunctive claim could satisfy the
+  lexical all-term check without guaranteeing every capability. The repair
+  permits only conjunctive enumeration in that positive runtime grammar and
+  adds regressions for all-`or`, Oxford-comma-`or`, and mixed `and`/`or`
+  variants. The focused capability suite passed all 27 tests. The complete
+  post-merge suite passed all 671 tests in 111.205 seconds with nine skips;
+  `ruff check`, Python 3.10 grammar parsing, `compileall`, actionlint, the
+  isolated skill validator, project-journal validation, and `git diff --check`
+  passed. A credential-free real help smoke also accepted all 16 required
+  options from installed Claude Code `2.1.202` under the tightened grammar.
 - Anthropic installation, signed-manifest, release-key fingerprint, and platform
   signature documentation: https://code.claude.com/docs/en/installation
 - Anthropic Seatbelt, `bubblewrap`, `socat`, WSL2, and WSL1 sandboxing

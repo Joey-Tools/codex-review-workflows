@@ -172,7 +172,7 @@ _CLAUDE_SAFE_MODE_RUNTIME_TARGET = (
 )
 _CLAUDE_SAFE_MODE_RUNTIME_TARGETS = (
     _CLAUDE_SAFE_MODE_RUNTIME_TARGET
-    + r"(?:\s*(?:,\s*(?:(?:and|or)\s+)?|(?:and|or)\s+)"
+    + r"(?:\s*(?:,\s*(?:and\s+)?|and\s+)"
     + _CLAUDE_SAFE_MODE_RUNTIME_TARGET
     + r")*"
 )
