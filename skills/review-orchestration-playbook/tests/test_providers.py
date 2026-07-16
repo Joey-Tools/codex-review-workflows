@@ -3875,38 +3875,70 @@ class ProviderPolicyTest(unittest.TestCase):
         return_value=pathlib.Path("/bin/copilot"),
     )
     @mock.patch.object(providers, "_copilot_attempt")
-    def test_stale_claude_credential_allows_authorized_copilot_fallback(
+    def test_attempt_local_auth_unavailable_allows_authorized_copilot_fallback(
         self,
         copilot_attempt: mock.Mock,
         resolve: mock.Mock,
         _resolve_claude: mock.Mock,
         _environment: mock.Mock,
     ) -> None:
-        self.warmup.side_effect = (
-            providers.ClaudeKeychainCredentialUnavailable("credential remains stale")
-        )
-        copilot_attempt.return_value = self.attempt(
-            "copilot",
-            providers.COPILOT_MODELS[0],
-            "success",
-            final_text="No findings.",
-        )
-
-        outcome = providers.run_review(
-            review=self.review,
-            reviewer="claude",
-            egress_consent="double-review",
-        )
-
-        self.assertEqual(outcome.returncode, 0)
-        copilot_attempt.assert_called_once()
-        resolve.assert_called_once_with("copilot")
-        self.assertIn(
-            "credential remains stale",
-            (self.review.container_dir / "claude-skip.txt").read_text(
-                encoding="utf-8"
+        cases = (
+            providers.ClaudeKeychainCredentialUnavailable(
+                "credential remains stale"
+            ),
+            providers.ClaudeKeychainBrokerUnavailable(
+                "credential broker is unavailable"
             ),
         )
+        for error in cases:
+            with self.subTest(error_type=type(error).__name__):
+                self.warmup.reset_mock()
+                copilot_attempt.reset_mock()
+                resolve.reset_mock()
+                self.warmup.side_effect = error
+                copilot_attempt.return_value = self.attempt(
+                    "copilot",
+                    providers.COPILOT_MODELS[0],
+                    "success",
+                    final_text="No findings.",
+                )
+                providers.write_json(
+                    self.review.container_dir / "claude-runtime.json",
+                    {
+                        "phase": "publisher-and-capabilities-verified",
+                        "outer_sandbox": {"status": "pending-runtime-launch"},
+                        "authentication": {"status": "pending"},
+                    },
+                )
+
+                outcome = providers.run_review(
+                    review=self.review,
+                    reviewer="claude",
+                    egress_consent="double-review",
+                )
+
+                self.assertEqual(outcome.returncode, 0)
+                copilot_attempt.assert_called_once()
+                resolve.assert_called_once_with("copilot")
+                self.assertIn(
+                    str(error),
+                    (self.review.container_dir / "claude-skip.txt").read_text(
+                        encoding="utf-8"
+                    ),
+                )
+                report = json.loads(
+                    (self.review.container_dir / "claude-runtime.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(
+                    report["phase"],
+                    "authentication-preflight-unavailable",
+                )
+                self.assertEqual(
+                    report["authentication"]["status"],
+                    "unavailable",
+                )
 
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(
@@ -4198,7 +4230,7 @@ class ProviderPolicyTest(unittest.TestCase):
     )
     @mock.patch.object(providers, "_copilot_attempt")
     @mock.patch.object(providers, "_claude_attempt")
-    def test_second_model_credential_unavailable_allows_authorized_fallback(
+    def test_second_model_local_auth_unavailable_allows_authorized_fallback(
         self,
         claude_attempt: mock.Mock,
         copilot_attempt: mock.Mock,
@@ -4206,36 +4238,47 @@ class ProviderPolicyTest(unittest.TestCase):
         _resolve_claude: mock.Mock,
         _environment: mock.Mock,
     ) -> None:
-        first = self.attempt(
-            "claude",
-            providers.CLAUDE_MODELS[0],
-            "entitlement",
-        )
-        claude_attempt.side_effect = (
-            first,
+        errors = (
             providers.ClaudeKeychainCredentialUnavailable(
                 "second model credential is unavailable"
             ),
+            providers.ClaudeKeychainBrokerUnavailable(
+                "second model credential broker is unavailable"
+            ),
         )
-        copilot_attempt.return_value = self.attempt(
-            "copilot",
-            providers.COPILOT_MODELS[0],
-            "success",
-            final_text="No findings.",
-        )
+        for error in errors:
+            with self.subTest(error_type=type(error).__name__):
+                claude_attempt.reset_mock()
+                copilot_attempt.reset_mock()
+                resolve.reset_mock()
+                first = self.attempt(
+                    "claude",
+                    providers.CLAUDE_MODELS[0],
+                    "entitlement",
+                )
+                claude_attempt.side_effect = (first, error)
+                copilot_attempt.return_value = self.attempt(
+                    "copilot",
+                    providers.COPILOT_MODELS[0],
+                    "success",
+                    final_text="No findings.",
+                )
 
-        outcome = providers.run_review(
-            review=self.review,
-            reviewer="claude",
-            egress_consent="triple-review",
-        )
+                outcome = providers.run_review(
+                    review=self.review,
+                    reviewer="claude",
+                    egress_consent="triple-review",
+                )
 
-        self.assertEqual(outcome.returncode, 0)
-        self.assertEqual(outcome.attempts[0], first)
-        self.assertEqual(outcome.attempts[1].runtime, "copilot")
-        self.assertEqual(claude_attempt.call_count, len(providers.CLAUDE_MODELS))
-        copilot_attempt.assert_called_once()
-        resolve.assert_called_once_with("copilot")
+                self.assertEqual(outcome.returncode, 0)
+                self.assertEqual(outcome.attempts[0], first)
+                self.assertEqual(outcome.attempts[1].runtime, "copilot")
+                self.assertEqual(
+                    claude_attempt.call_count,
+                    len(providers.CLAUDE_MODELS),
+                )
+                copilot_attempt.assert_called_once()
+                resolve.assert_called_once_with("copilot")
 
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(
@@ -4246,7 +4289,7 @@ class ProviderPolicyTest(unittest.TestCase):
     @mock.patch.object(providers, "resolve_reviewer_executable")
     @mock.patch.object(providers, "_copilot_attempt")
     @mock.patch.object(providers, "_claude_attempt")
-    def test_second_model_credential_unavailable_needs_fallback_consent(
+    def test_second_model_local_auth_unavailable_needs_fallback_consent(
         self,
         claude_attempt: mock.Mock,
         copilot_attempt: mock.Mock,
@@ -4254,34 +4297,42 @@ class ProviderPolicyTest(unittest.TestCase):
         _resolve_claude: mock.Mock,
         _environment: mock.Mock,
     ) -> None:
-        first = self.attempt(
-            "claude",
-            providers.CLAUDE_MODELS[0],
-            "entitlement",
-        )
-        claude_attempt.side_effect = (
-            first,
+        errors = (
             providers.ClaudeKeychainCredentialUnavailable(
                 "second model credential is unavailable"
             ),
-        )
-
-        outcome = providers.run_review(
-            review=self.review,
-            reviewer="claude",
-            egress_consent="explicit-claude-review",
-        )
-
-        self.assertEqual(outcome.returncode, 2)
-        self.assertEqual(outcome.attempts, (first,))
-        copilot_attempt.assert_not_called()
-        resolve.assert_not_called()
-        self.assertIn(
-            "does not authorize GitHub Copilot",
-            (self.review.container_dir / "runner-error.txt").read_text(
-                encoding="utf-8"
+            providers.ClaudeKeychainBrokerUnavailable(
+                "second model credential broker is unavailable"
             ),
         )
+        for error in errors:
+            with self.subTest(error_type=type(error).__name__):
+                claude_attempt.reset_mock()
+                copilot_attempt.reset_mock()
+                resolve.reset_mock()
+                first = self.attempt(
+                    "claude",
+                    providers.CLAUDE_MODELS[0],
+                    "entitlement",
+                )
+                claude_attempt.side_effect = (first, error)
+
+                outcome = providers.run_review(
+                    review=self.review,
+                    reviewer="claude",
+                    egress_consent="explicit-claude-review",
+                )
+
+                self.assertEqual(outcome.returncode, 2)
+                self.assertEqual(outcome.attempts, (first,))
+                copilot_attempt.assert_not_called()
+                resolve.assert_not_called()
+                self.assertIn(
+                    "does not authorize GitHub Copilot",
+                    (self.review.container_dir / "runner-error.txt").read_text(
+                        encoding="utf-8"
+                    ),
+                )
 
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(

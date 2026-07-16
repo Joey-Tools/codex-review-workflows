@@ -4325,7 +4325,10 @@ def _claude_attempt(
                     },
                 )
                 raise
-            except ClaudeKeychainCredentialUnavailable:
+            except (
+                ClaudeKeychainBrokerUnavailable,
+                ClaudeKeychainCredentialUnavailable,
+            ):
                 _update_claude_runtime_report(
                     review,
                     {
@@ -4941,6 +4944,7 @@ def run_review(
             _write_attempts(review, attempts)
             return Outcome(75, None, tuple(attempts))
         except (
+            ClaudeKeychainBrokerUnavailable,
             ClaudeKeychainCredentialUnavailable,
             ClaudeReviewToolUnavailable,
             ClaudeLoopbackUnavailable,

@@ -78,6 +78,10 @@ capabilities workstreams.
   prepared TLS CA copies. Whole-chain TLS preparation was removed; each attempt
   now performs exactly one preparation before warmup/final runtime, avoiding
   duplicate CA directories while preserving the attempt-boundary ordering.
+- The next follow-up found that an attempt-local restricted Keychain broker
+  failure was not included in the inner unavailable branch. It now records
+  `authentication-preflight-unavailable`, preserves earlier attempts, and uses
+  the same consent-gated fallback policy as an unavailable credential.
 - Strict Clang syntax checks passed for the unchanged Keychain broker and Linux
   launcher, including the production POSIX feature macro for the launcher.
 - Both workflow actionlint checks, the isolated PyYAML skill validator,

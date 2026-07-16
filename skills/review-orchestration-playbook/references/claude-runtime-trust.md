@@ -624,6 +624,9 @@ reached:
    warmup failure class without inventing a formal review attempt. This includes
    supervision failures from the credential freshness read immediately before
    or after the warmup.
+   `authentication-preflight-unavailable` also covers an attempt-local failure
+   of the restricted Keychain broker, with the same consent-gated fallback
+   policy as an unavailable credential.
    `authentication-preflight-entitlement` records a strict, exact-model-verified
    warmup entitlement attempt while keeping `outer_sandbox.status` at
    `pending-runtime-launch` and `validated_for_model` unset. This is fallback
