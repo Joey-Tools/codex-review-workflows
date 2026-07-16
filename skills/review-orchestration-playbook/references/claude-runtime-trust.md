@@ -550,7 +550,10 @@ model attempt repeats this refresh-if-needed and validation sequence. A
 strictly structured, exact-model-verified entitlement denial from the warmup is
 recorded only as model-chain fallback evidence with no final text; it skips the
 final broker and repository-review launch, and the next model still starts from
-its own freshness boundary.
+its own freshness boundary. Its bounded complete stdout/stderr capture is copied
+to the formal attempt logs after the temporary warmup output directory closes.
+An explicit authentication failure remains unavailable even when the refreshed
+Keychain item is structurally fresh enough for a later attempt.
 
 On Linux and WSL2, every model attempt validates the documented Claude Code
 credential file as a non-symlink regular file owned by the current user with

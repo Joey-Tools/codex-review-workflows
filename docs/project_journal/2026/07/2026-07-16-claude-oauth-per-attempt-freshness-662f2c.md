@@ -48,7 +48,10 @@ capabilities workstreams.
   It has no final text, does not start the final broker or repository-review
   sandbox, and leaves credential freshness unvalidated. Missing or mismatched
   model metadata stops the lane without fallback, while the next entitled model
-  still repeats its own credential-boundary refresh and validation.
+  still repeats its own credential-boundary refresh and validation. Its complete
+  bounded stdout/stderr is copied into the persistent formal attempt logs, and
+  an explicit authentication failure stays unavailable even if refresh produced
+  a structurally fresh credential.
 - The trusted executable snapshot remains reusable across the model chain;
   credential freshness is the per-attempt boundary that is re-evaluated.
 
@@ -57,11 +60,11 @@ capabilities workstreams.
 - Python compile checks passed for the helper scripts and complete runtime/test
   trees.
 - Full runtime/test `ruff check` passed.
-- Focused provider and contract suite: 259 tests run; 6 skipped and the suite
+- Focused provider and contract suite: 260 tests run; 6 skipped and the suite
   passed. The entitlement-preflight routing, exact-model verification,
   next-model revalidation, no-final-broker path, and final
   transient-after-refresh regressions also passed separately.
-- Full helper suite on current `master`: 689 tests run; 9 skipped and the suite
+- Full helper suite on current `master`: 690 tests run; 9 skipped and the suite
   passed.
 - Strict Clang syntax checks passed for the unchanged Keychain broker and Linux
   launcher, including the production POSIX feature macro for the launcher.

@@ -1189,6 +1189,14 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(attempt.category, "entitlement")
         self.assertEqual(attempt.effective_model, model)
         self.assertIsNone(attempt.final_text)
+        self.assertEqual(
+            pathlib.Path(attempt.stdout_path).read_bytes(),
+            completed.stdout,
+        )
+        self.assertEqual(
+            pathlib.Path(attempt.stderr_path).read_bytes(),
+            completed.stderr,
+        )
         run_command.assert_not_called()
         providers._claude_keychain_runtime.assert_not_called()
         report = json.loads(
@@ -1513,6 +1521,37 @@ class ProviderPolicyTest(unittest.TestCase):
                 {},
                 providers.CLAUDE_MODELS[0],
             )
+
+    @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
+    @mock.patch.object(providers, "_run_claude_auth_warmup")
+    def test_auth_warmup_remains_unavailable_after_credential_refresh(
+        self,
+        warmup: mock.Mock,
+        require_fresh: mock.Mock,
+    ) -> None:
+        require_fresh.side_effect = (
+            providers.ClaudeKeychainCredentialUnavailable("stale"),
+            None,
+        )
+        warmup.return_value = Completed(
+            argv=("claude",),
+            returncode=1,
+            stdout=b"",
+            stderr=b"authentication failed",
+        )
+
+        with self.assertRaisesRegex(
+            providers.ClaudeKeychainCredentialUnavailable,
+            "warmup reported an authentication failure",
+        ):
+            self.warm_claude_local_login(
+                self.review,
+                pathlib.Path("/bin/claude"),
+                {},
+                providers.CLAUDE_MODELS[0],
+            )
+
+        self.assertEqual(require_fresh.call_count, 2)
 
     @mock.patch.object(
         providers,

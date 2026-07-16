@@ -2219,10 +2219,14 @@ def _warm_claude_local_login(
         raise inconclusive
     if category == "entitlement":
         raise ClaudeAuthWarmupEntitlement(warmup)
+    if category == "auth":
+        if credential_error is not None:
+            raise credential_error
+        raise ClaudeKeychainCredentialUnavailable(
+            "Claude authentication warmup reported an authentication failure"
+        )
     if credential_error is None:
         return
-    if category == "auth":
-        raise credential_error
     raise ClaudeAuthWarmupInconclusive(
         "Claude authentication warmup did not produce a fresh credential "
         f"({category})"

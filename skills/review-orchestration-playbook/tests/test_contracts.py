@@ -157,6 +157,11 @@ class RepositoryContractTest(unittest.TestCase):
             "with no final text and without claiming that the final broker",
             helper_contract,
         )
+        self.assertIn("full stdout/stderr is retained", helper_contract)
+        self.assertIn(
+            "authentication failure remains unavailable",
+            helper_contract,
+        )
         self.assertIn(
             "missing or mismatched model metadata stops the",
             runtime_trust,
