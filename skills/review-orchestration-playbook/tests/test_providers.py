@@ -836,6 +836,29 @@ class ProviderPolicyTest(unittest.TestCase):
         ):
             self.native_macho_dependencies(missing, label="Claude Code")
 
+    def test_claude_probe_launch_access_io_is_inconclusive(self) -> None:
+        with (
+            mock.patch.object(
+                providers,
+                "_claude_probe_command",
+                return_value=("/verified/claude", "--version"),
+            ),
+            mock.patch.object(
+                providers,
+                "run",
+                side_effect=PermissionError(errno.EACCES, "launch denied"),
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "launch denied",
+            ),
+        ):
+            providers._run_claude_probe(
+                pathlib.Path("/verified/claude"),
+                {"HOME": str(self.review.container_dir)},
+                "--version",
+            )
+
     def test_claude_keychain_broker_compiles_and_rejects_other_queries(self) -> None:
         if (
             sys.platform != "darwin"
@@ -2211,6 +2234,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     "subtype": "error_during_execution",
                     "is_error": True,
                     "api_error_status": 429,
+                    "modelUsage": {providers.CLAUDE_MODELS[0]: {}},
                 }
             ).encode(),
             stderr=b"",
@@ -2247,6 +2271,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     "subtype": "error_during_execution",
                     "is_error": True,
                     "api_error_status": 429,
+                    "modelUsage": {providers.CLAUDE_MODELS[0]: {}},
                 }
             ).encode(),
             stderr=b"",
@@ -2285,6 +2310,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     "subtype": "error_during_execution",
                     "is_error": True,
                     "api_error_status": 429,
+                    "modelUsage": {providers.CLAUDE_MODELS[0]: {}},
                 }
             ).encode(),
             stderr=b"",
@@ -2511,6 +2537,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     "subtype": "error_during_execution",
                     "is_error": True,
                     "result": "Not logged in - please run /login",
+                    "modelUsage": {providers.CLAUDE_MODELS[0]: {}},
                 }
             ).encode(),
             stderr=b"",
@@ -2555,6 +2582,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     "subtype": "error_during_execution",
                     "is_error": True,
                     "result": "Not logged in - please run /login",
+                    "modelUsage": {providers.CLAUDE_MODELS[0]: {}},
                 }
             ).encode(),
             stderr=b"Model is not available for your account plan",
@@ -2599,6 +2627,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     "subtype": "error_during_execution",
                     "is_error": True,
                     "result": "Not logged in - please run /login",
+                    "modelUsage": {providers.CLAUDE_MODELS[0]: {}},
                 }
             ).encode(),
             stderr=b"",
@@ -2638,6 +2667,7 @@ class ProviderPolicyTest(unittest.TestCase):
             "subtype": "error_during_execution",
             "is_error": True,
             "result": "Not logged in - please run /login",
+            "modelUsage": {providers.CLAUDE_MODELS[0]: {}},
         }
         for overrides in cases:
             with self.subTest(overrides=overrides):
@@ -3176,6 +3206,7 @@ class ProviderPolicyTest(unittest.TestCase):
             "subtype": "error_during_execution",
             "is_error": True,
             "result": "Not logged in - please run /login",
+            "modelUsage": {providers.CLAUDE_MODELS[0]: {}},
         }
         exact = self.record_claude_result(
             json.dumps(base).encode(),
@@ -3268,6 +3299,86 @@ class ProviderPolicyTest(unittest.TestCase):
                 self.assertEqual(attempt.reason, expected_reason)
                 self.assertIsNone(attempt.final_text)
 
+    def test_exact_auth_requires_matching_requested_model_usage(self) -> None:
+        model = providers.CLAUDE_MODELS[0]
+        base = {
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": True,
+            "result": "Not logged in - please run /login",
+        }
+        cases = (
+            ("missing", None, "inconclusive", "unverified-auth-failure-envelope"),
+            ("malformed", [], "runtime-unverified", "malformed-model-usage"),
+            (
+                "wrong",
+                {providers.CLAUDE_MODELS[1]: {}},
+                "model-mismatch",
+                "effective-model-mismatch",
+            ),
+            ("matching", {model: {}}, "auth", "structured-authentication"),
+        )
+
+        for index, (name, model_usage, category, reason) in enumerate(
+            cases,
+            start=150,
+        ):
+            payload = dict(base)
+            if name != "missing":
+                payload["modelUsage"] = model_usage
+            encoded = json.dumps(payload).encode()
+            with self.subTest(name=name):
+                self.assertEqual(
+                    providers._claude_supported_failure_category(
+                        encoded,
+                        requested_model=model,
+                    ),
+                    "auth" if name == "matching" else None,
+                )
+                attempt = self.record_claude_result(encoded, index=index)
+                self.assertEqual(attempt.category, category)
+                self.assertEqual(attempt.reason, reason)
+                self.assertIsNone(attempt.final_text)
+
+    def test_all_supported_failures_require_requested_model_binding(self) -> None:
+        model = providers.CLAUDE_MODELS[0]
+        wrong_model = providers.CLAUDE_MODELS[1]
+        payloads = {
+            "auth": {"result": "Not logged in - please run /login"},
+            "entitlement": {
+                "error": {
+                    "code": "model_access_denied",
+                    "message": "request rejected",
+                },
+            },
+            "transient": {"api_error_status": 429},
+        }
+        model_usage_cases = {
+            "missing": None,
+            "malformed": [],
+            "wrong": {wrong_model: {}},
+            "matching": {model: {}},
+        }
+
+        for category, category_payload in payloads.items():
+            for usage_name, model_usage in model_usage_cases.items():
+                payload = {
+                    "type": "result",
+                    "subtype": "error_during_execution",
+                    "is_error": True,
+                    **category_payload,
+                }
+                if usage_name != "missing":
+                    payload["modelUsage"] = model_usage
+                with self.subTest(category=category, model_usage=usage_name):
+                    self.assertEqual(
+                        providers._claude_supported_failure_category(
+                            json.dumps(payload).encode(),
+                            requested_model=model,
+                        ),
+                        category if usage_name == "matching" else None,
+                    )
+
     def test_claude_entitlement_rejects_stderr_only_evidence(self) -> None:
         model = providers.CLAUDE_MODELS[0]
         stdout = json.dumps(
@@ -3307,6 +3418,7 @@ class ProviderPolicyTest(unittest.TestCase):
             "subtype": "error_during_execution",
             "is_error": True,
             "error": {"message": "network error while contacting the provider"},
+            "modelUsage": {providers.CLAUDE_MODELS[0]: {}},
         }
         for index, returncode in enumerate((0, 1), start=109):
             with self.subTest(returncode=returncode, shape="exact"):
@@ -3516,17 +3628,25 @@ class ProviderPolicyTest(unittest.TestCase):
             json.dumps({**base, "modelUsage": []}).encode(),
             index=102,
         )
+        wrong = self.record_claude_result(
+            json.dumps(
+                {**base, "modelUsage": {providers.CLAUDE_MODELS[1]: {}}}
+            ).encode(),
+            index=103,
+        )
         matching = self.record_claude_result(
             json.dumps(
                 {**base, "modelUsage": {providers.CLAUDE_MODELS[0]: {}}}
             ).encode(),
-            index=103,
+            index=104,
         )
 
         self.assertEqual(missing.category, "inconclusive")
         self.assertEqual(missing.reason, "unverified-entitlement-failure-envelope")
         self.assertEqual(malformed.category, "runtime-unverified")
         self.assertEqual(malformed.reason, "malformed-model-usage")
+        self.assertEqual(wrong.category, "model-mismatch")
+        self.assertEqual(wrong.reason, "effective-model-mismatch")
         self.assertEqual(matching.category, "entitlement")
 
     def test_claude_fallback_envelope_uses_exact_recursive_allowlists(self) -> None:
@@ -6038,6 +6158,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     "subtype": "error_during_execution",
                     "is_error": True,
                     "api_error_status": 429,
+                    "modelUsage": {providers.CLAUDE_MODELS[1]: {}},
                 }
             ).encode(),
             stderr=b"",
@@ -8525,6 +8646,10 @@ class ProviderPolicyTest(unittest.TestCase):
         )
 
         def resolve_and_validate(_name: str, **kwargs) -> pathlib.Path:
+            self.assertIs(
+                kwargs["inspection_error"],
+                providers.ClaudeExecutableInspectionInconclusive,
+            )
             kwargs["candidate_validator"](candidate)
             return candidate
 
@@ -8845,6 +8970,114 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
             evidence.bundled_root_sha256_fingerprints,
         )
+
+    def test_bundled_root_verification_directory_creation_io_is_inconclusive(
+        self,
+    ) -> None:
+        certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+
+        with (
+            mock.patch.object(
+                providers.tempfile,
+                "TemporaryDirectory",
+                side_effect=OSError(errno.EIO, "mkdir failed"),
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "cannot create Claude bundled root verification directory",
+            ),
+        ):
+            providers._validated_bundled_root_certificates(
+                certificate,
+                executable=self.review.container_dir / "verified-claude",
+            )
+
+    def test_bundled_root_creation_programmer_error_is_not_reclassified(self) -> None:
+        certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+
+        with (
+            mock.patch.object(
+                providers.tempfile,
+                "TemporaryDirectory",
+                side_effect=RuntimeError("temporary directory bug"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "temporary directory bug"),
+        ):
+            providers._validated_bundled_root_certificates(
+                certificate,
+                executable=self.review.container_dir / "verified-claude",
+            )
+
+    def test_bundled_root_verification_cleanup_io_is_inconclusive(self) -> None:
+        certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+        directory = mock.MagicMock()
+        directory.__enter__.return_value = str(self.review.container_dir / "verify")
+        directory.__exit__.side_effect = OSError(errno.EIO, "cleanup failed")
+
+        with (
+            mock.patch.object(
+                providers.tempfile,
+                "TemporaryDirectory",
+                return_value=directory,
+            ),
+            mock.patch.object(providers, "_require_bundled_root_self_signature"),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "cannot clean up Claude bundled root verification directory",
+            ),
+        ):
+            providers._validated_bundled_root_certificates(
+                certificate,
+                executable=self.review.container_dir / "verified-claude",
+            )
+
+    def test_bundled_root_cleanup_preserves_active_policy_error(self) -> None:
+        certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+        directory = mock.MagicMock()
+        directory.__enter__.return_value = str(self.review.container_dir / "verify")
+        directory.__exit__.side_effect = OSError(errno.EIO, "cleanup failed")
+        policy_error = providers.ClaudeTrustCertificateInvalid("invalid root")
+
+        with (
+            mock.patch.object(
+                providers.tempfile,
+                "TemporaryDirectory",
+                return_value=directory,
+            ),
+            mock.patch.object(
+                providers,
+                "_require_unconditional_root_extensions",
+                side_effect=policy_error,
+            ),
+            self.assertRaises(providers.ClaudeTrustCertificateInvalid) as raised,
+        ):
+            providers._validated_bundled_root_certificates(
+                certificate,
+                executable=self.review.container_dir / "verified-claude",
+            )
+
+        self.assertIs(raised.exception, policy_error)
+        directory.__exit__.assert_called_once()
+
+    def test_bundled_root_cleanup_programmer_error_is_not_reclassified(self) -> None:
+        certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+        directory = mock.MagicMock()
+        directory.__enter__.return_value = str(self.review.container_dir / "verify")
+        directory.__exit__.side_effect = RuntimeError("cleanup bug")
+
+        with (
+            mock.patch.object(
+                providers.tempfile,
+                "TemporaryDirectory",
+                return_value=directory,
+            ),
+            mock.patch.object(providers, "_require_bundled_root_self_signature"),
+            self.assertRaisesRegex(RuntimeError, "cleanup bug"),
+        ):
+            providers._validated_bundled_root_certificates(
+                certificate,
+                executable=self.review.container_dir / "verified-claude",
+            )
 
     def test_verified_macos_snapshot_accepts_root_without_key_usage(self) -> None:
         certificate = (
@@ -10036,6 +10269,7 @@ class ProviderPolicyTest(unittest.TestCase):
         mixed = "E" * 40
         constrained_result = "F" * 40
         implicit_trust_root = "0" * 40
+        dual_authorization = "1" * 40
         classified = providers._classify_trust_fingerprints(
             plistlib.dumps(
                 {
@@ -10062,6 +10296,20 @@ class ProviderPolicyTest(unittest.TestCase):
                                         providers.CLAUDE_TRUST_RESULT_TRUST_AS_ROOT
                                     )
                                 }
+                            ]
+                        },
+                        dual_authorization: {
+                            "trustSettings": [
+                                {
+                                    providers.CLAUDE_TRUST_RESULT_KEY: (
+                                        providers.CLAUDE_TRUST_RESULT_TRUST_ROOT
+                                    )
+                                },
+                                {
+                                    providers.CLAUDE_TRUST_RESULT_KEY: (
+                                        providers.CLAUDE_TRUST_RESULT_TRUST_AS_ROOT
+                                    )
+                                },
                             ]
                         },
                         mixed: {
@@ -10100,13 +10348,27 @@ class ProviderPolicyTest(unittest.TestCase):
                         trust_root,
                         trust_as_root,
                         mixed,
+                        dual_authorization,
                     )
                 )
             ),
         )
         self.assertEqual(
             classified.trust_as_root,
-            tuple(sorted((trust_as_root, mixed))),
+            tuple(sorted((trust_as_root, mixed, dual_authorization))),
+        )
+        self.assertEqual(
+            classified.trust_root,
+            tuple(
+                sorted(
+                    (
+                        empty,
+                        implicit_trust_root,
+                        trust_root,
+                        dual_authorization,
+                    )
+                )
+            ),
         )
         self.assertEqual(
             classified.constrained,
@@ -10347,6 +10609,51 @@ class ProviderPolicyTest(unittest.TestCase):
                 ca_root=self.review.container_dir,
                 timeout_seconds=1.0,
                 allow_non_self_signed=True,
+            )
+
+    def test_dual_trust_authorization_accepts_root_or_intermediate(self) -> None:
+        self_signed = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+        _intermediate_der, intermediate = self.non_self_issued_ca_fixture()
+        cases = (
+            ("self-signed", self_signed, False, [False]),
+            ("intermediate", intermediate, True, [False, True]),
+        )
+
+        for name, certificate, accepted_mode, expected_modes in cases:
+            fingerprint = self.ca_sha1_fingerprint(certificate)
+            observed_modes: list[bool] = []
+
+            def verify(*_args, allow_non_self_signed: bool, **_kwargs) -> None:
+                observed_modes.append(allow_non_self_signed)
+                if allow_non_self_signed != accepted_mode:
+                    raise providers.ClaudeTrustCertificateInvalid(
+                        "authorization does not match certificate kind"
+                    )
+
+            with (
+                self.subTest(name=name),
+                mock.patch.object(
+                    providers,
+                    "_verify_unconditional_trust_root",
+                    side_effect=verify,
+                ),
+            ):
+                selected = providers._select_trust_certificates(
+                    ((name, certificate),),
+                    (fingerprint,),
+                    ca_root=self.review.container_dir,
+                    trust_root_fingerprints=(fingerprint,),
+                    trust_as_root_fingerprints=(fingerprint,),
+                )
+
+            self.assertEqual(observed_modes, expected_modes)
+            self.assertEqual(selected.omitted_sha1_fingerprints, frozenset())
+            self.assertEqual(
+                providers._ca_sha256_fingerprints(
+                    selected.certificates,
+                    source=f"{name} dual authorization",
+                ),
+                frozenset({self.ca_sha256_fingerprint(certificate)}),
             )
 
     def test_trust_as_root_rejects_semantically_self_issued_name_variant(
@@ -10897,6 +11204,160 @@ class ProviderPolicyTest(unittest.TestCase):
             select.call_args.kwargs["trust_as_root_fingerprints"],
             [],
         )
+        self.assertEqual(
+            select.call_args.kwargs["trust_root_fingerprints"],
+            [fingerprint],
+        )
+
+    def test_lower_priority_domain_cannot_change_anchor_authorizations(self) -> None:
+        fingerprint = "A" * 40
+        cases = (
+            (
+                "trust-as-root",
+                providers.ClaudeTrustFingerprints(
+                    unconditional=(fingerprint,),
+                    trust_as_root=(fingerprint,),
+                    constrained=(),
+                ),
+                providers.ClaudeTrustFingerprints(
+                    unconditional=(fingerprint,),
+                    trust_as_root=(),
+                    constrained=(),
+                    trust_root=(fingerprint,),
+                ),
+                [],
+                [fingerprint],
+            ),
+            (
+                "dual-authorization",
+                providers.ClaudeTrustFingerprints(
+                    unconditional=(fingerprint,),
+                    trust_as_root=(fingerprint,),
+                    constrained=(),
+                    trust_root=(fingerprint,),
+                ),
+                providers.ClaudeTrustFingerprints(
+                    unconditional=(),
+                    trust_as_root=(),
+                    constrained=(fingerprint,),
+                ),
+                [fingerprint],
+                [fingerprint],
+            ),
+        )
+
+        for name, user, admin, expected_root, expected_as_root in cases:
+            classifications = {"user": user, "admin": admin, "system": None}
+
+            def read_domain(*_args, domain, **_kwargs):
+                return classifications[domain]
+
+            def export_certificates(argv, **_kwargs):
+                return common.BoundedCapture(
+                    argv=tuple(argv),
+                    returncode=0,
+                    stdout=bytearray(),
+                    stderr=bytearray(),
+                )
+
+            evidence = providers._new_claude_trust_policy_evidence(
+                self.claude_executable_evidence
+            )
+            selected = providers.ClaudeSelectedTrustMaterial(
+                certificates=b"selected",
+                omitted_sha1_fingerprints=frozenset(),
+            )
+            with (
+                self.subTest(name=name),
+                mock.patch.object(
+                    providers,
+                    "_require_claude_trust_export_tool",
+                    return_value=(pathlib.Path("/usr/bin/security"), {}),
+                ),
+                mock.patch.object(
+                    providers,
+                    "_read_claude_trust_domain",
+                    side_effect=read_domain,
+                ),
+                mock.patch.object(
+                    providers,
+                    "run_bounded_capture",
+                    side_effect=export_certificates,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_select_trust_certificates",
+                    return_value=selected,
+                ) as select,
+            ):
+                material = providers._read_claude_trust_certificates(
+                    self.review,
+                    self.review.container_dir,
+                    evidence=evidence,
+                )
+
+            self.assertEqual(material.certificates, b"selected")
+            self.assertEqual(material.excluded_sha1_fingerprints, frozenset())
+            self.assertEqual(
+                select.call_args.kwargs["trust_root_fingerprints"],
+                expected_root,
+            )
+            self.assertEqual(
+                select.call_args.kwargs["trust_as_root_fingerprints"],
+                expected_as_root,
+            )
+
+    def test_higher_priority_constraint_blocks_lower_dual_authorization(self) -> None:
+        fingerprint = "A" * 40
+        classifications = {
+            "user": providers.ClaudeTrustFingerprints(
+                unconditional=(),
+                trust_as_root=(),
+                constrained=(fingerprint,),
+            ),
+            "admin": providers.ClaudeTrustFingerprints(
+                unconditional=(fingerprint,),
+                trust_as_root=(fingerprint,),
+                constrained=(),
+                trust_root=(fingerprint,),
+            ),
+            "system": None,
+        }
+
+        def read_domain(*_args, domain, **_kwargs):
+            return classifications[domain]
+
+        evidence = providers._new_claude_trust_policy_evidence(
+            self.claude_executable_evidence
+        )
+        with (
+            mock.patch.object(
+                providers,
+                "_require_claude_trust_export_tool",
+                return_value=(pathlib.Path("/usr/bin/security"), {}),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_claude_trust_domain",
+                side_effect=read_domain,
+            ),
+            mock.patch.object(providers, "run_bounded_capture") as export,
+            mock.patch.object(providers, "_select_trust_certificates") as select,
+        ):
+            material = providers._read_claude_trust_certificates(
+                self.review,
+                self.review.container_dir,
+                evidence=evidence,
+            )
+
+        self.assertEqual(material.certificates, b"")
+        self.assertEqual(
+            material.excluded_sha1_fingerprints,
+            frozenset({fingerprint}),
+        )
+        self.assertEqual(evidence["additional_unconditional_candidate_count"], 0)
+        export.assert_not_called()
+        select.assert_not_called()
 
     def test_trust_certificate_export_launch_io_is_inconclusive(self) -> None:
         certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
@@ -13073,6 +13534,72 @@ class ProviderPolicyTest(unittest.TestCase):
         )
 
         self.assertEqual(material, certificate)
+
+    def test_ca_path_reader_close_only_failure_is_inconclusive(self) -> None:
+        path = pathlib.Path("/fixture/ca.pem")
+        readers = (
+            providers._read_ca_path_from_parent_with_size,
+            providers._read_absolute_ca_path_with_size,
+        )
+
+        for reader in readers:
+            with (
+                self.subTest(reader=reader.__name__),
+                mock.patch.object(
+                    providers,
+                    "_open_stable_ca_directory",
+                    return_value=71,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_read_ca_path_at_with_size",
+                    return_value=(b"certificate", 11),
+                ),
+                mock.patch.object(
+                    providers.os,
+                    "close",
+                    side_effect=OSError(errno.EIO, "close failed"),
+                ),
+                self.assertRaisesRegex(
+                    providers.ClaudeExecutableInspectionInconclusive,
+                    "cannot close Claude review CA",
+                ),
+            ):
+                reader(path, source="fixture CA")
+
+    def test_ca_path_reader_cleanup_preserves_active_typed_error(self) -> None:
+        path = pathlib.Path("/fixture/ca.pem")
+        readers = (
+            providers._read_ca_path_from_parent_with_size,
+            providers._read_absolute_ca_path_with_size,
+        )
+
+        for reader in readers:
+            policy_error = providers.ClaudeTrustPolicyUnavailable(
+                f"{reader.__name__} policy failure"
+            )
+            with (
+                self.subTest(reader=reader.__name__),
+                mock.patch.object(
+                    providers,
+                    "_open_stable_ca_directory",
+                    return_value=73,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_read_ca_path_at_with_size",
+                    side_effect=policy_error,
+                ),
+                mock.patch.object(
+                    providers.os,
+                    "close",
+                    side_effect=OSError(errno.EIO, "close failed"),
+                ),
+                self.assertRaises(providers.ClaudeTrustPolicyUnavailable) as raised,
+            ):
+                reader(path, source="fixture CA")
+
+            self.assertIs(raised.exception, policy_error)
 
     def test_claude_tls_directory_symlink_rejects_unsafe_parent(self) -> None:
         source_dir = self.review.source_root / "unsafe-parent-source"

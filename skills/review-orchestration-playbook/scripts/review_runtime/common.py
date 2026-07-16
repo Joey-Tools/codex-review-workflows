@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import math
 import os
@@ -8,6 +9,7 @@ import re
 import select
 import signal
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -101,6 +103,7 @@ TRUSTED_PATH = os.pathsep.join(
         "/sbin",
     )
 )
+REVIEWER_EXECUTABLE_PATH_COMPONENT_LIMIT = 64
 
 BASE_ENV_KEYS = (
     "ALL_PROXY",
@@ -1133,10 +1136,221 @@ def _executable_identity_matches(
     return all(marker.lower() in output for marker in marker_values)
 
 
+def _executable_candidate_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _lexical_component_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+    )
+
+
+def _prove_reviewer_candidate_lexical_absence(
+    path: pathlib.Path,
+    *,
+    inspection_error: type[ReviewError],
+) -> None:
+    if not path.is_absolute():
+        raise inspection_error(
+            f"reviewer executable candidate absence requires an absolute path: {path}"
+        )
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise inspection_error(
+            "reviewer executable candidate absence requires O_NOFOLLOW"
+        )
+    components = path.parts[1:]
+    if not components or len(components) > REVIEWER_EXECUTABLE_PATH_COMPONENT_LIMIT:
+        raise inspection_error(
+            f"reviewer executable candidate path has an invalid component count: {path}"
+        )
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | nofollow
+    )
+    descriptors: list[int] = []
+    directory_records: list[tuple[int, str, os.stat_result]] = []
+    missing_component: tuple[int, str] | None = None
+    try:
+        try:
+            root_descriptor = os.open(path.anchor, directory_flags)
+        except OSError as error:
+            raise inspection_error(
+                f"cannot inspect reviewer executable path root for {path}: {error}"
+            ) from error
+        descriptors.append(root_descriptor)
+        current_directory = root_descriptor
+        for index, component in enumerate(components):
+            try:
+                metadata = os.lstat(component, dir_fd=current_directory)
+            except OSError as error:
+                if error.errno == errno.ENOENT:
+                    missing_component = (current_directory, component)
+                    break
+                raise inspection_error(
+                    f"cannot lstat reviewer executable path component for {path}: "
+                    f"{error}"
+                ) from error
+            if stat.S_ISLNK(metadata.st_mode):
+                raise inspection_error(
+                    f"reviewer executable candidate ENOENT involves a symlink: {path}"
+                )
+            if index == len(components) - 1:
+                raise inspection_error(
+                    f"reviewer executable candidate appeared during inspection: {path}"
+                )
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise inspection_error(
+                    f"reviewer executable candidate parent is not a directory: {path}"
+                )
+            try:
+                next_directory = os.open(
+                    component,
+                    directory_flags,
+                    dir_fd=current_directory,
+                )
+            except OSError as error:
+                raise inspection_error(
+                    f"reviewer executable candidate parent changed during inspection: "
+                    f"{path}: {error}"
+                ) from error
+            descriptors.append(next_directory)
+            try:
+                opened = os.fstat(next_directory)
+            except OSError as error:
+                raise inspection_error(
+                    f"cannot inspect reviewer executable candidate parent for {path}: "
+                    f"{error}"
+                ) from error
+            if _lexical_component_identity(metadata) != _lexical_component_identity(
+                opened
+            ):
+                raise inspection_error(
+                    f"reviewer executable candidate parent changed during inspection: "
+                    f"{path}"
+                )
+            directory_records.append(
+                (current_directory, component, metadata)
+            )
+            current_directory = next_directory
+        if missing_component is None:
+            raise inspection_error(
+                f"reviewer executable candidate absence could not be proven: {path}"
+            )
+        for parent_descriptor, component, expected in directory_records:
+            try:
+                current = os.lstat(component, dir_fd=parent_descriptor)
+            except OSError as error:
+                raise inspection_error(
+                    f"reviewer executable candidate parent changed during inspection: "
+                    f"{path}: {error}"
+                ) from error
+            if stat.S_ISLNK(current.st_mode) or (
+                _lexical_component_identity(expected)
+                != _lexical_component_identity(current)
+            ):
+                raise inspection_error(
+                    f"reviewer executable candidate parent changed during inspection: "
+                    f"{path}"
+                )
+        missing_parent, missing_name = missing_component
+        try:
+            os.lstat(missing_name, dir_fd=missing_parent)
+        except OSError as error:
+            if error.errno != errno.ENOENT:
+                raise inspection_error(
+                    f"cannot recheck missing reviewer executable component for "
+                    f"{path}: {error}"
+                ) from error
+        else:
+            raise inspection_error(
+                f"reviewer executable candidate appeared during inspection: {path}"
+            )
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+    else:
+        close_error: OSError | None = None
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                close_error = close_error or error
+        if close_error is not None:
+            raise inspection_error(
+                f"cannot close reviewer executable path inspection for {path}: "
+                f"{close_error}"
+            ) from close_error
+
+
+def _reviewer_candidate_is_executable(
+    path: pathlib.Path,
+    *,
+    inspection_error: type[ReviewError],
+) -> bool:
+    try:
+        before = path.stat()
+    except FileNotFoundError:
+        _prove_reviewer_candidate_lexical_absence(
+            path,
+            inspection_error=inspection_error,
+        )
+        return False
+    except OSError as error:
+        if error.errno == errno.ENOENT:
+            _prove_reviewer_candidate_lexical_absence(
+                path,
+                inspection_error=inspection_error,
+            )
+            return False
+        raise inspection_error(
+            f"cannot inspect reviewer executable candidate {path}: {error}"
+        ) from error
+    if not stat.S_ISREG(before.st_mode) or not before.st_mode & 0o111:
+        return False
+    try:
+        after = path.stat()
+    except OSError as error:
+        raise inspection_error(
+            f"reviewer executable candidate changed during inspection: {path}"
+        ) from error
+    if _executable_candidate_identity(before) != _executable_candidate_identity(
+        after
+    ):
+        raise inspection_error(
+            f"reviewer executable candidate changed during inspection: {path}"
+        )
+    return True
+
+
 def resolve_reviewer_executable(
     name: str,
     *,
     candidate_validator: Callable[[pathlib.Path], None] | None = None,
+    inspection_error: type[ReviewError] = ReviewError,
 ) -> pathlib.Path | None:
     specs = {
         "codex": (
@@ -1170,7 +1384,10 @@ def resolve_reviewer_executable(
         override = pathlib.Path(override_value).expanduser()
         if not override.is_absolute():
             raise ReviewError(f"{override_key} must be an absolute executable path")
-        if not override.is_file() or not os.access(override, os.X_OK):
+        if not _reviewer_candidate_is_executable(
+            override,
+            inspection_error=inspection_error,
+        ):
             raise ReviewError(f"{override_key} is not executable: {override}")
         if defer_identity and candidate_validator is not None:
             try:
@@ -1189,6 +1406,11 @@ def resolve_reviewer_executable(
     candidates = [
         *(pathlib.Path(value) for value in system_paths),
         *_user_executable_candidates(name),
+        *(
+            pathlib.Path(entry) / name
+            for entry in TRUSTED_PATH.split(os.pathsep)
+            if entry
+        ),
     ]
     discovered = shutil.which(name, path=TRUSTED_PATH)
     if discovered:
@@ -1200,7 +1422,10 @@ def resolve_reviewer_executable(
         if key in seen:
             continue
         seen.add(key)
-        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+        if not _reviewer_candidate_is_executable(
+            candidate,
+            inspection_error=inspection_error,
+        ):
             continue
         absolute = candidate.absolute()
         if defer_identity:

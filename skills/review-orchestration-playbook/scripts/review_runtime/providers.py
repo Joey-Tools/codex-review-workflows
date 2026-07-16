@@ -824,6 +824,7 @@ class ClaudeTrustFingerprints:
     unconditional: tuple[str, ...]
     trust_as_root: tuple[str, ...]
     constrained: tuple[str, ...]
+    trust_root: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -888,12 +889,17 @@ def _native_macho_dependencies(
     resolved = candidates[-1]
     try:
         with resolved.open("rb") as handle:
+            metadata = os.fstat(handle.fileno())
             magic = handle.read(4)
     except OSError as error:
         raise ClaudeExecutableInspectionInconclusive(
             f"cannot inspect {label} executable: {error}"
         ) from error
-    if magic not in MACHO_MAGICS or not os.access(resolved, os.X_OK):
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or not metadata.st_mode & 0o111
+        or magic not in MACHO_MAGICS
+    ):
         raise InvalidReviewerExecutable(
             f"{label} must be a native Mach-O executable, not a script or wrapper"
         )
@@ -1845,19 +1851,11 @@ def _validated_bundled_root_certificates(
     deadline = time.monotonic() + CLAUDE_TRUST_ROOT_VERIFY_TOTAL_SECONDS
     certificates: dict[bytes, bytes] = {}
     verification_directory = (
-        tempfile.TemporaryDirectory(
-            prefix=".claude-bundled-roots-",
-            dir=executable.parent,
-        )
+        _bundled_root_verification_directory(executable)
         if verify_self_signatures
         else contextlib.nullcontext(None)
     )
-    with verification_directory as raw_verification_root:
-        verification_root = (
-            pathlib.Path(raw_verification_root)
-            if raw_verification_root is not None
-            else None
-        )
+    with verification_directory as verification_root:
         for index, block in enumerate(blocks):
             der, canonical = _canonical_ca_certificate(
                 block,
@@ -1886,6 +1884,44 @@ def _validated_bundled_root_certificates(
                 )
             certificates[fingerprint] = canonical
     return certificates
+
+
+@contextlib.contextmanager
+def _bundled_root_verification_directory(
+    executable: pathlib.Path,
+) -> Iterator[pathlib.Path]:
+    try:
+        directory = tempfile.TemporaryDirectory(
+            prefix=".claude-bundled-roots-",
+            dir=executable.parent,
+        )
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot create Claude bundled root verification directory"
+        ) from error
+    try:
+        verification_root = pathlib.Path(directory.__enter__())
+    except OSError as error:
+        active_error = sys.exc_info()
+        with contextlib.suppress(BaseException):
+            directory.__exit__(*active_error)
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot enter Claude bundled root verification directory"
+        ) from error
+    try:
+        yield verification_root
+    except BaseException:
+        active_error = sys.exc_info()
+        with contextlib.suppress(BaseException):
+            directory.__exit__(*active_error)
+        raise
+    else:
+        try:
+            directory.__exit__(None, None, None)
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                "cannot clean up Claude bundled root verification directory"
+            ) from error
 
 
 @contextlib.contextmanager
@@ -3350,14 +3386,24 @@ def _read_ca_path_from_parent_with_size(
 ) -> tuple[bytes, int]:
     source_directory = _open_stable_ca_directory(path.parent, source=source)
     try:
-        return _read_ca_path_at_with_size(
+        result = _read_ca_path_at_with_size(
             source_directory,
             path.name,
             source=source,
             extract_certificates=extract_certificates,
         )
-    finally:
-        os.close(source_directory)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(source_directory)
+        raise
+    else:
+        try:
+            os.close(source_directory)
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot close Claude review CA source directory: {source}"
+            ) from error
+        return result
 
 
 def _read_absolute_ca_path_with_size(
@@ -3370,14 +3416,24 @@ def _read_absolute_ca_path_with_size(
         raise ReviewError(f"Claude review requires an absolute CA path: {source}")
     root_directory = _open_stable_ca_directory(pathlib.Path(os.sep), source=source)
     try:
-        return _read_ca_path_at_with_size(
+        result = _read_ca_path_at_with_size(
             root_directory,
             str(path),
             source=source,
             extract_certificates=extract_certificates,
         )
-    finally:
-        os.close(root_directory)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(root_directory)
+        raise
+    else:
+        try:
+            os.close(root_directory)
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot close Claude review CA root directory: {source}"
+            ) from error
+        return result
 
 
 def _bounded_ca_directory_names(
@@ -3528,6 +3584,7 @@ def _classify_trust_fingerprints(
     if len(trust_list) > CLAUDE_TRUST_ENTRY_LIMIT:
         raise ClaudeTrustPolicyUnavailable(f"{label} exceed the trust entry limit")
     unconditional: set[str] = set()
+    trust_root: set[str] = set()
     trust_as_root: set[str] = set()
     constrained: set[str] = set()
     for fingerprint, entry in trust_list.items():
@@ -3545,6 +3602,7 @@ def _classify_trust_fingerprints(
             raise ClaudeTrustPolicyUnavailable(f"{label} contain invalid constraints")
         if not settings:
             unconditional.add(normalized)
+            trust_root.add(normalized)
             continue
         has_unconditional_trust_root = False
         has_unconditional_trust_as_root = False
@@ -3570,11 +3628,14 @@ def _classify_trust_fingerprints(
             if result in CLAUDE_TRUST_UNCONSTRAINED_RESULTS and set(setting) == {
                 CLAUDE_TRUST_RESULT_KEY
             }:
-                has_unconditional_trust_root = True
-                if result == CLAUDE_TRUST_RESULT_TRUST_AS_ROOT:
+                if result == CLAUDE_TRUST_RESULT_TRUST_ROOT:
+                    has_unconditional_trust_root = True
+                else:
                     has_unconditional_trust_as_root = True
-        if has_unconditional_trust_root:
+        if has_unconditional_trust_root or has_unconditional_trust_as_root:
             unconditional.add(normalized)
+            if has_unconditional_trust_root:
+                trust_root.add(normalized)
             if has_unconditional_trust_as_root:
                 trust_as_root.add(normalized)
         else:
@@ -3583,6 +3644,7 @@ def _classify_trust_fingerprints(
         unconditional=tuple(sorted(unconditional)),
         trust_as_root=tuple(sorted(trust_as_root)),
         constrained=tuple(sorted(constrained)),
+        trust_root=tuple(sorted(trust_root)),
     )
 
 
@@ -3592,12 +3654,22 @@ def _select_trust_certificates(
     *,
     ca_root: pathlib.Path,
     trust_as_root_fingerprints: Iterable[str] = (),
+    trust_root_fingerprints: Iterable[str] | None = None,
 ) -> ClaudeSelectedTrustMaterial:
     requested = tuple(fingerprints)
     requested_set = set(requested)
     trust_as_root = set(trust_as_root_fingerprints)
-    if not trust_as_root.issubset(requested_set):
-        raise ValueError("TrustAsRoot fingerprints must be selected trust anchors")
+    trust_root = (
+        requested_set - trust_as_root
+        if trust_root_fingerprints is None
+        else set(trust_root_fingerprints)
+    )
+    if not trust_as_root.issubset(requested_set) or not trust_root.issubset(
+        requested_set
+    ):
+        raise ValueError("trust fingerprints must be selected trust anchors")
+    if trust_root | trust_as_root != requested_set:
+        raise ValueError("every selected trust anchor requires an authorization")
     if len(requested) > CLAUDE_ADDITIONAL_TRUST_ROOT_LIMIT:
         raise ClaudeTrustPolicyUnavailable(
             "Claude additional trust roots exceed the verification limit"
@@ -3640,15 +3712,32 @@ def _select_trust_certificates(
             canonical,
             source="Claude trust certificates",
         )
-        try:
-            _verify_unconditional_trust_root(
-                der,
-                canonical,
-                ca_root=ca_root,
-                timeout_seconds=min(CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS, remaining),
-                allow_non_self_signed=fingerprint in trust_as_root,
-            )
-        except ClaudeTrustCertificateInvalid:
+        authorized = False
+        for allow_non_self_signed in (
+            ((False,) if fingerprint in trust_root else ())
+            + ((True,) if fingerprint in trust_as_root else ())
+        ):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ReviewTimeoutError(
+                    "Claude additional trust root verification exceeded its deadline"
+                )
+            try:
+                _verify_unconditional_trust_root(
+                    der,
+                    canonical,
+                    ca_root=ca_root,
+                    timeout_seconds=min(
+                        CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS,
+                        remaining,
+                    ),
+                    allow_non_self_signed=allow_non_self_signed,
+                )
+            except ClaudeTrustCertificateInvalid:
+                continue
+            authorized = True
+            break
+        if not authorized:
             omitted.add(fingerprint)
             continue
         selected.append(canonical)
@@ -3966,6 +4055,7 @@ def _read_claude_trust_certificates_impl(
     client, security_env = _require_claude_trust_export_tool(review, ca_root)
     unconditional: set[str] = set()
     additional_unconditional: set[str] = set()
+    additional_trust_root: set[str] = set()
     additional_trust_as_root: set[str] = set()
     constrained: set[str] = set()
     domain_evidence: list[dict[str, object]] = []
@@ -4026,6 +4116,12 @@ def _read_claude_trust_certificates_impl(
             )
             unconditional.update(domain_unconditional)
             additional_unconditional.update(domain_unconditional)
+            classified_trust_root = set(classified.trust_root) | (
+                set(classified.unconditional) - set(classified.trust_as_root)
+            )
+            additional_trust_root.update(
+                classified_trust_root & domain_unconditional
+            )
             additional_trust_as_root.update(
                 set(classified.trust_as_root) & domain_unconditional
             )
@@ -4088,6 +4184,7 @@ def _read_claude_trust_certificates_impl(
     if deferred_error is not None:
         raise deferred_error[1]
     effective_unconditional = additional_unconditional - constrained
+    effective_trust_root = additional_trust_root & effective_unconditional
     effective_trust_as_root = (
         additional_trust_as_root & effective_unconditional
     )
@@ -4133,6 +4230,7 @@ def _read_claude_trust_certificates_impl(
             sorted(effective_unconditional),
             ca_root=ca_root,
             trust_as_root_fingerprints=sorted(effective_trust_as_root),
+            trust_root_fingerprints=sorted(effective_trust_root),
         )
         evidence["additional_root_resolution"] = "complete"
         evidence["additional_unconditional_included_count"] = len(
@@ -5237,16 +5335,21 @@ def _warm_claude_local_login(
         and warmup_result.get("is_error") is True
         and _claude_failure_metadata_is_supported(warmup_result)
     )
-    verified_auth = supported_failure and _claude_supported_failure_category(
-        warmup.stdout,
-        stderr=warmup.stderr,
-        requested_model=model,
-    ) == "auth"
+    verified_category = (
+        _claude_supported_failure_category(
+            warmup.stdout,
+            stderr=warmup.stderr,
+            requested_model=model,
+        )
+        if supported_failure
+        else None
+    )
+    verified_auth = verified_category == "auth"
     if supported_success:
         category = "success"
-    elif category in {"auth", "entitlement", "transient"} and not supported_failure:
-        category = "inconclusive"
-    elif category == "auth" and not verified_auth:
+    elif category in {"auth", "entitlement", "transient"} and (
+        verified_category != category
+    ):
         category = "inconclusive"
     elif category == "other":
         category = "inconclusive"
@@ -5278,7 +5381,7 @@ def _warm_claude_local_login(
         raise inconclusive
     structured_entitlement = (
         category == "entitlement"
-        and supported_failure
+        and verified_category == "entitlement"
         and classify_failure(warmup.stdout, b"") == "entitlement"
     )
     if structured_entitlement:
@@ -6208,16 +6311,21 @@ def _run_claude_probe(
     probe_cwd = _claude_probe_cwd(env)
     with tempfile.TemporaryDirectory(prefix=".claude-probe-", dir=probe_cwd) as raw:
         output_dir = pathlib.Path(raw)
-        return run(
-            _claude_probe_command(executable, probe_cwd, *args),
-            cwd=probe_cwd,
-            env=env,
-            stdout_path=output_dir / "stdout.log",
-            stderr_path=output_dir / "stderr.log",
-            capture_limit_bytes=CLAUDE_PROBE_OUTPUT_LIMIT_BYTES,
-            timeout_seconds=CLAUDE_PROBE_TIMEOUT_SECONDS,
-            output_file_limit_bytes=CLAUDE_PROBE_OUTPUT_LIMIT_BYTES,
-        )
+        try:
+            return run(
+                _claude_probe_command(executable, probe_cwd, *args),
+                cwd=probe_cwd,
+                env=env,
+                stdout_path=output_dir / "stdout.log",
+                stderr_path=output_dir / "stderr.log",
+                capture_limit_bytes=CLAUDE_PROBE_OUTPUT_LIMIT_BYTES,
+                timeout_seconds=CLAUDE_PROBE_TIMEOUT_SECONDS,
+                output_file_limit_bytes=CLAUDE_PROBE_OUTPUT_LIMIT_BYTES,
+            )
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"Claude executable probe launch was inconclusive: {error}"
+            ) from error
 
 
 def _require_claude_identity(
@@ -6412,7 +6520,11 @@ def _claude_supported_failure_category(
         result,
         requested_model=requested_model,
     )
-    if not model_usage_valid:
+    if (
+        not model_usage_valid
+        or effective_model is None
+        or not _model_matches(requested_model, effective_model)
+    ):
         return None
     category, _reason = _classify_failure_evidence(stdout, stderr)
     evidence_categories = _failure_evidence_categories(stdout, stderr)
@@ -6437,9 +6549,6 @@ def _claude_supported_failure_category(
     if category in {"entitlement", "transient"}:
         category_source = evidence_categories.get(category, "")
         if not category_source.startswith("structured-"):
-            return None
-    if category == "entitlement":
-        if effective_model is None:
             return None
     return category if category in {"auth", "entitlement", "transient"} else None
 
@@ -7495,7 +7604,9 @@ def _resolve_validated_claude_executable(
 
     try:
         executable = resolve_reviewer_executable(
-            "claude", candidate_validator=validate_candidate
+            "claude",
+            candidate_validator=validate_candidate,
+            inspection_error=ClaudeExecutableInspectionInconclusive,
         )
     except RejectedReviewerCandidates as error:
         raise ClaudeExecutableUnavailable(str(error)) from error

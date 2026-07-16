@@ -234,6 +234,16 @@ the lexical symlink chain and resolved file chain are captured. Homebrew parent
 directories may use only the explicit `admin` group-write exception above.
 After the fixed tool passes its metadata prerequisite, an `otool` launch error
 or nonzero inspection result is inconclusive and cannot authorize fallback.
+Executable discovery treats an initial `FileNotFoundError`/`ENOENT` as an absent
+automatic candidate only after a bounded, component-wise `lstat`/no-follow walk
+proves a stable lexically missing component. A symlink involved in that failed
+resolution, a dangling final or parent symlink, a parent-path race, `EACCES`,
+`EIO`, `ESTALE`, or another metadata/access inspection failure is inconclusive.
+An existing symlink whose final `stat` succeeds remains a candidate; the full
+Claude provenance validator owns its lexical and resolved-chain policy. The same
+absence distinction applies to an explicit executable override, except that a
+proven absent or non-executable explicit override remains a blocking
+configuration error.
 
 On Linux and WSL2, the private snapshot copied from the root-owned fixed-path GPG
 source is inspected only after that source is trusted. Stable-descriptor ELF64
@@ -529,6 +539,14 @@ An unconstrained `TrustRoot` entry must be a strict currently valid self-signed
 CA root. An unconstrained `TrustAsRoot` entry may instead be a non-self-issued
 CA or intermediate certificate: it must retain strict CA and certificate-signing
 extensions, a current strict DER validity window, and a parseable public key.
+When the selected highest-priority domain contains independent unconstrained
+`TrustRoot` and `TrustAsRoot` entries for one fingerprint, the helper preserves
+both authorizations. It accepts the certificate when either the strict
+self-signed-root validation or the non-self-issued TrustAsRoot validation
+succeeds; one authorization does not collapse or replace the other. A
+lower-priority domain cannot add, remove, or constrain those selected
+authorizations. Explicit deny, malformed policy, and constraints selected from
+the highest-priority domain retain their terminal precedence.
 The fixed OpenSSL client performs partial-chain validation when it advertises
 that capability. Apple's fixed LibreSSL omits partial-chain support, so that
 host uses the same deterministic DER policy plus bounded public-key extraction;
@@ -806,17 +824,25 @@ invocation applies the same authentication checks as the fixed-input warmup;
 the helper collects fallback signal categories across both stdout and stderr,
 and mixed authentication and entitlement/transient semantics remain
 inconclusive regardless of which stream or priority branch supplied them.
-Entitlement fallback additionally requires requested-model evidence. Transient
-classification follows the same exact failure-envelope allowlist; stderr-only or
-structurally ambiguous network text remains inconclusive. Missing or malformed
-`modelUsage` never authorizes fallback.
+Every supported authentication, entitlement, or transient category additionally
+requires a valid `modelUsage` entry matching the exact requested model.
+Transient classification follows the same exact failure-envelope allowlist;
+stderr-only or structurally ambiguous network text remains inconclusive.
+Missing, malformed, or wrong-model `modelUsage` never authorizes model or
+backend fallback.
 
 A verifier dependency is `runtime-unavailable` only when its fixed source is
 deterministically absent or the supported platform/capability is not present.
 A present but non-native, untrusted-owner, writable, set-id, non-executable, or
 otherwise unsafe GPG/`otool`/glibc-loader candidate is a blocked security error.
-A resolve, stat, open, copy, launch, or refresh I/O failure is inconclusive. The
-final invocation treats entitlement as fallback evidence only when the strict
+A resolve, stat, open, copy, launch, or refresh I/O failure is inconclusive.
+An operational `OSError` while creating, entering, or cleaning a helper-owned
+bundled-root verification directory, and an `OSError` while closing a CA source
+directory after an otherwise successful read, are likewise inconclusive.
+Arbitrary programmer exceptions are not reclassified. Cleanup failure never
+replaces an active trust-policy, certificate-parse, or other typed error. The
+final invocation treats
+entitlement as fallback evidence only when the strict
 stdout result contains the structured entitlement signal; stderr-only account,
 plan, or model wording remains inconclusive even beside an otherwise valid
 result envelope and exact requested-model usage. The

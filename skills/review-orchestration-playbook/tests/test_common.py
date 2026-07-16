@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import errno
 import math
 import os
 import pathlib
 import signal
+import stat
 import sys
 import tempfile
 import time
@@ -21,6 +23,10 @@ sys.path.insert(0, str(SCRIPTS))
 
 from review_runtime import common  # noqa: E402
 from review_runtime.common import ReviewError  # noqa: E402
+
+
+class CandidateInspectionInconclusive(ReviewError):
+    pass
 
 
 class ChildEnvironmentTest(unittest.TestCase):
@@ -923,6 +929,367 @@ class ChildEnvironmentTest(unittest.TestCase):
         ):
             with self.assertRaises(ReviewError):
                 common.resolve_reviewer_executable("codex")
+
+    def test_automatic_reviewer_candidate_stat_io_is_inconclusive(self) -> None:
+        candidate = pathlib.Path("/home/reviewer/.local/bin/claude")
+
+        def stat_candidate(path: pathlib.Path, *_args, **_kwargs):
+            if path == candidate:
+                raise OSError(errno.EIO, "stat failed")
+            raise FileNotFoundError(errno.ENOENT, "missing")
+
+        with (
+            mock.patch.dict(common.os.environ, {"HOME": "/home/reviewer"}, clear=True),
+            mock.patch.object(
+                common,
+                "_user_executable_candidates",
+                return_value=[candidate],
+            ),
+            mock.patch.object(common.shutil, "which", return_value=None),
+            mock.patch.object(
+                common.pathlib.Path,
+                "stat",
+                autospec=True,
+                side_effect=stat_candidate,
+            ),
+            self.assertRaisesRegex(CandidateInspectionInconclusive, "stat failed"),
+        ):
+            common.resolve_reviewer_executable(
+                "claude",
+                inspection_error=CandidateInspectionInconclusive,
+            )
+
+    def test_explicit_reviewer_candidate_access_io_is_inconclusive(self) -> None:
+        candidate = pathlib.Path("/explicit/claude")
+
+        with (
+            mock.patch.dict(
+                common.os.environ,
+                {
+                    "HOME": "/home/reviewer",
+                    "CODEX_REVIEW_CLAUDE_PATH": str(candidate),
+                },
+                clear=True,
+            ),
+            mock.patch.object(
+                common.pathlib.Path,
+                "stat",
+                autospec=True,
+                side_effect=PermissionError(errno.EACCES, "access denied"),
+            ),
+            self.assertRaisesRegex(CandidateInspectionInconclusive, "access denied"),
+        ):
+            common.resolve_reviewer_executable(
+                "claude",
+                inspection_error=CandidateInspectionInconclusive,
+            )
+
+    def test_reviewer_candidate_disappearance_after_metadata_check_is_inconclusive(
+        self,
+    ) -> None:
+        candidate = pathlib.Path("/home/reviewer/.local/bin/claude")
+        metadata = os.stat_result((stat.S_IFREG | 0o700, 1, 2, 1, 1000, 1000, 1, 0, 0, 0))
+        candidate_stat_calls = 0
+
+        def stat_candidate(path: pathlib.Path, *_args, **_kwargs):
+            nonlocal candidate_stat_calls
+            if path != candidate:
+                raise FileNotFoundError(errno.ENOENT, "missing")
+            candidate_stat_calls += 1
+            if candidate_stat_calls == 1:
+                return metadata
+            raise FileNotFoundError(errno.ENOENT, "disappeared")
+
+        with (
+            mock.patch.dict(common.os.environ, {"HOME": "/home/reviewer"}, clear=True),
+            mock.patch.object(
+                common,
+                "_user_executable_candidates",
+                return_value=[candidate],
+            ),
+            mock.patch.object(common.shutil, "which", return_value=None),
+            mock.patch.object(
+                common.pathlib.Path,
+                "stat",
+                autospec=True,
+                side_effect=stat_candidate,
+            ),
+            self.assertRaisesRegex(
+                CandidateInspectionInconclusive,
+                "changed during inspection",
+            ),
+        ):
+            common.resolve_reviewer_executable(
+                "claude",
+                inspection_error=CandidateInspectionInconclusive,
+            )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "O_NOFOLLOW"),
+        "requires POSIX no-follow path inspection",
+    )
+    def test_automatic_dangling_final_symlink_is_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            candidate = root / "claude"
+            candidate.symlink_to("missing-target")
+            inspect_candidate = common._reviewer_candidate_is_executable
+
+            def inspect_only_candidate(path: pathlib.Path, **kwargs):
+                if path != candidate:
+                    return False
+                return inspect_candidate(path, **kwargs)
+
+            with (
+                mock.patch.dict(
+                    common.os.environ,
+                    {"HOME": str(root)},
+                    clear=True,
+                ),
+                mock.patch.object(
+                    common,
+                    "_user_executable_candidates",
+                    return_value=[candidate],
+                ),
+                mock.patch.object(common.shutil, "which", return_value=None),
+                mock.patch.object(
+                    common,
+                    "_reviewer_candidate_is_executable",
+                    side_effect=inspect_only_candidate,
+                ),
+                self.assertRaisesRegex(
+                    CandidateInspectionInconclusive,
+                    "involves a symlink",
+                ),
+            ):
+                common.resolve_reviewer_executable(
+                    "claude",
+                    inspection_error=CandidateInspectionInconclusive,
+                )
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX symlinks")
+    def test_existing_symlink_candidate_is_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            target = root / "claude-target"
+            target.write_bytes(b"#!/bin/sh\n")
+            target.chmod(0o700)
+            candidate = root / "claude"
+            candidate.symlink_to(target.name)
+            candidate_validator = mock.Mock()
+
+            with mock.patch.dict(
+                common.os.environ,
+                {
+                    "HOME": str(root),
+                    "CODEX_REVIEW_CLAUDE_PATH": str(candidate),
+                },
+                clear=True,
+            ):
+                resolved = common.resolve_reviewer_executable(
+                    "claude",
+                    candidate_validator=candidate_validator,
+                    inspection_error=CandidateInspectionInconclusive,
+                )
+
+        self.assertEqual(resolved, candidate.absolute())
+        candidate_validator.assert_called_once_with(candidate.absolute())
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "O_NOFOLLOW"),
+        "requires POSIX no-follow path inspection",
+    )
+    def test_dangling_parent_symlink_is_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            parent = root / "claude-parent"
+            parent.symlink_to("missing-parent", target_is_directory=True)
+            candidate = parent / "claude"
+
+            with self.assertRaisesRegex(
+                CandidateInspectionInconclusive,
+                "involves a symlink",
+            ):
+                common._reviewer_candidate_is_executable(
+                    candidate,
+                    inspection_error=CandidateInspectionInconclusive,
+                )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "O_NOFOLLOW"),
+        "requires POSIX no-follow path inspection",
+    )
+    def test_candidate_component_lstat_io_is_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            parent = root / "claude-lstat-io-parent"
+            parent.mkdir()
+            candidate = parent / "claude"
+            original_lstat = common.os.lstat
+
+            def lstat_with_io(path, *, dir_fd=None):
+                if path == parent.name:
+                    raise OSError(errno.EIO, "lstat failed")
+                return original_lstat(path, dir_fd=dir_fd)
+
+            with (
+                mock.patch.object(
+                    common.os,
+                    "lstat",
+                    side_effect=lstat_with_io,
+                ),
+                self.assertRaisesRegex(
+                    CandidateInspectionInconclusive,
+                    "lstat failed",
+                ),
+            ):
+                common._reviewer_candidate_is_executable(
+                    candidate,
+                    inspection_error=CandidateInspectionInconclusive,
+                )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "O_NOFOLLOW"),
+        "requires POSIX no-follow path inspection",
+    )
+    def test_truly_missing_lexical_component_is_automatic_absence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            candidate = root / "missing-install" / "bin" / "claude"
+            inspect_candidate = common._reviewer_candidate_is_executable
+
+            def inspect_only_candidate(path: pathlib.Path, **kwargs):
+                if path != candidate:
+                    return False
+                return inspect_candidate(path, **kwargs)
+
+            with (
+                mock.patch.dict(
+                    common.os.environ,
+                    {"HOME": str(root)},
+                    clear=True,
+                ),
+                mock.patch.object(
+                    common,
+                    "_user_executable_candidates",
+                    return_value=[candidate],
+                ),
+                mock.patch.object(common.shutil, "which", return_value=None),
+                mock.patch.object(
+                    common,
+                    "_reviewer_candidate_is_executable",
+                    side_effect=inspect_only_candidate,
+                ),
+            ):
+                resolved = common.resolve_reviewer_executable(
+                    "claude",
+                    inspection_error=CandidateInspectionInconclusive,
+                )
+
+        self.assertIsNone(resolved)
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "O_NOFOLLOW"),
+        "requires POSIX no-follow path inspection",
+    )
+    def test_explicit_dangling_candidate_is_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            candidate = root / "claude"
+            candidate.symlink_to("missing-target")
+
+            with (
+                mock.patch.dict(
+                    common.os.environ,
+                    {
+                        "HOME": str(root),
+                        "CODEX_REVIEW_CLAUDE_PATH": str(candidate),
+                    },
+                    clear=True,
+                ),
+                self.assertRaisesRegex(
+                    CandidateInspectionInconclusive,
+                    "involves a symlink",
+                ),
+            ):
+                common.resolve_reviewer_executable(
+                    "claude",
+                    inspection_error=CandidateInspectionInconclusive,
+                )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "O_NOFOLLOW"),
+        "requires POSIX no-follow path inspection",
+    )
+    def test_explicit_parent_disappearance_is_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            parent = root / "claude-race-parent"
+            parent.mkdir()
+            candidate = parent / "claude"
+            original_open = common.os.open
+            removed = False
+
+            def open_with_parent_race(path, flags, mode=0o777, *, dir_fd=None):
+                nonlocal removed
+                if path == parent.name and dir_fd is not None and not removed:
+                    parent.rmdir()
+                    removed = True
+                return original_open(path, flags, mode, dir_fd=dir_fd)
+
+            with (
+                mock.patch.dict(
+                    common.os.environ,
+                    {
+                        "HOME": str(root),
+                        "CODEX_REVIEW_CLAUDE_PATH": str(candidate),
+                    },
+                    clear=True,
+                ),
+                mock.patch.object(
+                    common.os,
+                    "open",
+                    side_effect=open_with_parent_race,
+                ),
+                self.assertRaisesRegex(
+                    CandidateInspectionInconclusive,
+                    "parent changed during inspection",
+                ),
+            ):
+                common.resolve_reviewer_executable(
+                    "claude",
+                    inspection_error=CandidateInspectionInconclusive,
+                )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "O_NOFOLLOW"),
+        "requires POSIX no-follow path inspection",
+    )
+    def test_explicit_truly_missing_candidate_remains_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            candidate = root / "missing-install" / "claude"
+
+            with (
+                mock.patch.dict(
+                    common.os.environ,
+                    {
+                        "HOME": str(root),
+                        "CODEX_REVIEW_CLAUDE_PATH": str(candidate),
+                    },
+                    clear=True,
+                ),
+                self.assertRaisesRegex(ReviewError, "is not executable") as raised,
+            ):
+                common.resolve_reviewer_executable(
+                    "claude",
+                    inspection_error=CandidateInspectionInconclusive,
+                )
+
+        self.assertNotIsInstance(
+            raised.exception,
+            CandidateInspectionInconclusive,
+        )
 
     def test_validated_user_local_install_is_discovered(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
