@@ -119,6 +119,7 @@ class RepositoryContractTest(unittest.TestCase):
             providers._claude_linux_review_runtime
         )
         self.assertIn("_warm_claude_local_login", attempt_source)
+        self.assertIn("_prepare_claude_tls_environment", attempt_source)
         self.assertEqual(
             warmup_source.count(
                 "_require_fresh_claude_keychain_credential_for_auth_preflight"
@@ -129,6 +130,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("require_verified_model=True", attempt_source)
         self.assertIn("CLAUDE_ATTEMPT_CREDENTIAL_VALIDITY_SECONDS", linux_runtime_source)
         self.assertNotIn("_warm_claude_local_login", run_review_source)
+        self.assertNotIn("_prepare_claude_tls_environment", run_review_source)
         self.assertNotIn("_require_fresh_claude_linux_credential", run_review_source)
 
         self.assertIn("current model attempt", skill)

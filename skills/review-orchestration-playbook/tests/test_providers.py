@@ -3252,7 +3252,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 providers,
                 "_prepare_claude_tls_environment",
                 side_effect=lambda _review, env: dict(env),
-            ),
+            ) as prepare_tls,
             mock.patch.object(
                 providers,
                 "_claude_attempt",
@@ -3273,6 +3273,7 @@ class ProviderPolicyTest(unittest.TestCase):
             seen_executables,
             [snapshot] * len(providers.CLAUDE_MODELS),
         )
+        prepare_tls.assert_not_called()
         copilot_attempt.assert_not_called()
 
     def test_claude_supervision_failures_finalize_runtime_report(self) -> None:

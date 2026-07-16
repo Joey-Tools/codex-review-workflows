@@ -74,6 +74,10 @@ capabilities workstreams.
   initial and post-warmup reads now convert timeout, output-limit, drain, and
   process-leak failures to `ClaudeAuthWarmupInconclusive`, preserving existing
   attempt evidence without fabricating an unstarted model attempt.
+- The follow-up review found that `run_review()` and each model attempt both
+  prepared TLS CA copies. Whole-chain TLS preparation was removed; each attempt
+  now performs exactly one preparation before warmup/final runtime, avoiding
+  duplicate CA directories while preserving the attempt-boundary ordering.
 - Strict Clang syntax checks passed for the unchanged Keychain broker and Linux
   launcher, including the production POSIX feature macro for the launcher.
 - Both workflow actionlint checks, the isolated PyYAML skill validator,

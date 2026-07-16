@@ -4826,7 +4826,6 @@ def run_review(
             if not _is_claude_linux_host():
                 claude_env = _prepare_claude_keychain_broker(review, claude_env)
             claude_env = _with_claude_review_tool_path(review, claude_env)
-            claude_env = _prepare_claude_tls_environment(review, claude_env)
     except (
         ClaudeProbeSandboxUnavailable,
         ClaudeKeychainBrokerUnavailable,
