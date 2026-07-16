@@ -158,6 +158,14 @@ superseded_by:
   and revalidates its complete resolved path identity while serializing the
   `bubblewrap` command. As with runtime-library mounts, this does not claim an
   FD-bound atomic handoff against another same-euid process.
+- `NODE_EXTRA_CA_CERTS` is now the sole Claude-specific Node TLS input. It
+  passes the existing fail-closed CA-file validation and private-copy boundary;
+  macOS exposes only the exact helper-owned copy, while Linux/WSL2 reuses one
+  fixed-path private bundle. Node-only configuration retains default system
+  trust, replacement CA inputs preserve their existing semantics, and Node
+  certificates are appended and deduplicated. Codex, Copilot, pre-provenance
+  probes, proxy/GPG host tools, arbitrary `NODE_*`, TLS-verification bypasses,
+  and private-key inputs remain outside this behavior.
 - The helper uses layered enforcement. Seatbelt on macOS and `bubblewrap` plus
   `socat` on Linux/WSL2 enforce host filesystem, process, write, and network
   isolation. On Linux/WSL2, the publisher-verified Claude permission engine is
@@ -858,6 +866,19 @@ superseded_by:
   isolated skill validator, project-journal validation, and `git diff --check`
   passed. A credential-free real help smoke also accepted all 16 required
   options from installed Claude Code `2.1.202` under the tightened grammar.
+- The Claude-only Node extra-CA implementation passed 17 focused regressions,
+  all 405 provider/Linux/common/contract tests with nine environment-gated
+  skips, and the complete 709-test local suite with nine skips in 255.393
+  seconds. Full helper `py_compile`, touched-file `ruff check`, strict C11
+  launcher syntax under Apple Clang 21.0.0, the isolated skill validator,
+  project-journal validation, and `git diff --check` also passed. The real Linux
+  isolation gate remains assigned to the required Ubuntu CI job and is not
+  claimed as local macOS evidence.
+- Anthropic corporate network configuration documents the supported custom-CA
+  entrypoint: https://code.claude.com/docs/en/corporate-proxy
+- Node.js documents the process-startup additive trust semantics of
+  `NODE_EXTRA_CA_CERTS`:
+  https://nodejs.org/api/cli.html#node_extra_ca_certsfile
 - Anthropic installation, signed-manifest, release-key fingerprint, and platform
   signature documentation: https://code.claude.com/docs/en/installation
 - Anthropic Seatbelt, `bubblewrap`, `socat`, WSL2, and WSL1 sandboxing

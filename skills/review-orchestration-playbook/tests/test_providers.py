@@ -291,18 +291,30 @@ class ProviderPolicyTest(unittest.TestCase):
             stderr_path=str(self.review.container_dir / "stderr"),
         )
 
-    def sample_ca_certificate(self) -> bytes:
+    def sample_ca_certificates(self, count: int) -> tuple[bytes, ...]:
         defaults = ssl.get_default_verify_paths()
-        for raw in (defaults.cafile, "/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt"):
+        for raw in (
+            defaults.cafile,
+            "/etc/ssl/cert.pem",
+            "/etc/ssl/certs/ca-certificates.crt",
+        ):
             if not raw:
                 continue
             path = pathlib.Path(raw)
             if not path.is_file():
                 continue
-            blocks = providers.CLAUDE_CERTIFICATE_BLOCK.findall(path.read_bytes())
-            if blocks:
-                return blocks[0] + b"\n"
-        self.skipTest("no system PEM CA certificate is available")
+            blocks = tuple(
+                block + b"\n"
+                for block in dict.fromkeys(
+                    providers.CLAUDE_CERTIFICATE_BLOCK.findall(path.read_bytes())
+                )
+            )
+            if len(blocks) >= count:
+                return blocks[:count]
+        self.skipTest(f"fewer than {count} system PEM CA certificates are available")
+
+    def sample_ca_certificate(self) -> bytes:
+        return self.sample_ca_certificates(1)[0]
 
     def stable_system_ca_file(self) -> tuple[pathlib.Path, bytes]:
         defaults = ssl.get_default_verify_paths()
@@ -3102,6 +3114,38 @@ class ProviderPolicyTest(unittest.TestCase):
             providers.CODEX_ENV_KEYS,
         )
 
+    def test_node_extra_ca_certs_is_claude_only(self) -> None:
+        source = "/private/reviewer-ca.pem"
+        with mock.patch.dict(
+            providers.os.environ,
+            {
+                "NODE_EXTRA_CA_CERTS": source,
+                "NODE_OPTIONS": "--require=/untrusted/bootstrap.js",
+                "NODE_TLS_REJECT_UNAUTHORIZED": "0",
+            },
+            clear=True,
+        ):
+            claude_env = providers._review_environment(
+                review=self.review,
+                passthrough_keys=providers.CLAUDE_ENV_KEYS,
+            )
+            codex_env = providers._review_environment(
+                review=self.review,
+                passthrough_keys=providers.CODEX_ENV_KEYS,
+            )
+            copilot_env = providers._review_environment(
+                review=self.review,
+                passthrough_keys=providers.COPILOT_ENV_KEYS,
+            )
+
+        self.assertEqual(claude_env["NODE_EXTRA_CA_CERTS"], source)
+        self.assertNotIn("NODE_EXTRA_CA_CERTS", codex_env)
+        self.assertNotIn("NODE_EXTRA_CA_CERTS", copilot_env)
+        self.assertNotIn("NODE_EXTRA_CA_CERTS", common.BASE_ENV_KEYS)
+        for env in (claude_env, codex_env, copilot_env):
+            self.assertNotIn("NODE_OPTIONS", env)
+            self.assertNotIn("NODE_TLS_REJECT_UNAUTHORIZED", env)
+
     def test_linux_rejects_prompt_file_mentions_before_authentication(self) -> None:
         self.review.prompt_file.write_text(
             "Review @/config/runtime-state.json\n",
@@ -5796,6 +5840,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 "HTTP_PROXY": "http://user:secret@proxy.invalid:8080",
                 "REQUESTS_CA_BUNDLE": "/secret/requests-ca.pem",
                 "SECRET_SENTINEL": "must-not-cross-preflight-boundary",
+                "NODE_EXTRA_CA_CERTS": "/secret/node-extra-ca.pem",
                 "SSL_CERT_DIR": "/secret/certs",
                 "SSL_CERT_FILE": "/secret/ssl-ca.pem",
                 "all_proxy": "http://lower:secret@proxy.invalid:8080",
@@ -6135,7 +6180,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 mock.patch.object(
                     providers,
                     "_claude_linux_ca_bundle",
-                    return_value=None,
+                    return_value=runtime_root / "ca/bundle.pem",
                 )
             )
             stack.enter_context(
@@ -6161,13 +6206,13 @@ class ProviderPolicyTest(unittest.TestCase):
                     return_value=contextlib.nullcontext(runtime_root / "proxy.sock"),
                 )
             )
-            stack.enter_context(
+            isolation_probe = stack.enter_context(
                 mock.patch.object(providers, "run_claude_linux_isolation_probe")
             )
             stack.enter_context(
                 mock.patch.object(providers, "_update_claude_runtime_report")
             )
-            stack.enter_context(
+            build_sandbox = stack.enter_context(
                 mock.patch.object(
                     providers,
                     "build_claude_linux_sandbox_command",
@@ -6239,11 +6284,18 @@ class ProviderPolicyTest(unittest.TestCase):
                     providers.REVIEW_ATTEMPT_TIMEOUT_SECONDS
                     + providers.CLAUDE_AUTH_EXPIRY_MARGIN_SECONDS,
                 )
+            for call in build_sandbox.call_args_list:
+                self.assertFalse(
+                    call.args[0].node_extra_ca_certs_configured
+                )
 
             with providers._claude_linux_review_runtime(
                 self.review,
                 executable,
-                {"ANTHROPIC_API_KEY": "test-only"},
+                {
+                    "ANTHROPIC_API_KEY": "test-only",
+                    "NODE_EXTRA_CA_CERTS": "/caller/node-extra-ca.pem",
+                },
                 providers._claude_review_arguments(
                     model=providers.CLAUDE_MODELS[0],
                     settings=providers._claude_review_settings(linux=True),
@@ -6255,6 +6307,19 @@ class ProviderPolicyTest(unittest.TestCase):
             self.assertEqual(
                 stage_credentials.call_count,
                 len(providers.CLAUDE_MODELS),
+            )
+            for captured in (
+                isolation_probe.call_args.args[0],
+                build_sandbox.call_args.args[0],
+            ):
+                self.assertTrue(captured.node_extra_ca_certs_configured)
+                self.assertEqual(
+                    captured.ca_bundle,
+                    runtime_root / "ca/bundle.pem",
+                )
+            self.assertEqual(
+                build_sandbox.call_args.kwargs["auth_env"],
+                {"ANTHROPIC_API_KEY": "test-only"},
             )
 
     def test_claude_linux_final_workspace_inspection_is_inconclusive(self) -> None:
@@ -7031,6 +7096,8 @@ class ProviderPolicyTest(unittest.TestCase):
             return candidate
 
         resolve.side_effect = resolve_and_validate
+        node_ca_file = self.review.source_root / "node-extra-ca.pem"
+        self.write_private_source(node_ca_file, self.sample_ca_certificate())
         self.assertIn("(deny default)", providers.CLAUDE_PROBE_SANDBOX_PROFILE)
         self.assertNotIn("(allow default)", providers.CLAUDE_PROBE_SANDBOX_PROFILE)
         payload = {
@@ -7070,6 +7137,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 "HTTPS_PROXY": "http://https-user:https-secret@proxy.invalid:8080",
                 "HTTP_PROXY": "http://http-user:http-secret@proxy.invalid:8080",
                 "NO_PROXY": "credential-bearing-no-proxy.invalid",
+                "NODE_EXTRA_CA_CERTS": str(node_ca_file),
                 "XDG_CONFIG_HOME": "/Users/reviewer/.config",
                 "TMPDIR": str(self.review.container_dir / "tmp"),
                 "PATH": str(self.claude_broker.parent),
@@ -7094,6 +7162,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(argv[:2], ("/usr/bin/true", "-p"))
         self.assertEqual(argv[3], "/bin/claude")
         review_profile = argv[2]
+        self.assertNotIn(str(node_ca_file), " ".join(argv))
         self.assertIn("(deny default)", review_profile)
         self.assertIn(str(self.review.workspace_root), review_profile)
         self.assertNotIn("com.apple.securityd.xpc", review_profile)
@@ -7128,6 +7197,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertNotIn("(allow default)", version_argv[2])
         probe_env = run_command.call_args_list[0].kwargs["env"]
         self.assertNotIn("ANTHROPIC_API_KEY", probe_env)
+        self.assertNotIn("NODE_EXTRA_CA_CERTS", probe_env)
         self.assertNotIn("CODEX_ISOLATED_REVIEW_RANGE", probe_env)
         self.assertEqual(
             probe_env,
@@ -7170,6 +7240,16 @@ class ProviderPolicyTest(unittest.TestCase):
             self.assertFalse(probe_call.kwargs["stdout_path"].parent.exists())
         review_env = run_command.call_args_list[2].kwargs["env"]
         self.assertNotIn("ANTHROPIC_API_KEY", review_env)
+        prepared_node_ca = pathlib.Path(review_env["NODE_EXTRA_CA_CERTS"])
+        prepared_node_metadata = prepared_node_ca.stat()
+        self.assertTrue(
+            providers.is_relative_to(prepared_node_ca, self.review.container_dir)
+        )
+        self.assertTrue(stat.S_ISREG(prepared_node_metadata.st_mode))
+        self.assertEqual(stat.S_IMODE(prepared_node_metadata.st_mode), 0o600)
+        self.assertIn(f'(literal "{prepared_node_ca}")', review_profile)
+        self.assertNotIn(f'(subpath "{prepared_node_ca.parent}")', review_profile)
+        self.assertNotIn(str(node_ca_file), review_profile)
         self.assertEqual(
             review_env["HOME"],
             str(self.review.container_dir / "claude-home"),
@@ -7420,6 +7500,8 @@ class ProviderPolicyTest(unittest.TestCase):
         certificate = self.sample_ca_certificate()
         ca_file = self.review.source_root / "corporate-ca.pem"
         self.write_private_source(ca_file, certificate)
+        node_ca_file = self.review.source_root / "node-extra-ca.pem"
+        self.write_private_source(node_ca_file, certificate)
         ca_dir = self.review.source_root / "certs"
         ca_dir.mkdir(mode=0o700)
         self.write_private_source(ca_dir / "12345678.0", certificate)
@@ -7432,6 +7514,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 "PATH": str(self.claude_broker.parent),
                 providers.CLAUDE_KEYCHAIN_BROKER_PORT_ENV: "43211",
                 providers.CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV: "00" * 32,
+                "NODE_EXTRA_CA_CERTS": str(node_ca_file),
                 "SSL_CERT_FILE": str(ca_file),
                 "SSL_CERT_DIR": str(ca_dir),
             },
@@ -7445,13 +7528,52 @@ class ProviderPolicyTest(unittest.TestCase):
         )
 
         prepared_file = pathlib.Path(prepared_env["SSL_CERT_FILE"])
+        prepared_node_file = pathlib.Path(prepared_env["NODE_EXTRA_CA_CERTS"])
         prepared_dir = pathlib.Path(prepared_env["SSL_CERT_DIR"])
         self.assertTrue(providers.is_relative_to(prepared_file, self.review.container_dir))
+        self.assertTrue(
+            providers.is_relative_to(prepared_node_file, self.review.container_dir)
+        )
         self.assertTrue(providers.is_relative_to(prepared_dir, self.review.container_dir))
+        node_metadata = prepared_node_file.stat()
+        self.assertTrue(stat.S_ISREG(node_metadata.st_mode))
+        self.assertEqual(stat.S_IMODE(node_metadata.st_mode), 0o600)
         self.assertIn(f'(literal "{prepared_file}")', profile)
+        self.assertIn(f'(literal "{prepared_node_file}")', profile)
         self.assertIn(f'(subpath "{prepared_dir}")', profile)
+        self.assertNotIn(f'(subpath "{prepared_node_file.parent}")', profile)
         self.assertNotIn(str(ca_file), profile)
+        self.assertNotIn(str(node_ca_file), profile)
         self.assertNotIn(str(ca_dir), profile)
+
+    @mock.patch.object(
+        providers,
+        "_trusted_claude_ripgrep",
+        return_value=pathlib.Path("/bin/echo"),
+    )
+    def test_claude_review_sandbox_rejects_host_node_extra_ca_file(
+        self,
+        _rg: mock.Mock,
+    ) -> None:
+        source = self.review.source_root / "node-extra-ca.pem"
+        self.write_private_source(source, self.sample_ca_certificate())
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "helper-owned NODE_EXTRA_CA_CERTS",
+        ):
+            providers._claude_review_sandbox_profile(
+                pathlib.Path("/bin/true"),
+                self.review,
+                {
+                    "ANTHROPIC_API_KEY": "test-api-key",
+                    "HOME": str(self.review.container_dir / "claude-home"),
+                    "TMPDIR": str(self.review.container_dir / "tmp"),
+                    "PATH": "/usr/bin",
+                    "NODE_EXTRA_CA_CERTS": str(source),
+                },
+                proxy_port=43210,
+            )
 
     @mock.patch.object(
         providers,
@@ -7519,13 +7641,15 @@ class ProviderPolicyTest(unittest.TestCase):
         self,
         _rg: mock.Mock,
     ) -> None:
-        with self.assertRaisesRegex(ReviewError, "valid absolute SSL_CERT_FILE"):
-            providers._prepare_claude_tls_environment(
-                self.review,
-                {
-                    "SSL_CERT_FILE": "corporate-ca.pem",
-                },
-            )
+        for key in ("SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS"):
+            with (
+                self.subTest(key=key),
+                self.assertRaisesRegex(ReviewError, f"valid absolute {key}"),
+            ):
+                providers._prepare_claude_tls_environment(
+                    self.review,
+                    {key: "corporate-ca.pem"},
+                )
 
     @mock.patch.object(
         providers,
@@ -7555,11 +7679,15 @@ class ProviderPolicyTest(unittest.TestCase):
             b"machine example.test login user password secret\n",
         )
 
-        with self.assertRaisesRegex(ReviewError, "contains no PEM certificate"):
-            providers._prepare_claude_tls_environment(
-                self.review,
-                {"SSL_CERT_FILE": str(source)},
-            )
+        for key in ("SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS"):
+            with (
+                self.subTest(key=key),
+                self.assertRaisesRegex(ReviewError, "contains no PEM certificate"),
+            ):
+                providers._prepare_claude_tls_environment(
+                    self.review,
+                    {key: str(source)},
+                )
 
     def test_claude_tls_preparation_rejects_private_key_material(self) -> None:
         source = self.review.source_root / "combined.pem"
@@ -7570,11 +7698,15 @@ class ProviderPolicyTest(unittest.TestCase):
             + b"PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n",
         )
 
-        with self.assertRaisesRegex(ReviewError, "contains a private key"):
-            providers._prepare_claude_tls_environment(
-                self.review,
-                {"SSL_CERT_FILE": str(source)},
-            )
+        for key in ("SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS"):
+            with (
+                self.subTest(key=key),
+                self.assertRaisesRegex(ReviewError, "contains a private key"),
+            ):
+                providers._prepare_claude_tls_environment(
+                    self.review,
+                    {key: str(source)},
+                )
 
     def test_claude_tls_source_rejects_symlink_and_fifo(self) -> None:
         certificate = self.sample_ca_certificate()
@@ -8139,6 +8271,91 @@ class ProviderPolicyTest(unittest.TestCase):
                 },
             )
 
+    def test_claude_linux_node_extra_ca_retains_default_trust(self) -> None:
+        default_certificate, node_certificate = self.sample_ca_certificates(2)
+        default_file = self.review.source_root / "default-ca.pem"
+        node_file = self.review.source_root / "node-extra-ca.pem"
+        self.write_private_source(default_file, default_certificate)
+        self.write_private_source(node_file, node_certificate)
+        destination_dir = self.review.container_dir / "node-default-ca-bundle"
+        destination_dir.mkdir(mode=0o700)
+
+        def read_default(
+            path: pathlib.Path,
+            *,
+            source: str,
+            extract_certificates: bool = True,
+        ) -> tuple[bytes, int]:
+            del source, extract_certificates
+            if path == default_file:
+                return default_certificate, len(default_certificate)
+            try:
+                raise FileNotFoundError(path)
+            except FileNotFoundError as error:
+                raise providers.ClaudeExecutableInspectionInconclusive(
+                    f"missing default CA file: {path}"
+                ) from error
+
+        with (
+            mock.patch.object(
+                providers.ssl,
+                "get_default_verify_paths",
+                return_value=mock.Mock(cafile=str(default_file), capath=None),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_absolute_ca_path_with_size",
+                side_effect=read_default,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_linux_private_directory",
+                return_value=destination_dir,
+            ),
+        ):
+            bundle = providers._claude_linux_ca_bundle(
+                self.review,
+                {"NODE_EXTRA_CA_CERTS": str(node_file)},
+            )
+
+        self.assertEqual(bundle.read_bytes(), default_certificate + node_certificate)
+
+    def test_claude_linux_node_extra_ca_appends_to_replacement_and_deduplicates(
+        self,
+    ) -> None:
+        replacement_certificate, node_certificate = self.sample_ca_certificates(2)
+        replacement_file = self.review.source_root / "replacement-ca.pem"
+        node_file = self.review.source_root / "node-extra-ca.pem"
+        self.write_private_source(replacement_file, replacement_certificate)
+        self.write_private_source(
+            node_file,
+            replacement_certificate + node_certificate,
+        )
+        destination_dir = self.review.container_dir / "replacement-node-ca-bundle"
+        destination_dir.mkdir(mode=0o700)
+
+        with (
+            mock.patch.object(providers.ssl, "get_default_verify_paths") as defaults,
+            mock.patch.object(
+                providers,
+                "_claude_linux_private_directory",
+                return_value=destination_dir,
+            ),
+        ):
+            bundle = providers._claude_linux_ca_bundle(
+                self.review,
+                {
+                    "SSL_CERT_FILE": str(replacement_file),
+                    "NODE_EXTRA_CA_CERTS": str(node_file),
+                },
+            )
+
+        defaults.assert_not_called()
+        self.assertEqual(
+            bundle.read_bytes(),
+            replacement_certificate + node_certificate,
+        )
+
     def test_claude_linux_ca_bundle_uses_capath_without_cafile(self) -> None:
         certificate = self.sample_ca_certificate()
         source_dir = self.review.source_root / "default-capath"
@@ -8225,6 +8442,20 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertIs(result, context)
         create_context.assert_called_once_with(cafile="/isolated/git-ca.pem")
+
+    @mock.patch.object(providers.ssl, "create_default_context")
+    def test_proxy_ssl_context_ignores_node_extra_ca_certs(
+        self,
+        create_context: mock.Mock,
+    ) -> None:
+        context = create_context.return_value
+
+        result = providers._proxy_ssl_context(
+            {"NODE_EXTRA_CA_CERTS": "/isolated/node-extra-ca.pem"}
+        )
+
+        self.assertIs(result, context)
+        create_context.assert_called_once_with(cafile=None)
 
     @mock.patch.object(providers.ssl, "create_default_context")
     def test_proxy_ssl_context_loads_each_ca_directory(

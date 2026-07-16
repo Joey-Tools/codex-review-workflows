@@ -3046,18 +3046,65 @@ class SandboxCommandTest(unittest.TestCase):
             bundle.chmod(0o600)
 
             command = claude_linux.build_sandbox_command(
-                dataclasses.replace(self.spec, ca_bundle=bundle),
+                dataclasses.replace(
+                    self.spec,
+                    ca_bundle=bundle,
+                    node_extra_ca_certs_configured=True,
+                ),
                 _linux_review_arguments(),
             ).argv
 
+        ca_mount = (
+            "--ro-bind",
+            str(bundle.resolve()),
+            str(claude_linux.SANDBOX_CA_BUNDLE),
+        )
+        command_triples = tuple(zip(command, command[1:], command[2:]))
+        self.assertIn(ca_mount, command_triples)
+        self.assertEqual(command_triples.count(ca_mount), 1)
+        environment_triples = command_triples
         self.assertIn(
             (
-                "--ro-bind",
-                str(bundle.resolve()),
+                "--setenv",
+                "NODE_EXTRA_CA_CERTS",
                 str(claude_linux.SANDBOX_CA_BUNDLE),
             ),
-            tuple(zip(command, command[1:], command[2:])),
+            environment_triples,
         )
+        self.assertIn(
+            (
+                "--setenv",
+                "SSL_CERT_FILE",
+                str(claude_linux.SANDBOX_CA_BUNDLE),
+            ),
+            environment_triples,
+        )
+
+    def test_rejects_node_extra_ca_state_without_private_bundle(self) -> None:
+        with self.assertRaisesRegex(
+            claude_linux.LinuxRuntimeError,
+            "requires a private CA bundle",
+        ):
+            claude_linux.build_sandbox_command(
+                dataclasses.replace(
+                    self.spec,
+                    node_extra_ca_certs_configured=True,
+                ),
+                _linux_review_arguments(),
+            )
+
+    def test_rejects_non_boolean_node_extra_ca_state(self) -> None:
+        with self.assertRaisesRegex(
+            claude_linux.LinuxRuntimeError,
+            "must be boolean",
+        ):
+            claude_linux.build_sandbox_command(
+                dataclasses.replace(
+                    self.spec,
+                    node_extra_ca_certs_configured="yes",
+                ),
+                _linux_review_arguments(),
+            )
 
     def test_rejects_ca_bundle_path_replacement_after_validation(self) -> None:
         with tempfile.TemporaryDirectory(
@@ -3243,6 +3290,10 @@ class SandboxCommandTest(unittest.TestCase):
                 str(claude_linux.SANDBOX_CA_BUNDLE),
             ),
             tuple(zip(command, command[1:], command[2:])),
+        )
+        self.assertNotIn(
+            "NODE_EXTRA_CA_CERTS",
+            command,
         )
 
     def test_bootstrap_probe_has_no_proxy_or_auxiliary_tools(self) -> None:
