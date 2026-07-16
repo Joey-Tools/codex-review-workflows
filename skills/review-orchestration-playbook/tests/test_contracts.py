@@ -57,29 +57,109 @@ def _workflow_job_needs(workflow: str, job_name: str) -> tuple[str, ...]:
     return ()
 
 
-def _workflow_job_success_guards(workflow: str, job_name: str) -> tuple[str, ...]:
-    job_lines = _workflow_job_lines(workflow, job_name)
-    result_variables: dict[str, str] = {}
+def _workflow_env_bindings(
+    lines: tuple[str, ...],
+    env_indent: str,
+) -> dict[str, str | None]:
+    marker = f"{env_indent}env:"
+    step_item_marker = f"{env_indent[:-2]}- env:" if env_indent else ""
+    variable_indent = f"{env_indent}  "
+    bindings: dict[str, str | None] = {}
+    in_env = False
     expression_prefix = "${{ needs."
     expression_suffix = ".result }}"
-    for line in job_lines:
+
+    for line in lines:
+        if line == marker or line == step_item_marker:
+            in_env = True
+            continue
+        if not in_env or not line.strip():
+            continue
+        indentation = len(line) - len(line.lstrip())
+        if indentation <= len(env_indent):
+            break
+        if indentation != len(variable_indent):
+            continue
         variable, separator, expression = line.strip().partition(": ")
-        if (
-            separator
-            and expression.startswith(expression_prefix)
-            and expression.endswith(expression_suffix)
+        if not separator:
+            continue
+        dependency = None
+        if expression.startswith(expression_prefix) and expression.endswith(
+            expression_suffix
         ):
             dependency = expression[
                 len(expression_prefix) : -len(expression_suffix)
             ]
-            result_variables[dependency] = variable
+        bindings[variable] = dependency
+    return bindings
 
-    job_body = "\n".join(line.strip() for line in job_lines)
-    return tuple(
-        dependency
-        for dependency, variable in result_variables.items()
-        if f'test "${variable}" = "success"' in job_body
-    )
+
+def _workflow_job_steps(job_lines: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
+    try:
+        steps_index = job_lines.index("    steps:")
+    except ValueError:
+        return ()
+
+    steps: list[list[str]] = []
+    current_step: list[str] | None = None
+    for line in job_lines[steps_index + 1 :]:
+        indentation = len(line) - len(line.lstrip())
+        if line.strip() and indentation <= 4:
+            break
+        if line.startswith("      - "):
+            current_step = [line]
+            steps.append(current_step)
+        elif current_step is not None:
+            current_step.append(line)
+    return tuple(tuple(step) for step in steps)
+
+
+def _workflow_step_run_body(step: tuple[str, ...]) -> str:
+    for index, line in enumerate(step):
+        marker = next(
+            (
+                candidate
+                for candidate in ("        run:", "      - run:")
+                if line.startswith(candidate)
+            ),
+            None,
+        )
+        if marker is None:
+            continue
+        header = line.removeprefix(marker).strip()
+        if not header or header[0] not in "|>":
+            return header
+        body: list[str] = []
+        body_indent: int | None = None
+        for body_line in step[index + 1 :]:
+            indentation = len(body_line) - len(body_line.lstrip())
+            if body_line.strip():
+                if body_indent is None:
+                    body_indent = indentation
+                elif indentation < body_indent:
+                    break
+            body.append(body_line.strip())
+        return "\n".join(body)
+    return ""
+
+
+def _workflow_job_success_guards(workflow: str, job_name: str) -> tuple[str, ...]:
+    job_lines = _workflow_job_lines(workflow, job_name)
+    job_bindings = _workflow_env_bindings(job_lines, "    ")
+    guarded_dependencies: list[str] = []
+    for step in _workflow_job_steps(job_lines):
+        step_bindings = _workflow_env_bindings(step, "        ")
+        effective_bindings = dict(job_bindings)
+        effective_bindings.update(step_bindings)
+        run_body = _workflow_step_run_body(step)
+        for variable, dependency in effective_bindings.items():
+            if (
+                dependency is not None
+                and dependency not in guarded_dependencies
+                and f'test "${variable}" = "success"' in run_body
+            ):
+                guarded_dependencies.append(dependency)
+    return tuple(guarded_dependencies)
 
 
 class RepositoryContractTest(unittest.TestCase):
@@ -363,6 +443,60 @@ class RepositoryContractTest(unittest.TestCase):
             "  test:\n"
             "    needs: compatibility_tests\n"
         )
+        split_step_guard = (
+            "jobs:\n"
+            "  test:\n"
+            "    needs: platform_tests\n"
+            "    steps:\n"
+            "      - name: Bind result\n"
+            "        env:\n"
+            "          PLATFORM_RESULT: ${{ needs.platform_tests.result }}\n"
+            "        run: echo bound\n"
+            "      - name: Check result\n"
+            "        run: test \"$PLATFORM_RESULT\" = \"success\"\n"
+        )
+        job_env_guard = (
+            "jobs:\n"
+            "  test:\n"
+            "    needs: platform_tests\n"
+            "    env:\n"
+            "      PLATFORM_RESULT: ${{ needs.platform_tests.result }}\n"
+            "    steps:\n"
+            "      - name: Check result\n"
+            "        run: test \"$PLATFORM_RESULT\" = \"success\"\n"
+        )
+        shadowed_job_env_guard = (
+            "jobs:\n"
+            "  test:\n"
+            "    needs: platform_tests\n"
+            "    env:\n"
+            "      PLATFORM_RESULT: ${{ needs.platform_tests.result }}\n"
+            "    steps:\n"
+            "      - name: Check a shadowed result\n"
+            "        env:\n"
+            "          PLATFORM_RESULT: success\n"
+            "        run: test \"$PLATFORM_RESULT\" = \"success\"\n"
+        )
+        name_only_guard = (
+            "jobs:\n"
+            "  test:\n"
+            "    needs: platform_tests\n"
+            "    steps:\n"
+            "      - name: test \"$PLATFORM_RESULT\" = \"success\"\n"
+            "        env:\n"
+            "          PLATFORM_RESULT: ${{ needs.platform_tests.result }}\n"
+            "        run: echo unchecked\n"
+        )
+        inline_block_run_guard = (
+            "jobs:\n"
+            "  test:\n"
+            "    needs: platform_tests\n"
+            "    env:\n"
+            "      PLATFORM_RESULT: ${{ needs.platform_tests.result }}\n"
+            "    steps:\n"
+            "      - run: |\n"
+            "          test \"$PLATFORM_RESULT\" = \"success\"\n"
+        )
 
         self.assertEqual(_workflow_job_needs(scalar, "test"), ("platform_tests",))
         self.assertEqual(
@@ -380,6 +514,20 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(
             _workflow_job_success_guards(list_form, "test"),
             ("compatibility_tests", "platform_tests"),
+        )
+        self.assertEqual(_workflow_job_success_guards(split_step_guard, "test"), ())
+        self.assertEqual(
+            _workflow_job_success_guards(job_env_guard, "test"),
+            ("platform_tests",),
+        )
+        self.assertEqual(
+            _workflow_job_success_guards(shadowed_job_env_guard, "test"),
+            (),
+        )
+        self.assertEqual(_workflow_job_success_guards(name_only_guard, "test"), ())
+        self.assertEqual(
+            _workflow_job_success_guards(inline_block_run_guard, "test"),
+            ("platform_tests",),
         )
 
     def test_helper_declares_and_tests_its_minimum_python_runtime(self) -> None:

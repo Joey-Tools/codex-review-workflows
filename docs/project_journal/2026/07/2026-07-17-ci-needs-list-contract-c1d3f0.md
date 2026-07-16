@@ -30,6 +30,8 @@ status context on additional compatibility and platform jobs.
   and inline-list forms.
 - Every accepted direct dependency must expose its result and be checked for a
   successful outcome by the aggregate `test` job.
+- Step-scoped result variables count only when the same step checks them;
+  job-scoped result variables remain available to every aggregate step.
 
 ## Validation Evidence
 
