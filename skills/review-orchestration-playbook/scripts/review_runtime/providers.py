@@ -684,6 +684,89 @@ def _claude_linux_directory_identity(
     )
 
 
+def _validate_claude_runtime_directory_descriptor(
+    path: pathlib.Path,
+    descriptor: int,
+    *,
+    private: bool,
+) -> None:
+    try:
+        before = path.lstat()
+        opened = os.fstat(descriptor)
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            f"cannot inspect Claude runtime directory {path}: {error}"
+        ) from error
+    mode = stat.S_IMODE(before.st_mode)
+    if not stat.S_ISDIR(before.st_mode):
+        raise ReviewError(f"Claude Linux runtime path must be a real directory: {path}")
+    if before.st_uid != os.geteuid():
+        raise ReviewError(f"Claude runtime directory has an unexpected owner: {path}")
+    if (private and mode != 0o700) or (not private and mode & 0o022):
+        requirement = "0700" if private else "not group- or world-writable"
+        raise ReviewError(f"Claude runtime directory must be {requirement}: {path}")
+    if _claude_linux_directory_identity(before) != _claude_linux_directory_identity(
+        opened
+    ):
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude runtime directory changed during validation"
+        )
+    _require_no_extended_acl(descriptor, label="Claude runtime directory")
+    try:
+        after = path.lstat()
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            f"Claude runtime directory changed during validation: {error}"
+        ) from error
+    if _claude_linux_directory_identity(opened) != _claude_linux_directory_identity(
+        after
+    ):
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude runtime directory changed during validation"
+        )
+
+
+def _require_existing_claude_runtime_directory(
+    path: pathlib.Path,
+    *,
+    private: bool,
+) -> pathlib.Path:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise ReviewError(
+                f"Claude Linux runtime path must be a real directory: {path}"
+            ) from error
+        raise ClaudeExecutableInspectionInconclusive(
+            f"cannot open stable Claude runtime directory {path}: {error}"
+        ) from error
+    try:
+        _validate_claude_runtime_directory_descriptor(
+            path,
+            descriptor,
+            private=private,
+        )
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        raise
+    else:
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot close stable Claude runtime directory {path}: {error}"
+            ) from error
+    return path
+
+
 def _create_or_validate_claude_runtime_directory(
     path: pathlib.Path,
     *,
@@ -697,53 +780,7 @@ def _create_or_validate_claude_runtime_directory(
         raise ReviewError(
             f"cannot create Claude runtime directory {path}: {error}"
         ) from error
-    try:
-        before = path.lstat()
-    except OSError as error:
-        raise ReviewError(
-            f"cannot inspect Claude runtime directory {path}: {error}"
-        ) from error
-    mode = stat.S_IMODE(before.st_mode)
-    if not stat.S_ISDIR(before.st_mode):
-        raise ReviewError(f"Claude Linux runtime path must be a real directory: {path}")
-    if before.st_uid != os.geteuid():
-        raise ReviewError(f"Claude runtime directory has an unexpected owner: {path}")
-    if (private and mode != 0o700) or (not private and mode & 0o022):
-        requirement = "0700" if private else "not group- or world-writable"
-        raise ReviewError(f"Claude runtime directory must be {requirement}: {path}")
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as error:
-        raise ReviewError(
-            f"cannot open stable Claude runtime directory {path}: {error}"
-        ) from error
-    try:
-        opened = os.fstat(descriptor)
-        after = path.lstat()
-    except OSError as error:
-        raise ReviewError(
-            f"Claude runtime directory changed during validation: {error}"
-        ) from error
-    finally:
-        os.close(descriptor)
-    if (
-        len(
-            {
-                _claude_linux_directory_identity(before),
-                _claude_linux_directory_identity(opened),
-                _claude_linux_directory_identity(after),
-            }
-        )
-        != 1
-    ):
-        raise ReviewError("Claude runtime directory changed during validation")
-    return path
+    return _require_existing_claude_runtime_directory(path, private=private)
 
 
 @dataclass(frozen=True)
@@ -1701,9 +1738,109 @@ def _validated_bundled_root_certificates(
     return certificates
 
 
+@contextlib.contextmanager
+def _open_private_claude_snapshot_parent(
+    path: pathlib.Path,
+    *,
+    container_dir: pathlib.Path,
+) -> Iterator[int]:
+    container = container_dir.expanduser().absolute()
+    executable = path.expanduser().absolute()
+    if (
+        container != pathlib.Path(os.path.normpath(container))
+        or executable != pathlib.Path(os.path.normpath(executable))
+    ):
+        raise ReviewError(
+            "Claude executable snapshot paths must be lexically normalized"
+        )
+    review_root = container.parent
+    try:
+        relative_parent = executable.parent.relative_to(container)
+    except ValueError as error:
+        raise ReviewError(
+            "Claude executable snapshot is outside the private review container"
+        ) from error
+    if len(relative_parent.parts) > 8:
+        raise ReviewError(
+            "Claude executable snapshot directory chain exceeds its depth limit"
+        )
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptors: list[int] = []
+    try:
+        try:
+            review_root_descriptor = os.open(review_root, flags)
+        except OSError as error:
+            if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise ReviewError(
+                    "Claude executable snapshot review root must be a real directory"
+                ) from error
+            raise ClaudeExecutableInspectionInconclusive(
+                "cannot open the Claude review root for snapshot validation"
+            ) from error
+        descriptors.append(review_root_descriptor)
+        try:
+            _validate_claude_runtime_directory_descriptor(
+                review_root,
+                review_root_descriptor,
+                private=False,
+            )
+            container_descriptor = os.open(
+                container.name,
+                flags,
+                dir_fd=review_root_descriptor,
+            )
+            descriptors.append(container_descriptor)
+            _validate_claude_runtime_directory_descriptor(
+                container,
+                container_descriptor,
+                private=True,
+            )
+            current = container
+            for component in relative_parent.parts:
+                descriptor = os.open(component, flags, dir_fd=descriptors[-1])
+                descriptors.append(descriptor)
+                current /= component
+                _validate_claude_runtime_directory_descriptor(
+                    current,
+                    descriptor,
+                    private=True,
+                )
+        except OSError as error:
+            if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise ReviewError(
+                    "Claude executable snapshot path must use real directories"
+                ) from error
+            raise ClaudeExecutableInspectionInconclusive(
+                "cannot inspect the Claude executable snapshot directory chain"
+            ) from error
+        yield descriptors[-1]
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+        raise
+    else:
+        close_error: OSError | None = None
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                close_error = close_error or error
+        if close_error is not None:
+            raise ClaudeExecutableInspectionInconclusive(
+                "cannot close the Claude snapshot directory chain"
+            ) from close_error
+
+
 def _inspect_claude_executable_trust(
     path: pathlib.Path,
     *,
+    container_dir: pathlib.Path,
     expected_sha256: str | None = None,
     include_bundled_roots: bool,
     validate_bundled_roots: bool = True,
@@ -1720,12 +1857,6 @@ def _inspect_claude_executable_trust(
         | getattr(os, "O_NONBLOCK", 0)
         | nofollow
     )
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as error:
-        raise ClaudeExecutableInspectionInconclusive(
-            f"cannot open Claude executable snapshot: {error}"
-        ) from error
     digest = hashlib.sha256()
     root_store_search = bytearray()
     bundled_root_store: bytes | None = None
@@ -1750,42 +1881,75 @@ def _inspect_claude_executable_trust(
         if len(root_store_search) > retained_limit:
             del root_store_search[: len(root_store_search) - retained_limit]
 
-    try:
-        before = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or before.st_uid != os.geteuid()
-            or before.st_nlink != 1
-            or before.st_mode & 0o022
-            or (
-                required_mode is not None
-                and stat.S_IMODE(before.st_mode) != required_mode
-            )
-            or before.st_size <= 0
-            or before.st_size > CLAUDE_BINARY_MAX_BYTES
-        ):
+    with _open_private_claude_snapshot_parent(
+        path,
+        container_dir=container_dir,
+    ) as parent_descriptor:
+        try:
+            descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
+        except OSError as error:
+            if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise ReviewError(
+                    "Claude executable snapshot must be a real file"
+                ) from error
             raise ClaudeExecutableInspectionInconclusive(
-                "Claude executable snapshot has unsafe file metadata"
-            )
-        total = 0
-        while chunk := os.read(descriptor, CLAUDE_EXECUTABLE_HASH_CHUNK_BYTES):
-            total += len(chunk)
-            if total > CLAUDE_BINARY_MAX_BYTES:
-                raise ClaudeExecutableInspectionInconclusive(
-                    "Claude executable snapshot exceeds the inspection limit"
+                f"cannot open Claude executable snapshot: {error}"
+            ) from error
+        try:
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != os.geteuid()
+                or before.st_nlink != 1
+                or before.st_mode & 0o022
+                or (
+                    required_mode is not None
+                    and stat.S_IMODE(before.st_mode) != required_mode
                 )
-            digest.update(chunk)
-            if include_bundled_roots:
-                root_store_search.extend(chunk)
-                consume_root_store_search()
-        after = os.fstat(descriptor)
-        path_after = path.lstat()
-    except OSError as error:
-        raise ClaudeExecutableInspectionInconclusive(
-            f"cannot inspect Claude executable snapshot: {error}"
-        ) from error
-    finally:
-        os.close(descriptor)
+                or before.st_size <= 0
+                or before.st_size > CLAUDE_BINARY_MAX_BYTES
+            ):
+                raise ReviewError(
+                    "Claude executable snapshot has unsafe file metadata"
+                )
+            _require_no_extended_acl(
+                descriptor,
+                label="Claude executable snapshot",
+            )
+            total = 0
+            while chunk := os.read(descriptor, CLAUDE_EXECUTABLE_HASH_CHUNK_BYTES):
+                total += len(chunk)
+                if total > CLAUDE_BINARY_MAX_BYTES:
+                    raise ClaudeExecutableInspectionInconclusive(
+                        "Claude executable snapshot exceeds the inspection limit"
+                    )
+                digest.update(chunk)
+                if include_bundled_roots:
+                    root_store_search.extend(chunk)
+                    consume_root_store_search()
+            after = os.fstat(descriptor)
+            path_after = os.stat(
+                path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot inspect Claude executable snapshot: {error}"
+            ) from error
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+            raise
+        else:
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                raise ClaudeExecutableInspectionInconclusive(
+                    f"cannot close Claude executable snapshot: {error}"
+                ) from error
     if (
         _ca_source_metadata(before) != _ca_source_metadata(after)
         or _ca_source_metadata(after) != _ca_source_metadata(path_after)
@@ -1829,9 +1993,12 @@ def _inspect_claude_executable_trust(
 def _require_matching_claude_executable_snapshot(
     executable: pathlib.Path,
     expected: ClaudeExecutableTrustEvidence,
+    *,
+    container_dir: pathlib.Path,
 ) -> None:
     current = _inspect_claude_executable_trust(
         executable,
+        container_dir=container_dir,
         expected_sha256=expected.executable_sha256,
         include_bundled_roots=_is_claude_macos_host(),
         validate_bundled_roots=False,
@@ -2274,13 +2441,17 @@ def _require_no_extended_acl(descriptor: int, *, label: str) -> None:
         acl_free.argtypes = [ctypes.c_void_p]
         acl_free.restype = ctypes.c_int
     except (AttributeError, OSError) as error:
-        raise ReviewError(f"cannot inspect {label} access controls") from error
+        raise ClaudeExecutableInspectionInconclusive(
+            f"cannot inspect {label} access controls"
+        ) from error
     ctypes.set_errno(0)
     acl = acl_get_fd_np(descriptor, CLAUDE_ACL_TYPE_EXTENDED)
     if not acl:
         if ctypes.get_errno() == errno.ENOENT:
             return
-        raise ReviewError(f"cannot inspect {label} access controls")
+        raise ClaudeExecutableInspectionInconclusive(
+            f"cannot inspect {label} access controls"
+        )
     try:
         entry = ctypes.c_void_p()
         ctypes.set_errno(0)
@@ -2289,7 +2460,9 @@ def _require_no_extended_acl(descriptor: int, *, label: str) -> None:
         if entry_status == 0:
             raise ReviewError(f"{label} has an extended access control list")
         if entry_status != -1 or entry_errno != errno.EINVAL:
-            raise ReviewError(f"cannot inspect {label} access controls")
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot inspect {label} access controls"
+            )
     finally:
         acl_free(acl)
 
@@ -2642,8 +2815,17 @@ def _read_ca_source_with_size(
             source=source,
             extract_certificates=extract_certificates,
         )
-    finally:
-        os.close(descriptor)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        raise
+    else:
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot close a stable Claude review CA source {source}: {error}"
+            ) from error
     try:
         path_after = path.lstat()
     except OSError as error:
@@ -2690,8 +2872,17 @@ def _read_ca_source_at_with_size(
             source=source,
             extract_certificates=extract_certificates,
         )
-    finally:
-        os.close(descriptor)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        raise
+    else:
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot close a stable Claude review CA source {source}: {error}"
+            ) from error
     try:
         entry_after = os.stat(
             name,
@@ -3151,8 +3342,7 @@ def _classify_trust_fingerprints(
             raise ClaudeTrustPolicyUnavailable(f"{label} contain an invalid entry")
         normalized = fingerprint.upper()
         if "trustSettings" not in entry:
-            unconditional.add(normalized)
-            continue
+            raise ClaudeTrustPolicyUnavailable(f"{label} contain invalid constraints")
         settings = entry["trustSettings"]
         if not isinstance(settings, list):
             raise ClaudeTrustPolicyUnavailable(f"{label} contain invalid constraints")
@@ -3171,6 +3361,9 @@ def _classify_trust_fingerprints(
                     f"{label} contain ambiguous constraints"
                 )
             if CLAUDE_TRUST_RESULT_KEY not in setting:
+                # An empty constraints dictionary defaults to TrustRoot.
+                if not setting:
+                    has_unconditional_trust_root = True
                 continue
             result = setting[CLAUDE_TRUST_RESULT_KEY]
             if type(result) is not int or result not in CLAUDE_TRUST_RESULTS:
@@ -6922,6 +7115,7 @@ def _resolve_validated_claude_executable(
         )
         executable_evidence = _inspect_claude_executable_trust(
             verified_executable,
+            container_dir=review.container_dir,
             expected_sha256=(
                 verified.artifact.checksum
                 if isinstance(verified, VerifiedClaudeExecutable)
@@ -7325,7 +7519,11 @@ def _claude_attempt(
         )
     assert executable_evidence is not None
     trust_state = trust_state or ClaudeTrustSessionState()
-    _require_matching_claude_executable_snapshot(executable, executable_evidence)
+    _require_matching_claude_executable_snapshot(
+        executable,
+        executable_evidence,
+        container_dir=review.container_dir,
+    )
     linux_host = _is_claude_linux_host()
     prompt = _claude_review_prompt(
         review,
@@ -7346,6 +7544,7 @@ def _claude_attempt(
         _require_matching_claude_executable_snapshot(
             executable,
             executable_evidence,
+            container_dir=review.container_dir,
         )
         attempt_env = _with_claude_review_tool_path(review, env)
         proxy_env = dict(attempt_env)
@@ -7358,6 +7557,7 @@ def _claude_attempt(
         _require_matching_claude_executable_snapshot(
             executable,
             executable_evidence,
+            container_dir=review.container_dir,
         )
         if not linux_host:
             if attempt_env.get("ANTHROPIC_API_KEY"):
@@ -7473,6 +7673,7 @@ def _claude_attempt(
             _require_matching_claude_executable_snapshot(
                 executable,
                 executable_evidence,
+                container_dir=review.container_dir,
             )
             with _claude_linux_review_runtime(
                 review,
@@ -7483,6 +7684,7 @@ def _claude_attempt(
                 _require_matching_claude_executable_snapshot(
                     executable,
                     executable_evidence,
+                    container_dir=review.container_dir,
                 )
                 completed = run(
                     sandbox_command.argv,
@@ -7524,6 +7726,7 @@ def _claude_attempt(
                 _require_matching_claude_executable_snapshot(
                     executable,
                     executable_evidence,
+                    container_dir=review.container_dir,
                 )
                 _update_claude_runtime_report(
                     review,

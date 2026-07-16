@@ -58,12 +58,12 @@ metadata behavior.
 ## Validation
 
 - Python 3.10.19 complete canonical suite with the `tomli` test backport and
-  `PYTHONDONTWRITEBYTECODE=1`: 837 tests run, 4 skipped, no failures. Disabling
+  `PYTHONDONTWRITEBYTECODE=1`: 847 tests run, 4 skipped, no failures. Disabling
   bytecode writes keeps the intentional `RLIMIT_FSIZE` tests from truncating
   uv's own `_virtualenv.pyc` import hook.
-- Python 3.13.0 complete canonical suite: 837 tests run, 9 skipped, no failures.
+- Python 3.13.0 complete canonical suite: 847 tests run, 9 skipped, no failures.
 - Focused Python 3.13 suites: the 3 `SSL_CERT_DIR` regressions passed, providers
-  ran 370 tests with 6 skipped, and provenance ran 90 tests with no skips or
+  ran 380 tests with 6 skipped, and provenance ran 90 tests with no skips or
   failures; earlier current-range common 49 and repository contract 14 test
   suites also passed.
 - Final-head review remediation covers strict signed-manifest numeric parsing,
@@ -152,9 +152,30 @@ metadata behavior.
   cleanup preserve an existing deny. New proof tests also bind the already
   present macOS caller-directory symlink rejection and trust-race terminal
   inconclusive behavior.
+- The next offline trust audit corrected Apple's external Trust Settings edge
+  cases: an entry without a `trustSettings` array is rejected instead of being
+  promoted, while an empty usage-constraints dictionary applies the documented
+  implicit `TrustRoot` result. Caller CA file readers now also preserve a prior
+  policy rejection when descriptor close fails; a close-only failure remains
+  inspection-inconclusive for both path and `dir_fd` inputs.
+- The final old-head helper review found that mode and ownership checks did not
+  reject macOS extended ACLs on the publisher-verified executable snapshot or
+  its private directory chain. Snapshot inspection now binds the explicit review
+  `container_dir`, opens the true review root and every descendant through stable
+  `openat` descriptors, and checks the executable plus the complete directory
+  chain on every revalidation. Lexically non-normal paths are rejected before
+  descriptor traversal, a nested directory named `.codex-tmp` cannot truncate
+  that boundary, and inherited ACLs on any chain member fail closed before
+  credentials or review content reach the executable.
+- The final clean-context review separated deterministic isolation violations
+  from transient inspection failures. Non-normal or escaping paths, symlinks,
+  unsafe owner/mode/link metadata, and present ACL entries now remain blocked;
+  descriptor I/O, close failures, ACL API failures, and identity races remain
+  inspection-inconclusive. Focused tests assert both exception classes before
+  the complete Python 3.10 and 3.13 suites.
 - Ruff 0.13.2 lint, Python compile, project-journal validation, the official
   skill validator through its documented uv/PyYAML fallback, and working-tree
-  diff checks passed. No provider/test formatter churn was retained:
-  Ruff would also rewrite three pre-existing current-head expressions outside
-  this P2 fix. The previously documented formatter drift in
-  `claude_provenance.py` and its two test files remains untouched.
+  diff checks passed. No formatter churn was retained: the full-skill formatter
+  check still reports existing current-head drift in 13 files, while the focused
+  provider/test formatter diff contains no hunk in the new descriptor, ACL,
+  Trust Settings, or close-error logic. That unrelated drift remains untouched.

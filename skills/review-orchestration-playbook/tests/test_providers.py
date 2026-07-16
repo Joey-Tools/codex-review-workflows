@@ -8090,6 +8090,46 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertTrue(private_path.is_symlink())
         self.assertEqual(stat.S_IMODE(victim.stat().st_mode), victim_mode)
 
+    def test_claude_runtime_directory_open_close_io_are_inconclusive(self) -> None:
+        runtime_root = self.review.container_dir / "claude-runtime"
+
+        with (
+            mock.patch.object(
+                providers.os,
+                "open",
+                side_effect=OSError(errno.EIO, "open failed"),
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "cannot open stable",
+            ),
+        ):
+            providers._require_existing_claude_runtime_directory(
+                runtime_root,
+                private=True,
+            )
+
+        with (
+            mock.patch.object(providers.os, "open", return_value=123),
+            mock.patch.object(
+                providers,
+                "_validate_claude_runtime_directory_descriptor",
+            ),
+            mock.patch.object(
+                providers.os,
+                "close",
+                side_effect=OSError(errno.EIO, "close failed"),
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "cannot close stable",
+            ),
+        ):
+            providers._require_existing_claude_runtime_directory(
+                runtime_root,
+                private=True,
+            )
+
     def test_claude_linux_runtime_root_rejects_unsafe_mode_without_chmod(
         self,
     ) -> None:
@@ -8444,6 +8484,7 @@ class ProviderPolicyTest(unittest.TestCase):
         executable.chmod(0o500)
         evidence = self.inspect_claude_executable_trust(
             executable,
+            container_dir=self.review.container_dir,
             include_bundled_roots=False,
         )
         executable.chmod(0o700)
@@ -8461,7 +8502,11 @@ class ProviderPolicyTest(unittest.TestCase):
                 "no longer matches signed provenance",
             ),
         ):
-            self.require_matching_claude_executable_snapshot(executable, evidence)
+            self.require_matching_claude_executable_snapshot(
+                executable,
+                evidence,
+                container_dir=self.review.container_dir,
+            )
 
     def test_verified_executable_snapshot_rejects_owner_writable_mode(self) -> None:
         executable = self.review.container_dir / "verified-executable-mode-drift"
@@ -8469,6 +8514,7 @@ class ProviderPolicyTest(unittest.TestCase):
         executable.chmod(0o500)
         evidence = self.inspect_claude_executable_trust(
             executable,
+            container_dir=self.review.container_dir,
             include_bundled_roots=False,
         )
         executable.chmod(0o700)
@@ -8481,11 +8527,186 @@ class ProviderPolicyTest(unittest.TestCase):
                 side_effect=self.inspect_claude_executable_trust,
             ),
             self.assertRaisesRegex(
-                providers.ClaudeExecutableInspectionInconclusive,
+                ReviewError,
                 "unsafe file metadata",
-            ),
+            ) as caught,
         ):
-            self.require_matching_claude_executable_snapshot(executable, evidence)
+            self.require_matching_claude_executable_snapshot(
+                executable,
+                evidence,
+                container_dir=self.review.container_dir,
+            )
+        self.assertNotIsInstance(
+            caught.exception,
+            providers.ClaudeExecutableInspectionInconclusive,
+        )
+
+    def test_verified_executable_snapshot_rejects_directory_chain_acl(self) -> None:
+        snapshot_root = (
+            self.review.container_dir / "claude-runtime" / "verified-executables"
+        )
+        snapshot_root.mkdir(parents=True, mode=0o700)
+        executable = snapshot_root / "claude-snapshot"
+        executable.write_bytes(b"publisher-verified-snapshot")
+        executable.chmod(0o500)
+
+        for rejected_directory in range(1, 5):
+            call_count = 0
+
+            def reject_inherited_acl(_descriptor: int, *, label: str) -> None:
+                nonlocal call_count
+                if label != "Claude runtime directory":
+                    return
+                call_count += 1
+                if call_count == rejected_directory:
+                    raise ReviewError("inherited ACL sentinel")
+
+            self.acl_check.side_effect = reject_inherited_acl
+            with (
+                self.subTest(directory_index=rejected_directory),
+                self.assertRaisesRegex(
+                    ReviewError,
+                    "inherited ACL sentinel",
+                ) as caught,
+            ):
+                self.inspect_claude_executable_trust(
+                    executable,
+                    container_dir=self.review.container_dir,
+                    include_bundled_roots=False,
+                    required_mode=0o500,
+                )
+            self.assertNotIsInstance(
+                caught.exception,
+                providers.ClaudeExecutableInspectionInconclusive,
+            )
+            self.acl_check.side_effect = None
+
+    def test_verified_executable_snapshot_rejects_file_acl(self) -> None:
+        executable = self.review.container_dir / "verified-executable-file-acl"
+        executable.write_bytes(b"publisher-verified-snapshot")
+        executable.chmod(0o500)
+
+        def reject_file_acl(_descriptor: int, *, label: str) -> None:
+            if label == "Claude executable snapshot":
+                raise ReviewError("snapshot ACL sentinel")
+
+        self.acl_check.side_effect = reject_file_acl
+        with self.assertRaisesRegex(
+            ReviewError,
+            "snapshot ACL sentinel",
+        ) as caught:
+            self.inspect_claude_executable_trust(
+                executable,
+                container_dir=self.review.container_dir,
+                include_bundled_roots=False,
+                required_mode=0o500,
+            )
+        self.assertNotIsInstance(
+            caught.exception,
+            providers.ClaudeExecutableInspectionInconclusive,
+        )
+
+    def test_verified_executable_snapshot_acl_io_is_inconclusive(self) -> None:
+        executable = self.review.container_dir / "verified-executable-acl-io"
+        executable.write_bytes(b"publisher-verified-snapshot")
+        executable.chmod(0o500)
+        self.acl_check.side_effect = (
+            providers.ClaudeExecutableInspectionInconclusive(
+                "snapshot ACL inspection unavailable"
+            )
+        )
+
+        with self.assertRaisesRegex(
+            providers.ClaudeExecutableInspectionInconclusive,
+            "ACL inspection unavailable",
+        ):
+            self.inspect_claude_executable_trust(
+                executable,
+                container_dir=self.review.container_dir,
+                include_bundled_roots=False,
+                required_mode=0o500,
+            )
+
+    def test_snapshot_chain_does_not_trust_nested_codex_tmp_name(self) -> None:
+        nested_root = (
+            self.review.container_dir
+            / "claude-runtime"
+            / "verified-executables"
+            / ".codex-tmp"
+        )
+        nested_root.mkdir(parents=True, mode=0o700)
+        executable = nested_root / "claude-snapshot"
+        executable.write_bytes(b"publisher-verified-snapshot")
+        executable.chmod(0o500)
+        call_count = 0
+
+        def reject_outer_chain_acl(_descriptor: int, *, label: str) -> None:
+            nonlocal call_count
+            if label != "Claude runtime directory":
+                return
+            call_count += 1
+            if call_count == 2:
+                raise ReviewError("outer chain ACL sentinel")
+
+        self.acl_check.side_effect = reject_outer_chain_acl
+        with self.assertRaisesRegex(
+            ReviewError,
+            "outer chain ACL sentinel",
+        ) as caught:
+            self.inspect_claude_executable_trust(
+                executable,
+                container_dir=self.review.container_dir,
+                include_bundled_roots=False,
+                required_mode=0o500,
+            )
+        self.assertEqual(call_count, 2)
+        self.assertNotIsInstance(
+            caught.exception,
+            providers.ClaudeExecutableInspectionInconclusive,
+        )
+
+    def test_snapshot_chain_rejects_noncanonical_parent_component(self) -> None:
+        snapshot_root = self.review.container_dir / "claude-runtime"
+        snapshot_root.mkdir(mode=0o700, exist_ok=True)
+        executable = self.review.container_dir / "claude-snapshot"
+        executable.write_bytes(b"publisher-verified-snapshot")
+        executable.chmod(0o500)
+        noncanonical = snapshot_root / ".." / executable.name
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "lexically normalized",
+        ) as caught:
+            self.inspect_claude_executable_trust(
+                noncanonical,
+                container_dir=self.review.container_dir,
+                include_bundled_roots=False,
+                required_mode=0o500,
+            )
+        self.assertNotIsInstance(
+            caught.exception,
+            providers.ClaudeExecutableInspectionInconclusive,
+        )
+
+    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "requires O_NOFOLLOW")
+    def test_verified_executable_snapshot_symlink_is_blocked(self) -> None:
+        target = self.review.container_dir / "verified-executable-target"
+        target.write_bytes(b"publisher-verified-snapshot")
+        target.chmod(0o500)
+        executable = self.review.container_dir / "verified-executable-symlink"
+        executable.symlink_to(target.name)
+
+        with self.assertRaisesRegex(ReviewError, "real file") as caught:
+            self.inspect_claude_executable_trust(
+                executable,
+                container_dir=self.review.container_dir,
+                include_bundled_roots=False,
+                required_mode=0o500,
+            )
+        self.assertNotIsInstance(
+            caught.exception,
+            providers.ClaudeExecutableInspectionInconclusive,
+        )
 
     def test_verified_macos_snapshot_captures_exact_bundled_root_set(self) -> None:
         certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
@@ -8500,6 +8721,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
         evidence = self.inspect_claude_executable_trust(
             executable,
+            container_dir=self.review.container_dir,
             include_bundled_roots=True,
         )
 
@@ -8528,6 +8750,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
         evidence = self.inspect_claude_executable_trust(
             executable,
+            container_dir=self.review.container_dir,
             include_bundled_roots=True,
         )
 
@@ -8543,6 +8766,7 @@ class ProviderPolicyTest(unittest.TestCase):
         executable.chmod(0o500)
         evidence = self.inspect_claude_executable_trust(
             executable,
+            container_dir=self.review.container_dir,
             include_bundled_roots=True,
         )
 
@@ -8558,7 +8782,11 @@ class ProviderPolicyTest(unittest.TestCase):
                 "_require_bundled_root_self_signature",
             ) as verify_self_signature,
         ):
-            self.require_matching_claude_executable_snapshot(executable, evidence)
+            self.require_matching_claude_executable_snapshot(
+                executable,
+                evidence,
+                container_dir=self.review.container_dir,
+            )
 
         verify_self_signature.assert_not_called()
 
@@ -8586,7 +8814,11 @@ class ProviderPolicyTest(unittest.TestCase):
                 "trust evidence changed",
             ),
         ):
-            self.require_matching_claude_executable_snapshot(executable, expected)
+            self.require_matching_claude_executable_snapshot(
+                executable,
+                expected,
+                container_dir=self.review.container_dir,
+            )
 
     def test_verified_macos_snapshot_requires_one_anchored_root_store(self) -> None:
         certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
@@ -8617,6 +8849,7 @@ class ProviderPolicyTest(unittest.TestCase):
             ):
                 self.inspect_claude_executable_trust(
                     executable,
+                    container_dir=self.review.container_dir,
                     include_bundled_roots=True,
                 )
 
@@ -8631,6 +8864,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 with self.assertRaises(providers.ClaudeTrustCertificateInvalid):
                     self.inspect_claude_executable_trust(
                         executable,
+                        container_dir=self.review.container_dir,
                         include_bundled_roots=True,
                     )
 
@@ -8654,6 +8888,7 @@ class ProviderPolicyTest(unittest.TestCase):
         ):
             self.inspect_claude_executable_trust(
                 executable,
+                container_dir=self.review.container_dir,
                 include_bundled_roots=True,
             )
 
@@ -8665,13 +8900,18 @@ class ProviderPolicyTest(unittest.TestCase):
         os.link(executable, self.review.container_dir / "snapshot-alias")
 
         with self.assertRaisesRegex(
-            providers.ClaudeExecutableInspectionInconclusive,
+            ReviewError,
             "unsafe file metadata",
-        ):
+        ) as caught:
             self.inspect_claude_executable_trust(
                 executable,
+                container_dir=self.review.container_dir,
                 include_bundled_roots=False,
             )
+        self.assertNotIsInstance(
+            caught.exception,
+            providers.ClaudeExecutableInspectionInconclusive,
+        )
 
     def test_claude_linux_candidate_mountinfo_failure_is_inconclusive(self) -> None:
         candidate = self.review.source_root / "claude"
@@ -9542,7 +9782,10 @@ class ProviderPolicyTest(unittest.TestCase):
                         "get_errno",
                         return_value=error_number,
                     ),
-                    self.assertRaisesRegex(ReviewError, "cannot inspect"),
+                    self.assertRaisesRegex(
+                        providers.ClaudeExecutableInspectionInconclusive,
+                        "cannot inspect",
+                    ),
                 ):
                     self.require_no_extended_acl(7, label="fixture")
 
@@ -9686,12 +9929,14 @@ class ProviderPolicyTest(unittest.TestCase):
         trust_as_root = "D" * 40
         mixed = "E" * 40
         constrained_result = "F" * 40
+        implicit_trust_root = "0" * 40
         classified = providers._classify_trust_fingerprints(
             plistlib.dumps(
                 {
                     "trustVersion": 1,
                     "trustList": {
                         empty: {"trustSettings": []},
+                        implicit_trust_root: {"trustSettings": [{}]},
                         constrained: {
                             "trustSettings": [{"kSecTrustSettingsPolicyName": "ssl"}]
                         },
@@ -9741,7 +9986,17 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertEqual(
             classified.unconditional,
-            tuple(sorted((empty, trust_root, trust_as_root, mixed))),
+            tuple(
+                sorted(
+                    (
+                        empty,
+                        implicit_trust_root,
+                        trust_root,
+                        trust_as_root,
+                        mixed,
+                    )
+                )
+            ),
         )
         self.assertEqual(
             classified.trust_as_root,
@@ -9751,6 +10006,20 @@ class ProviderPolicyTest(unittest.TestCase):
             classified.constrained,
             tuple(sorted((constrained, constrained_result))),
         )
+
+    def test_trust_settings_reject_entry_without_settings_array(self) -> None:
+        payload = plistlib.dumps(
+            {
+                "trustVersion": 1,
+                "trustList": {"A" * 40: {}},
+            }
+        )
+
+        with self.assertRaisesRegex(
+            providers.ClaudeTrustPolicyUnavailable,
+            "invalid constraints",
+        ):
+            providers._classify_trust_fingerprints(payload, domain="user")
 
     def test_trust_settings_validate_neighbors_of_unconditional_entries(
         self,
@@ -11378,6 +11647,85 @@ class ProviderPolicyTest(unittest.TestCase):
                 limit_bytes=1024,
                 label="fixture owner file",
             )
+
+    def test_caller_ca_file_close_io_is_inconclusive(self) -> None:
+        source = self.review.source_root / "caller-ca-close-io.pem"
+        readers = (
+            (
+                "path",
+                lambda: providers._read_ca_source_with_size(
+                    source,
+                    source="SSL_CERT_FILE",
+                ),
+            ),
+            (
+                "directory-entry",
+                lambda: providers._read_ca_source_at_with_size(
+                    7,
+                    source.name,
+                    source="SSL_CERT_DIR",
+                ),
+            ),
+        )
+
+        for name, reader in readers:
+            with (
+                self.subTest(reader=name),
+                mock.patch.object(providers.os, "open", return_value=123),
+                mock.patch.object(
+                    providers,
+                    "_read_stable_ca_descriptor",
+                    return_value=(b"fixture", 7, object()),
+                ),
+                mock.patch.object(
+                    providers.os,
+                    "close",
+                    side_effect=OSError(errno.EIO, "close failed"),
+                ),
+                self.assertRaisesRegex(
+                    providers.ClaudeExecutableInspectionInconclusive,
+                    "cannot close a stable Claude review CA source",
+                ),
+            ):
+                reader()
+
+    def test_caller_ca_file_close_io_preserves_policy_error(self) -> None:
+        source = self.review.source_root / "caller-ca-close-after-policy-error.pem"
+        readers = (
+            (
+                "path",
+                lambda: providers._read_ca_source_with_size(
+                    source,
+                    source="SSL_CERT_FILE",
+                ),
+            ),
+            (
+                "directory-entry",
+                lambda: providers._read_ca_source_at_with_size(
+                    7,
+                    source.name,
+                    source="SSL_CERT_DIR",
+                ),
+            ),
+        )
+
+        for name, reader in readers:
+            with (
+                self.subTest(reader=name),
+                mock.patch.object(providers.os, "open", return_value=123),
+                mock.patch.object(
+                    providers,
+                    "_read_stable_ca_descriptor",
+                    side_effect=ReviewError("policy rejection sentinel"),
+                ),
+                mock.patch.object(
+                    providers.os,
+                    "close",
+                    side_effect=OSError(errno.EIO, "close failed"),
+                ),
+                self.assertRaisesRegex(ReviewError, "policy rejection sentinel"),
+            ):
+                reader()
 
     def test_caller_ca_open_io_remains_inspection_inconclusive(self) -> None:
         source = self.review.source_root / "caller-ca-open-io.pem"
