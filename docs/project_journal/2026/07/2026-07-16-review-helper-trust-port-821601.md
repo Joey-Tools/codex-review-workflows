@@ -58,13 +58,14 @@ metadata behavior.
 ## Validation
 
 - Python 3.10.19 complete canonical suite with the `tomli` test backport and
-  `PYTHONDONTWRITEBYTECODE=1`: 805 tests run, 4 skipped, no failures. Disabling
+  `PYTHONDONTWRITEBYTECODE=1`: 808 tests run, 4 skipped, no failures. Disabling
   bytecode writes keeps the intentional `RLIMIT_FSIZE` tests from truncating
   uv's own `_virtualenv.pyc` import hook.
-- Python 3.13.0 complete canonical suite: 805 tests run, 4 skipped, no failures.
-- Focused Python 3.13 suites: providers 334 tests run with 3 skipped and
-  provenance 90 tests run with no skips or failures; earlier current-range
-  common 49 and repository contract 14 test suites also passed.
+- Python 3.13.0 complete canonical suite: 808 tests run, 4 skipped, no failures.
+- Focused Python 3.13 suites: the 3 `SSL_CERT_DIR` regressions passed, providers
+  ran 337 tests with 3 skipped, and provenance ran 90 tests with no skips or
+  failures; earlier current-range common 49 and repository contract 14 test
+  suites also passed.
 - Final-head review remediation covers strict signed-manifest numeric parsing,
   system-domain custom roots, bounded snapshot revalidation without repeated
   OpenSSL self-signature work, blocked `runtime-unverified` outcomes,
@@ -73,8 +74,11 @@ metadata behavior.
   Linux/WSL2 hard-linked certificate layouts. Explicit macOS `TrustAsRoot`
   anchors retain non-self-issued CA certificates through strict partial-chain
   verification rather than incorrectly requiring a root self-signature.
-- Ruff lint, provider-file format checks, Python compile, and staged repository
-  diff checks passed. The locally installed Ruff formatter still names the
-  pre-existing layout in `claude_provenance.py` and its two test files; those
-  files were not mechanically reformatted because doing so creates unrelated
-  whole-file churn.
+- The current-head P2 follow-up treats configured `SSL_CERT_DIR` entries as one
+  certificate union: safe empty directories can precede a valid directory, the
+  complete all-empty union is rejected, and any unsafe member still blocks.
+- Ruff 0.13.2 lint, Python compile, skill and project-journal validation, and
+  working-tree diff checks passed. No provider/test formatter churn was retained:
+  Ruff would also rewrite three pre-existing current-head expressions outside
+  this P2 fix. The previously documented formatter drift in
+  `claude_provenance.py` and its two test files remains untouched.

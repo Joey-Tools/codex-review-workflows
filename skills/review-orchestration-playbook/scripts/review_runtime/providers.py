@@ -3746,8 +3746,11 @@ def _collect_claude_caller_ca_material(
         append_material(key, material)
 
     directory_entry_count = 0
+    configured_directory = False
+    found_directory_certificate = False
     for key in CLAUDE_TLS_DIR_ENV_KEYS:
         raw_entries = [entry for entry in env.get(key, "").split(os.pathsep) if entry]
+        configured_directory = configured_directory or bool(raw_entries)
         for raw in raw_entries:
             source_dir = pathlib.Path(raw)
             if not source_dir.is_absolute():
@@ -3763,7 +3766,6 @@ def _collect_claude_caller_ca_material(
                     too_many_message="Claude review CA directory has too many entries",
                 )
                 directory_entry_count += len(names)
-                found_certificate = False
                 for name in names:
                     metadata = os.stat(
                         name,
@@ -3793,18 +3795,16 @@ def _collect_claude_caller_ca_material(
                             continue
                         raise
                     append_material(f"{key}:{name}", material)
-                    found_certificate = True
+                    found_directory_certificate = True
                 after = os.fstat(descriptor)
                 if _ca_source_metadata(before) != _ca_source_metadata(after):
                     raise ClaudeExecutableInspectionInconclusive(
                         "Claude review CA directory changed while being read"
                     )
-                if not found_certificate:
-                    raise ReviewError(
-                        "Claude review CA directory contains no PEM certificates"
-                    )
             finally:
                 os.close(descriptor)
+    if configured_directory and not found_directory_certificate:
+        raise ReviewError("Claude review CA directory contains no PEM certificates")
     return materials
 
 

@@ -10065,6 +10065,46 @@ class ProviderPolicyTest(unittest.TestCase):
         ):
             providers._collect_claude_caller_ca_material({"SSL_CERT_FILE": str(source)})
 
+    def test_caller_ca_directories_accept_empty_then_valid(self) -> None:
+        certificate = self.sample_ca_certificate()
+        empty_dir = self.review.source_root / "empty-caller-ca-directory"
+        valid_dir = self.review.source_root / "valid-caller-ca-directory"
+        empty_dir.mkdir(mode=0o700)
+        valid_dir.mkdir(mode=0o700)
+        self.write_private_source(valid_dir / "caller.pem", certificate)
+
+        materials = providers._collect_claude_caller_ca_material(
+            {"SSL_CERT_DIR": os.pathsep.join((str(empty_dir), str(valid_dir)))}
+        )
+
+        self.assertEqual(materials, [("SSL_CERT_DIR:caller.pem", certificate)])
+
+    def test_caller_ca_directories_reject_when_all_are_empty(self) -> None:
+        empty_dirs = []
+        for name in ("first-empty-caller-ca", "second-empty-caller-ca"):
+            source_dir = self.review.source_root / name
+            source_dir.mkdir(mode=0o700)
+            empty_dirs.append(source_dir)
+
+        with self.assertRaisesRegex(ReviewError, "contains no PEM certificates"):
+            providers._collect_claude_caller_ca_material(
+                {"SSL_CERT_DIR": os.pathsep.join(str(path) for path in empty_dirs)}
+            )
+
+    def test_caller_ca_directories_reject_unsafe_member_after_valid(self) -> None:
+        certificate = self.sample_ca_certificate()
+        valid_dir = self.review.source_root / "valid-before-unsafe-ca-directory"
+        unsafe_dir = self.review.source_root / "unsafe-caller-ca-directory"
+        valid_dir.mkdir(mode=0o700)
+        unsafe_dir.mkdir(mode=0o700)
+        self.write_private_source(valid_dir / "caller.pem", certificate)
+        unsafe_dir.chmod(0o777)
+
+        with self.assertRaisesRegex(ReviewError, "group- or world-writable"):
+            providers._collect_claude_caller_ca_material(
+                {"SSL_CERT_DIR": os.pathsep.join((str(valid_dir), str(unsafe_dir)))}
+            )
+
     def test_caller_ca_budget_charges_noncertificate_files_before_parsing(
         self,
     ) -> None:

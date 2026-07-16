@@ -498,7 +498,11 @@ traversed link and directory plus the final no-follow regular file is
 owner/mode/identity checked and revalidated around a bounded read. Only PEM
 certificates are materialized, never private-key material. The helper keeps the
 original hash basename but writes a private `0600` regular file instead of
-recreating a symlink.
+recreating a symlink. Multiple configured directories form one certificate
+union: safe empty directories do not reject a later admissible certificate, but
+the complete union must contain at least one certificate. Every configured
+directory is still validated, so an unsafe member blocks even when another
+member supplies a valid certificate.
 
 On macOS, caller CA inputs use owner-only, single-link regular-file reads with
 no symlinks, FIFOs, extended ACL entries, or identity/growth races. The helper
