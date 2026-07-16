@@ -17,7 +17,7 @@ superseded_by:
 This work semantically ports the still-applicable security hardening from
 private-overlay PR 82 onto the canonical repository. The final integration
 also incorporates canonical `master` through
-`4da59bf424f941f61bf36fd1f9871ad09dff8d3a`. It preserves canonical floating
+`8c095454d2d5cb25b6a2c1fb544de5e7487ba423`. It preserves canonical floating
 publisher-signed Claude provenance, immutable executable snapshots, macOS and
 Linux/WSL2 isolation, the synthetic-token catalog, and the Python 3.10
 contract. It does not cherry-pick or restore obsolete private-overlay account
@@ -58,10 +58,10 @@ metadata behavior.
 ## Validation
 
 - Python 3.10.19 complete canonical suite with the `tomli` test backport and
-  `PYTHONDONTWRITEBYTECODE=1`: 824 tests run, 9 skipped, no failures. Disabling
+  `PYTHONDONTWRITEBYTECODE=1`: 820 tests run, 9 skipped, no failures. Disabling
   bytecode writes keeps the intentional `RLIMIT_FSIZE` tests from truncating
   uv's own `_virtualenv.pyc` import hook.
-- Python 3.13.0 complete canonical suite: 824 tests run, 9 skipped, no failures.
+- Python 3.13.0 complete canonical suite: 820 tests run, 9 skipped, no failures.
 - Focused Python 3.13 suites: the 3 `SSL_CERT_DIR` regressions passed, providers
   ran 353 tests with 6 skipped, and provenance ran 90 tests with no skips or
   failures; earlier current-range common 49 and repository contract 14 test
@@ -125,6 +125,10 @@ metadata behavior.
   parent/proxy TLS environment for both local-login warmup and final review;
   Claude's merged bundled/caller/Node CA set is exposed only to the sandboxed
   Claude process and no longer widens the upstream CONNECT proxy trust store.
+- The final `origin/master` integration preserves this branch's strict JSON and
+  runtime-failure contract while adopting the canonical JWT retirement: legacy
+  exemptions may cover only catalog-declared generic assignments or GitHub
+  tokens, and JWT findings are never suppressible.
 - Ruff 0.13.2 lint, Python compile, project-journal validation, the official
   skill validator through its documented uv/PyYAML fallback, and working-tree
   diff checks passed. No provider/test formatter churn was retained:

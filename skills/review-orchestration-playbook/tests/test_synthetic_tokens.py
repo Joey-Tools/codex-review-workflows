@@ -142,38 +142,8 @@ class PublicPoolScannerTest(unittest.TestCase):
         )
         self.assertEqual(
             tuple(item.identifier for item in self.catalog.legacy_exemptions),
-            ("codex-workflow-hygiene-jwt",),
+            (),
         )
-
-    def test_public_jwt_legacy_envelope_has_exact_raw_free_metadata(self) -> None:
-        if self.catalog.pool_version != "public-example-v1":
-            self.skipTest("active downstream catalog replaces the public catalog")
-        exemption = self.catalog.legacy_exemption("codex-workflow-hygiene-jwt")
-        self.assertEqual(exemption.repository, "Joey-Tools/codex-workflow-hygiene")
-        self.assertEqual(
-            exemption.verified_master_tip,
-            "95befb966cd93e0161ecb45099c124eac56cb52f",
-        )
-        self.assertEqual(exemption.match, "non-increasing-global-count")
-        self.assertEqual(len(exemption.values), 1)
-        token = exemption.values[0]
-        self.assertEqual(token.identifier, "session-retrospective-redaction-jwt")
-        self.assertEqual(token.rule, "jwt")
-        self.assertEqual(
-            token.containing_commit,
-            "49dc9bb8af8256b5c39ff870ec6b682ff08bd5a8",
-        )
-        self.assertEqual(token.source_occurrences, 1)
-        self.assertEqual(token.value_length, 43)
-        self.assertEqual(
-            token.value_sha256,
-            "e36cc9d7dacb75b118e282ae535b09df0658089cb215e271651972dde37340f3",
-        )
-        payload = catalog_payload()
-        stored = payload["legacy_exemptions"][0]["values"][0]["value_base64"]
-        self.assertEqual(len(stored), 60)
-        catalog_bytes = synthetic_tokens.CATALOG_PATH.read_bytes()
-        self.assertNotIn(token.value, catalog_bytes)
 
     def test_each_exact_pool_value_suppresses_only_generic_assignment(self) -> None:
         for descriptor in self.accepted:
@@ -527,23 +497,6 @@ class PublicPoolScannerTest(unittest.TestCase):
         )
         self.assertEqual(adjacent.blocking_rule, "generic-secret-assignment")
         self.assertEqual(adjacent.accepted_counts[accepted], 1)
-
-    def test_jwt_legacy_acceptance_suppresses_duplicate_assignment_only(self) -> None:
-        accepted = accepted_legacy_value(JWT_LEGACY, rule="jwt")
-        scan = workspace._scan_secret_value(
-            assignment_bytes(b"access_token", JWT_LEGACY.encode("ascii")),
-            accepted_values=(accepted,),
-        )
-        self.assertIsNone(scan.blocking_rule)
-        self.assertEqual(scan.accepted_counts[accepted], 1)
-
-        unknown = JWT_LEGACY.replace("C" * 12, "D" * 12)
-        blocked = workspace._scan_secret_value(
-            assignment_bytes(b"access_token", unknown.encode("ascii")),
-            accepted_values=(accepted,),
-        )
-        self.assertEqual(blocked.blocking_rule, "jwt")
-        self.assertFalse(blocked.accepted_counts)
 
     def test_provider_specific_legacy_acceptance_survives_stream_boundary(self) -> None:
         accepted = accepted_legacy_value(GITHUB_LEGACY, rule="github-token")
@@ -1781,11 +1734,9 @@ class CatalogValidationTest(unittest.TestCase):
             with self.subTest(case=label), self.assertRaises(ReviewError):
                 legacy_catalog(values=(candidate,))
 
-    def test_jwt_is_accepted_only_as_a_legacy_rule(self) -> None:
-        catalog = legacy_catalog(values=(JWT_LEGACY,), rule="jwt")
-        token = catalog.legacy_exemption("historical-fixtures").values[0]
-        self.assertEqual(token.rule, "jwt")
-        self.assertEqual(token.value, JWT_LEGACY.encode("ascii"))
+    def test_jwt_is_not_an_allowed_legacy_or_authoring_rule(self) -> None:
+        with self.assertRaisesRegex(ReviewError, "rule is not allowed"):
+            legacy_catalog(values=(JWT_LEGACY,), rule="jwt")
 
         authoring = catalog_payload()
         authoring["authoring_pool"]["tokens"][0]["rule"] = "jwt"
@@ -2453,39 +2404,6 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         self.assertEqual(counts[0]["head_count"], 1)
         self.assertNotIn(GITHUB_LEGACY, json.dumps(evidence, sort_keys=True))
 
-    def test_jwt_legacy_deletion_uses_the_provider_specific_exemption(
-        self,
-    ) -> None:
-        catalog = legacy_catalog(values=(JWT_LEGACY,), rule="jwt")
-        repo, base = self.new_repo(
-            {
-                "fixture.cfg": (
-                    'state = "base"\n'
-                    + assignment_text("access_token", JWT_LEGACY)
-                    + 'status = "done"\n'
-                )
-            }
-        )
-        (repo / "fixture.cfg").write_text(
-            'state = "base"\nstatus = "done"\n',
-            encoding="utf-8",
-        )
-        head = self.commit(repo)
-        review = self.prepare(
-            repo=repo,
-            base=base,
-            head=head,
-            catalog=catalog,
-            exemptions=("historical-fixtures",),
-        )
-        evidence = self.validate(review, catalog=catalog)
-        counts = evidence["synthetic_tokens"]["legacy_counts"]
-        self.assertEqual(len(counts), 1)
-        self.assertEqual(counts[0]["rule"], "jwt")
-        self.assertEqual(counts[0]["base_count"], 1)
-        self.assertEqual(counts[0]["head_count"], 0)
-        self.assertNotIn(JWT_LEGACY, json.dumps(evidence, sort_keys=True))
-
     def test_multi_value_legacy_move_and_rename_pass(self) -> None:
         catalog = legacy_catalog()
         repo, base = self.new_repo(
@@ -3092,70 +3010,27 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             self.validate(review, catalog=catalog)
 
     def test_prompt_does_not_accept_selected_legacy_values(self) -> None:
-        for value, rule in (
-            (LEGACY_A, "generic-secret-assignment"),
-            (JWT_LEGACY, "jwt"),
-        ):
-            with self.subTest(rule=rule):
-                catalog = legacy_catalog(values=(value,), rule=rule)
-                repo, base = self.new_repo(
-                    {"fixture.cfg": assignment_text("access_token", value)}
-                )
-                (repo / "README.md").write_text("head\n", encoding="utf-8")
-                head = self.commit(repo)
-                prompt = self.root / f"prompt-{rule}.txt"
-                prompt.write_text(
-                    f'Review {{review_range}}\naccess_token = "{value}"\n',
-                    encoding="utf-8",
-                )
-                review = self.prepare(
-                    repo=repo,
-                    base=base,
-                    head=head,
-                    catalog=catalog,
-                    exemptions=("historical-fixtures",),
-                    prompt_override=prompt,
-                )
-                with self.assertRaisesRegex(ReviewError, "review.prompt"):
-                    self.validate(review, catalog=catalog)
-
-    def test_jwt_audit_master_evidence_is_raw_free(self) -> None:
-        repo, tip = self.new_repo(
-            {"fixture.cfg": assignment_text("access_token", JWT_LEGACY)}
+        catalog = legacy_catalog(values=(LEGACY_A,))
+        repo, base = self.new_repo(
+            {"fixture.cfg": assignment_text("access_token", LEGACY_A)}
         )
-        git(repo, "remote", "add", "origin", "https://github.com/example/project.git")
-        payload = catalog_payload()
-        payload["legacy_exemptions"] = [
-            {
-                "id": "historical-fixtures",
-                "repository": "example/project",
-                "verified_master_tip": tip,
-                "match": "non-increasing-global-count",
-                "values": [
-                    {
-                        "id": "historical-jwt",
-                        "rule": "jwt",
-                        "value_base64": legacy_value_base64(JWT_LEGACY),
-                        "containing_commit": tip,
-                        "source_occurrences": 1,
-                    }
-                ],
-            }
-        ]
-        catalog = synthetic_tokens.parse_catalog_bytes(
-            json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        (repo / "README.md").write_text("head\n", encoding="utf-8")
+        head = self.commit(repo)
+        prompt = self.root / "prompt-generic-secret-assignment.txt"
+        prompt.write_text(
+            f'Review {{review_range}}\naccess_token = "{LEGACY_A}"\n',
+            encoding="utf-8",
         )
-        with mock.patch.object(workspace, "load_catalog", return_value=catalog):
-            evidence = workspace.audit_legacy_exemption(
-                repo=repo,
-                ref=tip,
-                exemption=catalog.legacy_exemption("historical-fixtures"),
-            )
-        self.assertEqual(evidence["status"], "verified")
-        self.assertEqual(evidence["values"][0]["rule"], "jwt")
-        serialized = json.dumps(evidence, sort_keys=True)
-        self.assertNotIn(JWT_LEGACY, serialized)
-        self.assertNotIn(legacy_value_base64(JWT_LEGACY), serialized)
+        review = self.prepare(
+            repo=repo,
+            base=base,
+            head=head,
+            catalog=catalog,
+            exemptions=("historical-fixtures",),
+            prompt_override=prompt,
+        )
+        with self.assertRaisesRegex(ReviewError, "review.prompt"):
+            self.validate(review, catalog=catalog)
 
     def test_audit_master_cli_verifies_pinned_provenance_without_raw_value(
         self,
