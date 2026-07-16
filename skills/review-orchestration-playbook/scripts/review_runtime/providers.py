@@ -497,6 +497,7 @@ CLAUDE_MODEL_USAGE_FIELDS = frozenset(
         "contextWindow",
         "costUSD",
         "inputTokens",
+        "maxOutputTokens",
         "outputTokens",
         "webSearchRequests",
     }
@@ -2242,8 +2243,8 @@ def _require_safe_ca_source_metadata(
         raise ReviewError(
             f"Claude review CA source is group- or world-writable: {source}"
         )
-    if _is_claude_macos_host() and metadata.st_uid == os.geteuid():
-        if metadata.st_mode & 0o077:
+    if _is_claude_macos_host():
+        if metadata.st_uid == os.geteuid() and metadata.st_mode & 0o077:
             raise ReviewError(f"Claude review CA source is not owner-only: {source}")
         if descriptor is None:
             raise ReviewError(
@@ -5742,17 +5743,15 @@ def _claude_model_usage_evidence(
         return None, False
     candidates = list(model_usage)
     if requested_model is not None:
-        return (
-            next(
-                (
-                    candidate
-                    for candidate in candidates
-                    if _model_matches(requested_model, candidate)
-                ),
-                None,
+        matching = next(
+            (
+                candidate
+                for candidate in candidates
+                if _model_matches(requested_model, candidate)
             ),
-            True,
+            None,
         )
+        return matching or (candidates[-1] if candidates else None), True
     return (candidates[-1] if candidates else None), True
 
 

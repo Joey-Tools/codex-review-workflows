@@ -2854,12 +2854,22 @@ class ProviderPolicyTest(unittest.TestCase):
             returncode=0,
             index=107,
         )
+        mismatched = self.record_claude_result(
+            json.dumps(
+                {**base, "modelUsage": {providers.CLAUDE_MODELS[1]: {}}}
+            ).encode(),
+            returncode=0,
+            index=108,
+        )
 
         self.assertEqual(exact.category, "auth")
         self.assertIsNone(exact.final_text)
         self.assertEqual(unknown.category, "inconclusive")
         self.assertEqual(unknown.reason, "unverified-auth-failure-envelope")
         self.assertIsNone(unknown.final_text)
+        self.assertEqual(mismatched.category, "model-mismatch")
+        self.assertEqual(mismatched.reason, "effective-model-mismatch")
+        self.assertIsNone(mismatched.final_text)
 
     def test_claude_transient_requires_exact_failure_envelope(self) -> None:
         base = {
@@ -3085,6 +3095,7 @@ class ProviderPolicyTest(unittest.TestCase):
             "modelUsage": {
                 model: {
                     "inputTokens": 1,
+                    "maxOutputTokens": 32_000,
                     "outputTokens": 1,
                     "costUSD": 0.0,
                 }
@@ -9097,6 +9108,28 @@ class ProviderPolicyTest(unittest.TestCase):
                     self.assertRaisesRegex(ReviewError, "cannot inspect"),
                 ):
                     self.require_no_extended_acl(7, label="fixture")
+
+    def test_macos_root_owned_ca_source_acl_entries_block(self) -> None:
+        metadata = types.SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o644,
+            st_uid=0,
+            st_nlink=1,
+        )
+        self.acl_check.side_effect = ReviewError(
+            "Claude review CA source has an extended access control list"
+        )
+
+        with self.assertRaisesRegex(ReviewError, "extended access control list"):
+            providers._require_safe_ca_source_metadata(
+                metadata,
+                source="root-owned-ca.pem",
+                descriptor=7,
+            )
+
+        self.acl_check.assert_called_once_with(
+            7,
+            label="Claude review CA source",
+        )
 
     def test_linux_acl_policy_never_resolves_darwin_symbols(self) -> None:
         with (
