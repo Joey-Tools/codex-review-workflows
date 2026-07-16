@@ -616,6 +616,10 @@ class ClaudeTrustCertificateInvalid(ReviewError):
     """An additional host trust certificate cannot be imported safely."""
 
 
+class ClaudeCACertificateNotFound(ReviewError):
+    """A bounded CA source contains no PEM certificate blocks."""
+
+
 class ClaudeTrustSettingsDeny(ReviewError):
     """Host trust settings contain an explicit deny and require a hard stop."""
 
@@ -1856,7 +1860,11 @@ def _read_claude_keychain_credential(
             raise ClaudeKeychainCredentialIntegrityError(
                 "Claude Keychain query failed without a deterministic missing-item status"
             )
-        credential = bytearray(completed.stdout.strip())
+        if not completed.stdout.endswith(b"\n"):
+            raise ClaudeKeychainCredentialIntegrityError(
+                "Claude Keychain output is missing its command terminator"
+            )
+        credential = bytearray(completed.stdout[:-1])
         if not credential:
             raise ClaudeKeychainCredentialIntegrityError(
                 "Claude Keychain returned an empty credential after a successful query"
@@ -2120,7 +2128,7 @@ def _extract_ca_certificates(data: bytes, *, source: str) -> bytes:
         raise ReviewError(f"Claude review CA source contains a private key: {source}")
     blocks = CLAUDE_CERTIFICATE_BLOCK.findall(data)
     if not blocks:
-        raise ReviewError(
+        raise ClaudeCACertificateNotFound(
             f"Claude review CA source contains no PEM certificate: {source}"
         )
     return b"\n".join(block.strip() for block in blocks) + b"\n"
@@ -3614,10 +3622,8 @@ def _prepare_claude_generic_tls_environment(
                             raw_material,
                             source=f"{key}:{source_name}",
                         )
-                    except ReviewError as error:
-                        if "contains no PEM certificate" in str(error):
-                            continue
-                        raise
+                    except ClaudeCACertificateNotFound:
+                        continue
                     destination = destination_dir / source_name
                     _write_private_ca_file(destination, material)
                     _validate_ca_file(destination)
@@ -3790,10 +3796,8 @@ def _collect_claude_caller_ca_material(
                             raw_material,
                             source=f"{key}:{name}",
                         )
-                    except ReviewError as error:
-                        if "contains no PEM certificate" in str(error):
-                            continue
-                        raise
+                    except ClaudeCACertificateNotFound:
+                        continue
                     append_material(f"{key}:{name}", material)
                     found_directory_certificate = True
                 after = os.fstat(descriptor)
@@ -4909,10 +4913,8 @@ def _claude_linux_ca_bundle(
             raise ReviewError("Claude Linux CA input exceeds the size limit")
         try:
             certificates = _extract_ca_certificates(material, source=source)
-        except ReviewError as error:
-            if "contains no PEM certificate" in str(error):
-                return
-            raise
+        except ClaudeCACertificateNotFound:
+            return
         for block in CLAUDE_CERTIFICATE_BLOCK.findall(certificates):
             normalized = block.strip() + b"\n"
             if normalized in seen:
@@ -7506,7 +7508,9 @@ def _finish(
             review.container_dir / "final.txt", final_text.rstrip("\r\n") + "\n"
         )
         return Outcome(0, final_text, tuple(attempts))
-    if not attempts or attempts[-1].category in {
+    if not attempts:
+        return Outcome(1, None, tuple())
+    if attempts[-1].category in {
         "inconclusive",
         "transient",
     }:

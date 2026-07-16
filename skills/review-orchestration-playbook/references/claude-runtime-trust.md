@@ -502,7 +502,9 @@ recreating a symlink. Multiple configured directories form one certificate
 union: safe empty directories do not reject a later admissible certificate, but
 the complete union must contain at least one certificate. Every configured
 directory is still validated, so an unsafe member blocks even when another
-member supplies a valid certificate.
+member supplies a valid certificate. Empty-certificate classification uses a
+dedicated exception type rather than source-path or error-message text; a file
+name therefore cannot disguise private-key or malformed-certificate rejection.
 
 On macOS, caller CA inputs use owner-only, single-link regular-file reads with
 no symlinks, FIFOs, extended ACL entries, or identity/growth races. The helper
@@ -602,7 +604,11 @@ credentials into the same child environment.
 On macOS, retain the capability-authenticated, one-shot Keychain broker. Before
 each model attempt, after trusted executable, review-tool, and TLS preparation,
 the parent reads and validates the current Claude Code item with Apple's trusted
-client. The token needs to cover only the current bounded attempt plus its
+client. It removes exactly the client's final line-feed command terminator and
+preserves every preceding credential byte. The two raw credential values are
+compared before strict JSON validation, so boundary control bytes cannot be
+normalized away or make distinct reads appear stable. The token needs to cover
+only the current bounded attempt plus its
 safety margin, currently `1800 + 120 = 1920` seconds. A sufficiently fresh token
 is not refreshed. Otherwise the helper runs the fixed-input safe-mode warmup
 with the current attempt's model, no tools, and no workspace read, then re-reads
@@ -735,6 +741,11 @@ described as an enforced final launch.
 | Authoritative macOS trust deny, malformed trust policy, excluded bundled root, private-key caller CA, or mismatched bundled-root evidence | `blocked` security error with terminal trust evidence | No |
 | Manifest/probe timeout, output overflow, executable resolve/stat I/O failure, other inspection I/O failure, file race, transient network failure, capacity error, or missing trustworthy terminal artifact | `inconclusive` | No |
 | Explicit model entitlement or organization-policy denial from a final review invocation, or from a fixed-input warmup after exact effective-model verification | Existing same-lane model/backend fallback policy | Only as already authorized by the lane contract |
+
+If the primary runtime is unavailable and the authorized fallback executable is
+also absent before any model launch, the lane is deterministically blocked with
+non-retry exit `1`. A zero-attempt outcome never receives transient exit `75`;
+that code remains reserved for actual inconclusive or transient evidence.
 
 A transient, timed-out, output-limited, drain-failed, or process-leaking macOS
 warmup is `inconclusive` and returns exit `75`; it never authorizes Copilot. If

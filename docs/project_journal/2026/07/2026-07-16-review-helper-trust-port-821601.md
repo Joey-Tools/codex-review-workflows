@@ -58,12 +58,12 @@ metadata behavior.
 ## Validation
 
 - Python 3.10.19 complete canonical suite with the `tomli` test backport and
-  `PYTHONDONTWRITEBYTECODE=1`: 808 tests run, 4 skipped, no failures. Disabling
+  `PYTHONDONTWRITEBYTECODE=1`: 814 tests run, 4 skipped, no failures. Disabling
   bytecode writes keeps the intentional `RLIMIT_FSIZE` tests from truncating
   uv's own `_virtualenv.pyc` import hook.
-- Python 3.13.0 complete canonical suite: 808 tests run, 4 skipped, no failures.
+- Python 3.13.0 complete canonical suite: 814 tests run, 4 skipped, no failures.
 - Focused Python 3.13 suites: the 3 `SSL_CERT_DIR` regressions passed, providers
-  ran 337 tests with 3 skipped, and provenance ran 90 tests with no skips or
+  ran 343 tests with 3 skipped, and provenance ran 90 tests with no skips or
   failures; earlier current-range common 49 and repository contract 14 test
   suites also passed.
 - Final-head review remediation covers strict signed-manifest numeric parsing,
@@ -77,6 +77,15 @@ metadata behavior.
 - The current-head P2 follow-up treats configured `SSL_CERT_DIR` entries as one
   certificate union: safe empty directories can precede a valid directory, the
   complete all-empty union is rejected, and any unsafe member still blocks.
+- Final independent-review remediation gives an empty CA source its own typed
+  exception so a source filename cannot disguise private-key or malformed
+  certificate failures. macOS Keychain output now removes exactly one required
+  command-terminating LF, compares both raw credential reads before parsing,
+  and preserves every preceding control byte for strict JSON rejection.
+- A Claude-family lane that cannot make any model attempt because both Claude
+  and the policy-authorized Copilot fallback are unavailable is blocked with
+  exit 1. Exit 75 is reserved for a last attempt that actually ended as
+  inconclusive or transient.
 - Ruff 0.13.2 lint, Python compile, skill and project-journal validation, and
   working-tree diff checks passed. No provider/test formatter churn was retained:
   Ruff would also rewrite three pre-existing current-head expressions outside

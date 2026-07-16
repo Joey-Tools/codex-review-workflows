@@ -911,7 +911,7 @@ class ProviderPolicyTest(unittest.TestCase):
         completed = common.BoundedCapture(
             argv=(),
             returncode=0,
-            stdout=bytearray(payload),
+            stdout=bytearray(payload + b"\n"),
             stderr=bytearray(),
         )
         run_command.return_value = completed
@@ -932,7 +932,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 "Claude Code-credentials",
             ),
         )
-        self.assertEqual(completed.stdout, bytearray(len(payload)))
+        self.assertEqual(completed.stdout, bytearray(len(payload) + 1))
         self.assertEqual(
             run_command.call_args.kwargs["stdout_limit_bytes"],
             providers.CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES,
@@ -941,6 +941,87 @@ class ProviderPolicyTest(unittest.TestCase):
             run_command.call_args.kwargs["stderr_limit_bytes"],
             providers.CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
         )
+
+    @mock.patch.object(providers, "run_bounded_capture")
+    def test_keychain_prefetch_preserves_invalid_boundary_control_bytes(
+        self,
+        run_command: mock.Mock,
+    ) -> None:
+        payload = oauth_credential_fixture()
+        first = common.BoundedCapture(
+            argv=(),
+            returncode=0,
+            stdout=bytearray(payload + b"\v\n"),
+            stderr=bytearray(),
+        )
+        second = common.BoundedCapture(
+            argv=(),
+            returncode=0,
+            stdout=bytearray(payload + b"\f\n"),
+            stderr=bytearray(),
+        )
+        run_command.side_effect = (first, second)
+
+        with self.assertRaisesRegex(
+            providers.ClaudeKeychainCredentialIntegrityError,
+            "changed during stable validation",
+        ):
+            providers._read_stable_claude_keychain_credential(self.review)
+
+        self.assertEqual(first.stdout, bytearray(len(payload) + 2))
+        self.assertEqual(second.stdout, bytearray(len(payload) + 2))
+
+    @mock.patch.object(providers, "run_bounded_capture")
+    def test_keychain_prefetch_rejects_invalid_control_byte_before_terminator(
+        self,
+        run_command: mock.Mock,
+    ) -> None:
+        payload = oauth_credential_fixture()
+        captures = [
+            common.BoundedCapture(
+                argv=(),
+                returncode=0,
+                stdout=bytearray(payload + b"\v\n"),
+                stderr=bytearray(),
+            )
+            for _ in range(2)
+        ]
+        run_command.side_effect = captures
+
+        with self.assertRaisesRegex(
+            providers.ClaudeKeychainCredentialIntegrityError,
+            "credential is malformed",
+        ):
+            providers._read_stable_claude_keychain_credential(self.review)
+
+        self.assertTrue(
+            all(
+                capture.stdout == bytearray(len(payload) + 2)
+                for capture in captures
+            )
+        )
+
+    @mock.patch.object(providers, "run_bounded_capture")
+    def test_keychain_prefetch_requires_security_output_terminator(
+        self,
+        run_command: mock.Mock,
+    ) -> None:
+        payload = oauth_credential_fixture()
+        completed = common.BoundedCapture(
+            argv=(),
+            returncode=0,
+            stdout=bytearray(payload),
+            stderr=bytearray(),
+        )
+        run_command.return_value = completed
+
+        with self.assertRaisesRegex(
+            providers.ClaudeKeychainCredentialIntegrityError,
+            "missing its command terminator",
+        ):
+            providers._read_claude_keychain_credential(self.review)
+
+        self.assertEqual(completed.stdout, bytearray(len(payload)))
 
     @mock.patch.object(providers, "run_bounded_capture")
     def test_keychain_query_only_treats_item_not_found_as_missing(
@@ -4406,6 +4487,20 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(outcome.returncode, 1)
         self.assertEqual(outcome.attempts, (attempt,))
 
+    def test_finish_treats_zero_attempts_as_blocked(self) -> None:
+        outcome = providers._finish(self.review, [], None)
+
+        self.assertEqual(outcome.returncode, 1)
+        self.assertEqual(outcome.attempts, ())
+        self.assertEqual(
+            json.loads(
+                (self.review.container_dir / "attempts.json").read_text(
+                    encoding="utf-8"
+                )
+            ),
+            [],
+        )
+
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(providers, "_codex_attempt")
     def test_codex_capacity_does_not_downgrade(
@@ -4944,6 +5039,39 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn(
             "secure runtime is unavailable",
             (self.review.container_dir / "claude-skip.txt").read_text(encoding="utf-8"),
+        )
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        side_effect=providers.ClaudeProbeSandboxUnavailable("sandbox unavailable"),
+    )
+    @mock.patch.object(
+        providers,
+        "resolve_reviewer_executable",
+        return_value=None,
+    )
+    def test_missing_claude_and_copilot_is_blocked_without_attempts(
+        self,
+        resolve: mock.Mock,
+        _resolve_claude: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="triple-review",
+        )
+
+        self.assertEqual(outcome.returncode, 1)
+        self.assertEqual(outcome.attempts, ())
+        resolve.assert_called_once_with("copilot")
+        self.assertIn(
+            "Copilot CLI is unavailable",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
         )
 
     @mock.patch.dict(
@@ -10103,6 +10231,23 @@ class ProviderPolicyTest(unittest.TestCase):
         with self.assertRaisesRegex(ReviewError, "group- or world-writable"):
             providers._collect_claude_caller_ca_material(
                 {"SSL_CERT_DIR": os.pathsep.join((str(valid_dir), str(unsafe_dir)))}
+            )
+
+    def test_caller_ca_directory_private_key_filename_cannot_spoof_empty_source(
+        self,
+    ) -> None:
+        certificate = self.sample_ca_certificate()
+        source_dir = self.review.source_root / "private-key-name-spoof-ca-directory"
+        source_dir.mkdir(mode=0o700)
+        self.write_private_source(source_dir / "valid.pem", certificate)
+        self.write_private_source(
+            source_dir / "contains no PEM certificate",
+            b"-----BEGIN PRIVATE KEY-----\nfixture\n-----END PRIVATE KEY-----\n",
+        )
+
+        with self.assertRaisesRegex(ReviewError, "contains a private key"):
+            providers._collect_claude_caller_ca_material(
+                {"SSL_CERT_DIR": str(source_dir)}
             )
 
     def test_caller_ca_budget_charges_noncertificate_files_before_parsing(
