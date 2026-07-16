@@ -67,8 +67,8 @@ capabilities workstreams.
   passed. The entitlement-preflight routing, exact-model verification,
   next-model revalidation, no-final-broker path, and final
   transient-after-refresh regressions also passed separately.
-- Full helper suite on current `master`: 691 tests run; 9 skipped and the suite
-  passed.
+- Full helper suite after the final `master` refresh at `4d40df7`: 696 tests
+  run; 9 skipped and the suite passed.
 - Strict Clang syntax checks passed for the unchanged Keychain broker and Linux
   launcher, including the production POSIX feature macro for the launcher.
 - Both workflow actionlint checks, the isolated PyYAML skill validator,
