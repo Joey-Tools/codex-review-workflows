@@ -528,7 +528,12 @@ a sanitized terminal `claude-trust-policy.json` record.
 An unconstrained `TrustRoot` entry must be a strict currently valid self-signed
 CA root. An unconstrained `TrustAsRoot` entry may instead be a non-self-issued
 CA or intermediate certificate: it must retain strict CA and certificate-signing
-extensions and pass OpenSSL partial-chain validation as the explicit anchor.
+extensions, a current strict DER validity window, and a parseable public key.
+The fixed OpenSSL client performs partial-chain validation when it advertises
+that capability. Apple's fixed LibreSSL omits partial-chain support, so that
+host uses the same deterministic DER policy plus bounded public-key extraction;
+the ignored issuer signature is not part of an explicitly selected trust
+anchor's authority.
 
 Linux and WSL2 coalesce validated certificates into the existing single private
 bundle mounted read-only at `/etc/ssl/certs/ca-certificates.crt`. If

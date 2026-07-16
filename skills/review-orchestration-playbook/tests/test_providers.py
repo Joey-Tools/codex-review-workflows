@@ -457,6 +457,49 @@ class ProviderPolicyTest(unittest.TestCase):
         return self.sample_ca_certificates(1)[0]
 
     @staticmethod
+    def non_self_issued_ca_fixture() -> tuple[bytes, bytes]:
+        valid = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+        valid_der, _canonical = providers._canonical_ca_certificate(
+            valid,
+            source="valid root fixture",
+        )
+        intermediate = bytearray(valid_der)
+        _outer_tag, tbs_offset, outer_end, _outer_next = providers._der_tlv(
+            intermediate,
+            0,
+            len(intermediate),
+        )
+        _tbs_tag, tbs_start, tbs_end, _tbs_next = providers._der_tlv(
+            intermediate,
+            tbs_offset,
+            outer_end,
+        )
+        offset = tbs_start
+        if intermediate[offset] == 0xA0:
+            _tag, _start, _end, offset = providers._der_tlv(
+                intermediate,
+                offset,
+                tbs_end,
+            )
+        for _expected_tag in (0x02, 0x30):
+            _tag, _start, _end, offset = providers._der_tlv(
+                intermediate,
+                offset,
+                tbs_end,
+            )
+        issuer_tag, _issuer_start, issuer_end, _issuer_next = providers._der_tlv(
+            intermediate,
+            offset,
+            tbs_end,
+        )
+        if issuer_tag != 0x30:
+            raise AssertionError("fixture issuer is not a sequence")
+        intermediate[issuer_end - 1] ^= 1
+        intermediate_der = bytes(intermediate)
+        intermediate_pem = ssl.DER_cert_to_PEM_cert(intermediate_der).encode("ascii")
+        return intermediate_der, intermediate_pem
+
+    @staticmethod
     def ca_sha256_fingerprint(certificate: bytes) -> bytes:
         der, _canonical = providers._canonical_ca_certificate(
             certificate,
@@ -9811,47 +9854,10 @@ class ProviderPolicyTest(unittest.TestCase):
                 with self.assertRaises(providers.ClaudeTrustCertificateInvalid):
                     providers._require_unconditional_root_extensions(der)
 
-    def test_trust_as_root_accepts_non_self_issued_ca_with_partial_chain(
+    def test_trust_as_root_uses_partial_chain_when_supported(
         self,
     ) -> None:
-        valid = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
-        valid_der, _canonical = providers._canonical_ca_certificate(
-            valid,
-            source="valid root fixture",
-        )
-        intermediate = bytearray(valid_der)
-        _outer_tag, tbs_offset, outer_end, _outer_next = providers._der_tlv(
-            intermediate,
-            0,
-            len(intermediate),
-        )
-        _tbs_tag, tbs_start, tbs_end, _tbs_next = providers._der_tlv(
-            intermediate,
-            tbs_offset,
-            outer_end,
-        )
-        offset = tbs_start
-        if intermediate[offset] == 0xA0:
-            _tag, _start, _end, offset = providers._der_tlv(
-                intermediate,
-                offset,
-                tbs_end,
-            )
-        for _expected_tag in (0x02, 0x30):
-            _tag, _start, _end, offset = providers._der_tlv(
-                intermediate,
-                offset,
-                tbs_end,
-            )
-        issuer_tag, _issuer_start, issuer_end, _issuer_next = providers._der_tlv(
-            intermediate,
-            offset,
-            tbs_end,
-        )
-        self.assertEqual(issuer_tag, 0x30)
-        intermediate[issuer_end - 1] ^= 1
-        intermediate_der = bytes(intermediate)
-        intermediate_pem = ssl.DER_cert_to_PEM_cert(intermediate_der).encode("ascii")
+        intermediate_der, intermediate_pem = self.non_self_issued_ca_fixture()
 
         with self.assertRaises(providers.ClaudeTrustCertificateInvalid):
             providers._require_unconditional_root_extensions(intermediate_der)
@@ -9860,6 +9866,12 @@ class ProviderPolicyTest(unittest.TestCase):
             require_self_issued=False,
         )
 
+        capabilities = common.BoundedCapture(
+            argv=("openssl",),
+            returncode=1,
+            stdout=bytearray(),
+            stderr=bytearray(b"-trusted -x509_strict -partial_chain"),
+        )
         completed = common.BoundedCapture(
             argv=("openssl",),
             returncode=0,
@@ -9875,7 +9887,7 @@ class ProviderPolicyTest(unittest.TestCase):
             mock.patch.object(
                 providers,
                 "run_bounded_capture",
-                return_value=completed,
+                side_effect=(capabilities, completed),
             ) as verify,
         ):
             providers._verify_unconditional_trust_root(
@@ -9886,9 +9898,66 @@ class ProviderPolicyTest(unittest.TestCase):
                 allow_non_self_signed=True,
             )
 
-        argv = verify.call_args.args[0]
+        argv = verify.call_args_list[1].args[0]
         self.assertIn("-partial_chain", argv)
         self.assertNotIn("-check_ss_sig", argv)
+
+    def test_trust_as_root_falls_back_when_partial_chain_is_unavailable(
+        self,
+    ) -> None:
+        intermediate_der, intermediate_pem = self.non_self_issued_ca_fixture()
+        capabilities = common.BoundedCapture(
+            argv=("openssl",),
+            returncode=1,
+            stdout=bytearray(),
+            stderr=bytearray(b"-trusted -x509_strict"),
+        )
+        parsed = common.BoundedCapture(
+            argv=("openssl",),
+            returncode=0,
+            stdout=bytearray(b"-----BEGIN PUBLIC KEY-----\nfixture\n"),
+            stderr=bytearray(),
+        )
+
+        with (
+            mock.patch.object(
+                providers,
+                "CLAUDE_OPENSSL_CLIENT",
+                pathlib.Path(sys.executable),
+            ),
+            mock.patch.object(
+                providers,
+                "run_bounded_capture",
+                side_effect=(capabilities, parsed),
+            ) as verify,
+        ):
+            providers._verify_unconditional_trust_root(
+                intermediate_der,
+                intermediate_pem,
+                ca_root=self.review.container_dir,
+                timeout_seconds=1,
+                allow_non_self_signed=True,
+            )
+
+        argv = verify.call_args_list[1].args[0]
+        self.assertEqual(argv[1], "x509")
+        self.assertIn("-pubkey", argv)
+        self.assertNotIn("-partial_chain", argv)
+
+    @unittest.skipUnless(
+        providers.CLAUDE_OPENSSL_CLIENT.is_file(),
+        "fixed platform OpenSSL client is unavailable",
+    )
+    def test_trust_as_root_works_with_fixed_platform_openssl(self) -> None:
+        intermediate_der, intermediate_pem = self.non_self_issued_ca_fixture()
+
+        providers._verify_unconditional_trust_root(
+            intermediate_der,
+            intermediate_pem,
+            ca_root=self.review.container_dir,
+            timeout_seconds=5,
+            allow_non_self_signed=True,
+        )
 
     def test_expired_unconditional_root_is_omitted_not_tool_unavailable(
         self,

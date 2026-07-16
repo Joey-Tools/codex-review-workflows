@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import contextlib
+import datetime
 import errno
 import hashlib
 import hmac
@@ -975,6 +976,32 @@ def _der_tlv(
     return tag, cursor, content_end, content_end
 
 
+def _der_certificate_time(tag: int, value: bytes) -> datetime.datetime:
+    if not value.endswith(b"Z"):
+        raise ValueError("certificate time is not UTC")
+    digits = value[:-1]
+    if not digits.isdigit():
+        raise ValueError("certificate time is not numeric")
+    if tag == 0x17 and len(digits) == 12:
+        year = int(digits[:2])
+        year += 2000 if year < 50 else 1900
+        offset = 2
+    elif tag == 0x18 and len(digits) == 14:
+        year = int(digits[:4])
+        offset = 4
+    else:
+        raise ValueError("certificate time has an unsupported encoding")
+    return datetime.datetime(
+        year,
+        int(digits[offset : offset + 2]),
+        int(digits[offset + 2 : offset + 4]),
+        int(digits[offset + 4 : offset + 6]),
+        int(digits[offset + 6 : offset + 8]),
+        int(digits[offset + 8 : offset + 10]),
+        tzinfo=datetime.timezone.utc,
+    )
+
+
 def _require_unconditional_root_extensions(
     der: bytes,
     *,
@@ -1006,7 +1033,11 @@ def _require_unconditional_root_extensions(
         issuer_offset = offset
         issuer_tag, _, _, offset = _der_tlv(der, offset, tbs_end)
         issuer = der[issuer_offset:offset]
-        validity_tag, _, _, offset = _der_tlv(der, offset, tbs_end)
+        validity_tag, validity_start, validity_end, offset = _der_tlv(
+            der,
+            offset,
+            tbs_end,
+        )
         subject_offset = offset
         subject_tag, _, _, offset = _der_tlv(der, offset, tbs_end)
         subject = der[subject_offset:offset]
@@ -1019,6 +1050,31 @@ def _require_unconditional_root_extensions(
             or (require_self_issued and issuer != subject)
         ):
             raise ValueError("certificate is not an admissible trust anchor")
+
+        validity_offset = validity_start
+        not_before_tag, not_before_start, not_before_end, validity_offset = _der_tlv(
+            der,
+            validity_offset,
+            validity_end,
+        )
+        not_after_tag, not_after_start, not_after_end, validity_offset = _der_tlv(
+            der,
+            validity_offset,
+            validity_end,
+        )
+        if validity_offset != validity_end:
+            raise ValueError("certificate validity has trailing data")
+        not_before = _der_certificate_time(
+            not_before_tag,
+            der[not_before_start:not_before_end],
+        )
+        not_after = _der_certificate_time(
+            not_after_tag,
+            der[not_after_start:not_after_end],
+        )
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if not_before > not_after or not_before > now or now > not_after:
+            raise ValueError("certificate is not currently valid")
 
         extensions: tuple[int, int] | None = None
         while offset < tbs_end:
@@ -1173,13 +1229,49 @@ def _verify_unconditional_trust_root(
             handle.flush()
             os.fsync(handle.fileno())
         try:
-            verification_mode = (
-                ("-partial_chain",)
-                if allow_non_self_signed
-                else ("-check_ss_sig",)
-            )
-            completed = run_bounded_capture(
-                (
+            use_partial_chain = False
+            if allow_non_self_signed:
+                capabilities = run_bounded_capture(
+                    (str(CLAUDE_OPENSSL_CLIENT), "verify", "-help"),
+                    cwd=ca_root,
+                    env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+                    timeout_seconds=timeout_seconds,
+                    stdout_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
+                    stderr_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
+                )
+                try:
+                    capability_output = bytes(capabilities.stdout) + bytes(
+                        capabilities.stderr
+                    )
+                    if (
+                        capabilities.returncode not in (0, 1)
+                        or b"-trusted" not in capability_output
+                        or b"-x509_strict" not in capability_output
+                    ):
+                        raise ClaudeTrustToolUnavailable(
+                            "Claude TLS root verification tooling lacks required "
+                            "capabilities"
+                        )
+                    use_partial_chain = b"-partial_chain" in capability_output
+                finally:
+                    capabilities.stdout[:] = b"\x00" * len(capabilities.stdout)
+                    capabilities.stderr[:] = b"\x00" * len(capabilities.stderr)
+
+            if allow_non_self_signed and not use_partial_chain:
+                verification_command = (
+                    str(CLAUDE_OPENSSL_CLIENT),
+                    "x509",
+                    "-in",
+                    certificate_path.name,
+                    "-pubkey",
+                    "-noout",
+                )
+                invalid_returncode = 1
+            else:
+                verification_mode = (
+                    ("-partial_chain",) if allow_non_self_signed else ("-check_ss_sig",)
+                )
+                verification_command = (
                     str(CLAUDE_OPENSSL_CLIENT),
                     "verify",
                     "-x509_strict",
@@ -1189,7 +1281,10 @@ def _verify_unconditional_trust_root(
                     "-trusted",
                     certificate_path.name,
                     certificate_path.name,
-                ),
+                )
+                invalid_returncode = 2
+            completed = run_bounded_capture(
+                verification_command,
                 cwd=ca_root,
                 env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
                 timeout_seconds=timeout_seconds,
@@ -1201,7 +1296,12 @@ def _verify_unconditional_trust_root(
                 "Claude TLS root verification launch was inconclusive"
             ) from error
         try:
-            if completed.returncode == 2:
+            public_key_invalid = (
+                allow_non_self_signed
+                and not use_partial_chain
+                and b"-----BEGIN PUBLIC KEY-----" not in completed.stdout
+            )
+            if completed.returncode == invalid_returncode or public_key_invalid:
                 certificate_kind = (
                     "CA trust anchor"
                     if allow_non_self_signed

@@ -3,7 +3,7 @@ id: 20260716-821601
 title: Review Helper Trust Hardening Port
 status: completed
 created: 2026-07-16
-updated: 2026-07-16
+updated: 2026-07-17
 branch: wip/review-helper-trust-port
 pr: 53
 supersedes: []
@@ -58,12 +58,12 @@ metadata behavior.
 ## Validation
 
 - Python 3.10.19 complete canonical suite with the `tomli` test backport and
-  `PYTHONDONTWRITEBYTECODE=1`: 820 tests run, 9 skipped, no failures. Disabling
+  `PYTHONDONTWRITEBYTECODE=1`: 822 tests run, 4 skipped, no failures. Disabling
   bytecode writes keeps the intentional `RLIMIT_FSIZE` tests from truncating
   uv's own `_virtualenv.pyc` import hook.
-- Python 3.13.0 complete canonical suite: 820 tests run, 9 skipped, no failures.
+- Python 3.13.0 complete canonical suite: 822 tests run, 9 skipped, no failures.
 - Focused Python 3.13 suites: the 3 `SSL_CERT_DIR` regressions passed, providers
-  ran 353 tests with 6 skipped, and provenance ran 90 tests with no skips or
+  ran 355 tests with 6 skipped, and provenance ran 90 tests with no skips or
   failures; earlier current-range common 49 and repository contract 14 test
   suites also passed.
 - Final-head review remediation covers strict signed-manifest numeric parsing,
@@ -72,8 +72,8 @@ metadata behavior.
   mismatched model-usage evidence, supported `maxOutputTokens` telemetry, and
   extended ACL rejection for root-owned CA sources while preserving normal
   Linux/WSL2 hard-linked certificate layouts. Explicit macOS `TrustAsRoot`
-  anchors retain non-self-issued CA certificates through strict partial-chain
-  verification rather than incorrectly requiring a root self-signature.
+  anchors retain non-self-issued CA certificates without incorrectly requiring
+  a root self-signature.
 - The current-head P2 follow-up treats configured `SSL_CERT_DIR` entries as one
   certificate union: safe empty directories can precede a valid directory, the
   complete all-empty union is rejected, and any unsafe member still blocks.
@@ -129,6 +129,12 @@ metadata behavior.
   runtime-failure contract while adopting the canonical JWT retirement: legacy
   exemptions may cover only catalog-declared generic assignments or GitHub
   tokens, and JWT findings are never suppressible.
+- The post-integration independent review reproduced that Apple's fixed
+  LibreSSL 3.3.6 does not accept `-partial_chain`. Trust-anchor verification now
+  probes the fixed client's actual capabilities: supporting clients keep strict
+  partial-chain validation, while LibreSSL applies the same strict CA and DER
+  validity policy plus bounded public-key extraction. The provider suite
+  includes both capability branches and a real fixed-`/usr/bin/openssl` test.
 - Ruff 0.13.2 lint, Python compile, project-journal validation, the official
   skill validator through its documented uv/PyYAML fallback, and working-tree
   diff checks passed. No provider/test formatter churn was retained:
