@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import pathlib
 import subprocess
 import sys
@@ -93,6 +94,131 @@ class RepositoryContractTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertNotIn(".claude.json", providers_source)
+
+    def test_claude_oauth_freshness_is_per_model_attempt(self) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        helper_contract = (SKILL_ROOT / "references/helper-contract.md").read_text(
+            encoding="utf-8"
+        )
+        runtime_trust = (
+            SKILL_ROOT / "references/claude-runtime-trust.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertEqual(providers.REVIEW_ATTEMPT_TIMEOUT_SECONDS, 1800.0)
+        self.assertEqual(providers.CLAUDE_AUTH_EXPIRY_MARGIN_SECONDS, 120.0)
+        self.assertEqual(
+            providers.CLAUDE_ATTEMPT_CREDENTIAL_VALIDITY_SECONDS,
+            1920.0,
+        )
+        self.assertEqual(
+            claude_linux.DEFAULT_CREDENTIAL_VALIDITY_SECONDS,
+            providers.CLAUDE_ATTEMPT_CREDENTIAL_VALIDITY_SECONDS,
+        )
+        self.assertNotIn(
+            "attempt_count",
+            inspect.signature(
+                providers._validate_fresh_claude_keychain_credential
+            ).parameters,
+        )
+        attempt_source = inspect.getsource(providers._claude_attempt)
+        warmup_source = inspect.getsource(providers._warm_claude_local_login)
+        run_review_source = inspect.getsource(providers.run_review)
+        linux_runtime_source = inspect.getsource(
+            providers._claude_linux_review_runtime
+        )
+        self.assertIn("_warm_claude_local_login", attempt_source)
+        self.assertIn("_prepare_claude_tls_environment", attempt_source)
+        self.assertIn("ClaudeKeychainBrokerUnavailable", attempt_source)
+        self.assertEqual(
+            attempt_source.count("ClaudeLoopbackUnavailable"),
+            2,
+        )
+        self.assertIn('"failure_class": "credential-read"', attempt_source)
+        self.assertEqual(
+            warmup_source.count(
+                "_require_fresh_claude_keychain_credential_for_auth_preflight"
+            ),
+            2,
+        )
+        self.assertIn(
+            "isinstance(credential_error, ClaudeKeychainBrokerUnavailable)",
+            warmup_source,
+        )
+        self.assertIn("ClaudeAuthWarmupEntitlement", attempt_source)
+        self.assertIn("require_verified_model=True", attempt_source)
+        self.assertIn("CLAUDE_ATTEMPT_CREDENTIAL_VALIDITY_SECONDS", linux_runtime_source)
+        self.assertNotIn("_warm_claude_local_login", run_review_source)
+        self.assertNotIn("_prepare_claude_tls_environment", run_review_source)
+        self.assertEqual(
+            run_review_source.count("ClaudeKeychainBrokerUnavailable"),
+            2,
+        )
+        self.assertNotIn("_require_fresh_claude_linux_credential", run_review_source)
+
+        self.assertIn("current model attempt", skill)
+        self.assertIn(
+            "Local-login credential freshness is an attempt-boundary property",
+            helper_contract,
+        )
+        self.assertIn(
+            "complete 30-minute timeout plus the 2-minute safety margin",
+            helper_contract,
+        )
+        self.assertIn("current attempt's model", helper_contract)
+        self.assertIn("Every later Opus attempt repeats", helper_contract)
+        self.assertIn("API_KEY` skips local-login warmup and staging", helper_contract)
+        self.assertIn("returns exit `75`; it never authorizes Copilot", helper_contract)
+        self.assertIn(
+            "either the initial or post-warmup credential freshness read",
+            helper_contract,
+        )
+        self.assertIn(
+            "attempt-local restricted Keychain broker failure",
+            helper_contract,
+        )
+        self.assertIn(
+            "A structured transient warmup remains inconclusive",
+            helper_contract,
+        )
+        self.assertIn(
+            "credential-read timeout, output-limit, drain, or process-leak",
+            helper_contract,
+        )
+        self.assertIn(
+            "only with `double-review` or `triple-review` consent",
+            helper_contract,
+        )
+        self.assertIn("At every model-attempt boundary", runtime_trust)
+        self.assertIn("authentication-preflight-inconclusive", runtime_trust)
+        self.assertIn("authentication-preflight-entitlement", runtime_trust)
+        self.assertIn("authentication-preflight-unavailable", runtime_trust)
+        self.assertIn(
+            "while the model whose inconclusive authentication gate failed is not",
+            runtime_trust,
+        )
+        self.assertIn(
+            "exact-model-verified entitlement denial",
+            helper_contract,
+        )
+        self.assertIn(
+            "with no final text and without claiming that the final broker",
+            helper_contract,
+        )
+        self.assertIn("explicitly in an error state", helper_contract)
+        self.assertIn(
+            "entitlement-shaped stderr is not fallback evidence",
+            helper_contract,
+        )
+        self.assertIn("overwrites any earlier entitlement model", helper_contract)
+        self.assertIn("full stdout/stderr is retained", helper_contract)
+        self.assertIn(
+            "authentication failure remains unavailable",
+            helper_contract,
+        )
+        self.assertIn(
+            "missing or mismatched model metadata stops the",
+            runtime_trust,
+        )
 
     def test_claude_linux_file_tools_are_workspace_only_across_supported_versions(
         self,

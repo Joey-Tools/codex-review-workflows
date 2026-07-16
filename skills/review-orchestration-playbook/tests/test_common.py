@@ -58,6 +58,23 @@ class ChildEnvironmentTest(unittest.TestCase):
         self.assertEqual(parsed["negative"], -sys.float_info.max)
         self.assertGreater(parsed["subnormal"], 0.0)
 
+    def test_strict_json_bounds_integer_literal_digits(self) -> None:
+        boundary = "9" * common.STRICT_JSON_MAX_INTEGER_DIGITS
+        parsed = common.strict_json_loads(
+            f'{{"positive":{boundary},"negative":-{boundary}}}'
+        )
+
+        self.assertEqual(len(str(parsed["positive"])), len(boundary))
+        self.assertEqual(len(str(abs(parsed["negative"]))), len(boundary))
+
+        oversized = "9" * (common.STRICT_JSON_MAX_INTEGER_DIGITS + 1)
+        for number in (oversized, f"-{oversized}"):
+            with (
+                self.subTest(number=number[:2]),
+                self.assertRaisesRegex(ValueError, "integer exceeds"),
+            ):
+                common.strict_json_loads(f'{{"value":{number}}}')
+
     def test_strict_json_recursively_rejects_decoder_nonfinite_values(self) -> None:
         with (
             mock.patch.object(

@@ -3,7 +3,7 @@ id: 20260703-b4e9d1
 title: Default Claude Reviews To Local Login
 status: completed
 created: 2026-07-03
-updated: 2026-07-03
+updated: 2026-07-16
 branch: codex/claude-local-login
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/42
 supersedes: []
@@ -19,10 +19,10 @@ superseded_by:
 ## Current State
 
 - Claude Code runs with verified `--safe-mode`, restricted read-only tools, disabled setting sources, an isolated home, a capability-authenticated memory-only parent query plus native broker restricted to Claude's current-account Keychain item, and an Anthropic-only local CONNECT proxy.
-- A stale access token is refreshed only by a separate fixed-input, no-tools Claude 2.1.187 safe-mode warmup using ordinary Keychain behavior; the final review revalidates that the refreshed token covers the complete two-model timeout chain, serves it once per attempt through a read-only broker, blocks OAuth refresh egress, and rejects every Keychain update command.
+- Before every model attempt, a stale access token is refreshed only when it cannot cover that attempt's 30-minute timeout plus the 2-minute safety margin. The fixed-input, no-tools safe-mode warmup uses the current attempt's model and the publisher-verified executable snapshot without workspace access, then the helper re-reads and validates the Keychain item. The final read-only broker performs another single-attempt validation, serves the credential once, blocks OAuth refresh egress, and rejects every Keychain update command. Later Opus attempts repeat the same refresh-if-needed sequence.
 - The authentication warmup cannot read the frozen review workspace even while its narrowly pinned API and OAuth refresh egress is enabled.
-- Claude Code 2.1.187 and trusted `rg` must be native Mach-O executables; script or wrapper installations are rejected, the final sandbox reads the Claude executable only by exact path, and the child `PATH` is reduced to the restricted broker plus the verified `rg` directory.
-- Before any Claude process can access the warmup Keychain path, its complete artifact SHA-256 must match the pinned official Homebrew Cask digest for Claude Code 2.1.187 on macOS arm64 or x86_64.
+- Claude Code releases `>=2.1.187,<3.0.0` and trusted `rg` must be native Mach-O executables; script or wrapper installations are rejected, the final sandbox reads the verified executable snapshot only by exact path, and the child `PATH` is reduced to the restricted broker plus the verified `rg` directory.
+- Before any Claude process can access the warmup Keychain path, the fixed Anthropic GPG fingerprint must verify the release's signed manifest and that manifest's SHA-256 must match the selected arm64 or x64 artifact.
 - Custom CA environment paths are reduced to validated certificate-only copies under the helper container before entering the sandbox, with distinct source directories kept separate.
 - Uppercase and lowercase corporate proxy variables are preserved before Claude is routed through the helper-owned local proxy, with lowercase task overrides taking precedence over uppercase system defaults.
 - Selected upstream proxy URLs and ports are validated before the helper binds its local proxy; malformed, zero, and out-of-range ports fail closed as configuration errors.
@@ -56,7 +56,7 @@ superseded_by:
 - `python3 -m unittest discover -s skills/review-orchestration-playbook/tests` (`298` tests passed; `2` loopback-dependent tests skipped in the restricted local sandbox)
 - Native broker integration: clang compilation, rejected wrong capability without consumption, sandboxed one-shot fixture delivery, second-read denial, stdin/direct update denial, and in-memory zeroing passed.
 - Real local-auth smoke: the fixed no-tools warmup refreshed an expired credential through ordinary Claude behavior; the final read-only sandbox reported `loggedIn: true`, `authMethod: claude.ai`, `apiProvider: firstParty`, and about 478 remaining token minutes without `ANTHROPIC_API_KEY`.
-- Real bounded Keychain smoke: the local Claude credential was read through separate stdout/stderr streaming limits, validated for the complete two-model review chain, and zeroed without printing or persisting credential contents.
+- Historical bounded Keychain smoke: the local Claude credential was read through separate stdout/stderr streaming limits, exercised the aggregate-lifetime gate that existed when PR #42 landed, and was zeroed without printing or persisting credential contents. The 2026-07-16 per-model-attempt workstream replaces only that freshness rule and preserves the zeroing evidence.
 - Final exact-CA runtime smoke no longer hit global-temp, permission-mode, TLS-file, or sandbox-denial failures; its network-auth terminal check was inconclusive because the host's ordinary `claude auth status --json` had changed to `loggedIn: false`.
 - macOS sandbox smoke probe: Claude authentication status remained readable, trusted `rg` could search the frozen workspace, and `/bin/sh` hook execution was blocked.
 - Local CONNECT proxy smoke probe: the warmup route permits `api.anthropic.com:443` plus `platform.claude.com:443`, while the final review permits only the API target and rejects OAuth refresh plus unrelated hosts.

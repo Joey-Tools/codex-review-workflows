@@ -53,6 +53,10 @@ is supported only when every applicable gate below passes.
   fixed credential-free environment, not a denylist-filtered copy of the caller
   environment. Inherited proxy URLs, custom CA paths, authentication material,
   review metadata, and unrelated caller variables must be absent.
+- Treat `NODE_EXTRA_CA_CERTS` as a Claude-only, process-startup additive CA
+  input. It is never part of the shared reviewer environment, never inferred
+  from `SSL_CERT_FILE`, and never supplied to the unverified candidate probe or
+  security-sensitive host tools.
 - Use layered enforcement. The helper-owned outer sandbox enforces host
   filesystem, process, write, and network isolation. On Linux and WSL2, the
   signed Claude runtime's permission engine additionally separates files that
@@ -123,22 +127,30 @@ explicitly configured Claude Code candidate:
     verified executable snapshot and accept only cryptographically self-signed
     CA members whose KeyUsage, when present, permits certificate signing;
     unrelated embedded PEM data is never promoted. Before every model attempt,
-    revalidate that snapshot and
-    exact root evidence, export all authoritative trust domains, apply explicit-
-    deny precedence, omit constrained or invalid roots, and rebuild a
-    certificate-only helper bundle from current system, bundled, permitted
-    additional, and snapshotted caller material.
-11. Prepare the platform-specific private credential carrier. macOS may run its
-   fixed no-tools authentication warmup when the Keychain credential is not
-   fresh. Linux and WSL2 never warm or refresh credentials: require the host
-   credential to remain valid for the imminent bounded attempt plus its safety
-   margin, repeat validation and private staging before every later attempt, or
-   use an explicitly supplied API key.
+    revalidate that snapshot and exact root evidence, export all authoritative
+    trust domains, apply explicit-deny precedence, omit constrained or invalid
+    roots, and rebuild a certificate-only helper bundle from current system,
+    bundled, permitted additional, and snapshotted caller material.
+11. At every model-attempt boundary, prepare the platform-specific private
+    credential carrier for only that attempt's 30-minute timeout plus the
+    2-minute safety margin. On macOS, first check freshness; only when the
+    current window is insufficient, run the fixed no-tools, no-workspace-read
+    warmup with the current attempt's model, then re-read and validate the
+    Keychain item. Linux and WSL2 never warm or refresh credentials; each
+    attempt independently validates and stages a new private copy. An explicit
+    API key skips local-login warmup and staging. If the warmup returns an
+    explicit entitlement or organization-policy denial in a strict top-level
+    error result, with structured-error classification and exact effective-model
+    verification, persist that fallback evidence and end the current model
+    boundary without starting the final broker or review sandbox, even when
+    credential freshness remains insufficient. Successful structured output
+    plus entitlement-shaped stderr never authorizes fallback.
 12. Launch only the one captured verified snapshot for every real model attempt
     in a fresh outer sandbox; never rediscover or fall back to the mutable source
-    installation between Opus attempts. Validate structured output, effective
-    model, and terminal status before accepting text as review evidence. The
-    requested effort remains explicit in every real command.
+    installation between Opus attempts. If entitlement selects a later Opus
+    model, repeat step 11 before that attempt. Validate structured output,
+    effective model, and terminal status before accepting text as review
+    evidence. The requested effort remains explicit in every real command.
 
 ## Publisher Provenance
 
@@ -469,21 +481,24 @@ host boundary. On Linux and WSL2, however, the signed Claude permission engine
 is part of the trusted computing base for the narrower distinction between
 runtime authentication reads and model-invoked file reads.
 
-On Linux and WSL2, custom TLS sources are copied rather than mounted from their original paths.
-`SSL_CERT_FILE` is read through a stable no-follow regular-file descriptor.
-`SSL_CERT_DIR` is enumerated through a fixed directory descriptor with bounded
-entry counts and supports normal OpenSSL hash links, including the multi-hop
-relative/absolute layout used by Ubuntu. Link depth and path components are
-bounded; every traversed link and directory plus the final no-follow regular
-file is owner/mode/identity checked and revalidated around a bounded read. Only
-PEM certificates are materialized, never private-key material. The helper keeps
-the original hash basename but writes a private `0600` regular file instead of
-recreating a symlink. Linux and WSL2 coalesce the validated certificates into a
-private bundle whose complete resolved path identity is captured and rechecked
-while the read-only `bubblewrap` command is serialized. Like the existing
-runtime-library mounts, this fixes the selected resolved source but does not
-claim an FD-bound, atomic path-to-mount handoff against another same-euid
-process.
+Custom TLS sources are copied rather than mounted from their original paths.
+The Claude-only `NODE_EXTRA_CA_CERTS` input uses the same absolute-path, stable
+no-follow identity, owner/mode, bounded-read, PEM-only, private-key rejection,
+and private-`0600` materialization policy as the existing CA-file inputs. On
+macOS, the rewritten variable names only the exact helper-owned copy; the
+Seatbelt profile grants `file-read*` to that file literally, does not grant a
+parent-directory subpath read, and does not disclose the caller path through
+the profile or launch arguments. Literal ancestor metadata checks remain part
+of safe path traversal.
+`SSL_CERT_FILE` and `SSL_CERT_DIR` retain their existing handling. The latter is
+enumerated through a fixed directory descriptor with bounded entry counts and
+supports normal OpenSSL hash links, including the multi-hop relative/absolute
+layout used by Ubuntu. Link depth and path components are bounded; every
+traversed link and directory plus the final no-follow regular file is
+owner/mode/identity checked and revalidated around a bounded read. Only PEM
+certificates are materialized, never private-key material. The helper keeps the
+original hash basename but writes a private `0600` regular file instead of
+recreating a symlink.
 
 On macOS, caller CA inputs use owner-only, single-link regular-file reads with
 no symlinks, FIFOs, extended ACL entries, or identity/growth races. The helper
@@ -497,6 +512,32 @@ root set is evidence derived from the publisher-verified snapshot; if a host
 policy excludes a root still reachable through Claude's bundled store, the lane
 blocks rather than weakening signed provenance. Every trust preparation writes
 a sanitized terminal `claude-trust-policy.json` record.
+
+Linux and WSL2 coalesce validated certificates into the existing single private
+bundle mounted read-only at `/etc/ssl/certs/ca-certificates.crt`. If
+`NODE_EXTRA_CA_CERTS` is the only configured CA input, the helper begins with
+the default system trust and appends and deduplicates the Node certificates. If
+a replacement input (`CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`,
+`REQUESTS_CA_BUNDLE`, `SSL_CERT_FILE`, or `SSL_CERT_DIR`) is configured, the
+helper preserves the existing replacement semantics, then appends and
+deduplicates the Node certificates. The sandbox sets `NODE_EXTRA_CA_CERTS` to
+the fixed bundle path only when the caller explicitly supplied it; no additional
+host mount is created. The same private bundle also remains the final sandbox's
+`SSL_CERT_FILE`. This is an intentional single-bundle runtime design, not a
+claim that replacement and additive inputs become separate in-sandbox trust
+domains. The helper's parent/proxy TLS context still consumes the original
+caller environment and does not read `NODE_EXTRA_CA_CERTS`. The bundle's
+complete resolved path identity is captured and rechecked while the read-only
+`bubblewrap` command is serialized. Like the existing runtime-library mounts,
+this fixes the selected resolved source but does not claim an FD-bound, atomic
+path-to-mount handoff against another same-euid process.
+
+`SSL_CERT_FILE` remains an independent caller input for the helper's parent/proxy
+TLS path and does not cause the Node variable to be set. The parent proxy TLS
+context, pre-provenance candidate probe, GPG, and security-sensitive host-tool
+environments do not consult `NODE_EXTRA_CA_CERTS`. Arbitrary `NODE_*`,
+`NODE_TLS_REJECT_UNAUTHORIZED=0`, mTLS private-key inputs, and private-key
+material remain outside the contract.
 
 Linux and WSL2 fix cwd at `/workspace`, use `dontAsk`, expose only `Read`, and
 pre-approve only `Read(./**)`. Every other top-level path mounted into the
@@ -550,33 +591,45 @@ An explicitly supplied `ANTHROPIC_API_KEY` remains an optional override and does
 not require local-login credential access. Never pass Claude and Copilot
 credentials into the same child environment.
 
-On macOS, retain the capability-authenticated, one-shot Keychain broker. The
-parent binds the current account and reads the fixed Claude Code item twice with
-Apple's trusted client, requires byte equality and expiry coverage for the
-imminent bounded attempt plus its safety margin, and repeats freshness at every
-final launch boundary. A deterministically missing item or an expiring item may
-trigger one fixed no-tools warmup; an existing blob with missing, null, or blank
-OAuth fields, malformed JSON, account drift, or unstable reads does not. The
-helper does not read or bridge `~/.claude.json` account metadata. The
-final Claude process cannot execute `/usr/bin/security`, access Keychain
-services directly, update the host item, or refresh OAuth credentials during the
-review.
+On macOS, retain the capability-authenticated, one-shot Keychain broker. Before
+each model attempt, after trusted executable, review-tool, and TLS preparation,
+the parent reads and validates the current Claude Code item with Apple's trusted
+client. The token needs to cover only the current bounded attempt plus its
+safety margin, currently `1800 + 120 = 1920` seconds. A sufficiently fresh token
+is not refreshed. Otherwise the helper runs the fixed-input safe-mode warmup
+with the current attempt's model, no tools, and no workspace read, then re-reads
+and validates the item. The final broker performs another read and fail-closed
+single-attempt validation before its one-shot handoff. The final Claude process
+cannot execute `/usr/bin/security`, access Keychain services directly, update
+the host item, or refresh OAuth credentials during the review. Every later
+model attempt repeats this refresh-if-needed and validation sequence. A
+strictly structured, exact-model-verified entitlement denial from the warmup is
+recorded only as model-chain fallback evidence with no final text; it skips the
+final broker and repository-review launch, and the next model still starts from
+its own freshness boundary. Its bounded complete stdout/stderr capture is copied
+to the formal attempt logs after the temporary warmup output directory closes.
+An explicit authentication failure remains unavailable even when the refreshed
+Keychain item is structurally fresh enough for a later attempt.
+Only a deterministic missing Keychain item or a valid but insufficiently fresh
+credential is refresh-eligible. An existing blob with missing, null, or blank
+OAuth fields, malformed JSON, account drift, or unstable double-read evidence
+is an integrity failure and never authorizes warmup or Copilot fallback.
 
-On Linux and WSL2, validate the documented Claude Code credential file as a
-non-symlink regular file owned by the current user with exact mode `0600`. Copy
-it into a helper-owned `0700` directory as a private `0600` file and expose only
-that staged copy's config directory through a read-only mount at `/config`; the
-original host credential is never mounted. Parse the OAuth expiry and require
-the host credential to remain valid for the imminent bounded attempt plus its
-safety margin before launch. Repeat source validation and private staging for
-every later model attempt. Linux and WSL2 perform no warmup, refresh, or
-host-credential write; a missing or insufficiently fresh credential is
-unavailable unless an explicit `ANTHROPIC_API_KEY` is supplied. Reject unsafe
-ownership, mode, symlink, path-race, size, or JSON structure, and never persist
-or print credential contents in review state. The source descriptor must close
-successfully before a validated payload is returned; close failure zeroes the
-in-memory copy, preserves any earlier validation/control-flow error, and fails
-closed without retrying the same numeric descriptor.
+On Linux and WSL2, every model attempt validates the documented Claude Code
+credential file as a non-symlink regular file owned by the current user with
+exact mode `0600`. For that attempt, copy it into a new helper-owned `0700`
+directory as a private `0600` file and expose only that staged copy's config
+directory through a read-only mount at `/config`; the original host credential
+is never mounted. Parse the OAuth expiry and require the same single-attempt
+`1920`-second window before launch. Linux and WSL2 perform no pre-chain staging,
+warmup, refresh, or host-credential write; a missing or insufficiently fresh
+credential is unavailable unless an explicit `ANTHROPIC_API_KEY` is supplied.
+Reject unsafe ownership, mode, symlink, path-race, size, or JSON structure, and
+never persist or print credential contents in review state. The source
+descriptor must close successfully before a validated payload is returned;
+close failure zeroes the in-memory copy, preserves any earlier
+validation/control-flow error, and fails closed without retrying the same
+numeric descriptor.
 
 Credential staging owns cleanup from the first successful create through the
 final close. Scrub, close, unlink, and directory removal are attempted in a
@@ -616,19 +669,47 @@ reached:
 1. `publisher-and-capabilities-verified`: the signed release, private snapshot,
    and safe-mode/help capability contract passed. `outer_sandbox.status` remains
    `pending-runtime-launch` and `authentication.status` remains `pending`.
-2. `authentication-preflight-complete`: API-key configuration or local-login
-   freshness passed; authentication status becomes `configured` or
-   `freshness-verified`.
-3. Platform preparation: Linux/WSL2 reports `runtime-ready` only after its real
-   isolation probe, with `outer_sandbox.status: isolation-probe-verified` and
+2. macOS `authentication-preflight-complete`: after review-tool and TLS
+   preparation for the current attempt, API-key configuration or local-login
+   refresh/validation passed. Authentication status becomes `configured` or
+   `freshness-verified`; `authentication.model` and `validated_for_model` both
+   identify the current model whose attempt window was checked. When this
+   outcome is published for a later Opus attempt, it clears the previous
+   attempt subtree, restores the outer-sandbox
+   status to pending, and is not a whole-chain freshness guarantee.
+3. macOS authentication preparation failure before a model launch is explicit.
+   `authentication-preflight-inconclusive` records the current model and stable
+   warmup failure class without inventing a formal review attempt. This includes
+   supervision failures from the credential freshness read immediately before
+   or after the warmup.
+   `authentication-preflight-unavailable` also covers an attempt-local failure
+   of the restricted Keychain broker, with the same consent-gated fallback
+   policy as an unavailable credential.
+   A structured transient warmup remains inconclusive when the post-warmup read
+   also finds that broker unavailable. During final staging, credential-read
+   supervision failures use failure class `credential-read` with no model
+   attempt, while broker failure or a warmup/final-staging loopback failure
+   resets the phase to unavailable before the Claude CLI launch.
+   `authentication-preflight-entitlement` records a strict, exact-model-verified
+   warmup entitlement attempt while keeping `outer_sandbox.status` at
+   `pending-runtime-launch` and `validated_for_model` unset. This is fallback
+   evidence with no final text, not a final review launch or clean artifact.
+   `authentication-preflight-unavailable` records an explicitly unavailable
+   current-attempt Keychain credential. Linux/WSL2 credential unavailability
+   prevents `runtime-ready` from being published and is retained through the
+   ordinary unavailable error artifact instead of a macOS preflight phase.
+4. Platform preparation: Linux/WSL2 reports `runtime-ready` only after the
+   current attempt's credential staging and real isolation probe, with
+   `outer_sandbox.status: isolation-probe-verified` and
    `authentication.status: sandbox-auth-staged`. macOS reports
    `runtime-launching` with `outer_sandbox.status: profile-generated` only when
-   the final Seatbelt launch is prepared.
-4. `attempt-inconclusive`: a bounded supervisor timeout, output overflow, drain
-   failure, or retained descendant interrupted an attempted launch. The report
-   records `attempt.category: inconclusive` and a stable `failure_class` rather
-   than leaving an earlier readiness phase as the apparent terminal result.
-5. `attempt-complete`: the report records the final sandbox status, attempt
+   the final one-shot broker and Seatbelt launch are prepared.
+5. `attempt-inconclusive`: a bounded supervisor timeout, output overflow, drain
+   failure, or retained descendant interrupted an attempted model launch. The
+   report records `attempt.category: inconclusive` and a stable `failure_class`
+   rather than leaving an earlier readiness phase as the apparent terminal
+   result.
+6. `attempt-complete`: the report records the final sandbox status, attempt
    category, bounded reason and return code, and requested/effective model and
    effort. A separate `claude-trust-policy.json` generation records the terminal
    trust/bundle result for the latest attempt.
@@ -640,12 +721,25 @@ described as an enforced final launch.
 
 | Condition | Terminal classification | Copilot fallback |
 | --- | --- | --- |
-| No automatic candidate, supported platform unavailable, accepted-range candidate lacks a required non-security capability, or usable local/API authentication is absent | `runtime-unavailable` or `auth-unavailable` | Only for explicit double/triple-review consent |
+| No automatic candidate, supported platform unavailable, accepted-range candidate lacks a required non-security capability, or usable local/API authentication is absent at the current attempt boundary | `runtime-unavailable` or `auth-unavailable` | Only for explicit double/triple-review consent |
 | Explicit override has the wrong version, platform, binary shape, capability contract, or lacks trusted GPG, probe sandbox, or trusted review tool prerequisites | `blocked` configuration error | No |
 | Wrong publisher fingerprint, invalid signature, checksum mismatch, contradictory safe-mode semantics, unsafe credential metadata, or an isolation-boundary mismatch | `blocked` security error | No |
 | Authoritative macOS trust deny, malformed trust policy, excluded bundled root, private-key caller CA, or mismatched bundled-root evidence | `blocked` security error with terminal trust evidence | No |
 | Manifest/probe timeout, output overflow, executable resolve/stat I/O failure, other inspection I/O failure, file race, transient network failure, capacity error, or missing trustworthy terminal artifact | `inconclusive` | No |
-| Explicit model entitlement or organization-policy denial after runtime verification | Existing same-lane model/backend fallback policy | Only as already authorized by the lane contract |
+| Explicit model entitlement or organization-policy denial from a final review invocation, or from a fixed-input warmup after exact effective-model verification | Existing same-lane model/backend fallback policy | Only as already authorized by the lane contract |
+
+A transient, timed-out, output-limited, drain-failed, or process-leaking macOS
+warmup is `inconclusive` and returns exit `75`; it never authorizes Copilot. If
+an earlier Opus attempt completed with entitlement metadata, that evidence stays
+persisted while the model whose inconclusive authentication gate failed is not
+recorded as a launched attempt. A verified warmup entitlement is recorded as an
+attempt with no final text, but missing or mismatched model metadata stops the
+lane as `runtime-unverified` or `model-mismatch` and never authorizes fallback.
+Transient and authentication classifications retain their existing precedence.
+Every later Opus model independently repeats the freshness/warmup boundary. A
+credential that is explicitly unavailable at a later model boundary follows
+only the existing double/triple-review consent gate; `explicit-claude-review`
+remains Anthropic-only.
 
 An unsupported future patch inside the version range may be treated as automatic
 runtime unavailability only when it cleanly lacks a required capability. Evidence
@@ -696,6 +790,10 @@ metadata that can act as a bearer secret, or unbounded probe output.
   on macOS, `bubblewrap` plus `socat` on Linux and WSL2, and the WSL1 limitation.
 - [Claude Code authentication](https://code.claude.com/docs/en/authentication):
   macOS Keychain storage and the Linux `0600` credential file.
+- [Claude Code corporate network configuration](https://code.claude.com/docs/en/corporate-proxy):
+  the supported enterprise custom-CA entrypoint for Claude Code.
+- [Node.js `NODE_EXTRA_CA_CERTS`](https://nodejs.org/api/cli.html#node_extra_ca_certsfile):
+  process-startup handling and additive PEM trust semantics.
 - [Claude Code CLI reference](https://code.claude.com/docs/en/cli-usage): the
   supported command/flag surface and the upstream warning that general help may
   omit flags; the helper still requires every public flag it invokes to be

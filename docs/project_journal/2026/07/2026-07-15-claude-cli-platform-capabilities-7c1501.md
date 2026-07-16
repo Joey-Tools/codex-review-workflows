@@ -158,6 +158,14 @@ superseded_by:
   and revalidates its complete resolved path identity while serializing the
   `bubblewrap` command. As with runtime-library mounts, this does not claim an
   FD-bound atomic handoff against another same-euid process.
+- `NODE_EXTRA_CA_CERTS` is now the sole Claude-specific Node TLS input. It
+  passes the existing fail-closed CA-file validation and private-copy boundary;
+  macOS exposes only the exact helper-owned copy, while Linux/WSL2 reuses one
+  fixed-path private bundle. Node-only configuration retains default system
+  trust, replacement CA inputs preserve their existing semantics, and Node
+  certificates are appended and deduplicated. Codex, Copilot, pre-provenance
+  probes, proxy/GPG host tools, arbitrary `NODE_*`, TLS-verification bypasses,
+  and private-key inputs remain outside this behavior.
 - The helper uses layered enforcement. Seatbelt on macOS and `bubblewrap` plus
   `socat` on Linux/WSL2 enforce host filesystem, process, write, and network
   isolation. On Linux/WSL2, the publisher-verified Claude permission engine is
@@ -203,9 +211,10 @@ superseded_by:
   helper-owned read-only private copy of the validated current-user `0600`
   credential for runtime authentication; read-only prevents mutation, while the
   separate file-tool policy below prevents model-visible reads. Linux/WSL2
-  perform no warmup or refresh; the host credential must already remain fresh
-  for the complete bounded review plus its safety margin, unless an explicit
-  API key is supplied.
+  perform no warmup or refresh; every model attempt independently requires the
+  host credential to cover that attempt's 30-minute timeout plus the 2-minute
+  safety margin, then creates a new private staged copy. An explicit API key
+  skips local credential staging.
 - Linux credential staging owns cleanup from the first successful file create:
   a write, sync, or mode-finalization failure zeroes and unlinks the partial
   credential before control returns. If unlink itself fails, the staged bytes
@@ -237,11 +246,12 @@ superseded_by:
   The original host credential is never mounted.
 - Retained `claude-runtime.json` state records both `source_executable` and the
   actual `verified_executable` snapshot, plus the selected GPG verifier and
-  signed-release evidence. Its phases distinguish
-  `publisher-and-capabilities-verified`,
-  `authentication-preflight-complete`, platform runtime readiness/launch, and
-  `attempt-complete`; bounded supervisor failures instead advance to
-  `attempt-inconclusive` with a stable failure class. Nested sandbox,
+  signed-release evidence. On macOS, its phases distinguish publisher and
+  capability verification, per-attempt authentication outcomes, runtime launch,
+  and attempt completion. Linux/WSL2 publishes `runtime-ready` only after the
+  current attempt's credential staging and isolation probe; an unavailable
+  credential prevents that phase. Bounded supervisor failures instead advance
+  to `attempt-inconclusive` with a stable failure class. Nested sandbox,
   authentication, and attempt statuses avoid claiming final enforcement before
   the relevant probe or launch occurs.
 - The former exact `2.1.187` plus artifact-digest pin entered with local-login
@@ -856,6 +866,19 @@ superseded_by:
   isolated skill validator, project-journal validation, and `git diff --check`
   passed. A credential-free real help smoke also accepted all 16 required
   options from installed Claude Code `2.1.202` under the tightened grammar.
+- The Claude-only Node extra-CA implementation passed 17 focused regressions,
+  all 405 provider/Linux/common/contract tests with nine environment-gated
+  skips, and the complete 709-test local suite with nine skips in 255.393
+  seconds. Full helper `py_compile`, touched-file `ruff check`, strict C11
+  launcher syntax under Apple Clang 21.0.0, the isolated skill validator,
+  project-journal validation, and `git diff --check` also passed. The real Linux
+  isolation gate remains assigned to the required Ubuntu CI job and is not
+  claimed as local macOS evidence.
+- Anthropic corporate network configuration documents the supported custom-CA
+  entrypoint: https://code.claude.com/docs/en/corporate-proxy
+- Node.js documents the process-startup additive trust semantics of
+  `NODE_EXTRA_CA_CERTS`:
+  https://nodejs.org/api/cli.html#node_extra_ca_certsfile
 - Anthropic installation, signed-manifest, release-key fingerprint, and platform
   signature documentation: https://code.claude.com/docs/en/installation
 - Anthropic Seatbelt, `bubblewrap`, `socat`, WSL2, and WSL1 sandboxing

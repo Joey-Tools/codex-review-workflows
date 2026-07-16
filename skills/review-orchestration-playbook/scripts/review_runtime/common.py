@@ -127,6 +127,7 @@ PROCESS_GROUP_TERM_GRACE_SECONDS = 0.5
 PROCESS_GROUP_EXIT_GRACE_SECONDS = 0.5
 PROCESS_GROUP_POLL_SECONDS = 0.05
 STRICT_JSON_MAX_NESTING_DEPTH = 64
+STRICT_JSON_MAX_INTEGER_DIGITS = 1024
 REGULAR_FILE_LIMIT_WRAPPER = """
 import errno
 import os
@@ -222,6 +223,13 @@ def _strict_json_float(value: str) -> float:
     return parsed
 
 
+def _strict_json_int(value: str) -> int:
+    digit_count = len(value) - int(value.startswith("-"))
+    if digit_count > STRICT_JSON_MAX_INTEGER_DIGITS:
+        raise ValueError("JSON integer exceeds the bounded parser limit")
+    return int(value)
+
+
 def _require_finite_json_numbers(value: Any) -> None:
     pending = [value]
     while pending:
@@ -247,6 +255,7 @@ def strict_json_loads(payload: str | bytes | bytearray) -> Any:
             object_pairs_hook=_strict_json_object,
             parse_constant=_reject_json_constant,
             parse_float=_strict_json_float,
+            parse_int=_strict_json_int,
         )
     except RecursionError as error:
         raise ValueError("JSON nesting exceeds the bounded parser limit") from error
