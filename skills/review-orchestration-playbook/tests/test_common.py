@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import pathlib
 import signal
@@ -37,6 +38,36 @@ class ChildEnvironmentTest(unittest.TestCase):
                 ),
             ):
                 common.strict_json_loads(f'{{"value":{constant}}}')
+
+    def test_strict_json_rejects_overflowed_floats(self) -> None:
+        for number in ("1e10000", "-1e10000"):
+            with (
+                self.subTest(number=number),
+                self.assertRaisesRegex(ValueError, "non-finite JSON number"),
+            ):
+                common.strict_json_loads(f'{{"outer":[{{"value":{number}}}]}}')
+
+    def test_strict_json_accepts_finite_float_boundaries(self) -> None:
+        parsed = common.strict_json_loads(
+            '{"positive":1.7976931348623157e308,'
+            '"negative":-1.7976931348623157e308,"subnormal":5e-324}'
+        )
+
+        self.assertTrue(all(math.isfinite(value) for value in parsed.values()))
+        self.assertEqual(parsed["positive"], sys.float_info.max)
+        self.assertEqual(parsed["negative"], -sys.float_info.max)
+        self.assertGreater(parsed["subnormal"], 0.0)
+
+    def test_strict_json_recursively_rejects_decoder_nonfinite_values(self) -> None:
+        with (
+            mock.patch.object(
+                common.json,
+                "loads",
+                return_value={"outer": [float("inf")]},
+            ),
+            self.assertRaisesRegex(ValueError, "non-finite JSON number"),
+        ):
+            common.strict_json_loads("{}")
 
     def test_strict_json_rejects_over_nested_payload(self) -> None:
         payload = (

@@ -119,17 +119,21 @@ explicitly configured Claude Code candidate:
    mentions, and deny every non-workspace synthetic-root mount with absolute
    double-slash rules. Command construction must fail closed when a mount lacks
    coverage or appears below `/workspace`.
-10. On macOS, extract the exact bundled certificate set from the publisher-
-    verified executable snapshot. Before every model attempt, revalidate that
-    snapshot and root evidence, export all authoritative trust domains, apply
-    explicit-deny precedence, omit constrained or invalid roots, and rebuild a
+10. On macOS, require one bounded Bun `root_certs.cpp` store in the publisher-
+    verified executable snapshot and accept only cryptographically self-signed
+    CA members whose KeyUsage, when present, permits certificate signing;
+    unrelated embedded PEM data is never promoted. Before every model attempt,
+    revalidate that snapshot and
+    exact root evidence, export all authoritative trust domains, apply explicit-
+    deny precedence, omit constrained or invalid roots, and rebuild a
     certificate-only helper bundle from current system, bundled, permitted
     additional, and snapshotted caller material.
 11. Prepare the platform-specific private credential carrier. macOS may run its
    fixed no-tools authentication warmup when the Keychain credential is not
    fresh. Linux and WSL2 never warm or refresh credentials: require the host
-   credential to remain valid for the full bounded review window, or use an
-   explicitly supplied API key.
+   credential to remain valid for the imminent bounded attempt plus its safety
+   margin, repeat validation and private staging before every later attempt, or
+   use an explicitly supplied API key.
 12. Launch only the one captured verified snapshot for every real model attempt
     in a fresh outer sandbox; never rediscover or fall back to the mutable source
     installation between Opus attempts. Validate structured output, effective
@@ -548,10 +552,12 @@ credentials into the same child environment.
 
 On macOS, retain the capability-authenticated, one-shot Keychain broker. The
 parent binds the current account and reads the fixed Claude Code item twice with
-Apple's trusted client, requires byte equality and expiry coverage, and repeats
-freshness at the final launch boundary. A missing or expiring item may trigger
-one fixed no-tools warmup; malformed JSON, account drift, or unstable reads do
-not. The helper does not read or bridge `~/.claude.json` account metadata. The
+Apple's trusted client, requires byte equality and expiry coverage for the
+imminent bounded attempt plus its safety margin, and repeats freshness at every
+final launch boundary. A deterministically missing item or an expiring item may
+trigger one fixed no-tools warmup; an existing blob with missing, null, or blank
+OAuth fields, malformed JSON, account drift, or unstable reads does not. The
+helper does not read or bridge `~/.claude.json` account metadata. The
 final Claude process cannot execute `/usr/bin/security`, access Keychain
 services directly, update the host item, or refresh OAuth credentials during the
 review.
@@ -561,8 +567,9 @@ non-symlink regular file owned by the current user with exact mode `0600`. Copy
 it into a helper-owned `0700` directory as a private `0600` file and expose only
 that staged copy's config directory through a read-only mount at `/config`; the
 original host credential is never mounted. Parse the OAuth expiry and require
-the host credential to remain valid for the complete bounded review window plus
-its safety margin before launch. Linux and WSL2 perform no warmup, refresh, or
+the host credential to remain valid for the imminent bounded attempt plus its
+safety margin before launch. Repeat source validation and private staging for
+every later model attempt. Linux and WSL2 perform no warmup, refresh, or
 host-credential write; a missing or insufficiently fresh credential is
 unavailable unless an explicit `ANTHROPIC_API_KEY` is supplied. Reject unsafe
 ownership, mode, symlink, path-race, size, or JSON structure, and never persist
@@ -658,8 +665,10 @@ classification, but malformed, duplicate-key, non-standard-constant, unknown,
 or success-looking nonzero envelopes are fail-closed and receive a sanitized
 machine-readable attempt reason. Authentication becomes deterministic only for
 the documented complete result shape, and entitlement fallback additionally
-requires requested-model evidence. Missing or malformed `modelUsage` never
-authorizes fallback.
+requires requested-model evidence. Transient classification follows the same
+exact failure-envelope allowlist; stderr-only or structurally ambiguous network
+text remains inconclusive. Missing or malformed `modelUsage` never authorizes
+fallback.
 
 A verifier dependency is `runtime-unavailable` only when its fixed source is
 deterministically absent or the supported platform/capability is not present.

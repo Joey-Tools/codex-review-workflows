@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import pathlib
 import re
@@ -214,6 +215,25 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError(f"non-standard JSON constant: {value}")
 
 
+def _strict_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("non-finite JSON number")
+    return parsed
+
+
+def _require_finite_json_numbers(value: Any) -> None:
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, float) and not math.isfinite(item):
+            raise ValueError("non-finite JSON number")
+        if isinstance(item, dict):
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+
+
 def strict_json_loads(payload: str | bytes | bytearray) -> Any:
     if isinstance(payload, str):
         text = payload
@@ -222,13 +242,16 @@ def strict_json_loads(payload: str | bytes | bytearray) -> Any:
     if not json_nesting_is_bounded(text):
         raise ValueError("JSON nesting exceeds the bounded parser limit")
     try:
-        return json.loads(
+        result = json.loads(
             text,
             object_pairs_hook=_strict_json_object,
             parse_constant=_reject_json_constant,
+            parse_float=_strict_json_float,
         )
     except RecursionError as error:
         raise ValueError("JSON nesting exceeds the bounded parser limit") from error
+    _require_finite_json_numbers(result)
+    return result
 
 
 def read_json(path: pathlib.Path) -> dict[str, Any]:

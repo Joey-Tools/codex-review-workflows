@@ -86,6 +86,17 @@ def sensitive_assignment_diff(*, key_name: str, fixture_value: str) -> str:
     )
 
 
+def bundled_root_store_fixture(
+    *certificates: bytes,
+    prefix: bytes = b"publisher-verified-prefix",
+    suffix: bytes = b"",
+) -> bytes:
+    store = b"\n".join(certificate.strip() for certificate in certificates)
+    return (
+        prefix + b"\x00" + store + providers.CLAUDE_BUNDLED_ROOT_STORE_TRAILER + suffix
+    )
+
+
 CLAUDE_SAFE_MODE_DESCRIPTION = (
     "Start with all customizations (CLAUDE.md, skills, plugins, hooks, MCP "
     "servers, custom commands and agents, output styles, workflows, custom "
@@ -931,6 +942,33 @@ class ProviderPolicyTest(unittest.TestCase):
             providers.CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
         )
 
+    @mock.patch.object(providers, "run_bounded_capture")
+    def test_keychain_query_only_treats_item_not_found_as_missing(
+        self,
+        run_command: mock.Mock,
+    ) -> None:
+        missing = common.BoundedCapture(
+            argv=(),
+            returncode=providers.CLAUDE_KEYCHAIN_ITEM_NOT_FOUND_STATUS,
+            stdout=bytearray(),
+            stderr=bytearray(b"bounded missing detail"),
+        )
+        run_command.return_value = missing
+
+        self.assertIsNone(providers._read_claude_keychain_credential(self.review))
+        self.assertEqual(missing.stderr, bytearray(len(missing.stderr)))
+
+        failed = common.BoundedCapture(
+            argv=(),
+            returncode=1,
+            stdout=bytearray(),
+            stderr=bytearray(b"bounded query failure"),
+        )
+        run_command.return_value = failed
+        with self.assertRaises(providers.ClaudeKeychainCredentialIntegrityError):
+            providers._read_claude_keychain_credential(self.review)
+        self.assertEqual(failed.stderr, bytearray(len(failed.stderr)))
+
     @mock.patch.object(providers, "_read_claude_keychain_credential")
     def test_keychain_preflight_rejects_stale_access_token(
         self,
@@ -960,7 +998,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(credential, bytearray(len(credential)))
 
     @mock.patch.object(providers, "_read_claude_keychain_credential")
-    def test_keychain_preflight_requires_whole_model_chain_lifetime(
+    def test_keychain_preflight_requires_only_imminent_attempt_lifetime(
         self,
         read_credential: mock.Mock,
     ) -> None:
@@ -974,13 +1012,30 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         read_credential.side_effect = (credential, bytearray(credential))
 
-        with self.assertRaisesRegex(
-            providers.ClaudeKeychainCredentialUnavailable,
-            "cannot cover the isolated review window",
-        ):
-            self.require_fresh_claude_keychain_credential(self.review)
+        self.require_fresh_claude_keychain_credential(self.review)
 
         self.assertEqual(credential, bytearray(len(credential)))
+
+    @mock.patch.object(providers, "_read_claude_keychain_credential")
+    def test_keychain_preflight_rechecks_each_imminent_attempt(
+        self,
+        read_credential: mock.Mock,
+    ) -> None:
+        lifetime = (
+            providers.REVIEW_ATTEMPT_TIMEOUT_SECONDS
+            + providers.CLAUDE_AUTH_EXPIRY_MARGIN_SECONDS
+            + 30
+        )
+        first = bytearray(oauth_credential_fixture(expires_in_seconds=lifetime))
+        second = bytearray(oauth_credential_fixture(expires_in_seconds=lifetime))
+        credentials = [first, bytearray(first), second, bytearray(second)]
+        read_credential.side_effect = credentials
+
+        self.require_fresh_claude_keychain_credential(self.review)
+        self.require_fresh_claude_keychain_credential(self.review)
+
+        self.assertEqual(read_credential.call_count, 4)
+        self.assertTrue(all(value == bytearray(len(value)) for value in credentials))
 
     def test_keychain_preflight_rejects_unbounded_integer_expiry(self) -> None:
         credential = bytearray(
@@ -996,10 +1051,34 @@ class ProviderPolicyTest(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(
-            providers.ClaudeKeychainCredentialUnavailable,
+            providers.ClaudeKeychainCredentialIntegrityError,
             "credential is malformed",
         ):
             providers._validate_fresh_claude_keychain_credential(credential)
+
+    def test_existing_keychain_blob_without_usable_oauth_is_integrity_failure(
+        self,
+    ) -> None:
+        access_key = "access" + "Token"
+        cases = (
+            {},
+            {"claudeAiOauth": None},
+            {"claudeAiOauth": {}},
+            {"claudeAiOauth": {access_key: None, "expiresAt": 1}},
+            {"claudeAiOauth": {access_key: "", "expiresAt": 1}},
+            {"claudeAiOauth": {access_key: "   ", "expiresAt": 1}},
+        )
+        for payload in cases:
+            with (
+                self.subTest(payload=payload),
+                self.assertRaisesRegex(
+                    providers.ClaudeKeychainCredentialIntegrityError,
+                    "credential is malformed",
+                ),
+            ):
+                providers._validate_fresh_claude_keychain_credential(
+                    bytearray(json.dumps(payload).encode())
+                )
 
     def test_keychain_preflight_uses_strict_recursive_json(self) -> None:
         payloads = (
@@ -1015,7 +1094,7 @@ class ProviderPolicyTest(unittest.TestCase):
             with (
                 self.subTest(payload=payload),
                 self.assertRaisesRegex(
-                    providers.ClaudeKeychainCredentialUnavailable,
+                    providers.ClaudeKeychainCredentialIntegrityError,
                     "credential is malformed",
                 ),
             ):
@@ -1035,7 +1114,7 @@ class ProviderPolicyTest(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(
-            providers.ClaudeKeychainCredentialUnavailable,
+            providers.ClaudeKeychainCredentialIntegrityError,
             "credential is malformed",
         ):
             providers._validate_fresh_claude_keychain_credential(credential)
@@ -1078,7 +1157,7 @@ class ProviderPolicyTest(unittest.TestCase):
         read_credential.side_effect = (first, second)
 
         with self.assertRaisesRegex(
-            providers.ClaudeKeychainCredentialUnavailable,
+            providers.ClaudeKeychainCredentialIntegrityError,
             "changed during stable validation",
         ):
             providers._read_stable_claude_keychain_credential(self.review)
@@ -1094,7 +1173,7 @@ class ProviderPolicyTest(unittest.TestCase):
         read_credential: mock.Mock,
     ) -> None:
         with self.assertRaisesRegex(
-            providers.ClaudeKeychainCredentialUnavailable,
+            providers.ClaudeKeychainCredentialIntegrityError,
             "account binding changed",
         ):
             providers._read_stable_claude_keychain_credential(
@@ -1126,12 +1205,12 @@ class ProviderPolicyTest(unittest.TestCase):
         warmup: mock.Mock,
         require_fresh: mock.Mock,
     ) -> None:
-        require_fresh.side_effect = providers.ClaudeKeychainCredentialUnavailable(
+        require_fresh.side_effect = providers.ClaudeKeychainCredentialIntegrityError(
             "Claude local-login account binding changed during review"
         )
 
         with self.assertRaisesRegex(
-            providers.ClaudeKeychainCredentialUnavailable,
+            providers.ClaudeKeychainCredentialIntegrityError,
             "account binding changed",
         ):
             self.warm_claude_local_login(
@@ -1332,7 +1411,9 @@ class ProviderPolicyTest(unittest.TestCase):
             {"type": "future_result"},
             {"subtype": "future_error"},
             {"providerFailure": "authentication failed"},
+            {"telemetry": None},
             {"modelUsage": []},
+            {"modelUsage": {providers.CLAUDE_MODELS[0]: {"futureCounter": 1}}},
             {"is_error": "true"},
         )
         base = {
@@ -1380,6 +1461,8 @@ class ProviderPolicyTest(unittest.TestCase):
             b'"subtype":"error_during_execution","is_error":true}',
             b'{"type":"result","subtype":"error_during_execution",'
             b'"is_error":true,"metric":NaN}',
+            b'{"type":"result","subtype":"error_during_execution",'
+            b'"is_error":true,"metric":1e10000}',
             (
                 '{"type":"result","subtype":"error_during_execution",'
                 '"is_error":true,"modelUsage":' + nested + "}"
@@ -1791,6 +1874,98 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn("nonzero-success-envelope", diagnostic)
         self.assertNotIn(private_result, diagnostic)
 
+    def test_record_attempt_clears_nonzero_final_text_invariant(self) -> None:
+        private_result = "private reviewer text must remain non-final"
+        stdout = json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": private_result,
+                "modelUsage": {providers.CLAUDE_MODELS[0]: {}},
+            }
+        ).encode()
+
+        attempt = providers._record_attempt(
+            review=self.review,
+            index=105,
+            runtime="claude",
+            model=providers.CLAUDE_MODELS[0],
+            completed=Completed(
+                argv=("claude",),
+                returncode=1,
+                stdout=stdout,
+                stderr=b"",
+            ),
+            final_text=private_result,
+            effective_model=providers.CLAUDE_MODELS[0],
+            requested_effort=providers.CLAUDE_REASONING_EFFORT,
+            effective_effort=None,
+            require_verified_model=True,
+        )
+
+        self.assertIsNone(attempt.final_text)
+        self.assertFalse(providers._attempt_summary(attempt)["final_available"])
+
+    def test_zero_exit_claude_failure_still_requires_exact_envelope(self) -> None:
+        base = {
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": True,
+            "result": "Not logged in - please run /login",
+        }
+        exact = self.record_claude_result(
+            json.dumps(base).encode(),
+            returncode=0,
+            index=106,
+        )
+        unknown = self.record_claude_result(
+            json.dumps({**base, "telemetry": None}).encode(),
+            returncode=0,
+            index=107,
+        )
+
+        self.assertEqual(exact.category, "auth")
+        self.assertIsNone(exact.final_text)
+        self.assertEqual(unknown.category, "inconclusive")
+        self.assertEqual(unknown.reason, "unverified-auth-failure-envelope")
+        self.assertIsNone(unknown.final_text)
+
+    def test_claude_transient_requires_exact_failure_envelope(self) -> None:
+        base = {
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": True,
+            "error": {"message": "network error while contacting the provider"},
+        }
+        for index, returncode in enumerate((0, 1), start=109):
+            with self.subTest(returncode=returncode, shape="exact"):
+                exact = self.record_claude_result(
+                    json.dumps(base).encode(),
+                    returncode=returncode,
+                    index=index,
+                )
+                self.assertEqual(exact.category, "transient")
+                self.assertIsNone(exact.final_text)
+
+        invalid_cases = (
+            ({**base, "telemetry": None}, 0),
+            ({**base, "is_error": "yes"}, 1),
+        )
+        for index, (payload, returncode) in enumerate(invalid_cases, start=111):
+            with self.subTest(returncode=returncode, shape="invalid"):
+                invalid = self.record_claude_result(
+                    json.dumps(payload).encode(),
+                    returncode=returncode,
+                    index=index,
+                )
+                self.assertEqual(invalid.category, "inconclusive")
+                self.assertEqual(
+                    invalid.reason,
+                    "unverified-transient-failure-envelope",
+                )
+                self.assertIsNone(invalid.final_text)
+
     def test_nonzero_malformed_claude_output_has_machine_visible_reason(self) -> None:
         for index, stdout in enumerate(
             (
@@ -1953,6 +2128,72 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(malformed.reason, "malformed-model-usage")
         self.assertEqual(matching.category, "entitlement")
 
+    def test_claude_fallback_envelope_uses_exact_recursive_allowlists(self) -> None:
+        model = providers.CLAUDE_MODELS[0]
+        base = {
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": True,
+            "result": "request rejected",
+            "errors": [
+                {
+                    "type": "error",
+                    "code": "model_not_enabled",
+                    "message": "Model is not available for your account",
+                }
+            ],
+            "duration_ms": 10,
+            "duration_api_ms": 5,
+            "num_turns": 1,
+            "session_id": "fixture-session",
+            "total_cost_usd": 0.0,
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "server_tool_use": {"web_search_requests": 0},
+            },
+            "modelUsage": {
+                model: {
+                    "inputTokens": 1,
+                    "outputTokens": 1,
+                    "costUSD": 0.0,
+                }
+            },
+            "permission_denials": [],
+            "uuid": "fixture-result",
+        }
+
+        self.assertEqual(
+            providers._claude_supported_failure_category(
+                json.dumps(base).encode(),
+                requested_model=model,
+            ),
+            "entitlement",
+        )
+
+        cases = []
+        unknown_top = json.loads(json.dumps(base))
+        unknown_top["telemetry"] = None
+        cases.append(unknown_top)
+        unknown_error = json.loads(json.dumps(base))
+        unknown_error["errors"][0]["requestId"] = "fixture-request"
+        cases.append(unknown_error)
+        unknown_model_usage = json.loads(json.dumps(base))
+        unknown_model_usage["modelUsage"][model]["futureCounter"] = 0
+        cases.append(unknown_model_usage)
+        unknown_usage = json.loads(json.dumps(base))
+        unknown_usage["usage"]["future_counter"] = 0
+        cases.append(unknown_usage)
+
+        for payload in cases:
+            with self.subTest(keys=sorted(payload)):
+                self.assertIsNone(
+                    providers._claude_supported_failure_category(
+                        json.dumps(payload).encode(),
+                        requested_model=model,
+                    )
+                )
+
     def test_success_without_model_usage_is_runtime_unverified(self) -> None:
         stdout = json.dumps(
             {
@@ -2081,6 +2322,158 @@ class ProviderPolicyTest(unittest.TestCase):
             providers._parse_copilot_output(stdout, requested_model="claude-opus-4.8"),
             (None, None),
         )
+
+    def test_copilot_model_discovery_dns_failure_is_transient_and_stops_chain(
+        self,
+    ) -> None:
+        private_host = "models.private.invalid"
+        stderr = (
+            f"Error: Failed to load models: dns error for {private_host}: "
+            "[ENOTFOUND]\n"
+            "Copilot could not retrieve the list of available models."
+        ).encode()
+        attempts: list[providers.Attempt] = []
+        calls = 0
+
+        def runner(**kwargs: object) -> providers.Attempt:
+            nonlocal calls
+            calls += 1
+            return providers._record_attempt(
+                review=self.review,
+                index=int(kwargs["index"]),
+                runtime="copilot",
+                model=str(kwargs["model"]),
+                completed=Completed(
+                    argv=("copilot",),
+                    returncode=1,
+                    stdout=b"",
+                    stderr=stderr,
+                ),
+                final_text=None,
+                effective_model=None,
+                requested_effort=providers.COPILOT_REASONING_EFFORT,
+                effective_effort=None,
+            )
+
+        category, final_text = providers._run_model_chain(
+            review=self.review,
+            models=providers.COPILOT_MODELS,
+            runner=runner,
+            runtime="copilot",
+            requested_effort=providers.COPILOT_REASONING_EFFORT,
+            env={},
+            attempts=attempts,
+        )
+
+        self.assertEqual(category, "transient")
+        self.assertIsNone(final_text)
+        self.assertEqual(calls, 1)
+        self.assertEqual(attempts[0].reason, "stderr-model-discovery-network")
+        summary = json.loads(
+            (self.review.container_dir / "attempts.json").read_text(encoding="utf-8")
+        )[0]
+        self.assertEqual(summary["reason"], "stderr-model-discovery-network")
+        self.assertNotIn(private_host, json.dumps(summary))
+
+    def test_copilot_model_discovery_dns_special_case_is_exact(self) -> None:
+        same_line = b"Failed to load models: DNS error [ENOTFOUND]"
+        split_lines = b"Failed to load models\nDNS error [ENOTFOUND]"
+        self.assertTrue(providers._copilot_model_discovery_network_failure(same_line))
+        self.assertFalse(
+            providers._copilot_model_discovery_network_failure(split_lines)
+        )
+
+        zero_exit = providers._record_attempt(
+            review=self.review,
+            index=113,
+            runtime="copilot",
+            model=providers.COPILOT_MODELS[0],
+            completed=Completed(
+                argv=("copilot",),
+                returncode=0,
+                stdout=b"",
+                stderr=same_line,
+            ),
+            final_text=None,
+            effective_model=None,
+            requested_effort=providers.COPILOT_REASONING_EFFORT,
+            effective_effort=None,
+        )
+        self.assertEqual(zero_exit.category, "inconclusive")
+        self.assertEqual(zero_exit.reason, "zero-exit-without-verified-final")
+
+        mixed_auth = providers._record_attempt(
+            review=self.review,
+            index=114,
+            runtime="copilot",
+            model=providers.COPILOT_MODELS[0],
+            completed=Completed(
+                argv=("copilot",),
+                returncode=1,
+                stdout=b"",
+                stderr=(
+                    b"Authentication failed; Failed to load models: "
+                    b"DNS error [ENOTFOUND]"
+                ),
+            ),
+            final_text=None,
+            effective_model=None,
+            requested_effort=providers.COPILOT_REASONING_EFFORT,
+            effective_effort=None,
+        )
+        self.assertEqual(mixed_auth.category, "auth")
+        self.assertNotEqual(mixed_auth.reason, "stderr-model-discovery-network")
+
+        split_diagnostic = providers._record_attempt(
+            review=self.review,
+            index=115,
+            runtime="copilot",
+            model=providers.COPILOT_MODELS[0],
+            completed=Completed(
+                argv=("copilot",),
+                returncode=1,
+                stdout=b"",
+                stderr=split_lines,
+            ),
+            final_text=None,
+            effective_model=None,
+            requested_effort=providers.COPILOT_REASONING_EFFORT,
+            effective_effort=None,
+        )
+        self.assertNotEqual(
+            split_diagnostic.reason,
+            "stderr-model-discovery-network",
+        )
+
+    def test_copilot_stdout_cannot_trigger_model_discovery_network_category(
+        self,
+    ) -> None:
+        stdout = json.dumps(
+            {
+                "type": "turn.failed",
+                "error": {"message": "Failed to load models: DNS error [ENOTFOUND]"},
+            }
+        ).encode()
+
+        attempt = providers._record_attempt(
+            review=self.review,
+            index=108,
+            runtime="copilot",
+            model=providers.COPILOT_MODELS[0],
+            completed=Completed(
+                argv=("copilot",),
+                returncode=1,
+                stdout=stdout,
+                stderr=b"",
+            ),
+            final_text=None,
+            effective_model=None,
+            requested_effort=providers.COPILOT_REASONING_EFFORT,
+            effective_effort=None,
+        )
+
+        self.assertEqual(attempt.category, "other")
+        self.assertEqual(attempt.reason, "unclassified-failure")
 
     def test_copilot_error_does_not_inherit_previous_session_model(self) -> None:
         stdout = "\n".join(
@@ -3718,6 +4111,77 @@ class ProviderPolicyTest(unittest.TestCase):
     @mock.patch.object(
         providers,
         "_resolve_validated_claude_executable",
+        side_effect=providers.ClaudeTrustToolUnavailable(
+            "fixed trust verifier is missing"
+        ),
+    )
+    @mock.patch.object(
+        providers,
+        "resolve_reviewer_executable",
+        return_value=pathlib.Path("/bin/copilot"),
+    )
+    @mock.patch.object(providers, "_copilot_attempt")
+    def test_missing_claude_trust_tool_allows_authorized_fallback(
+        self,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _resolve_claude: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        copilot_attempt.return_value = self.attempt(
+            "copilot",
+            providers.COPILOT_MODELS[0],
+            "success",
+            final_text="No findings.",
+        )
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
+
+        self.assertEqual(outcome.returncode, 0)
+        copilot_attempt.assert_called_once()
+        resolve.assert_called_once_with("copilot")
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        side_effect=providers.ClaudeTrustPolicyUnavailable(
+            "trust verifier has unsafe metadata"
+        ),
+    )
+    @mock.patch.object(providers, "resolve_reviewer_executable")
+    @mock.patch.object(providers, "_copilot_attempt")
+    def test_unsafe_claude_trust_tool_refuses_fallback(
+        self,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _resolve_claude: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
+
+        self.assertEqual(outcome.returncode, 2)
+        copilot_attempt.assert_not_called()
+        resolve.assert_not_called()
+        self.assertIn(
+            "refusing Copilot fallback",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
         side_effect=providers.ClaudeExecutableInspectionInconclusive(
             "GPG snapshot write failed: ENOSPC"
         ),
@@ -3803,7 +4267,7 @@ class ProviderPolicyTest(unittest.TestCase):
         return_value=pathlib.Path("/bin/copilot"),
     )
     @mock.patch.object(providers, "_copilot_attempt")
-    def test_stale_claude_credential_allows_authorized_copilot_fallback(
+    def test_missing_keychain_item_allows_authorized_copilot_fallback(
         self,
         copilot_attempt: mock.Mock,
         resolve: mock.Mock,
@@ -3811,7 +4275,7 @@ class ProviderPolicyTest(unittest.TestCase):
         _environment: mock.Mock,
     ) -> None:
         self.warmup.side_effect = providers.ClaudeKeychainCredentialUnavailable(
-            "credential remains stale"
+            "Keychain item remains missing after supported authentication warmup"
         )
         copilot_attempt.return_value = self.attempt(
             "copilot",
@@ -3837,8 +4301,50 @@ class ProviderPolicyTest(unittest.TestCase):
         copilot_attempt.assert_called_once()
         resolve.assert_called_once_with("copilot")
         self.assertIn(
-            "credential remains stale",
+            "Keychain item remains missing",
             (self.review.container_dir / "claude-skip.txt").read_text(encoding="utf-8"),
+        )
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        return_value=(
+            pathlib.Path("/bin/claude"),
+            {},
+            EMPTY_CLAUDE_EXECUTABLE_EVIDENCE,
+        ),
+    )
+    @mock.patch.object(providers, "resolve_reviewer_executable")
+    @mock.patch.object(providers, "_copilot_attempt")
+    def test_keychain_integrity_failure_refuses_copilot_fallback(
+        self,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _resolve_claude: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        with mock.patch.object(
+            providers,
+            "_claude_keychain_runtime",
+            side_effect=providers.ClaudeKeychainCredentialIntegrityError(
+                "credential changed during stable validation"
+            ),
+        ):
+            outcome = providers.run_review(
+                review=self.review,
+                reviewer="claude",
+                egress_consent="double-review",
+            )
+
+        self.assertEqual(outcome.returncode, 2)
+        copilot_attempt.assert_not_called()
+        resolve.assert_not_called()
+        self.assertIn(
+            "refusing Copilot fallback",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
         )
 
     @mock.patch.object(providers, "child_environment", return_value={})
@@ -5873,9 +6379,13 @@ class ProviderPolicyTest(unittest.TestCase):
             self.require_matching_claude_executable_snapshot(executable, evidence)
 
     def test_verified_macos_snapshot_captures_exact_bundled_root_set(self) -> None:
-        certificate = self.sample_ca_certificate()
+        certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+        stray = (CERTIFICATE_FIXTURES / "trust-root-non-ca.pem").read_bytes()
         executable = self.review.container_dir / "verified-executable-roots"
-        payload = b"publisher-verified-prefix\n" + certificate + certificate
+        payload = bundled_root_store_fixture(
+            certificate,
+            suffix=b"\x00isolated-test-certificate\x00" + stray,
+        )
         executable.write_bytes(payload)
         executable.chmod(0o700)
 
@@ -5899,12 +6409,30 @@ class ProviderPolicyTest(unittest.TestCase):
             evidence.bundled_root_sha256_fingerprints,
         )
 
+    def test_verified_macos_snapshot_accepts_root_without_key_usage(self) -> None:
+        certificate = (
+            CERTIFICATE_FIXTURES / "trust-root-no-key-usage.pem"
+        ).read_bytes()
+        executable = self.review.container_dir / "verified-executable-no-key-usage"
+        executable.write_bytes(bundled_root_store_fixture(certificate))
+        executable.chmod(0o700)
+
+        evidence = self.inspect_claude_executable_trust(
+            executable,
+            include_bundled_roots=True,
+        )
+
+        self.assertEqual(
+            evidence.bundled_root_sha256_fingerprints,
+            frozenset({self.ca_sha256_fingerprint(certificate)}),
+        )
+
     def test_verified_macos_snapshot_rejects_missing_bundled_root_evidence(
         self,
     ) -> None:
-        certificate = self.sample_ca_certificate()
+        certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
         executable = self.review.container_dir / "verified-executable-roots"
-        executable.write_bytes(b"publisher-verified-prefix\n" + certificate)
+        executable.write_bytes(bundled_root_store_fixture(certificate))
         executable.chmod(0o700)
         expected = providers.ClaudeExecutableTrustEvidence(
             executable_sha256=hashlib.sha256(executable.read_bytes()).hexdigest(),
@@ -5924,6 +6452,75 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
         ):
             self.require_matching_claude_executable_snapshot(executable, expected)
+
+    def test_verified_macos_snapshot_requires_one_anchored_root_store(self) -> None:
+        certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+        cases = (
+            b"publisher-verified-without-root-store",
+            bundled_root_store_fixture(certificate)
+            + bundled_root_store_fixture(certificate, prefix=b"second-store"),
+            (
+                b"publisher-verified-prefix\x00"
+                + providers.CLAUDE_BUNDLED_ROOT_STORE_TRAILER
+            ),
+            (
+                b"publisher-verified-prefix\x00"
+                + certificate.strip()
+                + providers.CLAUDE_BUNDLED_ROOT_STORE_TRAILER.replace(
+                    b"unified/../../../packages/bun-usockets/src/crypto/root_certs.cpp",
+                    b"stray/root_certs.cpp",
+                )
+            ),
+        )
+        for index, payload in enumerate(cases):
+            executable = self.review.container_dir / f"root-store-case-{index}"
+            executable.write_bytes(payload)
+            executable.chmod(0o700)
+            with (
+                self.subTest(index=index),
+                self.assertRaises(providers.ClaudeExecutableInspectionInconclusive),
+            ):
+                self.inspect_claude_executable_trust(
+                    executable,
+                    include_bundled_roots=True,
+                )
+
+    def test_verified_macos_snapshot_rejects_nonroot_store_members(self) -> None:
+        valid = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+        for name in ("trust-root-non-ca.pem", "trust-root-bad-key-usage.pem"):
+            with self.subTest(name=name):
+                invalid = (CERTIFICATE_FIXTURES / name).read_bytes()
+                executable = self.review.container_dir / f"mixed-{name}"
+                executable.write_bytes(bundled_root_store_fixture(valid, invalid))
+                executable.chmod(0o700)
+                with self.assertRaises(providers.ClaudeTrustCertificateInvalid):
+                    self.inspect_claude_executable_trust(
+                        executable,
+                        include_bundled_roots=True,
+                    )
+
+    def test_verified_macos_snapshot_rejects_invalid_root_self_signature(
+        self,
+    ) -> None:
+        valid = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+        der, _canonical = providers._canonical_ca_certificate(
+            valid,
+            source="valid root fixture",
+        )
+        mutated = der[:-1] + bytes((der[-1] ^ 1,))
+        invalid_signature = ssl.DER_cert_to_PEM_cert(mutated).encode("ascii")
+        executable = self.review.container_dir / "invalid-self-signature"
+        executable.write_bytes(bundled_root_store_fixture(invalid_signature))
+        executable.chmod(0o700)
+
+        with self.assertRaisesRegex(
+            providers.ClaudeTrustCertificateInvalid,
+            "not self-signed",
+        ):
+            self.inspect_claude_executable_trust(
+                executable,
+                include_bundled_roots=True,
+            )
 
     @unittest.skipUnless(os.name == "posix", "requires POSIX hard links")
     def test_verified_executable_snapshot_rejects_hardlinks(self) -> None:
@@ -6840,7 +7437,18 @@ class ProviderPolicyTest(unittest.TestCase):
                 "trustList": {
                     "malformed": {"trustSettings": "invalid"},
                     deny_fingerprint: {
-                        "trustSettings": [{providers.CLAUDE_TRUST_RESULT_KEY: 3}]
+                        "trustSettings": [
+                            {
+                                providers.CLAUDE_TRUST_RESULT_KEY: (
+                                    providers.CLAUDE_TRUST_RESULT_TRUST_ROOT
+                                )
+                            },
+                            {
+                                providers.CLAUDE_TRUST_RESULT_KEY: (
+                                    providers.CLAUDE_TRUST_RESULT_DENY
+                                )
+                            },
+                        ]
                     },
                 },
             }
@@ -6852,16 +7460,58 @@ class ProviderPolicyTest(unittest.TestCase):
     def test_trust_settings_classify_constrained_and_unconditional_roots(
         self,
     ) -> None:
-        unconditional = "A" * 40
+        empty = "A" * 40
         constrained = "B" * 40
+        trust_root = "C" * 40
+        trust_as_root = "D" * 40
+        mixed = "E" * 40
+        constrained_result = "F" * 40
         classified = providers._classify_trust_fingerprints(
             plistlib.dumps(
                 {
                     "trustVersion": 1,
                     "trustList": {
-                        unconditional: {"trustSettings": []},
+                        empty: {"trustSettings": []},
                         constrained: {
                             "trustSettings": [{"kSecTrustSettingsPolicyName": "ssl"}]
+                        },
+                        trust_root: {
+                            "trustSettings": [
+                                {
+                                    providers.CLAUDE_TRUST_RESULT_KEY: (
+                                        providers.CLAUDE_TRUST_RESULT_TRUST_ROOT
+                                    )
+                                }
+                            ]
+                        },
+                        trust_as_root: {
+                            "trustSettings": [
+                                {
+                                    providers.CLAUDE_TRUST_RESULT_KEY: (
+                                        providers.CLAUDE_TRUST_RESULT_TRUST_AS_ROOT
+                                    )
+                                }
+                            ]
+                        },
+                        mixed: {
+                            "trustSettings": [
+                                {"kSecTrustSettingsPolicyName": "ssl"},
+                                {
+                                    providers.CLAUDE_TRUST_RESULT_KEY: (
+                                        providers.CLAUDE_TRUST_RESULT_TRUST_AS_ROOT
+                                    )
+                                },
+                            ]
+                        },
+                        constrained_result: {
+                            "trustSettings": [
+                                {
+                                    providers.CLAUDE_TRUST_RESULT_KEY: (
+                                        providers.CLAUDE_TRUST_RESULT_TRUST_ROOT
+                                    ),
+                                    "kSecTrustSettingsPolicyName": "ssl",
+                                }
+                            ]
                         },
                     },
                 }
@@ -6869,8 +7519,39 @@ class ProviderPolicyTest(unittest.TestCase):
             domain="user",
         )
 
-        self.assertEqual(classified.unconditional, (unconditional,))
-        self.assertEqual(classified.constrained, (constrained,))
+        self.assertEqual(
+            classified.unconditional,
+            tuple(sorted((empty, trust_root, trust_as_root, mixed))),
+        )
+        self.assertEqual(
+            classified.constrained,
+            tuple(sorted((constrained, constrained_result))),
+        )
+
+    def test_trust_settings_validate_neighbors_of_unconditional_entries(
+        self,
+    ) -> None:
+        fingerprint = "A" * 40
+        payload = plistlib.dumps(
+            {
+                "trustVersion": 1,
+                "trustList": {
+                    fingerprint: {
+                        "trustSettings": [
+                            {
+                                providers.CLAUDE_TRUST_RESULT_KEY: (
+                                    providers.CLAUDE_TRUST_RESULT_TRUST_ROOT
+                                )
+                            },
+                            {providers.CLAUDE_TRUST_RESULT_KEY: 99},
+                        ]
+                    }
+                },
+            }
+        )
+
+        with self.assertRaises(providers.ClaudeTrustPolicyUnavailable):
+            providers._classify_trust_fingerprints(payload, domain="user")
 
     def test_trust_settings_reject_duplicate_plist_keys(self) -> None:
         payload = b"""<?xml version="1.0" encoding="UTF-8"?>
@@ -7380,6 +8061,32 @@ class ProviderPolicyTest(unittest.TestCase):
             self.assertRaisesRegex(ReviewError, "aggregate limit"),
         ):
             providers._collect_claude_caller_ca_material({"SSL_CERT_FILE": str(source)})
+
+    def test_caller_ca_budget_charges_noncertificate_files_before_parsing(
+        self,
+    ) -> None:
+        source_dir = self.review.source_root / "noncertificate-ca-directory"
+        source_dir.mkdir(mode=0o700)
+        for index in range(4):
+            self.write_private_source(
+                source_dir / f"entry-{index:02d}",
+                b"data",
+            )
+
+        with (
+            mock.patch.object(providers, "CLAUDE_CALLER_CA_INPUT_LIMIT_BYTES", 6),
+            mock.patch.object(
+                providers,
+                "_extract_ca_certificates",
+                wraps=providers._extract_ca_certificates,
+            ) as extract,
+            self.assertRaisesRegex(ReviewError, "aggregate limit"),
+        ):
+            providers._collect_claude_caller_ca_material(
+                {"SSL_CERT_DIR": str(source_dir)}
+            )
+
+        self.assertEqual(extract.call_count, 1)
 
     @unittest.skipUnless(os.name == "posix", "requires POSIX file metadata")
     def test_owner_file_reader_rejects_symlink_hardlink_fifo_and_public_mode(
