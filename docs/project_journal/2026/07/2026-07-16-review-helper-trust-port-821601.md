@@ -86,6 +86,10 @@ metadata behavior.
   and the policy-authorized Copilot fallback are unavailable is blocked with
   exit 1. Exit 75 is reserved for a last attempt that actually ended as
   inconclusive or transient.
+- The current-head review preflight correctly rejected a newly added literal
+  private-key marker in a synthetic negative fixture. The fixture now builds
+  the same marker from non-credential-shaped byte fragments at runtime; both
+  complete Python suites were rerun after that source-only repair.
 - Ruff 0.13.2 lint, Python compile, skill and project-journal validation, and
   working-tree diff checks passed. No provider/test formatter churn was retained:
   Ruff would also rewrite three pre-existing current-head expressions outside

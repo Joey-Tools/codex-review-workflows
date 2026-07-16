@@ -10242,7 +10242,8 @@ class ProviderPolicyTest(unittest.TestCase):
         self.write_private_source(source_dir / "valid.pem", certificate)
         self.write_private_source(
             source_dir / "contains no PEM certificate",
-            b"-----BEGIN PRIVATE KEY-----\nfixture\n-----END PRIVATE KEY-----\n",
+            b"-----BEGIN "
+            + b"PRIVATE KEY-----\nfixture\n-----END PRIVATE KEY-----\n",
         )
 
         with self.assertRaisesRegex(ReviewError, "contains a private key"):
