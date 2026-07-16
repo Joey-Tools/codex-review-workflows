@@ -26,6 +26,7 @@ from .common import (
     ReviewOutputLimitError,
     ReviewProcessLeakError,
     ReviewTimeoutError,
+    json_nesting_is_bounded,
     run_bounded_capture,
 )
 
@@ -324,6 +325,8 @@ def _enforce_fetch_deadline(timeout_seconds: float):  # type: ignore[no-untyped-
 def _decode_strict_json(payload: bytes, *, label: str) -> object:
     try:
         text = payload.decode("utf-8")
+        if not json_nesting_is_bounded(text):
+            raise ValueError("JSON nesting exceeds the bounded parser limit")
         return json.loads(
             text,
             object_pairs_hook=_strict_object,
@@ -335,7 +338,7 @@ def _decode_strict_json(payload: bytes, *, label: str) -> object:
         raise ClaudeProvenanceInvalid(
             f"{label} contains duplicate key: {error.args[0]!r}"
         ) from error
-    except (json.JSONDecodeError, ValueError) as error:
+    except (json.JSONDecodeError, RecursionError, ValueError) as error:
         raise ClaudeProvenanceInvalid(
             f"{label} is invalid JSON: {getattr(error, 'msg', str(error))}"
         ) from error

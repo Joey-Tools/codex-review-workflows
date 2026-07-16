@@ -119,12 +119,18 @@ explicitly configured Claude Code candidate:
    mentions, and deny every non-workspace synthetic-root mount with absolute
    double-slash rules. Command construction must fail closed when a mount lacks
    coverage or appears below `/workspace`.
-10. Prepare the platform-specific private credential carrier. macOS may run its
+10. On macOS, extract the exact bundled certificate set from the publisher-
+    verified executable snapshot. Before every model attempt, revalidate that
+    snapshot and root evidence, export all authoritative trust domains, apply
+    explicit-deny precedence, omit constrained or invalid roots, and rebuild a
+    certificate-only helper bundle from current system, bundled, permitted
+    additional, and snapshotted caller material.
+11. Prepare the platform-specific private credential carrier. macOS may run its
    fixed no-tools authentication warmup when the Keychain credential is not
    fresh. Linux and WSL2 never warm or refresh credentials: require the host
    credential to remain valid for the full bounded review window, or use an
    explicitly supplied API key.
-11. Launch only the one captured verified snapshot for every real model attempt
+12. Launch only the one captured verified snapshot for every real model attempt
     in a fresh outer sandbox; never rediscover or fall back to the mutable source
     installation between Opus attempts. Validate structured output, effective
     model, and terminal status before accepting text as review evidence. The
@@ -459,7 +465,7 @@ host boundary. On Linux and WSL2, however, the signed Claude permission engine
 is part of the trusted computing base for the narrower distinction between
 runtime authentication reads and model-invoked file reads.
 
-Custom TLS sources are copied rather than mounted from their original paths.
+On Linux and WSL2, custom TLS sources are copied rather than mounted from their original paths.
 `SSL_CERT_FILE` is read through a stable no-follow regular-file descriptor.
 `SSL_CERT_DIR` is enumerated through a fixed directory descriptor with bounded
 entry counts and supports normal OpenSSL hash links, including the multi-hop
@@ -474,6 +480,19 @@ while the read-only `bubblewrap` command is serialized. Like the existing
 runtime-library mounts, this fixes the selected resolved source but does not
 claim an FD-bound, atomic path-to-mount handoff against another same-euid
 process.
+
+On macOS, caller CA inputs use owner-only, single-link regular-file reads with
+no symlinks, FIFOs, extended ACL entries, or identity/growth races. The helper
+snapshots only bounded certificate material once and revalidates its digest for
+the model chain. Before every attempt it re-exports user, admin, and system
+trust settings into bounded helper files. Explicit deny wins even when another
+domain or sibling entry is malformed. Constrained, missing, expired, non-root,
+or otherwise invalid additional certificates are excluded from the complete
+merged bundle, regardless of which input also contains them. The exact embedded
+root set is evidence derived from the publisher-verified snapshot; if a host
+policy excludes a root still reachable through Claude's bundled store, the lane
+blocks rather than weakening signed provenance. Every trust preparation writes
+a sanitized terminal `claude-trust-policy.json` record.
 
 Linux and WSL2 fix cwd at `/workspace`, use `dontAsk`, expose only `Read`, and
 pre-approve only `Read(./**)`. Every other top-level path mounted into the
@@ -528,8 +547,12 @@ not require local-login credential access. Never pass Claude and Copilot
 credentials into the same child environment.
 
 On macOS, retain the capability-authenticated, one-shot Keychain broker. The
-parent may read the current Claude Code item once with Apple's trusted client;
-the final Claude process cannot execute `/usr/bin/security`, access Keychain
+parent binds the current account and reads the fixed Claude Code item twice with
+Apple's trusted client, requires byte equality and expiry coverage, and repeats
+freshness at the final launch boundary. A missing or expiring item may trigger
+one fixed no-tools warmup; malformed JSON, account drift, or unstable reads do
+not. The helper does not read or bridge `~/.claude.json` account metadata. The
+final Claude process cannot execute `/usr/bin/security`, access Keychain
 services directly, update the host item, or refresh OAuth credentials during the
 review.
 
@@ -599,7 +622,9 @@ reached:
    records `attempt.category: inconclusive` and a stable `failure_class` rather
    than leaving an earlier readiness phase as the apparent terminal result.
 5. `attempt-complete`: the report records the final sandbox status, attempt
-   category and return code, and requested/effective model and effort.
+   category, bounded reason and return code, and requested/effective model and
+   effort. A separate `claude-trust-policy.json` generation records the terminal
+   trust/bundle result for the latest attempt.
 
 These records are evidence about which gates ran; an early phase must never be
 described as an enforced final launch.
@@ -611,6 +636,7 @@ described as an enforced final launch.
 | No automatic candidate, supported platform unavailable, accepted-range candidate lacks a required non-security capability, or usable local/API authentication is absent | `runtime-unavailable` or `auth-unavailable` | Only for explicit double/triple-review consent |
 | Explicit override has the wrong version, platform, binary shape, capability contract, or lacks trusted GPG, probe sandbox, or trusted review tool prerequisites | `blocked` configuration error | No |
 | Wrong publisher fingerprint, invalid signature, checksum mismatch, contradictory safe-mode semantics, unsafe credential metadata, or an isolation-boundary mismatch | `blocked` security error | No |
+| Authoritative macOS trust deny, malformed trust policy, excluded bundled root, private-key caller CA, or mismatched bundled-root evidence | `blocked` security error with terminal trust evidence | No |
 | Manifest/probe timeout, output overflow, executable resolve/stat I/O failure, other inspection I/O failure, file race, transient network failure, capacity error, or missing trustworthy terminal artifact | `inconclusive` | No |
 | Explicit model entitlement or organization-policy denial after runtime verification | Existing same-lane model/backend fallback policy | Only as already authorized by the lane contract |
 
@@ -625,6 +651,15 @@ parsed, matched to a runtime path, or used to prove local native backing is an
 inconclusive inspection failure; so is a workspace-link identity race or I/O
 failure. Neither case is ordinary runtime unavailability, so neither can
 authorize Copilot fallback.
+
+Claude stdout can never provide a final artifact when the process exits
+nonzero. Strictly recognized failure envelopes may retain bounded structural
+classification, but malformed, duplicate-key, non-standard-constant, unknown,
+or success-looking nonzero envelopes are fail-closed and receive a sanitized
+machine-readable attempt reason. Authentication becomes deterministic only for
+the documented complete result shape, and entitlement fallback additionally
+requires requested-model evidence. Missing or malformed `modelUsage` never
+authorizes fallback.
 
 A verifier dependency is `runtime-unavailable` only when its fixed source is
 deterministically absent or the supported platform/capability is not present.

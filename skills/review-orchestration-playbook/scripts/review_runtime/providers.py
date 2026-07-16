@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import contextlib
+import errno
+import hashlib
 import hmac
 import itertools
 import json
 import math
 import os
 import pathlib
+import plistlib
 import re
 import secrets
 import select
@@ -34,6 +38,7 @@ from .claude_capabilities import (
     validate_claude_help,
 )
 from .claude_provenance import (
+    CLAUDE_BINARY_MAX_BYTES,
     CLAUDE_RELEASE_KEY_FINGERPRINT,
     ClaudeProvenanceDependencyUnavailable,
     ClaudeProvenanceInconclusive,
@@ -87,6 +92,7 @@ from .common import (
     resolve_reviewer_executable,
     run,
     run_bounded_capture,
+    strict_json_loads,
     write_json,
     write_text_atomic,
 )
@@ -197,11 +203,78 @@ CLAUDE_TLS_FILE_ENV_KEYS = (
     "SSL_CERT_FILE",
 )
 CLAUDE_TLS_DIR_ENV_KEYS = ("SSL_CERT_DIR",)
+CLAUDE_TLS_BYPASS_ENV_KEYS = (
+    "NODE_OPTIONS",
+    "NODE_TLS_REJECT_UNAUTHORIZED",
+)
 CLAUDE_CA_FILE_LIMIT_BYTES = 16 * 1024 * 1024
 CLAUDE_CA_DIR_LIMIT_BYTES = 64 * 1024 * 1024
 CLAUDE_CA_DIR_ENTRY_LIMIT = 4096
 CLAUDE_CA_SYMLINK_LIMIT = 32
 CLAUDE_CA_PATH_COMPONENT_LIMIT = 256
+CLAUDE_EXECUTABLE_HASH_CHUNK_BYTES = 1024 * 1024
+CLAUDE_BUNDLED_CERTIFICATE_LIMIT_BYTES = 128 * 1024
+CLAUDE_BUNDLED_ROOT_LIMIT = 512
+CLAUDE_OPENSSL_CLIENT = pathlib.Path("/usr/bin/openssl")
+CLAUDE_SYSTEM_CA_FILE = pathlib.Path("/private/etc/ssl/cert.pem")
+CLAUDE_SYSTEM_KEYCHAIN = pathlib.Path("/Library/Keychains/System.keychain")
+CLAUDE_SYSTEM_ROOT_KEYCHAIN = pathlib.Path(
+    "/System/Library/Keychains/SystemRootCertificates.keychain"
+)
+CLAUDE_TRUST_CERTIFICATE_SOURCES = (
+    ("default keychain search", ()),
+    ("system keychain", (str(CLAUDE_SYSTEM_KEYCHAIN),)),
+    ("system root keychain", (str(CLAUDE_SYSTEM_ROOT_KEYCHAIN),)),
+)
+CLAUDE_CA_BUNDLE_NAME = "trusted-ca-bundle.pem"
+CLAUDE_CALLER_CA_SNAPSHOT_NAME = ".caller-ca-snapshot.pem"
+CLAUDE_TRUST_POLICY_EVIDENCE_NAME = "claude-trust-policy.json"
+CLAUDE_CERT_STORE_ENV = "CLAUDE_CODE_CERT_STORE"
+CLAUDE_CERT_STORE = "bundled"
+CLAUDE_TRUST_DOMAINS = (
+    ("user", ()),
+    ("admin", ("-d",)),
+    ("system", ("-s",)),
+)
+CLAUDE_TRUST_NO_SETTINGS = (
+    "SecTrustSettingsExport: No Trust Settings were found.",
+    "SecTrustSettingsCreateExternalRepresentation: No Trust Settings were found.",
+)
+CLAUDE_TRUST_EXPORT_HELP_VARIANTS = (
+    (
+        "Usage: trust-settings-export [-s] [-d] settings_file",
+        "-s Export system trust settings (default is user)",
+        "-d Export admin trust settings (default is user)",
+    ),
+    (
+        "Usage: trust-settings-export [-s] [-d] settings_file",
+        "-s Export system Trust Settings; default is user.",
+        "-d Export admin Trust Settings; default is user.",
+    ),
+)
+CLAUDE_TRUST_EXPORT_UNAVAILABLE = (
+    "SecTrustSettingsCreateExternalRepresentation: No keychain is available. "
+    "You may need to restart your computer."
+)
+CLAUDE_TRUST_FINGERPRINT = re.compile(r"^[0-9A-Fa-f]{40}$")
+CLAUDE_TRUST_RESULT_KEY = "kSecTrustSettingsResult"
+CLAUDE_TRUST_RESULT_DENY = 3
+CLAUDE_TRUST_RESULTS = frozenset({1, 2, 3, 4})
+CLAUDE_CALLER_CA_INPUT_LIMIT_BYTES = 8 * 1024 * 1024
+CLAUDE_CALLER_CA_SNAPSHOT_LIMIT_BYTES = CLAUDE_CALLER_CA_INPUT_LIMIT_BYTES + math.ceil(
+    CLAUDE_CALLER_CA_INPUT_LIMIT_BYTES / 32
+)
+CLAUDE_CA_BUNDLE_INPUT_LIMIT_BYTES = (
+    CLAUDE_CALLER_CA_INPUT_LIMIT_BYTES
+    + CLAUDE_CA_FILE_LIMIT_BYTES * (2 + len(CLAUDE_TRUST_CERTIFICATE_SOURCES))
+)
+CLAUDE_CA_BUNDLE_LIMIT_BYTES = CLAUDE_CA_BUNDLE_INPUT_LIMIT_BYTES + math.ceil(
+    CLAUDE_CA_BUNDLE_INPUT_LIMIT_BYTES / 32
+)
+CLAUDE_TRUST_SETTINGS_LIMIT_BYTES = 1024 * 1024
+CLAUDE_TRUST_ENTRY_LIMIT = 4096
+CLAUDE_ADDITIONAL_TRUST_ROOT_LIMIT = 256
+CLAUDE_TRUST_ROOT_VERIFY_TOTAL_SECONDS = 30.0
 CLAUDE_CERTIFICATE_BLOCK = re.compile(
     rb"-----BEGIN CERTIFICATE-----\r?\n.*?-----END CERTIFICATE-----",
     re.DOTALL,
@@ -336,6 +409,56 @@ AUTH_FAILURE_FRAGMENTS = (
     "unauthorized",
     "status 401",
 )
+CLAUDE_RESULT_AUTH_MESSAGES = frozenset(
+    {
+        "not logged in - please run /login",
+        "not logged in - please run `/login`",
+    }
+)
+CLAUDE_AUTH_WARMUP_SAFE_TYPES = frozenset({"result"})
+CLAUDE_AUTH_WARMUP_SAFE_SUBTYPES = frozenset({"error_during_execution", "success"})
+CLAUDE_AUTH_WARMUP_ERROR_FIELDS = frozenset(
+    {
+        "api_error_status",
+        "code",
+        "detail",
+        "error",
+        "errors",
+        "message",
+        "reason",
+    }
+)
+CLAUDE_AUTH_WARMUP_RESULT_SIGNAL_TERMS = {
+    "auth": (
+        "api key",
+        "authentication",
+        "credential",
+        "log in",
+        "logged in",
+        "login",
+        "oauth",
+        "sign in",
+        "token",
+        "unauthorized",
+    ),
+    "entitlement": (
+        "account",
+        "billing",
+        "model is not available",
+        "organization policy",
+        "plan",
+        "subscription",
+    ),
+    "transient": (
+        "connection",
+        "network",
+        "overloaded",
+        "rate limit",
+        "temporarily",
+        "timeout",
+        "try again",
+    ),
+}
 CODEX_ARG_TRANSPORT_NAME = re.compile(r"codex-arg0[A-Za-z0-9]+")
 
 
@@ -349,6 +472,10 @@ class ClaudeKeychainBrokerUnavailable(ReviewError):
 
 class ClaudeKeychainCredentialUnavailable(ReviewError):
     """The local Claude credential cannot be refreshed without argv exposure."""
+
+
+class ClaudeKeychainCredentialRefreshRequired(ClaudeKeychainCredentialUnavailable):
+    """The local Claude credential is valid but expires before the next attempt."""
 
 
 class ClaudeAuthWarmupInconclusive(ReviewError):
@@ -369,6 +496,22 @@ class ClaudeExecutableUnavailable(ReviewError):
 
 class ClaudeExecutableInspectionInconclusive(ReviewError):
     """A Claude runtime file changed or became unreadable during inspection."""
+
+
+class ClaudeTrustPolicyUnavailable(ReviewError):
+    """Host trust policy is malformed or cannot be represented safely."""
+
+
+class ClaudeTrustToolUnavailable(ReviewError):
+    """The host cannot provide Apple's bounded trust export tooling."""
+
+
+class ClaudeTrustCertificateInvalid(ReviewError):
+    """An additional host trust certificate cannot be imported safely."""
+
+
+class ClaudeTrustSettingsDeny(ReviewError):
+    """Host trust settings contain an explicit deny and require a hard stop."""
 
 
 class ClaudeProvenanceVerifierUnavailable(ReviewError):
@@ -407,9 +550,7 @@ def _is_claude_macos_host() -> bool:
 
 def _claude_linux_bootstrap_library_roots() -> tuple[pathlib.Path, ...]:
     roots = tuple(
-        path
-        for path in CLAUDE_LINUX_BOOTSTRAP_LIBRARY_ROOT_CANDIDATES
-        if path.is_dir()
+        path for path in CLAUDE_LINUX_BOOTSTRAP_LIBRARY_ROOT_CANDIDATES if path.is_dir()
     )
     if not roots:
         raise ClaudeProbeSandboxUnavailable(
@@ -452,18 +593,12 @@ def _create_or_validate_claude_runtime_directory(
         ) from error
     mode = stat.S_IMODE(before.st_mode)
     if not stat.S_ISDIR(before.st_mode):
-        raise ReviewError(
-            f"Claude Linux runtime path must be a real directory: {path}"
-        )
+        raise ReviewError(f"Claude Linux runtime path must be a real directory: {path}")
     if before.st_uid != os.geteuid():
-        raise ReviewError(
-            f"Claude runtime directory has an unexpected owner: {path}"
-        )
+        raise ReviewError(f"Claude runtime directory has an unexpected owner: {path}")
     if (private and mode != 0o700) or (not private and mode & 0o022):
         requirement = "0700" if private else "not group- or world-writable"
-        raise ReviewError(
-            f"Claude runtime directory must be {requirement}: {path}"
-        )
+        raise ReviewError(f"Claude runtime directory must be {requirement}: {path}")
     flags = (
         os.O_RDONLY
         | getattr(os, "O_CLOEXEC", 0)
@@ -485,13 +620,16 @@ def _create_or_validate_claude_runtime_directory(
         ) from error
     finally:
         os.close(descriptor)
-    if len(
-        {
-            _claude_linux_directory_identity(before),
-            _claude_linux_directory_identity(opened),
-            _claude_linux_directory_identity(after),
-        }
-    ) != 1:
+    if (
+        len(
+            {
+                _claude_linux_directory_identity(before),
+                _claude_linux_directory_identity(opened),
+                _claude_linux_directory_identity(after),
+            }
+        )
+        != 1
+    ):
         raise ReviewError("Claude runtime directory changed during validation")
     return path
 
@@ -508,6 +646,7 @@ class Attempt:
     final_text: str | None
     stdout_path: str
     stderr_path: str
+    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -515,6 +654,54 @@ class Outcome:
     returncode: int
     final_text: str | None
     attempts: tuple[Attempt, ...]
+
+
+@dataclass(frozen=True)
+class ClaudeExecutableTrustEvidence:
+    executable_sha256: str
+    bundled_root_certificates: bytes
+    bundled_root_sha256_fingerprints: frozenset[bytes]
+
+    @property
+    def bundled_root_set_sha256(self) -> str:
+        return hashlib.sha256(
+            b"".join(sorted(self.bundled_root_sha256_fingerprints))
+        ).hexdigest()
+
+
+@dataclass(frozen=True)
+class ClaudeTrustFingerprints:
+    unconditional: tuple[str, ...]
+    constrained: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ClaudeSelectedTrustMaterial:
+    certificates: bytes
+    omitted_sha1_fingerprints: frozenset[str]
+
+
+@dataclass(frozen=True)
+class ClaudeTrustMaterial:
+    certificates: bytes
+    excluded_sha1_fingerprints: frozenset[str]
+    evidence: dict[str, object]
+
+
+@dataclass
+class ClaudeTrustSessionState:
+    caller_ca_snapshot_sha256: str | None = None
+
+
+class _DuplicatePlistKey(ValueError):
+    pass
+
+
+class _UniquePlistDict(dict[Any, Any]):
+    def __setitem__(self, key: Any, value: Any) -> None:
+        if key in self:
+            raise _DuplicatePlistKey
+        super().__setitem__(key, value)
 
 
 def _merge_runtime_report(
@@ -572,9 +759,7 @@ def _claude_macos_platform_key(path: pathlib.Path) -> str:
             f"cannot inspect Claude Code architecture: {error}"
         ) from error
     if len(header) < 8:
-        raise InvalidReviewerExecutable(
-            "Claude Code Mach-O header is truncated"
-        )
+        raise InvalidReviewerExecutable("Claude Code Mach-O header is truncated")
     magic = header[:4]
     if magic == b"\xcf\xfa\xed\xfe":
         byteorder = "little"
@@ -626,6 +811,493 @@ def _require_trusted_claude_release(
         raise ClaudeProvenanceVerifierUnavailable(str(error)) from error
     except ClaudeProvenanceUnavailable as error:
         raise ClaudeExecutableInspectionInconclusive(str(error)) from error
+
+
+def _canonical_ca_certificate(block: bytes, *, source: str) -> tuple[bytes, bytes]:
+    lines = block.strip().splitlines()
+    if len(lines) < 3:
+        raise ReviewError(
+            f"Claude review CA source contains an invalid certificate: {source}"
+        )
+    try:
+        der = base64.b64decode(b"".join(lines[1:-1]), validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise ReviewError(
+            f"Claude review CA source contains an invalid certificate: {source}"
+        ) from error
+    if not der:
+        raise ReviewError(
+            f"Claude review CA source contains an invalid certificate: {source}"
+        )
+    canonical = ssl.DER_cert_to_PEM_cert(der).encode("ascii")
+    return der, canonical
+
+
+def _der_tlv(
+    data: bytes,
+    offset: int,
+    limit: int,
+) -> tuple[int, int, int, int]:
+    if offset < 0 or offset + 2 > limit or limit > len(data):
+        raise ValueError("truncated DER element")
+    tag = data[offset]
+    first_length = data[offset + 1]
+    cursor = offset + 2
+    if first_length & 0x80:
+        length_octets = first_length & 0x7F
+        if (
+            length_octets == 0
+            or length_octets > 4
+            or cursor + length_octets > limit
+            or data[cursor] == 0
+        ):
+            raise ValueError("invalid DER length")
+        length = int.from_bytes(data[cursor : cursor + length_octets], "big")
+        if length < 0x80:
+            raise ValueError("non-minimal DER length")
+        cursor += length_octets
+    else:
+        length = first_length
+    content_end = cursor + length
+    if content_end > limit:
+        raise ValueError("truncated DER content")
+    return tag, cursor, content_end, content_end
+
+
+def _require_unconditional_root_extensions(der: bytes) -> None:
+    try:
+        outer_tag, outer_start, outer_end, outer_next = _der_tlv(der, 0, len(der))
+        if outer_tag != 0x30 or outer_next != len(der):
+            raise ValueError("invalid certificate sequence")
+
+        offset = outer_start
+        tbs_tag, tbs_start, tbs_end, offset = _der_tlv(der, offset, outer_end)
+        if tbs_tag != 0x30:
+            raise ValueError("invalid TBSCertificate")
+        signature_tag, _, _, offset = _der_tlv(der, offset, outer_end)
+        signature_value_tag, _, _, offset = _der_tlv(der, offset, outer_end)
+        if signature_tag != 0x30 or signature_value_tag != 0x03 or offset != outer_end:
+            raise ValueError("invalid certificate signature")
+
+        offset = tbs_start
+        if offset < tbs_end and der[offset] == 0xA0:
+            _, _, _, offset = _der_tlv(der, offset, tbs_end)
+        for expected_tag in (0x02, 0x30):
+            tag, _, _, offset = _der_tlv(der, offset, tbs_end)
+            if tag != expected_tag:
+                raise ValueError("invalid TBSCertificate field")
+
+        issuer_offset = offset
+        issuer_tag, _, _, offset = _der_tlv(der, offset, tbs_end)
+        issuer = der[issuer_offset:offset]
+        validity_tag, _, _, offset = _der_tlv(der, offset, tbs_end)
+        subject_offset = offset
+        subject_tag, _, _, offset = _der_tlv(der, offset, tbs_end)
+        subject = der[subject_offset:offset]
+        public_key_tag, _, _, offset = _der_tlv(der, offset, tbs_end)
+        if (
+            issuer_tag != 0x30
+            or validity_tag != 0x30
+            or subject_tag != 0x30
+            or public_key_tag != 0x30
+            or issuer != subject
+        ):
+            raise ValueError("certificate is not self-issued")
+
+        extensions: tuple[int, int] | None = None
+        while offset < tbs_end:
+            tag, content_start, content_end, offset = _der_tlv(der, offset, tbs_end)
+            if tag in (0x81, 0x82):
+                continue
+            if tag != 0xA3 or extensions is not None:
+                raise ValueError("unsupported TBSCertificate field")
+            extensions = (content_start, content_end)
+        if extensions is None:
+            raise ValueError("missing certificate extensions")
+
+        extension_start, extension_end = extensions
+        sequence_tag, sequence_start, sequence_end, sequence_next = _der_tlv(
+            der,
+            extension_start,
+            extension_end,
+        )
+        if sequence_tag != 0x30 or sequence_next != extension_end:
+            raise ValueError("invalid extension sequence")
+
+        basic_constraints: tuple[bool, bytes] | None = None
+        key_usage: tuple[bool, bytes] | None = None
+        offset = sequence_start
+        while offset < sequence_end:
+            extension_tag, item_start, item_end, offset = _der_tlv(
+                der,
+                offset,
+                sequence_end,
+            )
+            if extension_tag != 0x30:
+                raise ValueError("invalid extension")
+            item_offset = item_start
+            oid_tag, oid_start, oid_end, item_offset = _der_tlv(
+                der,
+                item_offset,
+                item_end,
+            )
+            if oid_tag != 0x06:
+                raise ValueError("invalid extension identifier")
+            critical = False
+            if item_offset < item_end and der[item_offset] == 0x01:
+                _, value_start, value_end, item_offset = _der_tlv(
+                    der,
+                    item_offset,
+                    item_end,
+                )
+                if value_end - value_start != 1 or der[value_start] not in (0, 0xFF):
+                    raise ValueError("invalid extension critical flag")
+                critical = der[value_start] == 0xFF
+            value_tag, value_start, value_end, item_offset = _der_tlv(
+                der,
+                item_offset,
+                item_end,
+            )
+            if value_tag != 0x04 or item_offset != item_end:
+                raise ValueError("invalid extension value")
+            oid = der[oid_start:oid_end]
+            value = der[value_start:value_end]
+            if oid == b"\x55\x1d\x13":
+                if basic_constraints is not None:
+                    raise ValueError("duplicate basic constraints")
+                basic_constraints = (critical, value)
+            elif oid == b"\x55\x1d\x0f":
+                if key_usage is not None:
+                    raise ValueError("duplicate key usage")
+                key_usage = (critical, value)
+
+        if basic_constraints is None or not basic_constraints[0]:
+            raise ValueError("missing critical basic constraints")
+        basic = basic_constraints[1]
+        tag, content_start, content_end, next_offset = _der_tlv(basic, 0, len(basic))
+        if tag != 0x30 or next_offset != len(basic):
+            raise ValueError("invalid basic constraints")
+        tag, value_start, value_end, offset = _der_tlv(
+            basic,
+            content_start,
+            content_end,
+        )
+        if (
+            tag != 0x01
+            or basic[value_start:value_end] != b"\xff"
+            or (offset < content_end and basic[offset] != 0x02)
+        ):
+            raise ValueError("certificate is not a CA")
+        if offset < content_end:
+            _, _, _, offset = _der_tlv(basic, offset, content_end)
+        if offset != content_end:
+            raise ValueError("invalid basic constraints")
+
+        if key_usage is None or not key_usage[0]:
+            raise ValueError("missing critical key usage")
+        usage = key_usage[1]
+        tag, value_start, value_end, next_offset = _der_tlv(usage, 0, len(usage))
+        value = usage[value_start:value_end]
+        if (
+            tag != 0x03
+            or next_offset != len(usage)
+            or len(value) < 2
+            or value[0] > 7
+            or not (value[1] & 0x04)
+            or (value[0] and value[-1] & ((1 << value[0]) - 1))
+        ):
+            raise ValueError("key usage does not permit certificate signing")
+    except (IndexError, ValueError) as error:
+        raise ClaudeTrustCertificateInvalid(
+            "Claude trust settings reference a certificate that is not a strict "
+            "self-signed CA root"
+        ) from error
+
+
+def _verify_unconditional_trust_root(
+    der: bytes,
+    canonical: bytes,
+    *,
+    ca_root: pathlib.Path,
+    timeout_seconds: float,
+) -> None:
+    _require_unconditional_root_extensions(der)
+    if not CLAUDE_OPENSSL_CLIENT.is_file() or not os.access(
+        CLAUDE_OPENSSL_CLIENT,
+        os.X_OK,
+    ):
+        raise ClaudeTrustToolUnavailable(
+            "Claude TLS root verification tooling is unavailable"
+        )
+    fd, temporary = tempfile.mkstemp(prefix=".trust-root-", suffix=".pem", dir=ca_root)
+    certificate_path = pathlib.Path(temporary)
+    try:
+        os.fchmod(fd, 0o600)
+        _require_no_extended_acl(fd, label="Claude trust verification input")
+        with os.fdopen(fd, "wb") as handle:
+            fd = -1
+            handle.write(canonical)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            completed = run_bounded_capture(
+                (
+                    str(CLAUDE_OPENSSL_CLIENT),
+                    "verify",
+                    "-x509_strict",
+                    "-check_ss_sig",
+                    "-purpose",
+                    "any",
+                    "-trusted",
+                    certificate_path.name,
+                    certificate_path.name,
+                ),
+                cwd=ca_root,
+                env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+                timeout_seconds=timeout_seconds,
+                stdout_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
+                stderr_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
+            )
+        except OSError as error:
+            raise ClaudeTrustToolUnavailable(
+                "Claude TLS root verification tooling became unavailable"
+            ) from error
+        try:
+            if completed.returncode == 2:
+                raise ClaudeTrustCertificateInvalid(
+                    "Claude trust settings reference a certificate that is not a "
+                    "currently valid self-signed CA root"
+                )
+            if completed.returncode != 0:
+                raise ClaudeTrustToolUnavailable(
+                    "Claude TLS root verification tooling failed unexpectedly"
+                )
+        finally:
+            completed.stdout[:] = b"\x00" * len(completed.stdout)
+            completed.stderr[:] = b"\x00" * len(completed.stderr)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        certificate_path.unlink(missing_ok=True)
+
+
+def _merge_ca_certificates(
+    materials: Iterable[tuple[str, bytes]],
+    *,
+    excluded_sha1_fingerprints: Iterable[str] = (),
+    allow_empty: bool = False,
+    limit_bytes: int,
+    label: str,
+) -> bytes:
+    if limit_bytes < 0:
+        raise ValueError("CA merge byte limit must not be negative")
+    merged = bytearray()
+    try:
+        seen: set[bytes] = set()
+        excluded = {fingerprint.upper() for fingerprint in excluded_sha1_fingerprints}
+        for source, data in materials:
+            if not data and allow_empty:
+                continue
+            normalized = _extract_ca_certificates(data, source=source)
+            for block in CLAUDE_CERTIFICATE_BLOCK.findall(normalized):
+                der, canonical = _canonical_ca_certificate(block, source=source)
+                sha1_fingerprint = (
+                    hashlib.sha1(
+                        der,
+                        usedforsecurity=False,
+                    )
+                    .hexdigest()
+                    .upper()
+                )
+                if sha1_fingerprint in excluded:
+                    continue
+                fingerprint = hashlib.sha256(der).digest()
+                if fingerprint in seen:
+                    continue
+                seen.add(fingerprint)
+                if len(merged) + len(canonical) > limit_bytes:
+                    raise ReviewError(f"{label} exceeds the size limit")
+                merged.extend(canonical)
+        if not merged and not allow_empty:
+            raise ReviewError("Claude review CA bundle contains no PEM certificate")
+        return bytes(merged)
+    except MemoryError as error:
+        raise ReviewError(f"{label} exceeded the bounded memory budget") from error
+
+
+def _ca_sha256_fingerprints(data: bytes, *, source: str) -> frozenset[bytes]:
+    normalized = _extract_ca_certificates(data, source=source)
+    return frozenset(
+        hashlib.sha256(_canonical_ca_certificate(block, source=source)[0]).digest()
+        for block in CLAUDE_CERTIFICATE_BLOCK.findall(normalized)
+    )
+
+
+def _ca_fingerprint_pairs(data: bytes, *, source: str) -> dict[str, bytes]:
+    normalized = _extract_ca_certificates(data, source=source)
+    result: dict[str, bytes] = {}
+    for block in CLAUDE_CERTIFICATE_BLOCK.findall(normalized):
+        der, _canonical = _canonical_ca_certificate(block, source=source)
+        result[hashlib.sha1(der, usedforsecurity=False).hexdigest().upper()] = (
+            hashlib.sha256(der).digest()
+        )
+    return result
+
+
+def _inspect_claude_executable_trust(
+    path: pathlib.Path,
+    *,
+    expected_sha256: str | None = None,
+    include_bundled_roots: bool,
+) -> ClaudeExecutableTrustEvidence:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude executable snapshot validation requires O_NOFOLLOW"
+        )
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | nofollow
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            f"cannot open Claude executable snapshot: {error}"
+        ) from error
+    digest = hashlib.sha256()
+    certificates_by_fingerprint: dict[bytes, bytes] = {}
+    begin_marker = b"-----BEGIN CERTIFICATE-----"
+    end_marker = b"-----END CERTIFICATE-----"
+    pending = bytearray()
+    certificate_count = 0
+
+    def consume_pending(*, final: bool) -> None:
+        nonlocal certificate_count
+        while pending:
+            begin = pending.find(begin_marker)
+            if begin < 0:
+                if final:
+                    pending.clear()
+                else:
+                    overlap = min(len(pending), len(begin_marker) - 1)
+                    del pending[: len(pending) - overlap]
+                return
+            if begin:
+                del pending[:begin]
+            nested = pending.find(begin_marker, len(begin_marker))
+            end = pending.find(end_marker, len(begin_marker))
+            if nested >= 0 and (end < 0 or nested < end):
+                del pending[:nested]
+                continue
+            if end < 0:
+                if len(pending) <= CLAUDE_BUNDLED_CERTIFICATE_LIMIT_BYTES:
+                    if final:
+                        pending.clear()
+                    return
+                del pending[: len(begin_marker)]
+                continue
+            block_end = end + len(end_marker)
+            block = bytes(pending[:block_end])
+            del pending[:block_end]
+            if len(block) > CLAUDE_BUNDLED_CERTIFICATE_LIMIT_BYTES:
+                continue
+            try:
+                der, canonical = _canonical_ca_certificate(
+                    block,
+                    source="publisher-verified Claude executable snapshot",
+                )
+            except ReviewError:
+                continue
+            certificate_count += 1
+            if certificate_count > CLAUDE_BUNDLED_ROOT_LIMIT:
+                raise ClaudeExecutableInspectionInconclusive(
+                    "Claude executable bundled root count exceeds the inspection limit"
+                )
+            fingerprint = hashlib.sha256(der).digest()
+            existing = certificates_by_fingerprint.get(fingerprint)
+            if existing is not None and existing != canonical:
+                raise ClaudeExecutableInspectionInconclusive(
+                    "Claude executable bundled roots contain a fingerprint collision"
+                )
+            certificates_by_fingerprint[fingerprint] = canonical
+
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_nlink != 1
+            or before.st_mode & 0o022
+            or before.st_size <= 0
+            or before.st_size > CLAUDE_BINARY_MAX_BYTES
+        ):
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude executable snapshot has unsafe file metadata"
+            )
+        total = 0
+        while chunk := os.read(descriptor, CLAUDE_EXECUTABLE_HASH_CHUNK_BYTES):
+            total += len(chunk)
+            if total > CLAUDE_BINARY_MAX_BYTES:
+                raise ClaudeExecutableInspectionInconclusive(
+                    "Claude executable snapshot exceeds the inspection limit"
+                )
+            digest.update(chunk)
+            if include_bundled_roots:
+                pending.extend(chunk)
+                consume_pending(final=False)
+        if include_bundled_roots:
+            consume_pending(final=True)
+        after = os.fstat(descriptor)
+        path_after = path.lstat()
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            f"cannot inspect Claude executable snapshot: {error}"
+        ) from error
+    finally:
+        os.close(descriptor)
+    if (
+        _ca_source_metadata(before) != _ca_source_metadata(after)
+        or _ca_source_metadata(after) != _ca_source_metadata(path_after)
+        or total != before.st_size
+    ):
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude executable snapshot changed during inspection"
+        )
+    actual_sha256 = digest.hexdigest()
+    if expected_sha256 is not None and not hmac.compare_digest(
+        actual_sha256,
+        expected_sha256,
+    ):
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude executable snapshot no longer matches signed provenance"
+        )
+    fingerprints = frozenset(certificates_by_fingerprint)
+    return ClaudeExecutableTrustEvidence(
+        executable_sha256=actual_sha256,
+        bundled_root_certificates=b"".join(
+            certificates_by_fingerprint[fingerprint]
+            for fingerprint in sorted(fingerprints)
+        ),
+        bundled_root_sha256_fingerprints=fingerprints,
+    )
+
+
+def _require_matching_claude_executable_snapshot(
+    executable: pathlib.Path,
+    expected: ClaudeExecutableTrustEvidence,
+) -> None:
+    current = _inspect_claude_executable_trust(
+        executable,
+        expected_sha256=expected.executable_sha256,
+        include_bundled_roots=_is_claude_macos_host(),
+    )
+    if current != expected:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude executable snapshot trust evidence changed"
+        )
 
 
 def _claude_gpg_temp_root_validator(
@@ -727,13 +1399,15 @@ def _prepare_claude_keychain_broker(
 
 def _read_claude_keychain_credential(
     review: ReviewWorkspace,
+    *,
+    account: str | None = None,
 ) -> bytearray | None:
     client = CLAUDE_KEYCHAIN_CLIENT
     if not client.is_file() or not os.access(client, os.X_OK):
         raise ClaudeKeychainBrokerUnavailable(
             "Claude local-login review requires /usr/bin/security"
         )
-    account = _claude_keychain_account()
+    account = account or _claude_keychain_account()
     security_env = child_environment(container_dir=review.container_dir)
     security_env["USER"] = account
     try:
@@ -773,39 +1447,85 @@ def _validate_fresh_claude_keychain_credential(
     attempt_count: int = 1,
 ) -> None:
     try:
-        payload = json.loads(credential)
+        payload = strict_json_loads(credential)
         oauth = payload["claudeAiOauth"]
         expires_at = oauth["expiresAt"]
+        now = time.time()
         required_expiry = (
-            time.time()
+            now
             + attempt_count
             * (REVIEW_ATTEMPT_TIMEOUT_SECONDS + CLAUDE_AUTH_EXPIRY_MARGIN_SECONDS)
         ) * 1000
-        maximum_expiry = (time.time() + 7 * 24 * 60 * 60) * 1000
+        maximum_expiry = (now + 7 * 24 * 60 * 60) * 1000
         if (
             not isinstance(oauth.get("accessToken"), str)
-            or not oauth["accessToken"]
+            or not oauth["accessToken"].strip()
             or not isinstance(expires_at, (int, float))
             or isinstance(expires_at, bool)
             or (isinstance(expires_at, float) and not math.isfinite(expires_at))
-            or expires_at <= required_expiry
             or expires_at > maximum_expiry
         ):
             raise ClaudeKeychainCredentialUnavailable(
+                "Claude local-login credential is malformed"
+            )
+        if expires_at <= required_expiry:
+            raise ClaudeKeychainCredentialRefreshRequired(
                 "Claude local-login access token cannot cover the isolated review window"
             )
-    except (KeyError, TypeError, ValueError, OverflowError, json.JSONDecodeError) as error:
+    except ClaudeKeychainCredentialUnavailable:
+        raise
+    except (KeyError, TypeError, ValueError, OverflowError, UnicodeError) as error:
         raise ClaudeKeychainCredentialUnavailable(
             "Claude local-login credential is malformed"
         ) from error
 
 
-def _require_fresh_claude_keychain_credential(review: ReviewWorkspace) -> None:
-    credential = _read_claude_keychain_credential(review)
-    if credential is None:
+def _read_stable_claude_keychain_credential(
+    review: ReviewWorkspace,
+    *,
+    env: dict[str, str] | None = None,
+    attempt_count: int = 1,
+) -> bytearray:
+    account = _claude_keychain_account()
+    if env is not None and env.get("USER", account) != account:
         raise ClaudeKeychainCredentialUnavailable(
-            "Claude local-login credential is unavailable"
+            "Claude local-login account binding changed during review"
         )
+    credential = _read_claude_keychain_credential(review, account=account)
+    if credential is None:
+        raise ClaudeKeychainCredentialRefreshRequired(
+            "Claude local-login credential is unavailable and requires refresh"
+        )
+    comparison: bytearray | None = None
+    try:
+        comparison = _read_claude_keychain_credential(review, account=account)
+        if comparison is None or not hmac.compare_digest(credential, comparison):
+            raise ClaudeKeychainCredentialUnavailable(
+                "Claude local-login credential changed during stable validation"
+            )
+        _validate_fresh_claude_keychain_credential(
+            credential,
+            attempt_count=attempt_count,
+        )
+        return credential
+    except BaseException:
+        credential[:] = b"\x00" * len(credential)
+        raise
+    finally:
+        if comparison is not None:
+            comparison[:] = b"\x00" * len(comparison)
+
+
+def _require_fresh_claude_keychain_credential(
+    review: ReviewWorkspace,
+    *,
+    env: dict[str, str] | None = None,
+) -> None:
+    credential = _read_stable_claude_keychain_credential(
+        review,
+        env=env,
+        attempt_count=len(CLAUDE_MODELS),
+    )
     try:
         _validate_fresh_claude_keychain_credential(
             credential,
@@ -930,13 +1650,8 @@ def _claude_keychain_runtime(
     if result.get("ANTHROPIC_API_KEY"):
         yield result
         return
-    credential = _read_claude_keychain_credential(review)
-    if credential is None:
-        raise ClaudeKeychainCredentialUnavailable(
-            "Claude local-login credential is unavailable"
-        )
+    credential = _read_stable_claude_keychain_credential(review, env=result)
     try:
-        _validate_fresh_claude_keychain_credential(credential)
         capability = secrets.token_bytes(CLAUDE_KEYCHAIN_BROKER_CAPABILITY_BYTES)
         with _claude_keychain_credential_server(
             credential,
@@ -954,8 +1669,118 @@ def _extract_ca_certificates(data: bytes, *, source: str) -> bytes:
         raise ReviewError(f"Claude review CA source contains a private key: {source}")
     blocks = CLAUDE_CERTIFICATE_BLOCK.findall(data)
     if not blocks:
-        raise ReviewError(f"Claude review CA source contains no PEM certificate: {source}")
+        raise ReviewError(
+            f"Claude review CA source contains no PEM certificate: {source}"
+        )
     return b"\n".join(block.strip() for block in blocks) + b"\n"
+
+
+def _require_no_extended_acl(descriptor: int, *, label: str) -> None:
+    if not _is_claude_macos_host():
+        return
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        acl_get_fd = libc.acl_get_fd
+        acl_get_fd.argtypes = [ctypes.c_int]
+        acl_get_fd.restype = ctypes.c_void_p
+        acl_get_entry = libc.acl_get_entry
+        acl_get_entry.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        acl_get_entry.restype = ctypes.c_int
+        acl_free = libc.acl_free
+        acl_free.argtypes = [ctypes.c_void_p]
+        acl_free.restype = ctypes.c_int
+    except (AttributeError, OSError) as error:
+        raise ReviewError(f"cannot inspect {label} access controls") from error
+    ctypes.set_errno(0)
+    acl = acl_get_fd(descriptor)
+    if not acl:
+        if ctypes.get_errno() == errno.ENOENT:
+            return
+        raise ReviewError(f"cannot inspect {label} access controls")
+    try:
+        entry = ctypes.c_void_p()
+        ctypes.set_errno(0)
+        entry_status = acl_get_entry(acl, 0, ctypes.byref(entry))
+        entry_errno = ctypes.get_errno()
+        if entry_status == 0:
+            raise ReviewError(f"{label} has an extended access control list")
+        if entry_status != -1 or entry_errno != errno.EINVAL:
+            raise ReviewError(f"cannot inspect {label} access controls")
+    finally:
+        acl_free(acl)
+
+
+def _read_bounded_owner_file(
+    path: pathlib.Path,
+    *,
+    source: str,
+    limit_bytes: int,
+    label: str,
+    allow_empty: bool = False,
+) -> bytes:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise ReviewError(f"{label} requires O_NOFOLLOW support")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | nofollow
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ReviewError(f"cannot open {label}: {source}") from error
+    payload = bytearray()
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_nlink != 1
+            or before.st_mode & 0o077
+        ):
+            raise ReviewError(f"{label} has unsafe file metadata: {source}")
+        _require_no_extended_acl(descriptor, label=label)
+        if before.st_size > limit_bytes:
+            raise ReviewError(f"{label} exceeds the size limit: {source}")
+        while len(payload) <= limit_bytes:
+            chunk = os.read(
+                descriptor,
+                min(64 * 1024, limit_bytes + 1 - len(payload)),
+            )
+            if not chunk:
+                break
+            payload.extend(chunk)
+        after = os.fstat(descriptor)
+        try:
+            path_after = path.lstat()
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"{label} changed while being read: {source}"
+            ) from error
+        if (
+            _ca_source_metadata(before) != _ca_source_metadata(after)
+            or _ca_source_metadata(after) != _ca_source_metadata(path_after)
+            or len(payload) != before.st_size
+        ):
+            raise ClaudeExecutableInspectionInconclusive(
+                f"{label} changed while being read: {source}"
+            )
+        if len(payload) > limit_bytes:
+            raise ReviewError(f"{label} exceeds the size limit: {source}")
+        if not payload and not allow_empty:
+            raise ReviewError(f"{label} is empty: {source}")
+        return bytes(payload)
+    finally:
+        payload[:] = b"\x00" * len(payload)
+        os.close(descriptor)
 
 
 def _ca_source_metadata(metadata: os.stat_result) -> tuple[int, ...]:
@@ -976,15 +1801,26 @@ def _require_safe_ca_source_metadata(
     metadata: os.stat_result,
     *,
     source: str,
+    descriptor: int | None = None,
 ) -> None:
     if not stat.S_ISREG(metadata.st_mode):
         raise ReviewError(f"Claude review CA source is not a regular file: {source}")
     if metadata.st_uid not in {0, os.geteuid()}:
         raise ReviewError(f"Claude review CA source has an unsafe owner: {source}")
+    if metadata.st_nlink != 1:
+        raise ReviewError(f"Claude review CA source has an unsafe link count: {source}")
     if metadata.st_mode & 0o022:
         raise ReviewError(
             f"Claude review CA source is group- or world-writable: {source}"
         )
+    if _is_claude_macos_host() and metadata.st_uid == os.geteuid():
+        if metadata.st_mode & 0o077:
+            raise ReviewError(f"Claude review CA source is not owner-only: {source}")
+        if descriptor is None:
+            raise ReviewError(
+                f"cannot inspect Claude review CA source access controls: {source}"
+            )
+        _require_no_extended_acl(descriptor, label="Claude review CA source")
 
 
 def _require_safe_ca_symlink_metadata(
@@ -993,7 +1829,9 @@ def _require_safe_ca_symlink_metadata(
     source: str,
 ) -> None:
     if not stat.S_ISLNK(metadata.st_mode):
-        raise ReviewError(f"Claude review CA directory entry is not a symlink: {source}")
+        raise ReviewError(
+            f"Claude review CA directory entry is not a symlink: {source}"
+        )
     if metadata.st_uid not in {0, os.geteuid()}:
         raise ReviewError(
             f"Claude review CA directory symlink has an unsafe owner: {source}"
@@ -1042,6 +1880,10 @@ def _open_stable_ca_directory(path: pathlib.Path, *, source: str) -> int:
             f"cannot open a stable Claude review CA directory {source}: {error}"
         ) from error
     if stat.S_ISLNK(path_before.st_mode):
+        if _is_claude_macos_host():
+            raise ReviewError(
+                f"Claude review CA directory must not be a symlink: {source}"
+            )
         _require_safe_ca_symlink_metadata(path_before, source=source)
         try:
             target_before = os.readlink(path)
@@ -1118,10 +1960,9 @@ def _open_stable_ca_directory(path: pathlib.Path, *, source: str) -> int:
         raise ClaudeExecutableInspectionInconclusive(
             f"cannot validate a stable Claude review CA directory {source}: {error}"
         ) from error
-    if (
-        _ca_source_metadata(path_before) != _ca_source_metadata(opened)
-        or _ca_source_metadata(opened) != _ca_source_metadata(path_after)
-    ):
+    if _ca_source_metadata(path_before) != _ca_source_metadata(
+        opened
+    ) or _ca_source_metadata(opened) != _ca_source_metadata(path_after):
         os.close(descriptor)
         raise ClaudeExecutableInspectionInconclusive(
             f"Claude review CA directory changed while being opened: {source}"
@@ -1137,7 +1978,11 @@ def _read_stable_ca_descriptor(
 ) -> tuple[bytes, int, os.stat_result]:
     try:
         before = os.fstat(descriptor)
-        _require_safe_ca_source_metadata(before, source=source)
+        _require_safe_ca_source_metadata(
+            before,
+            source=source,
+            descriptor=descriptor,
+        )
         if before.st_size > CLAUDE_CA_FILE_LIMIT_BYTES:
             raise ReviewError(
                 f"Claude review CA source exceeds the size limit: {source}"
@@ -1204,9 +2049,7 @@ def _read_ca_source_with_size(
         raise ClaudeExecutableInspectionInconclusive(
             f"Claude review CA source changed while being read: {source}"
         ) from error
-    if (
-        _ca_source_metadata(after) != _ca_source_metadata(path_after)
-    ):
+    if _ca_source_metadata(after) != _ca_source_metadata(path_after):
         raise ClaudeExecutableInspectionInconclusive(
             f"Claude review CA source changed while being read: {source}"
         )
@@ -1311,10 +2154,9 @@ def _open_ca_directory_at(
             f"cannot validate a stable Claude review CA path directory {source}: "
             f"{error}"
         ) from error
-    if (
-        _ca_source_metadata(before) != _ca_source_metadata(opened)
-        or _ca_source_metadata(opened) != _ca_source_metadata(after)
-    ):
+    if _ca_source_metadata(before) != _ca_source_metadata(
+        opened
+    ) or _ca_source_metadata(opened) != _ca_source_metadata(after):
         os.close(descriptor)
         raise ClaudeExecutableInspectionInconclusive(
             f"Claude review CA path directory changed while being opened: {source}"
@@ -1355,8 +2197,7 @@ def _revalidate_ca_symlink_path(
             raise
         except OSError as error:
             raise ClaudeExecutableInspectionInconclusive(
-                f"Claude review CA directory symlink changed while being read: "
-                f"{source}"
+                f"Claude review CA directory symlink changed while being read: {source}"
             ) from error
         if (
             _ca_source_metadata(expected) != _ca_source_metadata(before)
@@ -1364,8 +2205,7 @@ def _revalidate_ca_symlink_path(
             or target != expected_target
         ):
             raise ClaudeExecutableInspectionInconclusive(
-                f"Claude review CA directory symlink changed while being read: "
-                f"{source}"
+                f"Claude review CA directory symlink changed while being read: {source}"
             )
     for descriptor, expected in directory_records:
         try:
@@ -1479,9 +2319,7 @@ def _read_ca_path_at_with_size(
                         raw_target,
                     )
                 )
-                absolute, target_components = _ca_symlink_target_components(
-                    raw_target
-                )
+                absolute, target_components = _ca_symlink_target_components(raw_target)
                 if len(target_components) + len(pending_components) > (
                     CLAUDE_CA_PATH_COMPONENT_LIMIT
                 ):
@@ -1624,12 +2462,24 @@ def _write_private_ca_file(path: pathlib.Path, data: bytes) -> None:
     temporary_path = pathlib.Path(temporary)
     try:
         os.fchmod(fd, 0o600)
+        metadata = os.fstat(fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or metadata.st_mode & 0o077
+        ):
+            raise ReviewError("cannot create a private Claude CA file")
+        _require_no_extended_acl(fd, label="Claude generated CA file")
         with os.fdopen(fd, "wb") as handle:
+            fd = -1
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_path, path)
     finally:
+        if fd >= 0:
+            os.close(fd)
         with contextlib.suppress(FileNotFoundError):
             temporary_path.unlink()
 
@@ -1641,7 +2491,558 @@ def _validate_ca_file(path: pathlib.Path) -> None:
         raise ReviewError(f"Claude review CA bundle is invalid: {path.name}") from error
 
 
-def _prepare_claude_tls_environment(
+def _classify_trust_fingerprints(
+    data: bytes,
+    *,
+    domain: str,
+) -> ClaudeTrustFingerprints:
+    label = f"Claude {domain} trust settings"
+    try:
+        payload = plistlib.loads(data, dict_type=_UniquePlistDict)
+    except (
+        _DuplicatePlistKey,
+        plistlib.InvalidFileException,
+        ValueError,
+        TypeError,
+        OverflowError,
+    ) as error:
+        raise ClaudeTrustPolicyUnavailable(f"{label} are invalid") from error
+    if not isinstance(payload, dict):
+        raise ClaudeTrustPolicyUnavailable(f"{label} have an unsupported format")
+    trust_list = payload.get("trustList")
+    if not isinstance(trust_list, dict):
+        raise ClaudeTrustPolicyUnavailable(f"{label} have an invalid trust list")
+
+    # An exact deny remains authoritative even when another entry is malformed.
+    for fingerprint, entry in trust_list.items():
+        if (
+            not isinstance(fingerprint, str)
+            or not CLAUDE_TRUST_FINGERPRINT.fullmatch(fingerprint)
+            or not isinstance(entry, dict)
+        ):
+            continue
+        settings = entry.get("trustSettings")
+        if not isinstance(settings, list):
+            continue
+        if any(
+            isinstance(setting, dict)
+            and type(setting.get(CLAUDE_TRUST_RESULT_KEY)) is int
+            and setting[CLAUDE_TRUST_RESULT_KEY] == CLAUDE_TRUST_RESULT_DENY
+            for setting in settings
+        ):
+            raise ClaudeTrustSettingsDeny(
+                f"{label} contain an explicit deny entry; refusing native Claude review"
+            )
+
+    if type(payload.get("trustVersion")) is not int or payload["trustVersion"] != 1:
+        raise ClaudeTrustPolicyUnavailable(f"{label} have an unsupported format")
+    if len(trust_list) > CLAUDE_TRUST_ENTRY_LIMIT:
+        raise ClaudeTrustPolicyUnavailable(f"{label} exceed the trust entry limit")
+    unconditional: set[str] = set()
+    constrained: set[str] = set()
+    for fingerprint, entry in trust_list.items():
+        if (
+            not isinstance(fingerprint, str)
+            or not CLAUDE_TRUST_FINGERPRINT.fullmatch(fingerprint)
+            or not isinstance(entry, dict)
+        ):
+            raise ClaudeTrustPolicyUnavailable(f"{label} contain an invalid entry")
+        normalized = fingerprint.upper()
+        if "trustSettings" not in entry:
+            unconditional.add(normalized)
+            continue
+        settings = entry["trustSettings"]
+        if not isinstance(settings, list):
+            raise ClaudeTrustPolicyUnavailable(f"{label} contain invalid constraints")
+        if not settings:
+            unconditional.add(normalized)
+            continue
+        constrained.add(normalized)
+        for setting in settings:
+            if not isinstance(setting, dict):
+                raise ClaudeTrustPolicyUnavailable(
+                    f"{label} contain invalid constraints"
+                )
+            if "result" in setting:
+                raise ClaudeTrustPolicyUnavailable(
+                    f"{label} contain ambiguous constraints"
+                )
+            if CLAUDE_TRUST_RESULT_KEY not in setting:
+                continue
+            result = setting[CLAUDE_TRUST_RESULT_KEY]
+            if type(result) is not int or result not in CLAUDE_TRUST_RESULTS:
+                raise ClaudeTrustPolicyUnavailable(
+                    f"{label} contain invalid constraints"
+                )
+    return ClaudeTrustFingerprints(
+        unconditional=tuple(sorted(unconditional)),
+        constrained=tuple(sorted(constrained)),
+    )
+
+
+def _select_trust_certificates(
+    materials: Iterable[tuple[str, bytes | bytearray]],
+    fingerprints: Iterable[str],
+    *,
+    ca_root: pathlib.Path,
+) -> ClaudeSelectedTrustMaterial:
+    requested = tuple(fingerprints)
+    if len(requested) > CLAUDE_ADDITIONAL_TRUST_ROOT_LIMIT:
+        raise ClaudeTrustPolicyUnavailable(
+            "Claude additional trust roots exceed the verification limit"
+        )
+    certificates: dict[str, bytes] = {}
+    for source, data in materials:
+        if not data:
+            continue
+        normalized = _extract_ca_certificates(bytes(data), source=source)
+        for block in CLAUDE_CERTIFICATE_BLOCK.findall(normalized):
+            der, canonical = _canonical_ca_certificate(block, source=source)
+            fingerprint = (
+                hashlib.sha1(
+                    der,
+                    usedforsecurity=False,
+                )
+                .hexdigest()
+                .upper()
+            )
+            existing = certificates.get(fingerprint)
+            if existing is not None and existing != canonical:
+                raise ClaudeTrustPolicyUnavailable(
+                    "Claude trust certificates contain a fingerprint collision"
+                )
+            certificates[fingerprint] = canonical
+    selected: list[bytes] = []
+    omitted: set[str] = set()
+    deadline = time.monotonic() + CLAUDE_TRUST_ROOT_VERIFY_TOTAL_SECONDS
+    for fingerprint in requested:
+        canonical = certificates.get(fingerprint)
+        if canonical is None:
+            omitted.add(fingerprint)
+            continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ReviewTimeoutError(
+                "Claude additional trust root verification exceeded its deadline"
+            )
+        der, _ = _canonical_ca_certificate(
+            canonical,
+            source="Claude trust certificates",
+        )
+        try:
+            _verify_unconditional_trust_root(
+                der,
+                canonical,
+                ca_root=ca_root,
+                timeout_seconds=min(CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS, remaining),
+            )
+        except ClaudeTrustCertificateInvalid:
+            omitted.add(fingerprint)
+            continue
+        selected.append(canonical)
+    return ClaudeSelectedTrustMaterial(
+        certificates=b"".join(selected),
+        omitted_sha1_fingerprints=frozenset(omitted),
+    )
+
+
+def _is_no_trust_settings(detail: str) -> bool:
+    lines = [line.strip() for line in detail.splitlines() if line.strip()]
+    return any(
+        lines in ([message], [f"security: {message}"])
+        for message in CLAUDE_TRUST_NO_SETTINGS
+    )
+
+
+def _is_trust_export_unavailable(detail: str) -> bool:
+    lines = [line.strip() for line in detail.splitlines() if line.strip()]
+    return lines in (
+        [CLAUDE_TRUST_EXPORT_UNAVAILABLE],
+        [f"security: {CLAUDE_TRUST_EXPORT_UNAVAILABLE}"],
+    )
+
+
+def _require_claude_trust_export_tool(
+    review: ReviewWorkspace,
+    ca_root: pathlib.Path,
+) -> tuple[pathlib.Path, dict[str, str]]:
+    client = CLAUDE_KEYCHAIN_CLIENT
+    if not client.is_file() or not os.access(client, os.X_OK):
+        raise ClaudeTrustToolUnavailable(
+            "Claude TLS setup requires Apple's security trust export tool"
+        )
+    security_env = child_environment(container_dir=review.container_dir)
+    security_env.update({"LANG": "C", "LC_ALL": "C"})
+    try:
+        completed = run_bounded_capture(
+            (str(client), "help", "trust-settings-export"),
+            cwd=ca_root,
+            env=security_env,
+            timeout_seconds=CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS,
+            stdout_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
+            stderr_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
+        )
+    except OSError as error:
+        raise ClaudeTrustToolUnavailable(
+            "Claude TLS trust export tooling is unavailable"
+        ) from error
+    try:
+        detail = (bytes(completed.stdout) + b"\n" + bytes(completed.stderr)).decode(
+            "utf-8",
+            errors="replace",
+        )
+    finally:
+        completed.stdout[:] = b"\x00" * len(completed.stdout)
+        completed.stderr[:] = b"\x00" * len(completed.stderr)
+    normalized_lines = tuple(
+        normalized
+        for line in detail.splitlines()
+        if (normalized := " ".join(line.split()))
+    )
+    if (
+        completed.returncode != 0
+        or normalized_lines not in CLAUDE_TRUST_EXPORT_HELP_VARIANTS
+    ):
+        raise ClaudeTrustToolUnavailable(
+            "Claude TLS trust export tooling is unavailable"
+        )
+    return client, security_env
+
+
+def _new_claude_trust_policy_evidence(
+    executable_evidence: ClaudeExecutableTrustEvidence,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "generation": secrets.token_hex(16),
+        "policy": "require-publisher-verified-bundled-root-subset",
+        "status": "checking",
+        "executable_sha256": executable_evidence.executable_sha256,
+        "bundled_root_count": len(executable_evidence.bundled_root_sha256_fingerprints),
+        "bundled_root_set_sha256": executable_evidence.bundled_root_set_sha256,
+        "bundled_root_resolution": "pending",
+        "bundled_root_excluded_count": 0,
+        "domains": [],
+        "distinct_unconditional_count": 0,
+        "distinct_constrained_omitted_count": 0,
+        "additional_unconditional_candidate_count": 0,
+        "additional_root_resolution": "not-started",
+        "additional_unconditional_included_count": 0,
+        "additional_unconditional_omitted_count": 0,
+    }
+
+
+def _write_claude_trust_policy_evidence(
+    review: ReviewWorkspace,
+    evidence: dict[str, object],
+) -> None:
+    write_json(
+        review.container_dir / CLAUDE_TRUST_POLICY_EVIDENCE_NAME,
+        evidence,
+    )
+
+
+def _terminalize_claude_trust_policy_evidence(
+    review: ReviewWorkspace,
+    evidence: dict[str, object],
+    *,
+    status: str,
+    unresolved_resolution: str,
+) -> None:
+    evidence["status"] = status
+    for key in ("bundled_root_resolution", "additional_root_resolution"):
+        if evidence.get(key) in {"not-started", "pending"}:
+            evidence[key] = unresolved_resolution
+    _write_claude_trust_policy_evidence(review, evidence)
+
+
+def _read_claude_trust_certificates(
+    review: ReviewWorkspace,
+    ca_root: pathlib.Path,
+    *,
+    evidence: dict[str, object],
+) -> ClaudeTrustMaterial:
+    try:
+        material = _read_claude_trust_certificates_impl(
+            review,
+            ca_root,
+            evidence=evidence,
+        )
+    except ClaudeTrustSettingsDeny:
+        _terminalize_claude_trust_policy_evidence(
+            review,
+            evidence,
+            status="denied",
+            unresolved_resolution="blocked",
+        )
+        raise
+    except ClaudeTrustPolicyUnavailable:
+        _terminalize_claude_trust_policy_evidence(
+            review,
+            evidence,
+            status="blocked",
+            unresolved_resolution="blocked",
+        )
+        raise
+    except ClaudeTrustToolUnavailable:
+        _terminalize_claude_trust_policy_evidence(
+            review,
+            evidence,
+            status="unavailable",
+            unresolved_resolution="unavailable",
+        )
+        raise
+    except ReviewOutputLimitError as error:
+        _terminalize_claude_trust_policy_evidence(
+            review,
+            evidence,
+            status="blocked",
+            unresolved_resolution="blocked",
+        )
+        raise ClaudeTrustPolicyUnavailable(
+            "Claude trust policy exceeds the inspection limit"
+        ) from error
+    except (
+        ReviewTimeoutError,
+        ReviewOutputDrainError,
+        ReviewProcessLeakError,
+    ):
+        _terminalize_claude_trust_policy_evidence(
+            review,
+            evidence,
+            status="inconclusive",
+            unresolved_resolution="inconclusive",
+        )
+        raise
+    except ReviewError:
+        _terminalize_claude_trust_policy_evidence(
+            review,
+            evidence,
+            status="blocked",
+            unresolved_resolution="blocked",
+        )
+        raise
+    except BaseException:
+        _terminalize_claude_trust_policy_evidence(
+            review,
+            evidence,
+            status="inconclusive",
+            unresolved_resolution="inconclusive",
+        )
+        raise
+    _write_claude_trust_policy_evidence(review, evidence)
+    return material
+
+
+def _read_claude_trust_certificates_impl(
+    review: ReviewWorkspace,
+    ca_root: pathlib.Path,
+    *,
+    evidence: dict[str, object],
+) -> ClaudeTrustMaterial:
+    client, security_env = _require_claude_trust_export_tool(review, ca_root)
+    unconditional: set[str] = set()
+    additional_unconditional: set[str] = set()
+    constrained: set[str] = set()
+    domain_evidence: list[dict[str, object]] = []
+    deferred_error: ReviewError | None = None
+
+    def refresh_counts() -> None:
+        effective = additional_unconditional - constrained
+        evidence.update(
+            {
+                "domains": list(domain_evidence),
+                "distinct_unconditional_count": len(unconditional),
+                "distinct_constrained_omitted_count": len(constrained),
+                "additional_unconditional_candidate_count": len(effective),
+            }
+        )
+
+    def record_domain_failure(domain: str, status: str) -> None:
+        domain_evidence.append(
+            {
+                "domain": domain,
+                "status": status,
+                "unconditional_count": 0,
+                "constrained_omitted_count": 0,
+            }
+        )
+        refresh_counts()
+
+    for domain, options in CLAUDE_TRUST_DOMAINS:
+        trust_path = ca_root / f".{domain}-trust.plist"
+        trust_path.unlink(missing_ok=True)
+        try:
+            try:
+                completed = run_bounded_capture(
+                    (
+                        str(client),
+                        "trust-settings-export",
+                        *options,
+                        str(trust_path),
+                    ),
+                    cwd=ca_root,
+                    env=security_env,
+                    timeout_seconds=CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS,
+                    stdout_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
+                    stderr_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
+                    regular_file_limit_bytes=CLAUDE_TRUST_SETTINGS_LIMIT_BYTES,
+                    regular_file_limit_path=trust_path,
+                )
+            except OSError as error:
+                raise ClaudeTrustToolUnavailable(
+                    "Claude TLS trust export tooling became unavailable"
+                ) from error
+            try:
+                detail = (
+                    (bytes(completed.stdout) + bytes(completed.stderr))
+                    .decode("utf-8", errors="replace")
+                    .strip()
+                )
+                if completed.returncode != 0:
+                    if not trust_path.exists() and _is_no_trust_settings(detail):
+                        domain_evidence.append(
+                            {
+                                "domain": domain,
+                                "status": "no-settings",
+                                "unconditional_count": 0,
+                                "constrained_omitted_count": 0,
+                            }
+                        )
+                        refresh_counts()
+                        continue
+                    if not trust_path.exists() and _is_trust_export_unavailable(detail):
+                        raise ClaudeTrustToolUnavailable(
+                            "Claude TLS trust export tooling is unavailable"
+                        )
+                    raise ClaudeTrustPolicyUnavailable(
+                        f"Claude {domain} trust export failed"
+                    )
+            finally:
+                completed.stdout[:] = b"\x00" * len(completed.stdout)
+                completed.stderr[:] = b"\x00" * len(completed.stderr)
+            trust_data = _read_bounded_owner_file(
+                trust_path,
+                source=domain,
+                limit_bytes=CLAUDE_TRUST_SETTINGS_LIMIT_BYTES,
+                label="Claude trust export",
+            )
+            classified = _classify_trust_fingerprints(trust_data, domain=domain)
+            unconditional.update(classified.unconditional)
+            if domain != "system":
+                additional_unconditional.update(classified.unconditional)
+            constrained.update(classified.constrained)
+            domain_evidence.append(
+                {
+                    "domain": domain,
+                    "status": "exported",
+                    "unconditional_count": len(classified.unconditional),
+                    "constrained_omitted_count": len(classified.constrained),
+                }
+            )
+            refresh_counts()
+        except ClaudeTrustSettingsDeny:
+            domain_evidence.append(
+                {
+                    "domain": domain,
+                    "status": "denied",
+                    "unconditional_count": 0,
+                    "constrained_omitted_count": 0,
+                }
+            )
+            refresh_counts()
+            raise
+        except ClaudeTrustToolUnavailable as error:
+            record_domain_failure(domain, "unavailable")
+            if deferred_error is None:
+                deferred_error = error
+        except (
+            ReviewTimeoutError,
+            ReviewOutputDrainError,
+            ReviewProcessLeakError,
+        ) as error:
+            record_domain_failure(domain, "inconclusive")
+            if deferred_error is None:
+                deferred_error = error
+        except ReviewOutputLimitError:
+            record_domain_failure(domain, "blocked")
+            if deferred_error is None:
+                deferred_error = ClaudeTrustPolicyUnavailable(
+                    f"Claude {domain} trust export exceeds the inspection limit"
+                )
+        except ReviewError as error:
+            record_domain_failure(domain, "blocked")
+            if deferred_error is None:
+                deferred_error = error
+        finally:
+            trust_path.unlink(missing_ok=True)
+
+    if deferred_error is not None:
+        raise deferred_error
+    effective_unconditional = additional_unconditional - constrained
+    evidence["additional_root_resolution"] = (
+        "pending" if effective_unconditional else "not-required"
+    )
+    if not effective_unconditional:
+        return ClaudeTrustMaterial(
+            certificates=b"",
+            excluded_sha1_fingerprints=frozenset(constrained),
+            evidence=evidence,
+        )
+
+    completed_exports: list[tuple[str, Any]] = []
+    try:
+        for source, arguments in CLAUDE_TRUST_CERTIFICATE_SOURCES:
+            try:
+                completed = run_bounded_capture(
+                    (
+                        str(client),
+                        "find-certificate",
+                        "-a",
+                        "-p",
+                        *arguments,
+                    ),
+                    cwd=ca_root,
+                    env=security_env,
+                    timeout_seconds=CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS,
+                    stdout_limit_bytes=CLAUDE_CA_FILE_LIMIT_BYTES,
+                    stderr_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
+                )
+            except OSError as error:
+                raise ClaudeTrustToolUnavailable(
+                    "Claude trust certificate export tooling became unavailable"
+                ) from error
+            completed_exports.append((source, completed))
+            if completed.returncode != 0:
+                raise ClaudeTrustToolUnavailable(
+                    f"Claude {source} certificate export failed"
+                )
+        selected = _select_trust_certificates(
+            ((source, completed.stdout) for source, completed in completed_exports),
+            sorted(effective_unconditional),
+            ca_root=ca_root,
+        )
+        evidence["additional_root_resolution"] = "complete"
+        evidence["additional_unconditional_included_count"] = len(
+            effective_unconditional
+        ) - len(selected.omitted_sha1_fingerprints)
+        evidence["additional_unconditional_omitted_count"] = len(
+            selected.omitted_sha1_fingerprints
+        )
+        return ClaudeTrustMaterial(
+            certificates=selected.certificates,
+            excluded_sha1_fingerprints=frozenset(
+                constrained | selected.omitted_sha1_fingerprints
+            ),
+            evidence=evidence,
+        )
+    finally:
+        for _source, completed in completed_exports:
+            completed.stdout[:] = b"\x00" * len(completed.stdout)
+            completed.stderr[:] = b"\x00" * len(completed.stderr)
+
+
+def _prepare_claude_generic_tls_environment(
     review: ReviewWorkspace,
     env: dict[str, str],
 ) -> dict[str, str]:
@@ -1666,7 +3067,9 @@ def _prepare_claude_tls_environment(
         result[key] = str(destination)
 
     for key in CLAUDE_TLS_DIR_ENV_KEYS:
-        raw_entries = [entry for entry in result.get(key, "").split(os.pathsep) if entry]
+        raw_entries = [
+            entry for entry in result.get(key, "").split(os.pathsep) if entry
+        ]
         if not raw_entries:
             continue
         destination_root = pathlib.Path(
@@ -1705,19 +3108,16 @@ def _prepare_claude_tls_environment(
                         )
                     except OSError as error:
                         raise ClaudeExecutableInspectionInconclusive(
-                            f"cannot inspect Claude review CA directory entry: "
-                            f"{error}"
+                            f"cannot inspect Claude review CA directory entry: {error}"
                         ) from error
                     if stat.S_ISDIR(entry_metadata.st_mode):
                         continue
-                    raw_material, source_size = (
-                        _read_ca_directory_entry_at_with_size(
-                            source_directory,
-                            source_name,
-                            entry_metadata,
-                            source=f"{key}:{source_name}",
-                            extract_certificates=False,
-                        )
+                    raw_material, source_size = _read_ca_directory_entry_at_with_size(
+                        source_directory,
+                        source_name,
+                        entry_metadata,
+                        source=f"{key}:{source_name}",
+                        extract_certificates=False,
                     )
                     total_size += source_size
                     if total_size > CLAUDE_CA_DIR_LIMIT_BYTES:
@@ -1754,6 +3154,378 @@ def _prepare_claude_tls_environment(
             raise ReviewError("Claude review CA directory contains no PEM certificates")
         result[key] = os.pathsep.join(str(path) for path in prepared_dirs)
     return result
+
+
+def _require_private_claude_ca_root(path: pathlib.Path) -> None:
+    path.mkdir(mode=0o700, exist_ok=True)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory_flag is None:
+        raise ReviewError("Claude CA workspace requires descriptor-safe directories")
+    try:
+        before = path.lstat()
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow | directory_flag,
+        )
+    except OSError as error:
+        raise ReviewError("Claude review CA directory is unavailable") from error
+    try:
+        opened = os.fstat(descriptor)
+        after = path.lstat()
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or opened.st_mode & 0o077
+            or _ca_source_metadata(before) != _ca_source_metadata(opened)
+            or _ca_source_metadata(opened) != _ca_source_metadata(after)
+        ):
+            raise ReviewError("Claude review CA directory has unsafe metadata")
+        _require_no_extended_acl(descriptor, label="Claude review CA directory")
+    finally:
+        os.close(descriptor)
+
+
+def _write_private_ca_snapshot(path: pathlib.Path, data: bytes) -> None:
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+    except OSError as error:
+        raise ReviewError("cannot create immutable caller CA snapshot") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or metadata.st_mode & 0o077
+        ):
+            raise ReviewError("caller CA snapshot has unsafe metadata")
+        _require_no_extended_acl(descriptor, label="Claude caller CA snapshot")
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _read_claude_caller_ca_snapshot(path: pathlib.Path) -> bytes:
+    data = _read_bounded_owner_file(
+        path,
+        source="caller CA snapshot",
+        limit_bytes=CLAUDE_CALLER_CA_SNAPSHOT_LIMIT_BYTES,
+        label="Claude caller CA snapshot",
+        allow_empty=True,
+    )
+    return _extract_ca_certificates(data, source="caller CA snapshot") if data else b""
+
+
+def _collect_claude_caller_ca_material(
+    env: dict[str, str],
+) -> list[tuple[str, bytes]]:
+    materials: list[tuple[str, bytes]] = []
+    aggregate_size = 0
+
+    def append_material(source: str, material: bytes, source_size: int) -> None:
+        nonlocal aggregate_size
+        aggregate_size += source_size
+        if aggregate_size > CLAUDE_CALLER_CA_INPUT_LIMIT_BYTES:
+            raise ReviewError("Claude caller CA material exceeds the aggregate limit")
+        materials.append((source, material))
+
+    for key in CLAUDE_TLS_FILE_ENV_KEYS:
+        raw = env.get(key)
+        if not raw:
+            continue
+        source_path = pathlib.Path(raw)
+        if not source_path.is_absolute():
+            raise ReviewError(f"Claude review requires valid absolute {key}")
+        material, source_size = _read_ca_source_with_size(source_path, source=key)
+        append_material(key, material, source_size)
+
+    directory_entry_count = 0
+    for key in CLAUDE_TLS_DIR_ENV_KEYS:
+        raw_entries = [entry for entry in env.get(key, "").split(os.pathsep) if entry]
+        for raw in raw_entries:
+            source_dir = pathlib.Path(raw)
+            if not source_dir.is_absolute():
+                raise ReviewError(
+                    f"Claude review requires valid absolute {key} entries"
+                )
+            descriptor = _open_stable_ca_directory(source_dir, source=key)
+            try:
+                before = os.fstat(descriptor)
+                names = _bounded_ca_directory_names(
+                    descriptor,
+                    CLAUDE_CA_DIR_ENTRY_LIMIT - directory_entry_count,
+                    too_many_message="Claude review CA directory has too many entries",
+                )
+                directory_entry_count += len(names)
+                found_certificate = False
+                for name in names:
+                    metadata = os.stat(
+                        name,
+                        dir_fd=descriptor,
+                        follow_symlinks=False,
+                    )
+                    if stat.S_ISDIR(metadata.st_mode):
+                        continue
+                    if stat.S_ISLNK(metadata.st_mode):
+                        raise ReviewError(
+                            "Claude review CA directory must not contain symlinks"
+                        )
+                    raw_material, source_size = _read_ca_source_at_with_size(
+                        descriptor,
+                        name,
+                        source=f"{key}:{name}",
+                        extract_certificates=False,
+                    )
+                    try:
+                        material = _extract_ca_certificates(
+                            raw_material,
+                            source=f"{key}:{name}",
+                        )
+                    except ReviewError as error:
+                        if "contains no PEM certificate" in str(error):
+                            continue
+                        raise
+                    append_material(f"{key}:{name}", material, source_size)
+                    found_certificate = True
+                after = os.fstat(descriptor)
+                if _ca_source_metadata(before) != _ca_source_metadata(after):
+                    raise ClaudeExecutableInspectionInconclusive(
+                        "Claude review CA directory changed while being read"
+                    )
+                if not found_certificate:
+                    raise ReviewError(
+                        "Claude review CA directory contains no PEM certificates"
+                    )
+            finally:
+                os.close(descriptor)
+    return materials
+
+
+def _caller_ca_snapshot_material(
+    review: ReviewWorkspace,
+    env: dict[str, str],
+    *,
+    trust_state: ClaudeTrustSessionState,
+) -> bytes:
+    snapshot = review.container_dir / "claude-ca" / CLAUDE_CALLER_CA_SNAPSHOT_NAME
+    if snapshot.exists() or snapshot.is_symlink():
+        material = _read_claude_caller_ca_snapshot(snapshot)
+    else:
+        source_materials = _collect_claude_caller_ca_material(env)
+        material = _merge_ca_certificates(
+            source_materials,
+            allow_empty=True,
+            limit_bytes=CLAUDE_CALLER_CA_SNAPSHOT_LIMIT_BYTES,
+            label="Claude caller CA snapshot",
+        )
+        _write_private_ca_snapshot(snapshot, material)
+        if _read_claude_caller_ca_snapshot(snapshot) != material:
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude caller CA snapshot changed during creation"
+            )
+    digest = hashlib.sha256(material).hexdigest()
+    if trust_state.caller_ca_snapshot_sha256 is None:
+        trust_state.caller_ca_snapshot_sha256 = digest
+    elif not hmac.compare_digest(trust_state.caller_ca_snapshot_sha256, digest):
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude caller CA snapshot changed between attempts"
+        )
+    return material
+
+
+def _prepare_claude_macos_tls_environment(
+    review: ReviewWorkspace,
+    env: dict[str, str],
+    *,
+    executable_evidence: ClaudeExecutableTrustEvidence,
+    trust_state: ClaudeTrustSessionState,
+) -> dict[str, str]:
+    evidence = _new_claude_trust_policy_evidence(executable_evidence)
+    _write_claude_trust_policy_evidence(review, evidence)
+    try:
+        ca_root = review.container_dir / "claude-ca"
+        _require_private_claude_ca_root(ca_root)
+        bundled_certificates = executable_evidence.bundled_root_certificates
+        bundled_fingerprints = executable_evidence.bundled_root_sha256_fingerprints
+        actual_bundled_fingerprints = (
+            _ca_sha256_fingerprints(
+                bundled_certificates,
+                source="publisher-verified Claude bundled roots",
+            )
+            if bundled_certificates
+            else frozenset()
+        )
+        if actual_bundled_fingerprints != bundled_fingerprints:
+            raise ClaudeTrustPolicyUnavailable(
+                "Claude bundled root evidence does not match the signed snapshot"
+            )
+        trust_material = _read_claude_trust_certificates(
+            review,
+            ca_root,
+            evidence=evidence,
+        )
+        system_certificates = _read_ca_source(
+            CLAUDE_SYSTEM_CA_FILE,
+            source="system CA bundle",
+        )
+        caller_certificates = _caller_ca_snapshot_material(
+            review,
+            env,
+            trust_state=trust_state,
+        )
+        materials = [("system CA bundle", system_certificates)]
+        if bundled_certificates:
+            materials.append(
+                ("publisher-verified Claude bundled roots", bundled_certificates)
+            )
+        if trust_material.certificates:
+            materials.append(
+                ("unconditional macOS trust roots", trust_material.certificates)
+            )
+        if caller_certificates:
+            materials.append(("caller CA snapshot", caller_certificates))
+        merged = _merge_ca_certificates(
+            materials,
+            excluded_sha1_fingerprints=trust_material.excluded_sha1_fingerprints,
+            limit_bytes=CLAUDE_CA_BUNDLE_LIMIT_BYTES,
+            label="Claude review CA bundle",
+        )
+        merged_fingerprints = _ca_sha256_fingerprints(
+            merged,
+            source="Claude review CA bundle",
+        )
+        bundled_pairs = (
+            _ca_fingerprint_pairs(
+                bundled_certificates,
+                source="publisher-verified Claude bundled roots",
+            )
+            if bundled_certificates
+            else {}
+        )
+        excluded_bundled = {
+            sha256
+            for sha1, sha256 in bundled_pairs.items()
+            if sha1 in trust_material.excluded_sha1_fingerprints
+        }
+        expected_bundled = bundled_fingerprints - excluded_bundled
+        actual_bundled = merged_fingerprints & bundled_fingerprints
+        evidence["bundled_root_excluded_count"] = len(excluded_bundled)
+        if actual_bundled != expected_bundled:
+            raise ClaudeTrustPolicyUnavailable(
+                "Claude merged CA bundle does not preserve the exact permitted "
+                "bundled root set"
+            )
+        if excluded_bundled:
+            raise ClaudeTrustPolicyUnavailable(
+                "Claude bundled certificate store contains a policy-excluded root"
+            )
+        evidence["bundled_root_resolution"] = "complete"
+        bundle = ca_root / CLAUDE_CA_BUNDLE_NAME
+        _write_private_ca_file(bundle, merged)
+        _validate_ca_file(bundle)
+        result = dict(env)
+        for key in CLAUDE_TLS_BYPASS_ENV_KEYS:
+            result.pop(key, None)
+        for key in CLAUDE_TLS_DIR_ENV_KEYS:
+            result.pop(key, None)
+        for key in CLAUDE_TLS_FILE_ENV_KEYS:
+            result[key] = str(bundle)
+        result[CLAUDE_CERT_STORE_ENV] = CLAUDE_CERT_STORE
+        _terminalize_claude_trust_policy_evidence(
+            review,
+            evidence,
+            status="complete",
+            unresolved_resolution="complete",
+        )
+        return result
+    except ClaudeTrustSettingsDeny:
+        _terminalize_claude_trust_policy_evidence(
+            review,
+            evidence,
+            status="denied",
+            unresolved_resolution="blocked",
+        )
+        raise
+    except ClaudeTrustPolicyUnavailable:
+        _terminalize_claude_trust_policy_evidence(
+            review,
+            evidence,
+            status="blocked",
+            unresolved_resolution="blocked",
+        )
+        raise
+    except ClaudeTrustToolUnavailable:
+        _terminalize_claude_trust_policy_evidence(
+            review,
+            evidence,
+            status="unavailable",
+            unresolved_resolution="unavailable",
+        )
+        raise
+    except (
+        ReviewTimeoutError,
+        ReviewOutputDrainError,
+        ReviewOutputLimitError,
+        ReviewProcessLeakError,
+        ClaudeExecutableInspectionInconclusive,
+    ):
+        _terminalize_claude_trust_policy_evidence(
+            review,
+            evidence,
+            status="inconclusive",
+            unresolved_resolution="inconclusive",
+        )
+        raise
+    except ReviewError:
+        _terminalize_claude_trust_policy_evidence(
+            review,
+            evidence,
+            status="blocked",
+            unresolved_resolution="blocked",
+        )
+        raise
+    except BaseException:
+        _terminalize_claude_trust_policy_evidence(
+            review,
+            evidence,
+            status="inconclusive",
+            unresolved_resolution="inconclusive",
+        )
+        raise
+
+
+def _prepare_claude_tls_environment(
+    review: ReviewWorkspace,
+    env: dict[str, str],
+    *,
+    executable_evidence: ClaudeExecutableTrustEvidence | None = None,
+    trust_state: ClaudeTrustSessionState | None = None,
+) -> dict[str, str]:
+    if not _is_claude_macos_host():
+        return _prepare_claude_generic_tls_environment(review, env)
+    if executable_evidence is None:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude macOS TLS preparation requires signed executable root evidence"
+        )
+    return _prepare_claude_macos_tls_environment(
+        review,
+        env,
+        executable_evidence=executable_evidence,
+        trust_state=trust_state or ClaudeTrustSessionState(),
+    )
 
 
 def _read_proxy_headers(sock: socket.socket) -> bytes:
@@ -1825,9 +3597,7 @@ def _parse_upstream_proxy_url(
     except ValueError as error:
         raise ReviewError("Claude review upstream proxy URL is invalid") from error
     if parsed.scheme not in {"http", "https"} or not hostname:
-        raise ReviewError(
-            "Claude review proxy supports only HTTP(S) upstream proxies"
-        )
+        raise ReviewError("Claude review proxy supports only HTTP(S) upstream proxies")
     proxy_port = (
         explicit_port
         if explicit_port is not None
@@ -1939,9 +3709,7 @@ class _ClaudeProxyHandler(socketserver.BaseRequestHandler):
             _tunnel_proxy_sockets(client, upstream)
         except (OSError, ReviewError):
             with contextlib.suppress(OSError):
-                client.sendall(
-                    b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n"
-                )
+                client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
         finally:
             if upstream is not None:
                 upstream.close()
@@ -2179,21 +3947,178 @@ def _warm_claude_local_login(
     env: dict[str, str],
 ) -> None:
     try:
-        _require_fresh_claude_keychain_credential(review)
+        _require_fresh_claude_keychain_credential(review, env=env)
         return
-    except ClaudeKeychainCredentialUnavailable:
+    except ClaudeKeychainCredentialRefreshRequired:
         pass
     warmup = _run_claude_auth_warmup(review, executable, env)
+    category = classify_failure(warmup.stdout, warmup.stderr)
+    output_shape = _claude_auth_warmup_output_shape(warmup.stdout)
+    result_signal_categories = output_shape.get("result_signal_categories")
+    deterministic_auth_shape = (
+        warmup.returncode != 0
+        and output_shape.get("json_shape") == "object"
+        and output_shape.get("event_shape") == "supported-result-error"
+        and output_shape.get("is_error") is True
+        and output_shape.get("unknown_error_field_count") == 0
+        and (
+            output_shape.get("model_usage_shape") == "missing"
+            or (
+                output_shape.get("model_usage_shape") == "object"
+                and output_shape.get("model_usage_entry_count") == 0
+            )
+        )
+        and output_shape.get("api_error_status_shape") in {"missing", "null"}
+        and result_signal_categories == ["auth"]
+    )
+    if category == "auth" and not deterministic_auth_shape:
+        category = "inconclusive"
+    elif category == "other":
+        category = "inconclusive"
+    write_json(
+        review.container_dir / "claude-auth-warmup.json",
+        {
+            "category": category,
+            "output_shape": output_shape,
+            "reason": (
+                "supported-structural-authentication"
+                if deterministic_auth_shape
+                else "warmup-output-unverified"
+            ),
+            "returncode": warmup.returncode,
+            "stderr_bytes": len(warmup.stderr),
+            "stdout_bytes": len(warmup.stdout),
+        },
+    )
     try:
-        _require_fresh_claude_keychain_credential(review)
-    except ClaudeKeychainCredentialUnavailable as error:
-        category = classify_failure(warmup.stdout, warmup.stderr)
-        if category == "auth":
-            raise
+        _require_fresh_claude_keychain_credential(review, env=env)
+    except ClaudeKeychainCredentialRefreshRequired as error:
+        if deterministic_auth_shape:
+            raise ClaudeKeychainCredentialUnavailable(
+                "Claude authentication warmup could not obtain a fresh local "
+                f"credential (returncode={warmup.returncode}, category=auth)"
+            ) from error
         raise ClaudeAuthWarmupInconclusive(
             "Claude authentication warmup did not produce a fresh credential "
-            f"({category})"
+            f"(returncode={warmup.returncode}, category={category})"
         ) from error
+
+
+def _safe_claude_auth_warmup_enum(value: Any, allowed: frozenset[str]) -> str:
+    if value is None:
+        return "missing"
+    if not isinstance(value, str):
+        return "invalid"
+    return value if value in allowed else "other"
+
+
+def _claude_auth_warmup_output_shape(stdout: bytes) -> dict[str, object]:
+    result = _strict_json_object(stdout)
+    if result is None:
+        return {"json_shape": "invalid-or-non-object"}
+    api_error_status = result.get("api_error_status")
+    safe_api_error_status = (
+        api_error_status
+        if type(api_error_status) is int and 100 <= api_error_status <= 599
+        else None
+    )
+    raw_result = result.get("result")
+    normalized_result = (
+        " ".join(raw_result.lower().split()) if isinstance(raw_result, str) else None
+    )
+    model_usage = result.get("modelUsage")
+    model_usage_valid = isinstance(model_usage, dict) and all(
+        isinstance(key, str) and key and isinstance(value, dict)
+        for key, value in model_usage.items()
+    )
+    safe_type = _safe_claude_auth_warmup_enum(
+        result.get("type"),
+        CLAUDE_AUTH_WARMUP_SAFE_TYPES,
+    )
+    safe_subtype = _safe_claude_auth_warmup_enum(
+        result.get("subtype"),
+        CLAUDE_AUTH_WARMUP_SAFE_SUBTYPES,
+    )
+    is_error = result["is_error"] if type(result.get("is_error")) is bool else None
+    known_error_fields = sorted(
+        key for key in CLAUDE_AUTH_WARMUP_ERROR_FIELDS if key in result
+    )
+    unknown_error_field_count = sum(
+        1
+        for key in result
+        if key not in CLAUDE_AUTH_WARMUP_ERROR_FIELDS
+        and key not in {"type", "subtype", "is_error", "result", "modelUsage"}
+        and any(token in key.lower() for token in ("error", "exception", "failure"))
+    )
+    known_error_payloads_empty = all(
+        result[key] is None
+        or (isinstance(result[key], str) and not result[key].strip())
+        or (isinstance(result[key], (list, dict)) and not result[key])
+        for key in known_error_fields
+    )
+    result_shape = (
+        "missing"
+        if "result" not in result
+        else "string"
+        if isinstance(raw_result, str)
+        else "non-string"
+    )
+    supported_result_error = (
+        safe_type == "result"
+        and safe_subtype in {"success", "error_during_execution"}
+        and is_error is True
+        and result_shape == "string"
+        and unknown_error_field_count == 0
+        and known_error_payloads_empty
+    )
+    return {
+        "api_error_status": safe_api_error_status,
+        "api_error_status_present": "api_error_status" in result,
+        "api_error_status_shape": (
+            "missing"
+            if "api_error_status" not in result
+            else "null"
+            if api_error_status is None
+            else "status"
+            if safe_api_error_status is not None
+            else "invalid"
+        ),
+        "event_shape": (
+            "supported-result-error" if supported_result_error else "unsupported"
+        ),
+        "is_error": is_error,
+        "json_shape": "object",
+        "known_error_fields_present": known_error_fields,
+        "model_usage_entry_count": (
+            min(len(model_usage), 256) if model_usage_valid else None
+        ),
+        "model_usage_present": "modelUsage" in result,
+        "model_usage_shape": (
+            "missing"
+            if "modelUsage" not in result
+            else "object"
+            if model_usage_valid
+            else "invalid"
+        ),
+        "result_matches_known_auth_message": (
+            normalized_result in CLAUDE_RESULT_AUTH_MESSAGES
+            if normalized_result is not None
+            else False
+        ),
+        "result_signal_categories": (
+            [
+                category
+                for category, terms in CLAUDE_AUTH_WARMUP_RESULT_SIGNAL_TERMS.items()
+                if any(term in normalized_result for term in terms)
+            ]
+            if normalized_result is not None
+            else []
+        ),
+        "result_shape": result_shape,
+        "subtype": safe_subtype,
+        "type": safe_type,
+        "unknown_error_field_count": min(unknown_error_field_count, 256),
+    }
 
 
 def _review_environment(
@@ -2277,9 +4202,7 @@ def _with_claude_review_tool_path(
         entries.append(broker_dir)
     entries.append(rg.absolute().parent)
     result = dict(env)
-    result["PATH"] = os.pathsep.join(
-        dict.fromkeys(str(entry) for entry in entries)
-    )
+    result["PATH"] = os.pathsep.join(dict.fromkeys(str(entry) for entry in entries))
     return result
 
 
@@ -2395,9 +4318,7 @@ def _claude_linux_ca_bundle(
             entries = _bounded_ca_directory_names(
                 directory_descriptor,
                 remaining_entries,
-                too_many_message=(
-                    "Claude Linux CA directories have too many entries"
-                ),
+                too_many_message=("Claude Linux CA directories have too many entries"),
             )
             entry_count += len(entries)
             for entry in entries:
@@ -2568,9 +4489,11 @@ def _claude_probe_sandbox_profile(
     probe_cwd: pathlib.Path,
 ) -> str:
     dependencies = _native_macho_dependencies(executable, label="Claude Code")
-    host_home = pathlib.Path(
-        os.environ.get("HOME", str(pathlib.Path.home()))
-    ).expanduser().resolve()
+    host_home = (
+        pathlib.Path(os.environ.get("HOME", str(pathlib.Path.home())))
+        .expanduser()
+        .resolve()
+    )
     dependency_roots = {path.parent.resolve() for path in dependencies}
     if any(
         root == pathlib.Path("/") or root == host_home or root in host_home.parents
@@ -2668,12 +4591,12 @@ def _claude_review_sandbox_profile(
             continue
         path = pathlib.Path(raw)
         if not path.is_absolute() or not path.is_file():
-            raise ReviewError(f"Claude Code review sandbox requires valid absolute {key}")
+            raise ReviewError(
+                f"Claude Code review sandbox requires valid absolute {key}"
+            )
         resolved = path.resolve()
         if not is_relative_to(resolved, container):
-            raise ReviewError(
-                f"Claude Code review sandbox requires helper-owned {key}"
-            )
+            raise ReviewError(f"Claude Code review sandbox requires helper-owned {key}")
         tls_files.update((path.absolute(), resolved))
     tls_dirs: set[pathlib.Path] = set()
     for key in CLAUDE_TLS_DIR_ENV_KEYS:
@@ -2721,7 +4644,9 @@ def _claude_review_sandbox_profile(
             broker_dir / "security",
             label="Claude Keychain broker",
         )
-        if any(not is_relative_to(path.resolve(), container) for path in auth_executables):
+        if any(
+            not is_relative_to(path.resolve(), container) for path in auth_executables
+        ):
             raise ReviewError("Claude Keychain broker must be helper-owned")
         try:
             keychain_broker_port = int(env[CLAUDE_KEYCHAIN_BROKER_PORT_ENV])
@@ -2918,7 +4843,10 @@ def _require_claude_safe_mode(
         raise InvalidReviewerExecutable(str(error)) from error
 
 
-def classify_failure(stdout: bytes | str, stderr: bytes | str) -> str:
+def _classify_failure_evidence(
+    stdout: bytes | str,
+    stderr: bytes | str,
+) -> tuple[str, str]:
     def decode(value: bytes | str) -> str:
         return (
             value.decode("utf-8", errors="replace")
@@ -2928,15 +4856,36 @@ def classify_failure(stdout: bytes | str, stderr: bytes | str) -> str:
 
     stdout_bytes = stdout.encode() if isinstance(stdout, str) else stdout
     structured_error = _structured_error_text(stdout_bytes).lower()
-    message = f"{decode(stderr)}\n{structured_error}".lower()
+    stderr_text = decode(stderr).lower()
+    message = f"{stderr_text}\n{structured_error}"
     if any(fragment in message for fragment in TRANSIENT_FAILURE_FRAGMENTS):
-        return "transient"
+        source = (
+            "structured"
+            if any(
+                fragment in structured_error for fragment in TRANSIENT_FAILURE_FRAGMENTS
+            )
+            else "stderr"
+        )
+        return "transient", f"{source}-transient"
     if any(fragment in message for fragment in AUTH_FAILURE_FRAGMENTS):
-        return "auth"
+        source = (
+            "structured"
+            if any(fragment in structured_error for fragment in AUTH_FAILURE_FRAGMENTS)
+            else "stderr"
+        )
+        return "auth", f"{source}-authentication"
     if any(fragment in message for fragment in ENTITLEMENT_FAILURE_FRAGMENTS):
-        return "entitlement"
+        source = (
+            "structured"
+            if any(
+                fragment in structured_error
+                for fragment in ENTITLEMENT_FAILURE_FRAGMENTS
+            )
+            else "stderr"
+        )
+        return "entitlement", f"{source}-entitlement"
     if any(code in structured_error for code in STRUCTURED_ENTITLEMENT_CODES):
-        return "entitlement"
+        return "entitlement", "structured-entitlement-code"
     if (
         any(code in structured_error for code in STRUCTURED_AMBIGUOUS_MODEL_CODES)
         and "model" in structured_error
@@ -2953,8 +4902,71 @@ def classify_failure(stdout: bytes | str, stderr: bytes | str) -> str:
             )
         )
     ):
-        return "entitlement"
-    return "other"
+        return "entitlement", "structured-entitlement-context"
+    return "other", "unclassified-failure"
+
+
+def classify_failure(stdout: bytes | str, stderr: bytes | str) -> str:
+    category, _reason = _classify_failure_evidence(stdout, stderr)
+    return category
+
+
+def _claude_nonzero_failure_reason(stdout: bytes) -> str:
+    if not stdout:
+        return "nonzero-without-structured-diagnostic"
+    result = _strict_json_object(stdout)
+    if result is None:
+        return "nonzero-invalid-strict-json"
+    if result.get("type") != "result":
+        return "nonzero-unsupported-event-type"
+    subtype = result.get("subtype")
+    if subtype not in CLAUDE_AUTH_WARMUP_SAFE_SUBTYPES:
+        return "nonzero-unsupported-result-subtype"
+    if type(result.get("is_error")) is not bool:
+        return "nonzero-invalid-result-error-flag"
+    _effective_model, model_evidence_consistent = _claude_model_usage_evidence(
+        result,
+        requested_model=None,
+    )
+    if not model_evidence_consistent:
+        return "nonzero-malformed-model-usage"
+    if result["is_error"] is False and subtype == "success":
+        return "nonzero-success-envelope"
+    if result["is_error"] is True:
+        return "nonzero-unclassified-result-error"
+    return "nonzero-contradictory-result-envelope"
+
+
+def _claude_supported_failure_category(
+    stdout: bytes,
+    *,
+    requested_model: str,
+) -> str | None:
+    result = _strict_json_object(stdout)
+    if (
+        result is None
+        or result.get("type") != "result"
+        or result.get("subtype") not in CLAUDE_AUTH_WARMUP_SAFE_SUBTYPES
+        or result.get("is_error") is not True
+    ):
+        return None
+    if any(
+        key not in CLAUDE_AUTH_WARMUP_ERROR_FIELDS
+        and key not in {"type", "subtype", "is_error", "result", "modelUsage"}
+        and any(token in key.lower() for token in ("error", "exception", "failure"))
+        for key in result
+    ):
+        return None
+    effective_model, model_usage_valid = _claude_model_usage_evidence(
+        result,
+        requested_model=requested_model,
+    )
+    if not model_usage_valid:
+        return None
+    category, _reason = _classify_failure_evidence(stdout, b"")
+    if category == "entitlement" and effective_model is None:
+        return None
+    return category if category in {"auth", "entitlement"} else None
 
 
 def _normalize_model(value: str) -> str:
@@ -2968,45 +4980,39 @@ def _model_matches(requested: str, effective: str) -> bool:
 
 
 def _json_objects(stdout: bytes) -> list[dict[str, Any]]:
-    text = stdout.decode("utf-8", errors="replace").strip()
+    try:
+        text = stdout.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return []
     if not text:
         return []
-    values: list[dict[str, Any]] = []
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        parsed = None
-    if isinstance(parsed, dict):
-        values.append(parsed)
-        return values
-    for line in text.split("\n"):
+
+    def parse_object(value: str) -> dict[str, Any] | None:
         try:
-            parsed_line = json.loads(line)
-        except json.JSONDecodeError:
+            parsed = strict_json_loads(value)
+        except (UnicodeError, ValueError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    parsed = parse_object(text)
+    if parsed is not None:
+        return [parsed]
+
+    values: list[dict[str, Any]] = []
+    for line in text.split("\n"):
+        if not line.strip():
             continue
-        if isinstance(parsed_line, dict):
-            values.append(parsed_line)
+        parsed_line = parse_object(line)
+        if parsed_line is None:
+            return []
+        values.append(parsed_line)
     return values
-
-
-def _strict_json_object_from_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate JSON object key: {key}")
-        result[key] = value
-    return result
 
 
 def _strict_json_object(stdout: bytes) -> dict[str, Any] | None:
     try:
-        text = stdout.decode("utf-8")
-        parsed = json.loads(
-            text,
-            parse_constant=_reject_nonstandard_json_constant,
-            object_pairs_hook=_strict_json_object_from_pairs,
-        )
-    except (UnicodeDecodeError, ValueError):
+        parsed = strict_json_loads(stdout)
+    except (UnicodeError, ValueError):
         return None
     return parsed if isinstance(parsed, dict) else None
 
@@ -3021,21 +5027,13 @@ def _strict_jsonl_objects(stdout: bytes) -> list[dict[str, Any]] | None:
         if not line.strip(" \t\r"):
             continue
         try:
-            parsed = json.loads(
-                line,
-                parse_constant=_reject_nonstandard_json_constant,
-                object_pairs_hook=_strict_json_object_from_pairs,
-            )
-        except ValueError:
+            parsed = strict_json_loads(line)
+        except (UnicodeError, ValueError):
             return None
         if not isinstance(parsed, dict):
             return None
         objects.append(parsed)
     return objects
-
-
-def _reject_nonstandard_json_constant(value: str) -> None:
-    raise ValueError(f"non-standard JSON constant: {value}")
 
 
 def _error_payload_text(value: Any) -> list[str]:
@@ -3085,12 +5083,27 @@ def _structured_error_item_text(item: dict[str, Any]) -> str:
     if not explicit_error:
         return ""
     messages.append(f"event {' '.join(tokens) or 'explicit error'}")
+    payload_found = False
     for key in ("error", "errors", "message", "reason", "detail", "code"):
         if key in item:
-            messages.extend(_error_payload_text(item[key]))
+            payload_messages = _error_payload_text(item[key])
+            if payload_messages:
+                payload_found = True
+                messages.extend(payload_messages)
     api_error_status = item.get("api_error_status")
-    if isinstance(api_error_status, (int, str)):
+    if (
+        isinstance(api_error_status, int) and not isinstance(api_error_status, bool)
+    ) or (isinstance(api_error_status, str) and api_error_status.strip()):
+        payload_found = True
         messages.append(f"status {api_error_status}")
+    if (
+        not payload_found
+        and item.get("type") == "result"
+        and isinstance(item.get("result"), str)
+    ):
+        normalized_result = " ".join(item["result"].lower().split())
+        if normalized_result in CLAUDE_RESULT_AUTH_MESSAGES:
+            messages.append("not logged in")
     return "\n".join(messages)
 
 
@@ -3102,39 +5115,49 @@ def _structured_error_text(stdout: bytes) -> str:
     )
 
 
-def _parse_claude_output(
-    stdout: bytes, *, requested_model: str | None = None
-) -> tuple[str | None, str | None]:
-    result = _strict_json_object(stdout)
-    if result is None:
-        return None, None
-    if result.get("type") != "result":
-        return None, None
-    model_usage = result.get("modelUsage")
-    if not isinstance(model_usage, dict) or not model_usage:
-        return None, None
-    if any(
-        not isinstance(key, str)
-        or not key
-        or not isinstance(value, dict)
+def _claude_model_usage_evidence(
+    result: dict[str, Any],
+    *,
+    requested_model: str | None,
+) -> tuple[str | None, bool]:
+    if "modelUsage" not in result:
+        return None, True
+    model_usage = result["modelUsage"]
+    if not isinstance(model_usage, dict) or not all(
+        isinstance(key, str) and key and isinstance(value, dict)
         for key, value in model_usage.items()
     ):
-        return None, None
+        return None, False
     candidates = list(model_usage)
-    effective_model = None
     if requested_model is not None:
-        effective_model = next(
-            (
-                candidate
-                for candidate in candidates
-                if _model_matches(requested_model, candidate)
+        return (
+            next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if _model_matches(requested_model, candidate)
+                ),
+                None,
             ),
-            None,
+            True,
         )
-    if effective_model is None and candidates:
-        effective_model = candidates[-1]
+    return (candidates[-1] if candidates else None), True
+
+
+def _parse_claude_output_evidence(
+    stdout: bytes, *, requested_model: str | None = None
+) -> tuple[str | None, str | None, bool]:
+    result = _strict_json_object(stdout)
+    if result is None:
+        return None, None, True
+    if result.get("type") != "result":
+        return None, None, True
+    effective_model, model_evidence_consistent = _claude_model_usage_evidence(
+        result,
+        requested_model=requested_model,
+    )
     if result.get("subtype") != "success" or result.get("is_error") is not False:
-        return None, effective_model
+        return None, effective_model, model_evidence_consistent
     for key in ("error", "errors"):
         if key not in result:
             continue
@@ -3145,18 +5168,29 @@ def _parse_claude_output(
             or (isinstance(value, (list, dict)) and not value)
         )
         if not explicitly_empty:
-            return None, effective_model
+            return None, effective_model, model_evidence_consistent
     if "api_error_status" in result:
         value = result["api_error_status"]
-        if value is not None and not (
-            isinstance(value, str) and not value.strip()
-        ):
-            return None, effective_model
+        if value is not None and not (isinstance(value, str) and not value.strip()):
+            return None, effective_model, model_evidence_consistent
     final_text = result.get("result")
-    if not isinstance(final_text, str) or not final_text.strip() or not candidates:
-        return None, effective_model
+    if (
+        not isinstance(final_text, str)
+        or not final_text.strip()
+        or effective_model is None
+    ):
+        return None, effective_model, model_evidence_consistent
     if _structured_error_text(stdout).strip():
-        return None, effective_model
+        return None, effective_model, model_evidence_consistent
+    return final_text, effective_model, model_evidence_consistent
+
+
+def _parse_claude_output(
+    stdout: bytes, *, requested_model: str | None = None
+) -> tuple[str | None, str | None]:
+    final_text, effective_model, _model_evidence_consistent = (
+        _parse_claude_output_evidence(stdout, requested_model=requested_model)
+    )
     return final_text, effective_model
 
 
@@ -3287,9 +5321,7 @@ def _parse_copilot_objects(
         turn = open_turn if open_turn is not None else completed_turn[1]
         message = turn["message"]
         message_model = message.get("model") if isinstance(message, dict) else None
-        effective_model = (
-            turn["usage_model"] or message_model or turn["session_model"]
-        )
+        effective_model = turn["usage_model"] or message_model or turn["session_model"]
         if not isinstance(effective_model, str) or not effective_model:
             return None, None
         return None, effective_model
@@ -3335,15 +5367,13 @@ def _strict_jsonl_file_objects(path: pathlib.Path) -> Iterable[dict[str, Any]]:
         while raw_line := handle.readline(COPILOT_JSONL_RECORD_LIMIT_BYTES + 2):
             line = raw_line[:-1] if raw_line.endswith(b"\n") else raw_line
             if len(line) > COPILOT_JSONL_RECORD_LIMIT_BYTES:
-                raise ValueError("Copilot JSONL record exceeds the bounded parser limit")
+                raise ValueError(
+                    "Copilot JSONL record exceeds the bounded parser limit"
+                )
             if not line.strip(b" \t\r"):
                 continue
             text = line.decode("utf-8")
-            parsed = json.loads(
-                text,
-                parse_constant=_reject_nonstandard_json_constant,
-                object_pairs_hook=_strict_json_object_from_pairs,
-            )
+            parsed = strict_json_loads(text)
             if not isinstance(parsed, dict):
                 raise ValueError("Copilot JSONL record is not an object")
             yield parsed
@@ -3404,8 +5434,8 @@ def _codex_session_metadata(
             with candidate.open("r", encoding="utf-8") as handle:
                 for line in handle:
                     try:
-                        item = json.loads(line)
-                    except json.JSONDecodeError:
+                        item = strict_json_loads(line)
+                    except (UnicodeError, ValueError):
                         continue
                     if not isinstance(item, dict) or item.get("type") != "turn_context":
                         continue
@@ -3485,17 +5515,16 @@ def _codex_permissions_match(
         access = entry["access"]
         if path_type == "special":
             value = path_value.get("value")
-            if (
-                minimal_seen
-                or access != "read"
-                or value != {"kind": "minimal"}
-            ):
+            if minimal_seen or access != "read" or value != {"kind": "minimal"}:
                 return False
             minimal_seen = True
             continue
         if path_type == "glob_pattern":
             pattern = path_value.get("pattern")
-            if not isinstance(pattern, str) or remaining_globs.pop(pattern, None) != access:
+            if (
+                not isinstance(pattern, str)
+                or remaining_globs.pop(pattern, None) != access
+            ):
                 return False
             continue
         if path_type != "path":
@@ -3550,17 +5579,39 @@ def _record_attempt(
     effective_effort: str | None,
     require_verified_model: bool = False,
     require_verified_effort: bool = False,
+    model_evidence_consistent: bool = True,
 ) -> Attempt:
     stdout_path, stderr_path = _attempt_paths(review, index, runtime, model)
     if not stdout_path.exists():
         stdout_path.write_bytes(completed.stdout)
     if not stderr_path.exists():
         stderr_path.write_bytes(completed.stderr)
-    category = (
-        "success"
-        if completed.returncode == 0 and final_text
-        else classify_failure(completed.stdout, completed.stderr)
-    )
+    if completed.returncode == 0 and final_text:
+        category = "success"
+        reason = None
+    else:
+        category, reason = _classify_failure_evidence(
+            completed.stdout,
+            completed.stderr,
+        )
+        if runtime == "claude" and completed.returncode != 0:
+            if category in {"auth", "entitlement"} and (
+                _claude_supported_failure_category(
+                    completed.stdout,
+                    requested_model=model,
+                )
+                != category
+            ):
+                reason = f"unverified-{category}-failure-envelope"
+                category = "inconclusive"
+            elif category == "other":
+                category = "inconclusive"
+                reason = _claude_nonzero_failure_reason(completed.stdout)
+            if category == "inconclusive":
+                _append_attempt_diagnostic(
+                    stderr_path,
+                    f"Claude structured failure was inconclusive: {reason}",
+                )
     attempt = Attempt(
         runtime=runtime,
         requested_model=model,
@@ -3572,7 +5623,49 @@ def _record_attempt(
         final_text=final_text,
         stdout_path=str(stdout_path),
         stderr_path=str(stderr_path),
+        reason=reason,
     )
+    if runtime == "claude" and not model_evidence_consistent:
+        detail = (
+            "Claude result exposed malformed modelUsage metadata; refusing to "
+            "classify authentication, entitlement, or final output"
+        )
+        _append_attempt_diagnostic(stderr_path, detail)
+        return replace(
+            attempt,
+            returncode=65,
+            category="runtime-unverified",
+            final_text=None,
+            reason="malformed-model-usage",
+        )
+    if runtime == "claude" and completed.returncode == 0 and final_text is None:
+        result = _strict_json_object(completed.stdout)
+        if result is None or result.get("type") != "result":
+            _append_attempt_diagnostic(
+                stderr_path,
+                "Claude successful process did not emit a supported strict result "
+                "envelope",
+            )
+            return replace(
+                attempt,
+                returncode=65,
+                category="runtime-unverified",
+                final_text=None,
+                reason="invalid-result-envelope",
+            )
+        if result.get("subtype") == "success" and result.get("is_error") is False:
+            detail = (
+                "Claude success result lacked verified requested-model evidence; "
+                "refusing to accept final output"
+            )
+            _append_attempt_diagnostic(stderr_path, detail)
+            return replace(
+                attempt,
+                returncode=65,
+                category="runtime-unverified",
+                final_text=None,
+                reason="missing-requested-model-usage",
+            )
     if attempt.category in {"success", "entitlement"} and (
         (require_verified_model and effective_model is None)
         or (require_verified_effort and effective_effort is None)
@@ -3587,6 +5680,7 @@ def _record_attempt(
             returncode=65,
             category="runtime-unverified",
             final_text=None,
+            reason="missing-runtime-verification-metadata",
         )
     if effective_model and not _model_matches(model, effective_model):
         mismatch = (
@@ -3599,6 +5693,7 @@ def _record_attempt(
             returncode=65,
             category="model-mismatch",
             final_text=None,
+            reason="effective-model-mismatch",
         )
     if effective_effort and effective_effort.lower() != requested_effort.lower():
         mismatch = (
@@ -3611,6 +5706,7 @@ def _record_attempt(
             returncode=65,
             category="effort-mismatch",
             final_text=None,
+            reason="effective-effort-mismatch",
         )
     return attempt
 
@@ -3742,7 +5838,11 @@ def _resolve_validated_claude_executable(
     *,
     review: ReviewWorkspace,
     env: dict[str, str],
-) -> tuple[pathlib.Path | None, dict[str, str]]:
+) -> tuple[
+    pathlib.Path | None,
+    dict[str, str],
+    ClaudeExecutableTrustEvidence | None,
+]:
     linux_host = _claude_linux_host() if _is_claude_linux_host() else None
     if linux_host is not None:
         try:
@@ -3771,9 +5871,7 @@ def _resolve_validated_claude_executable(
         private=True,
     )
     gpg_temp_root_validator = (
-        _claude_gpg_temp_root_validator(linux_host)
-        if linux_host is not None
-        else None
+        _claude_gpg_temp_root_validator(linux_host) if linux_host is not None else None
     )
     prepared_env.pop("XDG_CONFIG_HOME", None)
     probe_home = review.container_dir / "claude-probe-home"
@@ -3781,6 +5879,7 @@ def _resolve_validated_claude_executable(
     probe_home.chmod(0o700)
     runtime_reports: dict[str, dict[str, object]] = {}
     runtime_executables: dict[str, pathlib.Path] = {}
+    runtime_evidence: dict[str, ClaudeExecutableTrustEvidence] = {}
 
     def validate_candidate(candidate: pathlib.Path) -> None:
         if linux_host is not None:
@@ -3817,9 +5916,7 @@ def _resolve_validated_claude_executable(
             platform_key=platform_key,
             gpg_temp_root=gpg_temp_root,
             gpg_temp_root_validator=gpg_temp_root_validator,
-            cache_dir=(
-                review.container_dir / "claude-runtime" / "provenance-cache"
-            ),
+            cache_dir=(review.container_dir / "claude-runtime" / "provenance-cache"),
             snapshot_dir=(
                 review.container_dir / "claude-runtime" / "verified-executables"
             ),
@@ -3829,12 +5926,22 @@ def _resolve_validated_claude_executable(
             if isinstance(verified, VerifiedClaudeExecutable)
             else candidate
         )
+        executable_evidence = _inspect_claude_executable_trust(
+            verified_executable,
+            expected_sha256=(
+                verified.artifact.checksum
+                if isinstance(verified, VerifiedClaudeExecutable)
+                else None
+            ),
+            include_bundled_roots=_is_claude_macos_host(),
+        )
         candidate_env = _claude_preflight_probe_environment(
             home=probe_home,
             tmp=claude_tmp,
         )
         _require_claude_safe_mode(verified_executable, candidate_env)
         runtime_executables[str(candidate.absolute())] = verified_executable
+        runtime_evidence[str(candidate.absolute())] = executable_evidence
         if isinstance(verified, VerifiedClaudeExecutable):
             runtime_reports[str(candidate.absolute())] = {
                 "schema": 1,
@@ -3848,6 +5955,11 @@ def _resolve_validated_claude_executable(
                 "manifest_url": verified.manifest_url,
                 "signature_url": verified.signature_url,
                 "sha256": verified.artifact.checksum,
+                "bundled_roots": {
+                    "count": len(executable_evidence.bundled_root_sha256_fingerprints),
+                    "set_sha256": executable_evidence.bundled_root_set_sha256,
+                    "source": "publisher-verified-executable-snapshot",
+                },
                 "gpg_verifier": str(verified.gpg_path),
                 "gpg_verifier_trust": "fixed-path-native-host-tool",
                 "capabilities": {
@@ -3856,9 +5968,7 @@ def _resolve_validated_claude_executable(
                 },
                 "outer_sandbox": {
                     "implementation": (
-                        "bubblewrap"
-                        if _is_claude_linux_host()
-                        else "sandbox-exec"
+                        "bubblewrap" if _is_claude_linux_host() else "sandbox-exec"
                     ),
                     "status": "pending-runtime-launch",
                 },
@@ -3883,7 +5993,7 @@ def _resolve_validated_claude_executable(
     except RejectedReviewerCandidates as error:
         raise ClaudeExecutableUnavailable(str(error)) from error
     if executable is None:
-        return None, prepared_env
+        return None, prepared_env, None
     report = runtime_reports.get(str(executable.absolute()))
     if report is not None:
         write_json(review.container_dir / "claude-runtime.json", report)
@@ -3891,9 +6001,18 @@ def _resolve_validated_claude_executable(
         str(executable.absolute()),
         executable,
     )
-    return runtime_executable, _with_executable_path(
-        prepared_env,
+    evidence = runtime_evidence.get(str(executable.absolute()))
+    if evidence is None:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude executable snapshot evidence is unavailable"
+        )
+    return (
         runtime_executable,
+        _with_executable_path(
+            prepared_env,
+            runtime_executable,
+        ),
+        evidence,
     )
 
 
@@ -3945,9 +6064,7 @@ def _claude_linux_review_runtime(
         else:
             source = _claude_linux_credential_source()
             try:
-                staged = stack.enter_context(
-                    stage_claude_credentials(source, root)
-                )
+                staged = stack.enter_context(stage_claude_credentials(source, root))
             except LinuxCredentialUnavailable as error:
                 raise ClaudeKeychainCredentialUnavailable(str(error)) from error
             except LinuxCredentialUnsafe as error:
@@ -3955,9 +6072,7 @@ def _claude_linux_review_runtime(
                     f"Claude Linux local-login credential is unsafe: {error}"
                 ) from error
             config_dir = staged.config_dir
-        proxy_socket = stack.enter_context(
-            _claude_unix_connect_proxy(review, env)
-        )
+        proxy_socket = stack.enter_context(_claude_unix_connect_proxy(review, env))
         spec = SandboxSpec(
             host=host,
             toolchain=toolchain,
@@ -4008,13 +6123,9 @@ def _claude_review_arguments(
     settings: str,
     linux: bool,
 ) -> tuple[str, ...]:
-    permission_mode = (
-        CLAUDE_LINUX_REVIEW_PERMISSION_MODE if linux else "default"
-    )
+    permission_mode = CLAUDE_LINUX_REVIEW_PERMISSION_MODE if linux else "default"
     visible_tools = CLAUDE_LINUX_REVIEW_VISIBLE_TOOLS if linux else "Read,Grep,Glob"
-    allowed_tools = (
-        CLAUDE_LINUX_REVIEW_ALLOWED_TOOLS if linux else "Read(./**)"
-    )
+    allowed_tools = CLAUDE_LINUX_REVIEW_ALLOWED_TOOLS if linux else "Read(./**)"
     disallowed_tools = (
         CLAUDE_LINUX_REVIEW_DISALLOWED_TOOLS
         if linux
@@ -4101,9 +6212,7 @@ def _replace_claude_prompt_host_path(
         if not right_ok and allow_descendants and prompt[end : end + 1] == b"/":
             preceding = prompt[occurrence - 1] if occurrence else None
             quote = (
-                bytes((preceding,))
-                if preceding in CLAUDE_PROMPT_PATH_QUOTES
-                else b""
+                bytes((preceding,)) if preceding in CLAUDE_PROMPT_PATH_QUOTES else b""
             )
             if quote:
                 token_end = prompt.find(quote, end)
@@ -4118,8 +6227,7 @@ def _replace_claude_prompt_host_path(
                         break
                     if current == ord(".") and (
                         token_end + 1 == len(prompt)
-                        or prompt[token_end + 1]
-                        in CLAUDE_PROMPT_PATH_RIGHT_BOUNDARIES
+                        or prompt[token_end + 1] in CLAUDE_PROMPT_PATH_RIGHT_BOUNDARIES
                     ):
                         break
                     token_end += 1
@@ -4155,9 +6263,7 @@ def _claude_review_prompt(
     workspace = str(review.workspace_root).encode("utf-8")
     diff_file = str(review.diff_file).encode("utf-8")
     target_workspace = b"/workspace" if linux else workspace
-    target_diff = (
-        b"/workspace/.codex-review/review.diff" if linux else diff_file
-    )
+    target_diff = b"/workspace/.codex-review/review.diff" if linux else diff_file
     projected = prompt.replace(
         b"- Workspace: .\n",
         b"- Workspace: " + target_workspace + b"\n",
@@ -4195,16 +6301,25 @@ def _claude_attempt(
     index: int,
     env: dict[str, str],
     executable: pathlib.Path | None = None,
+    executable_evidence: ClaudeExecutableTrustEvidence | None = None,
+    trust_state: ClaudeTrustSessionState | None = None,
 ) -> Attempt:
     if executable is None:
-        executable, env = _resolve_validated_claude_executable(
+        executable, env, executable_evidence = _resolve_validated_claude_executable(
             review=review,
             env=env,
+        )
+    elif executable_evidence is None:
+        raise ClaudeExecutableInspectionInconclusive(
+            "validated Claude executable snapshot evidence is unavailable"
         )
     if executable is None:
         raise FileNotFoundError(
             "claude is not available in a validated executable path"
         )
+    assert executable_evidence is not None
+    trust_state = trust_state or ClaudeTrustSessionState()
+    _require_matching_claude_executable_snapshot(executable, executable_evidence)
     linux_host = _is_claude_linux_host()
     prompt = _claude_review_prompt(
         review,
@@ -4213,8 +6328,6 @@ def _claude_attempt(
     )
     if linux_host:
         _require_claude_linux_prompt_without_file_mentions(prompt)
-    env = _with_claude_review_tool_path(review, env)
-    env = _prepare_claude_tls_environment(review, env)
     stdout_path, stderr_path = _attempt_paths(review, index, "claude", model)
     settings = _claude_review_settings(linux=linux_host)
     arguments = _claude_review_arguments(
@@ -4222,60 +6335,111 @@ def _claude_attempt(
         settings=settings,
         linux=linux_host,
     )
-    if linux_host:
-        with _claude_linux_review_runtime(
-            review,
+    completed: Completed | None = None
+    for credential_round in range(2):
+        _require_matching_claude_executable_snapshot(
             executable,
-            env,
-            arguments,
-        ) as sandbox_command:
-            completed = run(
-                sandbox_command.argv,
-                cwd=review.workspace_root,
-                env=sandbox_command.env,
-                stdin=prompt,
-                stdout_path=stdout_path,
-                stderr_path=stderr_path,
-                timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
-                output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
-            )
-    else:
-        with contextlib.ExitStack() as stack:
-            env = stack.enter_context(_claude_keychain_runtime(review, env))
-            proxy_port = stack.enter_context(_claude_connect_proxy(env))
-            review_env = _with_claude_proxy_environment(env, proxy_port)
-            sandbox_profile = _claude_review_sandbox_profile(
+            executable_evidence,
+        )
+        attempt_env = _with_claude_review_tool_path(review, env)
+        attempt_env = _prepare_claude_tls_environment(
+            review,
+            attempt_env,
+            executable_evidence=executable_evidence,
+            trust_state=trust_state,
+        )
+        _require_matching_claude_executable_snapshot(
+            executable,
+            executable_evidence,
+        )
+        if linux_host:
+            with _claude_linux_review_runtime(
+                review,
                 executable,
+                attempt_env,
+                arguments,
+            ) as sandbox_command:
+                _require_matching_claude_executable_snapshot(
+                    executable,
+                    executable_evidence,
+                )
+                completed = run(
+                    sandbox_command.argv,
+                    cwd=review.workspace_root,
+                    env=sandbox_command.env,
+                    stdin=prompt,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                    timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
+                    output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
+                )
+            break
+        try:
+            with contextlib.ExitStack() as stack:
+                runtime_env = stack.enter_context(
+                    _claude_keychain_runtime(review, attempt_env)
+                )
+                proxy_port = stack.enter_context(_claude_connect_proxy(runtime_env))
+                review_env = _with_claude_proxy_environment(runtime_env, proxy_port)
+                sandbox_profile = _claude_review_sandbox_profile(
+                    executable,
+                    review,
+                    review_env,
+                    proxy_port=proxy_port,
+                )
+                _require_matching_claude_executable_snapshot(
+                    executable,
+                    executable_evidence,
+                )
+                _update_claude_runtime_report(
+                    review,
+                    {
+                        "phase": "runtime-launching",
+                        "outer_sandbox": {"status": "profile-generated"},
+                        "authentication": {"status": "sandbox-auth-staged"},
+                    },
+                )
+                completed = run(
+                    (
+                        str(CLAUDE_PROBE_SANDBOX),
+                        "-p",
+                        sandbox_profile,
+                        str(executable),
+                        *arguments,
+                    ),
+                    cwd=review.workspace_root,
+                    env=review_env,
+                    stdin=prompt,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                    timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
+                    output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
+                )
+            break
+        except ClaudeKeychainCredentialRefreshRequired as error:
+            if credential_round > 0:
+                raise ClaudeAuthWarmupInconclusive(
+                    "Claude credential freshness expired during repeated "
+                    "final-attempt preflight"
+                ) from error
+            _require_matching_claude_executable_snapshot(
+                executable,
+                executable_evidence,
+            )
+            _warm_claude_local_login(
                 review,
-                review_env,
-                proxy_port=proxy_port,
+                executable,
+                attempt_env,
             )
-            _update_claude_runtime_report(
-                review,
-                {
-                    "phase": "runtime-launching",
-                    "outer_sandbox": {"status": "profile-generated"},
-                    "authentication": {"status": "sandbox-auth-staged"},
-                },
-            )
-            completed = run(
-                (
-                    str(CLAUDE_PROBE_SANDBOX),
-                    "-p",
-                    sandbox_profile,
-                    str(executable),
-                    *arguments,
-                ),
-                cwd=review.workspace_root,
-                env=review_env,
-                stdin=prompt,
-                stdout_path=stdout_path,
-                stderr_path=stderr_path,
-                timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
-                output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
-            )
-    final_text, effective_model = _parse_claude_output(
-        completed.stdout, requested_model=model
+    if completed is None:
+        raise ClaudeAuthWarmupInconclusive(
+            "Claude final-attempt preflight did not complete"
+        )
+    final_text, effective_model, model_evidence_consistent = (
+        _parse_claude_output_evidence(
+            completed.stdout,
+            requested_model=model,
+        )
     )
     attempt = _record_attempt(
         review=review,
@@ -4288,6 +6452,7 @@ def _claude_attempt(
         requested_effort=CLAUDE_REASONING_EFFORT,
         effective_effort=None,
         require_verified_model=True,
+        model_evidence_consistent=model_evidence_consistent,
     )
     _update_claude_runtime_report(
         review,
@@ -4306,6 +6471,7 @@ def _claude_attempt(
                 "requested_effort": CLAUDE_REASONING_EFFORT,
                 "effective_effort": attempt.effective_effort,
                 "category": attempt.category,
+                "reason": attempt.reason,
                 "returncode": attempt.returncode,
             },
         },
@@ -4434,9 +6600,7 @@ def _copilot_attempt(
 
 AttemptRunner = Callable[..., Attempt]
 
-REVIEW_SUPERVISION_FAILURE_CLASSES: tuple[
-    tuple[type[Exception], str], ...
-] = (
+REVIEW_SUPERVISION_FAILURE_CLASSES: tuple[tuple[type[Exception], str], ...] = (
     (ReviewTimeoutError, "timeout"),
     (ReviewOutputLimitError, "output-limit"),
     (ReviewOutputDrainError, "output-drain"),
@@ -4460,6 +6624,7 @@ def _attempt_summary(attempt: Attempt) -> dict[str, Any]:
         "effective_effort": attempt.effective_effort,
         "returncode": attempt.returncode,
         "category": attempt.category,
+        "reason": attempt.reason,
         "final_available": bool(attempt.final_text),
         "stdout_path": attempt.stdout_path,
         "stderr_path": attempt.stderr_path,
@@ -4482,7 +6647,11 @@ def _finish(
             review.container_dir / "final.txt", final_text.rstrip("\r\n") + "\n"
         )
         return Outcome(0, final_text, tuple(attempts))
-    if attempts and attempts[-1].category == "transient":
+    if not attempts or attempts[-1].category in {
+        "inconclusive",
+        "runtime-unverified",
+        "transient",
+    }:
         return Outcome(75, None, tuple(attempts))
     return Outcome(1, None, tuple(attempts))
 
@@ -4514,7 +6683,9 @@ def _run_model_chain(
         ) as error:
             stdout_path, stderr_path = _attempt_paths(review, index, runtime, model)
             stdout_path.touch(exist_ok=True)
-            _append_attempt_diagnostic(stderr_path, f"review supervision failed: {error}")
+            _append_attempt_diagnostic(
+                stderr_path, f"review supervision failed: {error}"
+            )
             attempts.append(
                 Attempt(
                     runtime=runtime,
@@ -4527,6 +6698,7 @@ def _run_model_chain(
                     final_text=None,
                     stdout_path=str(stdout_path),
                     stderr_path=str(stderr_path),
+                    reason=_review_supervision_failure_class(error),
                 )
             )
             _write_attempts(review, attempts)
@@ -4648,9 +6820,7 @@ def run_review(
             "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
         },
     )
-    explicit_claude_override = bool(
-        os.environ.get("CODEX_REVIEW_CLAUDE_PATH")
-    )
+    explicit_claude_override = bool(os.environ.get("CODEX_REVIEW_CLAUDE_PATH"))
     try:
         linux_host = _is_claude_linux_host()
         prompt = _claude_review_prompt(
@@ -4659,10 +6829,12 @@ def run_review(
             linux=linux_host,
         )
         if linux_host:
-            _require_claude_linux_prompt_without_file_mentions(
-                prompt
-            )
-        claude_executable, claude_env = _resolve_validated_claude_executable(
+            _require_claude_linux_prompt_without_file_mentions(prompt)
+        (
+            claude_executable,
+            claude_env,
+            claude_executable_evidence,
+        ) = _resolve_validated_claude_executable(
             review=review,
             env=claude_env,
         )
@@ -4670,25 +6842,15 @@ def run_review(
         if claude_available:
             if not _is_claude_linux_host():
                 claude_env = _prepare_claude_keychain_broker(review, claude_env)
-            claude_env = _with_claude_review_tool_path(review, claude_env)
-            claude_env = _prepare_claude_tls_environment(review, claude_env)
-            if _is_claude_linux_host():
-                _require_fresh_claude_linux_credential(review, claude_env)
-            elif not claude_env.get("ANTHROPIC_API_KEY"):
-                _warm_claude_local_login(
-                    review,
-                    claude_executable,
-                    claude_env,
-                )
             _update_claude_runtime_report(
                 review,
                 {
-                    "phase": "authentication-preflight-complete",
+                    "phase": "attempt-preflight-ready",
                     "authentication": {
                         "status": (
                             "configured"
                             if claude_env.get("ANTHROPIC_API_KEY")
-                            else "freshness-verified"
+                            else "deferred-to-final-attempt"
                         )
                     },
                 },
@@ -4746,7 +6908,13 @@ def run_review(
         )
         write_json(review.container_dir / "attempts.json", [])
         return Outcome(2, None, tuple(attempts))
-    if claude_available and claude_executable is not None:
+    if (
+        claude_available
+        and claude_executable is not None
+        and claude_executable_evidence is not None
+    ):
+        claude_trust_state = ClaudeTrustSessionState()
+
         def run_claude_attempt_with_verified_executable(
             *,
             review: ReviewWorkspace,
@@ -4760,6 +6928,8 @@ def run_review(
                 index=index,
                 env=env,
                 executable=claude_executable,
+                executable_evidence=claude_executable_evidence,
+                trust_state=claude_trust_state,
             )
 
         try:
@@ -4774,6 +6944,7 @@ def run_review(
             )
         except (
             FileNotFoundError,
+            ClaudeAuthWarmupInconclusive,
             ClaudeExecutableInspectionInconclusive,
             ReviewTimeoutError,
             ReviewOutputDrainError,

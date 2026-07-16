@@ -125,6 +125,28 @@ BASE_ENV_KEYS = (
 PROCESS_GROUP_TERM_GRACE_SECONDS = 0.5
 PROCESS_GROUP_EXIT_GRACE_SECONDS = 0.5
 PROCESS_GROUP_POLL_SECONDS = 0.05
+STRICT_JSON_MAX_NESTING_DEPTH = 64
+REGULAR_FILE_LIMIT_WRAPPER = """
+import errno
+import os
+import resource
+import signal
+import sys
+
+limit = int(sys.argv[1])
+status_fd = int(sys.argv[2])
+os.set_inheritable(status_fd, False)
+for name in ("SIGPIPE", "SIGXFZ", "SIGXFSZ"):
+    candidate = getattr(signal, name, None)
+    if candidate is not None:
+        signal.signal(candidate, signal.SIG_DFL)
+resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
+try:
+    os.execve(sys.argv[3], sys.argv[3:], os.environ)
+except OSError as error:
+    os.write(status_fd, str(error.errno or errno.EIO).encode("ascii"))
+    os._exit(127)
+""".strip()
 
 
 def write_text_atomic(path: pathlib.Path, text: str) -> None:
@@ -145,10 +167,74 @@ def write_json(path: pathlib.Path, value: Any) -> None:
     write_text_atomic(path, json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
+def json_nesting_is_bounded(
+    value: str,
+    *,
+    max_depth: int = STRICT_JSON_MAX_NESTING_DEPTH,
+) -> bool:
+    if max_depth <= 0:
+        raise ValueError("JSON maximum nesting depth must be positive")
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in value:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > max_depth:
+                return False
+        elif character in "]}":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0 and not in_string
+
+
+def _strict_json_object(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
+def strict_json_loads(payload: str | bytes | bytearray) -> Any:
+    if isinstance(payload, str):
+        text = payload
+    else:
+        text = bytes(payload).decode("utf-8")
+    if not json_nesting_is_bounded(text):
+        raise ValueError("JSON nesting exceeds the bounded parser limit")
+    try:
+        return json.loads(
+            text,
+            object_pairs_hook=_strict_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except RecursionError as error:
+        raise ValueError("JSON nesting exceeds the bounded parser limit") from error
+
+
 def read_json(path: pathlib.Path) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        value = strict_json_loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as error:
         raise ReviewError(f"cannot read review state {path}: {error}") from error
     if not isinstance(value, dict):
         raise ReviewError(f"review state is not a JSON object: {path}")
@@ -265,10 +351,26 @@ def run_bounded_capture(
     timeout_seconds: float,
     stdout_limit_bytes: int,
     stderr_limit_bytes: int,
+    regular_file_limit_bytes: int | None = None,
+    regular_file_limit_path: pathlib.Path | None = None,
 ) -> BoundedCapture:
     command = tuple(str(item) for item in argv)
     if stdout_limit_bytes <= 0 or stderr_limit_bytes <= 0:
         raise ReviewError("bounded capture limits must be positive")
+    if regular_file_limit_bytes is not None and regular_file_limit_bytes <= 0:
+        raise ReviewError("regular file limit must be positive")
+    if (regular_file_limit_bytes is None) != (regular_file_limit_path is None):
+        raise ReviewError(
+            "regular file limit bytes and target path must be provided together"
+        )
+    if regular_file_limit_bytes is not None:
+        if not command or not pathlib.Path(command[0]).is_absolute():
+            raise ReviewError("regular file limits require an absolute executable path")
+        assert regular_file_limit_path is not None
+        target_path = pathlib.Path(regular_file_limit_path)
+        if not target_path.is_absolute():
+            target_path = (cwd or pathlib.Path.cwd()) / target_path
+        regular_file_limit_path = target_path.absolute()
     stdout = _BytearrayWriter()
     stderr = _BytearrayWriter()
     try:
@@ -282,6 +384,8 @@ def run_bounded_capture(
             timeout_seconds=timeout_seconds,
             stdout_file_limit_bytes=stdout_limit_bytes,
             stderr_file_limit_bytes=stderr_limit_bytes,
+            regular_file_limit_bytes=regular_file_limit_bytes,
+            regular_file_limit_path=regular_file_limit_path,
         )
     except subprocess.TimeoutExpired as error:
         stdout.data[:] = b"\x00" * len(stdout.data)
@@ -455,11 +559,18 @@ def _run_logged_process(
     timeout_seconds: float | None = None,
     stdout_file_limit_bytes: int | None = None,
     stderr_file_limit_bytes: int | None = None,
+    regular_file_limit_bytes: int | None = None,
+    regular_file_limit_path: pathlib.Path | None = None,
 ) -> int:
     process: subprocess.Popen[bytes] | None = None
     pending_signal: signal.Signals | None = None
     io_threads: list[threading.Thread] = []
     stop_io = threading.Event()
+    regular_file_overflow = threading.Event()
+    exec_status_read_fd: int | None = None
+    exec_status_write_fd: int | None = None
+    effective_regular_file_limit: int | None = None
+    deadline: float | None = None
 
     def forward_signal(signum: int, _frame: object) -> None:
         nonlocal pending_signal
@@ -480,15 +591,97 @@ def _run_logged_process(
     try:
         if pending_signal is not None:
             raise ForwardedSignal(pending_signal)
-        process = subprocess.Popen(
-            command,
-            cwd=cwd,
-            env=env,
-            stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
-            stdout=subprocess.PIPE if stdout_file_limit_bytes is not None else stdout_handle,
-            stderr=subprocess.PIPE if stderr_file_limit_bytes is not None else stderr_handle,
-            start_new_session=os.name == "posix",
+        popen_command = command
+        pass_fds: tuple[int, ...] = ()
+        if regular_file_limit_bytes is not None:
+            try:
+                import resource as posix_resource
+            except ImportError as error:
+                raise ReviewError(
+                    "regular file limits are unavailable on this platform"
+                ) from error
+            _soft_limit, hard_limit = posix_resource.getrlimit(
+                posix_resource.RLIMIT_FSIZE
+            )
+            kernel_limit = regular_file_limit_bytes + 1
+            if (
+                hard_limit != posix_resource.RLIM_INFINITY
+                and int(hard_limit) < kernel_limit
+            ):
+                raise ReviewError(
+                    "inherited regular file hard limit cannot preserve an overflow "
+                    "sentinel"
+                )
+            effective_regular_file_limit = regular_file_limit_bytes
+            exec_status_read_fd, exec_status_write_fd = os.pipe()
+            pass_fds = (exec_status_write_fd,)
+            popen_command = (
+                str(pathlib.Path(sys.executable).resolve()),
+                "-I",
+                "-S",
+                "-c",
+                REGULAR_FILE_LIMIT_WRAPPER,
+                str(kernel_limit),
+                str(exec_status_write_fd),
+                *command,
+            )
+        popen_options: dict[str, Any] = {
+            "cwd": cwd,
+            "env": env,
+            "stdin": subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+            "stdout": (
+                subprocess.PIPE
+                if stdout_file_limit_bytes is not None
+                else stdout_handle
+            ),
+            "stderr": (
+                subprocess.PIPE
+                if stderr_file_limit_bytes is not None
+                else stderr_handle
+            ),
+            "start_new_session": os.name == "posix",
+        }
+        if pass_fds:
+            popen_options["pass_fds"] = pass_fds
+        deadline = (
+            None if timeout_seconds is None else time.monotonic() + timeout_seconds
         )
+        process = subprocess.Popen(popen_command, **popen_options)
+        if exec_status_write_fd is not None:
+            os.close(exec_status_write_fd)
+            exec_status_write_fd = None
+        if exec_status_read_fd is not None:
+            exec_status = bytearray()
+            while True:
+                assert deadline is not None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout_seconds)
+                readable, _, _ = select.select(
+                    (exec_status_read_fd,),
+                    (),
+                    (),
+                    min(PROCESS_GROUP_POLL_SECONDS, remaining),
+                )
+                if not readable:
+                    continue
+                chunk = os.read(exec_status_read_fd, 32)
+                if not chunk:
+                    break
+                exec_status.extend(chunk)
+                if len(exec_status) > 16:
+                    raise ReviewError(
+                        "regular-file wrapper returned invalid exec status"
+                    )
+            os.close(exec_status_read_fd)
+            exec_status_read_fd = None
+            if exec_status:
+                if re.fullmatch(rb"[0-9]{1,10}", exec_status) is None:
+                    raise ReviewError(
+                        "regular-file wrapper returned invalid exec status"
+                    )
+                errno_value = int(exec_status)
+                raise OSError(errno_value, os.strerror(errno_value), command[0])
         if pending_signal is not None:
             signal_process_group(process, pending_signal)
             raise ForwardedSignal(pending_signal)
@@ -496,13 +689,43 @@ def _run_logged_process(
             if timeout_seconds is None:
                 process.communicate(input=stdin)
             else:
-                process.communicate(input=stdin, timeout=timeout_seconds)
+                assert deadline is not None
+                process.communicate(
+                    input=stdin,
+                    timeout=max(0.0, deadline - time.monotonic()),
+                )
             return int(process.returncode)
 
         assert process.stdout is not None
         assert process.stderr is not None
         output_overflow = threading.Event()
         drain_errors: list[Exception] = []
+
+        def regular_file_target_exceeded_limit() -> bool:
+            if effective_regular_file_limit is None:
+                return False
+            assert regular_file_limit_path is not None
+            try:
+                return (
+                    regular_file_limit_path.stat().st_size
+                    > effective_regular_file_limit
+                )
+            except FileNotFoundError:
+                return False
+
+        def monitor_regular_file_limit() -> None:
+            try:
+                while not stop_io.is_set():
+                    if regular_file_target_exceeded_limit():
+                        regular_file_overflow.set()
+                        signal_process_group(process, signal.SIGTERM)
+                        return
+                    if process.poll() is not None:
+                        return
+                    stop_io.wait(PROCESS_GROUP_POLL_SECONDS)
+            except Exception as error:
+                drain_errors.append(error)
+                signal_process_group(process, signal.SIGTERM)
 
         def drain_bounded(
             stream: BinaryIO,
@@ -563,6 +786,13 @@ def _run_logged_process(
 
         thread_start_mask = block_forwarded_signals()
         try:
+            if effective_regular_file_limit is not None:
+                thread = threading.Thread(
+                    target=monitor_regular_file_limit,
+                    daemon=True,
+                )
+                thread.start()
+                io_threads.append(thread)
             for stream, destination, limit_bytes in (
                 (process.stdout, stdout_handle, stdout_file_limit_bytes),
                 (process.stderr, stderr_handle, stderr_file_limit_bytes),
@@ -586,8 +816,12 @@ def _run_logged_process(
         finally:
             restore_signal_mask(thread_start_mask)
         assert timeout_seconds is not None
-        deadline = time.monotonic() + timeout_seconds
+        assert deadline is not None
         while True:
+            if regular_file_overflow.is_set() or regular_file_target_exceeded_limit():
+                regular_file_overflow.set()
+                terminate_process_group(process)
+                break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(command, timeout_seconds)
@@ -595,15 +829,18 @@ def _run_logged_process(
                 process.wait(timeout=min(PROCESS_GROUP_POLL_SECONDS, remaining))
                 break
             except subprocess.TimeoutExpired:
-                if output_overflow.is_set() or drain_errors:
+                if (
+                    output_overflow.is_set()
+                    or regular_file_overflow.is_set()
+                    or drain_errors
+                ):
                     terminate_process_group(process)
                     break
         leftover_process_group = _process_group_exists(process.pid)
         if leftover_process_group:
             exit_deadline = time.monotonic() + PROCESS_GROUP_EXIT_GRACE_SECONDS
             while (
-                _process_group_exists(process.pid)
-                and time.monotonic() < exit_deadline
+                _process_group_exists(process.pid) and time.monotonic() < exit_deadline
             ):
                 time.sleep(PROCESS_GROUP_POLL_SECONDS)
             leftover_process_group = _process_group_exists(process.pid)
@@ -625,9 +862,24 @@ def _run_logged_process(
             ) from drain_errors[0]
         if output_overflow.is_set():
             raise ReviewOutputLimitError(
-                "command output exceeded its bounded stream limit: "
-                f"{' '.join(command)}"
+                f"command output exceeded its bounded stream limit: {' '.join(command)}"
             )
+        if effective_regular_file_limit is not None:
+            assert regular_file_limit_path is not None
+            file_size_signal = getattr(signal, "SIGXFSZ", None)
+            signal_overflow = (
+                file_size_signal is not None
+                and process.returncode == -int(file_size_signal)
+            )
+            if (
+                signal_overflow
+                or regular_file_overflow.is_set()
+                or regular_file_target_exceeded_limit()
+            ):
+                raise ReviewOutputLimitError(
+                    "command exceeded its regular-file output limit: "
+                    f"{' '.join(command)}"
+                )
         if leftover_process_group:
             raise ReviewProcessLeakError(
                 f"command left descendant processes after exit: {' '.join(command)}"
@@ -649,6 +901,12 @@ def _run_logged_process(
             stop_io.set()
             for thread in io_threads:
                 thread.join(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
+            for descriptor in (exec_status_read_fd, exec_status_write_fd):
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
             if process is not None and stdout_file_limit_bytes is not None:
                 for stream in (process.stdin, process.stdout, process.stderr):
                     if stream is not None:

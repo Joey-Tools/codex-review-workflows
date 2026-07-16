@@ -84,7 +84,15 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("helper-controlled proxy", helper_contract)
         self.assertIn(">=2.1.187,<3.0.0", helper_contract)
         self.assertIn("Linux and WSL2", helper_contract)
+        self.assertIn("does not read or import `~/.claude.json`", helper_contract)
+        self.assertIn("Before every Claude model attempt", helper_contract)
+        self.assertIn("bounded machine-readable `reason`", helper_contract)
         self.assertNotIn("requires `ANTHROPIC_API_KEY`", skill)
+
+        providers_source = (SCRIPTS / "review_runtime/providers.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn(".claude.json", providers_source)
 
     def test_claude_linux_file_tools_are_workspace_only_across_supported_versions(
         self,

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import contextlib
 import enum
-import json
 import math
 import mmap
 import os
@@ -18,7 +17,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Protocol
 
-from .common import ReviewError, run_bounded_capture
+from .common import ReviewError, run_bounded_capture, strict_json_loads
 from .workspace import symlink_target_stays_within_workspace
 
 
@@ -1610,7 +1609,7 @@ def _read_valid_credential(
             )
         ):
             raise LinuxCredentialUnsafe("Claude credential changed while it was read")
-        value = json.loads(payload)
+        value = strict_json_loads(payload)
         if not isinstance(value, dict):
             raise LinuxCredentialUnsafe("Claude credential JSON is not an object")
         oauth = value.get("claudeAiOauth")
@@ -1636,8 +1635,7 @@ def _read_valid_credential(
         payload[:] = b"\x00" * len(payload)
         raise
     except (
-        json.JSONDecodeError,
-        UnicodeDecodeError,
+        UnicodeError,
         OverflowError,
         ValueError,
     ) as error:
@@ -3219,24 +3217,9 @@ def _unique_option_value(arguments: Sequence[str], option: str) -> str:
 
 
 def _strict_json_object(raw: str) -> dict[str, object]:
-    def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
-        result: dict[str, object] = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError(f"duplicate JSON key: {key}")
-            result[key] = value
-        return result
-
-    def reject_constant(value: str) -> object:
-        raise ValueError(f"non-standard JSON constant: {value}")
-
     try:
-        payload = json.loads(
-            raw,
-            object_pairs_hook=reject_duplicates,
-            parse_constant=reject_constant,
-        )
-    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        payload = strict_json_loads(raw)
+    except (TypeError, ValueError) as error:
         raise LinuxRuntimeUnsafe(
             "Claude Linux review settings are not strict JSON"
         ) from error

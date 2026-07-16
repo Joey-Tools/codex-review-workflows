@@ -9,6 +9,11 @@ import time
 import unittest
 from unittest import mock
 
+try:
+    import resource
+except ImportError:  # pragma: no cover - unavailable on native Windows
+    resource = None  # type: ignore[assignment]
+
 
 SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -18,12 +23,36 @@ from review_runtime.common import ReviewError  # noqa: E402
 
 
 class ChildEnvironmentTest(unittest.TestCase):
+    def test_strict_json_rejects_recursive_duplicate_keys(self) -> None:
+        with self.assertRaisesRegex(ValueError, "duplicate JSON object key"):
+            common.strict_json_loads('{"outer":{"value":1,"value":2}}')
+
+    def test_strict_json_rejects_nonstandard_constants(self) -> None:
+        for constant in ("NaN", "Infinity", "-Infinity"):
+            with (
+                self.subTest(constant=constant),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "non-standard JSON constant",
+                ),
+            ):
+                common.strict_json_loads(f'{{"value":{constant}}}')
+
+    def test_strict_json_rejects_over_nested_payload(self) -> None:
+        payload = (
+            "[" * (common.STRICT_JSON_MAX_NESTING_DEPTH + 1)
+            + "0"
+            + "]" * (common.STRICT_JSON_MAX_NESTING_DEPTH + 1)
+        )
+
+        with self.assertRaisesRegex(ValueError, "nesting exceeds"):
+            common.strict_json_loads(payload)
+
     def test_tail_text_reads_only_a_bounded_suffix(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = pathlib.Path(temporary) / "review.log"
             path.write_bytes(
-                b"discarded-line\n" * 10_000
-                + b"keep-one\nkeep-two\nkeep-three\n"
+                b"discarded-line\n" * 10_000 + b"keep-one\nkeep-two\nkeep-three\n"
             )
 
             result = common.tail_text(path, line_count=2, byte_count=128)
@@ -85,6 +114,259 @@ class ChildEnvironmentTest(unittest.TestCase):
                 stderr_limit_bytes=1024,
             )
 
+    @unittest.skipUnless(
+        hasattr(signal, "SIGXFSZ") and hasattr(os, "fork"),
+        "requires POSIX file-size limits",
+    )
+    def test_bounded_capture_enforces_regular_file_limit_during_process(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output_path = pathlib.Path(temporary) / "export.bin"
+            with self.assertRaises(common.ReviewOutputLimitError):
+                common.run_bounded_capture(
+                    (
+                        sys.executable,
+                        "-c",
+                        (
+                            "import os,sys; "
+                            "fd=os.open(sys.argv[1], os.O_WRONLY|os.O_CREAT, 0o600); "
+                            "data=b'x' * 1048576; offset=0; "
+                            "exec('while offset < len(data):\\n "
+                            " offset += os.write(fd, data[offset:])')"
+                        ),
+                        str(output_path),
+                    ),
+                    timeout_seconds=5,
+                    stdout_limit_bytes=4096,
+                    stderr_limit_bytes=4096,
+                    regular_file_limit_bytes=1024,
+                    regular_file_limit_path=output_path,
+                )
+            output_size = output_path.stat().st_size
+
+        self.assertLessEqual(output_size, 1025)
+
+    @unittest.skipUnless(
+        hasattr(signal, "SIGXFSZ") and hasattr(os, "fork"),
+        "requires POSIX file-size limits",
+    )
+    def test_bounded_capture_accepts_exact_regular_file_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output_path = pathlib.Path(temporary) / "export.bin"
+            completed = common.run_bounded_capture(
+                (
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os,sys; "
+                        "fd=os.open(sys.argv[1], os.O_WRONLY|os.O_CREAT, 0o600); "
+                        "os.write(fd, b'x' * 1024); os.close(fd)"
+                    ),
+                    str(output_path),
+                ),
+                timeout_seconds=5,
+                stdout_limit_bytes=4096,
+                stderr_limit_bytes=4096,
+                regular_file_limit_bytes=1024,
+                regular_file_limit_path=output_path,
+            )
+
+            self.assertEqual(completed.returncode, 0)
+            self.assertEqual(output_path.stat().st_size, 1024)
+
+    @unittest.skipUnless(
+        hasattr(signal, "SIGXFSZ") and hasattr(os, "fork"),
+        "requires POSIX file-size limits",
+    )
+    def test_inherited_soft_file_limit_does_not_shrink_logical_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output_path = pathlib.Path(temporary) / "export.bin"
+            with mock.patch("resource.getrlimit", return_value=(1024, 1025)):
+                completed = common.run_bounded_capture(
+                    (
+                        sys.executable,
+                        "-c",
+                        (
+                            "import os,sys; "
+                            "fd=os.open(sys.argv[1], os.O_WRONLY|os.O_CREAT, 0o600); "
+                            "os.write(fd, b'x' * 1024); os.close(fd)"
+                        ),
+                        str(output_path),
+                    ),
+                    timeout_seconds=5,
+                    stdout_limit_bytes=4096,
+                    stderr_limit_bytes=4096,
+                    regular_file_limit_bytes=1024,
+                    regular_file_limit_path=output_path,
+                )
+
+            self.assertEqual(completed.returncode, 0)
+            self.assertEqual(output_path.stat().st_size, 1024)
+
+    @unittest.skipUnless(
+        resource is not None and hasattr(signal, "SIGXFSZ"),
+        "requires POSIX file-size limits",
+    )
+    def test_actual_low_soft_file_limit_does_not_shrink_logical_limit(self) -> None:
+        assert resource is not None
+        original_soft, original_hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+        logical_limit = 1024
+        sentinel_limit = logical_limit + 1
+        if original_hard != resource.RLIM_INFINITY and original_hard < sentinel_limit:
+            self.skipTest("inherited hard file-size limit is below the test sentinel")
+        try:
+            resource.setrlimit(resource.RLIMIT_FSIZE, (512, original_hard))
+        except OSError as error:
+            self.skipTest(f"cannot lower the soft file-size limit: {error}")
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                output_path = pathlib.Path(temporary) / "export.bin"
+                completed = common.run_bounded_capture(
+                    (
+                        sys.executable,
+                        "-c",
+                        (
+                            "import os,sys; "
+                            "fd=os.open(sys.argv[1], os.O_WRONLY|os.O_CREAT, 0o600); "
+                            "os.write(fd, b'x' * 1024); os.close(fd)"
+                        ),
+                        str(output_path),
+                    ),
+                    timeout_seconds=5,
+                    stdout_limit_bytes=4096,
+                    stderr_limit_bytes=4096,
+                    regular_file_limit_bytes=logical_limit,
+                    regular_file_limit_path=output_path,
+                )
+
+                self.assertEqual(completed.returncode, 0)
+                self.assertEqual(output_path.stat().st_size, logical_limit)
+        finally:
+            resource.setrlimit(
+                resource.RLIMIT_FSIZE,
+                (original_soft, original_hard),
+            )
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX file-size limits")
+    @mock.patch.object(common.subprocess, "Popen")
+    def test_inherited_hard_file_limit_without_sentinel_blocks_before_launch(
+        self,
+        popen: mock.Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output_path = pathlib.Path(temporary) / "export.bin"
+            with (
+                mock.patch("resource.getrlimit", return_value=(1024, 1024)),
+                self.assertRaisesRegex(
+                    ReviewError,
+                    "hard limit cannot preserve an overflow sentinel",
+                ),
+            ):
+                common.run_bounded_capture(
+                    (sys.executable, "-c", "pass"),
+                    timeout_seconds=5,
+                    stdout_limit_bytes=4096,
+                    stderr_limit_bytes=4096,
+                    regular_file_limit_bytes=1024,
+                    regular_file_limit_path=output_path,
+                )
+
+        popen.assert_not_called()
+
+    @unittest.skipUnless(
+        hasattr(signal, "SIGXFSZ") and hasattr(os, "fork"),
+        "requires POSIX file-size limits",
+    )
+    def test_regular_file_limit_normalizes_efbig_to_output_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output_path = pathlib.Path(temporary) / "export.bin"
+            code = (
+                "import errno,os,signal,sys,time; "
+                "signal.signal(signal.SIGXFSZ, signal.SIG_IGN); "
+                "fd=os.open(sys.argv[1], os.O_WRONLY|os.O_CREAT, 0o600); "
+                "data=b'x' * 1048576; offset=0; "
+                "exec('while offset < len(data):\\n"
+                "  try:\\n"
+                "    offset += os.write(fd, data[offset:])\\n"
+                "  except OSError as error:\\n"
+                "    if error.errno != errno.EFBIG: sys.exit(24)\\n"
+                "    time.sleep(5)')"
+            )
+            started = time.monotonic()
+            with self.assertRaises(common.ReviewOutputLimitError):
+                common.run_bounded_capture(
+                    (sys.executable, "-c", code, str(output_path)),
+                    timeout_seconds=5,
+                    stdout_limit_bytes=4096,
+                    stderr_limit_bytes=4096,
+                    regular_file_limit_bytes=1024,
+                    regular_file_limit_path=output_path,
+                )
+
+            self.assertGreater(output_path.stat().st_size, 1024)
+            self.assertLessEqual(output_path.stat().st_size, 1025)
+            self.assertLess(time.monotonic() - started, 2)
+
+    @unittest.skipUnless(
+        hasattr(signal, "SIGXFSZ") and pathlib.Path("/bin/sh").is_file(),
+        "requires POSIX signal handling",
+    )
+    def test_regular_file_wrapper_restores_default_file_size_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output_path = pathlib.Path(temporary) / "unused.bin"
+            with self.assertRaises(common.ReviewOutputLimitError):
+                common.run_bounded_capture(
+                    (
+                        "/bin/sh",
+                        "-c",
+                        f"kill -{int(signal.SIGXFSZ)} $$; exit 0",
+                    ),
+                    timeout_seconds=5,
+                    stdout_limit_bytes=4096,
+                    stderr_limit_bytes=4096,
+                    regular_file_limit_bytes=1024,
+                    regular_file_limit_path=output_path,
+                )
+
+    @unittest.skipUnless(
+        hasattr(signal, "SIGXFSZ"),
+        "requires POSIX file-size signals",
+    )
+    def test_regular_file_limit_does_not_treat_shell_exit_code_as_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output_path = pathlib.Path(temporary) / "unused.bin"
+            completed = common.run_bounded_capture(
+                (
+                    sys.executable,
+                    "-c",
+                    f"raise SystemExit({128 + int(signal.SIGXFSZ)})",
+                ),
+                timeout_seconds=5,
+                stdout_limit_bytes=4096,
+                stderr_limit_bytes=4096,
+                regular_file_limit_bytes=1024,
+                regular_file_limit_path=output_path,
+            )
+
+            self.assertEqual(completed.returncode, 128 + int(signal.SIGXFSZ))
+            self.assertFalse(output_path.exists())
+
+    @unittest.skipUnless(os.name == "posix", "requires the POSIX wrapper")
+    def test_regular_file_limit_preserves_exec_oserror(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            missing = root / "missing-command"
+            with self.assertRaises(FileNotFoundError):
+                common.run_bounded_capture(
+                    (str(missing),),
+                    timeout_seconds=5,
+                    stdout_limit_bytes=4096,
+                    stderr_limit_bytes=4096,
+                    regular_file_limit_bytes=1024,
+                    regular_file_limit_path=root / "unused.bin",
+                )
+
     def test_output_limit_is_detected_while_stream_remains_open(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -93,11 +375,7 @@ class ChildEnvironmentTest(unittest.TestCase):
                     (
                         sys.executable,
                         "-c",
-                        (
-                            "import os,time; "
-                            "os.write(1, b'x' * 4097); "
-                            "time.sleep(5)"
-                        ),
+                        ("import os,time; os.write(1, b'x' * 4097); time.sleep(5)"),
                     ),
                     stdout_path=root / "stdout.log",
                     stderr_path=root / "stderr.log",
@@ -149,9 +427,7 @@ class ChildEnvironmentTest(unittest.TestCase):
     def test_invalid_bounded_output_arguments_preserve_existing_logs(
         self, popen: mock.Mock
     ) -> None:
-        cases = (
-            ({"output_file_limit_bytes": 0}, "must be positive"),
-        )
+        cases = (({"output_file_limit_bytes": 0}, "must be positive"),)
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             for index, (arguments, message) in enumerate(cases):
@@ -224,7 +500,9 @@ class ChildEnvironmentTest(unittest.TestCase):
                 mock.patch.object(
                     common.select, "select", return_value=([123], [], [])
                 ),
-                mock.patch.object(common.os, "read", side_effect=OSError("read failed")),
+                mock.patch.object(
+                    common.os, "read", side_effect=OSError("read failed")
+                ),
             ):
                 with self.assertRaises(common.ReviewOutputDrainError):
                     common.run(

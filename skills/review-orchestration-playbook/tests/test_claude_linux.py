@@ -2349,7 +2349,7 @@ class CredentialStagingTest(unittest.TestCase):
                 expires_at_ms=(now + 7200) * 1000,
             )
             captured_payloads: list[bytearray] = []
-            real_loads = json.loads
+            real_loads = claude_linux.strict_json_loads
 
             def capture_loads(payload: bytearray) -> object:
                 captured_payloads.append(payload)
@@ -2357,8 +2357,8 @@ class CredentialStagingTest(unittest.TestCase):
 
             with (
                 mock.patch.object(
-                    claude_linux.json,
-                    "loads",
+                    claude_linux,
+                    "strict_json_loads",
                     side_effect=capture_loads,
                 ),
                 mock.patch.object(
@@ -2380,6 +2380,56 @@ class CredentialStagingTest(unittest.TestCase):
 
             self.assertEqual(len(captured_payloads), 1)
             self.assertEqual(set(captured_payloads[0]), {0})
+
+    def test_rejects_recursive_duplicate_keys_and_nonstandard_constants(
+        self,
+    ) -> None:
+        now = time.time()
+        payloads = (
+            b'{"claudeAiOauth":{"accessToken":"first",'
+            b'"accessToken":"second","expiresAt":9999999999999}}',
+            b'{"claudeAiOauth":{"accessToken":"fixture","expiresAt":NaN}}',
+            b'{"claudeAiOauth":{"accessToken":"fixture","expiresAt":Infinity}}',
+            b'{"claudeAiOauth":{"accessToken":"fixture","expiresAt":-Infinity}}',
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            source = pathlib.Path(temporary) / ".credentials.json"
+            for payload in payloads:
+                with self.subTest(payload=payload):
+                    source.write_bytes(payload)
+                    source.chmod(0o600)
+                    with self.assertRaisesRegex(
+                        claude_linux.LinuxCredentialUnsafe,
+                        "JSON is malformed",
+                    ):
+                        claude_linux._read_valid_credential(
+                            source,
+                            owner_uid=os.getuid(),
+                            now=now,
+                            required_validity_seconds=3600,
+                        )
+
+    def test_rejects_over_nested_credential_json(self) -> None:
+        now = time.time()
+        nested = "[" * 65 + "0" + "]" * 65
+        payload = (
+            '{"claudeAiOauth":{"accessToken":"fixture","expiresAt":' + nested + "}}"
+        ).encode()
+        with tempfile.TemporaryDirectory() as temporary:
+            source = pathlib.Path(temporary) / ".credentials.json"
+            source.write_bytes(payload)
+            source.chmod(0o600)
+
+            with self.assertRaisesRegex(
+                claude_linux.LinuxCredentialUnsafe,
+                "JSON is malformed",
+            ):
+                claude_linux._read_valid_credential(
+                    source,
+                    owner_uid=os.getuid(),
+                    now=now,
+                    required_validity_seconds=3600,
+                )
 
     def test_source_close_failure_does_not_mask_validation_error(self) -> None:
         now = time.time()
