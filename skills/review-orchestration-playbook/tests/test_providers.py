@@ -9489,11 +9489,11 @@ class ProviderPolicyTest(unittest.TestCase):
             )
 
     def test_macos_acl_empty_allocation_is_allowed_but_entries_block(self) -> None:
-        acl_get_fd = mock.Mock(return_value=1)
+        acl_get_fd_np = mock.Mock(return_value=1)
         acl_get_entry = mock.Mock(return_value=-1)
         acl_free = mock.Mock(return_value=0)
         libc = types.SimpleNamespace(
-            acl_get_fd=acl_get_fd,
+            acl_get_fd_np=acl_get_fd_np,
             acl_get_entry=acl_get_entry,
             acl_free=acl_free,
         )
@@ -9505,8 +9505,13 @@ class ProviderPolicyTest(unittest.TestCase):
             self.require_no_extended_acl(7, label="fixture")
 
         acl_free.assert_called_once_with(1)
+        acl_get_fd_np.assert_called_once_with(
+            7,
+            providers.CLAUDE_ACL_TYPE_EXTENDED,
+        )
         acl_get_entry.return_value = 0
         acl_free.reset_mock()
+        acl_get_fd_np.reset_mock()
         with (
             mock.patch.object(ctypes, "CDLL", return_value=libc),
             mock.patch.object(ctypes, "get_errno", return_value=0),
@@ -9514,6 +9519,10 @@ class ProviderPolicyTest(unittest.TestCase):
         ):
             self.require_no_extended_acl(7, label="fixture")
         acl_free.assert_called_once_with(1)
+        acl_get_fd_np.assert_called_once_with(
+            7,
+            providers.CLAUDE_ACL_TYPE_EXTENDED,
+        )
 
     def test_macos_acl_unknown_errors_fail_closed(self) -> None:
         for acl_pointer, entry_status, error_number in (
@@ -9522,7 +9531,7 @@ class ProviderPolicyTest(unittest.TestCase):
         ):
             with self.subTest(acl_pointer=acl_pointer):
                 libc = types.SimpleNamespace(
-                    acl_get_fd=mock.Mock(return_value=acl_pointer),
+                    acl_get_fd_np=mock.Mock(return_value=acl_pointer),
                     acl_get_entry=mock.Mock(return_value=entry_status),
                     acl_free=mock.Mock(return_value=0),
                 )
@@ -9547,7 +9556,10 @@ class ProviderPolicyTest(unittest.TestCase):
             "Claude review CA source has an extended access control list"
         )
 
-        with self.assertRaisesRegex(ReviewError, "extended access control list"):
+        with (
+            mock.patch.object(providers.os, "geteuid", return_value=0),
+            self.assertRaisesRegex(ReviewError, "extended access control list"),
+        ):
             providers._require_safe_ca_source_metadata(
                 metadata,
                 source="root-owned-ca.pem",
@@ -9854,6 +9866,47 @@ class ProviderPolicyTest(unittest.TestCase):
                 with self.assertRaises(providers.ClaudeTrustCertificateInvalid):
                     providers._require_unconditional_root_extensions(der)
 
+    def test_unconditional_root_requires_explicit_x509_v3(self) -> None:
+        valid = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+        valid_der, _canonical = providers._canonical_ca_certificate(
+            valid,
+            source="valid root fixture",
+        )
+        invalid = bytearray(valid_der)
+        _outer_tag, tbs_offset, outer_end, _outer_next = providers._der_tlv(
+            invalid,
+            0,
+            len(invalid),
+        )
+        _tbs_tag, tbs_start, tbs_end, _tbs_next = providers._der_tlv(
+            invalid,
+            tbs_offset,
+            outer_end,
+        )
+        _version_tag, version_start, version_end, _version_next = providers._der_tlv(
+            invalid,
+            tbs_start,
+            tbs_end,
+        )
+        integer_tag, value_start, value_end, integer_next = providers._der_tlv(
+            invalid,
+            version_start,
+            version_end,
+        )
+        self.assertEqual(integer_tag, 0x02)
+        self.assertEqual(integer_next, version_end)
+        self.assertEqual(invalid[value_start:value_end], b"\x02")
+        invalid[value_start] = 3
+
+        with self.assertRaisesRegex(
+            providers.ClaudeTrustCertificateInvalid,
+            "strict CA trust anchor",
+        ):
+            providers._require_unconditional_root_extensions(
+                bytes(invalid),
+                require_self_issued=False,
+            )
+
     def test_trust_as_root_uses_partial_chain_when_supported(
         self,
     ) -> None:
@@ -10067,6 +10120,152 @@ class ProviderPolicyTest(unittest.TestCase):
                 self.review,
                 self.review.container_dir,
             )
+
+    def test_trust_export_stream_limit_is_inspection_inconclusive(self) -> None:
+        evidence = providers._new_claude_trust_policy_evidence(
+            self.claude_executable_evidence
+        )
+        with (
+            mock.patch.object(
+                providers,
+                "_require_claude_trust_export_tool",
+                side_effect=providers.ReviewOutputLimitError(
+                    "stream overflow",
+                    limit_kind="stream",
+                ),
+            ),
+            self.assertRaises(providers.ClaudeExecutableInspectionInconclusive),
+        ):
+            providers._read_claude_trust_certificates(
+                self.review,
+                self.review.container_dir,
+                evidence=evidence,
+            )
+
+        terminal = json.loads(
+            (
+                self.review.container_dir
+                / providers.CLAUDE_TRUST_POLICY_EVIDENCE_NAME
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(terminal["status"], "inconclusive")
+
+    def test_trust_domain_output_limits_preserve_limit_kind(self) -> None:
+        cases = (
+            (
+                "stream",
+                providers.ClaudeExecutableInspectionInconclusive,
+                "inconclusive",
+            ),
+            (
+                "regular-file",
+                providers.ClaudeTrustPolicyUnavailable,
+                "blocked",
+            ),
+        )
+        evidence_path = (
+            self.review.container_dir / providers.CLAUDE_TRUST_POLICY_EVIDENCE_NAME
+        )
+        for limit_kind, expected_error, expected_status in cases:
+            evidence = providers._new_claude_trust_policy_evidence(
+                self.claude_executable_evidence
+            )
+            with (
+                self.subTest(limit_kind=limit_kind),
+                mock.patch.object(
+                    providers,
+                    "_require_claude_trust_export_tool",
+                    return_value=(pathlib.Path("/usr/bin/security"), {}),
+                ),
+                mock.patch.object(
+                    providers,
+                    "run_bounded_capture",
+                    side_effect=providers.ReviewOutputLimitError(
+                        "trust export overflow",
+                        limit_kind=limit_kind,
+                    ),
+                ),
+                self.assertRaises(expected_error),
+            ):
+                providers._read_claude_trust_certificates(
+                    self.review,
+                    self.review.container_dir,
+                    evidence=evidence,
+                )
+
+            terminal = json.loads(evidence_path.read_text(encoding="utf-8"))
+            self.assertEqual(terminal["status"], expected_status)
+            self.assertEqual(
+                {domain["status"] for domain in terminal["domains"]},
+                {expected_status},
+            )
+
+    def test_no_trust_settings_ignores_created_export_file(self) -> None:
+        def export_no_settings(argv, **_kwargs):
+            output = pathlib.Path(argv[-1])
+            output.write_bytes(b"")
+            output.chmod(0o600)
+            return common.BoundedCapture(
+                argv=tuple(argv),
+                returncode=1,
+                stdout=bytearray(),
+                stderr=bytearray(providers.CLAUDE_TRUST_NO_SETTINGS[0].encode()),
+            )
+
+        evidence = providers._new_claude_trust_policy_evidence(
+            self.claude_executable_evidence
+        )
+        with (
+            mock.patch.object(
+                providers,
+                "_require_claude_trust_export_tool",
+                return_value=(pathlib.Path("/usr/bin/security"), {}),
+            ),
+            mock.patch.object(
+                providers,
+                "run_bounded_capture",
+                side_effect=export_no_settings,
+            ),
+        ):
+            material = providers._read_claude_trust_certificates(
+                self.review,
+                self.review.container_dir,
+                evidence=evidence,
+            )
+
+        self.assertEqual(material.certificates, b"")
+        self.assertEqual(
+            [domain["status"] for domain in evidence["domains"]],
+            ["no-settings", "no-settings", "no-settings"],
+        )
+        for domain, _options in providers.CLAUDE_TRUST_DOMAINS:
+            self.assertFalse(
+                (self.review.container_dir / f".{domain}-trust.plist").exists()
+            )
+
+    def test_trust_export_cleanup_preserves_existing_policy_error(self) -> None:
+        path = types.SimpleNamespace(
+            unlink=mock.Mock(
+                side_effect=(None, OSError(errno.EIO, "cleanup failed")),
+            )
+        )
+        deny = providers.ClaudeTrustSettingsDeny("explicit deny")
+
+        with self.assertRaises(providers.ClaudeTrustSettingsDeny) as raised:
+            with providers._managed_claude_trust_export_path(path):
+                raise deny
+
+        self.assertIs(raised.exception, deny)
+        self.assertEqual(path.unlink.call_count, 2)
+
+    def test_trust_export_preclean_io_is_inspection_inconclusive(self) -> None:
+        path = types.SimpleNamespace(
+            unlink=mock.Mock(side_effect=OSError(errno.EIO, "preclean failed"))
+        )
+
+        with self.assertRaises(providers.ClaudeExecutableInspectionInconclusive):
+            with providers._managed_claude_trust_export_path(path):
+                self.fail("trust export body must not run")
 
     def test_system_domain_trust_as_root_is_exported(self) -> None:
         certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
@@ -10353,6 +10552,51 @@ class ProviderPolicyTest(unittest.TestCase):
             ["inconclusive", "blocked", "no-settings"],
         )
 
+    def test_trust_export_race_remains_inconclusive_without_later_block(self) -> None:
+        def export_trust(argv, **_kwargs):
+            if "-d" not in argv and "-s" not in argv:
+                raise OSError(errno.EIO, "trust export race")
+            return common.BoundedCapture(
+                argv=tuple(argv),
+                returncode=1,
+                stdout=bytearray(),
+                stderr=bytearray(providers.CLAUDE_TRUST_NO_SETTINGS[0].encode()),
+            )
+
+        evidence = providers._new_claude_trust_policy_evidence(
+            self.claude_executable_evidence
+        )
+        with (
+            mock.patch.object(
+                providers,
+                "_require_claude_trust_export_tool",
+                return_value=(pathlib.Path("/usr/bin/security"), {}),
+            ),
+            mock.patch.object(
+                providers,
+                "run_bounded_capture",
+                side_effect=export_trust,
+            ),
+            self.assertRaises(providers.ClaudeExecutableInspectionInconclusive),
+        ):
+            providers._read_claude_trust_certificates(
+                self.review,
+                self.review.container_dir,
+                evidence=evidence,
+            )
+
+        terminal = json.loads(
+            (
+                self.review.container_dir
+                / providers.CLAUDE_TRUST_POLICY_EVIDENCE_NAME
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(terminal["status"], "inconclusive")
+        self.assertEqual(
+            [domain["status"] for domain in terminal["domains"]],
+            ["inconclusive", "no-settings", "no-settings"],
+        )
+
     def test_later_blocked_trust_domain_wins_over_earlier_read_io_failure(
         self,
     ) -> None:
@@ -10477,9 +10721,13 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
         )
         self.assertEqual(
-            {prepared[key] for key in providers.CLAUDE_TLS_FILE_ENV_KEYS},
+            {
+                prepared[key]
+                for key in providers.CLAUDE_TLS_REPLACEMENT_FILE_ENV_KEYS
+            },
             {prepared["SSL_CERT_FILE"]},
         )
+        self.assertNotIn("NODE_EXTRA_CA_CERTS", prepared)
         evidence = json.loads(
             (
                 self.review.container_dir / providers.CLAUDE_TRUST_POLICY_EVIDENCE_NAME
@@ -10490,6 +10738,48 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(
             evidence["bundled_root_set_sha256"],
             executable_evidence.bundled_root_set_sha256,
+        )
+
+    def test_macos_tls_preserves_explicit_node_extra_ca_opt_in(self) -> None:
+        system, node_extra = self.sample_ca_certificates(2)
+        system_path = self.review.source_root / "system-for-node-opt-in.pem"
+        node_path = self.review.source_root / "node-extra-opt-in.pem"
+        self.write_private_source(system_path, system)
+        self.write_private_source(node_path, node_extra)
+        trust_material = providers.ClaudeTrustMaterial(
+            certificates=b"",
+            excluded_sha1_fingerprints=frozenset(),
+            evidence={},
+        )
+
+        with (
+            mock.patch.object(providers, "CLAUDE_SYSTEM_CA_FILE", system_path),
+            mock.patch.object(
+                providers,
+                "_read_claude_trust_certificates",
+                return_value=trust_material,
+            ),
+        ):
+            prepared = self.prepare_claude_macos_tls_environment(
+                self.review,
+                {"NODE_EXTRA_CA_CERTS": str(node_path)},
+                executable_evidence=self.claude_executable_evidence,
+                trust_state=providers.ClaudeTrustSessionState(),
+            )
+
+        self.assertEqual(
+            prepared["NODE_EXTRA_CA_CERTS"],
+            prepared["SSL_CERT_FILE"],
+        )
+        bundle = pathlib.Path(prepared["SSL_CERT_FILE"]).read_bytes()
+        self.assertEqual(
+            providers._ca_sha256_fingerprints(bundle, source="node opt-in bundle"),
+            frozenset(
+                {
+                    self.ca_sha256_fingerprint(system),
+                    self.ca_sha256_fingerprint(node_extra),
+                }
+            ),
         )
 
     def test_macos_tls_excludes_constrained_roots_from_every_input(self) -> None:
@@ -10767,6 +11057,21 @@ class ProviderPolicyTest(unittest.TestCase):
                 {"SSL_CERT_DIR": os.pathsep.join((str(valid_dir), str(unsafe_dir)))}
             )
 
+    def test_macos_caller_ca_directory_rejects_symlink(self) -> None:
+        source_dir = self.review.source_root / "real-macos-caller-ca-directory"
+        source_dir.mkdir(mode=0o700)
+        self.write_private_source(
+            source_dir / "caller.pem",
+            self.sample_ca_certificate(),
+        )
+        directory_link = self.review.source_root / "linked-macos-caller-ca-directory"
+        directory_link.symlink_to(source_dir.name)
+
+        with self.assertRaisesRegex(ReviewError, "must not be a symlink"):
+            providers._collect_claude_caller_ca_material(
+                {"SSL_CERT_DIR": str(directory_link)}
+            )
+
     def test_caller_ca_directory_fstat_io_is_inconclusive(self) -> None:
         source_dir = self.review.source_root / "caller-ca-fstat-io"
         source_dir.mkdir(mode=0o700)
@@ -10838,6 +11143,65 @@ class ProviderPolicyTest(unittest.TestCase):
                 providers.ClaudeExecutableInspectionInconclusive,
                 "cannot inspect Claude review CA directory SSL_CERT_DIR",
             ),
+        ):
+            providers._collect_claude_caller_ca_material(
+                {"SSL_CERT_DIR": str(source_dir)}
+            )
+
+    def test_caller_ca_directory_close_io_is_inconclusive(self) -> None:
+        source_dir = self.review.source_root / "caller-ca-close-io"
+        source_dir.mkdir(mode=0o700)
+        metadata = source_dir.stat()
+
+        with (
+            mock.patch.object(
+                providers,
+                "_open_stable_ca_directory",
+                return_value=123,
+            ),
+            mock.patch.object(providers.os, "fstat", return_value=metadata),
+            mock.patch.object(
+                providers,
+                "_bounded_ca_directory_names",
+                return_value=[],
+            ),
+            mock.patch.object(
+                providers.os,
+                "close",
+                side_effect=OSError(errno.EIO, "close failed"),
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "cannot close Claude review CA directory SSL_CERT_DIR",
+            ),
+        ):
+            providers._collect_claude_caller_ca_material(
+                {"SSL_CERT_DIR": str(source_dir)}
+            )
+
+    def test_caller_ca_directory_close_io_preserves_policy_error(self) -> None:
+        source_dir = self.review.source_root / "caller-ca-close-after-policy-error"
+        source_dir.mkdir(mode=0o700)
+        metadata = source_dir.stat()
+
+        with (
+            mock.patch.object(
+                providers,
+                "_open_stable_ca_directory",
+                return_value=123,
+            ),
+            mock.patch.object(providers.os, "fstat", return_value=metadata),
+            mock.patch.object(
+                providers,
+                "_bounded_ca_directory_names",
+                side_effect=ReviewError("policy rejection sentinel"),
+            ),
+            mock.patch.object(
+                providers.os,
+                "close",
+                side_effect=OSError(errno.EIO, "close failed"),
+            ),
+            self.assertRaisesRegex(ReviewError, "policy rejection sentinel"),
         ):
             providers._collect_claude_caller_ca_material(
                 {"SSL_CERT_DIR": str(source_dir)}
@@ -11013,6 +11377,23 @@ class ProviderPolicyTest(unittest.TestCase):
                 source="final-fstat",
                 limit_bytes=1024,
                 label="fixture owner file",
+            )
+
+    def test_caller_ca_open_io_remains_inspection_inconclusive(self) -> None:
+        source = self.review.source_root / "caller-ca-open-io.pem"
+        self.write_private_source(source, self.sample_ca_certificate())
+
+        with (
+            mock.patch.object(
+                providers.os,
+                "open",
+                side_effect=OSError(errno.EIO, "open failed"),
+            ),
+            self.assertRaises(providers.ClaudeExecutableInspectionInconclusive),
+        ):
+            providers._read_ca_source_with_size(
+                source,
+                source="SSL_CERT_FILE",
             )
 
     def test_caller_ca_source_is_snapshotted_and_snapshot_drift_blocks(self) -> None:

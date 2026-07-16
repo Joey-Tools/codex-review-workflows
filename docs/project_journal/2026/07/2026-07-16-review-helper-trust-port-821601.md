@@ -58,12 +58,12 @@ metadata behavior.
 ## Validation
 
 - Python 3.10.19 complete canonical suite with the `tomli` test backport and
-  `PYTHONDONTWRITEBYTECODE=1`: 825 tests run, 4 skipped, no failures. Disabling
+  `PYTHONDONTWRITEBYTECODE=1`: 837 tests run, 4 skipped, no failures. Disabling
   bytecode writes keeps the intentional `RLIMIT_FSIZE` tests from truncating
   uv's own `_virtualenv.pyc` import hook.
-- Python 3.13.0 complete canonical suite: 825 tests run, 9 skipped, no failures.
+- Python 3.13.0 complete canonical suite: 837 tests run, 9 skipped, no failures.
 - Focused Python 3.13 suites: the 3 `SSL_CERT_DIR` regressions passed, providers
-  ran 358 tests with 6 skipped, and provenance ran 90 tests with no skips or
+  ran 370 tests with 6 skipped, and provenance ran 90 tests with no skips or
   failures; earlier current-range common 49 and repository contract 14 test
   suites also passed.
 - Final-head review remediation covers strict signed-manifest numeric parsing,
@@ -140,6 +140,18 @@ metadata behavior.
   `fstat`, bounded `scandir`, and per-entry `stat` failures now remain
   inspection-inconclusive, while unsafe metadata, symlinks, and input limits
   retain their existing blocked `ReviewError` classification.
+- Current-head GitHub review then exposed root-EUID handling, Apple's extended
+  ACL API, empty-domain export files, Node CA opt-in, and metadata-only open
+  failure gaps. Root-owned system files now retain their TCB policy under UID 0,
+  ACL inspection uses `acl_get_fd_np` with `ACL_TYPE_EXTENDED`, no-settings is
+  classified from the fixed tool result rather than destination-file absence,
+  and `NODE_EXTRA_CA_CERTS` is emitted only for an explicit caller opt-in.
+- The independent and offline reviews split stream limits from regular-file
+  export limits, classify directory close failure without masking a prior
+  policy rejection, require explicit X.509 v3 anchors, and make trust-export
+  cleanup preserve an existing deny. New proof tests also bind the already
+  present macOS caller-directory symlink rejection and trust-race terminal
+  inconclusive behavior.
 - Ruff 0.13.2 lint, Python compile, project-journal validation, the official
   skill validator through its documented uv/PyYAML fallback, and working-tree
   diff checks passed. No provider/test formatter churn was retained:

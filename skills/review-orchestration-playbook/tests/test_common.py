@@ -150,7 +150,7 @@ class ChildEnvironmentTest(unittest.TestCase):
         self.assertLessEqual(output_size, 4096)
 
     def test_bounded_capture_enforces_independent_stream_limits(self) -> None:
-        with self.assertRaises(common.ReviewOutputLimitError):
+        with self.assertRaises(common.ReviewOutputLimitError) as raised:
             common.run_bounded_capture(
                 (
                     sys.executable,
@@ -161,6 +161,7 @@ class ChildEnvironmentTest(unittest.TestCase):
                 stdout_limit_bytes=4096,
                 stderr_limit_bytes=1024,
             )
+        self.assertEqual(raised.exception.limit_kind, "stream")
 
     @unittest.skipUnless(
         hasattr(signal, "SIGXFSZ") and hasattr(os, "fork"),
@@ -171,7 +172,7 @@ class ChildEnvironmentTest(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             output_path = pathlib.Path(temporary) / "export.bin"
-            with self.assertRaises(common.ReviewOutputLimitError):
+            with self.assertRaises(common.ReviewOutputLimitError) as raised:
                 common.run_bounded_capture(
                     (
                         sys.executable,
@@ -192,6 +193,8 @@ class ChildEnvironmentTest(unittest.TestCase):
                     regular_file_limit_path=output_path,
                 )
             output_size = output_path.stat().st_size
+
+        self.assertEqual(raised.exception.limit_kind, "regular-file")
 
         self.assertLessEqual(output_size, 1025)
 

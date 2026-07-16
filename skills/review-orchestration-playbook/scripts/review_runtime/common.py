@@ -36,6 +36,12 @@ class ReviewTimeoutError(ReviewError):
 class ReviewOutputLimitError(ReviewError):
     """A bounded reviewer subprocess exceeded its output allowance."""
 
+    def __init__(self, message: str, *, limit_kind: str = "stream") -> None:
+        if limit_kind not in {"stream", "regular-file"}:
+            raise ValueError("output limit kind must be stream or regular-file")
+        super().__init__(message)
+        self.limit_kind = limit_kind
+
 
 class ReviewOutputDrainError(ReviewError):
     """A reviewer output stream could not be drained completely."""
@@ -910,7 +916,8 @@ def _run_logged_process(
             ):
                 raise ReviewOutputLimitError(
                     "command exceeded its regular-file output limit: "
-                    f"{' '.join(command)}"
+                    f"{' '.join(command)}",
+                    limit_kind="regular-file",
                 )
         if leftover_process_group:
             raise ReviewProcessLeakError(

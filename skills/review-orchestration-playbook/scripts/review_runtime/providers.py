@@ -279,6 +279,7 @@ CLAUDE_TRUST_EXPORT_UNAVAILABLE = (
     "You may need to restart your computer."
 )
 CLAUDE_TRUST_FINGERPRINT = re.compile(r"^[0-9A-Fa-f]{40}$")
+CLAUDE_ACL_TYPE_EXTENDED = 0x00000100
 CLAUDE_TRUST_RESULT_KEY = "kSecTrustSettingsResult"
 CLAUDE_TRUST_RESULT_TRUST_ROOT = 1
 CLAUDE_TRUST_RESULT_TRUST_AS_ROOT = 2
@@ -1023,8 +1024,20 @@ def _require_unconditional_root_extensions(
             raise ValueError("invalid certificate signature")
 
         offset = tbs_start
-        if offset < tbs_end and der[offset] == 0xA0:
-            _, _, _, offset = _der_tlv(der, offset, tbs_end)
+        if offset >= tbs_end or der[offset] != 0xA0:
+            raise ValueError("certificate does not declare X.509 v3")
+        _, version_start, version_end, offset = _der_tlv(der, offset, tbs_end)
+        version_tag, value_start, value_end, version_next = _der_tlv(
+            der,
+            version_start,
+            version_end,
+        )
+        if (
+            version_tag != 0x02
+            or der[value_start:value_end] != b"\x02"
+            or version_next != version_end
+        ):
+            raise ValueError("certificate does not declare X.509 v3")
         for expected_tag in (0x02, 0x30):
             tag, _, _, offset = _der_tlv(der, offset, tbs_end)
             if tag != expected_tag:
@@ -2247,9 +2260,9 @@ def _require_no_extended_acl(descriptor: int, *, label: str) -> None:
         import ctypes
 
         libc = ctypes.CDLL(None, use_errno=True)
-        acl_get_fd = libc.acl_get_fd
-        acl_get_fd.argtypes = [ctypes.c_int]
-        acl_get_fd.restype = ctypes.c_void_p
+        acl_get_fd_np = libc.acl_get_fd_np
+        acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
+        acl_get_fd_np.restype = ctypes.c_void_p
         acl_get_entry = libc.acl_get_entry
         acl_get_entry.argtypes = [
             ctypes.c_void_p,
@@ -2263,7 +2276,7 @@ def _require_no_extended_acl(descriptor: int, *, label: str) -> None:
     except (AttributeError, OSError) as error:
         raise ReviewError(f"cannot inspect {label} access controls") from error
     ctypes.set_errno(0)
-    acl = acl_get_fd(descriptor)
+    acl = acl_get_fd_np(descriptor, CLAUDE_ACL_TYPE_EXTENDED)
     if not acl:
         if ctypes.get_errno() == errno.ENOENT:
             return
@@ -2398,13 +2411,15 @@ def _require_safe_ca_source_metadata(
             raise ReviewError(
                 f"Claude review CA source has an unsafe link count: {source}"
             )
-        if metadata.st_uid == os.geteuid() and metadata.st_mode & 0o077:
+        effective_uid = os.geteuid()
+        if (
+            effective_uid != 0
+            and metadata.st_uid == effective_uid
+            and metadata.st_mode & 0o077
+        ):
             raise ReviewError(f"Claude review CA source is not owner-only: {source}")
-        if descriptor is None:
-            raise ReviewError(
-                f"cannot inspect Claude review CA source access controls: {source}"
-            )
-        _require_no_extended_acl(descriptor, label="Claude review CA source")
+        if descriptor is not None:
+            _require_no_extended_acl(descriptor, label="Claude review CA source")
 
 
 def _require_safe_ca_symlink_metadata(
@@ -3269,6 +3284,87 @@ def _is_trust_export_unavailable(detail: str) -> bool:
     )
 
 
+@contextlib.contextmanager
+def _managed_claude_trust_export_path(path: pathlib.Path) -> Iterator[None]:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude trust export path could not be prepared"
+        ) from error
+    try:
+        yield
+    except BaseException:
+        with contextlib.suppress(OSError):
+            path.unlink(missing_ok=True)
+        raise
+    else:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude trust export path could not be cleaned"
+            ) from error
+
+
+def _read_claude_trust_domain(
+    client: pathlib.Path,
+    security_env: dict[str, str],
+    ca_root: pathlib.Path,
+    *,
+    domain: str,
+    options: tuple[str, ...],
+) -> ClaudeTrustFingerprints | None:
+    trust_path = ca_root / f".{domain}-trust.plist"
+    with _managed_claude_trust_export_path(trust_path):
+        try:
+            completed = run_bounded_capture(
+                (
+                    str(client),
+                    "trust-settings-export",
+                    *options,
+                    str(trust_path),
+                ),
+                cwd=ca_root,
+                env=security_env,
+                timeout_seconds=CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS,
+                stdout_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
+                stderr_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
+                regular_file_limit_bytes=CLAUDE_TRUST_SETTINGS_LIMIT_BYTES,
+                regular_file_limit_path=trust_path,
+            )
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude TLS trust export tooling could not be inspected"
+            ) from error
+        try:
+            detail = (
+                (bytes(completed.stdout) + bytes(completed.stderr))
+                .decode("utf-8", errors="replace")
+                .strip()
+            )
+            if completed.returncode != 0:
+                if _is_no_trust_settings(detail):
+                    return None
+                if _is_trust_export_unavailable(detail):
+                    raise ClaudeTrustToolUnavailable(
+                        "Claude TLS trust export tooling is unavailable"
+                    )
+                raise ClaudeTrustPolicyUnavailable(
+                    f"Claude {domain} trust export failed"
+                )
+        finally:
+            completed.stdout[:] = b"\x00" * len(completed.stdout)
+            completed.stderr[:] = b"\x00" * len(completed.stderr)
+        trust_data = _read_bounded_owner_file(
+            trust_path,
+            source=domain,
+            limit_bytes=CLAUDE_TRUST_SETTINGS_LIMIT_BYTES,
+            label="Claude trust export",
+        )
+        return _classify_trust_fingerprints(trust_data, domain=domain)
+
+
 def _require_claude_trust_export_tool(
     review: ReviewWorkspace,
     ca_root: pathlib.Path,
@@ -3408,14 +3504,24 @@ def _read_claude_trust_certificates(
         )
         raise
     except ReviewOutputLimitError as error:
+        if error.limit_kind == "regular-file":
+            _terminalize_claude_trust_policy_evidence(
+                review,
+                evidence,
+                status="blocked",
+                unresolved_resolution="blocked",
+            )
+            raise ClaudeTrustPolicyUnavailable(
+                "Claude trust policy exceeds the inspection limit"
+            ) from error
         _terminalize_claude_trust_policy_evidence(
             review,
             evidence,
-            status="blocked",
-            unresolved_resolution="blocked",
+            status="inconclusive",
+            unresolved_resolution="inconclusive",
         )
-        raise ClaudeTrustPolicyUnavailable(
-            "Claude trust policy exceeds the inspection limit"
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude trust export stream exceeded the inspection limit"
         ) from error
     except (
         ReviewTimeoutError,
@@ -3491,64 +3597,25 @@ def _read_claude_trust_certificates_impl(
         refresh_counts()
 
     for domain, options in CLAUDE_TRUST_DOMAINS:
-        trust_path = ca_root / f".{domain}-trust.plist"
-        trust_path.unlink(missing_ok=True)
         try:
-            try:
-                completed = run_bounded_capture(
-                    (
-                        str(client),
-                        "trust-settings-export",
-                        *options,
-                        str(trust_path),
-                    ),
-                    cwd=ca_root,
-                    env=security_env,
-                    timeout_seconds=CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS,
-                    stdout_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
-                    stderr_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
-                    regular_file_limit_bytes=CLAUDE_TRUST_SETTINGS_LIMIT_BYTES,
-                    regular_file_limit_path=trust_path,
-                )
-            except OSError as error:
-                raise ClaudeExecutableInspectionInconclusive(
-                    "Claude TLS trust export tooling could not be inspected"
-                ) from error
-            try:
-                detail = (
-                    (bytes(completed.stdout) + bytes(completed.stderr))
-                    .decode("utf-8", errors="replace")
-                    .strip()
-                )
-                if completed.returncode != 0:
-                    if not trust_path.exists() and _is_no_trust_settings(detail):
-                        domain_evidence.append(
-                            {
-                                "domain": domain,
-                                "status": "no-settings",
-                                "unconditional_count": 0,
-                                "constrained_omitted_count": 0,
-                            }
-                        )
-                        refresh_counts()
-                        continue
-                    if not trust_path.exists() and _is_trust_export_unavailable(detail):
-                        raise ClaudeTrustToolUnavailable(
-                            "Claude TLS trust export tooling is unavailable"
-                        )
-                    raise ClaudeTrustPolicyUnavailable(
-                        f"Claude {domain} trust export failed"
-                    )
-            finally:
-                completed.stdout[:] = b"\x00" * len(completed.stdout)
-                completed.stderr[:] = b"\x00" * len(completed.stderr)
-            trust_data = _read_bounded_owner_file(
-                trust_path,
-                source=domain,
-                limit_bytes=CLAUDE_TRUST_SETTINGS_LIMIT_BYTES,
-                label="Claude trust export",
+            classified = _read_claude_trust_domain(
+                client,
+                security_env,
+                ca_root,
+                domain=domain,
+                options=options,
             )
-            classified = _classify_trust_fingerprints(trust_data, domain=domain)
+            if classified is None:
+                domain_evidence.append(
+                    {
+                        "domain": domain,
+                        "status": "no-settings",
+                        "unconditional_count": 0,
+                        "constrained_omitted_count": 0,
+                    }
+                )
+                refresh_counts()
+                continue
             unconditional.update(classified.unconditional)
             additional_unconditional.update(classified.unconditional)
             additional_trust_as_root.update(classified.trust_as_root)
@@ -3586,19 +3653,27 @@ def _read_claude_trust_certificates_impl(
         ) as error:
             record_domain_failure(domain, "inconclusive")
             defer_error(1, error)
-        except ReviewOutputLimitError:
-            record_domain_failure(domain, "blocked")
-            defer_error(
-                2,
-                ClaudeTrustPolicyUnavailable(
-                    f"Claude {domain} trust export exceeds the inspection limit"
-                ),
-            )
+        except ReviewOutputLimitError as error:
+            if error.limit_kind == "regular-file":
+                record_domain_failure(domain, "blocked")
+                defer_error(
+                    2,
+                    ClaudeTrustPolicyUnavailable(
+                        f"Claude {domain} trust export exceeds the inspection limit"
+                    ),
+                )
+            else:
+                record_domain_failure(domain, "inconclusive")
+                defer_error(
+                    1,
+                    ClaudeExecutableInspectionInconclusive(
+                        f"Claude {domain} trust export stream exceeded the "
+                        "inspection limit"
+                    ),
+                )
         except ReviewError as error:
             record_domain_failure(domain, "blocked")
             defer_error(2, error)
-        finally:
-            trust_path.unlink(missing_ok=True)
 
     if deferred_error is not None:
         raise deferred_error[1]
@@ -3948,8 +4023,17 @@ def _collect_claude_caller_ca_material(
                     raise ClaudeExecutableInspectionInconclusive(
                         f"cannot inspect Claude review CA directory {key}: {error}"
                     ) from error
-            finally:
-                os.close(descriptor)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.close(descriptor)
+                raise
+            else:
+                try:
+                    os.close(descriptor)
+                except OSError as error:
+                    raise ClaudeExecutableInspectionInconclusive(
+                        f"cannot close Claude review CA directory {key}: {error}"
+                    ) from error
     if configured_directory and not found_directory_certificate:
         raise ReviewError("Claude review CA directory contains no PEM certificates")
     return materials
@@ -4082,8 +4166,12 @@ def _prepare_claude_macos_tls_environment(
             result.pop(key, None)
         for key in CLAUDE_TLS_DIR_ENV_KEYS:
             result.pop(key, None)
-        for key in CLAUDE_TLS_FILE_ENV_KEYS:
+        for key in CLAUDE_TLS_REPLACEMENT_FILE_ENV_KEYS:
             result[key] = str(bundle)
+        if env.get("NODE_EXTRA_CA_CERTS"):
+            result["NODE_EXTRA_CA_CERTS"] = str(bundle)
+        else:
+            result.pop("NODE_EXTRA_CA_CERTS", None)
         result[CLAUDE_CERT_STORE_ENV] = CLAUDE_CERT_STORE
         _terminalize_claude_trust_policy_evidence(
             review,
