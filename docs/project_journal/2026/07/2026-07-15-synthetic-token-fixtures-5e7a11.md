@@ -22,6 +22,7 @@ superseded_by:
 - Public authoring tokens cover access, refresh, ID, API-key, and bearer roles plus expired and consumed states.
 - Exact complete scanner captures may suppress only `generic-secret-assignment`; provider credentials, JWTs, private keys, adjacent values, high-entropy assignments, and credential paths remain blocking.
 - Named legacy envelopes store exact values as strict canonical Base64 plus rules and pinned master provenance. Runtime decodes exact ASCII bytes in memory, while metadata and evidence expose only digests and lengths.
+- Legacy-only provider rules now include `jwt` alongside `github-token`, enabling one exact master-proven workflow-hygiene fixture to be removed through the same count-monotonic migration bridge without weakening JWT scanning for authoring tokens, unknown values, or prompts.
 - Authoring entries retain the restricted scanner-compatible byte class, while legacy migration entries accept bounded printable ASCII so an exact historical quoted capture may include spaces or punctuation. Control bytes, newlines, non-ASCII values, and inexact scanner matches remain blocked.
 - Selected legacy entries pass only when both the complete-tree raw-byte count and the count not embedded inside a longer value from the same envelope are monotonic. The stateful runner recomputes both materialized-head counts before egress, while cross-envelope overlaps fail closed.
 - Every complete-catalog legacy raw value and canonical Base64 storage encoding is independently forbidden in base, head, and materialized repository paths through a finite linear byte matcher; diagnostics never expose the matched path or value.
@@ -40,6 +41,7 @@ superseded_by:
 ## Next Steps
 
 - Downstream private overlays may wholesale replace the fixed catalog through a trusted release-time regular-file override.
+- Remove the `codex-workflow-hygiene-jwt` envelope after no supported review range needs the historical fixture.
 
 ## Evidence
 
@@ -56,3 +58,6 @@ superseded_by:
 - Exhaustive-audit follow-up: four focused scanner, provenance-audit, runtime-blocking, and catalog-neutral tree-metadata regressions passed.
 - Exhaustive-audit follow-up: `python3 -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py' -v` passed (`606` tests, `9` skipped).
 - Exhaustive-audit follow-up: `python3 -m py_compile`, `ruff check`, `ruff format --check`, both skill validators, `isolated_review synthetic-tokens validate`, and `git diff --check` passed.
+- JWT legacy-envelope follow-up: fixed-catalog metadata, legacy-only parser, provider-specific duplicate suppression, count/preflight, prompt rejection, and raw-free provenance tests passed (`88` synthetic-token tests total).
+- JWT legacy-envelope follow-up: pinned `audit-master` verification passed for `Joey-Tools/codex-workflow-hygiene` at `95befb966cd93e0161ecb45099c124eac56cb52f` with one source occurrence and metadata-only evidence.
+- JWT legacy-envelope follow-up: the full review-orchestration suite passed (`679` tests, `4` skipped), along with `python3 -m py_compile`, `ruff check`, `ruff format --check`, both skill validators, catalog validation, project-journal validation, and `git diff --check`.
