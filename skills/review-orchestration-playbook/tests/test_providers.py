@@ -2952,6 +2952,55 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(mismatched.reason, "effective-model-mismatch")
         self.assertIsNone(mismatched.final_text)
 
+    def test_claude_auth_fallback_rejects_nonexact_or_conflicting_evidence(
+        self,
+    ) -> None:
+        base = {
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": True,
+        }
+        payloads = (
+            (
+                {
+                    **base,
+                    "result": (
+                        "Not logged in - please run /login for this account plan"
+                    ),
+                },
+                "nonzero-unclassified-result-error",
+            ),
+            (
+                {
+                    **base,
+                    "result": "Not logged in - please run /login",
+                    "error": {
+                        "message": "Model is not available for your account plan"
+                    },
+                    "modelUsage": {providers.CLAUDE_MODELS[0]: {}},
+                },
+                "unverified-entitlement-failure-envelope",
+            ),
+        )
+
+        for index, (payload, expected_reason) in enumerate(payloads, start=109):
+            with self.subTest(index=index):
+                encoded = json.dumps(payload).encode()
+                self.assertIsNone(
+                    providers._claude_supported_failure_category(
+                        encoded,
+                        requested_model=providers.CLAUDE_MODELS[0],
+                    )
+                )
+                attempt = self.record_claude_result(
+                    encoded,
+                    returncode=1,
+                    index=index,
+                )
+                self.assertEqual(attempt.category, "inconclusive")
+                self.assertEqual(attempt.reason, expected_reason)
+                self.assertIsNone(attempt.final_text)
+
     def test_claude_transient_requires_exact_failure_envelope(self) -> None:
         base = {
             "type": "result",

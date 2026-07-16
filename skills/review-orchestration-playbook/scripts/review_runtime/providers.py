@@ -5621,6 +5621,20 @@ def _claude_supported_failure_category(
     if not model_usage_valid:
         return None
     category, _reason = _classify_failure_evidence(stdout, b"")
+    output_shape = _claude_auth_warmup_output_shape(stdout)
+    result_signal_categories = output_shape.get("result_signal_categories")
+    if category == "auth":
+        if not (
+            output_shape.get("event_shape") == "supported-result-error"
+            and output_shape.get("result_matches_known_auth_message") is True
+            and result_signal_categories == ["auth"]
+        ):
+            return None
+    elif category in {"entitlement", "transient"} and result_signal_categories not in (
+        [],
+        [category],
+    ):
+        return None
     if category == "entitlement" and effective_model is None:
         return None
     return category if category in {"auth", "entitlement", "transient"} else None

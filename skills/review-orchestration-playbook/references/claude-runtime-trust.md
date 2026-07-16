@@ -777,11 +777,14 @@ nonzero. Strictly recognized failure envelopes may retain bounded structural
 classification, but malformed, duplicate-key, non-standard-constant, unknown,
 or success-looking nonzero envelopes are fail-closed and receive a sanitized
 machine-readable attempt reason. Authentication becomes deterministic only for
-the documented complete result shape, and entitlement fallback additionally
-requires requested-model evidence. Transient classification follows the same
-exact failure-envelope allowlist; stderr-only or structurally ambiguous network
-text remains inconclusive. Missing or malformed `modelUsage` never authorizes
-fallback.
+the documented complete result shape, the exact known login result, no populated
+error payload, and exactly one authentication signal category. The final review
+invocation applies the same authentication checks as the fixed-input warmup;
+mixed authentication and entitlement/transient semantics remain inconclusive.
+Entitlement fallback additionally requires requested-model evidence. Transient
+classification follows the same exact failure-envelope allowlist; stderr-only or
+structurally ambiguous network text remains inconclusive. Missing or malformed
+`modelUsage` never authorizes fallback.
 
 A verifier dependency is `runtime-unavailable` only when its fixed source is
 deterministically absent or the supported platform/capability is not present.
