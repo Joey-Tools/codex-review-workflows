@@ -506,6 +506,11 @@ class WorkspaceTest(unittest.TestCase):
                 "_commit_uses_reserved_control_path",
                 return_value=False,
             ),
+            mock.patch.object(
+                workspace_runtime,
+                "_reject_legacy_values_in_frozen_tree_paths",
+                return_value=None,
+            ),
             mock.patch.object(workspace_runtime, "MAX_TREE_METADATA_BYTES", 1),
             self.assertRaisesRegex(ReviewError, "frozen Git tree metadata exceeds"),
         ):

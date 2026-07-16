@@ -1461,6 +1461,7 @@ def _scan_batch_blob(
     event_budget: SecretScanBudget | None = None,
     exact_index: ExactValueIndex | None = None,
     occurrence_budget: LegacyOccurrenceBudget | None = None,
+    _continue_after_blocking: bool = False,
 ) -> tuple[SecretScanResult, int]:
     cat_input.write(object_id.encode("ascii") + b"\n")
     cat_input.flush()
@@ -1489,6 +1490,7 @@ def _scan_batch_blob(
         _event_budget=event_budget,
         _exact_index=exact_index,
         _occurrence_budget=occurrence_budget,
+        _continue_after_blocking=_continue_after_blocking,
     )
     if cat_output.read(1) != b"\n":
         raise ReviewError("missing delimiter after scanned git cat-file blob")
@@ -1503,6 +1505,7 @@ def _scan_frozen_tree_values(
     accepted_values: Iterable[AcceptedSyntheticValue],
     raw_occurrence_values: Iterable[AcceptedSyntheticValue] = (),
     capture_accepted_candidates: bool = False,
+    _continue_after_blocking: bool = False,
 ) -> SecretScanResult:
     accepted = tuple(accepted_values)
     raw_occurrences = tuple(raw_occurrence_values)
@@ -1578,6 +1581,7 @@ def _scan_frozen_tree_values(
                     event_budget=event_budget,
                     exact_index=exact_index,
                     occurrence_budget=occurrence_budget,
+                    _continue_after_blocking=_continue_after_blocking,
                 )
                 result.merge(scan)
             _close_pipe(tree_process.stdout)
@@ -3921,7 +3925,12 @@ def _scan_secret_value(
     _event_budget: SecretScanBudget | None = None,
     _exact_index: ExactValueIndex | None = None,
     _occurrence_budget: LegacyOccurrenceBudget | None = None,
+    _continue_after_blocking: bool = False,
 ) -> SecretScanResult:
+    if _continue_after_blocking and not capture_accepted_candidates:
+        raise ReviewError(
+            "exhaustive secret scanning requires accepted-candidate capture"
+        )
     result = SecretScanResult.empty()
     exact_index = _exact_index or _index_exact_values(raw_occurrence_values)
     occurrence_budget = _occurrence_budget or LegacyOccurrenceBudget.default()
@@ -3988,7 +3997,8 @@ def _scan_secret_value(
                 result.accepted_candidates.setdefault(accepted, set()).add(candidate)
         elif result.blocking_rule is None:
             result.blocking_rule = rule
-            return result
+            if not _continue_after_blocking:
+                return result
     return result
 
 
@@ -4029,6 +4039,7 @@ def _stream_secret_scan(
     _event_budget: SecretScanBudget | None = None,
     _exact_index: ExactValueIndex | None = None,
     _occurrence_budget: LegacyOccurrenceBudget | None = None,
+    _continue_after_blocking: bool = False,
 ) -> SecretScanResult:
     overlap = STREAM_SCAN_OVERLAP
     accepted = tuple(accepted_values)
@@ -4116,9 +4127,10 @@ def _stream_secret_scan(
                 prefix_context_complete=pending_offset == 0,
                 _accepted_index=accepted_index,
                 _event_budget=event_budget,
+                _continue_after_blocking=_continue_after_blocking,
             )
         )
-        if result.blocking_rule is not None:
+        if result.blocking_rule is not None and not _continue_after_blocking:
             blocked = True
             pending = b""
         committed_end = next_committed_end
@@ -4292,6 +4304,7 @@ def audit_legacy_exemption(
                 accepted_values=scan_accepted,
                 raw_occurrence_values=commit_descriptors,
                 capture_accepted_candidates=True,
+                _continue_after_blocking=True,
             )
             for descriptor in sorted(
                 commit_descriptors,

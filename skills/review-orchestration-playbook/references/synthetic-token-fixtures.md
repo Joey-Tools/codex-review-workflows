@@ -130,7 +130,7 @@ isolated_review synthetic-tokens audit-master \
   --exemption <id>
 ```
 
-`list` returns authoring metadata only. `get` returns the raw value for exactly one selected authoring ID. `list-exemptions` exposes IDs, provenance, rules, digests, lengths, and counts without raw legacy values. `audit-master` verifies all exact raw-byte occurrences at each provenance commit and requires at least one occurrence eligible under the declared scanner rule; it does not mutate either the repository or catalog.
+`list` returns authoring metadata only. `get` returns the raw value for exactly one selected authoring ID. `list-exemptions` exposes IDs, provenance, rules, digests, lengths, and counts without raw legacy values. `audit-master` verifies all exact raw-byte occurrences at each provenance commit and requires at least one occurrence eligible under the declared scanner rule; it does not mutate either the repository or catalog. Provenance auditing exhaustively collects bounded scanner events so an unrelated earlier finding cannot hide a later eligible capture. This does not certify the tree as finding-free: ordinary preflight remains fail-fast, and every unrelated or non-exempt finding still blocks review.
 
 ## Preflight Evidence
 
