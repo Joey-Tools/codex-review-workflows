@@ -190,11 +190,16 @@ CLAUDE_LINUX_BOOTSTRAP_LIBRARY_ROOT_CANDIDATES = (
     pathlib.Path("/usr/lib"),
     pathlib.Path("/usr/lib64"),
 )
-CLAUDE_TLS_FILE_ENV_KEYS = (
+CLAUDE_TLS_REPLACEMENT_FILE_ENV_KEYS = (
     "CURL_CA_BUNDLE",
     "GIT_SSL_CAINFO",
     "REQUESTS_CA_BUNDLE",
     "SSL_CERT_FILE",
+)
+CLAUDE_TLS_ADDITIVE_FILE_ENV_KEYS = ("NODE_EXTRA_CA_CERTS",)
+CLAUDE_TLS_FILE_ENV_KEYS = (
+    *CLAUDE_TLS_REPLACEMENT_FILE_ENV_KEYS,
+    *CLAUDE_TLS_ADDITIVE_FILE_ENV_KEYS,
 )
 CLAUDE_TLS_DIR_ENV_KEYS = ("SSL_CERT_DIR",)
 CLAUDE_CA_FILE_LIMIT_BYTES = 16 * 1024 * 1024
@@ -255,7 +260,7 @@ CLAUDE_EGRESS_CONSENTS = (
 )
 COPILOT_EGRESS_CONSENTS = ("double-review", "triple-review")
 CODEX_ENV_KEYS = ("CODEX_HOME", "OPENAI_API_KEY")
-CLAUDE_ENV_KEYS = ("ANTHROPIC_API_KEY",)
+CLAUDE_ENV_KEYS = ("ANTHROPIC_API_KEY", "NODE_EXTRA_CA_CERTS")
 COPILOT_ENV_KEYS = (
     "COPILOT_GITHUB_TOKEN",
     "GH_TOKEN",
@@ -2489,12 +2494,12 @@ def _claude_linux_ca_bundle(
             cause = cause.__cause__
         return isinstance(cause, FileNotFoundError)
 
-    configured = False
-    for key in CLAUDE_TLS_FILE_ENV_KEYS:
+    replacement_configured = False
+    for key in CLAUDE_TLS_REPLACEMENT_FILE_ENV_KEYS:
         raw = env.get(key)
         if not raw:
             continue
-        configured = True
+        replacement_configured = True
         source = pathlib.Path(raw)
         if not source.is_absolute():
             raise ReviewError(f"Claude Linux requires an absolute {key}")
@@ -2508,12 +2513,12 @@ def _claude_linux_ca_bundle(
         for raw in env.get(key, "").split(os.pathsep):
             if not raw:
                 continue
-            configured = True
+            replacement_configured = True
             directory = pathlib.Path(raw)
             if not directory.is_absolute():
                 raise ReviewError(f"Claude Linux requires absolute {key} entries")
             add_directory(directory, source=key)
-    if not configured:
+    if not replacement_configured:
         defaults = ssl.get_default_verify_paths()
         for raw in dict.fromkeys(
             raw
@@ -2554,6 +2559,19 @@ def _claude_linux_ca_bundle(
                 except ClaudeExecutableInspectionInconclusive as error:
                     if not path_is_missing(error):
                         raise
+    for key in CLAUDE_TLS_ADDITIVE_FILE_ENV_KEYS:
+        raw = env.get(key)
+        if not raw:
+            continue
+        source = pathlib.Path(raw)
+        if not source.is_absolute():
+            raise ReviewError(f"Claude Linux requires an absolute {key}")
+        material, source_size = _read_ca_path_from_parent_with_size(
+            source,
+            source=key,
+            extract_certificates=False,
+        )
+        add_material(material, source_size, source=key)
     if not blocks:
         raise ClaudeProbeSandboxUnavailable(
             "Claude Linux review requires a usable PEM CA bundle"
@@ -4025,6 +4043,7 @@ def _claude_linux_review_runtime(
             proxy_socket=proxy_socket,
             runtime_libraries=runtime_libraries,
             ca_bundle=ca_bundle,
+            node_extra_ca_certs_configured=bool(env.get("NODE_EXTRA_CA_CERTS")),
         )
         try:
             run_claude_linux_isolation_probe(

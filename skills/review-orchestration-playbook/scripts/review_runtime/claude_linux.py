@@ -194,6 +194,7 @@ class SandboxSpec:
     runtime_libraries: tuple[RuntimeMount, ...]
     ca_bundle: pathlib.Path | None = None
     ca_bundle_identity: TrustedPathIdentity | None = None
+    node_extra_ca_certs_configured: bool = False
 
 
 @dataclass(frozen=True)
@@ -3165,6 +3166,10 @@ def _validate_sandbox_spec(spec: SandboxSpec) -> SandboxSpec:
     )
     ca_bundle: pathlib.Path | None = None
     ca_bundle_identity: TrustedPathIdentity | None = None
+    if not isinstance(spec.node_extra_ca_certs_configured, bool):
+        raise LinuxRuntimeError(
+            "Claude Node extra CA configuration state must be boolean"
+        )
     if spec.ca_bundle is not None:
         reject_wsl_windows_path(spec.ca_bundle, spec.host)
         ca_bundle_identity = _capture_trusted_path_identity(
@@ -3174,6 +3179,10 @@ def _validate_sandbox_spec(spec: SandboxSpec) -> SandboxSpec:
         ca_bundle = ca_bundle_identity.path
         if ca_bundle_identity.components[-1].size <= 0:
             raise LinuxRuntimeError("Claude CA bundle is not a non-empty regular file")
+    if spec.node_extra_ca_certs_configured and ca_bundle is None:
+        raise LinuxRuntimeError(
+            "Claude Node extra CA configuration requires a private CA bundle"
+        )
     return SandboxSpec(
         host=spec.host,
         toolchain=spec.toolchain,
@@ -3188,6 +3197,7 @@ def _validate_sandbox_spec(spec: SandboxSpec) -> SandboxSpec:
         runtime_libraries=libraries,
         ca_bundle=ca_bundle,
         ca_bundle_identity=ca_bundle_identity,
+        node_extra_ca_certs_configured=spec.node_extra_ca_certs_configured,
     )
 
 
@@ -3573,6 +3583,11 @@ def build_sandbox_command(
     }
     if validated.ca_bundle is not None:
         fixed_environment["SSL_CERT_FILE"] = str(SANDBOX_CA_BUNDLE)
+    # Caller inputs stay separate through validation. The final Linux sandbox
+    # intentionally reuses one private bundle; only explicit caller state
+    # enables Node's process-startup additive CA input.
+    if validated.node_extra_ca_certs_configured:
+        fixed_environment["NODE_EXTRA_CA_CERTS"] = str(SANDBOX_CA_BUNDLE)
     for key, value in sorted(fixed_environment.items()):
         if "\x00" in value:
             raise LinuxRuntimeError(f"sandbox environment value contains NUL: {key}")

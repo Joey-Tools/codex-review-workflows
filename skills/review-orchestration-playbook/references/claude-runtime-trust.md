@@ -53,6 +53,10 @@ is supported only when every applicable gate below passes.
   fixed credential-free environment, not a denylist-filtered copy of the caller
   environment. Inherited proxy URLs, custom CA paths, authentication material,
   review metadata, and unrelated caller variables must be absent.
+- Treat `NODE_EXTRA_CA_CERTS` as a Claude-only, process-startup additive CA
+  input. It is never part of the shared reviewer environment, never inferred
+  from `SSL_CERT_FILE`, and never supplied to the unverified candidate probe or
+  security-sensitive host tools.
 - Use layered enforcement. The helper-owned outer sandbox enforces host
   filesystem, process, write, and network isolation. On Linux and WSL2, the
   signed Claude runtime's permission engine additionally separates files that
@@ -470,20 +474,49 @@ is part of the trusted computing base for the narrower distinction between
 runtime authentication reads and model-invoked file reads.
 
 Custom TLS sources are copied rather than mounted from their original paths.
-`SSL_CERT_FILE` is read through a stable no-follow regular-file descriptor.
-`SSL_CERT_DIR` is enumerated through a fixed directory descriptor with bounded
-entry counts and supports normal OpenSSL hash links, including the multi-hop
-relative/absolute layout used by Ubuntu. Link depth and path components are
-bounded; every traversed link and directory plus the final no-follow regular
-file is owner/mode/identity checked and revalidated around a bounded read. Only
-PEM certificates are materialized, never private-key material. The helper keeps
-the original hash basename but writes a private `0600` regular file instead of
-recreating a symlink. Linux and WSL2 coalesce the validated certificates into a
-private bundle whose complete resolved path identity is captured and rechecked
-while the read-only `bubblewrap` command is serialized. Like the existing
-runtime-library mounts, this fixes the selected resolved source but does not
-claim an FD-bound, atomic path-to-mount handoff against another same-euid
-process.
+The Claude-only `NODE_EXTRA_CA_CERTS` input uses the same absolute-path, stable
+no-follow identity, owner/mode, bounded-read, PEM-only, private-key rejection,
+and private-`0600` materialization policy as the existing CA-file inputs. On
+macOS, the rewritten variable names only the exact helper-owned copy; the
+Seatbelt profile grants `file-read*` to that file literally, does not grant a
+parent-directory subpath read, and does not disclose the caller path through
+the profile or launch arguments. Literal ancestor metadata checks remain part
+of safe path traversal.
+`SSL_CERT_FILE` and `SSL_CERT_DIR` retain their existing handling. The latter is
+enumerated through a fixed directory descriptor with bounded entry counts and
+supports normal OpenSSL hash links, including the multi-hop relative/absolute
+layout used by Ubuntu. Link depth and path components are bounded; every
+traversed link and directory plus the final no-follow regular file is
+owner/mode/identity checked and revalidated around a bounded read. Only PEM
+certificates are materialized, never private-key material. The helper keeps the
+original hash basename but writes a private `0600` regular file instead of
+recreating a symlink.
+
+Linux and WSL2 coalesce validated certificates into the existing single private
+bundle mounted read-only at `/etc/ssl/certs/ca-certificates.crt`. If
+`NODE_EXTRA_CA_CERTS` is the only configured CA input, the helper begins with
+the default system trust and appends and deduplicates the Node certificates. If
+a replacement input (`CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`,
+`REQUESTS_CA_BUNDLE`, `SSL_CERT_FILE`, or `SSL_CERT_DIR`) is configured, the
+helper preserves the existing replacement semantics, then appends and
+deduplicates the Node certificates. The sandbox sets `NODE_EXTRA_CA_CERTS` to
+the fixed bundle path only when the caller explicitly supplied it; no additional
+host mount is created. The same private bundle also remains the final sandbox's
+`SSL_CERT_FILE`. This is an intentional single-bundle runtime design, not a
+claim that replacement and additive inputs become separate in-sandbox trust
+domains. The helper's parent/proxy TLS context still consumes the original
+caller environment and does not read `NODE_EXTRA_CA_CERTS`. The bundle's
+complete resolved path identity is captured and rechecked while the read-only
+`bubblewrap` command is serialized. Like the existing runtime-library mounts,
+this fixes the selected resolved source but does not claim an FD-bound, atomic
+path-to-mount handoff against another same-euid process.
+
+`SSL_CERT_FILE` remains an independent caller input for the helper's parent/proxy
+TLS path and does not cause the Node variable to be set. The parent proxy TLS
+context, pre-provenance candidate probe, GPG, and security-sensitive host-tool
+environments do not consult `NODE_EXTRA_CA_CERTS`. Arbitrary `NODE_*`,
+`NODE_TLS_REJECT_UNAUTHORIZED=0`, mTLS private-key inputs, and private-key
+material remain outside the contract.
 
 Linux and WSL2 fix cwd at `/workspace`, use `dontAsk`, expose only `Read`, and
 pre-approve only `Read(./**)`. Every other top-level path mounted into the
@@ -718,6 +751,10 @@ metadata that can act as a bearer secret, or unbounded probe output.
   on macOS, `bubblewrap` plus `socat` on Linux and WSL2, and the WSL1 limitation.
 - [Claude Code authentication](https://code.claude.com/docs/en/authentication):
   macOS Keychain storage and the Linux `0600` credential file.
+- [Claude Code corporate network configuration](https://code.claude.com/docs/en/corporate-proxy):
+  the supported enterprise custom-CA entrypoint for Claude Code.
+- [Node.js `NODE_EXTRA_CA_CERTS`](https://nodejs.org/api/cli.html#node_extra_ca_certsfile):
+  process-startup handling and additive PEM trust semantics.
 - [Claude Code CLI reference](https://code.claude.com/docs/en/cli-usage): the
   supported command/flag surface and the upstream warning that general help may
   omit flags; the helper still requires every public flag it invokes to be
