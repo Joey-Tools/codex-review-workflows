@@ -35,6 +35,7 @@ from .claude_capabilities import (
 )
 from .claude_provenance import (
     CLAUDE_RELEASE_KEY_FINGERPRINT,
+    ClaudeProvenanceDependencyUnavailable,
     ClaudeProvenanceInconclusive,
     ClaudeProvenanceInvalid,
     ClaudeProvenanceUnavailable,
@@ -621,8 +622,10 @@ def _require_trusted_claude_release(
         raise ClaudePublisherProvenanceInvalid(str(error)) from error
     except ClaudeProvenanceInconclusive as error:
         raise ClaudeExecutableInspectionInconclusive(str(error)) from error
-    except ClaudeProvenanceUnavailable as error:
+    except ClaudeProvenanceDependencyUnavailable as error:
         raise ClaudeProvenanceVerifierUnavailable(str(error)) from error
+    except ClaudeProvenanceUnavailable as error:
+        raise ClaudeExecutableInspectionInconclusive(str(error)) from error
 
 
 def _claude_gpg_temp_root_validator(
@@ -4645,6 +4648,9 @@ def run_review(
             "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
         },
     )
+    explicit_claude_override = bool(
+        os.environ.get("CODEX_REVIEW_CLAUDE_PATH")
+    )
     try:
         linux_host = _is_claude_linux_host()
         prompt = _claude_review_prompt(
@@ -4696,6 +4702,22 @@ def run_review(
         ClaudeExecutableUnavailable,
         ClaudeProvenanceVerifierUnavailable,
     ) as error:
+        if explicit_claude_override and isinstance(
+            error,
+            (
+                ClaudeProbeSandboxUnavailable,
+                ClaudeReviewToolUnavailable,
+                ClaudeProvenanceVerifierUnavailable,
+            ),
+        ):
+            write_text_atomic(
+                review.container_dir / "runner-error.txt",
+                "Explicit CODEX_REVIEW_CLAUDE_PATH lacks a required secure "
+                "runtime prerequisite; refusing Copilot fallback: "
+                f"{error}\n",
+            )
+            _write_attempts(review, attempts)
+            return Outcome(2, None, tuple(attempts))
         claude_available = False
         write_text_atomic(
             review.container_dir / "claude-skip.txt",
@@ -4791,6 +4813,22 @@ def run_review(
             ClaudeProbeSandboxUnavailable,
             ClaudeProvenanceVerifierUnavailable,
         ) as error:
+            if explicit_claude_override and isinstance(
+                error,
+                (
+                    ClaudeProbeSandboxUnavailable,
+                    ClaudeReviewToolUnavailable,
+                    ClaudeProvenanceVerifierUnavailable,
+                ),
+            ):
+                write_text_atomic(
+                    review.container_dir / "runner-error.txt",
+                    "Explicit CODEX_REVIEW_CLAUDE_PATH lacks a required secure "
+                    "runtime prerequisite; refusing Copilot fallback: "
+                    f"{error}\n",
+                )
+                _write_attempts(review, attempts)
+                return Outcome(2, None, tuple(attempts))
             category = "unavailable"
             final_text = None
             write_text_atomic(
