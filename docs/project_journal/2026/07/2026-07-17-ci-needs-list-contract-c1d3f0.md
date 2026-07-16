@@ -21,16 +21,16 @@ status context on additional compatibility and platform jobs.
 
 ## Current State
 
-- The contract still requires `platform_tests` to be a dependency of the
-  required `test` job.
+- The contract scopes dependency parsing to the required `test` job and still
+  requires `platform_tests` to be one of its direct dependencies.
 - Scalar `needs: platform_tests` remains accepted for the canonical workflow.
 - List-form `needs` declarations containing `platform_tests` are accepted for
   synchronized overlays with additional direct dependencies.
 
 ## Validation Evidence
 
-- The canonical review-orchestration suite passed (`705` tests; `9` skipped).
-- The synchronized private-overlay suite passed (`705` tests; `10` skipped).
+- The canonical review-orchestration suite passed (`706` tests; `9` skipped).
+- The synchronized private-overlay suite passed (`706` tests; `10` skipped).
 - `ruff check` and `git diff --check` passed for both copies.
 
 ## Next Steps

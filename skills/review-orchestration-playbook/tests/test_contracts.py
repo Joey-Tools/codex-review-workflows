@@ -20,6 +20,29 @@ sys.path.insert(0, str(SCRIPTS))
 from review_runtime import claude_linux, providers  # noqa: E402
 
 
+def _workflow_job_needs(workflow: str, job_name: str) -> tuple[str, ...]:
+    marker = f"\n  {job_name}:\n"
+    if marker not in workflow:
+        return ()
+    job_lines: list[str] = []
+    for line in workflow.split(marker, 1)[1].splitlines():
+        if line.startswith("  ") and not line.startswith("    "):
+            break
+        job_lines.append(line)
+
+    for index, line in enumerate(job_lines):
+        if line.startswith("    needs: "):
+            return (line.removeprefix("    needs: ").strip(),)
+        if line == "    needs:":
+            dependencies: list[str] = []
+            for dependency_line in job_lines[index + 1 :]:
+                if not dependency_line.startswith("      - "):
+                    break
+                dependencies.append(dependency_line.removeprefix("      - ").strip())
+            return tuple(dependencies)
+    return ()
+
+
 class RepositoryContractTest(unittest.TestCase):
     def test_only_canonical_review_skill_entrypoint_remains(self) -> None:
         self.assertTrue((SKILL_ROOT / "SKILL.md").is_file())
@@ -255,10 +278,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("\n  test:\n", workflow)
         self.assertIn("\n    name: test\n", workflow)
         self.assertIn("if: ${{ always() }}", workflow)
-        self.assertTrue(
-            "needs: platform_tests" in workflow
-            or "needs:\n      - platform_tests" in workflow
-        )
+        self.assertIn("platform_tests", _workflow_job_needs(workflow, "test"))
         self.assertIn(
             "PLATFORM_TESTS_RESULT: ${{ needs.platform_tests.result }}",
             workflow,
@@ -266,6 +286,35 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn(
             'test "$PLATFORM_TESTS_RESULT" = "success"',
             workflow,
+        )
+
+    def test_ci_dependency_parser_scopes_needs_to_the_selected_job(self) -> None:
+        scalar = "jobs:\n  test:\n    needs: platform_tests\n    runs-on: ubuntu-latest\n"
+        list_form = (
+            "jobs:\n"
+            "  test:\n"
+            "    needs:\n"
+            "      - compatibility_tests\n"
+            "      - platform_tests\n"
+            "    runs-on: ubuntu-latest\n"
+        )
+        other_job_only = (
+            "jobs:\n"
+            "  platform_gate:\n"
+            "    needs:\n"
+            "      - platform_tests\n"
+            "  test:\n"
+            "    needs: compatibility_tests\n"
+        )
+
+        self.assertEqual(_workflow_job_needs(scalar, "test"), ("platform_tests",))
+        self.assertEqual(
+            _workflow_job_needs(list_form, "test"),
+            ("compatibility_tests", "platform_tests"),
+        )
+        self.assertEqual(
+            _workflow_job_needs(other_job_only, "test"),
+            ("compatibility_tests",),
         )
 
     def test_helper_declares_and_tests_its_minimum_python_runtime(self) -> None:
