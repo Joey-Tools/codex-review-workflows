@@ -4,8 +4,8 @@ title: Claude CLI Platform Capabilities
 status: completed
 created: 2026-07-15
 updated: 2026-07-16
-branch: codex/claude-cli-platform-capabilities
-pr:
+branch: codex/claude-cli-trust-followup
+pr: https://github.com/Joey-Tools/codex-review-workflows/pull/46
 supersedes: []
 superseded_by:
 ---
@@ -33,8 +33,8 @@ superseded_by:
   `skills/review-orchestration-playbook/references/claude-runtime-trust.md` and
   summarized in the skill and helper contracts. The worktree implementation now
   contains the corresponding version, provenance, capability, Linux sandbox,
-  and credential paths; local and exact-archive Linux delivery validation is
-  complete.
+  and credential paths. The earlier exact-archive Linux validation is recorded
+  below; the final follow-up head is revalidated again before PR 46 merges.
 - Publisher provenance is based on Anthropic's fixed release-signing GPG
   fingerprint plus the signed per-version manifest and platform checksum.
   macOS code signing and notarization are not current acceptance gates; they may
@@ -48,22 +48,44 @@ superseded_by:
   to be disarmed.
 - The fixed-path native GPG source is a host-trust dependency used to verify the
   signature, not part of Anthropic publisher provenance. It must pass
-  native-format, owner, executable-mode, and stable file/path checks. A
-  group-writable parent is deliberately accepted for current-user Homebrew
-  layouts as an explicit same-user host-trust boundary; world-writable parents
-  and a group/world-writable verifier file are rejected. The helper retains a
-  stable source descriptor, copies it into a fresh current-user `0700` home
-  below an explicit helper-owned private root in the isolated review state,
-  publishes the copy as a `0500` execution snapshot, and uses only that snapshot
-  for key conversion, fingerprint listing, and signature verification. Ambient
-  temporary-directory variables are not trusted. On WSL2, each stability check
-  batches the requested root, resolved root, and complete parent chains against
-  one bounded mountinfo snapshot; DrvFS is rejected before private-home creation
-  and before every GPG call. The runtime report still records the inspected fixed
-  source path as `gpg_verifier`, separately from publisher provenance.
+  native-format, owner, executable-mode, and stable file/path checks. Linux/WSL2
+  accepts only root-owned `/usr/bin/gpg{,2}`. macOS may also accept canonical
+  same-user Homebrew GPG; only root/current-user-owned Homebrew directories with
+  the exact `admin` group may be group-writable, while verifier and dependency
+  files must not be group/world-writable. That `admin` group is an explicit
+  macOS host TCB boundary. The helper retains a stable source descriptor, copies
+  it into a fresh current-user `0700` home below an explicit helper-owned private
+  root, and publishes a `0500` execution snapshot. Copying the main executable
+  does not freeze libraries loaded later: fixed root-owned `/usr/bin/otool`
+  recursively captures the macOS Mach-O closure, requires the main executable
+  to select exactly `/usr/lib/dyld`, rejects loader commands in dependencies,
+  limits non-sealed dependencies to canonical Homebrew `opt`/`Cellar` roots,
+  and rejects mutable dyld search commands. Sealed macOS endpoints terminate
+  traversal as platform TCB; every
+  non-sealed Homebrew branch is recursively captured. Linux/WSL2 proves the
+  loader-visible `PT_DYNAMIC` table maps consistently through exactly one file-
+  backed `PT_LOAD` at byte and loader-page granularity, rejects other page-
+  rounded mappings over that table, rejects `DT_RPATH`/`DT_RUNPATH` and
+  `DT_AUDIT`/`DT_DEPAUDIT` in the main snapshot before a loader process may run,
+  and requires the canonical x64/arm64 glibc interpreter. The helper captures
+  the loader's lexical/resolved root-owned identity, proves native mount
+  provenance, matching architecture, `ET_DYN` type, no second interpreter or
+  unsafe tag, and a floating glibc version `>=2.27,<3.0`. It invokes that loader
+  directly with `--list`, rejects unsafe dependencies after the proven trace but
+  before GPG, and rebuilds the same loader version and closure for exact equality
+  before every GPG call. Musl and unknown host-GPG loaders are unavailable. Only the
+  private snapshot may traverse
+  a root-owned exact-`01777` system-temp ancestor. Its non-final directories use
+  device/inode/type/mode/owner/group anchor identities so GPG may create sibling
+  keyring/lock files without invalidating the closure; the executable itself,
+  glibc loader, and dependencies retain full identities. On WSL2, mountinfo proves both
+  old and refreshed snapshot, loader, lexical dependency, and resolved endpoint
+  paths are Linux-native. An already safe `otool` launch/nonzero failure is
+  inconclusive. The runtime report records the fixed source path as
+  `gpg_verifier`, separately from publisher provenance.
 - GPG and Linux security-sensitive host-tool calls use explicit minimal
   environments. Inherited dynamic-loader variables, shell startup state,
-  compiler flags, and toolchain overrides cannot influence GPG, `ldd`, tool
+  compiler flags, and toolchain overrides cannot influence GPG, loader/`ldd`, tool
   capability probes, or launcher compilation.
 - Native Mach-O/ELF shape, execute permission, architecture, and Linux libc
   target only exclude scripts, interpreter wrappers, and incompatible artifacts;
@@ -110,6 +132,22 @@ superseded_by:
   subject and object pronoun continuations must match positive templates. This
   avoids an open-ended negative-wording parser while still admitting bounded
   harmless wording changes.
+- A later PR-readiness review found a temporal reversal that still satisfied the
+  customization keyword set: text could claim customizations were disabled and
+  then restored after startup. Customization disablement now uses a bounded
+  whole-sentence positive grammar. It requires that the enumerated
+  customizations start, are, remain, or stay disabled, optionally for a bounded
+  whole-review/session duration. It rejects execution before disablement,
+  restoration after startup, conditional or temporary transitions, unsafe
+  enumerations, and additional relevant sentences that do not independently
+  satisfy a positive grammar. A later residual audit replaced the remaining
+  customization-name enumeration with true per-sentence default denial: every
+  sentence must match a bounded customization, policy, runtime, environment,
+  positive self/anaphoric, or online-information grammar. This also rejects
+  unknown surfaces such as `.claude/settings.json`, `CLAUDE.local.md`, auto
+  memory, and context shims regardless of their verb. The real `2.1.202`
+  troubleshooting-purpose suffix is explicitly bounded and accepted; harmless
+  whitespace wrapping around the enumeration remains accepted.
 - That review also found that strict `O_NOFOLLOW` reads rejected standard
   OpenSSL hash directories. CA directories are now pinned by descriptor and
   enumerated with explicit entry bounds. The bounded link resolver supports the
@@ -129,11 +167,18 @@ superseded_by:
   manifest entry from the artifact architecture. An x64 artifact may run through
   Rosetta on Apple Silicon, so the policy does not require exact host-CPU
   equality; the actual bootstrap probe must still execute successfully.
-- WSL2 is positively classified from multiple available signal sources: an
-  explicit WSL2 kernel marker, `/run/WSL`, or a validated `WSL_INTEROP` endpoint.
-  The runtime markers preserve support for WSL2 `customKernel` configurations
-  whose release string is user-selected, while weak environment/binfmt signals
-  alone cannot authorize the WSL2 path.
+- WSL2 is positively classified only when the kernel release or version has an
+  explicit `wsl2` or `microsoft-standard` identity marker. `/run/WSL`, any
+  nonempty `WSL_INTEROP` value (including an invalid or missing endpoint),
+  distro environment, binfmt evidence, and a generic `microsoft` kernel identity
+  remain conservative weak WSL-presence signals. They do not prove WSL2 and may
+  classify ambiguous or spoofed state as unsupported WSL1. If a guest removes
+  both the marker and
+  every weak signal, it is observationally indistinguishable from native Linux
+  and follows that classification. The common Linux/WSL mount guard therefore
+  rejects positive DrvFS/Windows provenance independently of WSL classification,
+  while positively identified WSL2 additionally requires proven native Linux
+  backing.
 - WSL2 requires the Claude executable, local-login credential, frozen review
   state, and all helper runtime state—including the provenance cache and
   verified snapshot—to remain in the WSL Linux filesystem. In addition to the
@@ -207,6 +252,15 @@ superseded_by:
   rejection was only one input-shape gate. The replacement preserves publisher
   provenance and execution stability while allowing compatible signed 2.x
   releases to float.
+- Candidate discovery and failure classification preserve the same trust
+  distinction. Failure to resolve or stat the selected executable is an
+  inspection-I/O ambiguity and is therefore inconclusive, never ordinary
+  unavailability. For automatic discovery, a clean absence of trusted GPG,
+  probe sandbox, or trusted review-tool prerequisites may still follow the
+  explicitly authorized Copilot fallback. The same prerequisite absence under
+  `CODEX_REVIEW_CLAUDE_PATH` is a blocked configuration error because the user
+  explicitly selected that path; authentication and loopback unavailability
+  retain their existing authorized fallback behavior.
 
 ## Next Steps
 
@@ -562,6 +616,248 @@ superseded_by:
   certificate through root-owned 0755 directories, confirming that the GitHub
   runner result is a host trust-layout difference rather than a Linux-wide
   regression. All local and remote validation artifacts were removed.
+- Prompt-projection fix `0723a22e3db9c3bb2a35e6ffe495baf9c840ef8f` was
+  exported as a 1341440-byte Git archive with SHA-256
+  `2915390dd6595a8a344d00606349836b862afc5ac78f4eba626b0d1a4b1c29a8`.
+  The exact archive passed all 520 tests on `codex-hoteng-srv-01` in 38.416
+  seconds with three expected skips, followed by `compileall`, actionlint
+  1.7.12, and five focused Linux prompt-projection tests. A first wrapper run
+  was discarded because its global `umask 077` changed a test fixture's
+  expected `0755` mode to `0700`; the counted rerun kept only the task root
+  private and used deterministic `umask 022` for the test process.
+- Fixed-range PR-readiness review against `0682597..0723a22` produced four
+  actionable trust findings. The private GPG main-file snapshot did not freeze
+  dynamic libraries opened later, so a mutable Homebrew dependency could forge
+  signature output. The safe-mode customization keyword set accepted a claim
+  that disabled customizations and restored them after startup. Initial
+  executable `resolve`/`stat` I/O failures were misclassified as clean runtime
+  unavailability. Finally, an explicit `CODEX_REVIEW_CLAUDE_PATH` could still
+  fall back to Copilot when trusted GPG, the probe sandbox, or trusted `rg` was
+  missing. Each finding was independently reproduced before repair. GitHub
+  Codex found no additional major issue on `0723a22`; its older Linux-path
+  thread was answered with the exact fix evidence and resolved.
+- Adversarial review of the first GPG closure repair found that Linux direct
+  host execution cannot reuse only the resolved identities intended for later
+  `bubblewrap` bind mounts: the ELF loader resolves lexical symlinks and search
+  policy again at process start. It also found uncaught Python 3.10-3.12
+  symlink-loop `RuntimeError` paths and an `otool` launch-race exception. The
+  final policy therefore gives host GPG its own loader closure, rejects mutable
+  loader search policy, captures lexical and resolved identities, and rebuilds
+  the closure for equality before every call; all resolve/launch inspection
+  races remain inconclusive rather than authorizing fallback.
+- After those repairs, the four focused capability/provenance/Linux/provider
+  modules passed all 403 tests with nine environment-gated skips. The complete
+  local suite passed all 547 tests in 73.736 seconds with nine skips. Full
+  runtime/test `ruff`, `compileall`, Python 3.10 grammar parsing across 20 files,
+  both workflow actionlint checks, strict Clang syntax checks for both C
+  helpers, `git diff --check`, project-journal validation, and the isolated
+  PyYAML skill validator passed. A real macOS publisher smoke used the fixed
+  Homebrew GPG source and its six captured non-sealed dylibs to verify installed
+  Claude Code `2.1.202` as `darwin-arm64`, size `243631376`, and SHA-256
+  `7414f707861e2fe5afef33a466f888a8d2170e5028f5e9d2858f1d3ef45ffca5`.
+  No credential or review content was supplied.
+- The same source snapshot received focused validation on
+  `codex-hoteng-srv-01`: 77 Linux tests passed with one expected skip and all 79
+  provenance tests passed. Real root-owned `/usr/bin/gpg` produced a 12-endpoint
+  host-execution ELF closure that rebuilt identically, then completed all three
+  GPG operations against Anthropic's signed `2.1.202` manifest. The first real
+  Linux smoke exposed intentional keyring/lock writes changing the private GPG
+  home directory timestamp; non-final snapshot directories now retain anchor
+  identities while the final executable remains fully identity-pinned. The
+  corrected smoke passed, and local/remote temporary files were removed.
+- A final security audit then found four residual fail-open surfaces. Broad
+  customization prose could add an unknown positive verb, WSL1 interop markers
+  could be mistaken for WSL2, a Mach-O executable could select a custom dynamic
+  linker, and ELF audit tags could load code outside the `ldd` dependency list.
+  The repair default-denies all extra customization-surface sentences while
+  preserving the exact upstream troubleshooting-purpose suffix, requires an
+  explicit WSL2 kernel identity marker, requires one main
+  `LC_LOAD_DYLINKER=/usr/lib/dyld` and none in dependency images, rejects main
+  `DT_AUDIT`/`DT_DEPAUDIT` tags before list-only `ldd`, and rejects dependency
+  tags after the trace but before any real GPG operation.
+- After that repair, the four focused capability/provenance/Linux/provider
+  modules passed all 408 tests with nine environment-gated skips. The complete
+  local suite passed all 552 tests in 75.275 seconds with nine skips. Full
+  runtime/test `ruff`, `compileall`, Python 3.10 grammar parsing across 20 files,
+  both workflow actionlint checks, strict Clang syntax checks for both C
+  helpers, `git diff --check`, and project-journal validation passed. The normal
+  skill-validator wrapper lacked local PyYAML; its documented isolated
+  `uv --with pyyaml` fallback validated the skill successfully.
+- The final real macOS smoke verified installed Claude Code `2.1.202` through
+  the fixed Homebrew GPG source and recursive six-dependency Mach-O closure,
+  matched the signed `darwin-arm64` artifact size `243631376` and SHA-256
+  `7414f707861e2fe5afef33a466f888a8d2170e5028f5e9d2858f1d3ef45ffca5`,
+  materialized the digest-keyed executable snapshot, and accepted the installed
+  release's real safe-mode help contract. The first sandboxed attempt could not
+  nest Seatbelt; the narrow host rerun supplied no credential or review data and
+  removed its temporary state.
+- A final read-only residual audit found three more trust-boundary gaps. The
+  customization check still depended on an enumerated noun list and missed
+  `.claude/settings.json`, `CLAUDE.local.md`, auto memory, or an unknown future
+  surface. A WSL2 guest that removed both its kernel marker and every weak
+  interop signal was indistinguishable from native Linux, contradicting the
+  earlier unconditional unsupported claim and skipping the DrvFS guard. Finally,
+  ELF dynamic tags were read from `PT_DYNAMIC.p_offset` without proving that the
+  loader-visible virtual range mapped to the same file bytes through `PT_LOAD`.
+- The repair applies true per-sentence default denial to the complete safe-mode
+  option block; documents the markerless-guest observability limit; runs positive
+  Windows/DrvFS mount-provenance rejection for both Linux and WSL classifications;
+  and requires the `PT_DYNAMIC` address, memory, and file-backed ranges to map
+  consistently through exactly one `PT_LOAD` before parsing tags or invoking
+  `ldd`. Native Linux retains its normal filesystem variety after the common
+  positive Windows-provenance rejection, while positively identified WSL2 keeps
+  the stricter local-backing allowlist.
+- A final ELF mapping review found that raw virtual-range uniqueness was still
+  weaker than the Linux loader's page-granular mapping behavior. The final
+  inspection therefore requires every `PT_LOAD` file offset and virtual address
+  to be congruent at the bounded host page size, rounds memory intervals with
+  overflow checks, and rejects any second load segment whose mapped pages alias
+  the file-backed `PT_DYNAMIC` pages before an `ldd` subprocess can start.
+- The last parser and documentation audit found three bounded residuals. A
+  customization anaphor could remain active across intervening policy or online-
+  information sentences; it is now accepted only immediately after the
+  customization declaration. Semver components now have a nine-digit bound and
+  conversion failures stay inside the capability-error classification instead
+  of escaping before provenance. Finally, the WSL contract now states the
+  implementation's conservative rule that any nonempty raw `WSL_INTEROP` value
+  and a generic `microsoft` kernel identity are ambiguous presence signals even
+  when the endpoint is invalid or missing; independent regressions cover both
+  cases.
+- After those final repairs, the four focused capability/provenance/Linux/provider
+  modules passed all 420 tests with nine environment-gated skips. The complete
+  local suite passed all 564 tests in 67.919 seconds with nine skips. Full
+  runtime/test `ruff`, `compileall`, Python 3.10 grammar parsing across 20 files,
+  both workflow actionlint checks, strict Clang syntax checks for both C helpers,
+  the isolated PyYAML skill validator, `git diff --check`, and project-journal
+  validation passed. The real macOS `2.1.202` signed-release, six-dependency GPG
+  closure, digest-keyed snapshot, and safe-mode help smoke also passed again
+  without credential or review data. Final independent security and
+  documentation/contract audits reported no remaining P0-P2 findings.
+- Exact commit `2ca3bb3` was exported as a 1484800-byte Git archive with
+  SHA-256 `172d4d37121562fcaf305c5eb1295595f70fbe5409a93693ef197a7d0fb6f79e`.
+  Its first authoritative run on `codex-hoteng-srv-01` exposed a real Linux
+  compatibility bug before GPG verification: eight unrelated `nsfs` mounts had
+  roots such as `mnt:[4026532676]` and `net:[4026532575]`, which the parser
+  incorrectly required to be absolute paths. This caused 37 errors and 14
+  failures through the common mount guard; that run is not counted as passing
+  evidence. Linux `nsfs_show_path` intentionally emits a namespace name plus
+  bracketed inode. The repair accepts that strict bounded grammar only for an
+  exact `nsfs` record, checks the inode against unsigned 64-bit range, and keeps
+  absolute canonical requirements for every ordinary filesystem root and every
+  mount point. Non-`nsfs` opaque roots and malformed namespace handles still
+  fail closed; the root field remains unused by path coverage and Windows-
+  provenance decisions.
+- After the `nsfs` repair, the four focused capability/provenance/Linux/provider
+  modules passed all 423 tests with nine environment-gated skips. The complete
+  local suite passed all 567 tests in 70.498 seconds with nine skips. Full
+  runtime/test `ruff`, `compileall`, Python 3.10 grammar parsing across 20 files,
+  both workflow actionlint checks, strict Clang syntax checks for both C helpers,
+  the isolated PyYAML skill validator, `git diff --check`, and project-journal
+  validation passed. An independent security audit confirmed that the bounded
+  root exception cannot affect mount coverage or DrvFS provenance and reported
+  no P0-P2 findings.
+- Repair commit `289d9cbb0504e0db3690ffb52f2238f46c868536` was
+  exported as a 1484800-byte Git archive with SHA-256
+  `df720c67c78893f5dca211445d2b9ca760e778674c8ddcb8fc32105e215b0407`;
+  the copied archive matched on `codex-hoteng-srv-01`. An initial extraction
+  below `/tmp` was intentionally discarded because the real trusted-runtime
+  path check rejected the world-writable `/tmp` ancestor before fixture-specific
+  assertions. Re-extracting the same archive below a private `/home/codex`
+  directory exercised the real trust precondition and passed all 567 tests in
+  38.981 seconds with three platform/opt-in skips. Remote `compileall`, both
+  workflow actionlint 1.7.12 checks, and strict GCC syntax checks for both C
+  helpers passed. The real root-owned `/usr/bin/gpg` host closure passed the
+  loader-page and dynamic-table checks, verified Anthropic's signed Claude Code
+  `2.1.196` `linux-x64` artifact at size `245373752` and SHA-256
+  `eb933c6dd5534db89b83ba09009d5c0932bd1395f7e3bb0f34ba37eec37bbade`,
+  and materialized the expected digest-keyed mode-`0500` snapshot. No credential
+  or review content was supplied.
+- Exact-range review of follow-up PR 46 found that the provider treated every
+  provenance-verifier runtime failure as if a deterministic dependency were
+  absent, which could authorize the automatic Copilot fallback. The repair adds
+  a dedicated dependency-unavailable subtype. Only proven absence or unsupported
+  platform/capability uses it; GPG launch failures, snapshot I/O errors, and
+  source-path inspection races are inconclusive and block fallback. Source-level
+  `EIO`, post-inspection `ENOENT`, GPG-launch, snapshot-creation, and provider
+  routing tests pin that classification boundary. A present wrapper, unsafe GPG
+  path/metadata, non-root Linux verifier, or unsafe macOS `otool` is invalid and
+  blocked rather than being relabeled as dependency absence.
+- The same review initially alleged that dependency audit tags could execute in
+  the first Linux `ldd` trace. Pinned glibc source disproved that exact mechanism:
+  audit tags are collected from the already-checked main map, and ordinary list
+  mode exits before normal relocation and application initialization. The audit
+  exposed a narrower real contract gap, however: proving only `/usr/bin/ldd`
+  ownership did not prove which implementation or loader semantics would run.
+  The final design removes `ldd` from the host-GPG provenance boundary. It
+  statically requires the architecture's canonical glibc interpreter, captures
+  both lexical and resolved identities, proves root ownership/mode/native mount,
+  matching architecture, `ET_DYN`, no nested interpreter or unsafe tags, accepts
+  floating glibc `>=2.27,<3.0`, and invokes only the captured loader's direct
+  `--list` interface. Musl and unknown host-GPG loaders are unavailable. Every
+  real GPG call rechecks loader identity/version and exact closure equality.
+- A read-only probe on `codex-hoteng-srv-01` confirmed the production x64 path
+  `/lib64/ld-linux-x86-64.so.2`, Ubuntu glibc `2.39`, no loader `PT_INTERP`, and
+  a directly listable `/usr/bin/gpg` closure. This is host/runtime capability
+  evidence, not publisher provenance for Claude Code or GPG.
+- The first real direct-loader GPG smoke on the follow-up implementation found a
+  Linux compatibility error that synthetic tests had missed: glibc's
+  `libc.so.6` is an executable `ET_DYN` dependency and legitimately carries a
+  `PT_INTERP` naming the same canonical glibc loader. Rejecting every dependency
+  interpreter therefore blocked the real Ubuntu GPG closure. The corrected rule
+  permits only that already-proven canonical interpreter on dependencies and
+  still rejects musl, custom, relative, or inconsistent interpreters; the loader
+  itself must continue to have no second `PT_INTERP`. Positive `libc.so.6`-shape
+  and negative musl-interpreter regressions pin the distinction.
+- After the fallback-classification and direct-loader repairs, the focused
+  provenance/provider/Linux modules passed all 414 tests with nine
+  environment-gated skips. The complete local suite passed all 584 tests in
+  66.277 seconds with nine skips. Full runtime/test `ruff`, `compileall`, both
+  workflow actionlint checks, strict Clang syntax checks for both C helpers, and
+  `git diff --check` passed. Python 3.10 grammar parsing across 20 files, the
+  isolated PyYAML skill validator, and project-journal validation had also
+  passed on the same implementation/docs set before this evidence-only entry.
+- After merging current `master` (`8f336c5`) and repairing the real
+  `libc.so.6` interpreter compatibility issue, the focused
+  provenance/provider/Linux modules passed all 415 tests with nine skips. The
+  merged complete local suite passed all 668 tests in 125.832 seconds with nine
+  skips. Full runtime/test `ruff`, `compileall`, both workflow actionlint checks,
+  strict Clang checks for both C helpers, `git diff --check`, and project-journal
+  validation passed before committing the compatibility repair.
+- Compatibility repair commit `be86e4c` was exported as an exact Git archive
+  with SHA-256
+  `8d9b65322997813c5403b2617123e2e401c3bd8c4ea0f29390aa6aaf2cfa0d2d`;
+  the copied archive matched on `codex-hoteng-srv-01`. The remote account's
+  default `umask 0002` correctly triggered group-writable safety failures, while
+  `0077` made one deliberate `0755` negative fixture private; neither run is
+  counted as passing evidence. With the standard non-group-writable `0022`
+  test umask, the same archive passed all 668 tests in 90.044 seconds with three
+  platform/opt-in skips. Remote `compileall`, actionlint 1.7.12 on both
+  workflows, strict GCC with the launcher's production POSIX feature macro, and
+  strict GCC for the Keychain broker all passed.
+- The same exact Linux archive then rebuilt and revalidated the real root-owned
+  `/usr/bin/gpg` closure through glibc `2.39`: the canonical lexical loader was
+  `/lib64/ld-linux-x86-64.so.2`, its resolved endpoint was
+  `/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2`, and the captured closure had
+  13 dependencies. Three real GPG operations verified Anthropic's signed Claude
+  Code `2.1.196` `linux-x64` artifact at size `245373752` and SHA-256
+  `eb933c6dd5534db89b83ba09009d5c0932bd1395f7e3bb0f34ba37eec37bbade`,
+  then materialized a single-link mode-`0500` digest snapshot. No credential or
+  review content was supplied, and the smoke's temporary GPG/snapshot roots
+  were removed automatically.
+- The final independent Codex PR review of
+  `27b054c171516288226f92473aee882a7b0c2652..fe197f9ad7aea023738cd3c1b7c18d43cd6d48c8`
+  found one P1 in the bounded safe-mode help grammar: the required runtime
+  capability sentence accepted `or` between authentication, model selection,
+  built-in tools, and permissions, so a disjunctive claim could satisfy the
+  lexical all-term check without guaranteeing every capability. The repair
+  permits only conjunctive enumeration in that positive runtime grammar and
+  adds regressions for all-`or`, Oxford-comma-`or`, and mixed `and`/`or`
+  variants. The focused capability suite passed all 27 tests. The complete
+  post-merge suite passed all 671 tests in 111.205 seconds with nine skips;
+  `ruff check`, Python 3.10 grammar parsing, `compileall`, actionlint, the
+  isolated skill validator, project-journal validation, and `git diff --check`
+  passed. A credential-free real help smoke also accepted all 16 required
+  options from installed Claude Code `2.1.202` under the tightened grammar.
 - Anthropic installation, signed-manifest, release-key fingerprint, and platform
   signature documentation: https://code.claude.com/docs/en/installation
 - Anthropic Seatbelt, `bubblewrap`, `socat`, WSL2, and WSL1 sandboxing
@@ -576,3 +872,24 @@ superseded_by:
 - Anthropic `dontAsk` and built-in tool behavior documentation:
   https://code.claude.com/docs/en/permission-modes and
   https://code.claude.com/docs/en/tools-reference
+- Microsoft WSL interop documentation showing that `/run/WSL` and
+  `WSL_INTEROP` are shared by WSL1 and WSL2:
+  https://wsl.dev/technical-documentation/interop/
+- Microsoft custom-kernel verification example retaining a
+  `WSL2-Microsoft` kernel marker:
+  https://learn.microsoft.com/en-us/community/content/wsl-user-msft-kernel-v6
+- Apple dynamic-linker documentation for `/usr/lib/dyld` and
+  `LC_LOAD_DYLINKER`:
+  https://developer.apple.com/forums/tags/linker
+- GNU C Library dynamic-linker hardening guidance for `DT_AUDIT` and
+  `DT_DEPAUDIT`:
+  https://www.sourceware.org/glibc/manual/latest/html_node/Dynamic-Linker-Hardening.html
+- Pinned GNU C Library loader/list implementation used to justify the direct
+  `--list` contract:
+  https://github.com/bminor/glibc/blob/04e750e75b73957cf1c791535a3f4319534a52fc/elf/rtld.c
+- Linux kernel ELF mapping implementation:
+  https://github.com/torvalds/linux/blob/master/fs/binfmt_elf.c
+- Linux kernel namespace-filesystem path implementation:
+  https://github.com/torvalds/linux/blob/master/fs/nsfs.c
+- System V ELF program-header and page-congruence specification:
+  https://refspecs.linuxfoundation.org/elf/gabi4%2B/ch5.pheader.html

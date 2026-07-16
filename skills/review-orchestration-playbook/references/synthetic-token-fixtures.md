@@ -70,6 +70,8 @@ A legacy envelope uses this illustrative shape:
 
 The angle-bracket fields above are placeholders, not valid catalog data. Counts must be positive integers backed by the audit. The fixed helper-owned catalog stores each legacy value as strict canonical Base64 and decodes it in memory as the exact ASCII runtime authority, avoiding a raw-literal bootstrap exception when the helper's own private catalog is reviewed. The encoded form is storage only: it is never accepted as a token value and may not overlap any authoring value or public metadata. Metadata-only CLI output, manifests, and audit/preflight evidence expose only the derived SHA-256 digest, byte length, IDs, and counts; they never serialize the raw value or the storage encoding.
 
+Authoring values use the scanner-compatible restricted byte class so new fixtures remain portable and predictable. Legacy values are a separate migration boundary: canonical Base64 must decode to exactly 16–512 printable ASCII bytes (`0x20` through `0x7e`) without single- or double-quote delimiters. This permits an already-published quoted scanner capture to contain spaces or other punctuation without turning those characters into an authoring namespace. Control bytes, newlines, non-ASCII text, quote delimiters, alternate encodings, and regex forms fail closed. Runtime suppression and `audit-master` still require the complete decoded value to match the declared scanner rule exactly.
+
 `repository`, `containing_commit`, `verified_master_tip`, and `source_occurrences` are admission provenance. They prove why a value may enter the catalog; they are not a runtime repository or fork allowlist.
 
 ## Authoring Pool
@@ -128,7 +130,7 @@ isolated_review synthetic-tokens audit-master \
   --exemption <id>
 ```
 
-`list` returns authoring metadata only. `get` returns the raw value for exactly one selected authoring ID. `list-exemptions` exposes IDs, provenance, rules, digests, lengths, and counts without raw legacy values. `audit-master` verifies all exact raw-byte occurrences at each provenance commit and requires at least one occurrence eligible under the declared scanner rule; it does not mutate either the repository or catalog.
+`list` returns authoring metadata only. `get` returns the raw value for exactly one selected authoring ID. `list-exemptions` exposes IDs, provenance, rules, digests, lengths, and counts without raw legacy values. `audit-master` verifies all exact raw-byte occurrences at each provenance commit and requires at least one occurrence eligible under the declared scanner rule; it does not mutate either the repository or catalog. Provenance auditing exhaustively collects bounded scanner events so an unrelated earlier finding cannot hide a later eligible capture. This does not certify the tree as finding-free: ordinary preflight remains fail-fast, and every unrelated or non-exempt finding still blocks review.
 
 ## Preflight Evidence
 

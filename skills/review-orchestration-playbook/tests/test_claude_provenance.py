@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -753,6 +754,12 @@ class ManifestParsingTest(unittest.TestCase):
 
 class GpgVerificationTest(unittest.TestCase):
     def setUp(self) -> None:
+        self.gpg_runtime_patcher = mock.patch.object(
+            claude_provenance,
+            "_prepare_trusted_gpg_runtime",
+            return_value=claude_provenance._TrustedGpgRuntime(),
+        )
+        self.gpg_runtime_patcher.start()
         self.temporary = tempfile.TemporaryDirectory(
             dir=pathlib.Path(__file__).resolve().parent
         )
@@ -770,6 +777,7 @@ class GpgVerificationTest(unittest.TestCase):
         self.gpg_path.chmod(0o700)
 
     def tearDown(self) -> None:
+        self.gpg_runtime_patcher.stop()
         self.temporary.cleanup()
 
     def fake_gpg(
@@ -852,6 +860,341 @@ class GpgVerificationTest(unittest.TestCase):
         self.assertEqual(len(execution_paths), 3)
         self.assertEqual(len(set(execution_paths)), 1)
         self.assertTrue(all(not home.exists() for home in homes))
+
+    def test_revalidates_dynamic_dependencies_before_every_gpg_call(self) -> None:
+        with (
+            mock.patch.object(
+                claude_provenance,
+                "_revalidate_trusted_gpg_runtime",
+            ) as revalidate,
+            mock.patch.object(
+                claude_provenance,
+                "_run_gpg",
+                side_effect=self.fake_gpg,
+            ),
+        ):
+            claude_provenance.verify_manifest_signature(
+                self.bundle,
+                temp_root=self.root,
+                gpg_candidates=(self.gpg_path,),
+            )
+
+        self.assertEqual(revalidate.call_count, 3)
+
+    def test_changed_dynamic_dependency_blocks_gpg_before_execution(self) -> None:
+        dependency = self.root / "libgcrypt.dylib"
+        dependency.write_bytes(b"trusted")
+        dependency.chmod(0o400)
+        runtime = claude_provenance._TrustedGpgRuntime(
+            darwin_dependencies=(
+                claude_provenance._TrustedGpgDependency(
+                    dependency,
+                    (
+                        (
+                            dependency,
+                            claude_provenance._stat_identity(dependency.lstat()),
+                        ),
+                    ),
+                ),
+            )
+        )
+
+        def prepare(_executable):  # type: ignore[no-untyped-def]
+            replacement = self.root / "replacement.dylib"
+            replacement.write_bytes(b"evil-lib")
+            replacement.chmod(0o400)
+            os.replace(replacement, dependency)
+            return runtime
+
+        with (
+            mock.patch.object(
+                claude_provenance,
+                "_prepare_trusted_gpg_runtime",
+                side_effect=prepare,
+            ),
+            mock.patch.object(claude_provenance, "_run_gpg") as runner,
+            self.assertRaisesRegex(
+                claude_provenance.ClaudeProvenanceInconclusive,
+                "dynamic dependency changed",
+            ),
+        ):
+            claude_provenance.verify_manifest_signature(
+                self.bundle,
+                temp_root=self.root,
+                gpg_candidates=(self.gpg_path,),
+            )
+
+        runner.assert_not_called()
+
+    def test_darwin_dependency_inspection_rejects_mutable_external_path(
+        self,
+    ) -> None:
+        executable = pathlib.Path("/private/tmp/gpg-verifier")
+
+        def otool(path, option):  # type: ignore[no-untyped-def]
+            if option == "-l":
+                return (
+                    f"{path}:\n"
+                    "Load command 0\n"
+                    "          cmd LC_LOAD_DYLINKER\n"
+                    "      cmdsize 32\n"
+                    "         name /usr/lib/dyld (offset 12)\n"
+                )
+            return (
+                f"{path}:\n"
+                "\t/tmp/libgcrypt.20.dylib "
+                "(compatibility version 1.0.0, current version 1.0.0)\n"
+            )
+
+        with (
+            mock.patch.object(
+                claude_provenance,
+                "_run_otool",
+                side_effect=otool,
+            ),
+            self.assertRaisesRegex(
+                claude_provenance.ClaudeProvenanceInvalid,
+                "outside sealed or Homebrew roots",
+            ),
+        ):
+            claude_provenance._collect_darwin_gpg_dependencies(executable)
+
+    def test_darwin_load_commands_require_one_standard_main_dyld(self) -> None:
+        executable = pathlib.Path("/private/tmp/gpg-verifier")
+        for label, load_commands in (
+            (
+                "missing",
+                f"{executable}:\n"
+                "Load command 0\n"
+                "      cmd LC_SEGMENT_64\n"
+                "  cmdsize 72\n",
+            ),
+            (
+                "custom",
+                f"{executable}:\n"
+                "Load command 0\n"
+                "          cmd LC_LOAD_DYLINKER\n"
+                "      cmdsize 40\n"
+                "         name /opt/homebrew/lib/dyld (offset 12)\n",
+            ),
+            (
+                "duplicate",
+                f"{executable}:\n"
+                "Load command 0\n"
+                "          cmd LC_LOAD_DYLINKER\n"
+                "      cmdsize 32\n"
+                "         name /usr/lib/dyld (offset 12)\n"
+                "Load command 1\n"
+                "          cmd LC_LOAD_DYLINKER\n"
+                "      cmdsize 32\n"
+                "         name /usr/lib/dyld (offset 12)\n",
+            ),
+        ):
+            with (
+                self.subTest(label=label),
+                self.assertRaisesRegex(
+                    claude_provenance.ClaudeProvenanceInvalid,
+                    "exactly one sealed /usr/lib/dyld",
+                ),
+            ):
+                claude_provenance._validate_darwin_gpg_load_commands(
+                    executable,
+                    load_commands,
+                    main_executable=True,
+                )
+
+    def test_darwin_dependency_cannot_declare_a_dynamic_linker(self) -> None:
+        dependency = pathlib.Path(
+            "/opt/homebrew/opt/libgcrypt/lib/libgcrypt.20.dylib"
+        )
+        load_commands = (
+            f"{dependency}:\n"
+            "Load command 0\n"
+            "          cmd LC_LOAD_DYLINKER\n"
+            "      cmdsize 32\n"
+            "         name /usr/lib/dyld (offset 12)\n"
+        )
+
+        with self.assertRaisesRegex(
+            claude_provenance.ClaudeProvenanceInvalid,
+            "dependency unexpectedly declares LC_LOAD_DYLINKER",
+        ):
+            claude_provenance._validate_darwin_gpg_load_commands(
+                dependency,
+                load_commands,
+                main_executable=False,
+            )
+
+    def test_darwin_dependency_inspection_rejects_rpath(self) -> None:
+        executable = pathlib.Path("/private/tmp/gpg-verifier")
+
+        def otool(path, option):  # type: ignore[no-untyped-def]
+            if option == "-l":
+                return f"{path}:\nLoad command 1\n      cmd LC_RPATH\n"
+            self.fail("-L must not run after an unsafe LC_RPATH")
+
+        with (
+            mock.patch.object(
+                claude_provenance,
+                "_run_otool",
+                side_effect=otool,
+            ),
+            self.assertRaisesRegex(
+                claude_provenance.ClaudeProvenanceInvalid,
+                "mutable dyld search path",
+            ),
+        ):
+            claude_provenance._collect_darwin_gpg_dependencies(executable)
+
+    def test_darwin_dependency_symlink_loop_is_inconclusive(self) -> None:
+        dependency = pathlib.Path(
+            "/opt/homebrew/opt/libgcrypt/lib/libgcrypt.20.dylib"
+        )
+
+        with (
+            mock.patch.object(
+                pathlib.Path,
+                "resolve",
+                autospec=True,
+                side_effect=RuntimeError("symlink loop fixture"),
+            ),
+            self.assertRaisesRegex(
+                claude_provenance.ClaudeProvenanceInconclusive,
+                "cannot resolve GPG dynamic dependency",
+            ),
+        ):
+            claude_provenance._capture_gpg_dependency_chain(dependency)
+
+    def test_otool_start_io_failure_is_inconclusive(self) -> None:
+        trusted_otool = mock.Mock()
+        trusted_otool.stat.return_value = mock.Mock(
+            st_mode=stat.S_IFREG | 0o755,
+            st_uid=0,
+        )
+
+        with (
+            mock.patch.object(
+                claude_provenance,
+                "TRUSTED_OTOOL",
+                trusted_otool,
+            ),
+            mock.patch.object(
+                claude_provenance.os,
+                "access",
+                return_value=True,
+            ),
+            mock.patch.object(
+                claude_provenance,
+                "run_bounded_capture",
+                side_effect=OSError("exec fixture"),
+            ),
+            self.assertRaisesRegex(
+                claude_provenance.ClaudeProvenanceInconclusive,
+                "cannot start bounded macOS",
+            ),
+        ):
+            claude_provenance._run_otool(
+                pathlib.Path("/private/tmp/gpg-verifier"),
+                "-L",
+            )
+
+    def test_otool_unsafe_metadata_is_invalid_not_unavailable(self) -> None:
+        trusted_otool = mock.Mock()
+        trusted_otool.stat.return_value = mock.Mock(
+            st_mode=stat.S_IFREG | 0o775,
+            st_uid=0,
+        )
+
+        with (
+            mock.patch.object(
+                claude_provenance,
+                "TRUSTED_OTOOL",
+                trusted_otool,
+            ),
+            mock.patch.object(
+                claude_provenance.os,
+                "access",
+                return_value=True,
+            ),
+            self.assertRaises(
+                claude_provenance.ClaudeProvenanceInvalid
+            ) as caught,
+        ):
+            claude_provenance._run_otool(
+                pathlib.Path("/private/tmp/gpg-verifier"),
+                "-L",
+            )
+
+        self.assertNotIsInstance(
+            caught.exception,
+            claude_provenance.ClaudeProvenanceUnavailable,
+        )
+
+    def test_otool_inspection_failure_is_inconclusive(self) -> None:
+        trusted_otool = mock.Mock()
+        trusted_otool.stat.return_value = mock.Mock(
+            st_mode=stat.S_IFREG | 0o755,
+            st_uid=0,
+        )
+
+        with (
+            mock.patch.object(
+                claude_provenance,
+                "TRUSTED_OTOOL",
+                trusted_otool,
+            ),
+            mock.patch.object(
+                claude_provenance.os,
+                "access",
+                return_value=True,
+            ),
+            mock.patch.object(
+                claude_provenance,
+                "run_bounded_capture",
+                return_value=completed(
+                    ["/usr/bin/otool", "-L"],
+                    returncode=1,
+                    stderr=b"inspection fixture",
+                ),
+            ),
+            self.assertRaisesRegex(
+                claude_provenance.ClaudeProvenanceInconclusive,
+                "could not inspect",
+            ),
+        ):
+            claude_provenance._run_otool(
+                pathlib.Path("/private/tmp/gpg-verifier"),
+                "-L",
+            )
+
+    def test_darwin_dependency_rejects_group_writable_library_file(self) -> None:
+        dependency = self.root / "libgcrypt.dylib"
+        dependency.write_bytes(b"fixture")
+        dependency.chmod(0o460)
+        gid = dependency.stat().st_gid
+
+        with (
+            mock.patch.object(
+                claude_provenance,
+                "_darwin_homebrew_dependency_path",
+                return_value=True,
+            ),
+            mock.patch.object(
+                claude_provenance,
+                "_darwin_homebrew_path",
+                return_value=True,
+            ),
+            mock.patch.object(
+                claude_provenance,
+                "_darwin_admin_gid",
+                return_value=gid,
+            ),
+            self.assertRaisesRegex(
+                claude_provenance.ClaudeProvenanceInvalid,
+                "untrusted writable path",
+            ),
+        ):
+            claude_provenance._capture_gpg_dependency_chain(dependency)
 
     def test_ambient_tmpdir_cannot_redirect_gpg_snapshot_execution(self) -> None:
         ambient = self.root / "ambient-tmp"
@@ -1117,7 +1460,7 @@ class GpgVerificationTest(unittest.TestCase):
         self.gpg_path.chmod(0o720)
         with (
             mock.patch.object(claude_provenance, "_run_gpg") as runner,
-            self.assertRaises(claude_provenance.ClaudeProvenanceUnavailable),
+            self.assertRaises(claude_provenance.ClaudeProvenanceInvalid),
         ):
             claude_provenance.verify_manifest_signature(
                 self.bundle,
@@ -1244,6 +1587,56 @@ class GpgVerificationTest(unittest.TestCase):
                     timeout_seconds=1,
                 )
 
+    def test_run_gpg_start_io_is_not_dependency_unavailable(self) -> None:
+        with (
+            mock.patch.object(
+                claude_provenance,
+                "run_bounded_capture",
+                side_effect=OSError(errno.EIO, "injected GPG launch failure"),
+            ),
+            self.assertRaises(
+                claude_provenance.ClaudeProvenanceUnavailable
+            ) as caught,
+        ):
+            claude_provenance._run_gpg(
+                ["/trusted/gpg", "--version"],
+                env={"LANG": "C"},
+                timeout_seconds=1,
+            )
+
+        self.assertNotIsInstance(
+            caught.exception,
+            claude_provenance.ClaudeProvenanceDependencyUnavailable,
+        )
+
+    def test_gpg_snapshot_write_io_is_not_dependency_unavailable(self) -> None:
+        with tempfile.TemporaryFile() as source, tempfile.TemporaryFile() as target:
+            source.write(b"\x7fELF" + b"trusted GPG fixture")
+            source.flush()
+            with (
+                mock.patch.object(
+                    claude_provenance.os,
+                    "write",
+                    side_effect=OSError(
+                        errno.ENOSPC,
+                        "injected GPG snapshot write failure",
+                    ),
+                ),
+                self.assertRaises(
+                    claude_provenance.ClaudeProvenanceUnavailable
+                ) as caught,
+            ):
+                claude_provenance._copy_gpg_snapshot(
+                    source.fileno(),
+                    target.fileno(),
+                    max_bytes=1024,
+                )
+
+        self.assertNotIsInstance(
+            caught.exception,
+            claude_provenance.ClaudeProvenanceDependencyUnavailable,
+        )
+
     def test_run_gpg_applies_independent_stream_limits(self) -> None:
         capture = mock.Mock(returncode=0, stdout=bytearray(b"out"), stderr=bytearray())
         with mock.patch.object(
@@ -1285,6 +1678,111 @@ class GpgVerificationTest(unittest.TestCase):
                 native.resolve(),
             )
 
+    def test_missing_trusted_gpg_candidate_is_dependency_unavailable(self) -> None:
+        with self.assertRaises(
+            claude_provenance.ClaudeProvenanceDependencyUnavailable
+        ):
+            claude_provenance.resolve_trusted_gpg(
+                (pathlib.Path("/definitely/missing/codex-review-gpg"),)
+            )
+
+    def test_wrapper_only_gpg_candidate_is_invalid_not_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory(
+            dir=pathlib.Path(__file__).resolve().parent
+        ) as raw:
+            wrapper = pathlib.Path(raw) / "gpg-wrapper"
+            wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            wrapper.chmod(0o700)
+
+            with self.assertRaises(
+                claude_provenance.ClaudeProvenanceInvalid
+            ) as caught:
+                claude_provenance.resolve_trusted_gpg((wrapper,))
+
+        self.assertNotIsInstance(
+            caught.exception,
+            claude_provenance.ClaudeProvenanceUnavailable,
+        )
+
+    def test_trusted_gpg_candidate_stat_io_is_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory(
+            dir=pathlib.Path(__file__).resolve().parent
+        ) as raw:
+            native = pathlib.Path(raw) / "gpg"
+            native.write_bytes(b"\x7fELF" + b"\x00" * 16)
+            native.chmod(0o700)
+            resolved = native.resolve()
+            original_stat = pathlib.Path.stat
+
+            def fail_candidate_stat(
+                path: pathlib.Path,
+                *args: object,
+                **kwargs: object,
+            ) -> os.stat_result:
+                if path == resolved:
+                    raise OSError(errno.EIO, "injected candidate stat failure")
+                return original_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+            with (
+                mock.patch.object(
+                    pathlib.Path,
+                    "stat",
+                    autospec=True,
+                    side_effect=fail_candidate_stat,
+                ),
+                self.assertRaisesRegex(
+                    claude_provenance.ClaudeProvenanceInconclusive,
+                    "candidate stat failure",
+                ),
+            ):
+                claude_provenance.resolve_trusted_gpg((native,))
+
+    def test_trusted_gpg_candidate_open_race_is_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory(
+            dir=pathlib.Path(__file__).resolve().parent
+        ) as raw:
+            native = pathlib.Path(raw) / "gpg"
+            native.write_bytes(b"\x7fELF" + b"\x00" * 16)
+            native.chmod(0o700)
+
+            with (
+                mock.patch.object(
+                    claude_provenance.os,
+                    "open",
+                    side_effect=FileNotFoundError(
+                        errno.ENOENT,
+                        "injected candidate open race",
+                    ),
+                ),
+                self.assertRaisesRegex(
+                    claude_provenance.ClaudeProvenanceInconclusive,
+                    "candidate open race",
+                ),
+            ):
+                claude_provenance.resolve_trusted_gpg((native,))
+
+    def test_default_linux_gpg_candidates_are_root_owned_usr_bin_only(self) -> None:
+        with (
+            mock.patch.object(claude_provenance.sys, "platform", "linux"),
+            mock.patch.object(
+                claude_provenance,
+                "_resolve_trusted_gpg_source",
+                side_effect=claude_provenance.ClaudeProvenanceUnavailable(
+                    "fixture"
+                ),
+            ) as resolver,
+            self.assertRaises(claude_provenance.ClaudeProvenanceUnavailable),
+        ):
+            claude_provenance.resolve_trusted_gpg()
+
+        resolver.assert_called_once_with(
+            (
+                pathlib.Path("/usr/bin/gpg"),
+                pathlib.Path("/usr/bin/gpg2"),
+            ),
+            require_root_owner=True,
+        )
+
     def test_resolve_trusted_gpg_rejects_writable_verifier_file(self) -> None:
         with tempfile.TemporaryDirectory(
             dir=pathlib.Path(__file__).resolve().parent
@@ -1294,7 +1792,7 @@ class GpgVerificationTest(unittest.TestCase):
             native.chmod(0o720)
 
             with self.assertRaises(
-                claude_provenance.ClaudeProvenanceUnavailable
+                claude_provenance.ClaudeProvenanceInvalid
             ):
                 claude_provenance.resolve_trusted_gpg((native,))
 
@@ -1309,11 +1807,11 @@ class GpgVerificationTest(unittest.TestCase):
             root.chmod(0o707)
 
             with self.assertRaises(
-                claude_provenance.ClaudeProvenanceUnavailable
+                claude_provenance.ClaudeProvenanceInvalid
             ):
                 claude_provenance.resolve_trusted_gpg((native,))
 
-    def test_resolve_trusted_gpg_allows_group_writable_homebrew_style_parent(
+    def test_resolve_trusted_gpg_rejects_generic_group_writable_parent(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory(
@@ -1325,10 +1823,57 @@ class GpgVerificationTest(unittest.TestCase):
             native.chmod(0o700)
             root.chmod(0o770)
 
-            self.assertEqual(
-                claude_provenance.resolve_trusted_gpg((native,)),
-                native.resolve(),
-            )
+            with self.assertRaises(
+                claude_provenance.ClaudeProvenanceInvalid
+            ):
+                claude_provenance.resolve_trusted_gpg((native,))
+
+    def test_resolve_trusted_gpg_allows_only_homebrew_admin_group_parent(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            dir=pathlib.Path(__file__).resolve().parent
+        ) as raw:
+            root = pathlib.Path(raw)
+            native = root / "gpg"
+            native.write_bytes(b"\x7fELF" + b"\x00" * 16)
+            native.chmod(0o700)
+            root.chmod(0o770)
+            gid = root.stat().st_gid
+
+            with (
+                mock.patch.object(
+                    claude_provenance,
+                    "_darwin_homebrew_path",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    claude_provenance,
+                    "_darwin_admin_gid",
+                    return_value=gid,
+                ),
+            ):
+                self.assertEqual(
+                    claude_provenance.resolve_trusted_gpg((native,)),
+                    native.resolve(),
+                )
+
+            with (
+                mock.patch.object(
+                    claude_provenance,
+                    "_darwin_homebrew_path",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    claude_provenance,
+                    "_darwin_admin_gid",
+                    return_value=gid + 1,
+                ),
+                self.assertRaises(
+                    claude_provenance.ClaudeProvenanceInvalid
+                ),
+            ):
+                claude_provenance.resolve_trusted_gpg((native,))
 
     def test_resolve_trusted_gpg_rejects_foreign_non_root_owner(self) -> None:
         with tempfile.TemporaryDirectory(
@@ -1364,7 +1909,7 @@ class GpgVerificationTest(unittest.TestCase):
                     autospec=True,
                     side_effect=stat_with_foreign_owner,
                 ),
-                self.assertRaises(claude_provenance.ClaudeProvenanceUnavailable),
+                self.assertRaises(claude_provenance.ClaudeProvenanceInvalid),
             ):
                 claude_provenance.resolve_trusted_gpg((native,))
 
@@ -1400,6 +1945,65 @@ class ExecutableVerificationTest(unittest.TestCase):
         )
 
         self.assertEqual(verified, self.executable.resolve())
+
+    def test_missing_executable_is_inconclusive(self) -> None:
+        missing = self.root / "missing-claude"
+
+        with self.assertRaisesRegex(
+            claude_provenance.ClaudeProvenanceInconclusive,
+            "cannot resolve",
+        ):
+            claude_provenance.verify_release_executable(missing, self.artifact)
+
+    def test_executable_symlink_loop_is_inconclusive(self) -> None:
+        with (
+            mock.patch.object(
+                pathlib.Path,
+                "resolve",
+                autospec=True,
+                side_effect=RuntimeError("fixture symlink loop"),
+            ),
+            self.assertRaisesRegex(
+                claude_provenance.ClaudeProvenanceInconclusive,
+                "cannot resolve",
+            ),
+        ):
+            claude_provenance.verify_release_executable(
+                self.executable,
+                self.artifact,
+            )
+
+    def test_executable_stat_io_failure_is_inconclusive(self) -> None:
+        original_stat = pathlib.Path.stat
+        resolved_target = self.executable.resolve()
+
+        def fail_target_stat(
+            path: pathlib.Path,
+            *args: object,
+            **kwargs: object,
+        ) -> os.stat_result:
+            if path == resolved_target and kwargs.get(
+                "follow_symlinks"
+            ) is False:
+                raise OSError("fixture stat I/O failure")
+            return original_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+        with (
+            mock.patch.object(
+                pathlib.Path,
+                "stat",
+                autospec=True,
+                side_effect=fail_target_stat,
+            ),
+            self.assertRaisesRegex(
+                claude_provenance.ClaudeProvenanceInconclusive,
+                "cannot stat",
+            ),
+        ):
+            claude_provenance.verify_release_executable(
+                self.executable,
+                self.artifact,
+            )
 
     def test_rejects_size_mismatch_before_hashing(self) -> None:
         wrong = claude_provenance.ClaudeReleaseArtifact(

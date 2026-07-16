@@ -182,6 +182,25 @@ def _require_authoring_value(value: Any, *, label: str) -> bytes:
     return encoded
 
 
+def _require_legacy_ascii_value(value: str, *, label: str) -> bytes:
+    try:
+        encoded = value.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise ReviewError(
+            f"synthetic token catalog {label} must encode exact ASCII"
+        ) from error
+    if not 16 <= len(encoded) <= 512:
+        raise ReviewError(
+            f"synthetic token catalog {label} value length must be 16..512 bytes"
+        )
+    if any(byte < 0x20 or byte > 0x7E or byte in (0x22, 0x27) for byte in encoded):
+        raise ReviewError(
+            f"synthetic token catalog {label} must encode printable ASCII bytes "
+            "without quote delimiters"
+        )
+    return encoded
+
+
 def _require_legacy_value(value: Any, *, label: str) -> bytes:
     if not isinstance(value, str):
         raise ReviewError(f"synthetic token catalog {label} must be canonical Base64")
@@ -200,7 +219,7 @@ def _require_legacy_value(value: Any, *, label: str) -> bytes:
         raise ReviewError(
             f"synthetic token catalog {label} must encode exact ASCII"
         ) from error
-    return _require_authoring_value(raw_value, label=label)
+    return _require_legacy_ascii_value(raw_value, label=label)
 
 
 def _require_string_choice(

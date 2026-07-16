@@ -35,9 +35,11 @@ capabilities workstreams.
   read-only credential snapshot for the 1920-second window. The runtime never
   refreshes or persists the host credential.
 - API-key attempts skip local-login warmup and local credential staging.
-- A warmup supervision failure is recorded as authentication-preflight
-  inconclusive and returns Outcome 75 while preserving earlier model-attempt
-  evidence. It never enters Copilot fallback.
+- A warmup supervision or explicit transient failure is recorded as
+  authentication-preflight inconclusive and returns Outcome 75 while preserving
+  earlier model-attempt evidence. This remains true if the warmup happened to
+  refresh the credential before returning a transient result, and it never
+  enters Copilot fallback.
 - Explicit authentication unavailability and model entitlement keep the
   existing fallback policy: only prior `double-review` or `triple-review`
   consent may authorize Copilot.
@@ -46,16 +48,19 @@ capabilities workstreams.
 
 ## Validation Evidence
 
-- `python3 -m py_compile skills/review-orchestration-playbook/scripts/isolated_review skills/review-orchestration-playbook/scripts/review_runtime/*.py`
-- `ruff check` for the modified provider, Linux runtime, provider tests, and
-  contract tests
-- Focused provider tests: 15 passed
-- Full helper suite: 612 tests run; 4 skipped and the suite passed
-- The broker fixture's sandbox loopback denial reproduced on the unchanged
-  canonical mirror; the same fixture passed outside that sandbox, and the full
-  suite then passed outside it.
-- CI-equivalent Linux launcher syntax check with `cc -std=c11 -O2 -Wall
-  -Wextra -Werror -D_POSIX_C_SOURCE=200809L -fsyntax-only`
+- Python compile checks passed for the helper scripts and complete runtime/test
+  trees.
+- Full runtime/test `ruff check` passed.
+- Focused provider and contract suite: 251 tests run; 6 skipped and the suite
+  passed. The final transient-after-refresh regression and its adjacent warmup
+  cases also passed separately.
+- Full helper suite on current `master`: 682 tests run; 9 skipped and the suite
+  passed.
+- Strict Clang syntax checks passed for the unchanged Keychain broker and Linux
+  launcher, including the production POSIX feature macro for the launcher.
+- Both workflow actionlint checks, the isolated PyYAML skill validator,
+  synthetic-token catalog validation, project-journal validation, and
+  `git diff --check` passed.
 
 No live Claude or Copilot review, repository-content egress to those providers,
 private overlay synchronization, release, or live OAuth retry was performed.
@@ -63,13 +68,3 @@ private overlay synchronization, release, or live OAuth retry was performed.
 ## Next Steps
 
 - None for this local delivery workstream.
-
-## Deferred Follow-Up
-
-1. Merge the reviewed public change after explicit authorization.
-2. Force the private source sync and confirm its sync PR and Private Overlay
-   Release.
-3. Update the private overlay on the local machine and
-   `BL-mac-mini-m4-hoteng`, then verify the deployed helper contains the
-   per-attempt behavior.
-4. Retry the original live Claude review only after those deployment gates.
