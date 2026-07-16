@@ -51,16 +51,26 @@ class ClaudeCapabilitiesTest(unittest.TestCase):
                 with self.assertRaises(capabilities.ClaudeCapabilityError):
                     capabilities.parse_claude_version(output)
 
+    def test_version_range_rejects_oversized_numeric_components(self) -> None:
+        for output in (
+            f"2.{'9' * 10}.1 (Claude Code)\n",
+            f"{'9' * 5000}.1.1 (Claude Code)\n",
+        ):
+            with self.subTest(output_length=len(output)):
+                with self.assertRaises(capabilities.ClaudeCapabilityError):
+                    capabilities.parse_claude_version(output)
+
     def test_help_accepts_semantic_wording_changes(self) -> None:
         options, block = capabilities.validate_claude_help(supported_help())
 
         self.assertEqual(options, capabilities.CLAUDE_REQUIRED_OPTIONS)
         self.assertIn("admin-managed", block)
 
-    def test_help_accepts_harmless_negation_and_positive_wording_changes(self) -> None:
+    def test_help_accepts_bounded_information_and_positive_wording_changes(
+        self,
+    ) -> None:
         safe_mode = (
-            "This option may not require additional setup, but this note is "
-            "informational. Start with all "
+            "Documentation about safe mode remains available online. Start with all "
             "customizations (CLAUDE.md, skills, plugins, hooks, MCP servers, "
             "custom commands and agents, output styles, workflows, custom themes, "
             "keybindings, and more) disabled. Managed policy settings remain "
@@ -186,10 +196,168 @@ class ClaudeCapabilitiesTest(unittest.TestCase):
                 "temporarily",
                 base.replace(") disabled.", ") temporarily disabled."),
             ),
+            (
+                "then-restored-after-startup",
+                base.replace(
+                    ") disabled.",
+                    ") disabled, then restored after startup.",
+                ),
+            ),
+            (
+                "restored",
+                base.replace(") disabled.", ") disabled and restored."),
+            ),
+            (
+                "subsequently-re-enabled",
+                base.replace(
+                    ") disabled.",
+                    ") disabled, subsequently re-enabled.",
+                ),
+            ),
+            (
+                "unsafe-before-terminal-state",
+                base.replace(
+                    "Start with all customizations",
+                    "All customizations",
+                ).replace(
+                    ") disabled.",
+                    ") execute on startup and are disabled.",
+                ),
+            ),
+            (
+                "generic-customizations-restored",
+                base.replace(
+                    ") disabled.",
+                    ") disabled. Customizations are restored.",
+                ),
+            ),
+            (
+                "temporal-prefix-without-comma",
+                base.replace(
+                    ") disabled.",
+                    ") disabled. After startup customizations are restored.",
+                ),
+            ),
+            (
+                "interposed-temporal-clause",
+                base.replace(
+                    ") disabled.",
+                    ") disabled. Customizations, after startup, are restored.",
+                ),
+            ),
+            (
+                "relative-clause-restoration",
+                base.replace(
+                    ") disabled.",
+                    ") disabled. Customizations that the runtime restores after "
+                    "startup are available.",
+                ),
+            ),
+            (
+                "qualified-customizations-active",
+                base.replace(
+                    ") disabled.",
+                    ") disabled. Some customizations remain active.",
+                ),
+            ),
+            (
+                "unknown-extension-enabled",
+                base.replace(
+                    ") disabled.",
+                    ") disabled. Extensions remain enabled.",
+                ),
+            ),
+            (
+                "unknown-extension-honored",
+                base.replace(
+                    ") disabled.",
+                    ") disabled. Extensions are honored at startup.",
+                ),
+            ),
+            (
+                "quoted-unknown-extension-enabled",
+                base.replace(
+                    ") disabled.",
+                    ") disabled. “Extensions remain enabled.”",
+                ),
+            ),
+            (
+                "project-instructions-apply",
+                base.replace(
+                    ") disabled.",
+                    ") disabled. Project instructions still apply.",
+                ),
+            ),
+            (
+                "unknown-automation-enabled",
+                base.replace(
+                    ") disabled.",
+                    ") disabled. Automations remain enabled.",
+                ),
+            ),
+            (
+                "singular-plugin-loaded",
+                base.replace(
+                    ") disabled.",
+                    ") disabled. A plugin is loaded.",
+                ),
+            ),
         ):
             with self.subTest(label=label):
                 with self.assertRaises(capabilities.ClaudeSafetyContractInvalid):
                     capabilities.validate_claude_help(help_text)
+
+    def test_help_accepts_terminal_permanent_customization_claim(self) -> None:
+        base = supported_help()
+        for help_text in (
+            base.replace(") disabled.", ") disabled throughout the review."),
+            base.replace(") disabled.", ") disabled during safe mode."),
+            base.replace(
+                "Start with all customizations",
+                "All customizations",
+            ).replace(") disabled.", ") remain disabled throughout safe mode."),
+            base.replace(
+                ") disabled.",
+                ") disabled for the entire duration of the review session.",
+            ),
+            base.replace(
+                "(CLAUDE.md",
+                "(\n    CLAUDE.md",
+            ).replace(
+                "and more) disabled.",
+                "and more\n    ) disabled.",
+            ),
+        ):
+            with self.subTest(help_text=help_text):
+                options, _block = capabilities.validate_claude_help(help_text)
+
+                self.assertEqual(options, capabilities.CLAUDE_REQUIRED_OPTIONS)
+
+    def test_help_accepts_exact_benign_safe_mode_purpose_suffix(self) -> None:
+        help_text = (
+            supported_help()
+            .replace("--safe-mode <value>", "--safe-mode")
+            .replace(
+                ") disabled.",
+                ") disabled — useful for troubleshooting a broken configuration.",
+            )
+        )
+
+        options, _block = capabilities.validate_claude_help(help_text)
+
+        self.assertEqual(options, capabilities.CLAUDE_REQUIRED_OPTIONS)
+
+    def test_help_allows_unrelated_customization_documentation_claims(self) -> None:
+        help_text = supported_help().replace(
+            "Sets CLAUDE_CODE_SAFE_MODE=1.",
+            "Sets CLAUDE_CODE_SAFE_MODE=1. Documentation about customizations "
+            "is available online. Information about project instructions is "
+            "available online.",
+        )
+
+        options, _block = capabilities.validate_claude_help(help_text)
+
+        self.assertEqual(options, capabilities.CLAUDE_REQUIRED_OPTIONS)
 
     def test_help_rejects_ambiguity_in_each_other_required_claim(self) -> None:
         base = supported_help()
@@ -225,6 +393,22 @@ class ClaudeCapabilitiesTest(unittest.TestCase):
             ),
         ):
             with self.subTest(label=label):
+                with self.assertRaises(capabilities.ClaudeSafetyContractInvalid):
+                    capabilities.validate_claude_help(help_text)
+
+    def test_help_rejects_disjunctive_runtime_guarantees(self) -> None:
+        base = supported_help()
+        for runtime_claim in (
+            "Auth or model selection or built-in tools or permissions work normally.",
+            "Auth, model selection, built-in tools, or permissions work normally.",
+            "Auth and model selection and built-in tools or permissions work normally.",
+        ):
+            with self.subTest(runtime_claim=runtime_claim):
+                help_text = base.replace(
+                    "Auth, model selection, built-in tools, and permissions work "
+                    "normally.",
+                    runtime_claim,
+                )
                 with self.assertRaises(capabilities.ClaudeSafetyContractInvalid):
                     capabilities.validate_claude_help(help_text)
 
@@ -408,8 +592,8 @@ class ClaudeCapabilitiesTest(unittest.TestCase):
             "Safe mode remains enforced. It cannot be disabled.",
             "Safe mode remains enforced. It remains active. It cannot be disabled.",
             "Safe mode remains enforced. Users cannot disable it.",
-            "Safe mode remains enforced. Documentation remains available. "
-            "Users cannot disable it.",
+            "Safe mode remains enforced. Documentation about safe mode remains "
+            "available online. Users cannot disable it.",
         ):
             with self.subTest(statement=statement):
                 help_text = base.replace(
@@ -420,7 +604,9 @@ class ClaudeCapabilitiesTest(unittest.TestCase):
 
                 self.assertEqual(options, capabilities.CLAUDE_REQUIRED_OPTIONS)
 
-    def test_help_uses_word_boundaries_for_continuation_subjects(self) -> None:
+    def test_help_rejects_unrecognized_sentences_even_without_keyword_match(
+        self,
+    ) -> None:
         base = supported_help()
         for help_text in (
             base.replace(
@@ -433,9 +619,36 @@ class ClaudeCapabilitiesTest(unittest.TestCase):
             ),
         ):
             with self.subTest(help_text=help_text):
-                options, _block = capabilities.validate_claude_help(help_text)
+                with self.assertRaises(capabilities.ClaudeSafetyContractInvalid):
+                    capabilities.validate_claude_help(help_text)
 
-                self.assertEqual(options, capabilities.CLAUDE_REQUIRED_OPTIONS)
+    def test_help_default_denies_unknown_customization_surfaces_and_verbs(
+        self,
+    ) -> None:
+        base = supported_help()
+        for statement in (
+            ".claude/settings.json is honored at startup.",
+            "CLAUDE.local.md continues to apply.",
+            "Auto memory remains active.",
+            "Context shims are honored at startup.",
+        ):
+            with self.subTest(statement=statement):
+                help_text = base.replace(
+                    "Sets CLAUDE_CODE_SAFE_MODE=1.",
+                    f"Sets CLAUDE_CODE_SAFE_MODE=1. {statement}",
+                )
+                with self.assertRaises(capabilities.ClaudeSafetyContractInvalid):
+                    capabilities.validate_claude_help(help_text)
+
+    def test_help_rejects_claims_smuggled_into_information_topic(self) -> None:
+        help_text = supported_help().replace(
+            "Sets CLAUDE_CODE_SAFE_MODE=1.",
+            "Sets CLAUDE_CODE_SAFE_MODE=1. Documentation about auto memory that "
+            "remains active is available online.",
+        )
+
+        with self.assertRaises(capabilities.ClaudeSafetyContractInvalid):
+            capabilities.validate_claude_help(help_text)
 
     def test_help_allows_positive_anaphoric_customization_continuation(self) -> None:
         help_text = supported_help().replace(
@@ -446,6 +659,22 @@ class ClaudeCapabilitiesTest(unittest.TestCase):
         options, _block = capabilities.validate_claude_help(help_text)
 
         self.assertEqual(options, capabilities.CLAUDE_REQUIRED_OPTIONS)
+
+    def test_help_rejects_nonadjacent_customization_anaphor(self) -> None:
+        base = supported_help()
+        for replacement in (
+            ") disabled. Admin-managed (policy) settings still apply. They remain "
+            "disabled. Auth,",
+            ") disabled. Admin-managed (policy) settings still apply. Documentation "
+            "about safe mode remains available online. They remain disabled. Auth,",
+        ):
+            with self.subTest(replacement=replacement):
+                help_text = base.replace(
+                    ") disabled. Admin-managed (policy) settings still apply. Auth,",
+                    replacement,
+                )
+                with self.assertRaises(capabilities.ClaudeSafetyContractInvalid):
+                    capabilities.validate_claude_help(help_text)
 
     def test_help_requires_one_exact_safe_mode_environment_assignment(self) -> None:
         base = supported_help()

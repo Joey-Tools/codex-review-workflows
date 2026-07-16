@@ -464,6 +464,52 @@ class ProviderPolicyTest(unittest.TestCase):
                 gpg_temp_root=self.review.container_dir,
             )
 
+    def test_claude_release_provenance_maps_missing_verifier_dependency(
+        self,
+    ) -> None:
+        with (
+            mock.patch.object(
+                providers,
+                "verify_claude_release",
+                side_effect=providers.ClaudeProvenanceDependencyUnavailable(
+                    "missing trusted GPG"
+                ),
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeProvenanceVerifierUnavailable,
+                "missing trusted GPG",
+            ),
+        ):
+            self.require_trusted_claude_release(
+                pathlib.Path("/bin/claude"),
+                version="2.1.202",
+                platform_key="darwin-arm64",
+                gpg_temp_root=self.review.container_dir,
+            )
+
+    def test_claude_release_provenance_maps_runtime_io_to_inconclusive(
+        self,
+    ) -> None:
+        with (
+            mock.patch.object(
+                providers,
+                "verify_claude_release",
+                side_effect=providers.ClaudeProvenanceUnavailable(
+                    "cannot write verifier snapshot: ENOSPC"
+                ),
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "ENOSPC",
+            ),
+        ):
+            self.require_trusted_claude_release(
+                pathlib.Path("/bin/claude"),
+                version="2.1.202",
+                platform_key="darwin-arm64",
+                gpg_temp_root=self.review.container_dir,
+            )
+
     def test_claude_safe_mode_security_failure_is_not_candidate_unavailability(
         self,
     ) -> None:
@@ -2879,6 +2925,151 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
         )
 
+    @mock.patch.dict(
+        os.environ,
+        {"CODEX_REVIEW_CLAUDE_PATH": "/explicit/claude"},
+    )
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        side_effect=providers.ClaudeProbeSandboxUnavailable(
+            "sandbox unavailable"
+        ),
+    )
+    @mock.patch.object(providers, "resolve_reviewer_executable")
+    @mock.patch.object(providers, "_copilot_attempt")
+    def test_explicit_claude_missing_probe_sandbox_blocks_copilot_fallback(
+        self,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _resolve_claude: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="triple-review",
+        )
+
+        self.assertEqual(outcome.returncode, 2)
+        copilot_attempt.assert_not_called()
+        resolve.assert_not_called()
+        self.assertIn(
+            "Explicit CODEX_REVIEW_CLAUDE_PATH",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    @mock.patch.dict(
+        os.environ,
+        {"CODEX_REVIEW_CLAUDE_PATH": "/explicit/claude"},
+    )
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        side_effect=providers.ClaudeProvenanceVerifierUnavailable(
+            "trusted GPG unavailable"
+        ),
+    )
+    @mock.patch.object(providers, "resolve_reviewer_executable")
+    @mock.patch.object(providers, "_copilot_attempt")
+    def test_explicit_claude_missing_gpg_blocks_copilot_fallback(
+        self,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _resolve_claude: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
+
+        self.assertEqual(outcome.returncode, 2)
+        copilot_attempt.assert_not_called()
+        resolve.assert_not_called()
+        self.assertIn(
+            "trusted GPG unavailable",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        side_effect=providers.ClaudeProvenanceVerifierUnavailable(
+            "trusted GPG unavailable"
+        ),
+    )
+    @mock.patch.object(
+        providers,
+        "resolve_reviewer_executable",
+        return_value=pathlib.Path("/bin/copilot"),
+    )
+    @mock.patch.object(providers, "_copilot_attempt")
+    def test_automatic_claude_missing_gpg_allows_authorized_fallback(
+        self,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _resolve_claude: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        copilot_attempt.return_value = self.attempt(
+            "copilot",
+            providers.COPILOT_MODELS[0],
+            "success",
+            final_text="No findings.",
+        )
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
+
+        self.assertEqual(outcome.returncode, 0)
+        copilot_attempt.assert_called_once()
+        resolve.assert_called_once_with("copilot")
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        side_effect=providers.ClaudeExecutableInspectionInconclusive(
+            "GPG snapshot write failed: ENOSPC"
+        ),
+    )
+    @mock.patch.object(providers, "resolve_reviewer_executable")
+    @mock.patch.object(providers, "_copilot_attempt")
+    def test_automatic_claude_provenance_io_blocks_copilot_fallback(
+        self,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _resolve_claude: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
+
+        self.assertEqual(outcome.returncode, 75)
+        copilot_attempt.assert_not_called()
+        resolve.assert_not_called()
+        self.assertIn(
+            "ENOSPC",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(
         providers,
@@ -3049,6 +3240,99 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn(
             "trusted rg unavailable",
             (self.review.container_dir / "claude-skip.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    @mock.patch.dict(
+        os.environ,
+        {"CODEX_REVIEW_CLAUDE_PATH": "/explicit/claude"},
+    )
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        return_value=(pathlib.Path("/explicit/claude"), {}),
+    )
+    @mock.patch.object(
+        providers,
+        "_with_claude_review_tool_path",
+        side_effect=providers.ClaudeReviewToolUnavailable(
+            "trusted rg unavailable"
+        ),
+    )
+    @mock.patch.object(providers, "resolve_reviewer_executable")
+    @mock.patch.object(providers, "_copilot_attempt")
+    def test_explicit_claude_missing_trusted_rg_blocks_copilot_fallback(
+        self,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _tools: mock.Mock,
+        _resolve_claude: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
+
+        self.assertEqual(outcome.returncode, 2)
+        copilot_attempt.assert_not_called()
+        resolve.assert_not_called()
+        self.assertIn(
+            "refusing Copilot fallback",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    @mock.patch.dict(
+        os.environ,
+        {"CODEX_REVIEW_CLAUDE_PATH": "/explicit/claude"},
+    )
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        return_value=(pathlib.Path("/explicit/claude"), {}),
+    )
+    @mock.patch.object(
+        providers,
+        "_with_claude_review_tool_path",
+        return_value={},
+    )
+    @mock.patch.object(providers, "resolve_reviewer_executable")
+    @mock.patch.object(providers, "_copilot_attempt")
+    @mock.patch.object(
+        providers,
+        "_claude_attempt",
+        side_effect=providers.ClaudeReviewToolUnavailable(
+            "trusted rg disappeared before the attempt"
+        ),
+    )
+    def test_explicit_claude_attempt_prerequisite_failure_blocks_fallback(
+        self,
+        claude_attempt: mock.Mock,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _tools: mock.Mock,
+        _resolve_claude: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
+
+        self.assertEqual(outcome.returncode, 2)
+        claude_attempt.assert_called_once()
+        copilot_attempt.assert_not_called()
+        resolve.assert_not_called()
+        self.assertIn(
+            "refusing Copilot fallback",
+            (self.review.container_dir / "runner-error.txt").read_text(
                 encoding="utf-8"
             ),
         )
