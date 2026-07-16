@@ -195,6 +195,12 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         self.claude_linux_platform_patcher.start()
         self.claude_macos_platform_patcher.start()
+        self.require_no_extended_acl = providers._require_no_extended_acl
+        self.acl_patcher = mock.patch.object(
+            providers,
+            "_require_no_extended_acl",
+        )
+        self.acl_check = self.acl_patcher.start()
         self.require_trusted_claude_release = providers._require_trusted_claude_release
         self.trusted_release_patcher = mock.patch.object(
             providers,
@@ -271,6 +277,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.keychain_runtime_patcher.stop()
         self.keychain_broker_patcher.stop()
         self.trusted_release_patcher.stop()
+        self.acl_patcher.stop()
         self.claude_macos_platform_patcher.stop()
         self.claude_linux_platform_patcher.stop()
         self.macos_platform_patcher.stop()
@@ -4548,7 +4555,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         secret = "AKIA" + "B" * 16
         self.review.diff_file.write_text(
-            "diff --git a/config b/config\n-AWS_KEY=" + secret + "\n",
+            "diff --git a/config b/config\n-AWS" + "_KEY=" + secret + "\n",
             encoding="utf-8",
         )
         self._refresh_control_artifact_state()
@@ -4601,7 +4608,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         token = "z9Y8x7W6v5U4t3S2r1Q0p9O8n7M6"
         self.review.diff_file.write_text(
-            "diff --git a/config b/config\n-AUTH_TOKEN=" + token + "\n",
+            "diff --git a/config b/config\n-AUTH" + "_TOKEN=" + token + "\n",
             encoding="utf-8",
         )
         self._refresh_control_artifact_state()
@@ -6699,7 +6706,7 @@ class ProviderPolicyTest(unittest.TestCase):
             mock.patch.object(ctypes, "CDLL", return_value=libc),
             mock.patch.object(ctypes, "get_errno", return_value=providers.errno.EINVAL),
         ):
-            providers._require_no_extended_acl(7, label="fixture")
+            self.require_no_extended_acl(7, label="fixture")
 
         acl_free.assert_called_once_with(1)
         acl_get_entry.return_value = 0
@@ -6709,7 +6716,7 @@ class ProviderPolicyTest(unittest.TestCase):
             mock.patch.object(ctypes, "get_errno", return_value=0),
             self.assertRaisesRegex(ReviewError, "extended access control list"),
         ):
-            providers._require_no_extended_acl(7, label="fixture")
+            self.require_no_extended_acl(7, label="fixture")
         acl_free.assert_called_once_with(1)
 
     def test_macos_acl_unknown_errors_fail_closed(self) -> None:
@@ -6732,7 +6739,59 @@ class ProviderPolicyTest(unittest.TestCase):
                     ),
                     self.assertRaisesRegex(ReviewError, "cannot inspect"),
                 ):
-                    providers._require_no_extended_acl(7, label="fixture")
+                    self.require_no_extended_acl(7, label="fixture")
+
+    def test_linux_acl_policy_never_resolves_darwin_symbols(self) -> None:
+        with (
+            mock.patch.object(
+                providers,
+                "_is_claude_macos_host",
+                return_value=False,
+            ),
+            mock.patch.object(
+                ctypes,
+                "CDLL",
+                side_effect=AssertionError("Darwin ACL lookup reached Linux"),
+            ) as cdll,
+        ):
+            self.require_no_extended_acl(7, label="fixture")
+
+        cdll.assert_not_called()
+
+    def test_linux_generic_tls_retains_private_ca_copy_without_darwin_acl(
+        self,
+    ) -> None:
+        certificate = self.sample_ca_certificate()
+        source = self.review.source_root / "linux-caller-ca.pem"
+        self.write_private_source(source, certificate)
+
+        with (
+            mock.patch.object(
+                providers,
+                "_is_claude_macos_host",
+                return_value=False,
+            ),
+            mock.patch.object(
+                providers,
+                "_require_no_extended_acl",
+                wraps=self.require_no_extended_acl,
+            ) as acl_check,
+            mock.patch.object(
+                ctypes,
+                "CDLL",
+                side_effect=AssertionError("Darwin ACL lookup reached Linux"),
+            ) as cdll,
+        ):
+            prepared = providers._prepare_claude_generic_tls_environment(
+                self.review,
+                {"SSL_CERT_FILE": str(source)},
+            )
+
+        destination = pathlib.Path(prepared["SSL_CERT_FILE"])
+        self.assertEqual(destination.read_bytes(), certificate)
+        self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
+        self.assertGreaterEqual(acl_check.call_count, 1)
+        cdll.assert_not_called()
 
     def test_trust_settings_deny_precedes_malformed_neighbors(self) -> None:
         deny_fingerprint = "A" * 40
