@@ -84,6 +84,8 @@ A current-attempt authentication warmup that is transient, times out, exceeds an
 
 An attempt-local restricted Keychain broker failure has the same unavailable and consent-gated fallback semantics as an unavailable credential. It writes `authentication-preflight-unavailable`, preserves earlier attempt evidence, and never becomes an inconclusive model attempt when the model was not launched.
 
+A structured transient warmup remains inconclusive even if the post-warmup credential read also finds that the restricted broker disappeared; transient evidence never authorizes fallback. A successful or otherwise non-entitlement, non-transient warmup preserves the explicit broker-unavailable result. During final runtime staging, credential-read timeout, output-limit, drain, or process-leak failures write `authentication-preflight-inconclusive` with no fabricated model attempt. Restricted-broker or loopback failure before the Claude CLI launch writes `authentication-preflight-unavailable` and follows the existing consent gate.
+
 ## Snapshot And Safety
 
 - The helper requires `--base-ref` and `--head-ref`, resolves both to commits before launch, and rejects the range unless base is an ancestor of head. A diverged range reports the merge base to use instead of silently reviewing a two-endpoint diff with unrelated target-branch changes.

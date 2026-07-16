@@ -63,11 +63,11 @@ capabilities workstreams.
 - Python compile checks passed for the helper scripts and complete runtime/test
   trees.
 - Full runtime/test `ruff check` passed.
-- Focused provider and contract suite: 263 tests run; 6 skipped and the suite
+- Focused provider and contract suite: 267 tests run; 6 skipped and the suite
   passed. The entitlement-preflight routing, exact-model verification,
   next-model revalidation, no-final-broker path, and final
   transient-after-refresh regressions also passed separately.
-- Full helper suite after the final `master` refresh at `4d40df7`: 698 tests
+- Full helper suite after the final `master` refresh at `4d40df7`: 702 tests
   run; 9 skipped and the suite passed.
 - The final helper-backed review found that Keychain freshness-read supervision
   failures could bypass the authentication-preflight classification. Both the
@@ -82,6 +82,11 @@ capabilities workstreams.
   failure was not included in the inner unavailable branch. It now records
   `authentication-preflight-unavailable`, preserves earlier attempts, and uses
   the same consent-gated fallback policy as an unavailable credential.
+- A focused exception audit then closed the remaining pre-launch boundaries:
+  transient warmup evidence takes precedence over a post-warmup broker failure;
+  final credential-read supervision becomes credential-read inconclusive with
+  no attempt; and final broker/loopback failure resets the runtime report to
+  unavailable before any Claude CLI launch.
 - Strict Clang syntax checks passed for the unchanged Keychain broker and Linux
   launcher, including the production POSIX feature macro for the launcher.
 - Both workflow actionlint checks, the isolated PyYAML skill validator,

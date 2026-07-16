@@ -1007,6 +1007,135 @@ class ProviderPolicyTest(unittest.TestCase):
             ],
         )
 
+    def test_final_credential_boundary_failures_do_not_launch_model(self) -> None:
+        executable = self.review.container_dir / "verified-claude"
+        executable.write_bytes(b"snapshot")
+        model = providers.CLAUDE_MODELS[0]
+        cases = (
+            (
+                providers.ReviewTimeoutError("credential read timed out"),
+                providers.ClaudeAuthWarmupInconclusive,
+                "authentication-preflight-inconclusive",
+                "inconclusive",
+                "credential-read",
+            ),
+            (
+                providers.ReviewOutputLimitError(
+                    "credential read exceeded its output limit"
+                ),
+                providers.ClaudeAuthWarmupInconclusive,
+                "authentication-preflight-inconclusive",
+                "inconclusive",
+                "credential-read",
+            ),
+            (
+                providers.ReviewOutputDrainError("credential read did not drain"),
+                providers.ClaudeAuthWarmupInconclusive,
+                "authentication-preflight-inconclusive",
+                "inconclusive",
+                "credential-read",
+            ),
+            (
+                providers.ReviewProcessLeakError("credential read leaked a process"),
+                providers.ClaudeAuthWarmupInconclusive,
+                "authentication-preflight-inconclusive",
+                "inconclusive",
+                "credential-read",
+            ),
+            (
+                providers.ClaudeKeychainBrokerUnavailable(
+                    "credential broker disappeared"
+                ),
+                providers.ClaudeKeychainBrokerUnavailable,
+                "authentication-preflight-unavailable",
+                "unavailable",
+                None,
+            ),
+            (
+                providers.ClaudeKeychainCredentialUnavailable(
+                    "credential disappeared"
+                ),
+                providers.ClaudeKeychainCredentialUnavailable,
+                "authentication-preflight-unavailable",
+                "unavailable",
+                None,
+            ),
+            (
+                providers.ClaudeLoopbackUnavailable(
+                    "one-shot broker loopback disappeared"
+                ),
+                providers.ClaudeLoopbackUnavailable,
+                "authentication-preflight-unavailable",
+                "unavailable",
+                None,
+            ),
+        )
+
+        for error, expected_error, phase, status, failure_class in cases:
+            with self.subTest(error_type=type(error).__name__):
+                providers.write_json(
+                    self.review.container_dir / "claude-runtime.json",
+                    {
+                        "phase": "publisher-and-capabilities-verified",
+                        "outer_sandbox": {"status": "pending-runtime-launch"},
+                        "authentication": {"status": "pending"},
+                    },
+                )
+                self.warmup.reset_mock()
+                self.warmup.side_effect = None
+                self.warmup.return_value = None
+                providers._claude_keychain_runtime.reset_mock()
+
+                @contextlib.contextmanager
+                def failing_runtime(
+                    _review: ReviewWorkspace,
+                    _env: dict[str, str],
+                ):
+                    raise error
+                    yield {}
+
+                providers._claude_keychain_runtime.side_effect = failing_runtime
+                with (
+                    mock.patch.object(
+                        providers,
+                        "_with_claude_review_tool_path",
+                        side_effect=lambda _review, env: dict(env),
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_prepare_claude_tls_environment",
+                        side_effect=lambda _review, env: dict(env),
+                    ),
+                    mock.patch.object(providers, "run") as run_command,
+                    self.assertRaises(expected_error),
+                ):
+                    providers._claude_attempt(
+                        review=self.review,
+                        model=model,
+                        index=1,
+                        env={},
+                        executable=executable,
+                    )
+
+                run_command.assert_not_called()
+                report = json.loads(
+                    (self.review.container_dir / "claude-runtime.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(report["phase"], phase)
+                self.assertEqual(report["authentication"]["status"], status)
+                self.assertEqual(report["authentication"]["model"], model)
+                self.assertIsNone(
+                    report["authentication"]["validated_for_model"]
+                )
+                if failure_class is not None:
+                    self.assertEqual(
+                        report["authentication"]["failure_class"],
+                        failure_class,
+                    )
+                self.assertIsNone(report["attempt"])
+
     @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
     @mock.patch.object(
         providers,
@@ -1506,6 +1635,85 @@ class ProviderPolicyTest(unittest.TestCase):
                 providers.CLAUDE_MODELS[0],
             )
 
+        self.assertEqual(require_fresh.call_count, 2)
+
+    @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
+    @mock.patch.object(providers, "_run_claude_auth_warmup")
+    def test_transient_warmup_precedes_post_read_broker_unavailable(
+        self,
+        warmup: mock.Mock,
+        require_fresh: mock.Mock,
+    ) -> None:
+        require_fresh.side_effect = (
+            providers.ClaudeKeychainCredentialUnavailable("stale"),
+            providers.ClaudeKeychainBrokerUnavailable(
+                "credential broker disappeared"
+            ),
+        )
+        warmup.return_value = Completed(
+            argv=("claude",),
+            returncode=1,
+            stdout=json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "error_during_execution",
+                    "is_error": True,
+                    "api_error_status": 429,
+                }
+            ).encode(),
+            stderr=b"",
+        )
+
+        with self.assertRaisesRegex(
+            providers.ClaudeAuthWarmupInconclusive,
+            "transient",
+        ):
+            self.warm_claude_local_login(
+                self.review,
+                pathlib.Path("/bin/claude"),
+                {},
+                providers.CLAUDE_MODELS[0],
+            )
+
+        self.assertEqual(require_fresh.call_count, 2)
+
+    @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
+    @mock.patch.object(providers, "_run_claude_auth_warmup")
+    def test_successful_warmup_preserves_post_read_broker_unavailable(
+        self,
+        warmup: mock.Mock,
+        require_fresh: mock.Mock,
+    ) -> None:
+        broker_error = providers.ClaudeKeychainBrokerUnavailable(
+            "credential broker disappeared"
+        )
+        require_fresh.side_effect = (
+            providers.ClaudeKeychainCredentialUnavailable("stale"),
+            broker_error,
+        )
+        warmup.return_value = Completed(
+            argv=("claude",),
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "result": "OK",
+                }
+            ).encode(),
+            stderr=b"",
+        )
+
+        with self.assertRaises(providers.ClaudeKeychainBrokerUnavailable) as raised:
+            self.warm_claude_local_login(
+                self.review,
+                pathlib.Path("/bin/claude"),
+                {},
+                providers.CLAUDE_MODELS[0],
+            )
+
+        self.assertIs(raised.exception, broker_error)
         self.assertEqual(require_fresh.call_count, 2)
 
     @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
@@ -4108,6 +4316,88 @@ class ProviderPolicyTest(unittest.TestCase):
                 encoding="utf-8"
             ),
         )
+
+    def test_second_model_transient_warmup_precedes_broker_fallback(self) -> None:
+        first = self.attempt(
+            "claude",
+            providers.CLAUDE_MODELS[0],
+            "entitlement",
+        )
+        completed = Completed(
+            argv=("claude",),
+            returncode=1,
+            stdout=json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "error_during_execution",
+                    "is_error": True,
+                    "api_error_status": 429,
+                }
+            ).encode(),
+            stderr=b"",
+        )
+
+        def claude_attempt(**kwargs) -> providers.Attempt:
+            if kwargs["model"] == providers.CLAUDE_MODELS[0]:
+                return first
+            self.warm_claude_local_login(
+                kwargs["review"],
+                pathlib.Path("/bin/claude"),
+                kwargs["env"],
+                kwargs["model"],
+            )
+            raise AssertionError("transient warmup unexpectedly returned")
+
+        with (
+            mock.patch.object(providers, "child_environment", return_value={}),
+            mock.patch.object(
+                providers,
+                "_resolve_validated_claude_executable",
+                return_value=(pathlib.Path("/bin/claude"), {}),
+            ),
+            mock.patch.object(
+                providers,
+                "_require_fresh_claude_keychain_credential",
+                side_effect=(
+                    providers.ClaudeKeychainCredentialUnavailable("stale"),
+                    providers.ClaudeKeychainBrokerUnavailable(
+                        "credential broker disappeared"
+                    ),
+                ),
+            ),
+            mock.patch.object(
+                providers,
+                "_run_claude_auth_warmup",
+                return_value=completed,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_attempt",
+                side_effect=claude_attempt,
+            ),
+            mock.patch.object(
+                providers,
+                "resolve_reviewer_executable",
+            ) as resolve,
+            mock.patch.object(providers, "_copilot_attempt") as copilot_attempt,
+        ):
+            outcome = providers.run_review(
+                review=self.review,
+                reviewer="claude",
+                egress_consent="triple-review",
+            )
+
+        self.assertEqual(outcome.returncode, 75)
+        self.assertEqual(outcome.attempts, (first,))
+        resolve.assert_not_called()
+        copilot_attempt.assert_not_called()
+        persisted = json.loads(
+            (self.review.container_dir / "attempts.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(len(persisted), 1)
+        self.assertEqual(persisted[0]["category"], "entitlement")
 
     def test_second_model_warmup_inconclusive_updates_runtime_evidence(
         self,

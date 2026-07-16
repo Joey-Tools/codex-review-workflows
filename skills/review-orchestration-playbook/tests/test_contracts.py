@@ -121,11 +121,17 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("_warm_claude_local_login", attempt_source)
         self.assertIn("_prepare_claude_tls_environment", attempt_source)
         self.assertIn("ClaudeKeychainBrokerUnavailable", attempt_source)
+        self.assertIn("ClaudeLoopbackUnavailable", attempt_source)
+        self.assertIn('"failure_class": "credential-read"', attempt_source)
         self.assertEqual(
             warmup_source.count(
                 "_require_fresh_claude_keychain_credential_for_auth_preflight"
             ),
             2,
+        )
+        self.assertIn(
+            "isinstance(credential_error, ClaudeKeychainBrokerUnavailable)",
+            warmup_source,
         )
         self.assertIn("ClaudeAuthWarmupEntitlement", attempt_source)
         self.assertIn("require_verified_model=True", attempt_source)
@@ -157,6 +163,14 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertIn(
             "attempt-local restricted Keychain broker failure",
+            helper_contract,
+        )
+        self.assertIn(
+            "A structured transient warmup remains inconclusive",
+            helper_contract,
+        )
+        self.assertIn(
+            "credential-read timeout, output-limit, drain, or process-leak",
             helper_contract,
         )
         self.assertIn(

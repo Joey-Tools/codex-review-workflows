@@ -2221,10 +2221,17 @@ def _warm_claude_local_login(
         raise ClaudeAuthWarmupInconclusive(
             f"Claude authentication warmup was inconclusive: {error}"
         ) from error
-    credential_error: ClaudeKeychainCredentialUnavailable | None = None
+    credential_error: (
+        ClaudeKeychainBrokerUnavailable
+        | ClaudeKeychainCredentialUnavailable
+        | None
+    ) = None
     try:
         _require_fresh_claude_keychain_credential_for_auth_preflight(review)
-    except ClaudeKeychainCredentialUnavailable as error:
+    except (
+        ClaudeKeychainBrokerUnavailable,
+        ClaudeKeychainCredentialUnavailable,
+    ) as error:
         credential_error = error
     category = classify_failure(warmup.stdout, warmup.stderr)
     if category == "transient":
@@ -2253,6 +2260,8 @@ def _warm_claude_local_login(
         )
     if credential_error is None:
         return
+    if isinstance(credential_error, ClaudeKeychainBrokerUnavailable):
+        raise credential_error
     raise ClaudeAuthWarmupInconclusive(
         "Claude authentication warmup did not produce a fresh credential "
         f"({category})"
@@ -4384,7 +4393,20 @@ def _claude_attempt(
     else:
         try:
             with contextlib.ExitStack() as stack:
-                env = stack.enter_context(_claude_keychain_runtime(review, env))
+                try:
+                    env = stack.enter_context(
+                        _claude_keychain_runtime(review, env)
+                    )
+                except (
+                    ReviewTimeoutError,
+                    ReviewOutputDrainError,
+                    ReviewOutputLimitError,
+                    ReviewProcessLeakError,
+                ) as error:
+                    raise ClaudeAuthWarmupInconclusive(
+                        "Claude final credential check was inconclusive: "
+                        f"{error}"
+                    ) from error
                 proxy_port = stack.enter_context(_claude_connect_proxy(env))
                 review_env = _with_claude_proxy_environment(env, proxy_port)
                 sandbox_profile = _claude_review_sandbox_profile(
@@ -4417,7 +4439,27 @@ def _claude_attempt(
                     timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
                     output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
                 )
-        except ClaudeKeychainCredentialUnavailable:
+        except ClaudeAuthWarmupInconclusive:
+            _update_claude_runtime_report(
+                review,
+                {
+                    "phase": "authentication-preflight-inconclusive",
+                    "outer_sandbox": {"status": "pending-runtime-launch"},
+                    "authentication": {
+                        "status": "inconclusive",
+                        "model": model,
+                        "failure_class": "credential-read",
+                        "validated_for_model": None,
+                    },
+                    "attempt": None,
+                },
+            )
+            raise
+        except (
+            ClaudeKeychainBrokerUnavailable,
+            ClaudeKeychainCredentialUnavailable,
+            ClaudeLoopbackUnavailable,
+        ):
             _update_claude_runtime_report(
                 review,
                 {
