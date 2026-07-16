@@ -2201,10 +2201,17 @@ def _read_bounded_owner_file(
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
-        raise ReviewError(f"cannot open {label}: {source}") from error
+        raise ClaudeExecutableInspectionInconclusive(
+            f"cannot inspect {label}: {source}"
+        ) from error
     payload = bytearray()
     try:
-        before = os.fstat(descriptor)
+        try:
+            before = os.fstat(descriptor)
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot inspect {label}: {source}"
+            ) from error
         if (
             not stat.S_ISREG(before.st_mode)
             or before.st_uid != os.geteuid()
@@ -2216,14 +2223,24 @@ def _read_bounded_owner_file(
         if before.st_size > limit_bytes:
             raise ReviewError(f"{label} exceeds the size limit: {source}")
         while len(payload) <= limit_bytes:
-            chunk = os.read(
-                descriptor,
-                min(64 * 1024, limit_bytes + 1 - len(payload)),
-            )
+            try:
+                chunk = os.read(
+                    descriptor,
+                    min(64 * 1024, limit_bytes + 1 - len(payload)),
+                )
+            except OSError as error:
+                raise ClaudeExecutableInspectionInconclusive(
+                    f"cannot inspect {label}: {source}"
+                ) from error
             if not chunk:
                 break
             payload.extend(chunk)
-        after = os.fstat(descriptor)
+        try:
+            after = os.fstat(descriptor)
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot inspect {label}: {source}"
+            ) from error
         try:
             path_after = path.lstat()
         except OSError as error:
@@ -3173,8 +3190,8 @@ def _require_claude_trust_export_tool(
             stderr_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
         )
     except OSError as error:
-        raise ClaudeTrustToolUnavailable(
-            "Claude TLS trust export tooling is unavailable"
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude TLS trust export tooling could not be inspected"
         ) from error
     try:
         detail = (bytes(completed.stdout) + b"\n" + bytes(completed.stderr)).decode(
@@ -3282,6 +3299,14 @@ def _read_claude_trust_certificates(
             unresolved_resolution="unavailable",
         )
         raise
+    except ClaudeExecutableInspectionInconclusive:
+        _terminalize_claude_trust_policy_evidence(
+            review,
+            evidence,
+            status="inconclusive",
+            unresolved_resolution="inconclusive",
+        )
+        raise
     except ReviewOutputLimitError as error:
         _terminalize_claude_trust_policy_evidence(
             review,
@@ -3386,8 +3411,8 @@ def _read_claude_trust_certificates_impl(
                     regular_file_limit_path=trust_path,
                 )
             except OSError as error:
-                raise ClaudeTrustToolUnavailable(
-                    "Claude TLS trust export tooling became unavailable"
+                raise ClaudeExecutableInspectionInconclusive(
+                    "Claude TLS trust export tooling could not be inspected"
                 ) from error
             try:
                 detail = (
@@ -3510,8 +3535,8 @@ def _read_claude_trust_certificates_impl(
                     stderr_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
                 )
             except OSError as error:
-                raise ClaudeTrustToolUnavailable(
-                    "Claude trust certificate export tooling became unavailable"
+                raise ClaudeExecutableInspectionInconclusive(
+                    "Claude trust certificate export tooling could not be inspected"
                 ) from error
             completed_exports.append((source, completed))
             if completed.returncode != 0:
@@ -4484,6 +4509,10 @@ def _warm_claude_local_login(
     category = classify_failure(warmup.stdout, warmup.stderr)
     warmup_result = _strict_json_object(warmup.stdout)
     output_shape = _claude_auth_warmup_output_shape(warmup.stdout)
+    supported_success = (
+        warmup.returncode == 0
+        and output_shape.get("event_shape") == "supported-result-success"
+    )
     supported_failure = (
         warmup.returncode != 0
         and warmup_result is not None
@@ -4497,7 +4526,9 @@ def _warm_claude_local_login(
         stderr=warmup.stderr,
         requested_model=model,
     ) == "auth"
-    if category in {"auth", "entitlement", "transient"} and not supported_failure:
+    if supported_success:
+        category = "success"
+    elif category in {"auth", "entitlement", "transient"} and not supported_failure:
         category = "inconclusive"
     elif category == "auth" and not verified_auth:
         category = "inconclusive"
@@ -4509,7 +4540,9 @@ def _warm_claude_local_login(
             "category": category,
             "output_shape": output_shape,
             "reason": (
-                "supported-structural-authentication"
+                "supported-structural-success"
+                if supported_success
+                else "supported-structural-authentication"
                 if verified_auth
                 else f"supported-structural-{category}"
                 if category in {"entitlement", "transient"}
@@ -4543,8 +4576,20 @@ def _warm_claude_local_login(
         raise ClaudeKeychainCredentialUnavailable(
             "Claude authentication warmup reported an authentication failure"
         )
+    if supported_success:
+        if credential_error is None:
+            return
+        if isinstance(credential_error, ClaudeKeychainBrokerUnavailable):
+            raise credential_error
+        raise ClaudeAuthWarmupInconclusive(
+            "Claude authentication warmup did not produce a fresh credential "
+            "(success)"
+        ) from credential_error
     if credential_error is None:
-        return
+        raise ClaudeAuthWarmupInconclusive(
+            "Claude authentication warmup output was not a supported success "
+            "envelope"
+        )
     if isinstance(credential_error, ClaudeKeychainBrokerUnavailable):
         raise credential_error
     raise ClaudeAuthWarmupInconclusive(
@@ -4725,6 +4770,15 @@ def _claude_auth_warmup_output_shape(stdout: bytes) -> dict[str, object]:
         and _claude_failure_metadata_is_supported(result)
         and known_error_payloads_empty
     )
+    supported_result_success = (
+        safe_type == "result"
+        and safe_subtype == "success"
+        and is_error is False
+        and raw_result == "OK"
+        and unknown_field_count == 0
+        and _claude_failure_metadata_is_supported(result)
+        and known_error_payloads_empty
+    )
     return {
         "api_error_status": safe_api_error_status,
         "api_error_status_present": "api_error_status" in result,
@@ -4738,7 +4792,11 @@ def _claude_auth_warmup_output_shape(stdout: bytes) -> dict[str, object]:
             else "invalid"
         ),
         "event_shape": (
-            "supported-result-error" if supported_result_error else "unsupported"
+            "supported-result-error"
+            if supported_result_error
+            else "supported-result-success"
+            if supported_result_success
+            else "unsupported"
         ),
         "is_error": is_error,
         "json_shape": "object",

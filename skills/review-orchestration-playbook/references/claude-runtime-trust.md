@@ -146,7 +146,11 @@ explicitly configured Claude Code candidate:
     verification, persist that fallback evidence and end the current model
     boundary without starting the final broker or review sandbox, even when
     credential freshness remains insufficient. Successful structured output
-    plus entitlement-shaped stderr never authorizes fallback.
+    plus entitlement-shaped stderr never authorizes fallback. A refreshed
+    credential permits the review to continue only when the warmup itself
+    returns the supported strict `result/success/is_error=false` envelope with
+    result text exactly `OK`; unknown, malformed, or future output remains
+    inconclusive even when the post-warmup credential happens to be fresh.
 12. Launch only the one captured verified snapshot for every real model attempt
     in a fresh outer sandbox; never rediscover or fall back to the mutable source
     installation between Opus attempts. If entitlement selects a later Opus
@@ -627,6 +631,9 @@ its own freshness boundary. Its bounded complete stdout/stderr capture is copied
 to the formal attempt logs after the temporary warmup output directory closes.
 An explicit authentication failure remains unavailable even when the refreshed
 Keychain item is structurally fresh enough for a later attempt.
+An unsupported warmup envelope remains inconclusive under the same condition;
+credential side effects cannot turn unverified process output into successful
+preflight evidence.
 Only a deterministic missing Keychain item or a valid but insufficiently fresh
 credential is refresh-eligible. An existing blob with missing, null, or blank
 OAuth fields, malformed JSON, account drift, or unstable double-read evidence

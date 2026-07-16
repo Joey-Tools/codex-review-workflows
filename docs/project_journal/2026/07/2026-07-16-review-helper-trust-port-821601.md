@@ -58,12 +58,12 @@ metadata behavior.
 ## Validation
 
 - Python 3.10.19 complete canonical suite with the `tomli` test backport and
-  `PYTHONDONTWRITEBYTECODE=1`: 818 tests run, 4 skipped, no failures. Disabling
+  `PYTHONDONTWRITEBYTECODE=1`: 822 tests run, 4 skipped, no failures. Disabling
   bytecode writes keeps the intentional `RLIMIT_FSIZE` tests from truncating
   uv's own `_virtualenv.pyc` import hook.
-- Python 3.13.0 complete canonical suite: 818 tests run, 4 skipped, no failures.
+- Python 3.13.0 complete canonical suite: 822 tests run, 9 skipped, no failures.
 - Focused Python 3.13 suites: the 3 `SSL_CERT_DIR` regressions passed, providers
-  ran 347 tests with 3 skipped, and provenance ran 90 tests with no skips or
+  ran 351 tests with 6 skipped, and provenance ran 90 tests with no skips or
   failures; earlier current-range common 49 and repository contract 14 test
   suites also passed.
 - Final-head review remediation covers strict signed-manifest numeric parsing,
@@ -105,8 +105,17 @@ metadata behavior.
   later malformed policy. The domain collector now records that typed race as
   priority-1 inconclusive before the generic `ReviewError` branch, so any later
   priority-2 policy block wins; a three-domain regression covers the ordering.
-- Ruff 0.13.2 lint, Python compile, skill and project-journal validation, and
-  working-tree diff checks passed. No provider/test formatter churn was retained:
+- The next independent review closed three related fail-open edges. Launch I/O
+  failures from the already-discovered trust helper, trust-settings export, or
+  certificate export are inspection-inconclusive rather than deterministic tool
+  absence. Owner-file `open`, `fstat`, and `read` I/O failures now enter the same
+  typed path, allowing a later malformed or denied trust domain to retain blocked
+  precedence. Finally, a post-warmup fresh credential permits review only after
+  the exact supported success envelope; unknown or future output remains
+  inconclusive even when the warmup happened to refresh Keychain state.
+- Ruff 0.13.2 lint, Python compile, project-journal validation, the official
+  skill validator through its documented uv/PyYAML fallback, and working-tree
+  diff checks passed. No provider/test formatter churn was retained:
   Ruff would also rewrite three pre-existing current-head expressions outside
   this P2 fix. The previously documented formatter drift in
   `claude_provenance.py` and its two test files remains untouched.

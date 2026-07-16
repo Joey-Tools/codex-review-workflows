@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import errno
 import hashlib
 import itertools
 import json
@@ -1638,7 +1639,14 @@ class ProviderPolicyTest(unittest.TestCase):
         run_command.return_value = Completed(
             argv=("claude",),
             returncode=0,
-            stdout=b"OK",
+            stdout=json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "result": "OK",
+                }
+            ).encode(),
             stderr=b"",
         )
         home = self.review.container_dir / "claude-home"
@@ -1761,6 +1769,17 @@ class ProviderPolicyTest(unittest.TestCase):
         )
 
         self.assertEqual(require_fresh.call_count, 2)
+        evidence = json.loads(
+            (self.review.container_dir / "claude-auth-warmup.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(evidence["category"], "success")
+        self.assertEqual(evidence["reason"], "supported-structural-success")
+        self.assertEqual(
+            evidence["output_shape"]["event_shape"],
+            "supported-result-success",
+        )
 
     def test_warmup_entitlement_records_verified_attempt_without_final_runtime(
         self,
@@ -2504,6 +2523,51 @@ class ProviderPolicyTest(unittest.TestCase):
                 )
                 self.assertEqual(evidence["category"], "inconclusive")
                 self.assertEqual(evidence["reason"], "warmup-output-unverified")
+
+    @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
+    @mock.patch.object(providers, "_run_claude_auth_warmup")
+    def test_unknown_auth_warmup_stays_inconclusive_after_credential_refresh(
+        self,
+        warmup: mock.Mock,
+        require_fresh: mock.Mock,
+    ) -> None:
+        require_fresh.side_effect = (
+            providers.ClaudeKeychainCredentialRefreshRequired("stale"),
+            None,
+        )
+        warmup.return_value = Completed(
+            argv=("claude",),
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "type": "future_result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "result": "OK",
+                }
+            ).encode(),
+            stderr=b"",
+        )
+
+        with self.assertRaisesRegex(
+            providers.ClaudeAuthWarmupInconclusive,
+            "not a supported success envelope",
+        ):
+            self.warm_claude_local_login(
+                self.review,
+                pathlib.Path("/bin/claude"),
+                {},
+                providers.CLAUDE_MODELS[0],
+            )
+
+        self.assertEqual(require_fresh.call_count, 2)
+        evidence = json.loads(
+            (self.review.container_dir / "claude-auth-warmup.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(evidence["category"], "inconclusive")
+        self.assertEqual(evidence["reason"], "warmup-output-unverified")
 
     def test_auth_warmup_shape_uses_recursive_strict_json(self) -> None:
         nested = (
@@ -9827,6 +9891,25 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(selected.omitted_sha1_fingerprints, frozenset())
         verify.assert_called_once()
 
+    def test_trust_export_help_launch_io_is_inspection_inconclusive(self) -> None:
+        with (
+            mock.patch.object(
+                providers,
+                "CLAUDE_KEYCHAIN_CLIENT",
+                pathlib.Path(sys.executable),
+            ),
+            mock.patch.object(
+                providers,
+                "run_bounded_capture",
+                side_effect=OSError(errno.EIO, "help launch failed"),
+            ),
+            self.assertRaises(providers.ClaudeExecutableInspectionInconclusive),
+        ):
+            providers._require_claude_trust_export_tool(
+                self.review,
+                self.review.container_dir,
+            )
+
     def test_system_domain_trust_as_root_is_exported(self) -> None:
         certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
         fingerprint = self.ca_sha1_fingerprint(certificate)
@@ -9913,6 +9996,80 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(evidence["additional_unconditional_included_count"], 1)
         self.assertTrue(verify.call_args.kwargs["allow_non_self_signed"])
 
+    def test_trust_certificate_export_launch_io_is_inconclusive(self) -> None:
+        certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+        fingerprint = self.ca_sha1_fingerprint(certificate)
+        system_trust = plistlib.dumps(
+            {
+                "trustVersion": 1,
+                "trustList": {
+                    fingerprint: {
+                        "trustSettings": [
+                            {
+                                providers.CLAUDE_TRUST_RESULT_KEY: (
+                                    providers.CLAUDE_TRUST_RESULT_TRUST_AS_ROOT
+                                )
+                            }
+                        ],
+                    }
+                },
+            }
+        )
+
+        def export_trust(argv, **_kwargs):
+            arguments = tuple(argv)
+            if "trust-settings-export" in arguments:
+                output = pathlib.Path(arguments[-1])
+                if "-s" in arguments:
+                    output.write_bytes(system_trust)
+                    output.chmod(0o600)
+                    return common.BoundedCapture(
+                        argv=arguments,
+                        returncode=0,
+                        stdout=bytearray(),
+                        stderr=bytearray(),
+                    )
+                return common.BoundedCapture(
+                    argv=arguments,
+                    returncode=1,
+                    stdout=bytearray(),
+                    stderr=bytearray(
+                        providers.CLAUDE_TRUST_NO_SETTINGS[0].encode()
+                    ),
+                )
+            self.assertIn("find-certificate", arguments)
+            raise OSError(errno.EIO, "certificate export launch failed")
+
+        evidence = providers._new_claude_trust_policy_evidence(
+            self.claude_executable_evidence
+        )
+        with (
+            mock.patch.object(
+                providers,
+                "_require_claude_trust_export_tool",
+                return_value=(pathlib.Path("/usr/bin/security"), {}),
+            ),
+            mock.patch.object(
+                providers,
+                "run_bounded_capture",
+                side_effect=export_trust,
+            ),
+            self.assertRaises(providers.ClaudeExecutableInspectionInconclusive),
+        ):
+            providers._read_claude_trust_certificates(
+                self.review,
+                self.review.container_dir,
+                evidence=evidence,
+            )
+
+        terminal = json.loads(
+            (
+                self.review.container_dir
+                / providers.CLAUDE_TRUST_POLICY_EVIDENCE_NAME
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(terminal["status"], "inconclusive")
+
     def test_later_trust_deny_wins_over_earlier_malformed_domain(self) -> None:
         deny_fingerprint = "A" * 40
         malformed = plistlib.dumps({"trustVersion": 1, "trustList": {"malformed": {}}})
@@ -9980,7 +10137,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 pathlib.Path(argv[-1]),
             )
 
-    def test_later_blocked_trust_domain_wins_over_earlier_unavailable_domain(
+    def test_later_blocked_trust_domain_wins_over_earlier_launch_io_failure(
         self,
     ) -> None:
         malformed = plistlib.dumps({"trustVersion": 1, "trustList": {"malformed": {}}})
@@ -10033,21 +10190,19 @@ class ProviderPolicyTest(unittest.TestCase):
             ).read_text(encoding="utf-8")
         )
         self.assertEqual(terminal["status"], "blocked")
+        self.assertEqual(
+            [domain["status"] for domain in terminal["domains"]],
+            ["inconclusive", "blocked", "no-settings"],
+        )
 
-    def test_later_blocked_trust_domain_wins_over_earlier_inspection_race(
+    def test_later_blocked_trust_domain_wins_over_earlier_read_io_failure(
         self,
     ) -> None:
+        empty = plistlib.dumps({"trustVersion": 1, "trustList": {}})
         malformed = plistlib.dumps({"trustVersion": 1, "trustList": {"malformed": {}}})
-        call_count = 0
 
         def export_trust(argv, **_kwargs):
-            nonlocal call_count
-            call_count += 1
             output = pathlib.Path(argv[-1])
-            if call_count == 1:
-                raise providers.ClaudeExecutableInspectionInconclusive(
-                    "trust export executable changed during inspection"
-                )
             if "-d" in argv:
                 output.write_bytes(malformed)
                 output.chmod(0o600)
@@ -10064,7 +10219,24 @@ class ProviderPolicyTest(unittest.TestCase):
                     stdout=bytearray(),
                     stderr=bytearray(providers.CLAUDE_TRUST_NO_SETTINGS[0].encode()),
                 )
-            self.fail(f"unexpected trust export command: {argv!r}")
+            output.write_bytes(empty)
+            output.chmod(0o600)
+            return common.BoundedCapture(
+                argv=tuple(argv),
+                returncode=0,
+                stdout=bytearray(),
+                stderr=bytearray(),
+            )
+
+        real_read = os.read
+        read_count = 0
+
+        def fail_first_read(descriptor: int, length: int):
+            nonlocal read_count
+            read_count += 1
+            if read_count == 1:
+                raise OSError(errno.EIO, "trust file read failed")
+            return real_read(descriptor, length)
 
         evidence = providers._new_claude_trust_policy_evidence(
             self.claude_executable_evidence
@@ -10079,6 +10251,11 @@ class ProviderPolicyTest(unittest.TestCase):
                 providers,
                 "run_bounded_capture",
                 side_effect=export_trust,
+            ),
+            mock.patch.object(
+                providers.os,
+                "read",
+                side_effect=fail_first_read,
             ),
             self.assertRaises(providers.ClaudeTrustPolicyUnavailable),
         ):
@@ -10537,6 +10714,69 @@ class ProviderPolicyTest(unittest.TestCase):
             providers._read_bounded_owner_file(
                 source,
                 source="changing",
+                limit_bytes=1024,
+                label="fixture owner file",
+            )
+
+    def test_owner_file_reader_io_failures_are_inspection_inconclusive(self) -> None:
+        source = self.review.source_root / "owner-file-io-failure"
+        self.write_private_source(source, b"fixture")
+        real_fstat = os.fstat
+        cases = (
+            (
+                "open",
+                mock.patch.object(
+                    providers.os,
+                    "open",
+                    side_effect=OSError(errno.EIO, "open failed"),
+                ),
+            ),
+            (
+                "initial-fstat",
+                mock.patch.object(
+                    providers.os,
+                    "fstat",
+                    side_effect=OSError(errno.EIO, "fstat failed"),
+                ),
+            ),
+            (
+                "read",
+                mock.patch.object(
+                    providers.os,
+                    "read",
+                    side_effect=OSError(errno.EIO, "read failed"),
+                ),
+            ),
+        )
+        for name, patcher in cases:
+            with (
+                self.subTest(operation=name),
+                patcher,
+                self.assertRaises(providers.ClaudeExecutableInspectionInconclusive),
+            ):
+                providers._read_bounded_owner_file(
+                    source,
+                    source=name,
+                    limit_bytes=1024,
+                    label="fixture owner file",
+                )
+
+        call_count = 0
+
+        def fail_final_fstat(descriptor: int):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise OSError(errno.EIO, "final fstat failed")
+            return real_fstat(descriptor)
+
+        with (
+            mock.patch.object(providers.os, "fstat", side_effect=fail_final_fstat),
+            self.assertRaises(providers.ClaudeExecutableInspectionInconclusive),
+        ):
+            providers._read_bounded_owner_file(
+                source,
+                source="final-fstat",
                 limit_bytes=1024,
                 label="fixture owner file",
             )
