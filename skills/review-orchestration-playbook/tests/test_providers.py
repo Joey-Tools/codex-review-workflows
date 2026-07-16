@@ -10767,6 +10767,82 @@ class ProviderPolicyTest(unittest.TestCase):
                 {"SSL_CERT_DIR": os.pathsep.join((str(valid_dir), str(unsafe_dir)))}
             )
 
+    def test_caller_ca_directory_fstat_io_is_inconclusive(self) -> None:
+        source_dir = self.review.source_root / "caller-ca-fstat-io"
+        source_dir.mkdir(mode=0o700)
+
+        with (
+            mock.patch.object(
+                providers,
+                "_open_stable_ca_directory",
+                return_value=123,
+            ),
+            mock.patch.object(providers.os, "fstat", side_effect=OSError(errno.EIO)),
+            mock.patch.object(providers.os, "close"),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "cannot inspect Claude review CA directory SSL_CERT_DIR",
+            ),
+        ):
+            providers._collect_claude_caller_ca_material(
+                {"SSL_CERT_DIR": str(source_dir)}
+            )
+
+    def test_caller_ca_directory_scandir_io_is_inconclusive(self) -> None:
+        source_dir = self.review.source_root / "caller-ca-scandir-io"
+        source_dir.mkdir(mode=0o700)
+        metadata = source_dir.stat()
+
+        with (
+            mock.patch.object(
+                providers,
+                "_open_stable_ca_directory",
+                return_value=123,
+            ),
+            mock.patch.object(providers.os, "fstat", return_value=metadata),
+            mock.patch.object(
+                providers,
+                "_bounded_ca_directory_names",
+                side_effect=OSError(errno.EIO),
+            ),
+            mock.patch.object(providers.os, "close"),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "cannot inspect Claude review CA directory SSL_CERT_DIR",
+            ),
+        ):
+            providers._collect_claude_caller_ca_material(
+                {"SSL_CERT_DIR": str(source_dir)}
+            )
+
+    def test_caller_ca_directory_entry_stat_io_is_inconclusive(self) -> None:
+        source_dir = self.review.source_root / "caller-ca-entry-stat-io"
+        source_dir.mkdir(mode=0o700)
+        metadata = source_dir.stat()
+
+        with (
+            mock.patch.object(
+                providers,
+                "_open_stable_ca_directory",
+                return_value=123,
+            ),
+            mock.patch.object(providers.os, "fstat", return_value=metadata),
+            mock.patch.object(
+                providers,
+                "_bounded_ca_directory_names",
+                return_value=["entry.pem"],
+            ),
+            mock.patch.object(providers.os, "stat", side_effect=OSError(errno.EIO)),
+            mock.patch.object(providers.os, "close"),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "cannot inspect Claude review CA directory SSL_CERT_DIR",
+            ),
+        ):
+            providers._collect_claude_caller_ca_material(
+                {"SSL_CERT_DIR": str(source_dir)}
+            )
+
     def test_caller_ca_directory_private_key_filename_cannot_spoof_empty_source(
         self,
     ) -> None:

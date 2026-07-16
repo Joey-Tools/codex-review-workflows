@@ -3899,46 +3899,55 @@ def _collect_claude_caller_ca_material(
                 )
             descriptor = _open_stable_ca_directory(source_dir, source=key)
             try:
-                before = os.fstat(descriptor)
-                names = _bounded_ca_directory_names(
-                    descriptor,
-                    CLAUDE_CA_DIR_ENTRY_LIMIT - directory_entry_count,
-                    too_many_message="Claude review CA directory has too many entries",
-                )
-                directory_entry_count += len(names)
-                for name in names:
-                    metadata = os.stat(
-                        name,
-                        dir_fd=descriptor,
-                        follow_symlinks=False,
-                    )
-                    if stat.S_ISDIR(metadata.st_mode):
-                        continue
-                    if stat.S_ISLNK(metadata.st_mode):
-                        raise ReviewError(
-                            "Claude review CA directory must not contain symlinks"
-                        )
-                    raw_material, source_size = _read_ca_source_at_with_size(
+                try:
+                    before = os.fstat(descriptor)
+                    names = _bounded_ca_directory_names(
                         descriptor,
-                        name,
-                        source=f"{key}:{name}",
-                        extract_certificates=False,
+                        CLAUDE_CA_DIR_ENTRY_LIMIT - directory_entry_count,
+                        too_many_message=(
+                            "Claude review CA directory has too many entries"
+                        ),
                     )
-                    charge_source(source_size)
-                    try:
-                        material = _extract_ca_certificates(
-                            raw_material,
-                            source=f"{key}:{name}",
+                    directory_entry_count += len(names)
+                    for name in names:
+                        metadata = os.stat(
+                            name,
+                            dir_fd=descriptor,
+                            follow_symlinks=False,
                         )
-                    except ClaudeCACertificateNotFound:
-                        continue
-                    append_material(f"{key}:{name}", material)
-                    found_directory_certificate = True
-                after = os.fstat(descriptor)
-                if _ca_source_metadata(before) != _ca_source_metadata(after):
+                        if stat.S_ISDIR(metadata.st_mode):
+                            continue
+                        if stat.S_ISLNK(metadata.st_mode):
+                            raise ReviewError(
+                                "Claude review CA directory must not contain symlinks"
+                            )
+                        raw_material, source_size = _read_ca_source_at_with_size(
+                            descriptor,
+                            name,
+                            source=f"{key}:{name}",
+                            extract_certificates=False,
+                        )
+                        charge_source(source_size)
+                        try:
+                            material = _extract_ca_certificates(
+                                raw_material,
+                                source=f"{key}:{name}",
+                            )
+                        except ClaudeCACertificateNotFound:
+                            continue
+                        append_material(f"{key}:{name}", material)
+                        found_directory_certificate = True
+                    after = os.fstat(descriptor)
+                    if _ca_source_metadata(before) != _ca_source_metadata(after):
+                        raise ClaudeExecutableInspectionInconclusive(
+                            "Claude review CA directory changed while being read"
+                        )
+                except ReviewError:
+                    raise
+                except OSError as error:
                     raise ClaudeExecutableInspectionInconclusive(
-                        "Claude review CA directory changed while being read"
-                    )
+                        f"cannot inspect Claude review CA directory {key}: {error}"
+                    ) from error
             finally:
                 os.close(descriptor)
     if configured_directory and not found_directory_certificate:

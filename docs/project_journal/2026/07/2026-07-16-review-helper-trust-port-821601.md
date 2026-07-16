@@ -58,12 +58,12 @@ metadata behavior.
 ## Validation
 
 - Python 3.10.19 complete canonical suite with the `tomli` test backport and
-  `PYTHONDONTWRITEBYTECODE=1`: 822 tests run, 4 skipped, no failures. Disabling
+  `PYTHONDONTWRITEBYTECODE=1`: 825 tests run, 4 skipped, no failures. Disabling
   bytecode writes keeps the intentional `RLIMIT_FSIZE` tests from truncating
   uv's own `_virtualenv.pyc` import hook.
-- Python 3.13.0 complete canonical suite: 822 tests run, 9 skipped, no failures.
+- Python 3.13.0 complete canonical suite: 825 tests run, 9 skipped, no failures.
 - Focused Python 3.13 suites: the 3 `SSL_CERT_DIR` regressions passed, providers
-  ran 355 tests with 6 skipped, and provenance ran 90 tests with no skips or
+  ran 358 tests with 6 skipped, and provenance ran 90 tests with no skips or
   failures; earlier current-range common 49 and repository contract 14 test
   suites also passed.
 - Final-head review remediation covers strict signed-manifest numeric parsing,
@@ -135,6 +135,11 @@ metadata behavior.
   partial-chain validation, while LibreSSL applies the same strict CA and DER
   validity policy plus bounded public-key extraction. The provider suite
   includes both capability branches and a real fixed-`/usr/bin/openssl` test.
+- The next helper-backed review found that caller CA-directory metadata and
+  enumeration I/O still escaped the typed inspection boundary. Initial/final
+  `fstat`, bounded `scandir`, and per-entry `stat` failures now remain
+  inspection-inconclusive, while unsafe metadata, symlinks, and input limits
+  retain their existing blocked `ReviewError` classification.
 - Ruff 0.13.2 lint, Python compile, project-journal validation, the official
   skill validator through its documented uv/PyYAML fallback, and working-tree
   diff checks passed. No provider/test formatter churn was retained:
