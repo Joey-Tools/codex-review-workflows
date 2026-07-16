@@ -236,9 +236,11 @@ After the fixed tool passes its metadata prerequisite, an `otool` launch error
 or nonzero inspection result is inconclusive and cannot authorize fallback.
 Executable discovery treats an initial `FileNotFoundError`/`ENOENT` as an absent
 automatic candidate only after a bounded, component-wise `lstat`/no-follow walk
-proves a stable lexically missing component. A symlink involved in that failed
-resolution, a dangling final or parent symlink, a parent-path race, `EACCES`,
-`EIO`, `ESTALE`, or another metadata/access inspection failure is inconclusive.
+proves a stable missing component. A resolved parent symlink is accepted only
+when repeated no-follow metadata and target-directory identity checks bind the
+same resolution. A dangling final or parent symlink, a symlink or parent-path
+race, `EACCES`, `EIO`, `ESTALE`, or another metadata/access inspection failure
+is inconclusive.
 An existing symlink whose final `stat` succeeds remains a candidate; the full
 Claude provenance validator owns its lexical and resolved-chain policy. The same
 absence distinction applies to an explicit executable override, except that a
@@ -552,6 +554,11 @@ that capability. Apple's fixed LibreSSL omits partial-chain support, so that
 host uses the same deterministic DER policy plus bounded public-key extraction;
 the ignored issuer signature is not part of an explicitly selected trust
 anchor's authority.
+The fixed Security and OpenSSL tools are unavailable only when their inspected
+executable or a deterministically required capability is absent. A signal,
+unexpected nonzero exit, unknown help output, or failed `find-certificate` or
+certificate-verification operation is inspection-inconclusive and cannot
+authorize reviewer fallback.
 
 Linux and WSL2 coalesce validated certificates into the existing single private
 bundle mounted read-only at `/etc/ssl/certs/ca-certificates.crt`. If

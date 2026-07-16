@@ -275,10 +275,6 @@ CLAUDE_TRUST_EXPORT_HELP_VARIANTS = (
         "-d Export admin Trust Settings; default is user.",
     ),
 )
-CLAUDE_TRUST_EXPORT_UNAVAILABLE = (
-    "SecTrustSettingsCreateExternalRepresentation: No keychain is available. "
-    "You may need to restart your computer."
-)
 CLAUDE_TRUST_FINGERPRINT = re.compile(r"^[0-9A-Fa-f]{40}$")
 CLAUDE_ACL_TYPE_EXTENDED = 0x00000100
 CLAUDE_TRUST_RESULT_KEY = "kSecTrustSettingsResult"
@@ -1411,9 +1407,13 @@ def _verify_unconditional_trust_root(
                     capability_output = bytes(capabilities.stdout) + bytes(
                         capabilities.stderr
                     )
+                    if capabilities.returncode not in (0, 1):
+                        raise ClaudeExecutableInspectionInconclusive(
+                            "Claude TLS root verification capability probe was "
+                            "inconclusive"
+                        )
                     if (
-                        capabilities.returncode not in (0, 1)
-                        or b"-trusted" not in capability_output
+                        b"-trusted" not in capability_output
                         or b"-x509_strict" not in capability_output
                     ):
                         raise ClaudeTrustToolUnavailable(
@@ -1434,7 +1434,7 @@ def _verify_unconditional_trust_root(
                     "-pubkey",
                     "-noout",
                 )
-                invalid_returncode = 1
+                invalid_returncode: int | None = None
             else:
                 verification_mode = (
                     ("-partial_chain",) if allow_non_self_signed else ("-check_ss_sig",)
@@ -1469,7 +1469,10 @@ def _verify_unconditional_trust_root(
                 and not use_partial_chain
                 and b"-----BEGIN PUBLIC KEY-----" not in completed.stdout
             )
-            if completed.returncode == invalid_returncode or public_key_invalid:
+            if (
+                invalid_returncode is not None
+                and completed.returncode == invalid_returncode
+            ):
                 certificate_kind = (
                     "CA trust anchor"
                     if allow_non_self_signed
@@ -1480,8 +1483,13 @@ def _verify_unconditional_trust_root(
                     f"currently valid {certificate_kind}"
                 )
             if completed.returncode != 0:
-                raise ClaudeTrustToolUnavailable(
-                    "Claude TLS root verification tooling failed unexpectedly"
+                raise ClaudeExecutableInspectionInconclusive(
+                    "Claude TLS root verification failed inconclusively"
+                )
+            if public_key_invalid:
+                raise ClaudeTrustCertificateInvalid(
+                    "Claude trust settings reference a certificate that is not a "
+                    "currently valid CA trust anchor"
                 )
         finally:
             completed.stdout[:] = b"\x00" * len(completed.stdout)
@@ -3755,14 +3763,6 @@ def _is_no_trust_settings(detail: str) -> bool:
     )
 
 
-def _is_trust_export_unavailable(detail: str) -> bool:
-    lines = [line.strip() for line in detail.splitlines() if line.strip()]
-    return lines in (
-        [CLAUDE_TRUST_EXPORT_UNAVAILABLE],
-        [f"security: {CLAUDE_TRUST_EXPORT_UNAVAILABLE}"],
-    )
-
-
 @contextlib.contextmanager
 def _managed_claude_trust_export_path(path: pathlib.Path) -> Iterator[None]:
     try:
@@ -3825,12 +3825,8 @@ def _read_claude_trust_domain(
             if completed.returncode != 0:
                 if _is_no_trust_settings(detail):
                     return None
-                if _is_trust_export_unavailable(detail):
-                    raise ClaudeTrustToolUnavailable(
-                        "Claude TLS trust export tooling is unavailable"
-                    )
-                raise ClaudeTrustPolicyUnavailable(
-                    f"Claude {domain} trust export failed"
+                raise ClaudeExecutableInspectionInconclusive(
+                    f"Claude {domain} trust export failed inconclusively"
                 )
         finally:
             completed.stdout[:] = b"\x00" * len(completed.stdout)
@@ -3893,12 +3889,13 @@ def _require_claude_trust_export_tool(
         for line in detail.splitlines()
         if (normalized := " ".join(line.split()))
     )
-    if (
-        completed.returncode != 0
-        or normalized_lines not in CLAUDE_TRUST_EXPORT_HELP_VARIANTS
-    ):
-        raise ClaudeTrustToolUnavailable(
-            "Claude TLS trust export tooling is unavailable"
+    if completed.returncode != 0:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude TLS trust export capability probe failed inconclusively"
+        )
+    if normalized_lines not in CLAUDE_TRUST_EXPORT_HELP_VARIANTS:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude TLS trust export capability output was inconclusive"
         )
     return client, security_env
 
@@ -4222,8 +4219,8 @@ def _read_claude_trust_certificates_impl(
                 ) from error
             completed_exports.append((source, completed))
             if completed.returncode != 0:
-                raise ClaudeTrustToolUnavailable(
-                    f"Claude {source} certificate export failed"
+                raise ClaudeExecutableInspectionInconclusive(
+                    f"Claude {source} certificate export failed inconclusively"
                 )
         selected = _select_trust_certificates(
             ((source, completed.stdout) for source, completed in completed_exports),
@@ -5582,7 +5579,7 @@ def _claude_auth_warmup_output_shape(stdout: bytes) -> dict[str, object]:
     )
     supported_result_error = (
         safe_type == "result"
-        and safe_subtype in {"success", "error_during_execution"}
+        and safe_subtype == "error_during_execution"
         and is_error is True
         and result_shape == "string"
         and unknown_field_count == 0
@@ -6511,7 +6508,7 @@ def _claude_supported_failure_category(
     if (
         result is None
         or result.get("type") != "result"
-        or result.get("subtype") not in CLAUDE_AUTH_WARMUP_SAFE_SUBTYPES
+        or result.get("subtype") != "error_during_execution"
         or result.get("is_error") is not True
         or not _claude_failure_metadata_is_supported(result)
     ):

@@ -470,6 +470,25 @@ def unblock_forwarded_signals() -> None:
         signal.pthread_sigmask(signal.SIG_UNBLOCK, forwarded_signals())
 
 
+def _regular_file_limit_wrapper_command(
+    command: tuple[str, ...],
+    *,
+    kernel_limit: int,
+    exec_status_write_fd: int,
+) -> tuple[str, ...]:
+    return (
+        str(pathlib.Path(sys.executable).resolve()),
+        "-B",
+        "-I",
+        "-S",
+        "-c",
+        REGULAR_FILE_LIMIT_WRAPPER,
+        str(kernel_limit),
+        str(exec_status_write_fd),
+        *command,
+    )
+
+
 def consume_pending_forwarded_signal() -> signal.Signals | None:
     if not hasattr(signal, "sigpending") or not hasattr(signal, "sigwait"):
         return None
@@ -656,15 +675,10 @@ def _run_logged_process(
             effective_regular_file_limit = regular_file_limit_bytes
             exec_status_read_fd, exec_status_write_fd = os.pipe()
             pass_fds = (exec_status_write_fd,)
-            popen_command = (
-                str(pathlib.Path(sys.executable).resolve()),
-                "-I",
-                "-S",
-                "-c",
-                REGULAR_FILE_LIMIT_WRAPPER,
-                str(kernel_limit),
-                str(exec_status_write_fd),
-                *command,
+            popen_command = _regular_file_limit_wrapper_command(
+                command,
+                kernel_limit=kernel_limit,
+                exec_status_write_fd=exec_status_write_fd,
             )
         popen_options: dict[str, Any] = {
             "cwd": cwd,
@@ -1187,8 +1201,17 @@ def _prove_reviewer_candidate_lexical_absence(
         | getattr(os, "O_DIRECTORY", 0)
         | nofollow
     )
+    symlink_directory_flags = directory_flags & ~nofollow
     descriptors: list[int] = []
-    directory_records: list[tuple[int, str, os.stat_result]] = []
+    directory_records: list[
+        tuple[
+            int,
+            str,
+            os.stat_result,
+            str | None,
+            os.stat_result,
+        ]
+    ] = []
     missing_component: tuple[int, str] | None = None
     try:
         try:
@@ -1210,25 +1233,44 @@ def _prove_reviewer_candidate_lexical_absence(
                     f"cannot lstat reviewer executable path component for {path}: "
                     f"{error}"
                 ) from error
-            if stat.S_ISLNK(metadata.st_mode):
-                raise inspection_error(
-                    f"reviewer executable candidate ENOENT involves a symlink: {path}"
-                )
             if index == len(components) - 1:
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise inspection_error(
+                        f"reviewer executable candidate ENOENT involves a symlink: {path}"
+                    )
                 raise inspection_error(
                     f"reviewer executable candidate appeared during inspection: {path}"
                 )
-            if not stat.S_ISDIR(metadata.st_mode):
+            symlink_target: str | None = None
+            if stat.S_ISLNK(metadata.st_mode):
+                try:
+                    symlink_target = os.readlink(
+                        component,
+                        dir_fd=current_directory,
+                    )
+                except OSError as error:
+                    raise inspection_error(
+                        f"cannot inspect reviewer executable candidate parent symlink "
+                        f"for {path}: {error}"
+                    ) from error
+            elif not stat.S_ISDIR(metadata.st_mode):
                 raise inspection_error(
                     f"reviewer executable candidate parent is not a directory: {path}"
                 )
             try:
                 next_directory = os.open(
                     component,
-                    directory_flags,
+                    symlink_directory_flags
+                    if symlink_target is not None
+                    else directory_flags,
                     dir_fd=current_directory,
                 )
             except OSError as error:
+                if symlink_target is not None:
+                    raise inspection_error(
+                        f"reviewer executable candidate ENOENT involves a symlink "
+                        f"with an unresolved parent: {path}: {error}"
+                    ) from error
                 raise inspection_error(
                     f"reviewer executable candidate parent changed during inspection: "
                     f"{path}: {error}"
@@ -1241,22 +1283,39 @@ def _prove_reviewer_candidate_lexical_absence(
                     f"cannot inspect reviewer executable candidate parent for {path}: "
                     f"{error}"
                 ) from error
-            if _lexical_component_identity(metadata) != _lexical_component_identity(
-                opened
+            if not stat.S_ISDIR(opened.st_mode):
+                raise inspection_error(
+                    f"reviewer executable candidate parent is not a directory: {path}"
+                )
+            if symlink_target is None and (
+                _lexical_component_identity(metadata)
+                != _lexical_component_identity(opened)
             ):
                 raise inspection_error(
                     f"reviewer executable candidate parent changed during inspection: "
                     f"{path}"
                 )
             directory_records.append(
-                (current_directory, component, metadata)
+                (
+                    current_directory,
+                    component,
+                    metadata,
+                    symlink_target,
+                    opened,
+                )
             )
             current_directory = next_directory
         if missing_component is None:
             raise inspection_error(
                 f"reviewer executable candidate absence could not be proven: {path}"
             )
-        for parent_descriptor, component, expected in directory_records:
+        for (
+            parent_descriptor,
+            component,
+            expected,
+            expected_symlink_target,
+            expected_opened,
+        ) in directory_records:
             try:
                 current = os.lstat(component, dir_fd=parent_descriptor)
             except OSError as error:
@@ -1264,14 +1323,68 @@ def _prove_reviewer_candidate_lexical_absence(
                     f"reviewer executable candidate parent changed during inspection: "
                     f"{path}: {error}"
                 ) from error
-            if stat.S_ISLNK(current.st_mode) or (
-                _lexical_component_identity(expected)
+            current_is_symlink = stat.S_ISLNK(current.st_mode)
+            if (
+                current_is_symlink != (expected_symlink_target is not None)
+                or _lexical_component_identity(expected)
                 != _lexical_component_identity(current)
             ):
                 raise inspection_error(
                     f"reviewer executable candidate parent changed during inspection: "
                     f"{path}"
                 )
+            if expected_symlink_target is not None:
+                try:
+                    current_symlink_target = os.readlink(
+                        component,
+                        dir_fd=parent_descriptor,
+                    )
+                except OSError as error:
+                    raise inspection_error(
+                        f"cannot recheck reviewer executable candidate parent symlink "
+                        f"for {path}: {error}"
+                    ) from error
+                if current_symlink_target != expected_symlink_target:
+                    raise inspection_error(
+                        f"reviewer executable candidate parent changed during inspection: "
+                        f"{path}"
+                    )
+            try:
+                rechecked_directory = os.open(
+                    component,
+                    symlink_directory_flags
+                    if expected_symlink_target is not None
+                    else directory_flags,
+                    dir_fd=parent_descriptor,
+                )
+            except OSError as error:
+                raise inspection_error(
+                    f"reviewer executable candidate parent changed during inspection: "
+                    f"{path}: {error}"
+                ) from error
+            try:
+                try:
+                    rechecked_opened = os.fstat(rechecked_directory)
+                except OSError as error:
+                    raise inspection_error(
+                        f"cannot recheck reviewer executable candidate parent for "
+                        f"{path}: {error}"
+                    ) from error
+                if _lexical_component_identity(expected_opened) != (
+                    _lexical_component_identity(rechecked_opened)
+                ):
+                    raise inspection_error(
+                        f"reviewer executable candidate parent changed during inspection: "
+                        f"{path}"
+                    )
+            finally:
+                try:
+                    os.close(rechecked_directory)
+                except OSError as error:
+                    raise inspection_error(
+                        f"cannot close reviewer executable parent recheck for {path}: "
+                        f"{error}"
+                    ) from error
         missing_parent, missing_name = missing_component
         try:
             os.lstat(missing_name, dir_fd=missing_parent)

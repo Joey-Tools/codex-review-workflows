@@ -9,6 +9,7 @@ import json
 import os
 import pathlib
 import plistlib
+import signal
 import socket
 import socketserver
 import ssl
@@ -3339,6 +3340,32 @@ class ProviderPolicyTest(unittest.TestCase):
                 self.assertEqual(attempt.category, category)
                 self.assertEqual(attempt.reason, reason)
                 self.assertIsNone(attempt.final_text)
+
+    def test_success_subtype_error_cannot_authorize_auth_fallback(self) -> None:
+        model = providers.CLAUDE_MODELS[0]
+        payload = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": True,
+            "result": "Not logged in - please run /login",
+            "modelUsage": {model: {}},
+        }
+        encoded = json.dumps(payload).encode()
+
+        self.assertEqual(
+            providers._claude_auth_warmup_output_shape(encoded)["event_shape"],
+            "unsupported",
+        )
+        self.assertIsNone(
+            providers._claude_supported_failure_category(
+                encoded,
+                requested_model=model,
+            )
+        )
+        attempt = self.record_claude_result(encoded, index=154)
+        self.assertEqual(attempt.category, "inconclusive")
+        self.assertEqual(attempt.reason, "unverified-auth-failure-envelope")
+        self.assertIsNone(attempt.final_text)
 
     def test_all_supported_failures_require_requested_model_binding(self) -> None:
         model = providers.CLAUDE_MODELS[0]
@@ -10764,6 +10791,82 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn("-pubkey", argv)
         self.assertNotIn("-partial_chain", argv)
 
+    def test_trust_as_root_capability_probe_abnormal_exit_is_inconclusive(
+        self,
+    ) -> None:
+        intermediate_der, intermediate_pem = self.non_self_issued_ca_fixture()
+        capabilities = common.BoundedCapture(
+            argv=("openssl",),
+            returncode=-int(signal.SIGTERM),
+            stdout=bytearray(),
+            stderr=bytearray(b"-trusted -x509_strict -partial_chain"),
+        )
+
+        with (
+            mock.patch.object(
+                providers,
+                "CLAUDE_OPENSSL_CLIENT",
+                pathlib.Path(sys.executable),
+            ),
+            mock.patch.object(
+                providers,
+                "run_bounded_capture",
+                return_value=capabilities,
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "capability probe was inconclusive",
+            ),
+        ):
+            providers._verify_unconditional_trust_root(
+                intermediate_der,
+                intermediate_pem,
+                ca_root=self.review.container_dir,
+                timeout_seconds=1,
+                allow_non_self_signed=True,
+            )
+
+    def test_trust_as_root_public_key_probe_abnormal_exit_is_inconclusive(
+        self,
+    ) -> None:
+        intermediate_der, intermediate_pem = self.non_self_issued_ca_fixture()
+        capabilities = common.BoundedCapture(
+            argv=("openssl",),
+            returncode=1,
+            stdout=bytearray(),
+            stderr=bytearray(b"-trusted -x509_strict"),
+        )
+        public_key_probe = common.BoundedCapture(
+            argv=("openssl",),
+            returncode=-int(signal.SIGTERM),
+            stdout=bytearray(),
+            stderr=bytearray(),
+        )
+
+        with (
+            mock.patch.object(
+                providers,
+                "CLAUDE_OPENSSL_CLIENT",
+                pathlib.Path(sys.executable),
+            ),
+            mock.patch.object(
+                providers,
+                "run_bounded_capture",
+                side_effect=(capabilities, public_key_probe),
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "failed inconclusively",
+            ),
+        ):
+            providers._verify_unconditional_trust_root(
+                intermediate_der,
+                intermediate_pem,
+                ca_root=self.review.container_dir,
+                timeout_seconds=1,
+                allow_non_self_signed=True,
+            )
+
     @unittest.skipUnless(
         providers.CLAUDE_OPENSSL_CLIENT.is_file(),
         "fixed platform OpenSSL client is unavailable",
@@ -10844,6 +10947,44 @@ class ProviderPolicyTest(unittest.TestCase):
                 timeout_seconds=1,
             )
 
+    def test_trust_root_verifier_abnormal_exit_is_inspection_inconclusive(
+        self,
+    ) -> None:
+        certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+        der, canonical = providers._canonical_ca_certificate(
+            certificate,
+            source="valid root fixture",
+        )
+        completed = common.BoundedCapture(
+            argv=("openssl",),
+            returncode=-int(signal.SIGTERM),
+            stdout=bytearray(),
+            stderr=bytearray(),
+        )
+
+        with (
+            mock.patch.object(
+                providers,
+                "CLAUDE_OPENSSL_CLIENT",
+                pathlib.Path(sys.executable),
+            ),
+            mock.patch.object(
+                providers,
+                "run_bounded_capture",
+                return_value=completed,
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "failed inconclusively",
+            ),
+        ):
+            providers._verify_unconditional_trust_root(
+                der,
+                canonical,
+                ca_root=self.review.container_dir,
+                timeout_seconds=1,
+            )
+
     def test_trust_certificate_selection_uses_only_requested_roots(self) -> None:
         valid = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
         unrelated = self.sample_ca_certificate()
@@ -10882,6 +11023,36 @@ class ProviderPolicyTest(unittest.TestCase):
                 side_effect=OSError(errno.EIO, "help launch failed"),
             ),
             self.assertRaises(providers.ClaudeExecutableInspectionInconclusive),
+        ):
+            providers._require_claude_trust_export_tool(
+                self.review,
+                self.review.container_dir,
+            )
+
+    def test_trust_export_help_abnormal_exit_is_inspection_inconclusive(self) -> None:
+        completed = common.BoundedCapture(
+            argv=("security",),
+            returncode=-int(signal.SIGTERM),
+            stdout=bytearray(),
+            stderr=bytearray(
+                "\n".join(providers.CLAUDE_TRUST_EXPORT_HELP_VARIANTS[0]).encode()
+            ),
+        )
+        with (
+            mock.patch.object(
+                providers,
+                "CLAUDE_KEYCHAIN_CLIENT",
+                pathlib.Path(sys.executable),
+            ),
+            mock.patch.object(
+                providers,
+                "run_bounded_capture",
+                return_value=completed,
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "capability probe failed inconclusively",
+            ),
         ):
             providers._require_claude_trust_export_tool(
                 self.review,
@@ -11009,6 +11180,38 @@ class ProviderPolicyTest(unittest.TestCase):
             self.assertFalse(
                 (self.review.container_dir / f".{domain}-trust.plist").exists()
             )
+
+    def test_trust_domain_runtime_failure_is_inspection_inconclusive(self) -> None:
+        unavailable_detail = (
+            "SecTrustSettingsCreateExternalRepresentation: No keychain is "
+            "available. You may need to restart your computer."
+        )
+        for detail in (unavailable_detail, "securityd operation failed"):
+            completed = common.BoundedCapture(
+                argv=("security",),
+                returncode=1,
+                stdout=bytearray(),
+                stderr=bytearray(detail.encode()),
+            )
+            with (
+                self.subTest(detail=detail),
+                mock.patch.object(
+                    providers,
+                    "run_bounded_capture",
+                    return_value=completed,
+                ),
+                self.assertRaisesRegex(
+                    providers.ClaudeExecutableInspectionInconclusive,
+                    "failed inconclusively",
+                ),
+            ):
+                providers._read_claude_trust_domain(
+                    pathlib.Path("/usr/bin/security"),
+                    {},
+                    self.review.container_dir,
+                    domain="user",
+                    options=(),
+                )
 
     def test_trust_export_cleanup_preserves_existing_policy_error(self) -> None:
         path = types.SimpleNamespace(
@@ -11418,6 +11621,63 @@ class ProviderPolicyTest(unittest.TestCase):
                 side_effect=export_trust,
             ),
             self.assertRaises(providers.ClaudeExecutableInspectionInconclusive),
+        ):
+            providers._read_claude_trust_certificates(
+                self.review,
+                self.review.container_dir,
+                evidence=evidence,
+            )
+
+        terminal = json.loads(
+            (
+                self.review.container_dir
+                / providers.CLAUDE_TRUST_POLICY_EVIDENCE_NAME
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(terminal["status"], "inconclusive")
+
+    def test_trust_certificate_export_abnormal_exit_is_inconclusive(self) -> None:
+        certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+        fingerprint = self.ca_sha1_fingerprint(certificate)
+        evidence = providers._new_claude_trust_policy_evidence(
+            self.claude_executable_evidence
+        )
+        completed = common.BoundedCapture(
+            argv=("security",),
+            returncode=-int(signal.SIGTERM),
+            stdout=bytearray(),
+            stderr=bytearray(),
+        )
+
+        with (
+            mock.patch.object(
+                providers,
+                "_require_claude_trust_export_tool",
+                return_value=(pathlib.Path("/usr/bin/security"), {}),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_claude_trust_domain",
+                side_effect=(
+                    providers.ClaudeTrustFingerprints(
+                        unconditional=(fingerprint,),
+                        trust_root=(fingerprint,),
+                        trust_as_root=(),
+                        constrained=(),
+                    ),
+                    None,
+                    None,
+                ),
+            ),
+            mock.patch.object(
+                providers,
+                "run_bounded_capture",
+                return_value=completed,
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "certificate export failed inconclusively",
+            ),
         ):
             providers._read_claude_trust_certificates(
                 self.review,

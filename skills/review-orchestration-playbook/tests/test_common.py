@@ -424,6 +424,16 @@ class ChildEnvironmentTest(unittest.TestCase):
                     regular_file_limit_path=root / "unused.bin",
                 )
 
+    def test_regular_file_wrapper_disables_bytecode_before_isolation(self) -> None:
+        command = common._regular_file_limit_wrapper_command(
+            ("/usr/bin/example", "--version"),
+            kernel_limit=1025,
+            exec_status_write_fd=7,
+        )
+
+        self.assertEqual(command[1:4], ("-B", "-I", "-S"))
+        self.assertEqual(command[-4:], ("1025", "7", "/usr/bin/example", "--version"))
+
     def test_output_limit_is_detected_while_stream_remains_open(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -1109,6 +1119,69 @@ class ChildEnvironmentTest(unittest.TestCase):
             with self.assertRaisesRegex(
                 CandidateInspectionInconclusive,
                 "involves a symlink",
+            ):
+                common._reviewer_candidate_is_executable(
+                    candidate,
+                    inspection_error=CandidateInspectionInconclusive,
+                )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "O_NOFOLLOW"),
+        "requires POSIX no-follow path inspection",
+    )
+    def test_resolved_parent_symlink_can_prove_candidate_absence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            target = root / "real-bin"
+            target.mkdir()
+            parent = root / "bin"
+            parent.symlink_to(target.name, target_is_directory=True)
+            candidate = parent / "missing-reviewer"
+
+            self.assertFalse(
+                common._reviewer_candidate_is_executable(
+                    candidate,
+                    inspection_error=CandidateInspectionInconclusive,
+                )
+            )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "O_NOFOLLOW"),
+        "requires POSIX no-follow path inspection",
+    )
+    def test_parent_symlink_target_race_is_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            first_target = root / "first-bin"
+            second_target = root / "second-bin"
+            first_target.mkdir()
+            second_target.mkdir()
+            parent = root / "bin"
+            parent.symlink_to(first_target.name, target_is_directory=True)
+            candidate = parent / "missing-reviewer"
+            original_readlink = common.os.readlink
+            readlink_calls = 0
+
+            def readlink_with_race(path, *, dir_fd=None):
+                nonlocal readlink_calls
+                result = original_readlink(path, dir_fd=dir_fd)
+                if path == parent.name:
+                    readlink_calls += 1
+                    if readlink_calls == 1:
+                        parent.unlink()
+                        parent.symlink_to(second_target.name, target_is_directory=True)
+                return result
+
+            with (
+                mock.patch.object(
+                    common.os,
+                    "readlink",
+                    side_effect=readlink_with_race,
+                ),
+                self.assertRaisesRegex(
+                    CandidateInspectionInconclusive,
+                    "parent changed during inspection",
+                ),
             ):
                 common._reviewer_candidate_is_executable(
                     candidate,
