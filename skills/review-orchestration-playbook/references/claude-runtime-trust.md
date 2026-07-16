@@ -803,6 +803,10 @@ deterministically absent or the supported platform/capability is not present.
 A present but non-native, untrusted-owner, writable, set-id, non-executable, or
 otherwise unsafe GPG/`otool`/glibc-loader candidate is a blocked security error.
 A resolve, stat, open, copy, launch, or refresh I/O failure is inconclusive. The
+final invocation treats entitlement as fallback evidence only when the strict
+stdout result contains the structured entitlement signal; stderr-only account,
+plan, or model wording remains inconclusive even beside an otherwise valid
+result envelope and exact requested-model usage. The
 generic provenance-operation exception therefore never authorizes Copilot
 fallback; only its dedicated deterministic-dependency subtype may do so.
 

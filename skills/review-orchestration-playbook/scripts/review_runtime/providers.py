@@ -5718,8 +5718,12 @@ def _claude_supported_failure_category(
         [category],
     ):
         return None
-    if category == "entitlement" and effective_model is None:
-        return None
+    if category == "entitlement":
+        entitlement_source = evidence_categories.get("entitlement", "")
+        if not entitlement_source.startswith("structured-"):
+            return None
+        if effective_model is None:
+            return None
     return category if category in {"auth", "entitlement", "transient"} else None
 
 

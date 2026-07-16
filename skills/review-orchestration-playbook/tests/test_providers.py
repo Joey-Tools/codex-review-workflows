@@ -3124,6 +3124,39 @@ class ProviderPolicyTest(unittest.TestCase):
                 self.assertEqual(attempt.reason, expected_reason)
                 self.assertIsNone(attempt.final_text)
 
+    def test_claude_entitlement_rejects_stderr_only_evidence(self) -> None:
+        model = providers.CLAUDE_MODELS[0]
+        stdout = json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "result": "request rejected",
+                "modelUsage": {model: {}},
+            }
+        ).encode()
+        stderr = b"Model is not available for your account"
+
+        self.assertIsNone(
+            providers._claude_supported_failure_category(
+                stdout,
+                stderr=stderr,
+                requested_model=model,
+            )
+        )
+        attempt = self.record_claude_result(
+            stdout,
+            returncode=1,
+            stderr=stderr,
+            index=112,
+        )
+        self.assertEqual(attempt.category, "inconclusive")
+        self.assertEqual(
+            attempt.reason,
+            "unverified-entitlement-failure-envelope",
+        )
+        self.assertIsNone(attempt.final_text)
+
     def test_claude_transient_requires_exact_failure_envelope(self) -> None:
         base = {
             "type": "result",
