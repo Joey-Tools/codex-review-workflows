@@ -75,5 +75,21 @@
       }
     ]
   },
-  "legacy_exemptions": []
+  "legacy_exemptions": [
+    {
+      "id": "codex-workflow-hygiene-jwt",
+      "repository": "Joey-Tools/codex-workflow-hygiene",
+      "verified_master_tip": "95befb966cd93e0161ecb45099c124eac56cb52f",
+      "match": "non-increasing-global-count",
+      "values": [
+        {
+          "id": "session-retrospective-redaction-jwt",
+          "rule": "jwt",
+          "value_base64": "ZXlKYWJjZGVmZ2hpamtsLmV5Sm1ub3BxcnN0dXYuZXlKd3h5emFiY2RlZg==",
+          "containing_commit": "49dc9bb8af8256b5c39ff870ec6b682ff08bd5a8",
+          "source_occurrences": 1
+        }
+      ]
+    }
+  ]
 }
