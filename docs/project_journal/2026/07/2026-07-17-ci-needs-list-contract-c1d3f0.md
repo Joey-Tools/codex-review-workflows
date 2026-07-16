@@ -28,6 +28,8 @@ status context on additional compatibility and platform jobs.
   synchronized overlays with additional direct dependencies.
 - Quoted dependency names are normalized consistently in scalar, block-list,
   and inline-list forms.
+- Every accepted direct dependency must expose its result and be checked for a
+  successful outcome by the aggregate `test` job.
 
 ## Validation Evidence
 

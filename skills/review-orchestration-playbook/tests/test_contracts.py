@@ -20,7 +20,7 @@ sys.path.insert(0, str(SCRIPTS))
 from review_runtime import claude_linux, providers  # noqa: E402
 
 
-def _workflow_job_needs(workflow: str, job_name: str) -> tuple[str, ...]:
+def _workflow_job_lines(workflow: str, job_name: str) -> tuple[str, ...]:
     marker = f"\n  {job_name}:\n"
     if marker not in workflow:
         return ()
@@ -29,6 +29,11 @@ def _workflow_job_needs(workflow: str, job_name: str) -> tuple[str, ...]:
         if line.startswith("  ") and not line.startswith("    "):
             break
         job_lines.append(line)
+    return tuple(job_lines)
+
+
+def _workflow_job_needs(workflow: str, job_name: str) -> tuple[str, ...]:
+    job_lines = _workflow_job_lines(workflow, job_name)
 
     for index, line in enumerate(job_lines):
         if line.startswith("    needs: "):
@@ -50,6 +55,31 @@ def _workflow_job_needs(workflow: str, job_name: str) -> tuple[str, ...]:
                 )
             return tuple(dependencies)
     return ()
+
+
+def _workflow_job_success_guards(workflow: str, job_name: str) -> tuple[str, ...]:
+    job_lines = _workflow_job_lines(workflow, job_name)
+    result_variables: dict[str, str] = {}
+    expression_prefix = "${{ needs."
+    expression_suffix = ".result }}"
+    for line in job_lines:
+        variable, separator, expression = line.strip().partition(": ")
+        if (
+            separator
+            and expression.startswith(expression_prefix)
+            and expression.endswith(expression_suffix)
+        ):
+            dependency = expression[
+                len(expression_prefix) : -len(expression_suffix)
+            ]
+            result_variables[dependency] = variable
+
+    job_body = "\n".join(line.strip() for line in job_lines)
+    return tuple(
+        dependency
+        for dependency, variable in result_variables.items()
+        if f'test "${variable}" = "success"' in job_body
+    )
 
 
 class RepositoryContractTest(unittest.TestCase):
@@ -287,7 +317,12 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("\n  test:\n", workflow)
         self.assertIn("\n    name: test\n", workflow)
         self.assertIn("if: ${{ always() }}", workflow)
-        self.assertIn("platform_tests", _workflow_job_needs(workflow, "test"))
+        dependencies = _workflow_job_needs(workflow, "test")
+        self.assertIn("platform_tests", dependencies)
+        self.assertEqual(
+            set(_workflow_job_success_guards(workflow, "test")),
+            set(dependencies),
+        )
         self.assertIn(
             "PLATFORM_TESTS_RESULT: ${{ needs.platform_tests.result }}",
             workflow,
@@ -306,6 +341,13 @@ class RepositoryContractTest(unittest.TestCase):
             "      - compatibility_tests\n"
             '      - "platform_tests"\n'
             "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - env:\n"
+            "          COMPATIBILITY_RESULT: ${{ needs.compatibility_tests.result }}\n"
+            "          PLATFORM_RESULT: ${{ needs.platform_tests.result }}\n"
+            "        run: |\n"
+            '          test "$COMPATIBILITY_RESULT" = "success"\n'
+            '          test "$PLATFORM_RESULT" = "success"\n'
         )
         inline_list = (
             "jobs:\n"
@@ -334,6 +376,10 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(
             _workflow_job_needs(other_job_only, "test"),
             ("compatibility_tests",),
+        )
+        self.assertEqual(
+            _workflow_job_success_guards(list_form, "test"),
+            ("compatibility_tests", "platform_tests"),
         )
 
     def test_helper_declares_and_tests_its_minimum_python_runtime(self) -> None:
