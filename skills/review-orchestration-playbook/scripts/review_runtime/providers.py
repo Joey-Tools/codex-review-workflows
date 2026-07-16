@@ -1197,8 +1197,8 @@ def _verify_unconditional_trust_root(
                 stderr_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
             )
         except OSError as error:
-            raise ClaudeTrustToolUnavailable(
-                "Claude TLS root verification tooling became unavailable"
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude TLS root verification launch was inconclusive"
             ) from error
         try:
             if completed.returncode == 2:
@@ -4400,6 +4400,8 @@ def _run_claude_auth_warmup(
     executable: pathlib.Path,
     env: dict[str, str],
     model: str,
+    *,
+    proxy_env: dict[str, str] | None = None,
 ) -> Completed:
     rg = _trusted_claude_ripgrep()
     if rg is None:
@@ -4414,7 +4416,7 @@ def _run_claude_auth_warmup(
     )
     with (
         _claude_connect_proxy(
-            warmup_env,
+            warmup_env if proxy_env is None else proxy_env,
             allowed_targets=CLAUDE_AUTH_PROXY_TARGETS,
         ) as proxy_port,
         tempfile.TemporaryDirectory(
@@ -4479,6 +4481,8 @@ def _warm_claude_local_login(
     executable: pathlib.Path,
     env: dict[str, str],
     model: str,
+    *,
+    proxy_env: dict[str, str] | None = None,
 ) -> None:
     try:
         _require_fresh_claude_keychain_credential_for_auth_preflight(review)
@@ -4486,7 +4490,14 @@ def _warm_claude_local_login(
     except ClaudeKeychainCredentialUnavailable:
         pass
     try:
-        warmup = _run_claude_auth_warmup(review, executable, env, model)
+        proxy_options = {} if proxy_env is None else {"proxy_env": proxy_env}
+        warmup = _run_claude_auth_warmup(
+            review,
+            executable,
+            env,
+            model,
+            **proxy_options,
+        )
     except (
         ReviewTimeoutError,
         ReviewOutputDrainError,
@@ -7140,6 +7151,7 @@ def _claude_attempt(
             executable_evidence,
         )
         attempt_env = _with_claude_review_tool_path(review, env)
+        proxy_env = dict(attempt_env)
         attempt_env = _prepare_claude_tls_environment(
             review,
             attempt_env,
@@ -7160,6 +7172,7 @@ def _claude_attempt(
                         executable,
                         attempt_env,
                         model,
+                        proxy_env=proxy_env,
                     )
                 except ClaudeAuthWarmupEntitlement as error:
                     (
@@ -7300,7 +7313,7 @@ def _claude_attempt(
                     raise ClaudeAuthWarmupInconclusive(
                         f"Claude final credential check was inconclusive: {error}"
                     ) from error
-                proxy_port = stack.enter_context(_claude_connect_proxy(runtime_env))
+                proxy_port = stack.enter_context(_claude_connect_proxy(proxy_env))
                 review_env = _with_claude_proxy_environment(
                     runtime_env,
                     proxy_port,

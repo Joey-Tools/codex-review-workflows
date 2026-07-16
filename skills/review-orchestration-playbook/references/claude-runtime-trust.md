@@ -556,6 +556,14 @@ environments do not consult `NODE_EXTRA_CA_CERTS`. Arbitrary `NODE_*`,
 `NODE_TLS_REJECT_UNAUTHORIZED=0`, mTLS private-key inputs, and private-key
 material remain outside the contract.
 
+On macOS, each model attempt captures the parent/proxy TLS environment before
+building the Claude-only merged bundle. Both the local-login warmup proxy and
+the final review proxy use that pre-merge environment; only the sandboxed
+Claude process receives the merged bundle paths. A discovered fixed OpenSSL
+verifier that then fails to launch or returns an operating-system I/O error is
+inspection-inconclusive, never deterministic tool absence, and cannot authorize
+Copilot fallback.
+
 Linux and WSL2 fix cwd at `/workspace`, use `dontAsk`, expose only `Read`, and
 pre-approve only `Read(./**)`. Every other top-level path mounted into the
 synthetic root is denied both at the root and recursively with absolute

@@ -58,12 +58,12 @@ metadata behavior.
 ## Validation
 
 - Python 3.10.19 complete canonical suite with the `tomli` test backport and
-  `PYTHONDONTWRITEBYTECODE=1`: 823 tests run, 4 skipped, no failures. Disabling
+  `PYTHONDONTWRITEBYTECODE=1`: 824 tests run, 9 skipped, no failures. Disabling
   bytecode writes keeps the intentional `RLIMIT_FSIZE` tests from truncating
   uv's own `_virtualenv.pyc` import hook.
-- Python 3.13.0 complete canonical suite: 823 tests run, 9 skipped, no failures.
+- Python 3.13.0 complete canonical suite: 824 tests run, 9 skipped, no failures.
 - Focused Python 3.13 suites: the 3 `SSL_CERT_DIR` regressions passed, providers
-  ran 352 tests with 6 skipped, and provenance ran 90 tests with no skips or
+  ran 353 tests with 6 skipped, and provenance ran 90 tests with no skips or
   failures; earlier current-range common 49 and repository contract 14 test
   suites also passed.
 - Final-head review remediation covers strict signed-manifest numeric parsing,
@@ -118,6 +118,13 @@ metadata behavior.
   wording about account, plan, or model availability can no longer authorize an
   Opus downgrade or Copilot fallback, even when the envelope otherwise carries
   exact requested-model usage.
+- The next independent review closed two trust-domain leaks. A discovered
+  OpenSSL root verifier whose launch fails now remains inspection-inconclusive
+  instead of becoming deterministic tool absence, so it cannot authorize the
+  Copilot fallback. macOS model attempts also preserve a separate pre-merge
+  parent/proxy TLS environment for both local-login warmup and final review;
+  Claude's merged bundled/caller/Node CA set is exposed only to the sandboxed
+  Claude process and no longer widens the upstream CONNECT proxy trust store.
 - Ruff 0.13.2 lint, Python compile, project-journal validation, the official
   skill validator through its documented uv/PyYAML fallback, and working-tree
   diff checks passed. No provider/test formatter churn was retained:

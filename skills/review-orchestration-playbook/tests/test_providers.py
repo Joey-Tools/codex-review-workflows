@@ -1345,13 +1345,18 @@ class ProviderPolicyTest(unittest.TestCase):
             **_kwargs: object,
         ) -> dict[str, str]:
             events.append("tls")
-            return dict(env)
+            return {
+                **env,
+                "NODE_EXTRA_CA_CERTS": "/helper/merged-claude-ca.pem",
+                "SSL_CERT_FILE": "/helper/merged-claude-ca.pem",
+            }
 
         def warmup(
             _review: ReviewWorkspace,
             _executable: pathlib.Path,
             _env: dict[str, str],
             _model: str,
+            **_kwargs: object,
         ) -> None:
             events.append("warmup")
 
@@ -1403,7 +1408,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 providers,
                 "_claude_connect_proxy",
                 return_value=contextlib.nullcontext(43210),
-            ),
+            ) as connect_proxy,
             mock.patch.object(
                 providers,
                 "_claude_review_sandbox_profile",
@@ -1431,7 +1436,10 @@ class ProviderPolicyTest(unittest.TestCase):
                 runner=runner,
                 runtime="claude",
                 requested_effort=providers.CLAUDE_REASONING_EFFORT,
-                env={},
+                env={
+                    "NODE_EXTRA_CA_CERTS": "/caller/node-extra-ca.pem",
+                    "SSL_CERT_FILE": "/caller/parent-proxy-ca.pem",
+                },
                 attempts=[],
             )
 
@@ -1455,6 +1463,24 @@ class ProviderPolicyTest(unittest.TestCase):
             [call.args[3] for call in self.warmup.call_args_list],
             list(providers.CLAUDE_MODELS),
         )
+        for call in self.warmup.call_args_list:
+            self.assertEqual(
+                call.kwargs["proxy_env"]["SSL_CERT_FILE"],
+                "/caller/parent-proxy-ca.pem",
+            )
+            self.assertEqual(
+                call.kwargs["proxy_env"]["NODE_EXTRA_CA_CERTS"],
+                "/caller/node-extra-ca.pem",
+            )
+        for call in connect_proxy.call_args_list:
+            self.assertEqual(
+                call.args[0]["SSL_CERT_FILE"],
+                "/caller/parent-proxy-ca.pem",
+            )
+            self.assertEqual(
+                call.args[0]["NODE_EXTRA_CA_CERTS"],
+                "/caller/node-extra-ca.pem",
+            )
         self.assertEqual(
             providers._claude_keychain_runtime.call_count,
             len(providers.CLAUDE_MODELS),
@@ -9891,6 +9917,36 @@ class ProviderPolicyTest(unittest.TestCase):
                 return_value=completed,
             ),
             self.assertRaises(providers.ClaudeTrustCertificateInvalid),
+        ):
+            providers._verify_unconditional_trust_root(
+                der,
+                canonical,
+                ca_root=self.review.container_dir,
+                timeout_seconds=1,
+            )
+
+    def test_trust_root_verifier_launch_io_is_inspection_inconclusive(self) -> None:
+        certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+        der, canonical = providers._canonical_ca_certificate(
+            certificate,
+            source="valid root fixture",
+        )
+
+        with (
+            mock.patch.object(
+                providers,
+                "CLAUDE_OPENSSL_CLIENT",
+                pathlib.Path(sys.executable),
+            ),
+            mock.patch.object(
+                providers,
+                "run_bounded_capture",
+                side_effect=OSError(errno.EIO, "OpenSSL launch failed"),
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "launch was inconclusive",
+            ),
         ):
             providers._verify_unconditional_trust_root(
                 der,
