@@ -7453,7 +7453,6 @@ def _finish(
         return Outcome(0, final_text, tuple(attempts))
     if not attempts or attempts[-1].category in {
         "inconclusive",
-        "runtime-unverified",
         "transient",
     }:
         return Outcome(75, None, tuple(attempts))

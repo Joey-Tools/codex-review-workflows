@@ -4383,6 +4383,18 @@ class ProviderPolicyTest(unittest.TestCase):
             final_text + "\n",
         )
 
+    def test_finish_treats_runtime_unverified_as_blocked(self) -> None:
+        attempt = self.attempt(
+            "claude",
+            providers.CLAUDE_MODELS[0],
+            "runtime-unverified",
+        )
+
+        outcome = providers._finish(self.review, [attempt], None)
+
+        self.assertEqual(outcome.returncode, 1)
+        self.assertEqual(outcome.attempts, (attempt,))
+
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(providers, "_codex_attempt")
     def test_codex_capacity_does_not_downgrade(
