@@ -186,6 +186,15 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("bounded FIFO/pipe", readiness)
         self.assertIn("distinct fresh ordinary artifact", readiness)
         self.assertIn("only that ordinary artifact", readiness)
+        self.assertIn(
+            "Never implement the final-message cap with process-wide `RLIMIT_FSIZE`",
+            readiness,
+        )
+        self.assertIn("terminate the reviewer with `SIGXFSZ`", readiness)
+        self.assertIn(
+            "a parent supervisor that enforces the caps on parent-owned bounded sinks",
+            readiness,
+        )
         self.assertIn("Enforce every cap while the reviewer runs", readiness)
         self.assertIn("OS-enforced job/cgroup/container", readiness)
         self.assertIn("survives `setsid` / `setpgid`", readiness)
@@ -215,6 +224,17 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("when the deadline expires", contracts)
         self.assertIn("hard per-file quota or bounded sink", contracts)
         self.assertIn("bounded FIFO/pipe reader", contracts)
+        self.assertIn(
+            "Do not set process-wide file-size limits such as `RLIMIT_FSIZE`",
+            contracts,
+        )
+        self.assertIn("unrelated internal session and state files", contracts)
+        self.assertIn("terminate the reviewer with `SIGXFSZ`", contracts)
+        self.assertIn("invalid harness attempt, not review evidence", contracts)
+        self.assertIn(
+            "a parent supervisor enforces the relevant byte ceilings",
+            contracts,
+        )
         self.assertIn("Direct-path monitoring or a post-exit size check alone", contracts)
         self.assertIn("OS-enforced job, cgroup, or container", contracts)
         self.assertIn("survives `setsid` / `setpgid`", contracts)
