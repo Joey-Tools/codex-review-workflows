@@ -157,6 +157,12 @@ class RepositoryContractTest(unittest.TestCase):
             "with no final text and without claiming that the final broker",
             helper_contract,
         )
+        self.assertIn("explicitly in an error state", helper_contract)
+        self.assertIn(
+            "entitlement-shaped stderr is not fallback evidence",
+            helper_contract,
+        )
+        self.assertIn("overwrites any earlier entitlement model", helper_contract)
         self.assertIn("full stdout/stderr is retained", helper_contract)
         self.assertIn(
             "authentication failure remains unavailable",

@@ -998,6 +998,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     "outer_sandbox": {"status": "pending-runtime-launch"},
                     "authentication": {
                         "status": "freshness-verified",
+                        "model": model,
                         "validated_for_model": model,
                     },
                     "attempt": None,
@@ -1128,6 +1129,42 @@ class ProviderPolicyTest(unittest.TestCase):
             )
 
         self.assertIs(raised.exception.completed, completed)
+        self.assertEqual(require_fresh.call_count, 2)
+
+    @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
+    @mock.patch.object(providers, "_run_claude_auth_warmup")
+    def test_successful_warmup_ignores_entitlement_wording_on_stderr(
+        self,
+        warmup: mock.Mock,
+        require_fresh: mock.Mock,
+    ) -> None:
+        model = providers.CLAUDE_MODELS[0]
+        require_fresh.side_effect = (
+            providers.ClaudeKeychainCredentialUnavailable("stale"),
+            None,
+        )
+        warmup.return_value = Completed(
+            argv=("claude",),
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "result": "OK",
+                    "modelUsage": {model: {}},
+                }
+            ).encode(),
+            stderr=b"model is not available for an unrelated optional feature",
+        )
+
+        self.warm_claude_local_login(
+            self.review,
+            pathlib.Path("/bin/claude"),
+            {},
+            model,
+        )
+
         self.assertEqual(require_fresh.call_count, 2)
 
     def test_warmup_entitlement_records_verified_attempt_without_final_runtime(
@@ -1293,6 +1330,14 @@ class ProviderPolicyTest(unittest.TestCase):
         first_model, second_model = providers.CLAUDE_MODELS
         executable = self.review.container_dir / "verified-claude"
         executable.write_bytes(b"snapshot")
+        providers.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {
+                "phase": "publisher-and-capabilities-verified",
+                "authentication": {"status": "pending"},
+                "outer_sandbox": {"status": "pending-runtime-launch"},
+            },
+        )
         entitlement = Completed(
             argv=("claude",),
             returncode=1,
@@ -1378,6 +1423,16 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         run_command.assert_called_once()
         self.assertEqual(providers._claude_keychain_runtime.call_count, 1)
+        report = json.loads(
+            (self.review.container_dir / "claude-runtime.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(report["authentication"]["model"], second_model)
+        self.assertEqual(
+            report["authentication"]["validated_for_model"],
+            second_model,
+        )
 
     @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
     @mock.patch.object(providers, "_run_claude_auth_warmup")

@@ -127,10 +127,12 @@ explicitly configured Claude Code candidate:
     Keychain item. Linux and WSL2 never warm or refresh credentials; each
     attempt independently validates and stages a new private copy. An explicit
     API key skips local-login warmup and staging. If the warmup returns an
-    explicit entitlement or organization-policy denial with exact effective-
-    model verification, persist that fallback evidence and end the current
-    model boundary without starting the final broker or review sandbox, even
-    when credential freshness remains insufficient.
+    explicit entitlement or organization-policy denial in a strict top-level
+    error result, with structured-error classification and exact effective-model
+    verification, persist that fallback evidence and end the current model
+    boundary without starting the final broker or review sandbox, even when
+    credential freshness remains insufficient. Successful structured output
+    plus entitlement-shaped stderr never authorizes fallback.
 11. Launch only the one captured verified snapshot for every real model attempt
     in a fresh outer sandbox; never rediscover or fall back to the mutable source
     installation between Opus attempts. If entitlement selects a later Opus
@@ -612,9 +614,10 @@ reached:
 2. macOS `authentication-preflight-complete`: after review-tool and TLS
    preparation for the current attempt, API-key configuration or local-login
    refresh/validation passed. Authentication status becomes `configured` or
-   `freshness-verified`, and `validated_for_model` identifies the model whose
-   attempt window was checked. When this outcome is published for a later Opus
-   attempt, it clears the previous attempt subtree, restores the outer-sandbox
+   `freshness-verified`; `authentication.model` and `validated_for_model` both
+   identify the current model whose attempt window was checked. When this
+   outcome is published for a later Opus attempt, it clears the previous
+   attempt subtree, restores the outer-sandbox
    status to pending, and is not a whole-chain freshness guarantee.
 3. macOS authentication preparation failure before a model launch is explicit.
    `authentication-preflight-inconclusive` records the current model and stable

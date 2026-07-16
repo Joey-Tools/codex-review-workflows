@@ -2217,7 +2217,16 @@ def _warm_claude_local_login(
         if credential_error is not None:
             raise inconclusive from credential_error
         raise inconclusive
-    if category == "entitlement":
+    warmup_result = _strict_json_object(warmup.stdout)
+    structured_entitlement = (
+        category == "entitlement"
+        and warmup_result is not None
+        and warmup_result.get("type") == "result"
+        and warmup_result.get("subtype") != "success"
+        and warmup_result.get("is_error") is True
+        and classify_failure(warmup.stdout, b"") == "entitlement"
+    )
+    if structured_entitlement:
         raise ClaudeAuthWarmupEntitlement(warmup)
     if category == "auth":
         if credential_error is not None:
@@ -4322,6 +4331,7 @@ def _claude_attempt(
                 "outer_sandbox": {"status": "pending-runtime-launch"},
                 "authentication": {
                     "status": authentication_status,
+                    "model": model,
                     "validated_for_model": model,
                 },
                 "attempt": None,
