@@ -690,6 +690,28 @@ class ManifestParsingTest(unittest.TestCase):
                 platform_key="darwin-arm64",
             )
 
+    def test_rejects_unbounded_json_numbers(self) -> None:
+        size_field = f'"size": {len(self.payload)}'.encode()
+        for value, reason in (
+            (b"1e10000", "non-finite"),
+            (b"9" * 1025, "bounded parser limit"),
+        ):
+            with self.subTest(reason=reason):
+                manifest = manifest_for(self.payload).replace(
+                    size_field,
+                    b'"size": ' + value,
+                    1,
+                )
+                with self.assertRaisesRegex(
+                    claude_provenance.ClaudeProvenanceInvalid,
+                    reason,
+                ):
+                    claude_provenance.parse_signed_manifest_artifact(
+                        manifest,
+                        version="2.1.202",
+                        platform_key="darwin-arm64",
+                    )
+
     def test_rejects_over_nested_signed_manifest(self) -> None:
         nested = "[" * 65 + "0" + "]" * 65
         manifest = (

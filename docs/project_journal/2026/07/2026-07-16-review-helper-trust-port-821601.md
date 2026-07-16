@@ -31,7 +31,7 @@ metadata behavior.
 | Warmup and fallback evidence | Port | Authentication is deterministic only for one supported complete result-error shape with the exact known login message and no conflicting category. Unknown fields or event shapes and malformed usage remain inconclusive or runtime-unverified. Entitlement requires requested-model usage evidence. |
 | macOS owner-only reads and ACLs | Port to files canonical reads | Trust exports, caller CA snapshots, and generated trust inputs use descriptor-anchored bounded regular-file reads, reject symlinks, hardlinks, FIFOs, growth, public modes, and ACL entries, allow an allocated empty ACL, and fail closed on unknown ACL errors. |
 | Credential/account stability | Port without metadata bridge | The current account is bound once, the Keychain value is read twice and compared, expiry covers one bounded model attempt, and freshness is repeated at the final launch boundary. If freshness expires there, one complete executable, trust/TLS, authentication, broker, and sandbox preflight retry is allowed; a second expiry is inconclusive. Every model attempt repeats the same sequence and preserves earlier completed attempts. Linux/WSL2 credential staging remains unchanged except for shared strict JSON. |
-| macOS trust and TLS | Port and bind to signed provenance | Authoritative deny wins, constrained or omitted roots are excluded from the complete merge, caller material is bounded and certificate-only, private keys are rejected, and every attempt re-exports trust and rebuilds the bundle. Across domains, blocked policy errors outrank inconclusive errors, which outrank unavailable exports. The exact bundled root set is extracted from and rebound to the publisher-verified snapshot; a policy-excluded bundled root blocks. Every failure terminalizes structured trust evidence. Linux/WSL2 keeps its canonical private CA preparation. |
+| macOS trust and TLS | Port and bind to signed provenance | Authoritative deny wins, constrained or omitted roots are excluded from the complete merge, and unconditional roots from user, admin, and system trust domains are all eligible for export. Caller material is bounded and certificate-only, private keys are rejected, and every attempt re-exports trust and rebuilds the bundle. Across domains, blocked policy errors outrank inconclusive errors, which outrank unavailable exports. The exact bundled root set is extracted from and rebound to the publisher-verified snapshot; initial inspection verifies every root self-signature, while later boundaries require the signed executable SHA-256 and exact extracted root set without replaying per-certificate OpenSSL. A policy-excluded bundled root blocks. Every failure terminalizes structured trust evidence. Linux/WSL2 keeps its canonical private CA preparation. |
 | Regular-file output limits | Port into shared supervisor | `run_bounded_capture` applies an exact logical limit with a kernel overflow sentinel, raises a low inherited soft limit when the hard limit permits it, blocks before launch when the hard limit cannot preserve the sentinel, and normalizes EFBIG/SIGXFSZ without treating an arbitrary positive child exit code as a signal. macOS trust export uses this shared path. |
 | Supervisor and fallback policy | Port | Every attempt remains inside existing timeout, stream budget, process-group, and containment contracts. Only verified authentication or entitlement evidence authorizes fallback; capacity, network, timeout, model mismatch, malformed output, and inspection failures do not. Explicitly inconclusive or transient evidence returns 75, while `runtime-unverified` is a blocked non-75 outcome. |
 | Nonzero Claude result regression | Canonical-only addition | Nonzero stdout can never become a final artifact. Strictly recognized structural failures may retain a justified category; empty, malformed, non-UTF-8, duplicate-key, non-standard-constant, unknown, and success-looking envelopes receive a bounded sanitized `reason` in attempt/status evidence instead of empty-stderr `category=other`. |
@@ -57,12 +57,17 @@ metadata behavior.
 
 ## Validation
 
-- Python 3.10.19 complete canonical suite with the `tomli` test backport: 798
-  tests passed, 4 skipped.
-- Python 3.13.0 complete canonical suite: 798 tests passed, 9 skipped.
-- Focused Python 3.13 suites: providers 328 passed and 6 skipped; common 49
-  passed; repository contracts 14 passed.
-- Ruff lint, changed-core-file format checks, Python compile, and staged
-  repository diff checks passed. The repository-wide format check still names
-  pre-existing files outside the conflict-resolution edits under the locally
-  installed Ruff formatter version; they were not mechanically reformatted.
+- Python 3.10.19 complete canonical suite with the `tomli` test backport: 802
+  tests run, 4 skipped, no failures.
+- Python 3.13.0 complete canonical suite: 802 tests run, 9 skipped, no failures.
+- Focused Python 3.13 suites: providers 331 tests run with 6 skipped and
+  provenance 90 tests run with no skips or failures; earlier current-range
+  common 49 and repository contract 14 test suites also passed.
+- Final-head review remediation covers strict signed-manifest numeric parsing,
+  system-domain custom roots, bounded snapshot revalidation without repeated
+  OpenSSL self-signature work, and blocked `runtime-unverified` outcomes.
+- Ruff lint, provider-file format checks, Python compile, and staged repository
+  diff checks passed. The locally installed Ruff formatter still names the
+  pre-existing layout in `claude_provenance.py` and its two test files; those
+  files were not mechanically reformatted because doing so creates unrelated
+  whole-file churn.

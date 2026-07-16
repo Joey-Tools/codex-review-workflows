@@ -1509,6 +1509,7 @@ def _validated_bundled_root_certificates(
     data: bytes,
     *,
     executable: pathlib.Path,
+    verify_self_signatures: bool = True,
 ) -> dict[bytes, bytes]:
     blocks = CLAUDE_CERTIFICATE_BLOCK.findall(data)
     if not blocks or len(blocks) > CLAUDE_BUNDLED_ROOT_LIMIT:
@@ -1517,29 +1518,40 @@ def _validated_bundled_root_certificates(
         )
     deadline = time.monotonic() + CLAUDE_TRUST_ROOT_VERIFY_TOTAL_SECONDS
     certificates: dict[bytes, bytes] = {}
-    with tempfile.TemporaryDirectory(
-        prefix=".claude-bundled-roots-",
-        dir=executable.parent,
-    ) as raw_verification_root:
-        verification_root = pathlib.Path(raw_verification_root)
+    verification_directory = (
+        tempfile.TemporaryDirectory(
+            prefix=".claude-bundled-roots-",
+            dir=executable.parent,
+        )
+        if verify_self_signatures
+        else contextlib.nullcontext(None)
+    )
+    with verification_directory as raw_verification_root:
+        verification_root = (
+            pathlib.Path(raw_verification_root)
+            if raw_verification_root is not None
+            else None
+        )
         for index, block in enumerate(blocks):
             der, canonical = _canonical_ca_certificate(
                 block,
                 source="publisher-verified Claude bundled root store",
             )
             _require_unconditional_root_extensions(der, require_critical=False)
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise ReviewTimeoutError(
-                    "Claude bundled root verification exceeded its total timeout"
+            if verify_self_signatures:
+                assert verification_root is not None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ReviewTimeoutError(
+                        "Claude bundled root verification exceeded its total timeout"
+                    )
+                _require_bundled_root_self_signature(
+                    der,
+                    canonical,
+                    verification_root=verification_root,
+                    index=index,
+                    timeout_seconds=remaining,
                 )
-            _require_bundled_root_self_signature(
-                der,
-                canonical,
-                verification_root=verification_root,
-                index=index,
-                timeout_seconds=remaining,
-            )
             fingerprint = hashlib.sha256(der).digest()
             existing = certificates.get(fingerprint)
             if existing is not None and existing != canonical:
@@ -1555,6 +1567,7 @@ def _inspect_claude_executable_trust(
     *,
     expected_sha256: str | None = None,
     include_bundled_roots: bool,
+    validate_bundled_roots: bool = True,
 ) -> ClaudeExecutableTrustEvidence:
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
@@ -1653,6 +1666,7 @@ def _inspect_claude_executable_trust(
         _validated_bundled_root_certificates(
             bundled_root_store,
             executable=path,
+            verify_self_signatures=validate_bundled_roots,
         )
         if bundled_root_store is not None
         else {}
@@ -1676,6 +1690,7 @@ def _require_matching_claude_executable_snapshot(
         executable,
         expected_sha256=expected.executable_sha256,
         include_bundled_roots=_is_claude_macos_host(),
+        validate_bundled_roots=False,
     )
     if current != expected:
         raise ClaudeExecutableInspectionInconclusive(
@@ -3358,8 +3373,7 @@ def _read_claude_trust_certificates_impl(
             )
             classified = _classify_trust_fingerprints(trust_data, domain=domain)
             unconditional.update(classified.unconditional)
-            if domain != "system":
-                additional_unconditional.update(classified.unconditional)
+            additional_unconditional.update(classified.unconditional)
             constrained.update(classified.constrained)
             domain_evidence.append(
                 {

@@ -8097,6 +8097,32 @@ class ProviderPolicyTest(unittest.TestCase):
             frozenset({self.ca_sha256_fingerprint(certificate)}),
         )
 
+    def test_verified_macos_snapshot_revalidation_does_not_repeat_openssl(self) -> None:
+        certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+        executable = self.review.container_dir / "verified-executable-revalidation"
+        executable.write_bytes(bundled_root_store_fixture(certificate))
+        executable.chmod(0o700)
+        evidence = self.inspect_claude_executable_trust(
+            executable,
+            include_bundled_roots=True,
+        )
+
+        with (
+            mock.patch.object(providers, "_is_claude_macos_host", return_value=True),
+            mock.patch.object(
+                providers,
+                "_inspect_claude_executable_trust",
+                side_effect=self.inspect_claude_executable_trust,
+            ),
+            mock.patch.object(
+                providers,
+                "_require_bundled_root_self_signature",
+            ) as verify_self_signature,
+        ):
+            self.require_matching_claude_executable_snapshot(executable, evidence)
+
+        verify_self_signature.assert_not_called()
+
     def test_verified_macos_snapshot_rejects_missing_bundled_root_evidence(
         self,
     ) -> None:
@@ -9396,6 +9422,82 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         self.assertEqual(selected.omitted_sha1_fingerprints, frozenset())
         verify.assert_called_once()
+
+    def test_system_domain_unconditional_root_is_exported(self) -> None:
+        certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+        fingerprint = self.ca_sha1_fingerprint(certificate)
+        system_trust = plistlib.dumps(
+            {
+                "trustVersion": 1,
+                "trustList": {
+                    fingerprint: {
+                        "trustSettings": [],
+                    }
+                },
+            }
+        )
+
+        def export_trust(argv, **_kwargs):
+            arguments = tuple(argv)
+            if "trust-settings-export" in arguments:
+                output = pathlib.Path(arguments[-1])
+                if "-s" in arguments:
+                    output.write_bytes(system_trust)
+                    output.chmod(0o600)
+                    return common.BoundedCapture(
+                        argv=arguments,
+                        returncode=0,
+                        stdout=bytearray(),
+                        stderr=bytearray(),
+                    )
+                return common.BoundedCapture(
+                    argv=arguments,
+                    returncode=1,
+                    stdout=bytearray(),
+                    stderr=bytearray(
+                        providers.CLAUDE_TRUST_NO_SETTINGS[0].encode()
+                    ),
+                )
+            self.assertIn("find-certificate", arguments)
+            return common.BoundedCapture(
+                argv=arguments,
+                returncode=0,
+                stdout=bytearray(certificate),
+                stderr=bytearray(),
+            )
+
+        evidence = providers._new_claude_trust_policy_evidence(
+            self.claude_executable_evidence
+        )
+        with (
+            mock.patch.object(
+                providers,
+                "_require_claude_trust_export_tool",
+                return_value=(pathlib.Path("/usr/bin/security"), {}),
+            ),
+            mock.patch.object(
+                providers,
+                "run_bounded_capture",
+                side_effect=export_trust,
+            ),
+            mock.patch.object(providers, "_verify_unconditional_trust_root"),
+        ):
+            material = providers._read_claude_trust_certificates(
+                self.review,
+                self.review.container_dir,
+                evidence=evidence,
+            )
+
+        self.assertEqual(
+            providers._ca_sha256_fingerprints(
+                material.certificates,
+                source="system-domain trust fixture",
+            ),
+            frozenset({self.ca_sha256_fingerprint(certificate)}),
+        )
+        self.assertEqual(material.excluded_sha1_fingerprints, frozenset())
+        self.assertEqual(evidence["additional_unconditional_candidate_count"], 1)
+        self.assertEqual(evidence["additional_unconditional_included_count"], 1)
 
     def test_later_trust_deny_wins_over_earlier_malformed_domain(self) -> None:
         deny_fingerprint = "A" * 40
