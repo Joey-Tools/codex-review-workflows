@@ -547,7 +547,7 @@ class ProviderPolicyTest(unittest.TestCase):
         _server: mock.Mock,
         read_credential: mock.Mock,
     ) -> None:
-        credential = bytearray(oauth_credential_fixture())
+        credential = bytearray(oauth_credential_fixture(expires_in_seconds=60 * 60))
         read_credential.return_value = credential
 
         with self.assertRaisesRegex(
@@ -726,12 +726,18 @@ class ProviderPolicyTest(unittest.TestCase):
         self,
         read_credential: mock.Mock,
     ) -> None:
-        credential = bytearray(oauth_credential_fixture(expires_in_seconds=60))
+        required_window = (
+            providers.REVIEW_ATTEMPT_TIMEOUT_SECONDS
+            + providers.CLAUDE_AUTH_EXPIRY_MARGIN_SECONDS
+        )
+        credential = bytearray(
+            oauth_credential_fixture(expires_in_seconds=required_window - 10)
+        )
         read_credential.return_value = credential
 
         with self.assertRaisesRegex(
             providers.ClaudeKeychainCredentialUnavailable,
-            "cannot cover the isolated review window",
+            "cannot cover the current model attempt window",
         ):
             self.require_fresh_claude_keychain_credential(self.review)
 
@@ -750,27 +756,40 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(credential, bytearray(len(credential)))
 
     @mock.patch.object(providers, "_read_claude_keychain_credential")
-    def test_keychain_preflight_requires_whole_model_chain_lifetime(
+    def test_keychain_preflight_accepts_one_hour_token_for_single_attempt(
         self,
         read_credential: mock.Mock,
     ) -> None:
-        single_attempt_lifetime = (
-            providers.REVIEW_ATTEMPT_TIMEOUT_SECONDS
-            + providers.CLAUDE_AUTH_EXPIRY_MARGIN_SECONDS
-            + 30
-        )
         credential = bytearray(
-            oauth_credential_fixture(expires_in_seconds=single_attempt_lifetime)
+            oauth_credential_fixture(expires_in_seconds=60 * 60)
         )
         read_credential.return_value = credential
 
-        with self.assertRaisesRegex(
-            providers.ClaudeKeychainCredentialUnavailable,
-            "cannot cover the isolated review window",
-        ):
-            self.require_fresh_claude_keychain_credential(self.review)
+        self.require_fresh_claude_keychain_credential(self.review)
 
         self.assertEqual(credential, bytearray(len(credential)))
+
+    def test_fresh_local_login_does_not_run_authentication_warmup(self) -> None:
+        executable = pathlib.Path("/verified/claude")
+        with (
+            mock.patch.object(
+                providers,
+                "_require_fresh_claude_keychain_credential",
+            ) as require_fresh,
+            mock.patch.object(
+                providers,
+                "_run_claude_auth_warmup",
+            ) as run_warmup,
+        ):
+            self.warm_claude_local_login(
+                self.review,
+                executable,
+                {},
+                providers.CLAUDE_MODELS[0],
+            )
+
+        require_fresh.assert_called_once_with(self.review)
+        run_warmup.assert_not_called()
 
     def test_keychain_preflight_rejects_unbounded_integer_expiry(self) -> None:
         credential = bytearray(
@@ -787,9 +806,159 @@ class ProviderPolicyTest(unittest.TestCase):
 
         with self.assertRaisesRegex(
             providers.ClaudeKeychainCredentialUnavailable,
-            "cannot cover the isolated review window",
+            "cannot cover the current model attempt window",
         ):
             providers._validate_fresh_claude_keychain_credential(credential)
+
+    def test_each_local_login_model_attempt_refreshes_after_runtime_preparation(
+        self,
+    ) -> None:
+        executable = self.review.container_dir / "verified-claude"
+        executable.write_bytes(b"snapshot")
+        events: list[str] = []
+
+        def prepare_tool(
+            _review: ReviewWorkspace,
+            env: dict[str, str],
+        ) -> dict[str, str]:
+            events.append("tool")
+            return dict(env)
+
+        def prepare_tls(
+            _review: ReviewWorkspace,
+            env: dict[str, str],
+        ) -> dict[str, str]:
+            events.append("tls")
+            return dict(env)
+
+        def warmup(
+            _review: ReviewWorkspace,
+            _executable: pathlib.Path,
+            _env: dict[str, str],
+            _model: str,
+        ) -> None:
+            events.append("warmup")
+
+        @contextlib.contextmanager
+        def broker_runtime(
+            _review: ReviewWorkspace,
+            env: dict[str, str],
+        ):
+            events.append("broker")
+            yield dict(env)
+
+        attempts = (
+            self.attempt("claude", providers.CLAUDE_MODELS[0], "entitlement"),
+            self.attempt(
+                "claude",
+                providers.CLAUDE_MODELS[1],
+                "success",
+                final_text="No findings.",
+            ),
+        )
+        completed = Completed(
+            argv=("claude",),
+            returncode=0,
+            stdout=b"{}",
+            stderr=b"",
+        )
+        self.warmup.side_effect = warmup
+        providers._claude_keychain_runtime.side_effect = broker_runtime
+
+        def runner(**kwargs) -> providers.Attempt:
+            return providers._claude_attempt(executable=executable, **kwargs)
+
+        with (
+            mock.patch.object(
+                providers,
+                "_with_claude_review_tool_path",
+                side_effect=prepare_tool,
+            ),
+            mock.patch.object(
+                providers,
+                "_prepare_claude_tls_environment",
+                side_effect=prepare_tls,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_connect_proxy",
+                return_value=contextlib.nullcontext(43210),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_review_sandbox_profile",
+                return_value="(version 1)",
+            ),
+            mock.patch.object(providers, "run", return_value=completed),
+            mock.patch.object(
+                providers,
+                "_parse_claude_output",
+                return_value=(None, None),
+            ),
+            mock.patch.object(
+                providers,
+                "_record_attempt",
+                side_effect=attempts,
+            ),
+            mock.patch.object(
+                providers,
+                "_update_claude_runtime_report",
+            ) as update_report,
+        ):
+            category, final_text = providers._run_model_chain(
+                review=self.review,
+                models=providers.CLAUDE_MODELS,
+                runner=runner,
+                runtime="claude",
+                requested_effort=providers.CLAUDE_REASONING_EFFORT,
+                env={},
+                attempts=[],
+            )
+
+        self.assertEqual(category, "success")
+        self.assertEqual(final_text, "No findings.")
+        self.assertEqual(
+            events,
+            [
+                "tool",
+                "tls",
+                "warmup",
+                "broker",
+                "tool",
+                "tls",
+                "warmup",
+                "broker",
+            ],
+        )
+        self.assertEqual(self.warmup.call_count, len(providers.CLAUDE_MODELS))
+        self.assertEqual(
+            [call.args[3] for call in self.warmup.call_args_list],
+            list(providers.CLAUDE_MODELS),
+        )
+        self.assertEqual(
+            providers._claude_keychain_runtime.call_count,
+            len(providers.CLAUDE_MODELS),
+        )
+        authentication_updates = [
+            call.args[1]
+            for call in update_report.call_args_list
+            if call.args[1].get("phase") == "authentication-preflight-complete"
+        ]
+        self.assertEqual(
+            authentication_updates,
+            [
+                {
+                    "phase": "authentication-preflight-complete",
+                    "outer_sandbox": {"status": "pending-runtime-launch"},
+                    "authentication": {
+                        "status": "freshness-verified",
+                        "validated_for_model": model,
+                    },
+                    "attempt": None,
+                }
+                for model in providers.CLAUDE_MODELS
+            ],
+        )
 
     @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
     @mock.patch.object(
@@ -839,10 +1008,15 @@ class ProviderPolicyTest(unittest.TestCase):
                 "TMPDIR": str(temporary),
                 "PATH": "/untrusted",
             },
+            providers.CLAUDE_MODELS[1],
         )
 
         argv = run_command.call_args.args[0]
         self.assertIn("--safe-mode", argv)
+        self.assertEqual(
+            argv[argv.index("--model") + 1],
+            providers.CLAUDE_MODELS[1],
+        )
         self.assertEqual(argv[argv.index("--permission-mode") + 1], "default")
         self.assertEqual(argv[argv.index("--tools") + 1], "")
         self.assertEqual(
@@ -899,7 +1073,48 @@ class ProviderPolicyTest(unittest.TestCase):
                 self.review,
                 pathlib.Path("/bin/claude"),
                 {},
+                providers.CLAUDE_MODELS[0],
             )
+
+    @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
+    @mock.patch.object(providers, "_run_claude_auth_warmup")
+    def test_warmup_supervision_failure_is_not_a_review_attempt(
+        self,
+        warmup: mock.Mock,
+        require_fresh: mock.Mock,
+    ) -> None:
+        for error_type in (
+            providers.ReviewTimeoutError,
+            providers.ReviewOutputLimitError,
+            providers.ReviewOutputDrainError,
+            providers.ReviewProcessLeakError,
+        ):
+            with self.subTest(error_type=error_type.__name__):
+                require_fresh.reset_mock()
+                warmup.reset_mock()
+                require_fresh.side_effect = (
+                    providers.ClaudeKeychainCredentialUnavailable("stale")
+                )
+                warmup.side_effect = error_type("warmup supervision failed")
+
+                with self.assertRaisesRegex(
+                    providers.ClaudeAuthWarmupInconclusive,
+                    "warmup was inconclusive",
+                ):
+                    self.warm_claude_local_login(
+                        self.review,
+                        pathlib.Path("/bin/claude"),
+                        {},
+                        providers.CLAUDE_MODELS[0],
+                    )
+
+                require_fresh.assert_called_once_with(self.review)
+                warmup.assert_called_once_with(
+                    self.review,
+                    pathlib.Path("/bin/claude"),
+                    {},
+                    providers.CLAUDE_MODELS[0],
+                )
 
     @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
     @mock.patch.object(providers, "_run_claude_auth_warmup")
@@ -927,6 +1142,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 self.review,
                 pathlib.Path("/bin/claude"),
                 {},
+                providers.CLAUDE_MODELS[0],
             )
 
     @mock.patch.object(
@@ -3013,6 +3229,269 @@ class ProviderPolicyTest(unittest.TestCase):
     )
     @mock.patch.object(
         providers,
+        "resolve_reviewer_executable",
+        return_value=pathlib.Path("/bin/copilot"),
+    )
+    @mock.patch.object(providers, "_copilot_attempt")
+    @mock.patch.object(providers, "_claude_attempt")
+    def test_second_model_warmup_inconclusive_preserves_first_attempt(
+        self,
+        claude_attempt: mock.Mock,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _resolve_claude: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        first = self.attempt(
+            "claude",
+            providers.CLAUDE_MODELS[0],
+            "entitlement",
+        )
+        claude_attempt.side_effect = (
+            first,
+            providers.ClaudeAuthWarmupInconclusive(
+                "second model refresh was inconclusive"
+            ),
+        )
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
+
+        self.assertEqual(outcome.returncode, 75)
+        self.assertEqual(outcome.attempts, (first,))
+        copilot_attempt.assert_not_called()
+        resolve.assert_not_called()
+        persisted = json.loads(
+            (self.review.container_dir / "attempts.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(len(persisted), 1)
+        self.assertEqual(persisted[0]["category"], "entitlement")
+        self.assertIn(
+            "second model refresh was inconclusive",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    def test_second_model_warmup_inconclusive_updates_runtime_evidence(
+        self,
+    ) -> None:
+        executable = self.review.container_dir / "verified-claude"
+        executable.write_bytes(b"snapshot")
+        providers.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {
+                "phase": "publisher-and-capabilities-verified",
+                "authentication": {"status": "pending"},
+                "outer_sandbox": {"status": "pending-runtime-launch"},
+            },
+        )
+        first = self.attempt(
+            "claude",
+            providers.CLAUDE_MODELS[0],
+            "entitlement",
+        )
+        self.warmup.side_effect = (
+            None,
+            providers.ClaudeAuthWarmupInconclusive(
+                "second model refresh was inconclusive"
+            ),
+        )
+        completed = Completed(
+            argv=("claude",),
+            returncode=1,
+            stdout=b"{}",
+            stderr=b"model entitlement denied",
+        )
+
+        with (
+            mock.patch.object(providers, "child_environment", return_value={}),
+            mock.patch.object(
+                providers,
+                "_resolve_validated_claude_executable",
+                return_value=(executable, {}),
+            ),
+            mock.patch.object(
+                providers,
+                "_with_claude_review_tool_path",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_prepare_claude_tls_environment",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_connect_proxy",
+                return_value=contextlib.nullcontext(43210),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_review_sandbox_profile",
+                return_value="(version 1)",
+            ),
+            mock.patch.object(providers, "run", return_value=completed) as run_command,
+            mock.patch.object(
+                providers,
+                "_parse_claude_output",
+                return_value=(None, None),
+            ),
+            mock.patch.object(
+                providers,
+                "_record_attempt",
+                return_value=first,
+            ),
+            mock.patch.object(providers, "resolve_reviewer_executable") as resolve,
+            mock.patch.object(providers, "_copilot_attempt") as copilot_attempt,
+        ):
+            outcome = providers.run_review(
+                review=self.review,
+                reviewer="claude",
+                egress_consent="double-review",
+            )
+
+        self.assertEqual(outcome.returncode, 75)
+        self.assertEqual(outcome.attempts, (first,))
+        self.assertEqual(self.warmup.call_count, len(providers.CLAUDE_MODELS))
+        run_command.assert_called_once()
+        resolve.assert_not_called()
+        copilot_attempt.assert_not_called()
+        report = json.loads(
+            (self.review.container_dir / "claude-runtime.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            report["phase"],
+            "authentication-preflight-inconclusive",
+        )
+        self.assertEqual(
+            report["authentication"],
+            {
+                "status": "inconclusive",
+                "model": providers.CLAUDE_MODELS[1],
+                "failure_class": "warmup",
+                "validated_for_model": None,
+            },
+        )
+        self.assertIsNone(report["attempt"])
+        self.assertEqual(
+            report["outer_sandbox"]["status"],
+            "pending-runtime-launch",
+        )
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        return_value=(pathlib.Path("/bin/claude"), {}),
+    )
+    @mock.patch.object(
+        providers,
+        "resolve_reviewer_executable",
+        return_value=pathlib.Path("/bin/copilot"),
+    )
+    @mock.patch.object(providers, "_copilot_attempt")
+    @mock.patch.object(providers, "_claude_attempt")
+    def test_second_model_credential_unavailable_allows_authorized_fallback(
+        self,
+        claude_attempt: mock.Mock,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _resolve_claude: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        first = self.attempt(
+            "claude",
+            providers.CLAUDE_MODELS[0],
+            "entitlement",
+        )
+        claude_attempt.side_effect = (
+            first,
+            providers.ClaudeKeychainCredentialUnavailable(
+                "second model credential is unavailable"
+            ),
+        )
+        copilot_attempt.return_value = self.attempt(
+            "copilot",
+            providers.COPILOT_MODELS[0],
+            "success",
+            final_text="No findings.",
+        )
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="triple-review",
+        )
+
+        self.assertEqual(outcome.returncode, 0)
+        self.assertEqual(outcome.attempts[0], first)
+        self.assertEqual(outcome.attempts[1].runtime, "copilot")
+        self.assertEqual(claude_attempt.call_count, len(providers.CLAUDE_MODELS))
+        copilot_attempt.assert_called_once()
+        resolve.assert_called_once_with("copilot")
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        return_value=(pathlib.Path("/bin/claude"), {}),
+    )
+    @mock.patch.object(providers, "resolve_reviewer_executable")
+    @mock.patch.object(providers, "_copilot_attempt")
+    @mock.patch.object(providers, "_claude_attempt")
+    def test_second_model_credential_unavailable_needs_fallback_consent(
+        self,
+        claude_attempt: mock.Mock,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _resolve_claude: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        first = self.attempt(
+            "claude",
+            providers.CLAUDE_MODELS[0],
+            "entitlement",
+        )
+        claude_attempt.side_effect = (
+            first,
+            providers.ClaudeKeychainCredentialUnavailable(
+                "second model credential is unavailable"
+            ),
+        )
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="explicit-claude-review",
+        )
+
+        self.assertEqual(outcome.returncode, 2)
+        self.assertEqual(outcome.attempts, (first,))
+        copilot_attempt.assert_not_called()
+        resolve.assert_not_called()
+        self.assertIn(
+            "does not authorize GitHub Copilot",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        return_value=(pathlib.Path("/bin/claude"), {}),
+    )
+    @mock.patch.object(
+        providers,
         "_with_claude_review_tool_path",
         side_effect=providers.ClaudeReviewToolUnavailable("trusted rg unavailable"),
     )
@@ -4270,6 +4749,222 @@ class ProviderPolicyTest(unittest.TestCase):
                 ):
                     pass
 
+    def test_claude_linux_stages_single_attempt_credential_each_time(
+        self,
+    ) -> None:
+        host = mock.Mock()
+        executable = pathlib.Path("/verified/claude")
+        info = mock.Mock(path=executable)
+        toolchain = mock.Mock(
+            socat=pathlib.Path("/usr/bin/socat"),
+            rg=pathlib.Path("/usr/bin/rg"),
+        )
+        runtime_root = self.review.container_dir / "claude-runtime" / "linux"
+        source = self.review.source_root / ".claude" / ".credentials.json"
+        staged = mock.Mock(config_dir=runtime_root / "staged-config")
+        attempts = (
+            self.attempt("claude", providers.CLAUDE_MODELS[0], "entitlement"),
+            self.attempt(
+                "claude",
+                providers.CLAUDE_MODELS[1],
+                "success",
+                final_text="No findings.",
+            ),
+        )
+        completed = Completed(
+            argv=("claude",),
+            returncode=0,
+            stdout=b"{}",
+            stderr=b"",
+        )
+        self.assertEqual(
+            providers.CLAUDE_ATTEMPT_CREDENTIAL_VALIDITY_SECONDS,
+            32 * 60.0,
+        )
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(
+                    providers,
+                    "_is_claude_linux_host",
+                    return_value=True,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    providers,
+                    "_claude_linux_host",
+                    return_value=host,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    providers,
+                    "validate_claude_linux_executable",
+                    return_value=info,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    providers,
+                    "discover_claude_linux_toolchain",
+                    return_value=toolchain,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    providers,
+                    "_claude_linux_runtime_root",
+                    return_value=runtime_root,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    providers,
+                    "_claude_linux_private_directory",
+                    side_effect=lambda _review, name: runtime_root / name,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    providers,
+                    "compile_claude_linux_launcher",
+                    return_value=runtime_root / "bin/launcher",
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    providers,
+                    "collect_claude_linux_runtime_libraries",
+                    return_value=(),
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    providers,
+                    "_claude_linux_ca_bundle",
+                    return_value=None,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    providers,
+                    "_claude_linux_credential_source",
+                    return_value=source,
+                )
+            )
+            stage_credentials = stack.enter_context(
+                mock.patch.object(
+                    providers,
+                    "stage_claude_credentials",
+                    side_effect=lambda *_args, **_kwargs: contextlib.nullcontext(
+                        staged
+                    ),
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    providers,
+                    "_claude_unix_connect_proxy",
+                    return_value=contextlib.nullcontext(runtime_root / "proxy.sock"),
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(providers, "run_claude_linux_isolation_probe")
+            )
+            stack.enter_context(
+                mock.patch.object(providers, "_update_claude_runtime_report")
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    providers,
+                    "build_claude_linux_sandbox_command",
+                    return_value=mock.Mock(argv=("sandbox",), env={}),
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    providers,
+                    "_with_claude_review_tool_path",
+                    side_effect=lambda _review, env: dict(env),
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    providers,
+                    "_prepare_claude_tls_environment",
+                    side_effect=lambda _review, env: dict(env),
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(providers, "run", return_value=completed)
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    providers,
+                    "_parse_claude_output",
+                    return_value=(None, None),
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    providers,
+                    "_record_attempt",
+                    side_effect=attempts,
+                )
+            )
+            recorded_attempts: list[providers.Attempt] = []
+
+            def runner(**kwargs) -> providers.Attempt:
+                return providers._claude_attempt(
+                    executable=executable,
+                    **kwargs,
+                )
+
+            category, final_text = providers._run_model_chain(
+                review=self.review,
+                models=providers.CLAUDE_MODELS,
+                runner=runner,
+                runtime="claude",
+                requested_effort=providers.CLAUDE_REASONING_EFFORT,
+                env={},
+                attempts=recorded_attempts,
+            )
+
+            self.assertEqual(category, "success")
+            self.assertEqual(final_text, "No findings.")
+            self.assertEqual(recorded_attempts, list(attempts))
+            self.warmup.assert_not_called()
+
+            self.assertEqual(
+                stage_credentials.call_count,
+                len(providers.CLAUDE_MODELS),
+            )
+            for call in stage_credentials.call_args_list:
+                self.assertEqual(call.args, (source, runtime_root))
+                self.assertEqual(
+                    call.kwargs["required_validity_seconds"],
+                    providers.REVIEW_ATTEMPT_TIMEOUT_SECONDS
+                    + providers.CLAUDE_AUTH_EXPIRY_MARGIN_SECONDS,
+                )
+
+            with providers._claude_linux_review_runtime(
+                self.review,
+                executable,
+                {"ANTHROPIC_API_KEY": "test-only"},
+                providers._claude_review_arguments(
+                    model=providers.CLAUDE_MODELS[0],
+                    settings=providers._claude_review_settings(linux=True),
+                    linux=True,
+                ),
+            ):
+                pass
+
+            self.assertEqual(
+                stage_credentials.call_count,
+                len(providers.CLAUDE_MODELS),
+            )
+
     def test_claude_linux_final_workspace_inspection_is_inconclusive(self) -> None:
         host = mock.Mock()
         executable = pathlib.Path("/verified/claude")
@@ -5340,6 +6035,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertEqual(attempt.category, "other")
         self.assertIsNone(attempt.final_text)
+        self.warmup.assert_not_called()
         report = json.loads(
             (self.review.container_dir / "claude-runtime.json").read_text(
                 encoding="utf-8"

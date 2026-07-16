@@ -3,7 +3,7 @@ id: 20260715-7c1501
 title: Claude CLI Platform Capabilities
 status: completed
 created: 2026-07-15
-updated: 2026-07-15
+updated: 2026-07-16
 branch: codex/claude-cli-platform-capabilities
 pr:
 supersedes: []
@@ -158,9 +158,10 @@ superseded_by:
   helper-owned read-only private copy of the validated current-user `0600`
   credential for runtime authentication; read-only prevents mutation, while the
   separate file-tool policy below prevents model-visible reads. Linux/WSL2
-  perform no warmup or refresh; the host credential must already remain fresh
-  for the complete bounded review plus its safety margin, unless an explicit
-  API key is supplied.
+  perform no warmup or refresh; every model attempt independently requires the
+  host credential to cover that attempt's 30-minute timeout plus the 2-minute
+  safety margin, then creates a new private staged copy. An explicit API key
+  skips local credential staging.
 - Linux credential staging owns cleanup from the first successful file create:
   a write, sync, or mode-finalization failure zeroes and unlinks the partial
   credential before control returns. If unlink itself fails, the staged bytes
@@ -192,11 +193,12 @@ superseded_by:
   The original host credential is never mounted.
 - Retained `claude-runtime.json` state records both `source_executable` and the
   actual `verified_executable` snapshot, plus the selected GPG verifier and
-  signed-release evidence. Its phases distinguish
-  `publisher-and-capabilities-verified`,
-  `authentication-preflight-complete`, platform runtime readiness/launch, and
-  `attempt-complete`; bounded supervisor failures instead advance to
-  `attempt-inconclusive` with a stable failure class. Nested sandbox,
+  signed-release evidence. On macOS, its phases distinguish publisher and
+  capability verification, per-attempt authentication outcomes, runtime launch,
+  and attempt completion. Linux/WSL2 publishes `runtime-ready` only after the
+  current attempt's credential staging and isolation probe; an unavailable
+  credential prevents that phase. Bounded supervisor failures instead advance
+  to `attempt-inconclusive` with a stable failure class. Nested sandbox,
   authentication, and attempt statuses avoid claiming final enforcement before
   the relevant probe or launch occurs.
 - The former exact `2.1.187` plus artifact-digest pin entered with local-login

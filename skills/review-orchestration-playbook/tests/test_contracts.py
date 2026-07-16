@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import pathlib
 import subprocess
 import sys
@@ -85,6 +86,66 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn(">=2.1.187,<3.0.0", helper_contract)
         self.assertIn("Linux and WSL2", helper_contract)
         self.assertNotIn("requires `ANTHROPIC_API_KEY`", skill)
+
+    def test_claude_oauth_freshness_is_per_model_attempt(self) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        helper_contract = (SKILL_ROOT / "references/helper-contract.md").read_text(
+            encoding="utf-8"
+        )
+        runtime_trust = (
+            SKILL_ROOT / "references/claude-runtime-trust.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertEqual(providers.REVIEW_ATTEMPT_TIMEOUT_SECONDS, 1800.0)
+        self.assertEqual(providers.CLAUDE_AUTH_EXPIRY_MARGIN_SECONDS, 120.0)
+        self.assertEqual(
+            providers.CLAUDE_ATTEMPT_CREDENTIAL_VALIDITY_SECONDS,
+            1920.0,
+        )
+        self.assertEqual(
+            claude_linux.DEFAULT_CREDENTIAL_VALIDITY_SECONDS,
+            providers.CLAUDE_ATTEMPT_CREDENTIAL_VALIDITY_SECONDS,
+        )
+        self.assertNotIn(
+            "attempt_count",
+            inspect.signature(
+                providers._validate_fresh_claude_keychain_credential
+            ).parameters,
+        )
+        attempt_source = inspect.getsource(providers._claude_attempt)
+        run_review_source = inspect.getsource(providers.run_review)
+        linux_runtime_source = inspect.getsource(
+            providers._claude_linux_review_runtime
+        )
+        self.assertIn("_warm_claude_local_login", attempt_source)
+        self.assertIn("CLAUDE_ATTEMPT_CREDENTIAL_VALIDITY_SECONDS", linux_runtime_source)
+        self.assertNotIn("_warm_claude_local_login", run_review_source)
+        self.assertNotIn("_require_fresh_claude_linux_credential", run_review_source)
+
+        self.assertIn("current model attempt", skill)
+        self.assertIn(
+            "Local-login credential freshness is an attempt-boundary property",
+            helper_contract,
+        )
+        self.assertIn(
+            "complete 30-minute timeout plus the 2-minute safety margin",
+            helper_contract,
+        )
+        self.assertIn("current attempt's model", helper_contract)
+        self.assertIn("Every later Opus attempt repeats", helper_contract)
+        self.assertIn("API_KEY` skips local-login warmup and staging", helper_contract)
+        self.assertIn("returns exit `75`; it never authorizes Copilot", helper_contract)
+        self.assertIn(
+            "only with `double-review` or `triple-review` consent",
+            helper_contract,
+        )
+        self.assertIn("At every model-attempt boundary", runtime_trust)
+        self.assertIn("authentication-preflight-inconclusive", runtime_trust)
+        self.assertIn("authentication-preflight-unavailable", runtime_trust)
+        self.assertIn(
+            "while the model whose authentication gate failed is not recorded as a",
+            runtime_trust,
+        )
 
     def test_claude_linux_file_tools_are_workspace_only_across_supported_versions(
         self,
