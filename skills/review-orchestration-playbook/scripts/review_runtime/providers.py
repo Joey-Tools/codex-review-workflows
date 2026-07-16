@@ -3451,6 +3451,9 @@ def _read_claude_trust_certificates_impl(
         except ClaudeTrustToolUnavailable as error:
             record_domain_failure(domain, "unavailable")
             defer_error(0, error)
+        except ClaudeExecutableInspectionInconclusive as error:
+            record_domain_failure(domain, "inconclusive")
+            defer_error(1, error)
         except (
             ReviewTimeoutError,
             ReviewOutputDrainError,

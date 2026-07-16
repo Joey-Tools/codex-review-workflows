@@ -10034,6 +10034,71 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         self.assertEqual(terminal["status"], "blocked")
 
+    def test_later_blocked_trust_domain_wins_over_earlier_inspection_race(
+        self,
+    ) -> None:
+        malformed = plistlib.dumps({"trustVersion": 1, "trustList": {"malformed": {}}})
+        call_count = 0
+
+        def export_trust(argv, **_kwargs):
+            nonlocal call_count
+            call_count += 1
+            output = pathlib.Path(argv[-1])
+            if call_count == 1:
+                raise providers.ClaudeExecutableInspectionInconclusive(
+                    "trust export executable changed during inspection"
+                )
+            if "-d" in argv:
+                output.write_bytes(malformed)
+                output.chmod(0o600)
+                return common.BoundedCapture(
+                    argv=tuple(argv),
+                    returncode=0,
+                    stdout=bytearray(),
+                    stderr=bytearray(),
+                )
+            if "-s" in argv:
+                return common.BoundedCapture(
+                    argv=tuple(argv),
+                    returncode=1,
+                    stdout=bytearray(),
+                    stderr=bytearray(providers.CLAUDE_TRUST_NO_SETTINGS[0].encode()),
+                )
+            self.fail(f"unexpected trust export command: {argv!r}")
+
+        evidence = providers._new_claude_trust_policy_evidence(
+            self.claude_executable_evidence
+        )
+        with (
+            mock.patch.object(
+                providers,
+                "_require_claude_trust_export_tool",
+                return_value=(pathlib.Path("/usr/bin/security"), {}),
+            ),
+            mock.patch.object(
+                providers,
+                "run_bounded_capture",
+                side_effect=export_trust,
+            ),
+            self.assertRaises(providers.ClaudeTrustPolicyUnavailable),
+        ):
+            providers._read_claude_trust_certificates(
+                self.review,
+                self.review.container_dir,
+                evidence=evidence,
+            )
+
+        terminal = json.loads(
+            (
+                self.review.container_dir / providers.CLAUDE_TRUST_POLICY_EVIDENCE_NAME
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(terminal["status"], "blocked")
+        self.assertEqual(
+            [domain["status"] for domain in terminal["domains"]],
+            ["inconclusive", "blocked", "no-settings"],
+        )
+
     def test_macos_tls_bundle_preserves_exact_signed_and_trusted_root_sets(
         self,
     ) -> None:

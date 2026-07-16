@@ -58,12 +58,12 @@ metadata behavior.
 ## Validation
 
 - Python 3.10.19 complete canonical suite with the `tomli` test backport and
-  `PYTHONDONTWRITEBYTECODE=1`: 817 tests run, 4 skipped, no failures. Disabling
+  `PYTHONDONTWRITEBYTECODE=1`: 818 tests run, 4 skipped, no failures. Disabling
   bytecode writes keeps the intentional `RLIMIT_FSIZE` tests from truncating
   uv's own `_virtualenv.pyc` import hook.
-- Python 3.13.0 complete canonical suite: 817 tests run, 4 skipped, no failures.
+- Python 3.13.0 complete canonical suite: 818 tests run, 4 skipped, no failures.
 - Focused Python 3.13 suites: the 3 `SSL_CERT_DIR` regressions passed, providers
-  ran 346 tests with 3 skipped, and provenance ran 90 tests with no skips or
+  ran 347 tests with 3 skipped, and provenance ran 90 tests with no skips or
   failures; earlier current-range common 49 and repository contract 14 test
   suites also passed.
 - Final-head review remediation covers strict signed-manifest numeric parsing,
@@ -100,6 +100,11 @@ metadata behavior.
   owner-writable `0700` mode after publisher verification. Initial and repeated
   verified-snapshot inspection now require exact `0500`, so digest-preserving
   mode drift cannot reopen the immutable executable to current-user writes.
+- Final independent review found that an executable-inspection race inherited
+  the generic blocked trust-domain priority and could tie with, then mask, a
+  later malformed policy. The domain collector now records that typed race as
+  priority-1 inconclusive before the generic `ReviewError` branch, so any later
+  priority-2 policy block wins; a three-domain regression covers the ordering.
 - Ruff 0.13.2 lint, Python compile, skill and project-journal validation, and
   working-tree diff checks passed. No provider/test formatter churn was retained:
   Ruff would also rewrite three pre-existing current-head expressions outside
