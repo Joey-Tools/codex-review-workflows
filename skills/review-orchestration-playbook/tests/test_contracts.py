@@ -255,7 +255,10 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("\n  test:\n", workflow)
         self.assertIn("\n    name: test\n", workflow)
         self.assertIn("if: ${{ always() }}", workflow)
-        self.assertIn("needs: platform_tests", workflow)
+        self.assertTrue(
+            "needs: platform_tests" in workflow
+            or "needs:\n      - platform_tests" in workflow
+        )
         self.assertIn(
             "PLATFORM_TESTS_RESULT: ${{ needs.platform_tests.result }}",
             workflow,
