@@ -3,7 +3,7 @@ id: 20260714-7a1401
 title: Bound Independent Codex Review Output
 status: completed
 created: 2026-07-14
-updated: 2026-07-14
+updated: 2026-07-16
 branch: codex/daily-skill-friction-20260714-codex-review-workflows-review-stdout-artifact-budget
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/43
 supersedes: []
@@ -31,6 +31,7 @@ superseded_by:
 - Process cleanup requires OS containment; a fully self-contained artifact-only review may instead use a verified kernel no-child policy, while process-group or descendant polling never substitutes for containment.
 - The final-message artifact is written through a bounded FIFO/pipe sink or quota-bounded target so its 64 KiB cap is enforced while the reviewer runs, not only after exit.
 - FIFO mode uses two paths: a freshly created transport target and a distinct fresh ordinary artifact written by the bounded reader; only the ordinary artifact is statted and accepted.
+- A parent supervisor applies reviewer byte caps to parent-owned sinks and final-message transport or artifacts. Process-wide `RLIMIT_FSIZE` is explicitly forbidden because it also limits Codex session and state files and can terminate a review with `SIGXFSZ` before any valid result exists.
 - Repository contract tests pin the process-output budget and cleanup language.
 
 ## Next Steps
@@ -40,6 +41,7 @@ superseded_by:
 ## Evidence
 
 - Daily Skill Friction session `019f20b9-b864-70b3-ae54-effa0d13ca3e` produced eight independent-review poll outputs ranging from 20,888 to 59,888 original tokens.
+- Archived sessions `019f6525-c24a-7240-8255-56e67d6bf744` and `019f6542-d9f2-7e00-9fbd-bfa42770c845` independently applied `RLIMIT_FSIZE` to the reviewer process, hit `SIGXFSZ`, and succeeded only after switching to parent-supervised bounded sinks and FIFO transport.
 - `uv run --isolated --with pyyaml python3 .../quick_validate.py skills/review-orchestration-playbook` passed.
-- `python3 skills/review-orchestration-playbook/tests/test_contracts.py` passed 10 tests.
-- `python3 -B -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py'` passed 299 tests with 2 skips.
+- `python3 -B skills/review-orchestration-playbook/tests/test_contracts.py` passed 13 tests.
+- `python3 -B -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py'` passed 674 tests with 4 skips on the refreshed `d8d310d` baseline using the prepared worktree's test-fixture directories.

@@ -59,7 +59,7 @@ A legacy envelope uses this illustrative shape:
   "values": [
     {
       "id": "<STABLE_VALUE_ID>",
-      "rule": "<GENERIC_OR_GITHUB_TOKEN_RULE>",
+      "rule": "<GENERIC_OR_PROVIDER_RULE>",
       "value_base64": "<CANONICAL_BASE64_OF_EXACT_ASCII_VALUE>",
       "containing_commit": "<FULL_COMMIT_OID>",
       "source_occurrences": <EXACT_SOURCE_OCCURRENCE_COUNT>
@@ -97,7 +97,7 @@ When authoring a fixture, reuse a project-recorded compatible ID. Otherwise sele
 
 ## Legacy Exemptions
 
-`--synthetic-secret-exemption <id>` explicitly selects a named helper-owned envelope and remains repeatable. Version 1 legacy entries may suppress only `generic-secret-assignment` or the existing migration need for `github-token`.
+`--synthetic-secret-exemption <id>` explicitly selects a named helper-owned envelope and remains repeatable. Version 1 legacy entries may suppress only `generic-secret-assignment` or the exact provider-specific `github-token` and `jwt` rules needed by master-proven migration envelopes.
 
 For every selected value, the helper counts exact raw-byte occurrences across every blob in the complete base tree and complete head tree, including ordinary text, comments, symlink targets, and binary content. This counter is independent of scanner suppression events and continues even after another scanner rule blocks the surface. It permits only `head_count <= base_count`:
 
