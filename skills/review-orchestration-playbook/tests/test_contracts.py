@@ -39,13 +39,15 @@ def _workflow_job_needs(workflow: str, job_name: str) -> tuple[str, ...]:
                     for dependency in scalar_or_inline[1:-1].split(",")
                     if dependency.strip()
                 )
-            return (scalar_or_inline,)
+            return (scalar_or_inline.strip("'\""),)
         if line == "    needs:":
             dependencies: list[str] = []
             for dependency_line in job_lines[index + 1 :]:
                 if not dependency_line.startswith("      - "):
                     break
-                dependencies.append(dependency_line.removeprefix("      - ").strip())
+                dependencies.append(
+                    dependency_line.removeprefix("      - ").strip().strip("'\"")
+                )
             return tuple(dependencies)
     return ()
 
@@ -296,13 +298,13 @@ class RepositoryContractTest(unittest.TestCase):
         )
 
     def test_ci_dependency_parser_scopes_needs_to_the_selected_job(self) -> None:
-        scalar = "jobs:\n  test:\n    needs: platform_tests\n    runs-on: ubuntu-latest\n"
+        scalar = "jobs:\n  test:\n    needs: 'platform_tests'\n    runs-on: ubuntu-latest\n"
         list_form = (
             "jobs:\n"
             "  test:\n"
             "    needs:\n"
             "      - compatibility_tests\n"
-            "      - platform_tests\n"
+            '      - "platform_tests"\n'
             "    runs-on: ubuntu-latest\n"
         )
         inline_list = (

@@ -26,6 +26,8 @@ status context on additional compatibility and platform jobs.
 - Scalar `needs: platform_tests` remains accepted for the canonical workflow.
 - List-form `needs` declarations containing `platform_tests` are accepted for
   synchronized overlays with additional direct dependencies.
+- Quoted dependency names are normalized consistently in scalar, block-list,
+  and inline-list forms.
 
 ## Validation Evidence
 
