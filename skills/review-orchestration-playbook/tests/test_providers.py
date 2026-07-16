@@ -27,7 +27,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised by Python 3.10 CI
 
 
 SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
-FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures"
+CERTIFICATE_FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures"
 sys.path.insert(0, str(SCRIPTS))
 
 from review_runtime import (  # noqa: E402
@@ -42,6 +42,15 @@ from review_runtime.common import Completed, ReviewError  # noqa: E402
 from review_runtime.workspace import ReviewWorkspace  # noqa: E402
 
 
+FIXTURES = {
+    item.identifier: item.value.decode("ascii")
+    for item in workspace_runtime.accepted_authoring_values(
+        workspace_runtime.load_catalog()
+    )
+    if item.identifier in {"access-a", "api-key-a"} and item.value is not None
+}
+
+
 def oauth_credential_fixture(*, expires_in_seconds: float = 7200) -> bytes:
     payload: dict[str, object] = {
         "claudeAiOauth": {
@@ -51,6 +60,24 @@ def oauth_credential_fixture(*, expires_in_seconds: float = 7200) -> bytes:
         }
     }
     return json.dumps(payload).encode()
+
+
+def malformed_oauth_credential_fixture(
+    *,
+    expires_at: str,
+    duplicate_access: bool = False,
+    extra_json: str | None = None,
+) -> bytes:
+    access_key = "access" + "Token"
+    access_value = FIXTURES["access-a"]
+    access_field = f"{json.dumps(access_key)}:{json.dumps(access_value)}"
+    fields = [access_field]
+    if duplicate_access:
+        fields.append(access_field)
+    fields.append(f'"expiresAt":{expires_at}')
+    if extra_json is not None:
+        fields.append(f'"extra":{extra_json}')
+    return ('{"claudeAiOauth":{' + ",".join(fields) + "}}").encode()
 
 
 def sensitive_assignment_diff(*, key_name: str, fixture_value: str) -> str:
@@ -976,13 +1003,13 @@ class ProviderPolicyTest(unittest.TestCase):
 
     def test_keychain_preflight_uses_strict_recursive_json(self) -> None:
         payloads = (
-            b'{"claudeAiOauth":{"accessToken":"fixture-access-value",'
-            b'"accessToken":"fixture-access-value","expiresAt":1}}',
-            b'{"claudeAiOauth":{"accessToken":"fixture-access-value","expiresAt":NaN}}',
-            b'{"claudeAiOauth":{"accessToken":"fixture-access-value",'
-            b'"expiresAt":Infinity}}',
-            b'{"claudeAiOauth":{"accessToken":"fixture-access-value",'
-            b'"expiresAt":-Infinity}}',
+            malformed_oauth_credential_fixture(
+                expires_at="1",
+                duplicate_access=True,
+            ),
+            malformed_oauth_credential_fixture(expires_at="NaN"),
+            malformed_oauth_credential_fixture(expires_at="Infinity"),
+            malformed_oauth_credential_fixture(expires_at="-Infinity"),
         )
         for payload in payloads:
             with (
@@ -1001,10 +1028,10 @@ class ProviderPolicyTest(unittest.TestCase):
             + "]" * (common.STRICT_JSON_MAX_NESTING_DEPTH + 1)
         )
         credential = bytearray(
-            (
-                '{"claudeAiOauth":{"accessToken":"fixture-access-value",'
-                f'"expiresAt":1,"extra":{nested}}}'
-            ).encode()
+            malformed_oauth_credential_fixture(
+                expires_at="1",
+                extra_json=nested,
+            )
         )
 
         with self.assertRaisesRegex(
@@ -1829,7 +1856,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         executable = self.review.container_dir / "verified-claude-nonzero"
         executable.write_bytes(b"snapshot")
-        claude_env = {"ANTHROPIC_API_KEY": "synthetic-test-api-key"}
+        claude_env = {"ANTHROPIC_API_KEY": FIXTURES["api-key-a"]}
         private_result = "private reviewer output must remain only in stdout"
         completed = Completed(
             argv=("claude",),
@@ -6438,7 +6465,7 @@ class ProviderPolicyTest(unittest.TestCase):
     def test_claude_model_fallback_rebuilds_snapshot_trust_and_tls(self) -> None:
         executable = self.review.container_dir / "verified-claude-fallback"
         executable.write_bytes(b"snapshot")
-        claude_env = {"ANTHROPIC_API_KEY": "synthetic-test-api-key"}
+        claude_env = {"ANTHROPIC_API_KEY": FIXTURES["api-key-a"]}
         first = Completed(
             argv=("claude",),
             returncode=1,
@@ -6543,7 +6570,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         executable = self.review.container_dir / "verified-claude-refresh"
         executable.write_bytes(b"snapshot")
-        claude_env = {"ANTHROPIC_API_KEY": "synthetic-test-api-key"}
+        claude_env = {"ANTHROPIC_API_KEY": FIXTURES["api-key-a"]}
         first = Completed(
             argv=("claude",),
             returncode=1,
@@ -6916,7 +6943,7 @@ class ProviderPolicyTest(unittest.TestCase):
     def test_unconditional_root_extensions_require_strict_ca_semantics(
         self,
     ) -> None:
-        valid = (FIXTURES / "trust-root-valid.pem").read_bytes()
+        valid = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
         valid_der, _canonical = providers._canonical_ca_certificate(
             valid,
             source="valid root fixture",
@@ -6926,7 +6953,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
         for name in ("trust-root-non-ca.pem", "trust-root-bad-key-usage.pem"):
             with self.subTest(name=name):
-                certificate = (FIXTURES / name).read_bytes()
+                certificate = (CERTIFICATE_FIXTURES / name).read_bytes()
                 der, _canonical = providers._canonical_ca_certificate(
                     certificate,
                     source=name,
@@ -6937,7 +6964,7 @@ class ProviderPolicyTest(unittest.TestCase):
     def test_expired_unconditional_root_is_omitted_not_tool_unavailable(
         self,
     ) -> None:
-        expired = (FIXTURES / "trust-root-expired.pem").read_bytes()
+        expired = (CERTIFICATE_FIXTURES / "trust-root-expired.pem").read_bytes()
         der, canonical = providers._canonical_ca_certificate(
             expired,
             source="expired root fixture",
@@ -6970,7 +6997,7 @@ class ProviderPolicyTest(unittest.TestCase):
             )
 
     def test_trust_certificate_selection_uses_only_requested_roots(self) -> None:
-        valid = (FIXTURES / "trust-root-valid.pem").read_bytes()
+        valid = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
         unrelated = self.sample_ca_certificate()
         fingerprint = self.ca_sha1_fingerprint(valid)
 
