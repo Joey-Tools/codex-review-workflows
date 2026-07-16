@@ -1594,6 +1594,7 @@ def _inspect_claude_executable_trust(
     expected_sha256: str | None = None,
     include_bundled_roots: bool,
     validate_bundled_roots: bool = True,
+    required_mode: int | None = None,
 ) -> ClaudeExecutableTrustEvidence:
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
@@ -1643,6 +1644,10 @@ def _inspect_claude_executable_trust(
             or before.st_uid != os.geteuid()
             or before.st_nlink != 1
             or before.st_mode & 0o022
+            or (
+                required_mode is not None
+                and stat.S_IMODE(before.st_mode) != required_mode
+            )
             or before.st_size <= 0
             or before.st_size > CLAUDE_BINARY_MAX_BYTES
         ):
@@ -1717,6 +1722,7 @@ def _require_matching_claude_executable_snapshot(
         expected_sha256=expected.executable_sha256,
         include_bundled_roots=_is_claude_macos_host(),
         validate_bundled_roots=False,
+        required_mode=0o500,
     )
     if current != expected:
         raise ClaudeExecutableInspectionInconclusive(
@@ -4483,13 +4489,11 @@ def _warm_claude_local_login(
         and warmup_result.get("is_error") is True
         and _claude_failure_metadata_is_supported(warmup_result)
     )
-    verified_auth = (
-        supported_failure
-        and category == "auth"
-        and output_shape.get("event_shape") == "supported-result-error"
-        and output_shape.get("result_matches_known_auth_message") is True
-        and output_shape.get("result_signal_categories") == ["auth"]
-    )
+    verified_auth = supported_failure and _claude_supported_failure_category(
+        warmup.stdout,
+        stderr=warmup.stderr,
+        requested_model=model,
+    ) == "auth"
     if category in {"auth", "entitlement", "transient"} and not supported_failure:
         category = "inconclusive"
     elif category == "auth" and not verified_auth:
@@ -5477,10 +5481,10 @@ def _require_claude_safe_mode(
         raise InvalidReviewerExecutable(str(error)) from error
 
 
-def _classify_failure_evidence(
+def _failure_evidence_categories(
     stdout: bytes | str,
     stderr: bytes | str,
-) -> tuple[str, str]:
+) -> dict[str, str]:
     def decode(value: bytes | str) -> str:
         return (
             value.decode("utf-8", errors="replace")
@@ -5492,6 +5496,7 @@ def _classify_failure_evidence(
     structured_error = _structured_error_text(stdout_bytes).lower()
     stderr_text = decode(stderr).lower()
     message = f"{stderr_text}\n{structured_error}"
+    categories: dict[str, str] = {}
     if any(fragment in message for fragment in TRANSIENT_FAILURE_FRAGMENTS):
         source = (
             "structured"
@@ -5500,14 +5505,14 @@ def _classify_failure_evidence(
             )
             else "stderr"
         )
-        return "transient", f"{source}-transient"
+        categories["transient"] = f"{source}-transient"
     if any(fragment in message for fragment in AUTH_FAILURE_FRAGMENTS):
         source = (
             "structured"
             if any(fragment in structured_error for fragment in AUTH_FAILURE_FRAGMENTS)
             else "stderr"
         )
-        return "auth", f"{source}-authentication"
+        categories["auth"] = f"{source}-authentication"
     if any(fragment in message for fragment in ENTITLEMENT_FAILURE_FRAGMENTS):
         source = (
             "structured"
@@ -5517,10 +5522,10 @@ def _classify_failure_evidence(
             )
             else "stderr"
         )
-        return "entitlement", f"{source}-entitlement"
-    if any(code in structured_error for code in STRUCTURED_ENTITLEMENT_CODES):
-        return "entitlement", "structured-entitlement-code"
-    if (
+        categories["entitlement"] = f"{source}-entitlement"
+    elif any(code in structured_error for code in STRUCTURED_ENTITLEMENT_CODES):
+        categories["entitlement"] = "structured-entitlement-code"
+    elif (
         any(code in structured_error for code in STRUCTURED_AMBIGUOUS_MODEL_CODES)
         and "model" in structured_error
         and any(
@@ -5536,7 +5541,18 @@ def _classify_failure_evidence(
             )
         )
     ):
-        return "entitlement", "structured-entitlement-context"
+        categories["entitlement"] = "structured-entitlement-context"
+    return categories
+
+
+def _classify_failure_evidence(
+    stdout: bytes | str,
+    stderr: bytes | str,
+) -> tuple[str, str]:
+    categories = _failure_evidence_categories(stdout, stderr)
+    for category in ("transient", "auth", "entitlement"):
+        if category in categories:
+            return category, categories[category]
     return "other", "unclassified-failure"
 
 
@@ -5603,6 +5619,7 @@ def _claude_nonzero_failure_reason(stdout: bytes) -> str:
 def _claude_supported_failure_category(
     stdout: bytes,
     *,
+    stderr: bytes = b"",
     requested_model: str,
 ) -> str | None:
     result = _strict_json_object(stdout)
@@ -5620,7 +5637,12 @@ def _claude_supported_failure_category(
     )
     if not model_usage_valid:
         return None
-    category, _reason = _classify_failure_evidence(stdout, b"")
+    category, _reason = _classify_failure_evidence(stdout, stderr)
+    evidence_categories = _failure_evidence_categories(stdout, stderr)
+    if category in {"auth", "entitlement", "transient"} and set(
+        evidence_categories
+    ) != {category}:
+        return None
     output_shape = _claude_auth_warmup_output_shape(stdout)
     result_signal_categories = output_shape.get("result_signal_categories")
     if category == "auth":
@@ -6284,6 +6306,7 @@ def _record_attempt(
             if category in {"auth", "entitlement", "transient"} and (
                 _claude_supported_failure_category(
                     completed.stdout,
+                    stderr=completed.stderr,
                     requested_model=model,
                 )
                 != category
@@ -6632,6 +6655,9 @@ def _resolve_validated_claude_executable(
                 else None
             ),
             include_bundled_roots=_is_claude_macos_host(),
+            required_mode=(
+                0o500 if isinstance(verified, VerifiedClaudeExecutable) else None
+            ),
         )
         candidate_env = _claude_preflight_probe_environment(
             home=probe_home,

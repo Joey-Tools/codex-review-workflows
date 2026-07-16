@@ -58,12 +58,12 @@ metadata behavior.
 ## Validation
 
 - Python 3.10.19 complete canonical suite with the `tomli` test backport and
-  `PYTHONDONTWRITEBYTECODE=1`: 815 tests run, 4 skipped, no failures. Disabling
+  `PYTHONDONTWRITEBYTECODE=1`: 817 tests run, 4 skipped, no failures. Disabling
   bytecode writes keeps the intentional `RLIMIT_FSIZE` tests from truncating
   uv's own `_virtualenv.pyc` import hook.
-- Python 3.13.0 complete canonical suite: 815 tests run, 4 skipped, no failures.
+- Python 3.13.0 complete canonical suite: 817 tests run, 4 skipped, no failures.
 - Focused Python 3.13 suites: the 3 `SSL_CERT_DIR` regressions passed, providers
-  ran 344 tests with 3 skipped, and provenance ran 90 tests with no skips or
+  ran 346 tests with 3 skipped, and provenance ran 90 tests with no skips or
   failures; earlier current-range common 49 and repository contract 14 test
   suites also passed.
 - Final-head review remediation covers strict signed-manifest numeric parsing,
@@ -93,8 +93,13 @@ metadata behavior.
 - Independent current-head review found that final-invocation authentication
   classification did not yet enforce the warmup's exact known login message,
   empty error payloads, and single authentication signal. Both paths now share
-  those fail-closed criteria, so mixed auth/entitlement evidence cannot authorize
-  Copilot fallback.
+  those fail-closed criteria across stdout and stderr, so mixed
+  auth/entitlement/transient evidence cannot authorize Copilot fallback even
+  when classifier priority would otherwise select one category.
+- Frozen Codex review also found that executable revalidation still allowed an
+  owner-writable `0700` mode after publisher verification. Initial and repeated
+  verified-snapshot inspection now require exact `0500`, so digest-preserving
+  mode drift cannot reopen the immutable executable to current-user writes.
 - Ruff 0.13.2 lint, Python compile, skill and project-journal validation, and
   working-tree diff checks passed. No provider/test formatter churn was retained:
   Ruff would also rewrite three pre-existing current-head expressions outside

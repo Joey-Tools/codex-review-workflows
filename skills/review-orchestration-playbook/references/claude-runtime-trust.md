@@ -106,7 +106,9 @@ explicitly configured Claude Code candidate:
    rehash the copy against the signed size and SHA-256, publish it atomically as
    a checksum-keyed `0500` executable, and revalidate it before reuse. The source
    candidate is not executed after this point, and the verified snapshot is
-   captured once for the complete Claude model-attempt chain.
+   captured once for the complete Claude model-attempt chain. Every later
+   descriptor-anchored revalidation requires exact mode `0500`; any owner,
+   group, or world write-bit drift rejects the snapshot before execution.
 7. On Linux and WSL2, only after the signed checksum passes, allow trusted
    root-owned `ldd` to collect the exact dynamic loader and shared-library files
    needed by the verified snapshot and final sandbox. Require each dependency to
@@ -304,7 +306,8 @@ atomically with exact mode `0500`, and fully revalidated before reuse. This is
 the executable-stability boundary: the original installation path may be
 managed or replaced by a package manager, but it cannot be switched between
 provenance verification and the capability/final launches because those stages
-execute only the private snapshot.
+execute only the private snapshot. An owner-writable mode is not a valid private
+execution snapshot even when the bytes still match the signed digest.
 
 ## Capability Probes
 
@@ -780,7 +783,9 @@ machine-readable attempt reason. Authentication becomes deterministic only for
 the documented complete result shape, the exact known login result, no populated
 error payload, and exactly one authentication signal category. The final review
 invocation applies the same authentication checks as the fixed-input warmup;
-mixed authentication and entitlement/transient semantics remain inconclusive.
+the helper collects fallback signal categories across both stdout and stderr,
+and mixed authentication and entitlement/transient semantics remain
+inconclusive regardless of which stream or priority branch supplied them.
 Entitlement fallback additionally requires requested-model evidence. Transient
 classification follows the same exact failure-envelope allowlist; stderr-only or
 structurally ambiguous network text remains inconclusive. Missing or malformed

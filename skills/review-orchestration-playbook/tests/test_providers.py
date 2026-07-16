@@ -2374,6 +2374,50 @@ class ProviderPolicyTest(unittest.TestCase):
 
     @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
     @mock.patch.object(providers, "_run_claude_auth_warmup")
+    def test_auth_warmup_rejects_cross_stream_failure_conflict(
+        self,
+        warmup: mock.Mock,
+        require_fresh: mock.Mock,
+    ) -> None:
+        require_fresh.side_effect = (
+            providers.ClaudeKeychainCredentialRefreshRequired("stale"),
+            providers.ClaudeKeychainCredentialRefreshRequired("still stale"),
+        )
+        warmup.return_value = Completed(
+            argv=("claude",),
+            returncode=1,
+            stdout=json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "error_during_execution",
+                    "is_error": True,
+                    "result": "Not logged in - please run /login",
+                }
+            ).encode(),
+            stderr=b"Model is not available for your account plan",
+        )
+
+        with self.assertRaisesRegex(
+            providers.ClaudeAuthWarmupInconclusive,
+            "did not produce a fresh credential",
+        ):
+            self.warm_claude_local_login(
+                self.review,
+                pathlib.Path("/bin/claude"),
+                {},
+                providers.CLAUDE_MODELS[0],
+            )
+
+        evidence = json.loads(
+            (self.review.container_dir / "claude-auth-warmup.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(evidence["category"], "inconclusive")
+        self.assertEqual(evidence["reason"], "warmup-output-unverified")
+
+    @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
+    @mock.patch.object(providers, "_run_claude_auth_warmup")
     def test_auth_warmup_remains_unavailable_after_credential_refresh(
         self,
         warmup: mock.Mock,
@@ -2968,6 +3012,7 @@ class ProviderPolicyTest(unittest.TestCase):
                         "Not logged in - please run /login for this account plan"
                     ),
                 },
+                b"",
                 "nonzero-unclassified-result-error",
             ),
             (
@@ -2979,22 +3024,36 @@ class ProviderPolicyTest(unittest.TestCase):
                     },
                     "modelUsage": {providers.CLAUDE_MODELS[0]: {}},
                 },
+                b"",
                 "unverified-entitlement-failure-envelope",
+            ),
+            (
+                {
+                    **base,
+                    "result": "Not logged in - please run /login",
+                },
+                b"Model is not available for your account plan",
+                "unverified-auth-failure-envelope",
             ),
         )
 
-        for index, (payload, expected_reason) in enumerate(payloads, start=109):
+        for index, (payload, stderr, expected_reason) in enumerate(
+            payloads,
+            start=109,
+        ):
             with self.subTest(index=index):
                 encoded = json.dumps(payload).encode()
                 self.assertIsNone(
                     providers._claude_supported_failure_category(
                         encoded,
+                        stderr=stderr,
                         requested_model=providers.CLAUDE_MODELS[0],
                     )
                 )
                 attempt = self.record_claude_result(
                     encoded,
                     returncode=1,
+                    stderr=stderr,
                     index=index,
                 )
                 self.assertEqual(attempt.category, "inconclusive")
@@ -8216,12 +8275,14 @@ class ProviderPolicyTest(unittest.TestCase):
     def test_verified_executable_snapshot_drift_is_rejected(self) -> None:
         executable = self.review.container_dir / "verified-executable-drift"
         executable.write_bytes(b"publisher-verified-snapshot")
-        executable.chmod(0o700)
+        executable.chmod(0o500)
         evidence = self.inspect_claude_executable_trust(
             executable,
             include_bundled_roots=False,
         )
+        executable.chmod(0o700)
         executable.write_bytes(b"changed-snapshot")
+        executable.chmod(0o500)
 
         with (
             mock.patch.object(
@@ -8232,6 +8293,30 @@ class ProviderPolicyTest(unittest.TestCase):
             self.assertRaisesRegex(
                 providers.ClaudeExecutableInspectionInconclusive,
                 "no longer matches signed provenance",
+            ),
+        ):
+            self.require_matching_claude_executable_snapshot(executable, evidence)
+
+    def test_verified_executable_snapshot_rejects_owner_writable_mode(self) -> None:
+        executable = self.review.container_dir / "verified-executable-mode-drift"
+        executable.write_bytes(b"publisher-verified-snapshot")
+        executable.chmod(0o500)
+        evidence = self.inspect_claude_executable_trust(
+            executable,
+            include_bundled_roots=False,
+        )
+        executable.chmod(0o700)
+
+        with (
+            mock.patch.object(providers, "_is_claude_macos_host", return_value=False),
+            mock.patch.object(
+                providers,
+                "_inspect_claude_executable_trust",
+                side_effect=self.inspect_claude_executable_trust,
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "unsafe file metadata",
             ),
         ):
             self.require_matching_claude_executable_snapshot(executable, evidence)
@@ -8289,7 +8374,7 @@ class ProviderPolicyTest(unittest.TestCase):
         certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
         executable = self.review.container_dir / "verified-executable-revalidation"
         executable.write_bytes(bundled_root_store_fixture(certificate))
-        executable.chmod(0o700)
+        executable.chmod(0o500)
         evidence = self.inspect_claude_executable_trust(
             executable,
             include_bundled_roots=True,
@@ -8317,7 +8402,7 @@ class ProviderPolicyTest(unittest.TestCase):
         certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
         executable = self.review.container_dir / "verified-executable-roots"
         executable.write_bytes(bundled_root_store_fixture(certificate))
-        executable.chmod(0o700)
+        executable.chmod(0o500)
         expected = providers.ClaudeExecutableTrustEvidence(
             executable_sha256=hashlib.sha256(executable.read_bytes()).hexdigest(),
             bundled_root_certificates=b"",
