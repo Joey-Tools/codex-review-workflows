@@ -118,6 +118,8 @@ class RepositoryContractTest(unittest.TestCase):
             providers._claude_linux_review_runtime
         )
         self.assertIn("_warm_claude_local_login", attempt_source)
+        self.assertIn("ClaudeAuthWarmupEntitlement", attempt_source)
+        self.assertIn("require_verified_model=True", attempt_source)
         self.assertIn("CLAUDE_ATTEMPT_CREDENTIAL_VALIDITY_SECONDS", linux_runtime_source)
         self.assertNotIn("_warm_claude_local_login", run_review_source)
         self.assertNotIn("_require_fresh_claude_linux_credential", run_review_source)
@@ -141,9 +143,22 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertIn("At every model-attempt boundary", runtime_trust)
         self.assertIn("authentication-preflight-inconclusive", runtime_trust)
+        self.assertIn("authentication-preflight-entitlement", runtime_trust)
         self.assertIn("authentication-preflight-unavailable", runtime_trust)
         self.assertIn(
-            "while the model whose authentication gate failed is not recorded as a",
+            "while the model whose inconclusive authentication gate failed is not",
+            runtime_trust,
+        )
+        self.assertIn(
+            "exact-model-verified entitlement denial",
+            helper_contract,
+        )
+        self.assertIn(
+            "with no final text and without claiming that the final broker",
+            helper_contract,
+        )
+        self.assertIn(
+            "missing or mismatched model metadata stops the",
             runtime_trust,
         )
 

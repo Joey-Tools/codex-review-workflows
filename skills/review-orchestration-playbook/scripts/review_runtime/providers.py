@@ -358,6 +358,16 @@ class ClaudeAuthWarmupInconclusive(ReviewError):
     """Claude login refresh failed for a reason that must not trigger fallback."""
 
 
+class ClaudeAuthWarmupEntitlement(ReviewError):
+    """Claude login refresh proved that the requested model is not entitled."""
+
+    def __init__(self, completed: Completed) -> None:
+        super().__init__(
+            "Claude authentication warmup reported a model entitlement denial"
+        )
+        self.completed = completed
+
+
 class ClaudeReviewToolUnavailable(ReviewError):
     """The host lacks a trusted local tool required by Claude Code."""
 
@@ -2207,6 +2217,8 @@ def _warm_claude_local_login(
         if credential_error is not None:
             raise inconclusive from credential_error
         raise inconclusive
+    if category == "entitlement":
+        raise ClaudeAuthWarmupEntitlement(warmup)
     if credential_error is None:
         return
     if category == "auth":
@@ -4224,6 +4236,49 @@ def _claude_attempt(
         else:
             try:
                 _warm_claude_local_login(review, executable, env, model)
+            except ClaudeAuthWarmupEntitlement as error:
+                _, effective_model = _parse_claude_output(
+                    error.completed.stdout,
+                    requested_model=model,
+                )
+                attempt = _record_attempt(
+                    review=review,
+                    index=index,
+                    runtime="claude",
+                    model=model,
+                    completed=error.completed,
+                    final_text=None,
+                    effective_model=effective_model,
+                    requested_effort=CLAUDE_REASONING_EFFORT,
+                    effective_effort=None,
+                    require_verified_model=True,
+                )
+                verified_entitlement = attempt.category == "entitlement"
+                _update_claude_runtime_report(
+                    review,
+                    {
+                        "phase": "authentication-preflight-entitlement",
+                        "outer_sandbox": {"status": "pending-runtime-launch"},
+                        "authentication": {
+                            "status": (
+                                "model-entitlement"
+                                if verified_entitlement
+                                else "model-entitlement-unverified"
+                            ),
+                            "model": model,
+                            "validated_for_model": None,
+                        },
+                        "attempt": {
+                            "requested_model": model,
+                            "effective_model": attempt.effective_model,
+                            "requested_effort": CLAUDE_REASONING_EFFORT,
+                            "effective_effort": attempt.effective_effort,
+                            "category": attempt.category,
+                            "returncode": attempt.returncode,
+                        },
+                    },
+                )
+                return attempt
             except ClaudeAuthWarmupInconclusive:
                 _update_claude_runtime_report(
                     review,

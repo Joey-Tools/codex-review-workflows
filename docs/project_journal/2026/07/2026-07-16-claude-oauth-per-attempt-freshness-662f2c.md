@@ -43,6 +43,12 @@ capabilities workstreams.
 - Explicit authentication unavailability and model entitlement keep the
   existing fallback policy: only prior `double-review` or `triple-review`
   consent may authorize Copilot.
+- A fixed-input warmup's explicit entitlement becomes model-chain evidence only
+  when strict structured output verifies the exact requested effective model.
+  It has no final text, does not start the final broker or repository-review
+  sandbox, and leaves credential freshness unvalidated. Missing or mismatched
+  model metadata stops the lane without fallback, while the next entitled model
+  still repeats its own credential-boundary refresh and validation.
 - The trusted executable snapshot remains reusable across the model chain;
   credential freshness is the per-attempt boundary that is re-evaluated.
 
@@ -51,10 +57,11 @@ capabilities workstreams.
 - Python compile checks passed for the helper scripts and complete runtime/test
   trees.
 - Full runtime/test `ruff check` passed.
-- Focused provider and contract suite: 254 tests run; 6 skipped and the suite
-  passed. The final transient-after-refresh regression and its adjacent warmup
-  cases also passed separately.
-- Full helper suite on current `master`: 684 tests run; 9 skipped and the suite
+- Focused provider and contract suite: 259 tests run; 6 skipped and the suite
+  passed. The entitlement-preflight routing, exact-model verification,
+  next-model revalidation, no-final-broker path, and final
+  transient-after-refresh regressions also passed separately.
+- Full helper suite on current `master`: 689 tests run; 9 skipped and the suite
   passed.
 - Strict Clang syntax checks passed for the unchanged Keychain broker and Linux
   launcher, including the production POSIX feature macro for the launcher.
@@ -62,8 +69,8 @@ capabilities workstreams.
   synthetic-token catalog validation, project-journal validation, and
   `git diff --check` passed.
 
-No live Claude or Copilot review, repository-content egress to those providers,
-private overlay synchronization, release, or live OAuth retry was performed.
+The pre-merge implementation gates did not run a live Claude or Copilot review,
+send repository content to those providers, or perform a live OAuth retry.
 
 ## Next Steps
 

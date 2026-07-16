@@ -1088,6 +1088,291 @@ class ProviderPolicyTest(unittest.TestCase):
 
     @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
     @mock.patch.object(providers, "_run_claude_auth_warmup")
+    def test_entitlement_login_warmup_preserves_model_evidence(
+        self,
+        warmup: mock.Mock,
+        require_fresh: mock.Mock,
+    ) -> None:
+        model = providers.CLAUDE_MODELS[0]
+        require_fresh.side_effect = (
+            providers.ClaudeKeychainCredentialUnavailable("stale"),
+            providers.ClaudeKeychainCredentialUnavailable("still stale"),
+        )
+        completed = Completed(
+            argv=("claude",),
+            returncode=1,
+            stdout=json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "error_during_execution",
+                    "is_error": True,
+                    "error": {
+                        "code": "model_access_denied",
+                        "message": "request rejected",
+                    },
+                    "modelUsage": {model: {}},
+                }
+            ).encode(),
+            stderr=b"",
+        )
+        warmup.return_value = completed
+
+        with self.assertRaises(
+            providers.ClaudeAuthWarmupEntitlement
+        ) as raised:
+            self.warm_claude_local_login(
+                self.review,
+                pathlib.Path("/bin/claude"),
+                {},
+                model,
+            )
+
+        self.assertIs(raised.exception.completed, completed)
+        self.assertEqual(require_fresh.call_count, 2)
+
+    def test_warmup_entitlement_records_verified_attempt_without_final_runtime(
+        self,
+    ) -> None:
+        model = providers.CLAUDE_MODELS[0]
+        executable = self.review.container_dir / "verified-claude"
+        executable.write_bytes(b"snapshot")
+        providers.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {
+                "phase": "publisher-and-capabilities-verified",
+                "authentication": {"status": "pending"},
+                "outer_sandbox": {"status": "pending-runtime-launch"},
+            },
+        )
+        completed = Completed(
+            argv=("claude",),
+            returncode=1,
+            stdout=json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "error_during_execution",
+                    "is_error": True,
+                    "error": {
+                        "code": "model_access_denied",
+                        "message": "request rejected",
+                    },
+                    "modelUsage": {model: {}},
+                }
+            ).encode(),
+            stderr=b"",
+        )
+        self.warmup.side_effect = providers.ClaudeAuthWarmupEntitlement(
+            completed
+        )
+
+        with (
+            mock.patch.object(
+                providers,
+                "_with_claude_review_tool_path",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_prepare_claude_tls_environment",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(providers, "run") as run_command,
+        ):
+            attempt = providers._claude_attempt(
+                review=self.review,
+                model=model,
+                index=1,
+                env={},
+                executable=executable,
+            )
+
+        self.assertEqual(attempt.category, "entitlement")
+        self.assertEqual(attempt.effective_model, model)
+        self.assertIsNone(attempt.final_text)
+        run_command.assert_not_called()
+        providers._claude_keychain_runtime.assert_not_called()
+        report = json.loads(
+            (self.review.container_dir / "claude-runtime.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(report["phase"], "authentication-preflight-entitlement")
+        self.assertEqual(report["authentication"]["status"], "model-entitlement")
+        self.assertIsNone(report["authentication"]["validated_for_model"])
+        self.assertEqual(report["attempt"]["category"], "entitlement")
+
+    def test_unverified_warmup_entitlement_cannot_enter_model_fallback(
+        self,
+    ) -> None:
+        executable = self.review.container_dir / "verified-claude"
+        executable.write_bytes(b"snapshot")
+        providers.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {
+                "phase": "publisher-and-capabilities-verified",
+                "authentication": {"status": "pending"},
+                "outer_sandbox": {"status": "pending-runtime-launch"},
+            },
+        )
+        completed = Completed(
+            argv=("claude",),
+            returncode=1,
+            stdout=json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "error_during_execution",
+                    "is_error": True,
+                    "error": {
+                        "code": "model_access_denied",
+                        "message": "request rejected",
+                    },
+                }
+            ).encode(),
+            stderr=b"",
+        )
+        self.warmup.side_effect = providers.ClaudeAuthWarmupEntitlement(
+            completed
+        )
+
+        with (
+            mock.patch.object(
+                providers,
+                "_with_claude_review_tool_path",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_prepare_claude_tls_environment",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(providers, "run") as run_command,
+        ):
+            attempts: list[providers.Attempt] = []
+            category, final_text = providers._run_model_chain(
+                review=self.review,
+                models=providers.CLAUDE_MODELS,
+                runner=lambda **kwargs: providers._claude_attempt(
+                    executable=executable,
+                    **kwargs,
+                ),
+                runtime="claude",
+                requested_effort=providers.CLAUDE_REASONING_EFFORT,
+                env={},
+                attempts=attempts,
+            )
+
+        self.assertEqual(category, "runtime-unverified")
+        self.assertIsNone(final_text)
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0].category, "runtime-unverified")
+        self.assertEqual(self.warmup.call_count, 1)
+        run_command.assert_not_called()
+        providers._claude_keychain_runtime.assert_not_called()
+        report = json.loads(
+            (self.review.container_dir / "claude-runtime.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            report["authentication"]["status"],
+            "model-entitlement-unverified",
+        )
+        self.assertIsNone(report["authentication"]["validated_for_model"])
+
+    def test_warmup_entitlement_rechecks_next_model_before_final_runtime(
+        self,
+    ) -> None:
+        first_model, second_model = providers.CLAUDE_MODELS
+        executable = self.review.container_dir / "verified-claude"
+        executable.write_bytes(b"snapshot")
+        entitlement = Completed(
+            argv=("claude",),
+            returncode=1,
+            stdout=json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "error_during_execution",
+                    "is_error": True,
+                    "error": {
+                        "code": "model_access_denied",
+                        "message": "request rejected",
+                    },
+                    "modelUsage": {first_model: {}},
+                }
+            ).encode(),
+            stderr=b"",
+        )
+        success = Completed(
+            argv=("claude",),
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "result": "No findings.",
+                    "modelUsage": {second_model: {}},
+                }
+            ).encode(),
+            stderr=b"",
+        )
+        self.warmup.side_effect = (
+            providers.ClaudeAuthWarmupEntitlement(entitlement),
+            None,
+        )
+
+        with (
+            mock.patch.object(
+                providers,
+                "_with_claude_review_tool_path",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_prepare_claude_tls_environment",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_connect_proxy",
+                return_value=contextlib.nullcontext(43210),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_review_sandbox_profile",
+                return_value="(version 1)",
+            ),
+            mock.patch.object(providers, "run", return_value=success) as run_command,
+        ):
+            attempts: list[providers.Attempt] = []
+            category, final_text = providers._run_model_chain(
+                review=self.review,
+                models=providers.CLAUDE_MODELS,
+                runner=lambda **kwargs: providers._claude_attempt(
+                    executable=executable,
+                    **kwargs,
+                ),
+                runtime="claude",
+                requested_effort=providers.CLAUDE_REASONING_EFFORT,
+                env={},
+                attempts=attempts,
+            )
+
+        self.assertEqual(category, "success")
+        self.assertEqual(final_text, "No findings.")
+        self.assertEqual(
+            [attempt.category for attempt in attempts],
+            ["entitlement", "success"],
+        )
+        self.assertEqual(
+            [call.args[3] for call in self.warmup.call_args_list],
+            list(providers.CLAUDE_MODELS),
+        )
+        run_command.assert_called_once()
+        self.assertEqual(providers._claude_keychain_runtime.call_count, 1)
+
+    @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
+    @mock.patch.object(providers, "_run_claude_auth_warmup")
     def test_transient_login_warmup_failure_is_inconclusive(
         self,
         warmup: mock.Mock,
@@ -3486,6 +3771,79 @@ class ProviderPolicyTest(unittest.TestCase):
                 encoding="utf-8"
             ),
         )
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        return_value=(pathlib.Path("/bin/claude"), {}),
+    )
+    @mock.patch.object(
+        providers,
+        "resolve_reviewer_executable",
+        return_value=pathlib.Path("/bin/copilot"),
+    )
+    @mock.patch.object(providers, "_copilot_attempt")
+    def test_unverified_warmup_entitlement_refuses_copilot_fallback(
+        self,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _resolve_claude: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        completed = Completed(
+            argv=("claude",),
+            returncode=1,
+            stdout=json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "error_during_execution",
+                    "is_error": True,
+                    "error": {
+                        "code": "model_access_denied",
+                        "message": "request rejected",
+                    },
+                }
+            ).encode(),
+            stderr=b"",
+        )
+        self.warmup.side_effect = providers.ClaudeAuthWarmupEntitlement(
+            completed
+        )
+
+        with (
+            mock.patch.object(
+                providers,
+                "_with_claude_review_tool_path",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_prepare_claude_tls_environment",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(providers, "run") as run_command,
+        ):
+            outcome = providers.run_review(
+                review=self.review,
+                reviewer="claude",
+                egress_consent="double-review",
+            )
+
+        self.assertEqual(outcome.returncode, 1)
+        self.assertEqual(len(outcome.attempts), 1)
+        self.assertEqual(outcome.attempts[0].category, "runtime-unverified")
+        self.assertEqual(self.warmup.call_count, 1)
+        run_command.assert_not_called()
+        resolve.assert_not_called()
+        copilot_attempt.assert_not_called()
+        persisted = json.loads(
+            (self.review.container_dir / "attempts.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(len(persisted), 1)
+        self.assertEqual(persisted[0]["category"], "runtime-unverified")
 
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(
