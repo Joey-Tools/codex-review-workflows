@@ -5,7 +5,7 @@ status: completed
 created: 2026-07-16
 updated: 2026-07-16
 branch: wip/claude-oauth-per-attempt-freshness
-pr:
+pr: https://github.com/Joey-Tools/codex-review-workflows/pull/49
 supersedes: []
 superseded_by:
 ---
