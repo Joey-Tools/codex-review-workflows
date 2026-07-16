@@ -119,16 +119,26 @@ explicitly configured Claude Code candidate:
    mentions, and deny every non-workspace synthetic-root mount with absolute
    double-slash rules. Command construction must fail closed when a mount lacks
    coverage or appears below `/workspace`.
-10. Prepare the platform-specific private credential carrier. macOS may run its
-   fixed no-tools authentication warmup when the Keychain credential is not
-   fresh. Linux and WSL2 never warm or refresh credentials: require the host
-   credential to remain valid for the full bounded review window, or use an
-   explicitly supplied API key.
+10. At every model-attempt boundary, prepare the platform-specific private
+    credential carrier for only that attempt's 30-minute timeout plus the
+    2-minute safety margin. On macOS, first check freshness; only when the
+    current window is insufficient, run the fixed no-tools, no-workspace-read
+    warmup with the current attempt's model, then re-read and validate the
+    Keychain item. Linux and WSL2 never warm or refresh credentials; each
+    attempt independently validates and stages a new private copy. An explicit
+    API key skips local-login warmup and staging. If the warmup returns an
+    explicit entitlement or organization-policy denial in a strict top-level
+    error result, with structured-error classification and exact effective-model
+    verification, persist that fallback evidence and end the current model
+    boundary without starting the final broker or review sandbox, even when
+    credential freshness remains insufficient. Successful structured output
+    plus entitlement-shaped stderr never authorizes fallback.
 11. Launch only the one captured verified snapshot for every real model attempt
     in a fresh outer sandbox; never rediscover or fall back to the mutable source
-    installation between Opus attempts. Validate structured output, effective
-    model, and terminal status before accepting text as review evidence. The
-    requested effort remains explicit in every real command.
+    installation between Opus attempts. If entitlement selects a later Opus
+    model, repeat step 10 before that attempt. Validate structured output,
+    effective model, and terminal status before accepting text as review
+    evidence. The requested effort remains explicit in every real command.
 
 ## Publisher Provenance
 
@@ -527,26 +537,41 @@ An explicitly supplied `ANTHROPIC_API_KEY` remains an optional override and does
 not require local-login credential access. Never pass Claude and Copilot
 credentials into the same child environment.
 
-On macOS, retain the capability-authenticated, one-shot Keychain broker. The
-parent may read the current Claude Code item once with Apple's trusted client;
-the final Claude process cannot execute `/usr/bin/security`, access Keychain
-services directly, update the host item, or refresh OAuth credentials during the
-review.
+On macOS, retain the capability-authenticated, one-shot Keychain broker. Before
+each model attempt, after trusted executable, review-tool, and TLS preparation,
+the parent reads and validates the current Claude Code item with Apple's trusted
+client. The token needs to cover only the current bounded attempt plus its
+safety margin, currently `1800 + 120 = 1920` seconds. A sufficiently fresh token
+is not refreshed. Otherwise the helper runs the fixed-input safe-mode warmup
+with the current attempt's model, no tools, and no workspace read, then re-reads
+and validates the item. The final broker performs another read and fail-closed
+single-attempt validation before its one-shot handoff. The final Claude process
+cannot execute `/usr/bin/security`, access Keychain services directly, update
+the host item, or refresh OAuth credentials during the review. Every later
+model attempt repeats this refresh-if-needed and validation sequence. A
+strictly structured, exact-model-verified entitlement denial from the warmup is
+recorded only as model-chain fallback evidence with no final text; it skips the
+final broker and repository-review launch, and the next model still starts from
+its own freshness boundary. Its bounded complete stdout/stderr capture is copied
+to the formal attempt logs after the temporary warmup output directory closes.
+An explicit authentication failure remains unavailable even when the refreshed
+Keychain item is structurally fresh enough for a later attempt.
 
-On Linux and WSL2, validate the documented Claude Code credential file as a
-non-symlink regular file owned by the current user with exact mode `0600`. Copy
-it into a helper-owned `0700` directory as a private `0600` file and expose only
-that staged copy's config directory through a read-only mount at `/config`; the
-original host credential is never mounted. Parse the OAuth expiry and require
-the host credential to remain valid for the complete bounded review window plus
-its safety margin before launch. Linux and WSL2 perform no warmup, refresh, or
-host-credential write; a missing or insufficiently fresh credential is
-unavailable unless an explicit `ANTHROPIC_API_KEY` is supplied. Reject unsafe
-ownership, mode, symlink, path-race, size, or JSON structure, and never persist
-or print credential contents in review state. The source descriptor must close
-successfully before a validated payload is returned; close failure zeroes the
-in-memory copy, preserves any earlier validation/control-flow error, and fails
-closed without retrying the same numeric descriptor.
+On Linux and WSL2, every model attempt validates the documented Claude Code
+credential file as a non-symlink regular file owned by the current user with
+exact mode `0600`. For that attempt, copy it into a new helper-owned `0700`
+directory as a private `0600` file and expose only that staged copy's config
+directory through a read-only mount at `/config`; the original host credential
+is never mounted. Parse the OAuth expiry and require the same single-attempt
+`1920`-second window before launch. Linux and WSL2 perform no pre-chain staging,
+warmup, refresh, or host-credential write; a missing or insufficiently fresh
+credential is unavailable unless an explicit `ANTHROPIC_API_KEY` is supplied.
+Reject unsafe ownership, mode, symlink, path-race, size, or JSON structure, and
+never persist or print credential contents in review state. The source
+descriptor must close successfully before a validated payload is returned;
+close failure zeroes the in-memory copy, preserves any earlier
+validation/control-flow error, and fails closed without retrying the same
+numeric descriptor.
 
 Credential staging owns cleanup from the first successful create through the
 final close. Scrub, close, unlink, and directory removal are attempted in a
@@ -586,19 +611,47 @@ reached:
 1. `publisher-and-capabilities-verified`: the signed release, private snapshot,
    and safe-mode/help capability contract passed. `outer_sandbox.status` remains
    `pending-runtime-launch` and `authentication.status` remains `pending`.
-2. `authentication-preflight-complete`: API-key configuration or local-login
-   freshness passed; authentication status becomes `configured` or
-   `freshness-verified`.
-3. Platform preparation: Linux/WSL2 reports `runtime-ready` only after its real
-   isolation probe, with `outer_sandbox.status: isolation-probe-verified` and
+2. macOS `authentication-preflight-complete`: after review-tool and TLS
+   preparation for the current attempt, API-key configuration or local-login
+   refresh/validation passed. Authentication status becomes `configured` or
+   `freshness-verified`; `authentication.model` and `validated_for_model` both
+   identify the current model whose attempt window was checked. When this
+   outcome is published for a later Opus attempt, it clears the previous
+   attempt subtree, restores the outer-sandbox
+   status to pending, and is not a whole-chain freshness guarantee.
+3. macOS authentication preparation failure before a model launch is explicit.
+   `authentication-preflight-inconclusive` records the current model and stable
+   warmup failure class without inventing a formal review attempt. This includes
+   supervision failures from the credential freshness read immediately before
+   or after the warmup.
+   `authentication-preflight-unavailable` also covers an attempt-local failure
+   of the restricted Keychain broker, with the same consent-gated fallback
+   policy as an unavailable credential.
+   A structured transient warmup remains inconclusive when the post-warmup read
+   also finds that broker unavailable. During final staging, credential-read
+   supervision failures use failure class `credential-read` with no model
+   attempt, while broker failure or a warmup/final-staging loopback failure
+   resets the phase to unavailable before the Claude CLI launch.
+   `authentication-preflight-entitlement` records a strict, exact-model-verified
+   warmup entitlement attempt while keeping `outer_sandbox.status` at
+   `pending-runtime-launch` and `validated_for_model` unset. This is fallback
+   evidence with no final text, not a final review launch or clean artifact.
+   `authentication-preflight-unavailable` records an explicitly unavailable
+   current-attempt Keychain credential. Linux/WSL2 credential unavailability
+   prevents `runtime-ready` from being published and is retained through the
+   ordinary unavailable error artifact instead of a macOS preflight phase.
+4. Platform preparation: Linux/WSL2 reports `runtime-ready` only after the
+   current attempt's credential staging and real isolation probe, with
+   `outer_sandbox.status: isolation-probe-verified` and
    `authentication.status: sandbox-auth-staged`. macOS reports
    `runtime-launching` with `outer_sandbox.status: profile-generated` only when
-   the final Seatbelt launch is prepared.
-4. `attempt-inconclusive`: a bounded supervisor timeout, output overflow, drain
-   failure, or retained descendant interrupted an attempted launch. The report
-   records `attempt.category: inconclusive` and a stable `failure_class` rather
-   than leaving an earlier readiness phase as the apparent terminal result.
-5. `attempt-complete`: the report records the final sandbox status, attempt
+   the final one-shot broker and Seatbelt launch are prepared.
+5. `attempt-inconclusive`: a bounded supervisor timeout, output overflow, drain
+   failure, or retained descendant interrupted an attempted model launch. The
+   report records `attempt.category: inconclusive` and a stable `failure_class`
+   rather than leaving an earlier readiness phase as the apparent terminal
+   result.
+6. `attempt-complete`: the report records the final sandbox status, attempt
    category and return code, and requested/effective model and effort.
 
 These records are evidence about which gates ran; an early phase must never be
@@ -608,11 +661,24 @@ described as an enforced final launch.
 
 | Condition | Terminal classification | Copilot fallback |
 | --- | --- | --- |
-| No automatic candidate, supported platform unavailable, accepted-range candidate lacks a required non-security capability, or usable local/API authentication is absent | `runtime-unavailable` or `auth-unavailable` | Only for explicit double/triple-review consent |
+| No automatic candidate, supported platform unavailable, accepted-range candidate lacks a required non-security capability, or usable local/API authentication is absent at the current attempt boundary | `runtime-unavailable` or `auth-unavailable` | Only for explicit double/triple-review consent |
 | Explicit override has the wrong version, platform, binary shape, capability contract, or lacks trusted GPG, probe sandbox, or trusted review tool prerequisites | `blocked` configuration error | No |
 | Wrong publisher fingerprint, invalid signature, checksum mismatch, contradictory safe-mode semantics, unsafe credential metadata, or an isolation-boundary mismatch | `blocked` security error | No |
 | Manifest/probe timeout, output overflow, executable resolve/stat I/O failure, other inspection I/O failure, file race, transient network failure, capacity error, or missing trustworthy terminal artifact | `inconclusive` | No |
-| Explicit model entitlement or organization-policy denial after runtime verification | Existing same-lane model/backend fallback policy | Only as already authorized by the lane contract |
+| Explicit model entitlement or organization-policy denial from a final review invocation, or from a fixed-input warmup after exact effective-model verification | Existing same-lane model/backend fallback policy | Only as already authorized by the lane contract |
+
+A transient, timed-out, output-limited, drain-failed, or process-leaking macOS
+warmup is `inconclusive` and returns exit `75`; it never authorizes Copilot. If
+an earlier Opus attempt completed with entitlement metadata, that evidence stays
+persisted while the model whose inconclusive authentication gate failed is not
+recorded as a launched attempt. A verified warmup entitlement is recorded as an
+attempt with no final text, but missing or mismatched model metadata stops the
+lane as `runtime-unverified` or `model-mismatch` and never authorizes fallback.
+Transient and authentication classifications retain their existing precedence.
+Every later Opus model independently repeats the freshness/warmup boundary. A
+credential that is explicitly unavailable at a later model boundary follows
+only the existing double/triple-review consent gate; `explicit-claude-review`
+remains Anthropic-only.
 
 An unsupported future patch inside the version range may be treated as automatic
 runtime unavailability only when it cleanly lacks a required capability. Evidence

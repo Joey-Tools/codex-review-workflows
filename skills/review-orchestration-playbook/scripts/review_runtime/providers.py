@@ -243,6 +243,9 @@ MACHO_MAGICS = frozenset(
 COPILOT_PROBE_TIMEOUT_SECONDS = 20.0
 COPILOT_PROBE_OUTPUT_LIMIT_BYTES = 64 * 1024
 REVIEW_ATTEMPT_TIMEOUT_SECONDS = 30 * 60.0
+CLAUDE_ATTEMPT_CREDENTIAL_VALIDITY_SECONDS = (
+    REVIEW_ATTEMPT_TIMEOUT_SECONDS + CLAUDE_AUTH_EXPIRY_MARGIN_SECONDS
+)
 REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES = 64 * 1024 * 1024
 COPILOT_JSONL_RECORD_LIMIT_BYTES = 4 * 1024 * 1024
 CLAUDE_EGRESS_CONSENTS = (
@@ -353,6 +356,16 @@ class ClaudeKeychainCredentialUnavailable(ReviewError):
 
 class ClaudeAuthWarmupInconclusive(ReviewError):
     """Claude login refresh failed for a reason that must not trigger fallback."""
+
+
+class ClaudeAuthWarmupEntitlement(ReviewError):
+    """Claude login refresh proved that the requested model is not entitled."""
+
+    def __init__(self, completed: Completed) -> None:
+        super().__init__(
+            "Claude authentication warmup reported a model entitlement denial"
+        )
+        self.completed = completed
 
 
 class ClaudeReviewToolUnavailable(ReviewError):
@@ -769,19 +782,16 @@ def _read_claude_keychain_credential(
 
 def _validate_fresh_claude_keychain_credential(
     credential: bytearray,
-    *,
-    attempt_count: int = 1,
 ) -> None:
     try:
         payload = json.loads(credential)
         oauth = payload["claudeAiOauth"]
         expires_at = oauth["expiresAt"]
+        now = time.time()
         required_expiry = (
-            time.time()
-            + attempt_count
-            * (REVIEW_ATTEMPT_TIMEOUT_SECONDS + CLAUDE_AUTH_EXPIRY_MARGIN_SECONDS)
+            now + CLAUDE_ATTEMPT_CREDENTIAL_VALIDITY_SECONDS
         ) * 1000
-        maximum_expiry = (time.time() + 7 * 24 * 60 * 60) * 1000
+        maximum_expiry = (now + 7 * 24 * 60 * 60) * 1000
         if (
             not isinstance(oauth.get("accessToken"), str)
             or not oauth["accessToken"]
@@ -792,7 +802,8 @@ def _validate_fresh_claude_keychain_credential(
             or expires_at > maximum_expiry
         ):
             raise ClaudeKeychainCredentialUnavailable(
-                "Claude local-login access token cannot cover the isolated review window"
+                "Claude local-login access token cannot cover the current model "
+                "attempt window"
             )
     except (KeyError, TypeError, ValueError, OverflowError, json.JSONDecodeError) as error:
         raise ClaudeKeychainCredentialUnavailable(
@@ -807,12 +818,26 @@ def _require_fresh_claude_keychain_credential(review: ReviewWorkspace) -> None:
             "Claude local-login credential is unavailable"
         )
     try:
-        _validate_fresh_claude_keychain_credential(
-            credential,
-            attempt_count=len(CLAUDE_MODELS),
-        )
+        _validate_fresh_claude_keychain_credential(credential)
     finally:
         credential[:] = b"\x00" * len(credential)
+
+
+def _require_fresh_claude_keychain_credential_for_auth_preflight(
+    review: ReviewWorkspace,
+) -> None:
+    try:
+        _require_fresh_claude_keychain_credential(review)
+    except (
+        ReviewTimeoutError,
+        ReviewOutputDrainError,
+        ReviewOutputLimitError,
+        ReviewProcessLeakError,
+    ) as error:
+        raise ClaudeAuthWarmupInconclusive(
+            "Claude authentication credential check was inconclusive: "
+            f"{error}"
+        ) from error
 
 
 def _recv_exact(sock: socket.socket, length: int) -> bytes | None:
@@ -2099,6 +2124,7 @@ def _run_claude_auth_warmup(
     review: ReviewWorkspace,
     executable: pathlib.Path,
     env: dict[str, str],
+    model: str,
 ) -> Completed:
     rg = _trusted_claude_ripgrep()
     if rg is None:
@@ -2138,7 +2164,7 @@ def _run_claude_auth_warmup(
                 str(executable),
                 "--print",
                 "--model",
-                CLAUDE_MODELS[0],
+                model,
                 "--effort",
                 CLAUDE_REASONING_EFFORT,
                 "--permission-mode",
@@ -2177,23 +2203,69 @@ def _warm_claude_local_login(
     review: ReviewWorkspace,
     executable: pathlib.Path,
     env: dict[str, str],
+    model: str,
 ) -> None:
     try:
-        _require_fresh_claude_keychain_credential(review)
+        _require_fresh_claude_keychain_credential_for_auth_preflight(review)
         return
     except ClaudeKeychainCredentialUnavailable:
         pass
-    warmup = _run_claude_auth_warmup(review, executable, env)
     try:
-        _require_fresh_claude_keychain_credential(review)
-    except ClaudeKeychainCredentialUnavailable as error:
-        category = classify_failure(warmup.stdout, warmup.stderr)
-        if category == "auth":
-            raise
+        warmup = _run_claude_auth_warmup(review, executable, env, model)
+    except (
+        ReviewTimeoutError,
+        ReviewOutputDrainError,
+        ReviewOutputLimitError,
+        ReviewProcessLeakError,
+    ) as error:
         raise ClaudeAuthWarmupInconclusive(
-            "Claude authentication warmup did not produce a fresh credential "
-            f"({category})"
+            f"Claude authentication warmup was inconclusive: {error}"
         ) from error
+    credential_error: (
+        ClaudeKeychainBrokerUnavailable
+        | ClaudeKeychainCredentialUnavailable
+        | None
+    ) = None
+    try:
+        _require_fresh_claude_keychain_credential_for_auth_preflight(review)
+    except (
+        ClaudeKeychainBrokerUnavailable,
+        ClaudeKeychainCredentialUnavailable,
+    ) as error:
+        credential_error = error
+    category = classify_failure(warmup.stdout, warmup.stderr)
+    if category == "transient":
+        inconclusive = ClaudeAuthWarmupInconclusive(
+            "Claude authentication warmup was inconclusive (transient)"
+        )
+        if credential_error is not None:
+            raise inconclusive from credential_error
+        raise inconclusive
+    warmup_result = _strict_json_object(warmup.stdout)
+    structured_entitlement = (
+        category == "entitlement"
+        and warmup_result is not None
+        and warmup_result.get("type") == "result"
+        and warmup_result.get("subtype") != "success"
+        and warmup_result.get("is_error") is True
+        and classify_failure(warmup.stdout, b"") == "entitlement"
+    )
+    if structured_entitlement:
+        raise ClaudeAuthWarmupEntitlement(warmup)
+    if category == "auth":
+        if credential_error is not None:
+            raise credential_error
+        raise ClaudeKeychainCredentialUnavailable(
+            "Claude authentication warmup reported an authentication failure"
+        )
+    if credential_error is None:
+        return
+    if isinstance(credential_error, ClaudeKeychainBrokerUnavailable):
+        raise credential_error
+    raise ClaudeAuthWarmupInconclusive(
+        "Claude authentication warmup did not produce a fresh credential "
+        f"({category})"
+    ) from credential_error
 
 
 def _review_environment(
@@ -2325,30 +2397,6 @@ def _claude_linux_credential_source() -> pathlib.Path:
     except LinuxRuntimeError as error:
         raise ReviewError(str(error)) from error
     return source
-
-
-def _require_fresh_claude_linux_credential(
-    review: ReviewWorkspace,
-    env: dict[str, str],
-) -> None:
-    if env.get("ANTHROPIC_API_KEY"):
-        return
-    required_validity = len(CLAUDE_MODELS) * (
-        REVIEW_ATTEMPT_TIMEOUT_SECONDS + CLAUDE_AUTH_EXPIRY_MARGIN_SECONDS
-    )
-    try:
-        with stage_claude_credentials(
-            _claude_linux_credential_source(),
-            _claude_linux_runtime_root(review),
-            required_validity_seconds=required_validity,
-        ):
-            pass
-    except LinuxCredentialUnavailable as error:
-        raise ClaudeKeychainCredentialUnavailable(str(error)) from error
-    except LinuxCredentialUnsafe as error:
-        raise ReviewError(
-            f"Claude Linux local-login credential is unsafe: {error}"
-        ) from error
 
 
 def _claude_linux_ca_bundle(
@@ -3946,7 +3994,13 @@ def _claude_linux_review_runtime(
             source = _claude_linux_credential_source()
             try:
                 staged = stack.enter_context(
-                    stage_claude_credentials(source, root)
+                    stage_claude_credentials(
+                        source,
+                        root,
+                        required_validity_seconds=(
+                            CLAUDE_ATTEMPT_CREDENTIAL_VALIDITY_SECONDS
+                        ),
+                    )
                 )
             except LinuxCredentialUnavailable as error:
                 raise ClaudeKeychainCredentialUnavailable(str(error)) from error
@@ -4215,6 +4269,104 @@ def _claude_attempt(
         _require_claude_linux_prompt_without_file_mentions(prompt)
     env = _with_claude_review_tool_path(review, env)
     env = _prepare_claude_tls_environment(review, env)
+    if not linux_host:
+        if env.get("ANTHROPIC_API_KEY"):
+            authentication_status = "configured"
+        else:
+            try:
+                _warm_claude_local_login(review, executable, env, model)
+            except ClaudeAuthWarmupEntitlement as error:
+                _, effective_model = _parse_claude_output(
+                    error.completed.stdout,
+                    requested_model=model,
+                )
+                attempt = _record_attempt(
+                    review=review,
+                    index=index,
+                    runtime="claude",
+                    model=model,
+                    completed=error.completed,
+                    final_text=None,
+                    effective_model=effective_model,
+                    requested_effort=CLAUDE_REASONING_EFFORT,
+                    effective_effort=None,
+                    require_verified_model=True,
+                )
+                verified_entitlement = attempt.category == "entitlement"
+                _update_claude_runtime_report(
+                    review,
+                    {
+                        "phase": "authentication-preflight-entitlement",
+                        "outer_sandbox": {"status": "pending-runtime-launch"},
+                        "authentication": {
+                            "status": (
+                                "model-entitlement"
+                                if verified_entitlement
+                                else "model-entitlement-unverified"
+                            ),
+                            "model": model,
+                            "validated_for_model": None,
+                        },
+                        "attempt": {
+                            "requested_model": model,
+                            "effective_model": attempt.effective_model,
+                            "requested_effort": CLAUDE_REASONING_EFFORT,
+                            "effective_effort": attempt.effective_effort,
+                            "category": attempt.category,
+                            "returncode": attempt.returncode,
+                        },
+                    },
+                )
+                return attempt
+            except ClaudeAuthWarmupInconclusive:
+                _update_claude_runtime_report(
+                    review,
+                    {
+                        "phase": "authentication-preflight-inconclusive",
+                        "outer_sandbox": {"status": "pending-runtime-launch"},
+                        "authentication": {
+                            "status": "inconclusive",
+                            "model": model,
+                            "failure_class": "warmup",
+                            "validated_for_model": None,
+                        },
+                        "attempt": None,
+                    },
+                )
+                raise
+            except (
+                ClaudeKeychainBrokerUnavailable,
+                ClaudeKeychainCredentialUnavailable,
+                ClaudeLoopbackUnavailable,
+            ):
+                _update_claude_runtime_report(
+                    review,
+                    {
+                        "phase": "authentication-preflight-unavailable",
+                        "outer_sandbox": {"status": "pending-runtime-launch"},
+                        "authentication": {
+                            "status": "unavailable",
+                            "model": model,
+                            "validated_for_model": None,
+                        },
+                        "attempt": None,
+                    },
+                )
+                raise
+            authentication_status = "freshness-verified"
+        _update_claude_runtime_report(
+            review,
+            {
+                "phase": "authentication-preflight-complete",
+                "outer_sandbox": {"status": "pending-runtime-launch"},
+                "authentication": {
+                    "status": authentication_status,
+                    "model": model,
+                    "validated_for_model": model,
+                },
+                "attempt": None,
+            },
+        )
     stdout_path, stderr_path = _attempt_paths(review, index, "claude", model)
     settings = _claude_review_settings(linux=linux_host)
     arguments = _claude_review_arguments(
@@ -4240,40 +4392,89 @@ def _claude_attempt(
                 output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
             )
     else:
-        with contextlib.ExitStack() as stack:
-            env = stack.enter_context(_claude_keychain_runtime(review, env))
-            proxy_port = stack.enter_context(_claude_connect_proxy(env))
-            review_env = _with_claude_proxy_environment(env, proxy_port)
-            sandbox_profile = _claude_review_sandbox_profile(
-                executable,
-                review,
-                review_env,
-                proxy_port=proxy_port,
-            )
+        try:
+            with contextlib.ExitStack() as stack:
+                try:
+                    env = stack.enter_context(
+                        _claude_keychain_runtime(review, env)
+                    )
+                except (
+                    ReviewTimeoutError,
+                    ReviewOutputDrainError,
+                    ReviewOutputLimitError,
+                    ReviewProcessLeakError,
+                ) as error:
+                    raise ClaudeAuthWarmupInconclusive(
+                        "Claude final credential check was inconclusive: "
+                        f"{error}"
+                    ) from error
+                proxy_port = stack.enter_context(_claude_connect_proxy(env))
+                review_env = _with_claude_proxy_environment(env, proxy_port)
+                sandbox_profile = _claude_review_sandbox_profile(
+                    executable,
+                    review,
+                    review_env,
+                    proxy_port=proxy_port,
+                )
+                _update_claude_runtime_report(
+                    review,
+                    {
+                        "phase": "runtime-launching",
+                        "outer_sandbox": {"status": "profile-generated"},
+                        "authentication": {"status": "sandbox-auth-staged"},
+                    },
+                )
+                completed = run(
+                    (
+                        str(CLAUDE_PROBE_SANDBOX),
+                        "-p",
+                        sandbox_profile,
+                        str(executable),
+                        *arguments,
+                    ),
+                    cwd=review.workspace_root,
+                    env=review_env,
+                    stdin=prompt,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                    timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
+                    output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
+                )
+        except ClaudeAuthWarmupInconclusive:
             _update_claude_runtime_report(
                 review,
                 {
-                    "phase": "runtime-launching",
-                    "outer_sandbox": {"status": "profile-generated"},
-                    "authentication": {"status": "sandbox-auth-staged"},
+                    "phase": "authentication-preflight-inconclusive",
+                    "outer_sandbox": {"status": "pending-runtime-launch"},
+                    "authentication": {
+                        "status": "inconclusive",
+                        "model": model,
+                        "failure_class": "credential-read",
+                        "validated_for_model": None,
+                    },
+                    "attempt": None,
                 },
             )
-            completed = run(
-                (
-                    str(CLAUDE_PROBE_SANDBOX),
-                    "-p",
-                    sandbox_profile,
-                    str(executable),
-                    *arguments,
-                ),
-                cwd=review.workspace_root,
-                env=review_env,
-                stdin=prompt,
-                stdout_path=stdout_path,
-                stderr_path=stderr_path,
-                timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
-                output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
+            raise
+        except (
+            ClaudeKeychainBrokerUnavailable,
+            ClaudeKeychainCredentialUnavailable,
+            ClaudeLoopbackUnavailable,
+        ):
+            _update_claude_runtime_report(
+                review,
+                {
+                    "phase": "authentication-preflight-unavailable",
+                    "outer_sandbox": {"status": "pending-runtime-launch"},
+                    "authentication": {
+                        "status": "unavailable",
+                        "model": model,
+                        "validated_for_model": None,
+                    },
+                    "attempt": None,
+                },
             )
+            raise
     final_text, effective_model = _parse_claude_output(
         completed.stdout, requested_model=model
     )
@@ -4671,28 +4872,6 @@ def run_review(
             if not _is_claude_linux_host():
                 claude_env = _prepare_claude_keychain_broker(review, claude_env)
             claude_env = _with_claude_review_tool_path(review, claude_env)
-            claude_env = _prepare_claude_tls_environment(review, claude_env)
-            if _is_claude_linux_host():
-                _require_fresh_claude_linux_credential(review, claude_env)
-            elif not claude_env.get("ANTHROPIC_API_KEY"):
-                _warm_claude_local_login(
-                    review,
-                    claude_executable,
-                    claude_env,
-                )
-            _update_claude_runtime_report(
-                review,
-                {
-                    "phase": "authentication-preflight-complete",
-                    "authentication": {
-                        "status": (
-                            "configured"
-                            if claude_env.get("ANTHROPIC_API_KEY")
-                            else "freshness-verified"
-                        )
-                    },
-                },
-            )
     except (
         ClaudeProbeSandboxUnavailable,
         ClaudeKeychainBrokerUnavailable,
@@ -4775,6 +4954,7 @@ def run_review(
             )
         except (
             FileNotFoundError,
+            ClaudeAuthWarmupInconclusive,
             ClaudeExecutableInspectionInconclusive,
             ReviewTimeoutError,
             ReviewOutputDrainError,
@@ -4807,6 +4987,7 @@ def run_review(
             _write_attempts(review, attempts)
             return Outcome(75, None, tuple(attempts))
         except (
+            ClaudeKeychainBrokerUnavailable,
             ClaudeKeychainCredentialUnavailable,
             ClaudeReviewToolUnavailable,
             ClaudeLoopbackUnavailable,

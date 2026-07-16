@@ -1628,7 +1628,7 @@ def _read_valid_credential(
         required_expiry_ms = (now + required_validity_seconds) * 1000.0
         if expires_at_ms < required_expiry_ms:
             raise LinuxCredentialUnavailable(
-                "Claude credential cannot cover the bounded isolated review window"
+                "Claude credential cannot cover the current bounded model attempt"
             )
         result = (payload, expires_at_ms)
     except LinuxCredentialError as error:
