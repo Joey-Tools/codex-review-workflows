@@ -32,7 +32,14 @@ def _workflow_job_needs(workflow: str, job_name: str) -> tuple[str, ...]:
 
     for index, line in enumerate(job_lines):
         if line.startswith("    needs: "):
-            return (line.removeprefix("    needs: ").strip(),)
+            scalar_or_inline = line.removeprefix("    needs: ").strip()
+            if scalar_or_inline.startswith("[") and scalar_or_inline.endswith("]"):
+                return tuple(
+                    dependency.strip().strip("'\"")
+                    for dependency in scalar_or_inline[1:-1].split(",")
+                    if dependency.strip()
+                )
+            return (scalar_or_inline,)
         if line == "    needs:":
             dependencies: list[str] = []
             for dependency_line in job_lines[index + 1 :]:
@@ -298,6 +305,12 @@ class RepositoryContractTest(unittest.TestCase):
             "      - platform_tests\n"
             "    runs-on: ubuntu-latest\n"
         )
+        inline_list = (
+            "jobs:\n"
+            "  test:\n"
+            "    needs: [compatibility_tests, 'platform_tests']\n"
+            "    runs-on: ubuntu-latest\n"
+        )
         other_job_only = (
             "jobs:\n"
             "  platform_gate:\n"
@@ -310,6 +323,10 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(_workflow_job_needs(scalar, "test"), ("platform_tests",))
         self.assertEqual(
             _workflow_job_needs(list_form, "test"),
+            ("compatibility_tests", "platform_tests"),
+        )
+        self.assertEqual(
+            _workflow_job_needs(inline_list, "test"),
             ("compatibility_tests", "platform_tests"),
         )
         self.assertEqual(
