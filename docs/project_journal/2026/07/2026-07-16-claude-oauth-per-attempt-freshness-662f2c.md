@@ -51,10 +51,10 @@ capabilities workstreams.
 - Python compile checks passed for the helper scripts and complete runtime/test
   trees.
 - Full runtime/test `ruff check` passed.
-- Focused provider and contract suite: 251 tests run; 6 skipped and the suite
+- Focused provider and contract suite: 254 tests run; 6 skipped and the suite
   passed. The final transient-after-refresh regression and its adjacent warmup
   cases also passed separately.
-- Full helper suite on current `master`: 682 tests run; 9 skipped and the suite
+- Full helper suite on current `master`: 684 tests run; 9 skipped and the suite
   passed.
 - Strict Clang syntax checks passed for the unchanged Keychain broker and Linux
   launcher, including the production POSIX feature macro for the launcher.

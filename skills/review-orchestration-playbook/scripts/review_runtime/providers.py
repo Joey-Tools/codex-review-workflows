@@ -4753,6 +4753,7 @@ def run_review(
         if explicit_claude_override and isinstance(
             error,
             (
+                ClaudeExecutableUnavailable,
                 ClaudeProbeSandboxUnavailable,
                 ClaudeReviewToolUnavailable,
                 ClaudeProvenanceVerifierUnavailable,
@@ -4865,6 +4866,7 @@ def run_review(
             if explicit_claude_override and isinstance(
                 error,
                 (
+                    ClaudeExecutableUnavailable,
                     ClaudeProbeSandboxUnavailable,
                     ClaudeReviewToolUnavailable,
                     ClaudeProvenanceVerifierUnavailable,
