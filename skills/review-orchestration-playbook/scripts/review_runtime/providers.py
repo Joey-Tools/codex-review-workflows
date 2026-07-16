@@ -778,6 +778,7 @@ class ClaudeExecutableTrustEvidence:
 @dataclass(frozen=True)
 class ClaudeTrustFingerprints:
     unconditional: tuple[str, ...]
+    trust_as_root: tuple[str, ...]
     constrained: tuple[str, ...]
 
 
@@ -974,6 +975,7 @@ def _require_unconditional_root_extensions(
     der: bytes,
     *,
     require_critical: bool = True,
+    require_self_issued: bool = True,
 ) -> None:
     try:
         outer_tag, outer_start, outer_end, outer_next = _der_tlv(der, 0, len(der))
@@ -1010,9 +1012,9 @@ def _require_unconditional_root_extensions(
             or validity_tag != 0x30
             or subject_tag != 0x30
             or public_key_tag != 0x30
-            or issuer != subject
+            or (require_self_issued and issuer != subject)
         ):
-            raise ValueError("certificate is not self-issued")
+            raise ValueError("certificate is not an admissible trust anchor")
 
         extensions: tuple[int, int] | None = None
         while offset < tbs_end:
@@ -1126,9 +1128,14 @@ def _require_unconditional_root_extensions(
             ):
                 raise ValueError("key usage does not permit certificate signing")
     except (IndexError, ValueError) as error:
+        certificate_kind = (
+            "strict self-signed CA root"
+            if require_self_issued
+            else "strict CA trust anchor"
+        )
         raise ClaudeTrustCertificateInvalid(
-            "Claude trust settings reference a certificate that is not a strict "
-            "self-signed CA root"
+            "Claude trust settings reference a certificate that is not a "
+            f"{certificate_kind}"
         ) from error
 
 
@@ -1138,8 +1145,12 @@ def _verify_unconditional_trust_root(
     *,
     ca_root: pathlib.Path,
     timeout_seconds: float,
+    allow_non_self_signed: bool = False,
 ) -> None:
-    _require_unconditional_root_extensions(der)
+    _require_unconditional_root_extensions(
+        der,
+        require_self_issued=not allow_non_self_signed,
+    )
     if not CLAUDE_OPENSSL_CLIENT.is_file() or not os.access(
         CLAUDE_OPENSSL_CLIENT,
         os.X_OK,
@@ -1158,12 +1169,17 @@ def _verify_unconditional_trust_root(
             handle.flush()
             os.fsync(handle.fileno())
         try:
+            verification_mode = (
+                ("-partial_chain",)
+                if allow_non_self_signed
+                else ("-check_ss_sig",)
+            )
             completed = run_bounded_capture(
                 (
                     str(CLAUDE_OPENSSL_CLIENT),
                     "verify",
                     "-x509_strict",
-                    "-check_ss_sig",
+                    *verification_mode,
                     "-purpose",
                     "any",
                     "-trusted",
@@ -1182,9 +1198,14 @@ def _verify_unconditional_trust_root(
             ) from error
         try:
             if completed.returncode == 2:
+                certificate_kind = (
+                    "CA trust anchor"
+                    if allow_non_self_signed
+                    else "self-signed CA root"
+                )
                 raise ClaudeTrustCertificateInvalid(
                     "Claude trust settings reference a certificate that is not a "
-                    "currently valid self-signed CA root"
+                    f"currently valid {certificate_kind}"
                 )
             if completed.returncode != 0:
                 raise ClaudeTrustToolUnavailable(
@@ -2237,13 +2258,15 @@ def _require_safe_ca_source_metadata(
         raise ReviewError(f"Claude review CA source is not a regular file: {source}")
     if metadata.st_uid not in {0, os.geteuid()}:
         raise ReviewError(f"Claude review CA source has an unsafe owner: {source}")
-    if metadata.st_nlink != 1:
-        raise ReviewError(f"Claude review CA source has an unsafe link count: {source}")
     if metadata.st_mode & 0o022:
         raise ReviewError(
             f"Claude review CA source is group- or world-writable: {source}"
         )
     if _is_claude_macos_host():
+        if metadata.st_nlink != 1:
+            raise ReviewError(
+                f"Claude review CA source has an unsafe link count: {source}"
+            )
         if metadata.st_uid == os.geteuid() and metadata.st_mode & 0o077:
             raise ReviewError(f"Claude review CA source is not owner-only: {source}")
         if descriptor is None:
@@ -2971,6 +2994,7 @@ def _classify_trust_fingerprints(
     if len(trust_list) > CLAUDE_TRUST_ENTRY_LIMIT:
         raise ClaudeTrustPolicyUnavailable(f"{label} exceed the trust entry limit")
     unconditional: set[str] = set()
+    trust_as_root: set[str] = set()
     constrained: set[str] = set()
     for fingerprint, entry in trust_list.items():
         if (
@@ -2990,6 +3014,7 @@ def _classify_trust_fingerprints(
             unconditional.add(normalized)
             continue
         has_unconditional_trust_root = False
+        has_unconditional_trust_as_root = False
         for setting in settings:
             if not isinstance(setting, dict):
                 raise ClaudeTrustPolicyUnavailable(
@@ -3010,12 +3035,17 @@ def _classify_trust_fingerprints(
                 CLAUDE_TRUST_RESULT_KEY
             }:
                 has_unconditional_trust_root = True
+                if result == CLAUDE_TRUST_RESULT_TRUST_AS_ROOT:
+                    has_unconditional_trust_as_root = True
         if has_unconditional_trust_root:
             unconditional.add(normalized)
+            if has_unconditional_trust_as_root:
+                trust_as_root.add(normalized)
         else:
             constrained.add(normalized)
     return ClaudeTrustFingerprints(
         unconditional=tuple(sorted(unconditional)),
+        trust_as_root=tuple(sorted(trust_as_root)),
         constrained=tuple(sorted(constrained)),
     )
 
@@ -3025,8 +3055,13 @@ def _select_trust_certificates(
     fingerprints: Iterable[str],
     *,
     ca_root: pathlib.Path,
+    trust_as_root_fingerprints: Iterable[str] = (),
 ) -> ClaudeSelectedTrustMaterial:
     requested = tuple(fingerprints)
+    requested_set = set(requested)
+    trust_as_root = set(trust_as_root_fingerprints)
+    if not trust_as_root.issubset(requested_set):
+        raise ValueError("TrustAsRoot fingerprints must be selected trust anchors")
     if len(requested) > CLAUDE_ADDITIONAL_TRUST_ROOT_LIMIT:
         raise ClaudeTrustPolicyUnavailable(
             "Claude additional trust roots exceed the verification limit"
@@ -3075,6 +3110,7 @@ def _select_trust_certificates(
                 canonical,
                 ca_root=ca_root,
                 timeout_seconds=min(CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS, remaining),
+                allow_non_self_signed=fingerprint in trust_as_root,
             )
         except ClaudeTrustCertificateInvalid:
             omitted.add(fingerprint)
@@ -3283,6 +3319,7 @@ def _read_claude_trust_certificates_impl(
     client, security_env = _require_claude_trust_export_tool(review, ca_root)
     unconditional: set[str] = set()
     additional_unconditional: set[str] = set()
+    additional_trust_as_root: set[str] = set()
     constrained: set[str] = set()
     domain_evidence: list[dict[str, object]] = []
     deferred_error: tuple[int, ReviewError] | None = None
@@ -3375,6 +3412,7 @@ def _read_claude_trust_certificates_impl(
             classified = _classify_trust_fingerprints(trust_data, domain=domain)
             unconditional.update(classified.unconditional)
             additional_unconditional.update(classified.unconditional)
+            additional_trust_as_root.update(classified.trust_as_root)
             constrained.update(classified.constrained)
             domain_evidence.append(
                 {
@@ -3423,6 +3461,9 @@ def _read_claude_trust_certificates_impl(
     if deferred_error is not None:
         raise deferred_error[1]
     effective_unconditional = additional_unconditional - constrained
+    effective_trust_as_root = (
+        additional_trust_as_root & effective_unconditional
+    )
     evidence["additional_root_resolution"] = (
         "pending" if effective_unconditional else "not-required"
     )
@@ -3464,6 +3505,7 @@ def _read_claude_trust_certificates_impl(
             ((source, completed.stdout) for source, completed in completed_exports),
             sorted(effective_unconditional),
             ca_root=ca_root,
+            trust_as_root_fingerprints=sorted(effective_trust_as_root),
         )
         evidence["additional_root_resolution"] = "complete"
         evidence["additional_unconditional_included_count"] = len(

@@ -512,6 +512,10 @@ root set is evidence derived from the publisher-verified snapshot; if a host
 policy excludes a root still reachable through Claude's bundled store, the lane
 blocks rather than weakening signed provenance. Every trust preparation writes
 a sanitized terminal `claude-trust-policy.json` record.
+An unconstrained `TrustRoot` entry must be a strict currently valid self-signed
+CA root. An unconstrained `TrustAsRoot` entry may instead be a non-self-issued
+CA or intermediate certificate: it must retain strict CA and certificate-signing
+extensions and pass OpenSSL partial-chain validation as the explicit anchor.
 
 Linux and WSL2 coalesce validated certificates into the existing single private
 bundle mounted read-only at `/etc/ssl/certs/ca-certificates.crt`. If

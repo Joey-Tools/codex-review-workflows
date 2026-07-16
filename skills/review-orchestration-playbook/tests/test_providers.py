@@ -9131,6 +9131,32 @@ class ProviderPolicyTest(unittest.TestCase):
             label="Claude review CA source",
         )
 
+    def test_ca_source_hardlink_restriction_is_macos_only(self) -> None:
+        metadata = types.SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o644,
+            st_uid=0,
+            st_nlink=2,
+        )
+
+        with self.assertRaisesRegex(ReviewError, "unsafe link count"):
+            providers._require_safe_ca_source_metadata(
+                metadata,
+                source="macos-hardlinked-ca.pem",
+                descriptor=7,
+            )
+
+        with mock.patch.object(
+            providers,
+            "_is_claude_macos_host",
+            return_value=False,
+        ):
+            providers._require_safe_ca_source_metadata(
+                metadata,
+                source="linux-hardlinked-ca.pem",
+            )
+
+        self.acl_check.assert_not_called()
+
     def test_linux_acl_policy_never_resolves_darwin_symbols(self) -> None:
         with (
             mock.patch.object(
@@ -9278,6 +9304,10 @@ class ProviderPolicyTest(unittest.TestCase):
             tuple(sorted((empty, trust_root, trust_as_root, mixed))),
         )
         self.assertEqual(
+            classified.trust_as_root,
+            tuple(sorted((trust_as_root, mixed))),
+        )
+        self.assertEqual(
             classified.constrained,
             tuple(sorted((constrained, constrained_result))),
         )
@@ -9396,6 +9426,85 @@ class ProviderPolicyTest(unittest.TestCase):
                 with self.assertRaises(providers.ClaudeTrustCertificateInvalid):
                     providers._require_unconditional_root_extensions(der)
 
+    def test_trust_as_root_accepts_non_self_issued_ca_with_partial_chain(
+        self,
+    ) -> None:
+        valid = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+        valid_der, _canonical = providers._canonical_ca_certificate(
+            valid,
+            source="valid root fixture",
+        )
+        intermediate = bytearray(valid_der)
+        _outer_tag, tbs_offset, outer_end, _outer_next = providers._der_tlv(
+            intermediate,
+            0,
+            len(intermediate),
+        )
+        _tbs_tag, tbs_start, tbs_end, _tbs_next = providers._der_tlv(
+            intermediate,
+            tbs_offset,
+            outer_end,
+        )
+        offset = tbs_start
+        if intermediate[offset] == 0xA0:
+            _tag, _start, _end, offset = providers._der_tlv(
+                intermediate,
+                offset,
+                tbs_end,
+            )
+        for _expected_tag in (0x02, 0x30):
+            _tag, _start, _end, offset = providers._der_tlv(
+                intermediate,
+                offset,
+                tbs_end,
+            )
+        issuer_tag, _issuer_start, issuer_end, _issuer_next = providers._der_tlv(
+            intermediate,
+            offset,
+            tbs_end,
+        )
+        self.assertEqual(issuer_tag, 0x30)
+        intermediate[issuer_end - 1] ^= 1
+        intermediate_der = bytes(intermediate)
+        intermediate_pem = ssl.DER_cert_to_PEM_cert(intermediate_der).encode("ascii")
+
+        with self.assertRaises(providers.ClaudeTrustCertificateInvalid):
+            providers._require_unconditional_root_extensions(intermediate_der)
+        providers._require_unconditional_root_extensions(
+            intermediate_der,
+            require_self_issued=False,
+        )
+
+        completed = common.BoundedCapture(
+            argv=("openssl",),
+            returncode=0,
+            stdout=bytearray(),
+            stderr=bytearray(),
+        )
+        with (
+            mock.patch.object(
+                providers,
+                "CLAUDE_OPENSSL_CLIENT",
+                pathlib.Path(sys.executable),
+            ),
+            mock.patch.object(
+                providers,
+                "run_bounded_capture",
+                return_value=completed,
+            ) as verify,
+        ):
+            providers._verify_unconditional_trust_root(
+                intermediate_der,
+                intermediate_pem,
+                ca_root=self.review.container_dir,
+                timeout_seconds=1,
+                allow_non_self_signed=True,
+            )
+
+        argv = verify.call_args.args[0]
+        self.assertIn("-partial_chain", argv)
+        self.assertNotIn("-check_ss_sig", argv)
+
     def test_expired_unconditional_root_is_omitted_not_tool_unavailable(
         self,
     ) -> None:
@@ -9456,7 +9565,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(selected.omitted_sha1_fingerprints, frozenset())
         verify.assert_called_once()
 
-    def test_system_domain_unconditional_root_is_exported(self) -> None:
+    def test_system_domain_trust_as_root_is_exported(self) -> None:
         certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
         fingerprint = self.ca_sha1_fingerprint(certificate)
         system_trust = plistlib.dumps(
@@ -9464,7 +9573,13 @@ class ProviderPolicyTest(unittest.TestCase):
                 "trustVersion": 1,
                 "trustList": {
                     fingerprint: {
-                        "trustSettings": [],
+                        "trustSettings": [
+                            {
+                                providers.CLAUDE_TRUST_RESULT_KEY: (
+                                    providers.CLAUDE_TRUST_RESULT_TRUST_AS_ROOT
+                                )
+                            }
+                        ],
                     }
                 },
             }
@@ -9513,7 +9628,10 @@ class ProviderPolicyTest(unittest.TestCase):
                 "run_bounded_capture",
                 side_effect=export_trust,
             ),
-            mock.patch.object(providers, "_verify_unconditional_trust_root"),
+            mock.patch.object(
+                providers,
+                "_verify_unconditional_trust_root",
+            ) as verify,
         ):
             material = providers._read_claude_trust_certificates(
                 self.review,
@@ -9531,6 +9649,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(material.excluded_sha1_fingerprints, frozenset())
         self.assertEqual(evidence["additional_unconditional_candidate_count"], 1)
         self.assertEqual(evidence["additional_unconditional_included_count"], 1)
+        self.assertTrue(verify.call_args.kwargs["allow_non_self_signed"])
 
     def test_later_trust_deny_wins_over_earlier_malformed_domain(self) -> None:
         deny_fingerprint = "A" * 40

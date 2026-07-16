@@ -58,18 +58,21 @@ metadata behavior.
 ## Validation
 
 - Python 3.10.19 complete canonical suite with the `tomli` test backport and
-  `PYTHONDONTWRITEBYTECODE=1`: 803 tests run, 4 skipped, no failures. Disabling
+  `PYTHONDONTWRITEBYTECODE=1`: 805 tests run, 4 skipped, no failures. Disabling
   bytecode writes keeps the intentional `RLIMIT_FSIZE` tests from truncating
   uv's own `_virtualenv.pyc` import hook.
-- Python 3.13.0 complete canonical suite: 803 tests run, 9 skipped, no failures.
-- Focused Python 3.13 suites: providers 332 tests run with 6 skipped and
+- Python 3.13.0 complete canonical suite: 805 tests run, 4 skipped, no failures.
+- Focused Python 3.13 suites: providers 334 tests run with 3 skipped and
   provenance 90 tests run with no skips or failures; earlier current-range
   common 49 and repository contract 14 test suites also passed.
 - Final-head review remediation covers strict signed-manifest numeric parsing,
   system-domain custom roots, bounded snapshot revalidation without repeated
   OpenSSL self-signature work, blocked `runtime-unverified` outcomes,
   mismatched model-usage evidence, supported `maxOutputTokens` telemetry, and
-  extended ACL rejection for root-owned CA sources.
+  extended ACL rejection for root-owned CA sources while preserving normal
+  Linux/WSL2 hard-linked certificate layouts. Explicit macOS `TrustAsRoot`
+  anchors retain non-self-issued CA certificates through strict partial-chain
+  verification rather than incorrectly requiring a root self-signature.
 - Ruff lint, provider-file format checks, Python compile, and staged repository
   diff checks passed. The locally installed Ruff formatter still names the
   pre-existing layout in `claude_provenance.py` and its two test files; those
