@@ -621,7 +621,9 @@ reached:
    status to pending, and is not a whole-chain freshness guarantee.
 3. macOS authentication preparation failure before a model launch is explicit.
    `authentication-preflight-inconclusive` records the current model and stable
-   warmup failure class without inventing a formal review attempt.
+   warmup failure class without inventing a formal review attempt. This includes
+   supervision failures from the credential freshness read immediately before
+   or after the warmup.
    `authentication-preflight-entitlement` records a strict, exact-model-verified
    warmup entitlement attempt while keeping `outer_sandbox.status` at
    `pending-runtime-launch` and `validated_for_model` unset. This is fallback

@@ -113,11 +113,18 @@ class RepositoryContractTest(unittest.TestCase):
             ).parameters,
         )
         attempt_source = inspect.getsource(providers._claude_attempt)
+        warmup_source = inspect.getsource(providers._warm_claude_local_login)
         run_review_source = inspect.getsource(providers.run_review)
         linux_runtime_source = inspect.getsource(
             providers._claude_linux_review_runtime
         )
         self.assertIn("_warm_claude_local_login", attempt_source)
+        self.assertEqual(
+            warmup_source.count(
+                "_require_fresh_claude_keychain_credential_for_auth_preflight"
+            ),
+            2,
+        )
         self.assertIn("ClaudeAuthWarmupEntitlement", attempt_source)
         self.assertIn("require_verified_model=True", attempt_source)
         self.assertIn("CLAUDE_ATTEMPT_CREDENTIAL_VALIDITY_SECONDS", linux_runtime_source)
@@ -137,6 +144,10 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("Every later Opus attempt repeats", helper_contract)
         self.assertIn("API_KEY` skips local-login warmup and staging", helper_contract)
         self.assertIn("returns exit `75`; it never authorizes Copilot", helper_contract)
+        self.assertIn(
+            "either the initial or post-warmup credential freshness read",
+            helper_contract,
+        )
         self.assertIn(
             "only with `double-review` or `triple-review` consent",
             helper_contract,

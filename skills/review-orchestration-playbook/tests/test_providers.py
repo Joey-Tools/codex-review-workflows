@@ -1550,6 +1550,86 @@ class ProviderPolicyTest(unittest.TestCase):
 
     @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
     @mock.patch.object(providers, "_run_claude_auth_warmup")
+    def test_initial_credential_read_supervision_is_preflight_inconclusive(
+        self,
+        warmup: mock.Mock,
+        require_fresh: mock.Mock,
+    ) -> None:
+        for error_type in (
+            providers.ReviewTimeoutError,
+            providers.ReviewOutputLimitError,
+            providers.ReviewOutputDrainError,
+            providers.ReviewProcessLeakError,
+        ):
+            with self.subTest(error_type=error_type.__name__):
+                require_fresh.reset_mock()
+                warmup.reset_mock()
+                require_fresh.side_effect = error_type(
+                    "credential read supervision failed"
+                )
+
+                with self.assertRaisesRegex(
+                    providers.ClaudeAuthWarmupInconclusive,
+                    "credential check was inconclusive",
+                ):
+                    self.warm_claude_local_login(
+                        self.review,
+                        pathlib.Path("/bin/claude"),
+                        {},
+                        providers.CLAUDE_MODELS[0],
+                    )
+
+                require_fresh.assert_called_once_with(self.review)
+                warmup.assert_not_called()
+
+    @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
+    @mock.patch.object(providers, "_run_claude_auth_warmup")
+    def test_post_warmup_credential_read_supervision_is_preflight_inconclusive(
+        self,
+        warmup: mock.Mock,
+        require_fresh: mock.Mock,
+    ) -> None:
+        warmup.return_value = Completed(
+            argv=("claude",),
+            returncode=0,
+            stdout=b"{}",
+            stderr=b"",
+        )
+        for error_type in (
+            providers.ReviewTimeoutError,
+            providers.ReviewOutputLimitError,
+            providers.ReviewOutputDrainError,
+            providers.ReviewProcessLeakError,
+        ):
+            with self.subTest(error_type=error_type.__name__):
+                require_fresh.reset_mock()
+                warmup.reset_mock()
+                require_fresh.side_effect = (
+                    providers.ClaudeKeychainCredentialUnavailable("stale"),
+                    error_type("credential read supervision failed"),
+                )
+
+                with self.assertRaisesRegex(
+                    providers.ClaudeAuthWarmupInconclusive,
+                    "credential check was inconclusive",
+                ):
+                    self.warm_claude_local_login(
+                        self.review,
+                        pathlib.Path("/bin/claude"),
+                        {},
+                        providers.CLAUDE_MODELS[0],
+                    )
+
+                self.assertEqual(require_fresh.call_count, 2)
+                warmup.assert_called_once_with(
+                    self.review,
+                    pathlib.Path("/bin/claude"),
+                    {},
+                    providers.CLAUDE_MODELS[0],
+                )
+
+    @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
+    @mock.patch.object(providers, "_run_claude_auth_warmup")
     def test_auth_login_warmup_failure_remains_unavailable(
         self,
         warmup: mock.Mock,

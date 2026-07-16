@@ -823,6 +823,23 @@ def _require_fresh_claude_keychain_credential(review: ReviewWorkspace) -> None:
         credential[:] = b"\x00" * len(credential)
 
 
+def _require_fresh_claude_keychain_credential_for_auth_preflight(
+    review: ReviewWorkspace,
+) -> None:
+    try:
+        _require_fresh_claude_keychain_credential(review)
+    except (
+        ReviewTimeoutError,
+        ReviewOutputDrainError,
+        ReviewOutputLimitError,
+        ReviewProcessLeakError,
+    ) as error:
+        raise ClaudeAuthWarmupInconclusive(
+            "Claude authentication credential check was inconclusive: "
+            f"{error}"
+        ) from error
+
+
 def _recv_exact(sock: socket.socket, length: int) -> bytes | None:
     result = bytearray()
     try:
@@ -2189,7 +2206,7 @@ def _warm_claude_local_login(
     model: str,
 ) -> None:
     try:
-        _require_fresh_claude_keychain_credential(review)
+        _require_fresh_claude_keychain_credential_for_auth_preflight(review)
         return
     except ClaudeKeychainCredentialUnavailable:
         pass
@@ -2206,7 +2223,7 @@ def _warm_claude_local_login(
         ) from error
     credential_error: ClaudeKeychainCredentialUnavailable | None = None
     try:
-        _require_fresh_claude_keychain_credential(review)
+        _require_fresh_claude_keychain_credential_for_auth_preflight(review)
     except ClaudeKeychainCredentialUnavailable as error:
         credential_error = error
     category = classify_failure(warmup.stdout, warmup.stderr)
