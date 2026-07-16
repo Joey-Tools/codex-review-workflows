@@ -53,6 +53,12 @@ def oauth_credential_fixture(*, expires_in_seconds: float = 7200) -> bytes:
     return json.dumps(payload).encode()
 
 
+def sensitive_assignment_diff(*, key_name: str, fixture_value: str) -> str:
+    return "".join(
+        ("diff --git a/config b/config\n-", key_name, "=", fixture_value, "\n")
+    )
+
+
 CLAUDE_SAFE_MODE_DESCRIPTION = (
     "Start with all customizations (CLAUDE.md, skills, plugins, hooks, MCP "
     "servers, custom commands and agents, output styles, workflows, custom "
@@ -4553,9 +4559,12 @@ class ProviderPolicyTest(unittest.TestCase):
         self,
         codex_attempt: mock.Mock,
     ) -> None:
-        secret = "AKIA" + "B" * 16
+        secret_fixture = "AKIA" + "B" * 16
         self.review.diff_file.write_text(
-            "diff --git a/config b/config\n-AWS" + "_KEY=" + secret + "\n",
+            sensitive_assignment_diff(
+                key_name="AWS_KEY",
+                fixture_value=secret_fixture,
+            ),
             encoding="utf-8",
         )
         self._refresh_control_artifact_state()
@@ -4570,7 +4579,7 @@ class ProviderPolicyTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("sensitive content preflight", error)
-        self.assertNotIn(secret, error)
+        self.assertNotIn(secret_fixture, error)
 
     @mock.patch.object(providers, "_review_environment", return_value={})
     @mock.patch.object(providers, "_run_model_chain")
@@ -4606,9 +4615,12 @@ class ProviderPolicyTest(unittest.TestCase):
         self,
         resolve: mock.Mock,
     ) -> None:
-        token = "z9Y8x7W6v5U4t3S2r1Q0p9O8n7M6"
+        token_fixture = "z9Y8x7W6v5U4t3S2r1Q0p9O8n7M6"
         self.review.diff_file.write_text(
-            "diff --git a/config b/config\n-AUTH" + "_TOKEN=" + token + "\n",
+            sensitive_assignment_diff(
+                key_name="AUTH_TOKEN",
+                fixture_value=token_fixture,
+            ),
             encoding="utf-8",
         )
         self._refresh_control_artifact_state()
@@ -4623,7 +4635,7 @@ class ProviderPolicyTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("review.diff (generic-secret-assignment)", error)
-        self.assertNotIn(token, error)
+        self.assertNotIn(token_fixture, error)
 
     @mock.patch.object(providers, "resolve_reviewer_executable")
     def test_deleted_sensitive_path_blocks_external_reviewer(
@@ -7875,10 +7887,22 @@ class ProviderPolicyTest(unittest.TestCase):
             self.skipTest("Linux system CA directory is unavailable")
 
         try:
-            prepared = providers._prepare_claude_generic_tls_environment(
-                self.review,
-                {"SSL_CERT_DIR": str(source_dir)},
-            )
+            with (
+                mock.patch.object(
+                    providers,
+                    "_is_claude_linux_host",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_is_claude_macos_host",
+                    return_value=False,
+                ),
+            ):
+                prepared = providers._prepare_claude_generic_tls_environment(
+                    self.review,
+                    {"SSL_CERT_DIR": str(source_dir)},
+                )
         except ReviewError as error:
             if not self.host_ca_safety_rejection(error, source="SSL_CERT_DIR:"):
                 raise
@@ -8248,14 +8272,18 @@ class ProviderPolicyTest(unittest.TestCase):
                 {"SSL_CERT_DIR": os.pathsep.join(str(path) for path in source_dirs)},
             )
 
-    def test_claude_linux_ca_bundle_uses_capath_without_cafile(self) -> None:
+    def test_claude_linux_ca_bundle_uses_symlinked_capath_without_cafile(
+        self,
+    ) -> None:
         certificate = self.sample_ca_certificate()
-        source_dir = self.review.source_root / "default-capath"
+        source_dir = self.review.source_root / "default-capath-target"
         source_dir.mkdir(mode=0o700)
         target = source_dir / "certificate.pem"
         self.write_private_source(target, certificate)
         hash_entry = source_dir / "deadbeef.0"
         hash_entry.symlink_to(target.name)
+        source_link = self.review.source_root / "default-capath"
+        source_link.symlink_to(source_dir.name, target_is_directory=True)
         destination_dir = self.review.container_dir / "capath-bundle"
         destination_dir.mkdir(mode=0o700)
 
@@ -8271,7 +8299,17 @@ class ProviderPolicyTest(unittest.TestCase):
             mock.patch.object(
                 providers.ssl,
                 "get_default_verify_paths",
-                return_value=mock.Mock(cafile=None, capath=str(source_dir)),
+                return_value=mock.Mock(cafile=None, capath=str(source_link)),
+            ),
+            mock.patch.object(
+                providers,
+                "_is_claude_linux_host",
+                return_value=True,
+            ),
+            mock.patch.object(
+                providers,
+                "_is_claude_macos_host",
+                return_value=False,
             ),
             mock.patch.object(
                 providers,
@@ -8304,10 +8342,22 @@ class ProviderPolicyTest(unittest.TestCase):
         destination_dir.mkdir(mode=0o700)
 
         try:
-            with mock.patch.object(
-                providers,
-                "_claude_linux_private_directory",
-                return_value=destination_dir,
+            with (
+                mock.patch.object(
+                    providers,
+                    "_is_claude_linux_host",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_is_claude_macos_host",
+                    return_value=False,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_claude_linux_private_directory",
+                    return_value=destination_dir,
+                ),
             ):
                 bundle = providers._claude_linux_ca_bundle(self.review, {})
         except ReviewError as error:
