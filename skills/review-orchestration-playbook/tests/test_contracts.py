@@ -121,7 +121,10 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("_warm_claude_local_login", attempt_source)
         self.assertIn("_prepare_claude_tls_environment", attempt_source)
         self.assertIn("ClaudeKeychainBrokerUnavailable", attempt_source)
-        self.assertIn("ClaudeLoopbackUnavailable", attempt_source)
+        self.assertEqual(
+            attempt_source.count("ClaudeLoopbackUnavailable"),
+            2,
+        )
         self.assertIn('"failure_class": "credential-read"', attempt_source)
         self.assertEqual(
             warmup_source.count(

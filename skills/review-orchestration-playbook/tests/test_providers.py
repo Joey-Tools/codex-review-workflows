@@ -4097,6 +4097,9 @@ class ProviderPolicyTest(unittest.TestCase):
             providers.ClaudeKeychainBrokerUnavailable(
                 "credential broker is unavailable"
             ),
+            providers.ClaudeLoopbackUnavailable(
+                "authentication warmup loopback is unavailable"
+            ),
         )
         for error in cases:
             with self.subTest(error_type=type(error).__name__):
@@ -4535,6 +4538,9 @@ class ProviderPolicyTest(unittest.TestCase):
             providers.ClaudeKeychainBrokerUnavailable(
                 "second model credential broker is unavailable"
             ),
+            providers.ClaudeLoopbackUnavailable(
+                "second model authentication loopback is unavailable"
+            ),
         )
         for error in errors:
             with self.subTest(error_type=type(error).__name__):
@@ -4593,6 +4599,9 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
             providers.ClaudeKeychainBrokerUnavailable(
                 "second model credential broker is unavailable"
+            ),
+            providers.ClaudeLoopbackUnavailable(
+                "second model authentication loopback is unavailable"
             ),
         )
         for error in errors:

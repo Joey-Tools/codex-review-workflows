@@ -4337,6 +4337,7 @@ def _claude_attempt(
             except (
                 ClaudeKeychainBrokerUnavailable,
                 ClaudeKeychainCredentialUnavailable,
+                ClaudeLoopbackUnavailable,
             ):
                 _update_claude_runtime_report(
                     review,

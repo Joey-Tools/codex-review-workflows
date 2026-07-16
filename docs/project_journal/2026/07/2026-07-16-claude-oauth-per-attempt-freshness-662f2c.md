@@ -87,6 +87,9 @@ capabilities workstreams.
   final credential-read supervision becomes credential-read inconclusive with
   no attempt; and final broker/loopback failure resets the runtime report to
   unavailable before any Claude CLI launch.
+- The final independent review extended the same runtime-report reset to a
+  loopback failure inside the safe-mode warmup, while preserving the existing
+  consent-gated unavailable classification.
 - Strict Clang syntax checks passed for the unchanged Keychain broker and Linux
   launcher, including the production POSIX feature macro for the launcher.
 - Both workflow actionlint checks, the isolated PyYAML skill validator,

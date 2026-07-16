@@ -630,8 +630,8 @@ reached:
    A structured transient warmup remains inconclusive when the post-warmup read
    also finds that broker unavailable. During final staging, credential-read
    supervision failures use failure class `credential-read` with no model
-   attempt, while broker or loopback failure resets the phase to unavailable
-   before the Claude CLI launch.
+   attempt, while broker failure or a warmup/final-staging loopback failure
+   resets the phase to unavailable before the Claude CLI launch.
    `authentication-preflight-entitlement` records a strict, exact-model-verified
    warmup entitlement attempt while keeping `outer_sandbox.status` at
    `pending-runtime-launch` and `validated_for_model` unset. This is fallback
