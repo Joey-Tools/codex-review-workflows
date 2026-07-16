@@ -97,7 +97,7 @@ When authoring a fixture, reuse a project-recorded compatible ID. Otherwise sele
 
 ## Legacy Exemptions
 
-`--synthetic-secret-exemption <id>` explicitly selects a named helper-owned envelope and remains repeatable. Version 1 legacy entries may suppress only `generic-secret-assignment` or the exact provider-specific `github-token` and `jwt` rules needed by master-proven migration envelopes.
+`--synthetic-secret-exemption <id>` explicitly selects a named helper-owned envelope and remains repeatable. Version 1 legacy entries may suppress only `generic-secret-assignment` or the exact provider-specific `github-token` rule needed by a master-proven migration envelope. JWT findings are never eligible for a legacy exemption.
 
 For every selected value, the helper counts exact raw-byte occurrences across every blob in the complete base tree and complete head tree, including ordinary text, comments, symlink targets, and binary content. This counter is independent of scanner suppression events and continues even after another scanner rule blocks the surface. It permits only `head_count <= base_count`:
 
