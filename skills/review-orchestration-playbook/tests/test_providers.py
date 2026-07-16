@@ -2970,6 +2970,43 @@ class ProviderPolicyTest(unittest.TestCase):
     @mock.patch.object(
         providers,
         "_resolve_validated_claude_executable",
+        side_effect=providers.ClaudeExecutableUnavailable(
+            "explicit executable is unavailable"
+        ),
+    )
+    @mock.patch.object(providers, "resolve_reviewer_executable")
+    @mock.patch.object(providers, "_copilot_attempt")
+    def test_explicit_claude_unavailable_blocks_copilot_fallback(
+        self,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _resolve_claude: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
+
+        self.assertEqual(outcome.returncode, 2)
+        copilot_attempt.assert_not_called()
+        resolve.assert_not_called()
+        self.assertIn(
+            "refusing Copilot fallback",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    @mock.patch.dict(
+        os.environ,
+        {"CODEX_REVIEW_CLAUDE_PATH": "/explicit/claude"},
+    )
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
         side_effect=providers.ClaudeProvenanceVerifierUnavailable(
             "trusted GPG unavailable"
         ),
@@ -3312,6 +3349,56 @@ class ProviderPolicyTest(unittest.TestCase):
         ),
     )
     def test_explicit_claude_attempt_prerequisite_failure_blocks_fallback(
+        self,
+        claude_attempt: mock.Mock,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _tools: mock.Mock,
+        _resolve_claude: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
+
+        self.assertEqual(outcome.returncode, 2)
+        claude_attempt.assert_called_once()
+        copilot_attempt.assert_not_called()
+        resolve.assert_not_called()
+        self.assertIn(
+            "refusing Copilot fallback",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    @mock.patch.dict(
+        os.environ,
+        {"CODEX_REVIEW_CLAUDE_PATH": "/explicit/claude"},
+    )
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        return_value=(pathlib.Path("/explicit/claude"), {}),
+    )
+    @mock.patch.object(
+        providers,
+        "_with_claude_review_tool_path",
+        return_value={},
+    )
+    @mock.patch.object(providers, "resolve_reviewer_executable")
+    @mock.patch.object(providers, "_copilot_attempt")
+    @mock.patch.object(
+        providers,
+        "_claude_attempt",
+        side_effect=providers.ClaudeExecutableUnavailable(
+            "explicit executable disappeared before the attempt"
+        ),
+    )
+    def test_explicit_claude_attempt_unavailable_blocks_fallback(
         self,
         claude_attempt: mock.Mock,
         copilot_attempt: mock.Mock,
