@@ -25,6 +25,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, replace
@@ -1040,12 +1041,84 @@ def _der_certificate_time(tag: int, value: bytes) -> datetime.datetime:
     )
 
 
+def _canonical_x509_name(name: bytes) -> tuple[tuple[object, ...], bool]:
+    string_decoders: dict[int, tuple[str, str]] = {
+        0x0C: ("utf-8", "strict"),
+        0x13: ("ascii", "strict"),
+        0x1C: ("utf-32-be", "strict"),
+        0x1E: ("utf-16-be", "strict"),
+    }
+    name_tag, name_start, name_end, name_next = _der_tlv(name, 0, len(name))
+    if name_tag != 0x30 or name_next != len(name):
+        raise ValueError("invalid X.509 name")
+    complete = True
+    rdns: list[tuple[object, ...]] = []
+    rdn_offset = name_start
+    while rdn_offset < name_end:
+        rdn_tag, rdn_start, rdn_end, rdn_offset = _der_tlv(
+            name,
+            rdn_offset,
+            name_end,
+        )
+        if rdn_tag != 0x31:
+            raise ValueError("invalid X.509 relative distinguished name")
+        attributes: list[tuple[bytes, object]] = []
+        attribute_offset = rdn_start
+        while attribute_offset < rdn_end:
+            attribute_tag, attribute_start, attribute_end, attribute_offset = _der_tlv(
+                name, attribute_offset, rdn_end
+            )
+            if attribute_tag != 0x30:
+                raise ValueError("invalid X.509 name attribute")
+            oid_tag, oid_start, oid_end, value_offset = _der_tlv(
+                name,
+                attribute_start,
+                attribute_end,
+            )
+            if oid_tag != 0x06:
+                raise ValueError("invalid X.509 name attribute identifier")
+            value_tag, value_start, value_end, value_next = _der_tlv(
+                name,
+                value_offset,
+                attribute_end,
+            )
+            if value_next != attribute_end:
+                raise ValueError("invalid X.509 name attribute value")
+            raw_value = name[value_start:value_end]
+            decoder = string_decoders.get(value_tag)
+            if decoder is None:
+                complete = False
+                normalized_value: object = (value_tag, raw_value)
+            else:
+                try:
+                    text = raw_value.decode(*decoder)
+                except UnicodeError as error:
+                    raise ValueError("invalid X.509 name string") from error
+                # Full RFC 4518 mapping is intentionally not reimplemented here.
+                # Only printable ASCII is complete enough to prove inequality.
+                if any(
+                    ord(character) < 0x20 or ord(character) > 0x7E for character in text
+                ):
+                    complete = False
+                normalized_value = " ".join(
+                    unicodedata.normalize("NFKC", text).casefold().split()
+                )
+            attributes.append((name[oid_start:oid_end], normalized_value))
+        rdns.append(
+            tuple(sorted(attributes, key=lambda item: (item[0], repr(item[1]))))
+        )
+    return tuple(rdns), complete
+
+
 def _require_unconditional_root_extensions(
     der: bytes,
     *,
     require_critical: bool = True,
     require_self_issued: bool = True,
+    require_non_self_issued: bool = False,
 ) -> None:
+    if require_self_issued and require_non_self_issued:
+        raise ValueError("certificate cannot require both issuer relationships")
     try:
         outer_tag, outer_start, outer_end, outer_next = _der_tlv(der, 0, len(der))
         if outer_tag != 0x30 or outer_next != len(der):
@@ -1092,12 +1165,25 @@ def _require_unconditional_root_extensions(
         subject_tag, _, _, offset = _der_tlv(der, offset, tbs_end)
         subject = der[subject_offset:offset]
         public_key_tag, _, _, offset = _der_tlv(der, offset, tbs_end)
+        issuer_name, issuer_name_complete = _canonical_x509_name(issuer)
+        subject_name, subject_name_complete = _canonical_x509_name(subject)
+        names_semantically_equal = issuer == subject or (
+            issuer_name_complete
+            and subject_name_complete
+            and issuer_name == subject_name
+        )
+        names_provably_different = (
+            issuer_name_complete
+            and subject_name_complete
+            and issuer_name != subject_name
+        )
         if (
             issuer_tag != 0x30
             or validity_tag != 0x30
             or subject_tag != 0x30
             or public_key_tag != 0x30
-            or (require_self_issued and issuer != subject)
+            or (require_self_issued and not names_semantically_equal)
+            or (require_non_self_issued and not names_provably_different)
         ):
             raise ValueError("certificate is not an admissible trust anchor")
 
@@ -1260,24 +1346,50 @@ def _verify_unconditional_trust_root(
     _require_unconditional_root_extensions(
         der,
         require_self_issued=not allow_non_self_signed,
+        require_non_self_issued=allow_non_self_signed,
     )
-    if not CLAUDE_OPENSSL_CLIENT.is_file() or not os.access(
-        CLAUDE_OPENSSL_CLIENT,
-        os.X_OK,
+    try:
+        openssl_metadata = CLAUDE_OPENSSL_CLIENT.stat()
+    except FileNotFoundError as error:
+        raise ClaudeTrustToolUnavailable(
+            "Claude TLS root verification tooling is unavailable"
+        ) from error
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot inspect Claude TLS root verification tooling"
+        ) from error
+    if not stat.S_ISREG(openssl_metadata.st_mode) or not (
+        openssl_metadata.st_mode & 0o111
     ):
         raise ClaudeTrustToolUnavailable(
             "Claude TLS root verification tooling is unavailable"
         )
-    fd, temporary = tempfile.mkstemp(prefix=".trust-root-", suffix=".pem", dir=ca_root)
+    try:
+        fd, temporary = tempfile.mkstemp(
+            prefix=".trust-root-",
+            suffix=".pem",
+            dir=ca_root,
+        )
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot prepare Claude trust verification input"
+        ) from error
     certificate_path = pathlib.Path(temporary)
     try:
-        os.fchmod(fd, 0o600)
-        _require_no_extended_acl(fd, label="Claude trust verification input")
-        with os.fdopen(fd, "wb") as handle:
-            fd = -1
-            handle.write(canonical)
-            handle.flush()
-            os.fsync(handle.fileno())
+        try:
+            os.fchmod(fd, 0o600)
+            _require_no_extended_acl(fd, label="Claude trust verification input")
+            with os.fdopen(fd, "wb") as handle:
+                fd = -1
+                handle.write(canonical)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except ReviewError:
+            raise
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                "cannot prepare Claude trust verification input"
+            ) from error
         try:
             use_partial_chain = False
             if allow_non_self_signed:
@@ -1369,9 +1481,21 @@ def _verify_unconditional_trust_root(
             completed.stdout[:] = b"\x00" * len(completed.stdout)
             completed.stderr[:] = b"\x00" * len(completed.stderr)
     finally:
+        active_error = sys.exc_info()[0] is not None
+        cleanup_error: OSError | None = None
         if fd >= 0:
-            os.close(fd)
-        certificate_path.unlink(missing_ok=True)
+            try:
+                os.close(fd)
+            except OSError as error:
+                cleanup_error = error
+        try:
+            certificate_path.unlink(missing_ok=True)
+        except OSError as error:
+            cleanup_error = cleanup_error or error
+        if cleanup_error is not None and not active_error:
+            raise ClaudeExecutableInspectionInconclusive(
+                "cannot clean up Claude trust verification input"
+            ) from cleanup_error
 
 
 def _merge_ca_certificates(
@@ -1536,13 +1660,18 @@ def _certificate_self_signature_evidence(
 
 
 def _write_private_verification_file(path: pathlib.Path, data: bytes) -> None:
-    descriptor = -1
     try:
         descriptor = os.open(
             path,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
             0o600,
         )
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot create Claude bundled root verification input"
+        ) from error
+    published = False
+    try:
         _require_no_extended_acl(
             descriptor,
             label="Claude bundled root verification input",
@@ -1552,9 +1681,30 @@ def _write_private_verification_file(path: pathlib.Path, data: bytes) -> None:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+        published = True
+    except ReviewError:
+        raise
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot write Claude bundled root verification input"
+        ) from error
     finally:
+        active_error = sys.exc_info()[0] is not None
+        cleanup_error: OSError | None = None
         if descriptor >= 0:
-            os.close(descriptor)
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                cleanup_error = error
+        if not published:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as error:
+                cleanup_error = cleanup_error or error
+        if cleanup_error is not None and not active_error:
+            raise ClaudeExecutableInspectionInconclusive(
+                "cannot clean up Claude bundled root verification input"
+            ) from cleanup_error
 
 
 def _require_bundled_root_self_signature(
@@ -2545,10 +2695,21 @@ def _read_bounded_owner_file(
             raise ReviewError(f"{label} exceeds the size limit: {source}")
         if not payload and not allow_empty:
             raise ReviewError(f"{label} is empty: {source}")
-        return bytes(payload)
+        material = bytes(payload)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        raise
+    else:
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot close {label}: {source}"
+            ) from error
+        return material
     finally:
         payload[:] = b"\x00" * len(payload)
-        os.close(descriptor)
 
 
 def _ca_source_metadata(metadata: os.stat_result) -> tuple[int, ...]:
@@ -2679,6 +2840,10 @@ def _open_stable_ca_directory(path: pathlib.Path, *, source: str) -> int:
             descriptor = os.open(path, flags | directory_flag)
             opened = os.fstat(descriptor)
             _require_safe_ca_directory_metadata(opened, source=source)
+            _require_no_extended_acl(
+                descriptor,
+                label="Claude review CA directory",
+            )
             followed_after = path.stat()
             link_before_final_read = path.lstat()
             target_after = os.readlink(path)
@@ -2705,7 +2870,8 @@ def _open_stable_ca_directory(path: pathlib.Path, *, source: str) -> int:
             or target_before != target_after
         ):
             assert descriptor is not None
-            os.close(descriptor)
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
             raise ClaudeExecutableInspectionInconclusive(
                 f"Claude review CA directory symlink changed while being opened: "
                 f"{source}"
@@ -2723,19 +2889,26 @@ def _open_stable_ca_directory(path: pathlib.Path, *, source: str) -> int:
     try:
         opened = os.fstat(descriptor)
         _require_safe_ca_directory_metadata(opened, source=source)
+        _require_no_extended_acl(
+            descriptor,
+            label="Claude review CA directory",
+        )
         path_after = path.lstat()
     except ReviewError:
-        os.close(descriptor)
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
         raise
     except OSError as error:
-        os.close(descriptor)
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
         raise ClaudeExecutableInspectionInconclusive(
             f"cannot validate a stable Claude review CA directory {source}: {error}"
         ) from error
     if _ca_source_metadata(path_before) != _ca_source_metadata(
         opened
     ) or _ca_source_metadata(opened) != _ca_source_metadata(path_after):
-        os.close(descriptor)
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
         raise ClaudeExecutableInspectionInconclusive(
             f"Claude review CA directory changed while being opened: {source}"
         )
@@ -3250,7 +3423,12 @@ def _read_ca_directory_entry_at_with_size(
 
 
 def _write_private_ca_file(path: pathlib.Path, data: bytes) -> None:
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot create a private Claude CA file"
+        ) from error
     temporary_path = pathlib.Path(temporary)
     try:
         os.fchmod(fd, 0o600)
@@ -3269,11 +3447,30 @@ def _write_private_ca_file(path: pathlib.Path, data: bytes) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_path, path)
+    except ReviewError:
+        raise
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot write a private Claude CA file"
+        ) from error
     finally:
+        active_error = sys.exc_info()[0] is not None
+        cleanup_error: OSError | None = None
         if fd >= 0:
-            os.close(fd)
-        with contextlib.suppress(FileNotFoundError):
+            try:
+                os.close(fd)
+            except OSError as error:
+                cleanup_error = error
+        try:
             temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            cleanup_error = cleanup_error or error
+        if cleanup_error is not None and not active_error:
+            raise ClaudeExecutableInspectionInconclusive(
+                "cannot clean up a private Claude CA file"
+            ) from cleanup_error
 
 
 def _validate_ca_file(path: pathlib.Path) -> None:
@@ -3563,7 +3760,19 @@ def _require_claude_trust_export_tool(
     ca_root: pathlib.Path,
 ) -> tuple[pathlib.Path, dict[str, str]]:
     client = CLAUDE_KEYCHAIN_CLIENT
-    if not client.is_file() or not os.access(client, os.X_OK):
+    try:
+        client_metadata = client.stat()
+    except FileNotFoundError as error:
+        raise ClaudeTrustToolUnavailable(
+            "Claude TLS setup requires Apple's security trust export tool"
+        ) from error
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot inspect Apple's security trust export tool"
+        ) from error
+    if not stat.S_ISREG(client_metadata.st_mode) or not (
+        client_metadata.st_mode & 0o111
+    ):
         raise ClaudeTrustToolUnavailable(
             "Claude TLS setup requires Apple's security trust export tool"
         )
@@ -3809,10 +4018,18 @@ def _read_claude_trust_certificates_impl(
                 )
                 refresh_counts()
                 continue
-            unconditional.update(classified.unconditional)
-            additional_unconditional.update(classified.unconditional)
-            additional_trust_as_root.update(classified.trust_as_root)
-            constrained.update(classified.constrained)
+            # Domains are ordered from highest to lowest precedence.
+            resolved = additional_unconditional | constrained
+            domain_unconditional = set(classified.unconditional) - resolved
+            domain_constrained = (
+                set(classified.constrained) - resolved - domain_unconditional
+            )
+            unconditional.update(domain_unconditional)
+            additional_unconditional.update(domain_unconditional)
+            additional_trust_as_root.update(
+                set(classified.trust_as_root) & domain_unconditional
+            )
+            constrained.update(domain_constrained)
             domain_evidence.append(
                 {
                     "domain": domain,
@@ -3943,9 +4160,7 @@ def _prepare_claude_generic_tls_environment(
 ) -> dict[str, str]:
     result = dict(env)
     ca_root = review.container_dir / "claude-ca"
-    ca_root.mkdir(mode=0o700, exist_ok=True)
-    if ca_root.is_symlink() or not ca_root.is_dir():
-        raise ReviewError("Claude review CA directory is not a real directory")
+    _require_private_claude_ca_root(ca_root)
     for key in CLAUDE_TLS_FILE_ENV_KEYS:
         raw = result.get(key)
         if not raw:
@@ -3967,9 +4182,14 @@ def _prepare_claude_generic_tls_environment(
         ]
         if not raw_entries:
             continue
-        destination_root = pathlib.Path(
-            tempfile.mkdtemp(prefix=f"{key.lower()}-", dir=ca_root)
-        )
+        try:
+            destination_root = pathlib.Path(
+                tempfile.mkdtemp(prefix=f"{key.lower()}-", dir=ca_root)
+            )
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot prepare Claude review {key} workspace"
+            ) from error
         prepared_dirs: list[pathlib.Path] = []
         total_size = 0
         entry_count = 0
@@ -3980,69 +4200,90 @@ def _prepare_claude_generic_tls_environment(
                     f"Claude review requires valid absolute {key} entries"
                 )
             destination_dir = destination_root / f"{index:04d}"
-            destination_dir.mkdir(mode=0o700)
+            try:
+                destination_dir.mkdir(mode=0o700)
+            except OSError as error:
+                raise ClaudeExecutableInspectionInconclusive(
+                    f"cannot prepare Claude review {key} directory"
+                ) from error
             copied = False
             source_directory = _open_stable_ca_directory(source_dir, source=key)
             try:
-                directory_before = os.fstat(source_directory)
-                remaining_entries = CLAUDE_CA_DIR_ENTRY_LIMIT - entry_count
-                source_names = _bounded_ca_directory_names(
-                    source_directory,
-                    remaining_entries,
-                    too_many_message=(
-                        "Claude review CA directory has too many entries"
-                    ),
-                )
-                entry_count += len(source_names)
-                for source_name in source_names:
-                    try:
+                try:
+                    directory_before = os.fstat(source_directory)
+                    remaining_entries = CLAUDE_CA_DIR_ENTRY_LIMIT - entry_count
+                    source_names = _bounded_ca_directory_names(
+                        source_directory,
+                        remaining_entries,
+                        too_many_message=(
+                            "Claude review CA directory has too many entries"
+                        ),
+                    )
+                    entry_count += len(source_names)
+                    for source_name in source_names:
                         entry_metadata = os.stat(
                             source_name,
                             dir_fd=source_directory,
                             follow_symlinks=False,
                         )
-                    except OSError as error:
+                        if stat.S_ISDIR(entry_metadata.st_mode):
+                            continue
+                        raw_material, source_size = (
+                            _read_ca_directory_entry_at_with_size(
+                                source_directory,
+                                source_name,
+                                entry_metadata,
+                                source=f"{key}:{source_name}",
+                                extract_certificates=False,
+                            )
+                        )
+                        total_size += source_size
+                        if total_size > CLAUDE_CA_DIR_LIMIT_BYTES:
+                            raise ReviewError(
+                                "Claude review CA directory exceeds the size limit"
+                            )
+                        try:
+                            material = _extract_ca_certificates(
+                                raw_material,
+                                source=f"{key}:{source_name}",
+                            )
+                        except ClaudeCACertificateNotFound:
+                            continue
+                        destination = destination_dir / source_name
+                        _write_private_ca_file(destination, material)
+                        _validate_ca_file(destination)
+                        copied = True
+                    directory_after = os.fstat(source_directory)
+                    if _ca_source_metadata(directory_before) != _ca_source_metadata(
+                        directory_after
+                    ):
                         raise ClaudeExecutableInspectionInconclusive(
-                            f"cannot inspect Claude review CA directory entry: {error}"
-                        ) from error
-                    if stat.S_ISDIR(entry_metadata.st_mode):
-                        continue
-                    raw_material, source_size = _read_ca_directory_entry_at_with_size(
-                        source_directory,
-                        source_name,
-                        entry_metadata,
-                        source=f"{key}:{source_name}",
-                        extract_certificates=False,
-                    )
-                    total_size += source_size
-                    if total_size > CLAUDE_CA_DIR_LIMIT_BYTES:
-                        raise ReviewError(
-                            "Claude review CA directory exceeds the size limit"
+                            "Claude review CA directory changed while being read"
                         )
-                    try:
-                        material = _extract_ca_certificates(
-                            raw_material,
-                            source=f"{key}:{source_name}",
-                        )
-                    except ClaudeCACertificateNotFound:
-                        continue
-                    destination = destination_dir / source_name
-                    _write_private_ca_file(destination, material)
-                    _validate_ca_file(destination)
-                    copied = True
-                directory_after = os.fstat(source_directory)
-                if _ca_source_metadata(directory_before) != _ca_source_metadata(
-                    directory_after
-                ):
+                except OSError as error:
                     raise ClaudeExecutableInspectionInconclusive(
-                        "Claude review CA directory changed while being read"
-                    )
-            finally:
-                os.close(source_directory)
+                        f"cannot inspect Claude review CA directory {key}"
+                    ) from error
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.close(source_directory)
+                raise
+            else:
+                try:
+                    os.close(source_directory)
+                except OSError as error:
+                    raise ClaudeExecutableInspectionInconclusive(
+                        f"cannot close Claude review CA directory {key}"
+                    ) from error
             if copied:
                 prepared_dirs.append(destination_dir)
             else:
-                destination_dir.rmdir()
+                try:
+                    destination_dir.rmdir()
+                except OSError as error:
+                    raise ClaudeExecutableInspectionInconclusive(
+                        f"cannot clean up Claude review {key} directory"
+                    ) from error
         if not prepared_dirs:
             raise ReviewError("Claude review CA directory contains no PEM certificates")
         result[key] = os.pathsep.join(str(path) for path in prepared_dirs)
@@ -4050,22 +4291,55 @@ def _prepare_claude_generic_tls_environment(
 
 
 def _require_private_claude_ca_root(path: pathlib.Path) -> None:
-    path.mkdir(mode=0o700, exist_ok=True)
+    try:
+        path.mkdir(mode=0o700, exist_ok=True)
+    except OSError as error:
+        try:
+            existing = path.lstat()
+        except OSError:
+            existing = None
+        if existing is not None and (
+            not stat.S_ISDIR(existing.st_mode)
+            or existing.st_uid != os.geteuid()
+            or existing.st_mode & 0o077
+        ):
+            raise ReviewError("Claude review CA directory has unsafe metadata")
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot prepare Claude review CA directory"
+        ) from error
     nofollow = getattr(os, "O_NOFOLLOW", None)
     directory_flag = getattr(os, "O_DIRECTORY", None)
     if nofollow is None or directory_flag is None:
         raise ReviewError("Claude CA workspace requires descriptor-safe directories")
     try:
         before = path.lstat()
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot inspect Claude review CA directory"
+        ) from error
+    if (
+        not stat.S_ISDIR(before.st_mode)
+        or before.st_uid != os.geteuid()
+        or before.st_mode & 0o077
+    ):
+        raise ReviewError("Claude review CA directory has unsafe metadata")
+    try:
         descriptor = os.open(
             path,
             os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow | directory_flag,
         )
     except OSError as error:
-        raise ReviewError("Claude review CA directory is unavailable") from error
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot open Claude review CA directory"
+        ) from error
     try:
-        opened = os.fstat(descriptor)
-        after = path.lstat()
+        try:
+            opened = os.fstat(descriptor)
+            after = path.lstat()
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                "cannot inspect Claude review CA directory"
+            ) from error
         if (
             not stat.S_ISDIR(opened.st_mode)
             or opened.st_uid != os.geteuid()
@@ -4075,8 +4349,17 @@ def _require_private_claude_ca_root(path: pathlib.Path) -> None:
         ):
             raise ReviewError("Claude review CA directory has unsafe metadata")
         _require_no_extended_acl(descriptor, label="Claude review CA directory")
-    finally:
-        os.close(descriptor)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        raise
+    else:
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                "cannot close Claude review CA directory"
+            ) from error
 
 
 def _write_private_ca_snapshot(path: pathlib.Path, data: bytes) -> None:
@@ -4087,7 +4370,21 @@ def _write_private_ca_snapshot(path: pathlib.Path, data: bytes) -> None:
             0o600,
         )
     except OSError as error:
-        raise ReviewError("cannot create immutable caller CA snapshot") from error
+        try:
+            existing = path.lstat()
+        except OSError:
+            existing = None
+        if existing is not None and (
+            not stat.S_ISREG(existing.st_mode)
+            or existing.st_uid != os.geteuid()
+            or existing.st_nlink != 1
+            or existing.st_mode & 0o077
+        ):
+            raise ReviewError("caller CA snapshot has unsafe metadata")
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot create immutable caller CA snapshot"
+        ) from error
+    published = False
     try:
         metadata = os.fstat(descriptor)
         if (
@@ -4103,12 +4400,30 @@ def _write_private_ca_snapshot(path: pathlib.Path, data: bytes) -> None:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-    except BaseException:
-        path.unlink(missing_ok=True)
+        published = True
+    except ReviewError:
         raise
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot write immutable caller CA snapshot"
+        ) from error
     finally:
+        active_error = sys.exc_info()[0] is not None
+        cleanup_error: OSError | None = None
         if descriptor >= 0:
-            os.close(descriptor)
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                cleanup_error = error
+        if not published:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as error:
+                cleanup_error = cleanup_error or error
+        if cleanup_error is not None and not active_error:
+            raise ClaudeExecutableInspectionInconclusive(
+                "cannot clean up immutable caller CA snapshot"
+            ) from cleanup_error
 
 
 def _read_claude_caller_ca_snapshot(path: pathlib.Path) -> bytes:
@@ -6119,10 +6434,11 @@ def _claude_supported_failure_category(
         [category],
     ):
         return None
-    if category == "entitlement":
-        entitlement_source = evidence_categories.get("entitlement", "")
-        if not entitlement_source.startswith("structured-"):
+    if category in {"entitlement", "transient"}:
+        category_source = evidence_categories.get(category, "")
+        if not category_source.startswith("structured-"):
             return None
+    if category == "entitlement":
         if effective_model is None:
             return None
     return category if category in {"auth", "entitlement", "transient"} else None

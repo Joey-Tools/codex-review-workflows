@@ -58,12 +58,12 @@ metadata behavior.
 ## Validation
 
 - Python 3.10.19 complete canonical suite with the `tomli` test backport and
-  `PYTHONDONTWRITEBYTECODE=1`: 847 tests run, 4 skipped, no failures. Disabling
+  `PYTHONDONTWRITEBYTECODE=1`: 869 tests run, 4 skipped, no failures. Disabling
   bytecode writes keeps the intentional `RLIMIT_FSIZE` tests from truncating
   uv's own `_virtualenv.pyc` import hook.
-- Python 3.13.0 complete canonical suite: 847 tests run, 9 skipped, no failures.
+- Python 3.13.0 complete canonical suite: 869 tests run, 9 skipped, no failures.
 - Focused Python 3.13 suites: the 3 `SSL_CERT_DIR` regressions passed, providers
-  ran 380 tests with 6 skipped, and provenance ran 90 tests with no skips or
+  ran 402 tests with 6 skipped, and provenance ran 90 tests with no skips or
   failures; earlier current-range common 49 and repository contract 14 test
   suites also passed.
 - Final-head review remediation covers strict signed-manifest numeric parsing,
@@ -173,6 +173,29 @@ metadata behavior.
   descriptor I/O, close failures, ACL API failures, and identity races remain
   inspection-inconclusive. Focused tests assert both exception classes before
   the complete Python 3.10 and 3.13 suites.
+- The final PR-readiness follow-up requires transient Claude failures to carry
+  structured stdout evidence; stderr-only network wording cannot authorize a
+  trusted retry or fallback. Owner-only bounded file reads also preserve an
+  earlier policy rejection when descriptor close fails, while a close-only I/O
+  failure remains inspection-inconclusive. Dedicated regressions cover both
+  close paths and the stderr-only envelope before the two complete suites.
+- The frozen-diff trust audit now checks extended ACLs on every opened caller
+  CA directory descriptor and resolves each certificate fingerprint according
+  to macOS user, admin, then system domain priority. A lower-priority domain
+  cannot change a higher-priority `TrustRoot` into `TrustAsRoot`, and
+  `TrustAsRoot` accepts only non-self-issued strict CA anchors. CA workspace,
+  snapshot, verification-input, and generic directory operational I/O remains
+  inspection-inconclusive, while stable symlink, metadata, ACL, and trust-policy
+  violations remain blocked even when cleanup also fails.
+- The final trust-tool audit replaces `Path.is_file()` probes with explicit
+  metadata inspection, so operational `stat` failures cannot masquerade as
+  deterministic OpenSSL or Security-tool absence. X.509 issuer and subject
+  names are compared through conservative RDN/OID normalization; only printable
+  ASCII DirectoryString values are complete enough to prove inequality, while
+  Unicode StringPrep cases fail closed. A differently encoded but semantically
+  self-issued name cannot enter the `TrustAsRoot` path. Generated CA and
+  bundled-root verification files also preserve a primary policy rejection
+  across both descriptor-close and temporary-file cleanup failures.
 - Ruff 0.13.2 lint, Python compile, project-journal validation, the official
   skill validator through its documented uv/PyYAML fallback, and working-tree
   diff checks passed. No formatter churn was retained: the full-skill formatter

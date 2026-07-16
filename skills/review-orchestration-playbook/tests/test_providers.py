@@ -500,6 +500,81 @@ class ProviderPolicyTest(unittest.TestCase):
         return intermediate_der, intermediate_pem
 
     @staticmethod
+    def self_issued_name_encoding_variant_fixture() -> bytes:
+        valid = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+        valid_der, _canonical = providers._canonical_ca_certificate(
+            valid,
+            source="valid root fixture",
+        )
+        variant = bytearray(valid_der)
+        _outer_tag, tbs_offset, outer_end, _outer_next = providers._der_tlv(
+            variant,
+            0,
+            len(variant),
+        )
+        _tbs_tag, tbs_start, tbs_end, _tbs_next = providers._der_tlv(
+            variant,
+            tbs_offset,
+            outer_end,
+        )
+        offset = tbs_start
+        if variant[offset] == 0xA0:
+            _tag, _start, _end, offset = providers._der_tlv(
+                variant,
+                offset,
+                tbs_end,
+            )
+        for _expected_tag in (0x02, 0x30):
+            _tag, _start, _end, offset = providers._der_tlv(
+                variant,
+                offset,
+                tbs_end,
+            )
+        issuer_tag, issuer_start, issuer_end, _issuer_next = providers._der_tlv(
+            variant,
+            offset,
+            tbs_end,
+        )
+        if issuer_tag != 0x30:
+            raise AssertionError("fixture issuer is not a sequence")
+        printable = frozenset(
+            b" '()+,-./:=?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+        )
+        rdn_offset = issuer_start
+        while rdn_offset < issuer_end:
+            rdn_tag, rdn_start, rdn_end, rdn_offset = providers._der_tlv(
+                variant,
+                rdn_offset,
+                issuer_end,
+            )
+            if rdn_tag != 0x31:
+                raise AssertionError("fixture RDN is not a set")
+            attribute_offset = rdn_start
+            while attribute_offset < rdn_end:
+                attribute_tag, attribute_start, attribute_end, attribute_offset = (
+                    providers._der_tlv(variant, attribute_offset, rdn_end)
+                )
+                if attribute_tag != 0x30:
+                    raise AssertionError("fixture attribute is not a sequence")
+                _oid_tag, _oid_start, _oid_end, value_offset = providers._der_tlv(
+                    variant,
+                    attribute_start,
+                    attribute_end,
+                )
+                value_tag, value_start, value_end, _value_next = providers._der_tlv(
+                    variant,
+                    value_offset,
+                    attribute_end,
+                )
+                if value_tag == 0x13:
+                    variant[value_offset] = 0x0C
+                    return bytes(variant)
+                if value_tag == 0x0C and set(variant[value_start:value_end]) <= printable:
+                    variant[value_offset] = 0x13
+                    return bytes(variant)
+        raise AssertionError("fixture has no interchangeable directory string")
+
+    @staticmethod
     def ca_sha256_fingerprint(certificate: bytes) -> bytes:
         der, _canonical = providers._canonical_ca_certificate(
             certificate,
@@ -3260,6 +3335,37 @@ class ProviderPolicyTest(unittest.TestCase):
                     "unverified-transient-failure-envelope",
                 )
                 self.assertIsNone(invalid.final_text)
+
+    def test_claude_transient_rejects_stderr_only_evidence(self) -> None:
+        stdout = json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "result": "request failed",
+            }
+        ).encode()
+        stderr = b"network error while contacting the provider"
+
+        self.assertIsNone(
+            providers._claude_supported_failure_category(
+                stdout,
+                stderr=stderr,
+                requested_model=providers.CLAUDE_MODELS[0],
+            )
+        )
+        attempt = self.record_claude_result(
+            stdout,
+            returncode=1,
+            stderr=stderr,
+            index=113,
+        )
+        self.assertEqual(attempt.category, "inconclusive")
+        self.assertEqual(
+            attempt.reason,
+            "unverified-transient-failure-envelope",
+        )
+        self.assertIsNone(attempt.final_text)
 
     def test_nonzero_malformed_claude_output_has_machine_visible_reason(self) -> None:
         for index, stdout in enumerate(
@@ -10224,6 +10330,91 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn("-partial_chain", argv)
         self.assertNotIn("-check_ss_sig", argv)
 
+    def test_trust_as_root_rejects_self_issued_ca(self) -> None:
+        certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+        der, canonical = providers._canonical_ca_certificate(
+            certificate,
+            source="self-issued TrustAsRoot fixture",
+        )
+
+        with self.assertRaisesRegex(
+            providers.ClaudeTrustCertificateInvalid,
+            "strict CA trust anchor",
+        ):
+            providers._verify_unconditional_trust_root(
+                der,
+                canonical,
+                ca_root=self.review.container_dir,
+                timeout_seconds=1.0,
+                allow_non_self_signed=True,
+            )
+
+    def test_trust_as_root_rejects_semantically_self_issued_name_variant(
+        self,
+    ) -> None:
+        variant = self.self_issued_name_encoding_variant_fixture()
+
+        providers._require_unconditional_root_extensions(variant)
+        with self.assertRaisesRegex(
+            providers.ClaudeTrustCertificateInvalid,
+            "strict CA trust anchor",
+        ):
+            providers._require_unconditional_root_extensions(
+                variant,
+                require_self_issued=False,
+                require_non_self_issued=True,
+            )
+
+    def test_x509_name_non_ascii_mapping_is_not_complete(self) -> None:
+        def common_name(value: bytes, *, tag: int = 0x0C) -> bytes:
+            attribute = b"\x06\x03\x55\x04\x03" + bytes((tag, len(value))) + value
+            sequence = b"\x30" + bytes((len(attribute),)) + attribute
+            rdn = b"\x31" + bytes((len(sequence),)) + sequence
+            return b"\x30" + bytes((len(rdn),)) + rdn
+
+        _ascii_name, ascii_complete = providers._canonical_x509_name(
+            common_name(b"Root")
+        )
+        _mapped_name, mapped_complete = providers._canonical_x509_name(
+            common_name("Ro\u00adot".encode("utf-8"))
+        )
+        _numeric_name, numeric_complete = providers._canonical_x509_name(
+            common_name(b"12 34", tag=0x12)
+        )
+        _ia5_name, ia5_complete = providers._canonical_x509_name(
+            common_name(b"root@example.test", tag=0x16)
+        )
+
+        self.assertTrue(ascii_complete)
+        self.assertFalse(mapped_complete)
+        self.assertFalse(numeric_complete)
+        self.assertFalse(ia5_complete)
+
+    def test_trust_root_tool_metadata_io_is_inconclusive(self) -> None:
+        certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+        der, canonical = providers._canonical_ca_certificate(
+            certificate,
+            source="trust tool metadata fixture",
+        )
+
+        with (
+            mock.patch.object(
+                pathlib.Path,
+                "stat",
+                side_effect=OSError(errno.EIO, "stat failed"),
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "cannot inspect Claude TLS root verification tooling",
+            ),
+        ):
+            providers._verify_unconditional_trust_root(
+                der,
+                canonical,
+                ca_root=self.review.container_dir,
+                timeout_seconds=1.0,
+            )
+
     def test_trust_as_root_falls_back_when_partial_chain_is_unavailable(
         self,
     ) -> None:
@@ -10536,8 +10727,25 @@ class ProviderPolicyTest(unittest.TestCase):
             with providers._managed_claude_trust_export_path(path):
                 self.fail("trust export body must not run")
 
+    def test_trust_export_tool_metadata_io_is_inconclusive(self) -> None:
+        with (
+            mock.patch.object(
+                pathlib.Path,
+                "stat",
+                side_effect=OSError(errno.EIO, "stat failed"),
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "cannot inspect Apple's security trust export tool",
+            ),
+        ):
+            providers._require_claude_trust_export_tool(
+                self.review,
+                self.review.container_dir,
+            )
+
     def test_system_domain_trust_as_root_is_exported(self) -> None:
-        certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+        _der, certificate = self.non_self_issued_ca_fixture()
         fingerprint = self.ca_sha1_fingerprint(certificate)
         system_trust = plistlib.dumps(
             {
@@ -10621,6 +10829,74 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(evidence["additional_unconditional_candidate_count"], 1)
         self.assertEqual(evidence["additional_unconditional_included_count"], 1)
         self.assertTrue(verify.call_args.kwargs["allow_non_self_signed"])
+
+    def test_higher_priority_trust_domain_preserves_anchor_kind(self) -> None:
+        fingerprint = "A" * 40
+        classifications = {
+            "user": providers.ClaudeTrustFingerprints(
+                unconditional=(fingerprint,),
+                trust_as_root=(),
+                constrained=(),
+            ),
+            "admin": providers.ClaudeTrustFingerprints(
+                unconditional=(fingerprint,),
+                trust_as_root=(fingerprint,),
+                constrained=(),
+            ),
+            "system": None,
+        }
+
+        def read_domain(*_args, domain, **_kwargs):
+            return classifications[domain]
+
+        def export_certificates(argv, **_kwargs):
+            return common.BoundedCapture(
+                argv=tuple(argv),
+                returncode=0,
+                stdout=bytearray(),
+                stderr=bytearray(),
+            )
+
+        evidence = providers._new_claude_trust_policy_evidence(
+            self.claude_executable_evidence
+        )
+        selected = providers.ClaudeSelectedTrustMaterial(
+            certificates=b"selected",
+            omitted_sha1_fingerprints=frozenset(),
+        )
+        with (
+            mock.patch.object(
+                providers,
+                "_require_claude_trust_export_tool",
+                return_value=(pathlib.Path("/usr/bin/security"), {}),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_claude_trust_domain",
+                side_effect=read_domain,
+            ),
+            mock.patch.object(
+                providers,
+                "run_bounded_capture",
+                side_effect=export_certificates,
+            ),
+            mock.patch.object(
+                providers,
+                "_select_trust_certificates",
+                return_value=selected,
+            ) as select,
+        ):
+            material = providers._read_claude_trust_certificates(
+                self.review,
+                self.review.container_dir,
+                evidence=evidence,
+            )
+
+        self.assertEqual(material.certificates, b"selected")
+        self.assertEqual(
+            select.call_args.kwargs["trust_as_root_fingerprints"],
+            [],
+        )
 
     def test_trust_certificate_export_launch_io_is_inconclusive(self) -> None:
         certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
@@ -11341,6 +11617,45 @@ class ProviderPolicyTest(unittest.TestCase):
                 {"SSL_CERT_DIR": str(directory_link)}
             )
 
+    def test_caller_ca_directory_acl_policy_is_fail_closed(self) -> None:
+        source_dir = self.review.source_root / "caller-ca-directory-acl"
+        source_dir.mkdir(mode=0o700)
+
+        with (
+            mock.patch.object(
+                providers,
+                "_require_no_extended_acl",
+                side_effect=ReviewError("extended ACL sentinel"),
+            ),
+            self.assertRaisesRegex(ReviewError, "extended ACL sentinel"),
+        ):
+            providers._open_stable_ca_directory(
+                source_dir,
+                source="SSL_CERT_DIR",
+            )
+
+    def test_caller_ca_directory_acl_io_is_inconclusive(self) -> None:
+        source_dir = self.review.source_root / "caller-ca-directory-acl-io"
+        source_dir.mkdir(mode=0o700)
+
+        with (
+            mock.patch.object(
+                providers,
+                "_require_no_extended_acl",
+                side_effect=providers.ClaudeExecutableInspectionInconclusive(
+                    "ACL API failure sentinel"
+                ),
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "ACL API failure sentinel",
+            ),
+        ):
+            providers._open_stable_ca_directory(
+                source_dir,
+                source="SSL_CERT_DIR",
+            )
+
     def test_caller_ca_directory_fstat_io_is_inconclusive(self) -> None:
         source_dir = self.review.source_root / "caller-ca-fstat-io"
         source_dir.mkdir(mode=0o700)
@@ -11648,6 +11963,359 @@ class ProviderPolicyTest(unittest.TestCase):
                 label="fixture owner file",
             )
 
+    def test_owner_file_reader_close_io_is_inspection_inconclusive(self) -> None:
+        source = self.review.source_root / "owner-file-close-io"
+        self.write_private_source(source, b"fixture")
+        real_open = os.open
+        real_close = os.close
+        descriptors: list[int] = []
+
+        def capture_open(*args, **kwargs):
+            descriptor = real_open(*args, **kwargs)
+            descriptors.append(descriptor)
+            return descriptor
+
+        try:
+            with (
+                mock.patch.object(providers.os, "open", side_effect=capture_open),
+                mock.patch.object(
+                    providers.os,
+                    "close",
+                    side_effect=OSError(errno.EIO, "close failed"),
+                ),
+                self.assertRaisesRegex(
+                    providers.ClaudeExecutableInspectionInconclusive,
+                    "cannot close fixture owner file",
+                ),
+            ):
+                providers._read_bounded_owner_file(
+                    source,
+                    source="close-io",
+                    limit_bytes=1024,
+                    label="fixture owner file",
+                )
+        finally:
+            for descriptor in descriptors:
+                real_close(descriptor)
+
+    def test_owner_file_reader_close_io_preserves_policy_error(self) -> None:
+        source = self.review.source_root / "owner-file-close-policy"
+        self.write_private_source(source, b"fixture")
+        real_open = os.open
+        real_close = os.close
+        descriptors: list[int] = []
+
+        def capture_open(*args, **kwargs):
+            descriptor = real_open(*args, **kwargs)
+            descriptors.append(descriptor)
+            return descriptor
+
+        try:
+            with (
+                mock.patch.object(providers.os, "open", side_effect=capture_open),
+                mock.patch.object(
+                    providers,
+                    "_require_no_extended_acl",
+                    side_effect=ReviewError("policy rejection sentinel"),
+                ),
+                mock.patch.object(
+                    providers.os,
+                    "close",
+                    side_effect=OSError(errno.EIO, "close failed"),
+                ),
+                self.assertRaisesRegex(ReviewError, "policy rejection sentinel"),
+            ):
+                providers._read_bounded_owner_file(
+                    source,
+                    source="close-after-policy-error",
+                    limit_bytes=1024,
+                    label="fixture owner file",
+                )
+        finally:
+            for descriptor in descriptors:
+                real_close(descriptor)
+
+    def test_private_ca_root_operational_io_is_inconclusive(self) -> None:
+        mkdir_path = self.review.container_dir / "ca-root-mkdir-io"
+        with (
+            mock.patch.object(
+                pathlib.Path,
+                "mkdir",
+                side_effect=OSError(errno.EIO, "mkdir failed"),
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "cannot prepare Claude review CA directory",
+            ),
+        ):
+            providers._require_private_claude_ca_root(mkdir_path)
+
+        open_path = self.review.container_dir / "ca-root-open-io"
+        open_path.mkdir(mode=0o700)
+        with (
+            mock.patch.object(
+                providers.os,
+                "open",
+                side_effect=OSError(errno.EIO, "open failed"),
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "cannot open Claude review CA directory",
+            ),
+        ):
+            providers._require_private_claude_ca_root(open_path)
+
+    def test_private_ca_root_rejects_stable_symlink(self) -> None:
+        target = self.review.container_dir / "ca-root-target"
+        target.mkdir(mode=0o700)
+        link = self.review.container_dir / "ca-root-link"
+        link.symlink_to(target.name)
+
+        with self.assertRaisesRegex(ReviewError, "unsafe metadata"):
+            providers._require_private_claude_ca_root(link)
+
+    def test_private_ca_root_close_io_is_inconclusive(self) -> None:
+        path = self.review.container_dir / "ca-root-close-io"
+        path.mkdir(mode=0o700)
+        real_open = os.open
+        real_close = os.close
+        descriptors: list[int] = []
+
+        def capture_open(*args, **kwargs):
+            descriptor = real_open(*args, **kwargs)
+            descriptors.append(descriptor)
+            return descriptor
+
+        try:
+            with (
+                mock.patch.object(providers.os, "open", side_effect=capture_open),
+                mock.patch.object(
+                    providers.os,
+                    "close",
+                    side_effect=OSError(errno.EIO, "close failed"),
+                ),
+                self.assertRaisesRegex(
+                    providers.ClaudeExecutableInspectionInconclusive,
+                    "cannot close Claude review CA directory",
+                ),
+            ):
+                providers._require_private_claude_ca_root(path)
+        finally:
+            for descriptor in descriptors:
+                real_close(descriptor)
+
+    def test_private_ca_root_close_io_preserves_policy_error(self) -> None:
+        path = self.review.container_dir / "ca-root-close-policy"
+        path.mkdir(mode=0o700)
+        real_open = os.open
+        real_close = os.close
+        descriptors: list[int] = []
+
+        def capture_open(*args, **kwargs):
+            descriptor = real_open(*args, **kwargs)
+            descriptors.append(descriptor)
+            return descriptor
+
+        try:
+            with (
+                mock.patch.object(providers.os, "open", side_effect=capture_open),
+                mock.patch.object(
+                    providers,
+                    "_require_no_extended_acl",
+                    side_effect=ReviewError("policy rejection sentinel"),
+                ),
+                mock.patch.object(
+                    providers.os,
+                    "close",
+                    side_effect=OSError(errno.EIO, "close failed"),
+                ),
+                self.assertRaisesRegex(ReviewError, "policy rejection sentinel"),
+            ):
+                providers._require_private_claude_ca_root(path)
+        finally:
+            for descriptor in descriptors:
+                real_close(descriptor)
+
+    def test_private_ca_snapshot_io_and_stable_metadata_classification(self) -> None:
+        unavailable = self.review.container_dir / "snapshot-open-io.pem"
+        with (
+            mock.patch.object(
+                providers.os,
+                "open",
+                side_effect=OSError(errno.EIO, "open failed"),
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "cannot create immutable caller CA snapshot",
+            ),
+        ):
+            providers._write_private_ca_snapshot(unavailable, b"fixture")
+
+        target = self.review.container_dir / "snapshot-target.pem"
+        self.write_private_source(target, b"fixture")
+        link = self.review.container_dir / "snapshot-link.pem"
+        link.symlink_to(target.name)
+        with self.assertRaisesRegex(ReviewError, "unsafe metadata"):
+            providers._write_private_ca_snapshot(link, b"fixture")
+
+    def test_private_ca_snapshot_close_io_preserves_policy_error(self) -> None:
+        path = self.review.container_dir / "snapshot-close-policy.pem"
+        real_open = os.open
+        real_close = os.close
+        descriptors: list[int] = []
+
+        def capture_open(*args, **kwargs):
+            descriptor = real_open(*args, **kwargs)
+            descriptors.append(descriptor)
+            return descriptor
+
+        try:
+            with (
+                mock.patch.object(providers.os, "open", side_effect=capture_open),
+                mock.patch.object(
+                    providers,
+                    "_require_no_extended_acl",
+                    side_effect=ReviewError("policy rejection sentinel"),
+                ),
+                mock.patch.object(
+                    providers.os,
+                    "close",
+                    side_effect=OSError(errno.EIO, "close failed"),
+                ),
+                self.assertRaisesRegex(ReviewError, "policy rejection sentinel"),
+            ):
+                providers._write_private_ca_snapshot(path, b"fixture")
+        finally:
+            for descriptor in descriptors:
+                real_close(descriptor)
+
+    def test_trust_verification_cleanup_preserves_policy_error(self) -> None:
+        certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+        der, canonical = providers._canonical_ca_certificate(
+            certificate,
+            source="trust cleanup fixture",
+        )
+        real_mkstemp = tempfile.mkstemp
+        real_close = os.close
+        descriptors: list[int] = []
+
+        def capture_mkstemp(*args, **kwargs):
+            descriptor, temporary = real_mkstemp(*args, **kwargs)
+            descriptors.append(descriptor)
+            return descriptor, temporary
+
+        try:
+            with (
+                mock.patch.object(
+                    providers.tempfile,
+                    "mkstemp",
+                    side_effect=capture_mkstemp,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_require_no_extended_acl",
+                    side_effect=ReviewError("policy rejection sentinel"),
+                ),
+                mock.patch.object(
+                    providers.os,
+                    "close",
+                    side_effect=OSError(errno.EIO, "close failed"),
+                ),
+                self.assertRaisesRegex(ReviewError, "policy rejection sentinel"),
+            ):
+                providers._verify_unconditional_trust_root(
+                    der,
+                    canonical,
+                    ca_root=self.review.container_dir,
+                    timeout_seconds=1.0,
+                )
+        finally:
+            for descriptor in descriptors:
+                real_close(descriptor)
+
+    def test_private_ca_file_cleanup_preserves_policy_error(self) -> None:
+        destination = self.review.container_dir / "generated-ca.pem"
+        real_mkstemp = tempfile.mkstemp
+        real_close = os.close
+        real_unlink = pathlib.Path.unlink
+        descriptors: list[int] = []
+        temporary_paths: list[pathlib.Path] = []
+
+        def capture_mkstemp(*args, **kwargs):
+            descriptor, temporary = real_mkstemp(*args, **kwargs)
+            descriptors.append(descriptor)
+            temporary_paths.append(pathlib.Path(temporary))
+            return descriptor, temporary
+
+        try:
+            with (
+                mock.patch.object(
+                    providers.tempfile,
+                    "mkstemp",
+                    side_effect=capture_mkstemp,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_require_no_extended_acl",
+                    side_effect=ReviewError("policy rejection sentinel"),
+                ),
+                mock.patch.object(
+                    providers.os,
+                    "close",
+                    side_effect=OSError(errno.EIO, "close failed"),
+                ),
+                mock.patch.object(
+                    pathlib.Path,
+                    "unlink",
+                    side_effect=OSError(errno.EIO, "unlink failed"),
+                ),
+                self.assertRaisesRegex(ReviewError, "policy rejection sentinel"),
+            ):
+                providers._write_private_ca_file(destination, b"fixture")
+        finally:
+            for descriptor in descriptors:
+                real_close(descriptor)
+            for temporary_path in temporary_paths:
+                real_unlink(temporary_path, missing_ok=True)
+
+    def test_private_verification_file_cleanup_preserves_policy_error(self) -> None:
+        destination = self.review.container_dir / "verification-input.pem"
+        real_open = os.open
+        real_close = os.close
+        real_unlink = pathlib.Path.unlink
+        descriptors: list[int] = []
+
+        def capture_open(*args, **kwargs):
+            descriptor = real_open(*args, **kwargs)
+            descriptors.append(descriptor)
+            return descriptor
+
+        try:
+            with (
+                mock.patch.object(providers.os, "open", side_effect=capture_open),
+                mock.patch.object(
+                    providers,
+                    "_require_no_extended_acl",
+                    side_effect=ReviewError("policy rejection sentinel"),
+                ),
+                mock.patch.object(
+                    providers.os,
+                    "close",
+                    side_effect=OSError(errno.EIO, "close failed"),
+                ),
+                mock.patch.object(
+                    pathlib.Path,
+                    "unlink",
+                    side_effect=OSError(errno.EIO, "unlink failed"),
+                ),
+                self.assertRaisesRegex(ReviewError, "policy rejection sentinel"),
+            ):
+                providers._write_private_verification_file(destination, b"fixture")
+        finally:
+            for descriptor in descriptors:
+                real_close(descriptor)
+            real_unlink(destination, missing_ok=True)
+
     def test_caller_ca_file_close_io_is_inconclusive(self) -> None:
         source = self.review.source_root / "caller-ca-close-io.pem"
         readers = (
@@ -11903,6 +12571,73 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertNotIn(str(ca_file), profile)
         self.assertNotIn(str(node_ca_file), profile)
         self.assertNotIn(str(ca_dir), profile)
+
+    def test_generic_tls_directory_close_io_is_inconclusive(self) -> None:
+        ca_root = self.review.container_dir / "claude-ca"
+        ca_root.mkdir(mode=0o700)
+        source_dir = self.review.source_root / "generic-ca-close-io"
+        source_dir.mkdir(mode=0o700)
+        metadata = source_dir.stat()
+
+        with (
+            mock.patch.object(providers, "_require_private_claude_ca_root"),
+            mock.patch.object(
+                providers,
+                "_open_stable_ca_directory",
+                return_value=123,
+            ),
+            mock.patch.object(providers.os, "fstat", return_value=metadata),
+            mock.patch.object(
+                providers,
+                "_bounded_ca_directory_names",
+                return_value=[],
+            ),
+            mock.patch.object(
+                providers.os,
+                "close",
+                side_effect=OSError(errno.EIO, "close failed"),
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "cannot close Claude review CA directory SSL_CERT_DIR",
+            ),
+        ):
+            providers._prepare_claude_generic_tls_environment(
+                self.review,
+                {"SSL_CERT_DIR": str(source_dir)},
+            )
+
+    def test_generic_tls_directory_close_io_preserves_policy_error(self) -> None:
+        ca_root = self.review.container_dir / "claude-ca"
+        ca_root.mkdir(mode=0o700)
+        source_dir = self.review.source_root / "generic-ca-close-policy"
+        source_dir.mkdir(mode=0o700)
+        metadata = source_dir.stat()
+
+        with (
+            mock.patch.object(providers, "_require_private_claude_ca_root"),
+            mock.patch.object(
+                providers,
+                "_open_stable_ca_directory",
+                return_value=123,
+            ),
+            mock.patch.object(providers.os, "fstat", return_value=metadata),
+            mock.patch.object(
+                providers,
+                "_bounded_ca_directory_names",
+                side_effect=ReviewError("policy rejection sentinel"),
+            ),
+            mock.patch.object(
+                providers.os,
+                "close",
+                side_effect=OSError(errno.EIO, "close failed"),
+            ),
+            self.assertRaisesRegex(ReviewError, "policy rejection sentinel"),
+        ):
+            providers._prepare_claude_generic_tls_environment(
+                self.review,
+                {"SSL_CERT_DIR": str(source_dir)},
+            )
 
     @mock.patch.object(
         providers,
