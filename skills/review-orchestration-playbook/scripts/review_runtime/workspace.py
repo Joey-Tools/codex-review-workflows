@@ -68,6 +68,7 @@ OVERSIZED_JWT_PATTERN = re.compile(
     rb"[A-Za-z0-9_-]{2049}"
     rb")"
 )
+# Complete shared-prefix rules must precede broader overlapping sentinel rules.
 SECRET_PATTERNS = (
     ("aws-access-key", re.compile(rb"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
     (
@@ -158,11 +159,17 @@ OVERSIZED_QUOTED_SECRET_ASSIGNMENT = re.compile(
     SECRET_KEY_PATTERN + rb"(['\"])[^\r\n'\"]{513}"
 )
 UNQUOTED_SECRET_ASSIGNMENT = re.compile(
-    SECRET_KEY_PATTERN + rb"((?:" + GENERIC_SECRET_VALUE_BYTE_CLASS + rb"){16,512})",
+    SECRET_KEY_PATTERN
+    + rb"((?:"
+    + GENERIC_SECRET_VALUE_BYTE_CLASS
+    + rb"){16,512})(?!"
+    + GENERIC_SECRET_VALUE_BYTE_CLASS
+    + rb")",
 )
 OVERSIZED_UNQUOTED_SECRET_ASSIGNMENT = re.compile(
     SECRET_KEY_PATTERN + rb"(?:" + GENERIC_SECRET_VALUE_BYTE_CLASS + rb"){513}"
 )
+GENERIC_SECRET_VALUE_BYTE = re.compile(GENERIC_SECRET_VALUE_BYTE_CLASS)
 PLACEHOLDER_SECRET_PATTERN = re.compile(
     rb"(?:"
     rb"\$\{[A-Za-z_][A-Za-z0-9_]*\}"
@@ -4044,6 +4051,37 @@ def _provider_candidate_is_prefix_only(rule: str, candidate: bytes) -> bool:
     return actual_prefix is not None and len(candidate) - len(actual_prefix) == 513
 
 
+def _oversized_assignment_is_exact_specific_candidate(
+    value: bytes,
+    *,
+    candidate_start: int,
+    prefix_end: int,
+    quote: bytes | None,
+    long_specific_candidate_ends: dict[int, set[int]],
+) -> bool:
+    for specific_end in long_specific_candidate_ends.get(candidate_start, ()):
+        if specific_end < prefix_end:
+            continue
+        if quote is not None:
+            if value[specific_end : specific_end + 1] == quote:
+                return True
+            continue
+        next_byte = value[specific_end : specific_end + 1]
+        if not next_byte or GENERIC_SECRET_VALUE_BYTE.fullmatch(next_byte) is None:
+            return True
+    return False
+
+
+def _record_long_specific_candidate(
+    long_specific_candidate_ends: dict[int, set[int]],
+    *,
+    start: int,
+    end: int,
+) -> None:
+    if end - start >= 513:
+        long_specific_candidate_ends.setdefault(start, set()).add(end)
+
+
 def _iter_secret_events(
     value: bytes,
     *,
@@ -4052,6 +4090,7 @@ def _iter_secret_events(
     _event_budget: SecretScanBudget | None = None,
 ) -> Iterator[tuple[str, bytes | None, int, bool, int | None, int | None]]:
     event_budget = _event_budget or SecretScanBudget.default()
+    long_specific_candidate_ends: dict[int, set[int]] = {}
     for match in PEM_PRIVATE_KEY_BEGIN.finditer(value):
         event_budget.consume()
         start = match.start()
@@ -4062,6 +4101,11 @@ def _iter_secret_events(
         end_start = value.find(end_marker, match.end(), search_end)
         if end_start >= 0:
             candidate_end = end_start + len(end_marker)
+            _record_long_specific_candidate(
+                long_specific_candidate_ends,
+                start=start,
+                end=candidate_end,
+            )
             yield (
                 rule,
                 value[start:candidate_end],
@@ -4082,8 +4126,18 @@ def _iter_secret_events(
             start, candidate_end = match.span(candidate_group)
             candidate = match.group(candidate_group)
             if _provider_candidate_is_prefix_only(rule, candidate):
+                if any(
+                    end >= match.end()
+                    for end in long_specific_candidate_ends.get(start, ())
+                ):
+                    continue
                 yield rule, None, match.end(), False, None, None
             else:
+                _record_long_specific_candidate(
+                    long_specific_candidate_ends,
+                    start=start,
+                    end=candidate_end,
+                )
                 yield rule, candidate, match.end(), True, start, candidate_end
     for rule, pattern in (
         ("aws-secret-key", OVERSIZED_AWS_SECRET_KEY_GAP),
@@ -4093,12 +4147,21 @@ def _iter_secret_events(
         for match in pattern.finditer(value):
             event_budget.consume()
             yield rule, None, match.end(), False, None, None
-    for pattern in (
-        OVERSIZED_QUOTED_SECRET_ASSIGNMENT,
-        OVERSIZED_UNQUOTED_SECRET_ASSIGNMENT,
+    for pattern, quoted in (
+        (OVERSIZED_QUOTED_SECRET_ASSIGNMENT, True),
+        (OVERSIZED_UNQUOTED_SECRET_ASSIGNMENT, False),
     ):
         for match in pattern.finditer(value):
             event_budget.consume()
+            candidate_start = match.end() - 513
+            if _oversized_assignment_is_exact_specific_candidate(
+                value,
+                candidate_start=candidate_start,
+                prefix_end=match.end(),
+                quote=match.group(1) if quoted else None,
+                long_specific_candidate_ends=long_specific_candidate_ends,
+            ):
+                continue
             yield (
                 "generic-secret-assignment",
                 None,

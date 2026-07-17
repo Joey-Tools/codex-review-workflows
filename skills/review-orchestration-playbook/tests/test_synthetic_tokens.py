@@ -1485,8 +1485,8 @@ class PublicPoolScannerTest(unittest.TestCase):
         self,
     ) -> None:
         cases = (
-            ("openai-key", b"sk-proj-" + b"B" * 508),
-            ("github-token", b"github_pat_" + b"C" * 506),
+            ("openai-key", b"sk-proj-B1" + b"B" * 506),
+            ("github-token", b"github_pat_C2" + b"C" * 504),
         )
         for expected_rule, candidate in cases:
             with self.subTest(rule=expected_rule):
@@ -1500,6 +1500,94 @@ class PublicPoolScannerTest(unittest.TestCase):
                     scan.blocking_candidates,
                     {candidate: {expected_rule}},
                 )
+
+    def test_valid_long_provider_candidates_suppress_exact_oversized_assignments(
+        self,
+    ) -> None:
+        cases = (
+            ("openai-key", b"sk-proj-B1" + b"B" * 506),
+            ("github-token", b"github_pat_C2" + b"C" * 504),
+        )
+        for expected_rule, candidate in cases:
+            for quoted, payload in (
+                (True, assignment_bytes(b"api_token", candidate)),
+                (False, b"api_token = " + candidate + b"\n"),
+            ):
+                with self.subTest(rule=expected_rule, quoted=quoted):
+                    scan = workspace._scan_secret_value(
+                        payload,
+                        capture_blocking_candidates=True,
+                        _continue_after_blocking=True,
+                    )
+                    self.assertIsNone(scan.blocking_rule)
+                    self.assertEqual(
+                        scan.blocking_candidates,
+                        {candidate: {expected_rule}},
+                    )
+
+                    adjacent = workspace._scan_secret_value(
+                        (
+                            assignment_bytes(b"api_token", candidate + b"!")
+                            if quoted
+                            else b"api_token = " + candidate + b"!\n"
+                        ),
+                        capture_blocking_candidates=True,
+                        _continue_after_blocking=True,
+                    )
+                    self.assertEqual(
+                        adjacent.blocking_rule,
+                        "generic-secret-assignment",
+                    )
+
+    def test_complete_anthropic_candidate_suppresses_openai_prefix_only_event(
+        self,
+    ) -> None:
+        candidate = b"sk-ant-A1" + b"A" * 507
+        scan = workspace._scan_secret_value(
+            assignment_bytes(b"api_token", candidate),
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+
+        self.assertIsNone(scan.blocking_rule)
+        self.assertEqual(
+            scan.blocking_candidates,
+            {candidate: {"anthropic-key"}},
+        )
+
+    def test_exact_long_provider_assignment_crosses_first_commit_without_blocking(
+        self,
+    ) -> None:
+        candidate = b"sk-proj-" + b"B" * 508
+        assignment_prefix = b'api_token = "'
+        first_read = (
+            workspace.MAX_SECRET_PREFIX_PROOF_BYTES + workspace.STREAM_SCAN_OVERLAP
+        )
+        committed_end = first_read - workspace.STREAM_SCAN_OVERLAP
+        candidate_start = committed_end - 513
+        line_start = candidate_start - len(assignment_prefix)
+        payload = (
+            b"x" * (line_start - 1)
+            + b"\n"
+            + assignment_prefix
+            + candidate
+            + b'"\n'
+            + b"x" * workspace.STREAM_SCAN_OVERLAP
+        )
+        self.assertGreater(len(payload), first_read)
+
+        scan = workspace._stream_secret_scan(
+            io.BytesIO(payload),
+            size=len(payload),
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+
+        self.assertIsNone(scan.blocking_rule)
+        self.assertEqual(
+            scan.blocking_candidates,
+            {candidate: {"openai-key"}},
+        )
 
     def test_audit_scan_captures_after_a_blocker_across_stream_chunks(self) -> None:
         accepted = accepted_legacy_value(LEGACY_A, rule="generic-secret-assignment")
@@ -3404,6 +3492,28 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                 reductions[0]["head_unembedded_count"],
             ),
             (1, 0, 1, 0),
+        )
+
+    def test_valid_long_provider_assignment_can_strictly_reduce(self) -> None:
+        candidate = "sk-proj-B1" + "B" * 506
+        fixture = assignment_text("api_token", candidate)
+        repo, base = self.new_repo({"fixture.cfg": fixture * 2})
+        (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
+        head = self.commit(repo)
+
+        review = self.prepare(repo=repo, base=base, head=head)
+        evidence = self.validate(review)
+        reductions = evidence["synthetic_tokens"]["secret_reductions"]
+        self.assertEqual(len(reductions), 1)
+        self.assertEqual(reductions[0]["rules"], ["openai-key"])
+        self.assertEqual(
+            (
+                reductions[0]["base_count"],
+                reductions[0]["head_count"],
+                reductions[0]["base_unembedded_count"],
+                reductions[0]["head_unembedded_count"],
+            ),
+            (2, 1, 2, 1),
         )
 
     def test_observed_legacy_value_must_not_overlap_authoring_pool(self) -> None:
