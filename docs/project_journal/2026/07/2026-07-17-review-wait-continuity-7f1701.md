@@ -5,7 +5,7 @@ status: completed
 created: 2026-07-17
 updated: 2026-07-17
 branch: codex/daily-skill-friction-20260717-codex-review-workflows-healthy-review-wait-continuity
-pr:
+pr: https://github.com/Joey-Tools/codex-review-workflows/pull/57
 supersedes: []
 superseded_by:
 ---
@@ -29,3 +29,4 @@ superseded_by:
 
 - Daily Skill Friction sessions `019f615b-2f9b-7073-a804-f21a7d6f0f34` and `019f62a6-a37a-7d21-b8e9-10df10aab9eb` ended a parent task while their reviewers were still healthy.
 - Five real main sessions required nine manual `please continue` messages during nonterminal review/test waits.
+- https://github.com/Joey-Tools/codex-review-workflows/pull/57
