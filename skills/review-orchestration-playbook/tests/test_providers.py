@@ -3240,6 +3240,435 @@ class ProviderPolicyTest(unittest.TestCase):
         persist.assert_not_called()
         retain.assert_not_called()
 
+    def test_refresh_validation_control_flow_retains_recovery_carrier(
+        self,
+    ) -> None:
+        real_validate = providers._validate_claude_local_credential
+        interruptions = (
+            ("forwarded-signal", providers.ForwardedSignal(signal.SIGTERM)),
+            ("keyboard-interrupt", KeyboardInterrupt("fixture interrupt")),
+            ("system-exit", SystemExit(19)),
+        )
+
+        for label, interruption in interruptions:
+            with self.subTest(interruption=label):
+                original = bytearray(
+                    oauth_credential_fixture(expires_in_seconds=-60)
+                )
+                refreshed = bytearray(
+                    oauth_credential_fixture(expires_in_seconds=7200)
+                )
+                refreshed_bytes = bytes(refreshed)
+                selected = providers._ClaudeLocalCredential(
+                    source="macos-keychain",
+                    payload=original,
+                    expires_at_ms=0,
+                    carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
+                        keychain_digest=providers._claude_credential_digest(
+                            original
+                        ),
+                        file_digest=None,
+                        file_snapshot=None,
+                    ),
+                )
+                validation_calls = 0
+                interrupted_payload: bytearray | None = None
+
+                def interrupt_second_validation(
+                    credential: bytearray,
+                    *,
+                    source: str,
+                ) -> None:
+                    nonlocal interrupted_payload, validation_calls
+                    validation_calls += 1
+                    if validation_calls == 2:
+                        interrupted_payload = credential
+                        raise interruption
+                    real_validate(credential, source=source)
+
+                @contextlib.contextmanager
+                def broker(
+                    _credential,
+                    _capability,
+                    *,
+                    update_callback=None,
+                    **_kwargs,
+                ):
+                    assert update_callback is not None
+                    self.assertTrue(update_callback(refreshed))
+                    refreshed[:] = b"\x00" * len(refreshed)
+                    yield 43211
+
+                common.write_json(
+                    self.review.container_dir / "claude-runtime.json",
+                    {"authentication": {}, "phase": "runtime-launching"},
+                )
+                with (
+                    mock.patch.object(
+                        providers,
+                        "_select_claude_macos_credential",
+                        return_value=selected,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_claude_keychain_credential_server",
+                        side_effect=broker,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_validate_claude_local_credential",
+                        side_effect=interrupt_second_validation,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_persist_claude_macos_refreshed_credential",
+                    ) as persist,
+                    self.assertRaises(type(interruption)) as raised,
+                ):
+                    with self.claude_keychain_runtime(
+                        self.review,
+                        {},
+                        self.claude_refresh_lock_protocol,
+                    ):
+                        pass
+
+                self.assertIs(raised.exception, interruption)
+                carrier = self.assert_macos_recovery_carrier(
+                    interruption,
+                    refreshed_bytes,
+                )
+                report = common.read_json(
+                    self.review.container_dir / "claude-runtime.json"
+                )
+                self.assertEqual(
+                    report["authentication"]["refresh_persistence"],
+                    "failed-after-attempt",
+                )
+                self.assertEqual(
+                    report["authentication"]["recovery_carrier"],
+                    str(carrier),
+                )
+                self.assertEqual(validation_calls, 3)
+                self.assertIsNotNone(interrupted_payload)
+                assert interrupted_payload is not None
+                self.assertEqual(
+                    interrupted_payload,
+                    b"\x00" * len(interrupted_payload),
+                )
+                self.assertEqual(original, b"\x00" * len(original))
+                self.assertEqual(refreshed, b"\x00" * len(refreshed))
+                persist.assert_not_called()
+
+    def test_refresh_validation_signal_survives_candidate_generation_failure(
+        self,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        selected = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
+                keychain_digest=providers._claude_credential_digest(original),
+                file_digest=None,
+                file_snapshot=None,
+            ),
+        )
+        forwarded = providers.ForwardedSignal(signal.SIGTERM)
+        real_validate = providers._validate_claude_local_credential
+        validation_calls = 0
+        interrupted_payload: bytearray | None = None
+
+        def interrupt_accept_validation(
+            credential: bytearray,
+            *,
+            source: str,
+        ) -> None:
+            nonlocal interrupted_payload, validation_calls
+            validation_calls += 1
+            if validation_calls == 2:
+                interrupted_payload = credential
+                raise forwarded
+            real_validate(credential, source=source)
+
+        @contextlib.contextmanager
+        def broker(_credential, _capability, *, update_callback=None, **_kwargs):
+            assert update_callback is not None
+            self.assertTrue(update_callback(refreshed))
+            refreshed[:] = b"\x00" * len(refreshed)
+            yield 43211
+
+        common.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {"authentication": {}, "phase": "runtime-launching"},
+        )
+        with (
+            mock.patch.object(
+                providers,
+                "_select_claude_macos_credential",
+                return_value=selected,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_credential_server",
+                side_effect=broker,
+            ),
+            mock.patch.object(
+                providers,
+                "_validate_claude_local_credential",
+                side_effect=interrupt_accept_validation,
+            ),
+            mock.patch.object(
+                providers.secrets,
+                "token_hex",
+                side_effect=OSError("fixture candidate generation failed"),
+            ) as token_hex,
+            mock.patch.object(
+                providers,
+                "_persist_claude_macos_refreshed_credential",
+            ) as persist,
+            self.assertRaises(providers.ForwardedSignal) as raised,
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+            ):
+                pass
+
+        self.assertIs(raised.exception, forwarded)
+        self.assertTrue(
+            getattr(forwarded, "_codex_claude_refresh_persistence_failed", False)
+        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
+        self.assertEqual(
+            report["authentication"]["refresh_persistence"],
+            "failed-after-attempt",
+        )
+        self.assertNotIn("recovery_carrier", report["authentication"])
+        self.assertEqual(validation_calls, 2)
+        self.assertIsNotNone(interrupted_payload)
+        assert interrupted_payload is not None
+        self.assertEqual(
+            interrupted_payload,
+            b"\x00" * len(interrupted_payload),
+        )
+        self.assertEqual(original, b"\x00" * len(original))
+        self.assertEqual(refreshed, b"\x00" * len(refreshed))
+        token_hex.assert_called_once_with(16)
+        persist.assert_not_called()
+
+    def test_refresh_state_lock_control_flow_retains_recovery_carrier(
+        self,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        refreshed_bytes = bytes(refreshed)
+        selected = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
+                keychain_digest=providers._claude_credential_digest(original),
+                file_digest=None,
+                file_snapshot=None,
+            ),
+        )
+        interrupted = KeyboardInterrupt("fixture state-lock interrupt")
+        real_lock_factory = threading.Lock
+        real_validate = providers._validate_claude_local_credential
+        validation_calls = 0
+        staged_payload: bytearray | None = None
+
+        class InterruptingLock:
+            def __init__(self) -> None:
+                self.delegate = real_lock_factory()
+                self.entries = 0
+
+            def __enter__(self):
+                self.entries += 1
+                if self.entries == 4:
+                    raise interrupted
+                self.delegate.acquire()
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback) -> None:
+                self.delegate.release()
+
+        runtime_lock = InterruptingLock()
+
+        def observe_accept_validation(
+            credential: bytearray,
+            *,
+            source: str,
+        ) -> None:
+            nonlocal staged_payload, validation_calls
+            validation_calls += 1
+            if validation_calls == 2:
+                staged_payload = credential
+            real_validate(credential, source=source)
+
+        @contextlib.contextmanager
+        def broker(_credential, _capability, *, update_callback=None, **_kwargs):
+            assert update_callback is not None
+            self.assertTrue(update_callback(refreshed))
+            refreshed[:] = b"\x00" * len(refreshed)
+            yield 43211
+
+        common.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {"authentication": {}, "phase": "runtime-launching"},
+        )
+        with (
+            mock.patch.object(
+                providers,
+                "_select_claude_macos_credential",
+                return_value=selected,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_credential_server",
+                side_effect=broker,
+            ),
+            mock.patch.object(
+                providers,
+                "_validate_claude_local_credential",
+                side_effect=observe_accept_validation,
+            ),
+            mock.patch.object(
+                providers,
+                "_persist_claude_macos_refreshed_credential",
+            ) as persist,
+            mock.patch.object(
+                providers.threading,
+                "Lock",
+                return_value=runtime_lock,
+            ),
+            self.assertRaises(KeyboardInterrupt) as raised,
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+            ):
+                pass
+
+        self.assertIs(raised.exception, interrupted)
+        carrier = self.assert_macos_recovery_carrier(
+            interrupted,
+            refreshed_bytes,
+        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
+        self.assertEqual(
+            report["authentication"]["recovery_carrier"],
+            str(carrier),
+        )
+        self.assertEqual(validation_calls, 3)
+        self.assertGreaterEqual(runtime_lock.entries, 7)
+        self.assertIsNotNone(staged_payload)
+        assert staged_payload is not None
+        self.assertEqual(staged_payload, b"\x00" * len(staged_payload))
+        self.assertEqual(original, b"\x00" * len(original))
+        self.assertEqual(refreshed, b"\x00" * len(refreshed))
+        persist.assert_not_called()
+
+    def test_refresh_validation_control_flow_replaces_prior_error(
+        self,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        refreshed_bytes = bytes(refreshed)
+        selected = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
+                keychain_digest=providers._claude_credential_digest(original),
+                file_digest=None,
+                file_snapshot=None,
+            ),
+        )
+        forwarded = providers.ForwardedSignal(signal.SIGTERM)
+        real_validate = providers._validate_claude_local_credential
+        validation_calls = 0
+        interrupted_payload: bytearray | None = None
+
+        def interrupt_accept_validation(
+            credential: bytearray,
+            *,
+            source: str,
+        ) -> None:
+            nonlocal interrupted_payload, validation_calls
+            validation_calls += 1
+            if validation_calls == 3:
+                interrupted_payload = credential
+                raise forwarded
+            real_validate(credential, source=source)
+
+        @contextlib.contextmanager
+        def broker(_credential, _capability, *, update_callback=None, **_kwargs):
+            assert update_callback is not None
+            malformed = bytearray(b"{}")
+            self.assertFalse(update_callback(malformed))
+            malformed[:] = b"\x00" * len(malformed)
+            self.assertTrue(update_callback(refreshed))
+            refreshed[:] = b"\x00" * len(refreshed)
+            yield 43211
+
+        common.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {"authentication": {}, "phase": "runtime-launching"},
+        )
+        with (
+            mock.patch.object(
+                providers,
+                "_select_claude_macos_credential",
+                return_value=selected,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_credential_server",
+                side_effect=broker,
+            ),
+            mock.patch.object(
+                providers,
+                "_validate_claude_local_credential",
+                side_effect=interrupt_accept_validation,
+            ),
+            mock.patch.object(
+                providers,
+                "_persist_claude_macos_refreshed_credential",
+            ) as persist,
+            self.assertRaises(providers.ForwardedSignal) as raised,
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+            ):
+                pass
+
+        self.assertIs(raised.exception, forwarded)
+        carrier = self.assert_macos_recovery_carrier(
+            forwarded,
+            refreshed_bytes,
+        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
+        self.assertEqual(
+            report["authentication"]["recovery_carrier"],
+            str(carrier),
+        )
+        self.assertEqual(validation_calls, 4)
+        self.assertIsNotNone(interrupted_payload)
+        assert interrupted_payload is not None
+        self.assertEqual(
+            interrupted_payload,
+            b"\x00" * len(interrupted_payload),
+        )
+        self.assertEqual(original, b"\x00" * len(original))
+        self.assertEqual(refreshed, b"\x00" * len(refreshed))
+        persist.assert_not_called()
+
     def test_newer_malformed_refresh_invalidates_older_staged_rotation(
         self,
     ) -> None:

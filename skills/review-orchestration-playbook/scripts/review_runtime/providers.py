@@ -4030,78 +4030,108 @@ def _claude_keychain_runtime(
         nonlocal carrier_snapshot, persisted_updates
         nonlocal quiescence_recovery_candidate
         nonlocal quiescence_recovery_replaces_existing
+        callback_expected_credential: bytearray | None = None
         try:
-            _validate_claude_local_credential(
-                updated,
-                source="broker refresh",
-            )
-        except ClaudeCredentialUnsafe as error:
-            malformed = ClaudeCredentialInspectionInconclusive(
-                "Claude produced a malformed refreshed OAuth credential"
-            )
-            malformed.__cause__ = error
-            with runtime_state_lock:
-                if not runtime_abandoned:
-                    persistence_errors.append(malformed)
-            return False
-
-        with runtime_state_lock:
-            if runtime_abandoned:
+            try:
+                _validate_claude_local_credential(
+                    updated,
+                    source="broker refresh",
+                )
+            except ClaudeCredentialUnsafe as error:
+                malformed = ClaudeCredentialInspectionInconclusive(
+                    "Claude produced a malformed refreshed OAuth credential"
+                )
+                malformed.__cause__ = error
+                with runtime_state_lock:
+                    if not runtime_abandoned:
+                        persistence_errors.append(malformed)
                 return False
-            prior_error = (
-                persistence_errors[0] if persistence_errors else None
-            )
-            callback_carrier_snapshot = carrier_snapshot
-            callback_expected_credential = bytearray(expected_credential)
-        if prior_error is not None:
-            callback_expected_credential[:] = (
-                b"\x00" * len(callback_expected_credential)
-            )
-            retained_candidate = getattr(
-                prior_error,
-                "_codex_claude_retained_credential_carrier",
-                None,
-            )
-            recovery_candidate = (
-                pathlib.Path(retained_candidate)
-                if isinstance(retained_candidate, str)
-                else new_recovery_candidate()
-            )
+
             with runtime_state_lock:
                 if runtime_abandoned:
                     return False
-                quiescence_recovery_candidate = recovery_candidate
-                quiescence_recovery_replaces_existing = isinstance(
-                    retained_candidate,
-                    str,
+                prior_error = (
+                    persistence_errors[0] if persistence_errors else None
                 )
-            try:
-                if isinstance(retained_candidate, str):
-                    _replace_claude_macos_recovery_credential(
-                        review,
-                        pathlib.Path(retained_candidate),
-                        updated,
+                callback_carrier_snapshot = carrier_snapshot
+                callback_expected_credential = bytearray(expected_credential)
+            if prior_error is not None:
+                callback_expected_credential[:] = (
+                    b"\x00" * len(callback_expected_credential)
+                )
+                retained_candidate = getattr(
+                    prior_error,
+                    "_codex_claude_retained_credential_carrier",
+                    None,
+                )
+                recovery_candidate = (
+                    pathlib.Path(retained_candidate)
+                    if isinstance(retained_candidate, str)
+                    else new_recovery_candidate()
+                )
+                with runtime_state_lock:
+                    if runtime_abandoned:
+                        return False
+                    quiescence_recovery_candidate = recovery_candidate
+                    quiescence_recovery_replaces_existing = isinstance(
+                        retained_candidate,
+                        str,
                     )
-                    retained_carrier = pathlib.Path(retained_candidate)
-                else:
-                    retained_carrier = _retain_claude_macos_refreshed_credential(
-                        review,
-                        updated,
-                        requested_carrier_root=recovery_candidate,
-                    )
-            except BaseException as recovery_error:
+                try:
+                    if isinstance(retained_candidate, str):
+                        _replace_claude_macos_recovery_credential(
+                            review,
+                            pathlib.Path(retained_candidate),
+                            updated,
+                        )
+                        retained_carrier = pathlib.Path(retained_candidate)
+                    else:
+                        retained_carrier = (
+                            _retain_claude_macos_refreshed_credential(
+                                review,
+                                updated,
+                                requested_carrier_root=recovery_candidate,
+                            )
+                        )
+                except BaseException as recovery_error:
+                    if _is_claude_control_flow_error(prior_error):
+                        replacement_error = prior_error
+                        deferred_persistence_note = recovery_error
+                    elif _is_claude_control_flow_error(recovery_error):
+                        _add_claude_persistence_note(
+                            recovery_error,
+                            prior_error,
+                        )
+                        replacement_error = recovery_error
+                        deferred_persistence_note = None
+                    else:
+                        replacement_error = _failed_claude_macos_recovery_error(
+                            prior_error,
+                            recovery_error,
+                        )
+                        deferred_persistence_note = None
+                    with runtime_state_lock:
+                        if (
+                            not runtime_abandoned
+                            and persistence_errors
+                            and persistence_errors[0] is prior_error
+                        ):
+                            if deferred_persistence_note is not None:
+                                _add_claude_persistence_note(
+                                    prior_error,
+                                    deferred_persistence_note,
+                                )
+                            persistence_errors[0] = replacement_error
+                    return False
+                retained_error = _retained_claude_macos_credential_error(
+                    retained_carrier,
+                    prior_error,
+                )
                 if _is_claude_control_flow_error(prior_error):
                     replacement_error = prior_error
-                    deferred_persistence_note = recovery_error
-                elif _is_claude_control_flow_error(recovery_error):
-                    _add_claude_persistence_note(recovery_error, prior_error)
-                    replacement_error = recovery_error
-                    deferred_persistence_note = None
+                    deferred_persistence_note = retained_error
                 else:
-                    replacement_error = _failed_claude_macos_recovery_error(
-                        prior_error,
-                        recovery_error,
-                    )
+                    replacement_error = retained_error
                     deferred_persistence_note = None
                 with runtime_state_lock:
                     if (
@@ -4109,6 +4139,7 @@ def _claude_keychain_runtime(
                         and persistence_errors
                         and persistence_errors[0] is prior_error
                     ):
+                        quiescence_recovery_replaces_existing = True
                         if deferred_persistence_note is not None:
                             _add_claude_persistence_note(
                                 prior_error,
@@ -4116,31 +4147,6 @@ def _claude_keychain_runtime(
                             )
                         persistence_errors[0] = replacement_error
                 return False
-            retained_error = _retained_claude_macos_credential_error(
-                retained_carrier,
-                prior_error,
-            )
-            if _is_claude_control_flow_error(prior_error):
-                replacement_error = prior_error
-                deferred_persistence_note = retained_error
-            else:
-                replacement_error = retained_error
-                deferred_persistence_note = None
-            with runtime_state_lock:
-                if (
-                    not runtime_abandoned
-                    and persistence_errors
-                    and persistence_errors[0] is prior_error
-                ):
-                    quiescence_recovery_replaces_existing = True
-                    if deferred_persistence_note is not None:
-                        _add_claude_persistence_note(
-                            prior_error,
-                            deferred_persistence_note,
-                        )
-                    persistence_errors[0] = replacement_error
-            return False
-        try:
             if (
                 (
                     selected.source == "macos-keychain"
@@ -4176,23 +4182,23 @@ def _claude_keychain_runtime(
                 persisted_updates += 1
                 return True
         except BaseException as error:
-            proposed_recovery_candidate = new_recovery_candidate()
-            with runtime_state_lock:
-                if runtime_abandoned:
-                    return False
-                if quiescence_recovery_candidate is None:
-                    quiescence_recovery_candidate = (
-                        proposed_recovery_candidate
-                    )
-                    quiescence_recovery_replaces_existing = False
-                callback_recovery_candidate = (
-                    quiescence_recovery_candidate
-                )
-                callback_replaces_existing = (
-                    quiescence_recovery_replaces_existing
-                )
-            assert callback_recovery_candidate is not None
             try:
+                proposed_recovery_candidate = new_recovery_candidate()
+                with runtime_state_lock:
+                    if runtime_abandoned:
+                        return False
+                    if quiescence_recovery_candidate is None:
+                        quiescence_recovery_candidate = (
+                            proposed_recovery_candidate
+                        )
+                        quiescence_recovery_replaces_existing = False
+                    callback_recovery_candidate = (
+                        quiescence_recovery_candidate
+                    )
+                    callback_replaces_existing = (
+                        quiescence_recovery_replaces_existing
+                    )
+                assert callback_recovery_candidate is not None
                 if callback_replaces_existing:
                     _replace_claude_macos_recovery_credential(
                         review,
@@ -4222,28 +4228,46 @@ def _claude_keychain_runtime(
                         error,
                         recovery_error,
                     )
-                with runtime_state_lock:
-                    if not runtime_abandoned:
-                        persistence_errors.append(persistence_error)
-                return False
-            retained_error = _retained_claude_macos_credential_error(
-                retained_carrier,
-                error,
-            )
-            if _is_claude_control_flow_error(error):
-                _add_claude_persistence_note(error, retained_error)
-                persistence_error = error
+                recovered_carrier = False
             else:
-                persistence_error = retained_error
+                retained_error = _retained_claude_macos_credential_error(
+                    retained_carrier,
+                    error,
+                )
+                if _is_claude_control_flow_error(error):
+                    _add_claude_persistence_note(error, retained_error)
+                    persistence_error = error
+                else:
+                    persistence_error = retained_error
+                recovered_carrier = True
             with runtime_state_lock:
-                if not runtime_abandoned:
+                if runtime_abandoned:
+                    return False
+                if recovered_carrier:
                     quiescence_recovery_replaces_existing = True
+                if not persistence_errors:
                     persistence_errors.append(persistence_error)
+                else:
+                    prior_error = persistence_errors[0]
+                    if _is_claude_control_flow_error(prior_error):
+                        if persistence_error is not prior_error:
+                            _add_claude_persistence_note(
+                                prior_error,
+                                persistence_error,
+                            )
+                    else:
+                        if persistence_error is not prior_error:
+                            _attach_claude_credential_cleanup_failure(
+                                persistence_error,
+                                prior_error,
+                            )
+                        persistence_errors[0] = persistence_error
             return False
         finally:
-            callback_expected_credential[:] = (
-                b"\x00" * len(callback_expected_credential)
-            )
+            if callback_expected_credential is not None:
+                callback_expected_credential[:] = (
+                    b"\x00" * len(callback_expected_credential)
+                )
 
     def abandon_unquiescent_handler() -> None:
         nonlocal quiescence_recovery_candidate, runtime_abandoned
