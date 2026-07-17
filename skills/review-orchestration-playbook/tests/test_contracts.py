@@ -118,6 +118,49 @@ def _workflow_block_scalar_header_indents(
     return header_indent, content_indent
 
 
+def _workflow_inline_quoted_scalar_is_complete(value: str) -> bool:
+    quote = value[:1]
+    if quote not in ("'", '"'):
+        return True
+
+    index = 1
+    while index < len(value):
+        character = value[index]
+        if quote == "'" and character == "'":
+            if index + 1 < len(value) and value[index + 1] == "'":
+                index += 2
+                continue
+            trailing = value[index + 1 :]
+            return not trailing.strip() or (
+                trailing[:1].isspace()
+                and trailing.lstrip().startswith("#")
+            )
+        if quote == '"' and character == "\\":
+            index += 2
+            continue
+        if quote == '"' and character == '"':
+            trailing = value[index + 1 :]
+            return not trailing.strip() or (
+                trailing[:1].isspace()
+                and trailing.lstrip().startswith("#")
+            )
+        index += 1
+    return False
+
+
+def _workflow_line_has_unsupported_quoted_scalar(candidate: str) -> bool:
+    key = r'''(?:[A-Za-z_][A-Za-z0-9_-]*|'[^']*'|"[^"\\]*")'''
+    mapping = re.fullmatch(
+        rf"{key}[ \t]*:[ \t]*(?P<value>.*)",
+        candidate,
+    )
+    value = mapping.group("value") if mapping is not None else candidate
+    value = value.lstrip()
+    return value[:1] in ("'", '"') and not _workflow_inline_quoted_scalar_is_complete(
+        value
+    )
+
+
 def _workflow_has_unsupported_mapping_key_syntax(lines: tuple[str, ...]) -> bool:
     block_header_indent: int | None = None
     block_content_indent: int | None = None
@@ -144,6 +187,8 @@ def _workflow_has_unsupported_mapping_key_syntax(lines: tuple[str, ...]) -> bool
         if candidate.startswith(("!", "&", "*")) and ":" in candidate:
             return True
         if _workflow_matching_key_marker(candidate, "", "<<") is not None:
+            return True
+        if _workflow_line_has_unsupported_quoted_scalar(candidate):
             return True
         if not candidate.startswith('"'):
             scalar_header_indents = _workflow_block_scalar_header_indents(line)
@@ -237,6 +282,8 @@ def _workflow_inline_sequence_values(value: str) -> tuple[str, ...] | None:
     if not value.startswith("[") or not value.endswith("]"):
         return None
     items = value[1:-1].split(",")
+    if items and not items[-1].strip():
+        items.pop()
     values: list[str] = []
     for item in items:
         dependency = _workflow_dependency_scalar(item)
@@ -463,6 +510,22 @@ def _workflow_job_top_level_values(
     return tuple(values)
 
 
+def _workflow_continue_on_error_is_disabled(values: tuple[str, ...]) -> bool:
+    normalized = tuple(
+        _workflow_strip_yaml_comment(value).strip() for value in values
+    )
+    return normalized in ((), ("false",))
+
+
+def _workflow_job_propagates_failure(workflow: str, job_name: str) -> bool:
+    job_lines = _workflow_job_lines(workflow, job_name)
+    if not job_lines:
+        return False
+    return _workflow_continue_on_error_is_disabled(
+        _workflow_job_top_level_values(job_lines, "continue-on-error")
+    )
+
+
 def _workflow_run_defaults_block_is_unsafe(
     lines: tuple[str, ...],
     run_index: int,
@@ -636,7 +699,7 @@ def _workflow_job_success_guards(workflow: str, job_name: str) -> tuple[str, ...
     job_continue_on_error = _workflow_job_top_level_values(
         job_lines, "continue-on-error"
     )
-    if job_continue_on_error not in ((), ("false",)):
+    if not _workflow_continue_on_error_is_disabled(job_continue_on_error):
         return ()
     guarded_dependencies: list[str] = []
     steps = _workflow_job_steps(job_lines)
@@ -648,11 +711,15 @@ def _workflow_job_success_guards(workflow: str, job_name: str) -> tuple[str, ...
         step_continue_on_error = _workflow_step_top_level_values(
             step, "continue-on-error"
         )
-        if step_continue_on_error not in ((), ("false",)):
+        if not _workflow_continue_on_error_is_disabled(step_continue_on_error):
             return ()
         if _workflow_step_top_level_values(step, "shell"):
             return ()
+        if _workflow_step_top_level_values(step, "uses"):
+            return ()
         if _workflow_step_top_level_values(step, "env") != ("",):
+            return ()
+        if len(_workflow_step_top_level_values(step, "run")) != 1:
             return ()
         step_bindings = _workflow_env_bindings(step, "        ")
         if not step_bindings:
@@ -933,6 +1000,11 @@ class RepositoryContractTest(unittest.TestCase):
             set(_workflow_job_success_guards(workflow, "test")),
             set(dependencies),
         )
+        for dependency in dependencies:
+            self.assertTrue(
+                _workflow_job_propagates_failure(workflow, dependency),
+                dependency,
+            )
         self.assertIn(
             "PLATFORM_TESTS_RESULT: ${{ needs.platform_tests.result }}",
             workflow,
@@ -992,6 +1064,17 @@ class RepositoryContractTest(unittest.TestCase):
             "jobs:\n"
             "  test:\n"
             "    needs: [compatibility_tests, 'platform_tests'] # Required jobs.\n"
+        )
+        inline_list_with_trailing_comma = (
+            "jobs:\n"
+            "  test:\n"
+            "    needs: [compatibility_tests, 'platform_tests',] # Required jobs.\n"
+        )
+        malformed_inline_lists = (
+            "jobs:\n  test:\n    needs: [platform_tests,,]\n",
+            "jobs:\n  test:\n    needs: [,]\n",
+            "jobs:\n  test:\n    needs: [platform_tests, ,]\n",
+            "jobs:\n  test:\n    needs: [ ]\n",
         )
         quoted_block_header = (
             "jobs:\n"
@@ -1190,6 +1273,12 @@ class RepositoryContractTest(unittest.TestCase):
             ("compatibility_tests", "platform_tests"),
         )
         self.assertEqual(
+            _workflow_job_needs(inline_list_with_trailing_comma, "test"),
+            ("compatibility_tests", "platform_tests"),
+        )
+        for workflow in malformed_inline_lists:
+            self.assertEqual(_workflow_job_needs(workflow, "test"), ())
+        self.assertEqual(
             _workflow_job_needs(quoted_block_header, "test"),
             ("compatibility_tests", "platform_tests"),
         )
@@ -1253,6 +1342,101 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(
             _workflow_job_success_guards(root_scalar_job_decoy, "test"),
             (),
+        )
+
+    def test_ci_direct_dependency_jobs_propagate_failures(self) -> None:
+        def dependency_workflow(*job_properties: str) -> str:
+            return (
+                "jobs:\n"
+                "  platform_tests:\n"
+                "    runs-on: ubuntu-latest\n"
+                + "".join(f"    {property_line}\n" for property_line in job_properties)
+                + "    steps:\n"
+                "      - run: true\n"
+            )
+
+        safe_workflows = (
+            dependency_workflow(),
+            dependency_workflow("continue-on-error: false"),
+            dependency_workflow(
+                "'continue-on-error': false # Failures remain visible."
+            ),
+        )
+        for workflow in safe_workflows:
+            self.assertTrue(
+                _workflow_job_propagates_failure(workflow, "platform_tests")
+            )
+
+        unsafe_workflows = {
+            "true": dependency_workflow("continue-on-error: true"),
+            "expression": dependency_workflow(
+                "continue-on-error: ${{ matrix.experimental }}"
+            ),
+            "quoted-false": dependency_workflow("continue-on-error: 'false'"),
+            "empty": dependency_workflow("continue-on-error:"),
+            "tagged": dependency_workflow("continue-on-error: !!bool false"),
+            "anchored": dependency_workflow("continue-on-error: &tolerance false"),
+            "aliased": dependency_workflow(
+                "tolerance: &tolerance false",
+                "continue-on-error: *tolerance",
+            ),
+            "flow": dependency_workflow("continue-on-error: [false]"),
+            "block": dependency_workflow(
+                "continue-on-error: |-",
+                "  false",
+            ),
+            "duplicate": dependency_workflow(
+                "continue-on-error: false",
+                "'continue-on-error': false",
+            ),
+            "multiline-quoted-decoy": dependency_workflow(
+                "name: 'decoy",
+                "continue-on-error: false",
+                "'",
+                "continue-on-error: true",
+            ),
+        }
+        for name, workflow in unsafe_workflows.items():
+            with self.subTest(name=name):
+                self.assertFalse(
+                    _workflow_job_propagates_failure(workflow, "platform_tests")
+                )
+        self.assertFalse(
+            _workflow_job_propagates_failure(dependency_workflow(), "missing")
+        )
+
+    def test_ci_structural_scan_rejects_multiline_quoted_scalars(self) -> None:
+        multiline_scalars = (
+            (
+                "jobs:",
+                "  test:",
+                "    steps:",
+                "      - name: 'single-quoted decoy",
+                "        env:",
+                "        '",
+            ),
+            (
+                "jobs:",
+                "  test:",
+                "    steps:",
+                '      - name: "double-quoted decoy',
+                "        env:",
+                '        "',
+            ),
+        )
+        for lines in multiline_scalars:
+            self.assertTrue(_workflow_has_unsupported_mapping_key_syntax(lines))
+
+        self.assertFalse(
+            _workflow_has_unsupported_mapping_key_syntax(
+                (
+                    "name: 'Joey''s workflow'   ",
+                    'run-name: "Guard # status" # Inline comment.',
+                    "description: |",
+                    "  name: 'shell text can keep an unmatched quote",
+                    "jobs:",
+                )
+            )
         )
 
     def test_ci_success_guard_parser_rejects_non_propagating_steps(self) -> None:
@@ -1330,6 +1514,19 @@ class RepositoryContractTest(unittest.TestCase):
             "          PLATFORM_RESULT: ${{ needs.platform_tests.result }}\n"
             "        run: |-\n"
             '          test "$PLATFORM_RESULT" = "success"\n'
+        )
+        multiline_quoted_step_decoy = (
+            "jobs:\n"
+            "  test:\n"
+            "    needs: platform_tests\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - name: 'decoy\n"
+            "        env:\n"
+            "          PLATFORM_RESULT: ${{ needs.platform_tests.result }}\n"
+            '        run: test "$PLATFORM_RESULT" = "success"\n'
+            "        '\n"
+            "        run: true\n"
         )
 
         unsafe_workflows = {
@@ -1623,6 +1820,16 @@ class RepositoryContractTest(unittest.TestCase):
                 )
             ),
             "explicit-indent-cross-step-poison": explicit_indent_cross_step_poison,
+            "multiline-quoted-step-decoy": multiline_quoted_step_decoy,
+            "uses-step": guarded_workflow(
+                step_properties=("uses: actions/checkout@v4",)
+            ),
+            "duplicate-run": guarded_workflow(
+                run_lines=(
+                    '        run: test "$PLATFORM_RESULT" = "success"',
+                    "        'run': true",
+                )
+            ),
             "bare-dash-poisoning-step": guarded_workflow(
                 leading_step_lines=(
                     "      -",
@@ -1720,6 +1927,11 @@ class RepositoryContractTest(unittest.TestCase):
 
         safe_workflows = (
             guarded_workflow(step_properties=("continue-on-error: false",)),
+            guarded_workflow(
+                step_properties=(
+                    "continue-on-error: false # Failures remain visible.",
+                )
+            ),
             guarded_workflow(step_properties=('"continue-on-error": false',)),
             guarded_workflow(job_properties=("continue-on-error: false",)),
             guarded_workflow(steps_line='    "steps":'),

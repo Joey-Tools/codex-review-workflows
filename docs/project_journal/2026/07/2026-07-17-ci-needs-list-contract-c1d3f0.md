@@ -25,7 +25,9 @@ status context on additional compatibility and platform jobs.
   requires `platform_tests` to be one of its direct dependencies.
 - Scalar `needs: platform_tests` remains accepted for the canonical workflow.
 - List-form `needs` declarations containing `platform_tests` are accepted for
-  synchronized overlays with additional direct dependencies.
+  synchronized overlays with additional direct dependencies. Inline sequences
+  may use YAML's legal single trailing comma, while empty or repeated-comma
+  items still invalidate the complete dependency list.
 - Indentless YAML block sequences under `needs` are accepted when they remain
   within the current job, including comments and the following job boundary.
 - A sequence item may put one ordinary job-ID scalar on the indented line after
@@ -41,6 +43,10 @@ status context on additional compatibility and platform jobs.
   a decoy; duplicate, inline, or unsupported root mappings fail closed.
 - Every accepted direct dependency must expose its result and be checked for a
   successful outcome by the aggregate `test` job.
+- Every accepted direct dependency job must also propagate its own failure.
+  Job-level `continue-on-error` accepts only an absent value or the canonical
+  unquoted `false` boolean; expressions, tolerant values, duplicate keys, and
+  unstructured YAML nodes fail closed.
 - Step-scoped result variables count only when the same step checks them;
   job-scoped bindings are rejected because an earlier step can overwrite them
   through `GITHUB_ENV`.
@@ -78,6 +84,11 @@ status context on additional compatibility and platform jobs.
   physical lines into a different shell command. Inline `run:` scalars also
   reject deeper-indented physical continuations, preventing folded commands
   from appending an unvalidated success path after an exact first line.
+  Multiline single- and double-quoted YAML scalars are outside the accepted
+  structural subset, so text resembling step-level `env` or `run` keys inside
+  a quoted `name` cannot become a guard decoy. Each accepted guard step must
+  expose exactly one real `run` key, exactly one real `env` block, and no
+  `uses` key.
 
 ## Validation Evidence
 
@@ -98,6 +109,10 @@ status context on additional compatibility and platform jobs.
   contract files (`17` tests each), Ruff, Python compilation, Actionlint 1.7.12
   coverage for both chomping/indicator orders and quoted/sequence `run` keys,
   project-journal validation, normalized copy comparison, and diff checks.
+- The exact-head dependency-propagation, multiline-quoted-scalar, and inline
+  trailing-comma regressions passed the focused canonical contract suite (`19`
+  tests), Ruff, Python compilation, and Actionlint 1.7.12 checks for the live
+  workflow plus an Actionlint-valid combined decoy/trailing-comma fixture.
 
 ## Next Steps
 
