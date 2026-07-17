@@ -122,14 +122,49 @@ def _workflow_has_unsupported_mapping_key_syntax(lines: tuple[str, ...]) -> bool
 
 
 def _workflow_job_lines(workflow: str, job_name: str) -> tuple[str, ...]:
-    marker = f"\n  {job_name}:\n"
-    if marker not in workflow:
+    workflow_lines = tuple(workflow.splitlines())
+    if workflow.startswith("\ufeff") or _workflow_has_unsupported_mapping_key_syntax(
+        workflow_lines
+    ):
         return ()
+
+    jobs_indexes: list[int] = []
+    for index, line in enumerate(workflow_lines):
+        marker = _workflow_matching_key_marker(line, "", "jobs")
+        if marker is None:
+            continue
+        if _workflow_strip_yaml_comment(line.removeprefix(marker).strip()):
+            return ()
+        jobs_indexes.append(index)
+    if len(jobs_indexes) != 1:
+        return ()
+
+    jobs_lines: list[str] = []
+    for line in workflow_lines[jobs_indexes[0] + 1 :]:
+        if line.strip() and not line.lstrip().startswith("#"):
+            indentation = len(line) - len(line.lstrip())
+            if indentation == 0:
+                break
+        jobs_lines.append(line)
+
+    job_indexes: list[int] = []
+    for index, line in enumerate(jobs_lines):
+        marker = _workflow_matching_key_marker(line, "  ", job_name)
+        if marker is None:
+            continue
+        if _workflow_strip_yaml_comment(line.removeprefix(marker).strip()):
+            return ()
+        job_indexes.append(index)
+    if len(job_indexes) != 1:
+        return ()
+
     job_lines: list[str] = []
-    for line in workflow.split(marker, 1)[1].splitlines():
+    for line in jobs_lines[job_indexes[0] + 1 :]:
         ignorable = not line.strip() or line.lstrip().startswith("#")
-        if not ignorable and line.startswith("  ") and not line.startswith("    "):
-            break
+        if not ignorable:
+            indentation = len(line) - len(line.lstrip())
+            if indentation <= 2:
+                break
         job_lines.append(line)
     return tuple(job_lines)
 
@@ -262,7 +297,7 @@ def _workflow_job_steps(job_lines: tuple[str, ...]) -> tuple[tuple[str, ...], ..
         ignorable = not line.strip() or line.lstrip().startswith("#")
         if not ignorable and indentation <= 4:
             break
-        if line.startswith("      - "):
+        if line == "      -" or line.startswith("      - "):
             current_step = [line]
             steps.append(current_step)
         elif current_step is not None:
@@ -285,55 +320,54 @@ def _workflow_scope_has_unsafe_run_defaults(
     lines: tuple[str, ...],
     defaults_indent: str,
 ) -> bool:
-    in_defaults = False
-    in_run = False
-
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        indentation = len(line) - len(line.lstrip())
+    for index, line in enumerate(lines):
         defaults_marker = _workflow_matching_key_marker(
             line,
             defaults_indent,
             "defaults",
         )
-        if defaults_marker is not None:
-            if line.removeprefix(defaults_marker).strip():
-                return True
-            in_defaults = True
-            in_run = False
+        if defaults_marker is None:
             continue
-        if not in_defaults:
-            continue
-        if indentation <= len(defaults_indent):
-            in_defaults = False
-            in_run = False
-            continue
-        run_marker = _workflow_matching_key_marker(
-            line,
-            f"{defaults_indent}  ",
-            "run",
-        )
-        if run_marker is not None:
-            if line.removeprefix(run_marker).strip():
-                return True
-            in_run = True
-            continue
-        if not in_run:
-            continue
-        if indentation <= len(defaults_indent) + 2:
-            in_run = False
-            continue
-        if (
-            _workflow_matching_key_marker(
-                line,
-                f"{defaults_indent}    ",
-                "shell",
-            )
-            is not None
+        if _workflow_strip_yaml_comment(
+            line.removeprefix(defaults_marker).strip()
         ):
             return True
+
+        run_indent: int | None = None
+        for nested_line in lines[index + 1 :]:
+            stripped = nested_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            indentation = len(nested_line) - len(nested_line.lstrip())
+            if indentation <= len(defaults_indent):
+                break
+            nested_indent = " " * indentation
+            run_marker = _workflow_matching_key_marker(
+                nested_line,
+                nested_indent,
+                "run",
+            )
+            if run_marker is not None:
+                if _workflow_strip_yaml_comment(
+                    nested_line.removeprefix(run_marker).strip()
+                ):
+                    return True
+                run_indent = indentation
+                continue
+            if run_indent is None:
+                continue
+            if indentation <= run_indent:
+                run_indent = None
+                continue
+            if (
+                _workflow_matching_key_marker(
+                    nested_line,
+                    nested_indent,
+                    "shell",
+                )
+                is not None
+            ):
+                return True
     return False
 
 
@@ -364,6 +398,8 @@ def _workflow_step_run_body(step: tuple[str, ...]) -> str:
         if marker is None:
             continue
         header = line.removeprefix(marker).strip()
+        if header.startswith(">"):
+            return ""
         if not header or header[0] not in "|>":
             run_indent = len(line) - len(line.lstrip())
             for continuation_line in step[index + 1 :]:
@@ -870,6 +906,23 @@ class RepositoryContractTest(unittest.TestCase):
             "          PLATFORM_RESULT: ${{ needs.platform_tests.result }}\n"
             '        run: test "$PLATFORM_RESULT" = "success"\n'
         )
+        root_scalar_job_decoy = (
+            "name: |\n"
+            "  test:\n"
+            "    needs: platform_tests\n"
+            "    runs-on: ubuntu-latest\n"
+            "on: push\n"
+            "jobs:\n"
+            "  compatibility_tests:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - run: true\n"
+            "  test:\n"
+            "    needs: compatibility_tests\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - run: echo unchecked\n"
+        )
 
         self.assertEqual(_workflow_job_needs(scalar, "test"), ("platform_tests",))
         self.assertEqual(
@@ -929,6 +982,14 @@ class RepositoryContractTest(unittest.TestCase):
             _workflow_job_success_guards(poisoned_step_environment, "test"),
             (),
         )
+        self.assertEqual(
+            _workflow_job_needs(root_scalar_job_decoy, "test"),
+            ("compatibility_tests",),
+        )
+        self.assertEqual(
+            _workflow_job_success_guards(root_scalar_job_decoy, "test"),
+            (),
+        )
 
     def test_ci_success_guard_parser_rejects_non_propagating_steps(self) -> None:
         def guarded_workflow(
@@ -942,6 +1003,7 @@ class RepositoryContractTest(unittest.TestCase):
             extra_env_bindings: tuple[str, ...] = (),
             result_variable: str = "PLATFORM_RESULT",
             runs_on: str = "ubuntu-latest",
+            leading_step_lines: tuple[str, ...] = (),
             trailing_job_lines: tuple[str, ...] = (),
         ) -> str:
             return (
@@ -951,6 +1013,7 @@ class RepositoryContractTest(unittest.TestCase):
                 + f"    runs-on: {runs_on}\n"
                 + "".join(f"    {property_line}\n" for property_line in job_properties)
                 + "    steps:\n"
+                + "".join(f"{line}\n" for line in leading_step_lines)
                 + f"{first_step_line}\n"
                 + "".join(f"        {property_line}\n" for property_line in step_properties)
                 + "        env:\n"
@@ -1045,6 +1108,19 @@ class RepositoryContractTest(unittest.TestCase):
                     "    shell: bash {0}",
                 )
             ),
+            "narrow-workflow-default-shell": (
+                "defaults:\n"
+                " run:\n"
+                "  shell: bash {0}\n"
+                + guarded_workflow()
+            ),
+            "narrow-job-default-shell": guarded_workflow(
+                job_properties=(
+                    "defaults:",
+                    " run:",
+                    "  shell: bash {0}",
+                )
+            ),
             "quoted-workflow-default-shell": (
                 "'defaults':\n"
                 '  "run":\n'
@@ -1136,6 +1212,21 @@ class RepositoryContractTest(unittest.TestCase):
                 run_lines=(
                     '        run: test "$PLATFORM_RESULT" = "success"',
                     "          ; true",
+                )
+            ),
+            "folded-run": guarded_workflow(
+                run_lines=(
+                    "        run: >-",
+                    '          test "$PLATFORM_RESULT" = "success"',
+                    '          test "$PLATFORM_RESULT" = "success"',
+                )
+            ),
+            "bare-dash-poisoning-step": guarded_workflow(
+                leading_step_lines=(
+                    "      -",
+                    "        name: Poison later shell startup",
+                    "        run: |",
+                    '          echo "BASH_ENV=$RUNNER_TEMP/guard-bypass" >> "$GITHUB_ENV"',
                 )
             ),
             "disabled-errexit": guarded_workflow(

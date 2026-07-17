@@ -33,6 +33,9 @@ status context on additional compatibility and platform jobs.
   ignored outside quoted values without truncating later dependencies.
 - A UTF-8 BOM is rejected before root-level defaults or job parsing, so it
   cannot hide a custom default shell from the contract.
+- The parser structurally anchors the single root `jobs` mapping before locating
+  the aggregate job, so job-shaped text inside root block scalars cannot act as
+  a decoy; duplicate, inline, or unsupported root mappings fail closed.
 - Every accepted direct dependency must expose its result and be checked for a
   successful outcome by the aggregate `test` job.
 - Step-scoped result variables count only when the same step checks them;
@@ -51,9 +54,12 @@ status context on additional compatibility and platform jobs.
   an incomplete YAML decoder. Blank lines and full-line comments cannot
   truncate the parsed job or step scope. Inherited workflow/job custom shells,
   echoed assertions, masked failures, disabled errexit, step custom shells,
-  and job-level tolerance are rejected. Inline `run:` scalars also reject
-  deeper-indented physical continuations, preventing folded commands from
-  appending an unvalidated success path after an exact first line.
+  and job-level tolerance are rejected regardless of legal YAML indentation.
+  Bare sequence-item steps are parsed and validated instead of being skipped,
+  and folded `run: >` block scalars are rejected because YAML folding can join
+  physical lines into a different shell command. Inline `run:` scalars also
+  reject deeper-indented physical continuations, preventing folded commands
+  from appending an unvalidated success path after an exact first line.
 
 ## Validation Evidence
 
