@@ -4173,6 +4173,48 @@ class CredentialStagingTest(unittest.TestCase):
             self.assertEqual(len(captured_payloads), 1)
             self.assertEqual(set(captured_payloads[0]), {0})
 
+    @unittest.skipUnless(
+        hasattr(os, "mkfifo") and hasattr(os, "O_NONBLOCK"),
+        "requires POSIX FIFO support",
+    )
+    def test_source_reader_rejects_fifo_without_blocking(self) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            source = pathlib.Path(temporary) / ".credentials.json"
+            os.mkfifo(source, mode=0o600)
+            requested_flags: list[int] = []
+            real_open = os.open
+
+            def guarded_open(
+                path: os.PathLike[str] | str,
+                flags: int,
+                *args: object,
+                **kwargs: object,
+            ) -> int:
+                requested_flags.append(flags)
+                return real_open(path, flags | os.O_NONBLOCK, *args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    claude_linux.os,
+                    "open",
+                    side_effect=guarded_open,
+                ),
+                self.assertRaisesRegex(
+                    claude_linux.LinuxCredentialUnsafe,
+                    "not a regular file",
+                ),
+            ):
+                claude_linux._read_valid_credential(
+                    source,
+                    owner_uid=os.getuid(),
+                    now=now,
+                    required_validity_seconds=3600,
+                )
+
+            self.assertEqual(len(requested_flags), 1)
+            self.assertTrue(requested_flags[0] & os.O_NONBLOCK)
+
     def test_source_close_failure_does_not_mask_validation_error(self) -> None:
         now = time.time()
         with tempfile.TemporaryDirectory() as temporary:
@@ -4620,6 +4662,83 @@ class CredentialStagingTest(unittest.TestCase):
                 manager.__exit__(ValueError, body_error, None)
 
             self.assertEqual(list(helper.iterdir()), [])
+
+    @unittest.skipUnless(
+        hasattr(os, "mkfifo") and hasattr(os, "O_NONBLOCK"),
+        "requires POSIX FIFO support",
+    )
+    def test_private_file_cleanup_unlinks_fifo_without_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / ".credentials.json"
+            os.mkfifo(path, mode=0o600)
+            requested_flags: list[int] = []
+            real_open = os.open
+
+            def guarded_open(
+                target: os.PathLike[str] | str,
+                flags: int,
+                *args: object,
+                **kwargs: object,
+            ) -> int:
+                requested_flags.append(flags)
+                return real_open(target, flags | os.O_NONBLOCK, *args, **kwargs)
+
+            with mock.patch.object(
+                claude_linux.os,
+                "open",
+                side_effect=guarded_open,
+            ):
+                cleanup_error = claude_linux._discard_private_file(path, None)
+
+            self.assertIsNone(cleanup_error)
+            self.assertFalse(path.exists())
+            self.assertEqual(len(requested_flags), 1)
+            self.assertTrue(requested_flags[0] & os.O_NONBLOCK)
+
+    @unittest.skipUnless(
+        hasattr(os, "mkfifo") and hasattr(os, "O_NONBLOCK"),
+        "requires POSIX FIFO support",
+    )
+    def test_private_file_at_cleanup_unlinks_fifo_without_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            name = ".credentials.json"
+            path = root / name
+            os.mkfifo(path, mode=0o600)
+            parent_fd = os.open(
+                root,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            requested_flags: list[int] = []
+            real_open = os.open
+
+            def guarded_open(
+                target: os.PathLike[str] | str,
+                flags: int,
+                *args: object,
+                **kwargs: object,
+            ) -> int:
+                requested_flags.append(flags)
+                return real_open(target, flags | os.O_NONBLOCK, *args, **kwargs)
+
+            try:
+                with mock.patch.object(
+                    claude_linux.os,
+                    "open",
+                    side_effect=guarded_open,
+                ):
+                    cleanup_error = claude_linux._discard_private_file_at(
+                        parent_fd,
+                        name,
+                        None,
+                    )
+            finally:
+                os.close(parent_fd)
+
+            self.assertIsInstance(cleanup_error, OSError)
+            self.assertFalse(path.exists())
+            self.assertEqual(len(requested_flags), 1)
+            self.assertTrue(requested_flags[0] & os.O_NONBLOCK)
 
     def test_unlink_failure_is_primary_after_scrub_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

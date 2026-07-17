@@ -1113,6 +1113,7 @@ def _read_claude_credential_file_from_directory(
 ) -> tuple[bytearray, tuple[int, ...]] | None:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(
             CLAUDE_CREDENTIAL_FILE_NAME,
@@ -1631,6 +1632,7 @@ def _claude_credential_update_lock(name: str) -> Iterator[None]:
     path = pathlib.Path(f"/tmp/codex-claude-{name}-{os.getuid()}.lock")
     flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags, 0o600)
     except OSError as error:

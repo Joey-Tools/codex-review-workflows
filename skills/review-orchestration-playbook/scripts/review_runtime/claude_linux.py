@@ -1752,7 +1752,12 @@ def _read_valid_credential(
     # Retain the timing arguments for caller compatibility. Claude Code 2.1.211+
     # can refresh an expired access token through the private writable copy.
     _ = now, required_validity_seconds
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     open_path: pathlib.Path | str = path.name if dir_fd is not None else path
     try:
         fd = os.open(open_path, flags, dir_fd=dir_fd)
@@ -1962,6 +1967,7 @@ def _discard_private_file(
             os.O_WRONLY
             | getattr(os, "O_CLOEXEC", 0)
             | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
         )
         try:
             fd = os.open(path, flags)
@@ -2102,6 +2108,7 @@ def _discard_private_file_at(
             os.O_WRONLY
             | getattr(os, "O_CLOEXEC", 0)
             | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
         )
         try:
             fd = os.open(name, flags, dir_fd=parent_fd)

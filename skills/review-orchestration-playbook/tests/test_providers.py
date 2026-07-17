@@ -911,6 +911,44 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertNotIn("injected sensitive lock detail", str(raised.exception))
 
+    @unittest.skipUnless(
+        hasattr(os, "mkfifo") and hasattr(os, "O_NONBLOCK"),
+        "requires POSIX FIFO support",
+    )
+    def test_helper_credential_lock_rejects_fifo_without_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fifo = pathlib.Path(temporary) / "credential.lock"
+            os.mkfifo(fifo, mode=0o600)
+            requested_flags: list[int] = []
+            real_open = os.open
+
+            def guarded_open(
+                path: os.PathLike[str] | str,
+                flags: int,
+                *args: object,
+                **kwargs: object,
+            ) -> int:
+                requested_flags.append(flags)
+                return real_open(path, flags | os.O_NONBLOCK, *args, **kwargs)
+
+            with (
+                mock.patch.object(providers.pathlib, "Path", return_value=fifo),
+                mock.patch.object(
+                    providers.os,
+                    "open",
+                    side_effect=guarded_open,
+                ),
+                self.assertRaisesRegex(
+                    ReviewError,
+                    "update lock is not private",
+                ),
+            ):
+                with providers._claude_credential_update_lock("keychain"):
+                    self.fail("FIFO helper lock unexpectedly acquired")
+
+            self.assertEqual(len(requested_flags), 1)
+            self.assertTrue(requested_flags[0] & os.O_NONBLOCK)
+
     def test_claude_keychain_broker_serves_one_in_memory_value(self) -> None:
         if (
             sys.platform != "darwin"
@@ -1250,6 +1288,48 @@ class ProviderPolicyTest(unittest.TestCase):
             self.assertRaises(KeyboardInterrupt),
         ):
             providers._read_claude_credential_file_from_directory(5)
+
+    @unittest.skipUnless(
+        hasattr(os, "mkfifo") and hasattr(os, "O_NONBLOCK"),
+        "requires POSIX FIFO support",
+    )
+    def test_credential_file_reader_rejects_fifo_without_blocking(self) -> None:
+        config_dir = self.claude_pwd_home / ".claude"
+        config_dir.mkdir(mode=0o700)
+        fifo = config_dir / providers.CLAUDE_CREDENTIAL_FILE_NAME
+        os.mkfifo(fifo, mode=0o600)
+        config_descriptor = os.open(
+            config_dir,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        requested_flags: list[int] = []
+        real_open = os.open
+
+        def guarded_open(
+            path: os.PathLike[str] | str,
+            flags: int,
+            *args: object,
+            **kwargs: object,
+        ) -> int:
+            requested_flags.append(flags)
+            return real_open(path, flags | os.O_NONBLOCK, *args, **kwargs)
+
+        try:
+            with (
+                mock.patch.object(providers.os, "open", side_effect=guarded_open),
+                self.assertRaisesRegex(
+                    providers.ClaudeCredentialUnsafe,
+                    "not regular",
+                ),
+            ):
+                providers._read_claude_credential_file_from_directory(
+                    config_descriptor
+                )
+        finally:
+            os.close(config_descriptor)
+
+        self.assertEqual(len(requested_flags), 1)
+        self.assertTrue(requested_flags[0] & os.O_NONBLOCK)
 
     def test_pwd_home_credential_reader_rejects_unsafe_file_or_directory(self) -> None:
         credential_path = self.write_pwd_home_credential(oauth_credential_fixture())
