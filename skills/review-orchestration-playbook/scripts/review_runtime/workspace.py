@@ -292,6 +292,13 @@ class ControlArtifactState:
     directory: ControlDirectoryEvidence
 
 
+class _IncompleteSecretScanSuffix(Exception):
+    pass
+
+
+_INCOMPLETE_SECRET_SCAN_SUFFIX_RULE = "__incomplete-secret-scan-suffix__"
+
+
 @dataclass
 class SecretScanResult:
     blocking_rule: str | None
@@ -299,10 +306,11 @@ class SecretScanResult:
     accepted_candidates: dict[AcceptedSyntheticValue, set[bytes]]
     raw_occurrence_counts: Counter[AcceptedSyntheticValue]
     unembedded_occurrence_counts: Counter[AcceptedSyntheticValue]
+    incomplete_suffix: bool
 
     @classmethod
     def empty(cls) -> "SecretScanResult":
-        return cls(None, Counter(), {}, Counter(), Counter())
+        return cls(None, Counter(), {}, Counter(), Counter(), False)
 
     def merge(self, other: "SecretScanResult") -> None:
         if self.blocking_rule is None:
@@ -2995,6 +3003,7 @@ def _quoted_assignment_may_accept(
     *,
     diff_surface: bool = False,
     prefix_context_complete: bool = True,
+    suffix_context_complete: bool = True,
     event_budget: SecretScanBudget,
 ) -> bool:
     cursor = match.end()
@@ -3089,6 +3098,8 @@ def _quoted_assignment_may_accept(
                 return False, skipped
             if not event_budget.consume_prefix_proof(record_size):
                 return False, skipped
+            if line_end < 0 and not suffix_context_complete:
+                raise _IncompleteSecretScanSuffix
             skipped_diff_bytes += record_size
             cursor = record_end
             crossed_line_boundary = True
@@ -3765,6 +3776,7 @@ def _iter_secret_events(
     *,
     diff_surface: bool = False,
     prefix_context_complete: bool = True,
+    suffix_context_complete: bool = True,
     _event_budget: SecretScanBudget | None = None,
 ) -> Iterator[tuple[str, bytes | None, int, bool, int | None, int | None]]:
     event_budget = _event_budget or SecretScanBudget.default()
@@ -3798,13 +3810,25 @@ def _iter_secret_events(
     for match in QUOTED_SECRET_ASSIGNMENT.finditer(value):
         event_budget.consume()
         candidate = match.group(2)
-        may_accept = _quoted_assignment_may_accept(
-            value,
-            match,
-            diff_surface=diff_surface,
-            prefix_context_complete=prefix_context_complete,
-            event_budget=event_budget,
-        )
+        try:
+            may_accept = _quoted_assignment_may_accept(
+                value,
+                match,
+                diff_surface=diff_surface,
+                prefix_context_complete=prefix_context_complete,
+                suffix_context_complete=suffix_context_complete,
+                event_budget=event_budget,
+            )
+        except _IncompleteSecretScanSuffix:
+            yield (
+                _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE,
+                None,
+                match.end(),
+                False,
+                match.start(),
+                None,
+            )
+            continue
         if not may_accept or not _is_placeholder_secret(candidate.lower()):
             start, candidate_end = match.span(2)
             yield (
@@ -3969,6 +3993,7 @@ def _scan_secret_value(
     capture_accepted_candidates: bool = False,
     diff_surface: bool = False,
     prefix_context_complete: bool = True,
+    suffix_context_complete: bool = True,
     _accepted_index: AcceptedValueIndex | None = None,
     _event_budget: SecretScanBudget | None = None,
     _exact_index: ExactValueIndex | None = None,
@@ -4016,10 +4041,14 @@ def _scan_secret_value(
         value,
         diff_surface=diff_surface,
         prefix_context_complete=prefix_context_complete,
+        suffix_context_complete=suffix_context_complete,
         _event_budget=event_budget,
     ):
         if not minimum_end < end <= upper:
             continue
+        if rule == _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE:
+            result.incomplete_suffix = True
+            return result
         if (
             rule == "generic-secret-assignment"
             and may_accept
@@ -4164,20 +4193,25 @@ def _stream_secret_scan(
         next_committed_end = total_read if at_end else max(0, total_read - overlap)
         local_minimum = max(0, committed_end - pending_offset)
         local_maximum = max(0, next_committed_end - pending_offset)
-        result.merge(
-            _scan_secret_value(
-                pending,
-                accepted_values=accepted,
-                minimum_end=local_minimum,
-                maximum_end=local_maximum,
-                capture_accepted_candidates=capture_accepted_candidates,
-                diff_surface=diff_surface,
-                prefix_context_complete=pending_offset == 0,
-                _accepted_index=accepted_index,
-                _event_budget=event_budget,
-                _continue_after_blocking=_continue_after_blocking,
-            )
+        pending_scan = _scan_secret_value(
+            pending,
+            accepted_values=accepted,
+            minimum_end=local_minimum,
+            maximum_end=local_maximum,
+            capture_accepted_candidates=capture_accepted_candidates,
+            diff_surface=diff_surface,
+            prefix_context_complete=pending_offset == 0,
+            suffix_context_complete=at_end,
+            _accepted_index=accepted_index,
+            _event_budget=event_budget,
+            _continue_after_blocking=_continue_after_blocking,
         )
+        if pending_scan.incomplete_suffix:
+            # Keep the current event boundary and discard provisional counts so
+            # the same assignment is evaluated once its diff record is complete.
+            next_committed_end = committed_end
+        else:
+            result.merge(pending_scan)
         if result.blocking_rule is not None and not _continue_after_blocking:
             blocked = True
             pending = b""

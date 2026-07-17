@@ -1375,6 +1375,54 @@ class PublicPoolScannerTest(unittest.TestCase):
             "generic-secret-assignment",
         )
 
+    def test_diff_opposite_record_continuation_survives_stream_boundary(
+        self,
+    ) -> None:
+        accepted = self.accepted[0]
+        quoted_assignment = (
+            b'-OPENAI_API_KEY = "' + accepted.value + b'",\n'
+        )
+        padding_size = workspace.MAX_SECRET_PREFIX_PROOF_BYTES - 1024
+        padding = b" " + b"x" * padding_size + b"\n"
+        opposite_record = (
+            b"+replacement("
+            + b"x" * (workspace.STREAM_SCAN_OVERLAP + 4096)
+            + b")\n"
+        )
+        adjacent_secret = b'"ActualOpaque' + b'SecretA9Z8Y7"'
+        payload = (
+            padding
+            + quoted_assignment
+            + opposite_record
+            + b"     + "
+            + adjacent_secret
+            + b"\n"
+        )
+
+        scan = workspace._stream_secret_scan(
+            io.BytesIO(payload),
+            size=len(payload),
+            accepted_values=self.accepted,
+            diff_surface=True,
+        )
+
+        self.assertEqual(
+            scan.blocking_rule,
+            "generic-secret-assignment",
+        )
+
+        safe_payload = (
+            padding + quoted_assignment + opposite_record.removesuffix(b"\n")
+        )
+        safe_scan = workspace._stream_secret_scan(
+            io.BytesIO(safe_payload),
+            size=len(safe_payload),
+            accepted_values=self.accepted,
+            diff_surface=True,
+        )
+        self.assertIsNone(safe_scan.blocking_rule)
+        self.assertEqual(safe_scan.accepted_counts[accepted], 1)
+
     def test_dense_accepted_surface_fails_closed_at_the_event_limit(self) -> None:
         accepted = self.accepted[0]
         for label, value in (

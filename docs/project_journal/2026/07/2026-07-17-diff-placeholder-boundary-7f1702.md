@@ -27,6 +27,8 @@ the opposite-side replacement was longer than the trailing proof budget.
   their raw bytes remain covered by the scan's bounded-work accounting.
 - Declaration proof reconstructs the matching base or head prefix instead of
   always reconstructing the head side.
+- A non-final streaming window defers an assignment whose opposite-side record
+  is incomplete, without committing provisional counts or dropping the match.
 - Security regressions keep scanning after opposite-side interleaving and
   continue to reject same-side or shared-context RHS continuations.
 
@@ -35,11 +37,14 @@ the opposite-side replacement was longer than the trailing proof budget.
 - The focused quoted-assignment regressions passed, including opposite-side
   interleaving, same-side and context continuations, base-prefix reconstruction,
   and both per-event and global proof budgets.
+- The streaming-boundary regression failed against the initial candidate and
+  passed after incomplete opposite-side records were deferred; the complete
+  EOF case remains accepted exactly once.
 - The previously blocked frozen `review.diff` passed the patched scanner in a
   redacted local probe.
-- The complete synthetic-token module passed (`85` tests).
+- The complete synthetic-token module passed (`86` tests).
 - The complete review-orchestration suite passed on the refreshed master
-  baseline (`710` tests; `9` skipped).
+  baseline (`711` tests; `9` skipped).
 - Full runtime/test `ruff check` and Python `compileall` passed.
 - Synthetic-token catalog validation returned `public-example-v1` as valid.
 - Skill validation, project-journal validation, and `git diff --check` passed.
