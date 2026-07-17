@@ -27,7 +27,9 @@ status context on additional compatibility and platform jobs.
 - List-form `needs` declarations containing `platform_tests` are accepted for
   synchronized overlays with additional direct dependencies. Inline sequences
   may use YAML's legal single trailing comma, while empty or repeated-comma
-  items still invalidate the complete dependency list.
+  items still invalidate the complete dependency list. The selected job must
+  expose exactly one structural `needs` key; duplicate scalar, list, or quoted
+  spellings invalidate the complete declaration.
 - Indentless YAML block sequences under `needs` are accepted when they remain
   within the current job, including comments and the following job boundary.
 - A sequence item may put one ordinary job-ID scalar on the indented line after
@@ -36,8 +38,9 @@ status context on additional compatibility and platform jobs.
 - Quoted dependency names are normalized consistently in scalar, block-list,
   and inline-list forms; YAML comments, including trailing comments, are
   ignored outside quoted values without truncating later dependencies.
-- A UTF-8 BOM is rejected before root-level defaults or job parsing, so it
-  cannot hide a custom default shell from the contract.
+- Any U+FEFF BOM is rejected before root-level defaults or job parsing,
+  including one placed after leading comments or blank lines, so it cannot
+  create a decoder-dependent key or hide workflow structure from the contract.
 - The parser structurally anchors the single root `jobs` mapping before locating
   the aggregate job, so job-shaped text inside root block scalars cannot act as
   a decoy; duplicate, inline, or unsupported root mappings fail closed.
@@ -46,7 +49,11 @@ status context on additional compatibility and platform jobs.
 - Every accepted direct dependency job must also propagate its own failure.
   Job-level `continue-on-error` accepts only an absent value or the canonical
   unquoted `false` boolean; expressions, tolerant values, duplicate keys, and
-  unstructured YAML nodes fail closed.
+  unstructured YAML nodes fail closed. Ordinary dependency jobs must expose
+  exactly one structural `steps` block, and each step must use exactly one
+  `run` or `uses` key without tolerant `continue-on-error`. Reusable-workflow
+  dependency jobs instead expose one `uses` key without `steps`, `runs-on`, or
+  `continue-on-error`; mixed or duplicate job shapes are rejected.
 - Step-scoped result variables count only when the same step checks them;
   job-scoped bindings are rejected because an earlier step can overwrite them
   through `GITHUB_ENV`.
@@ -86,9 +93,12 @@ status context on additional compatibility and platform jobs.
   from appending an unvalidated success path after an exact first line.
   Multiline single- and double-quoted YAML scalars are outside the accepted
   structural subset, so text resembling step-level `env` or `run` keys inside
-  a quoted `name` cannot become a guard decoy. Each accepted guard step must
-  expose exactly one real `run` key, exactly one real `env` block, and no
-  `uses` key.
+  a quoted `name` cannot become a guard decoy. Optional YAML tags and anchors
+  are stripped in either order and for any number of prefixes before checking
+  the quote boundary. The aggregate `test` job rejects job-level `uses`, and
+  requires one structural `needs` declaration and one `steps` block. Each
+  accepted guard step exposes exactly one real `run` key, exactly one real
+  `env` block, and no `uses` key.
 
 ## Validation Evidence
 
@@ -113,6 +123,16 @@ status context on additional compatibility and platform jobs.
   trailing-comma regressions passed the focused canonical contract suite (`19`
   tests), Ruff, Python compilation, and Actionlint 1.7.12 checks for the live
   workflow plus an Actionlint-valid combined decoy/trailing-comma fixture.
+- The follow-up exact-head structural regressions passed both focused contract
+  files (`19` tests each), Ruff, Python compilation, Actionlint 1.7.12 checks
+  for both live workflows and Actionlint-valid tagged/anchored multiline-job
+  plus tolerated-dependency fixtures, project-journal validation, normalized
+  copy comparison, and diff checks.
+- The U+FEFF follow-up passed both focused contract files (`19` tests each),
+  Ruff, Python compilation, both live workflow checks, project-journal
+  validation, normalized copy comparison, and diff checks. Actionlint 1.7.12
+  rejected the post-comment BOM fixture as an unexpected key, while the
+  contract now rejects the character independently of YAML decoder behavior.
 
 ## Next Steps
 

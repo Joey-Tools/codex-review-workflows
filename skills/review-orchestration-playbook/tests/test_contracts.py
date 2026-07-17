@@ -156,6 +156,11 @@ def _workflow_line_has_unsupported_quoted_scalar(candidate: str) -> bool:
     )
     value = mapping.group("value") if mapping is not None else candidate
     value = value.lstrip()
+    node_property = re.compile(
+        r"(?:&[^\s,\[\]{}]+|!<[^>]+>|![^\s]*)[ \t]+(?P<value>.*)"
+    )
+    while (property_match := node_property.fullmatch(value)) is not None:
+        value = property_match.group("value").lstrip()
     return value[:1] in ("'", '"') and not _workflow_inline_quoted_scalar_is_complete(
         value
     )
@@ -219,7 +224,7 @@ def _workflow_has_unsupported_mapping_key_syntax(lines: tuple[str, ...]) -> bool
 
 def _workflow_job_lines(workflow: str, job_name: str) -> tuple[str, ...]:
     workflow_lines = tuple(workflow.splitlines())
-    if workflow.startswith("\ufeff") or _workflow_has_unsupported_mapping_key_syntax(
+    if "\ufeff" in workflow or _workflow_has_unsupported_mapping_key_syntax(
         workflow_lines
     ):
         return ()
@@ -383,22 +388,25 @@ def _workflow_sequence_values(
 def _workflow_job_needs(workflow: str, job_name: str) -> tuple[str, ...]:
     job_lines = _workflow_job_lines(workflow, job_name)
 
+    needs_entries: list[tuple[int, str]] = []
     for index, line in enumerate(job_lines):
         marker = _workflow_matching_key_marker(line, "    ", "needs")
         if marker is None:
             continue
-        scalar_or_inline = _workflow_strip_yaml_comment(
-            line.removeprefix(marker).strip()
-        )
-        if scalar_or_inline:
-            if scalar_or_inline.startswith("["):
-                return _workflow_inline_sequence_values(scalar_or_inline) or ()
-            dependency = _workflow_dependency_scalar(scalar_or_inline)
-            return (dependency,) if dependency is not None else ()
-        return (
-            _workflow_sequence_values(tuple(job_lines[index + 1 :]), 4) or ()
-        )
-    return ()
+        needs_entries.append((index, marker))
+    if len(needs_entries) != 1:
+        return ()
+
+    index, marker = needs_entries[0]
+    scalar_or_inline = _workflow_strip_yaml_comment(
+        job_lines[index].removeprefix(marker).strip()
+    )
+    if scalar_or_inline:
+        if scalar_or_inline.startswith("["):
+            return _workflow_inline_sequence_values(scalar_or_inline) or ()
+        dependency = _workflow_dependency_scalar(scalar_or_inline)
+        return (dependency,) if dependency is not None else ()
+    return _workflow_sequence_values(tuple(job_lines[index + 1 :]), 4) or ()
 
 
 def _workflow_env_bindings(
@@ -521,9 +529,49 @@ def _workflow_job_propagates_failure(workflow: str, job_name: str) -> bool:
     job_lines = _workflow_job_lines(workflow, job_name)
     if not job_lines:
         return False
-    return _workflow_continue_on_error_is_disabled(
-        _workflow_job_top_level_values(job_lines, "continue-on-error")
+    continue_on_error = _workflow_job_top_level_values(
+        job_lines, "continue-on-error"
     )
+    if not _workflow_continue_on_error_is_disabled(continue_on_error):
+        return False
+
+    needs_values = _workflow_job_top_level_values(job_lines, "needs")
+    if len(needs_values) > 1 or (
+        needs_values and not _workflow_job_needs(workflow, job_name)
+    ):
+        return False
+
+    uses_values = _workflow_job_top_level_values(job_lines, "uses")
+    steps_values = _workflow_job_top_level_values(job_lines, "steps")
+    if len(uses_values) > 1 or len(steps_values) > 1:
+        return False
+    if uses_values:
+        uses = _workflow_strip_yaml_comment(uses_values[0]).strip()
+        return bool(uses) and not (
+            steps_values
+            or continue_on_error
+            or _workflow_job_top_level_values(job_lines, "runs-on")
+            or uses.startswith(("*", "&", "!", "[", "{", "|", ">", "${{"))
+        )
+    if len(steps_values) != 1:
+        return False
+
+    steps = _workflow_job_steps(job_lines)
+    if not steps:
+        return False
+    for step in steps:
+        if not _workflow_continue_on_error_is_disabled(
+            _workflow_step_top_level_values(step, "continue-on-error")
+        ):
+            return False
+        run_values = _workflow_step_top_level_values(step, "run")
+        step_uses_values = _workflow_step_top_level_values(step, "uses")
+        if (len(run_values), len(step_uses_values)) not in ((1, 0), (0, 1)):
+            return False
+        selected_value = (run_values or step_uses_values)[0]
+        if not _workflow_strip_yaml_comment(selected_value).strip():
+            return False
+    return True
 
 
 def _workflow_run_defaults_block_is_unsafe(
@@ -673,7 +721,7 @@ def _workflow_step_run_body(step: tuple[str, ...]) -> str:
 
 
 def _workflow_job_success_guards(workflow: str, job_name: str) -> tuple[str, ...]:
-    if workflow.startswith("\ufeff"):
+    if "\ufeff" in workflow:
         return ()
     job_lines = _workflow_job_lines(workflow, job_name)
     workflow_lines = tuple(workflow.splitlines())
@@ -681,9 +729,12 @@ def _workflow_job_success_guards(workflow: str, job_name: str) -> tuple[str, ...
         return ()
     if _workflow_job_top_level_values(job_lines, "runs-on") != ("ubuntu-latest",):
         return ()
+    declared_dependencies = _workflow_job_needs(workflow, job_name)
+    if not declared_dependencies:
+        return ()
     if any(
         _workflow_scope_has_key(job_lines, "    ", key)
-        for key in ("container", "services", "strategy")
+        for key in ("container", "services", "strategy", "uses")
     ):
         return ()
     if _workflow_scope_has_key(
@@ -745,6 +796,8 @@ def _workflow_job_success_guards(workflow: str, job_name: str) -> tuple[str, ...
         for dependency in step_dependencies:
             if dependency not in guarded_dependencies:
                 guarded_dependencies.append(dependency)
+    if set(guarded_dependencies) != set(declared_dependencies):
+        return ()
     return tuple(guarded_dependencies)
 
 
@@ -1076,6 +1129,28 @@ class RepositoryContractTest(unittest.TestCase):
             "jobs:\n  test:\n    needs: [platform_tests, ,]\n",
             "jobs:\n  test:\n    needs: [ ]\n",
         )
+        duplicate_needs_keys = (
+            (
+                "jobs:\n"
+                "  test:\n"
+                "    needs: platform_tests\n"
+                "    needs: compatibility_tests\n"
+            ),
+            (
+                "jobs:\n"
+                "  test:\n"
+                "    needs:\n"
+                "      - platform_tests\n"
+                "    'needs': [compatibility_tests]\n"
+            ),
+            (
+                "jobs:\n"
+                "  test:\n"
+                '    "needs": platform_tests\n'
+                "    needs:\n"
+                "      - compatibility_tests\n"
+            ),
+        )
         quoted_block_header = (
             "jobs:\n"
             "  test:\n"
@@ -1278,6 +1353,9 @@ class RepositoryContractTest(unittest.TestCase):
         )
         for workflow in malformed_inline_lists:
             self.assertEqual(_workflow_job_needs(workflow, "test"), ())
+        for workflow in duplicate_needs_keys:
+            self.assertEqual(_workflow_job_needs(workflow, "test"), ())
+            self.assertEqual(_workflow_job_success_guards(workflow, "test"), ())
         self.assertEqual(
             _workflow_job_needs(quoted_block_header, "test"),
             ("compatibility_tests", "platform_tests"),
@@ -1345,14 +1423,22 @@ class RepositoryContractTest(unittest.TestCase):
         )
 
     def test_ci_direct_dependency_jobs_propagate_failures(self) -> None:
-        def dependency_workflow(*job_properties: str) -> str:
+        def dependency_workflow(
+            *job_properties: str,
+            include_runs_on: bool = True,
+            step_lines: tuple[str, ...] | None = ("      - run: true",),
+        ) -> str:
             return (
                 "jobs:\n"
                 "  platform_tests:\n"
-                "    runs-on: ubuntu-latest\n"
+                + ("    runs-on: ubuntu-latest\n" if include_runs_on else "")
                 + "".join(f"    {property_line}\n" for property_line in job_properties)
-                + "    steps:\n"
-                "      - run: true\n"
+                + (
+                    "    steps:\n"
+                    + "".join(f"{step_line}\n" for step_line in step_lines)
+                    if step_lines is not None
+                    else ""
+                )
             )
 
         safe_workflows = (
@@ -1360,6 +1446,19 @@ class RepositoryContractTest(unittest.TestCase):
             dependency_workflow("continue-on-error: false"),
             dependency_workflow(
                 "'continue-on-error': false # Failures remain visible."
+            ),
+            dependency_workflow(
+                step_lines=(
+                    "      - continue-on-error: false # Failures remain visible.",
+                    "        run: true",
+                    "      - uses: actions/checkout@v4",
+                )
+            ),
+            dependency_workflow(
+                "needs: setup",
+                "uses: owner/repo/.github/workflows/tests.yml@main",
+                include_runs_on=False,
+                step_lines=None,
             ),
         )
         for workflow in safe_workflows:
@@ -1389,6 +1488,89 @@ class RepositoryContractTest(unittest.TestCase):
                 "continue-on-error: false",
                 "'continue-on-error': false",
             ),
+            "tolerated-step": dependency_workflow(
+                step_lines=(
+                    "      - continue-on-error: true",
+                    "        run: exit 1",
+                )
+            ),
+            "expression-tolerated-step": dependency_workflow(
+                step_lines=(
+                    "      - continue-on-error: ${{ matrix.experimental }}",
+                    "        run: exit 1",
+                )
+            ),
+            "quoted-false-step": dependency_workflow(
+                step_lines=(
+                    "      - continue-on-error: 'false'",
+                    "        run: exit 1",
+                )
+            ),
+            "tagged-false-step": dependency_workflow(
+                step_lines=(
+                    "      - continue-on-error: !!bool false",
+                    "        run: exit 1",
+                )
+            ),
+            "aliased-false-step": dependency_workflow(
+                step_lines=(
+                    "      - name: &tolerance false",
+                    "        continue-on-error: *tolerance",
+                    "        run: exit 1",
+                )
+            ),
+            "duplicate-false-step": dependency_workflow(
+                step_lines=(
+                    "      - continue-on-error: false",
+                    "        'continue-on-error': false",
+                    "        run: exit 1",
+                )
+            ),
+            "flow-tolerated-step": dependency_workflow(
+                step_lines=(
+                    '      - { run: "exit 1", continue-on-error: true }',
+                )
+            ),
+            "run-and-uses-step": dependency_workflow(
+                step_lines=(
+                    "      - uses: actions/checkout@v4",
+                    "        run: true",
+                )
+            ),
+            "duplicate-run-step": dependency_workflow(
+                step_lines=(
+                    "      - run: true",
+                    "        'run': false",
+                )
+            ),
+            "missing-run-or-uses-step": dependency_workflow(
+                step_lines=("      - name: No executable step",)
+            ),
+            "duplicate-needs": dependency_workflow(
+                "needs: setup",
+                "'needs': bootstrap",
+            ),
+            "malformed-needs": dependency_workflow("needs: []"),
+            "duplicate-steps": dependency_workflow("steps: []"),
+            "uses-and-steps": dependency_workflow(
+                "uses: owner/repo/.github/workflows/tests.yml@main"
+            ),
+            "duplicate-uses": dependency_workflow(
+                "uses: owner/repo/.github/workflows/tests.yml@main",
+                "'uses': owner/repo/.github/workflows/tests.yml@stable",
+                include_runs_on=False,
+                step_lines=None,
+            ),
+            "uses-and-runs-on": dependency_workflow(
+                "uses: owner/repo/.github/workflows/tests.yml@main",
+                step_lines=None,
+            ),
+            "uses-and-continue-on-error": dependency_workflow(
+                "uses: owner/repo/.github/workflows/tests.yml@main",
+                "continue-on-error: false",
+                include_runs_on=False,
+                step_lines=None,
+            ),
             "multiline-quoted-decoy": dependency_workflow(
                 "name: 'decoy",
                 "continue-on-error: false",
@@ -1406,32 +1588,41 @@ class RepositoryContractTest(unittest.TestCase):
         )
 
     def test_ci_structural_scan_rejects_multiline_quoted_scalars(self) -> None:
-        multiline_scalars = (
-            (
-                "jobs:",
-                "  test:",
-                "    steps:",
-                "      - name: 'single-quoted decoy",
-                "        env:",
-                "        '",
-            ),
-            (
-                "jobs:",
-                "  test:",
-                "    steps:",
-                '      - name: "double-quoted decoy',
-                "        env:",
-                '        "',
-            ),
+        quoted_scalars = (
+            "'single-quoted decoy",
+            '"double-quoted decoy',
         )
-        for lines in multiline_scalars:
-            self.assertTrue(_workflow_has_unsupported_mapping_key_syntax(lines))
+        node_property_prefixes = (
+            "",
+            "!!str ",
+            "&decoy ",
+            "!!str &decoy ",
+            "&decoy !!str ",
+            "!<tag:yaml.org,2002:str> &first &second ",
+        )
+        for quoted_scalar in quoted_scalars:
+            for prefix in node_property_prefixes:
+                with self.subTest(quoted_scalar=quoted_scalar, prefix=prefix):
+                    self.assertTrue(
+                        _workflow_has_unsupported_mapping_key_syntax(
+                            (
+                                "jobs:",
+                                "  test:",
+                                "    steps:",
+                                f"      - name: {prefix}{quoted_scalar}",
+                                "        env:",
+                                f"        {quoted_scalar[0]}",
+                            )
+                        )
+                    )
 
         self.assertFalse(
             _workflow_has_unsupported_mapping_key_syntax(
                 (
                     "name: 'Joey''s workflow'   ",
                     'run-name: "Guard # status" # Inline comment.',
+                    "description: !!str &description 'single-line scalar'",
+                    'summary: &summary !!str "single-line scalar"',
                     "description: |",
                     "  name: 'shell text can keep an unmatched quote",
                     "jobs:",
@@ -1515,6 +1706,23 @@ class RepositoryContractTest(unittest.TestCase):
             "        run: |-\n"
             '          test "$PLATFORM_RESULT" = "success"\n'
         )
+
+        def prefixed_multiline_job_decoy(prefix: str) -> str:
+            return (
+                "jobs:\n"
+                "  test:\n"
+                "    needs: platform_tests\n"
+                "    if: ${{ always() }}\n"
+                f"    name: {prefix}'decoy\n"
+                "    runs-on: ubuntu-latest\n"
+                "    steps:\n"
+                "      - env:\n"
+                "          PLATFORM_RESULT: ${{ needs.platform_tests.result }}\n"
+                '        run: test "$PLATFORM_RESULT" = "success"\n'
+                "    '\n"
+                "    uses: owner/repo/.github/workflows/tests.yml@main\n"
+            )
+
         multiline_quoted_step_decoy = (
             "jobs:\n"
             "  test:\n"
@@ -1544,6 +1752,30 @@ class RepositoryContractTest(unittest.TestCase):
             ),
             "tolerated-job": guarded_workflow(
                 job_properties=("continue-on-error: true",)
+            ),
+            "duplicate-job-tolerance": guarded_workflow(
+                job_properties=(
+                    "continue-on-error: false",
+                    "'continue-on-error': false",
+                )
+            ),
+            "job-level-uses": guarded_workflow(
+                job_properties=(
+                    "uses: owner/repo/.github/workflows/tests.yml@main",
+                )
+            ),
+            "duplicate-needs-scalar": guarded_workflow(
+                job_properties=("'needs': compatibility_tests",)
+            ),
+            "duplicate-needs-list": guarded_workflow(
+                job_properties=(
+                    '"needs":',
+                    "  - compatibility_tests",
+                )
+            ),
+            "tagged-multiline-job-decoy": prefixed_multiline_job_decoy("!!str "),
+            "anchored-multiline-job-decoy": prefixed_multiline_job_decoy(
+                "&decoy !!str "
             ),
             "inline-steps": guarded_workflow(steps_line="    steps: []"),
             "duplicate-steps": guarded_workflow(
@@ -1737,6 +1969,12 @@ class RepositoryContractTest(unittest.TestCase):
                 "    shell: bash {0}\n"
                 + guarded_workflow()
             ),
+            "comment-prefixed-bom": (
+                "# Leading comments do not make a later BOM structural.\n"
+                "\ufeff"
+                + guarded_workflow()
+            ),
+            "blank-prefixed-bom": "\n\n\ufeff" + guarded_workflow(),
             "workflow-environment": (
                 "env:\n"
                 "  BASH_ENV: /tmp/guard-bypass\n"
