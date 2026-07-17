@@ -4193,9 +4193,16 @@ def _index_exact_values(
     if not descriptors:
         return ExactValueIndex((), 0, {})
     containers: dict[bytes, tuple[tuple[bytes, int], ...]] = {}
-    for raw_value in descriptors:
+    for raw_value, raw_descriptor in descriptors.items():
         containing_matches: list[tuple[bytes, int]] = []
-        for longer_value in descriptors:
+        for longer_value, longer_descriptor in descriptors.items():
+            if longer_descriptor.kind != raw_descriptor.kind:
+                continue
+            if (
+                raw_descriptor.kind == "legacy"
+                and longer_descriptor.exemption_id != raw_descriptor.exemption_id
+            ):
+                continue
             if len(longer_value) <= len(raw_value):
                 continue
             offset = longer_value.find(raw_value)
@@ -4795,12 +4802,12 @@ def prepare_workspace(
                 raise ReviewError(
                     f"the frozen {label} uses the reserved top-level .codex-review path"
                 )
-        _reject_legacy_values_in_frozen_tree_paths(
-            git_view=git_view,
-            object_directory=object_directory,
-            commit=head_sha,
-            legacy_values=catalog_legacy_values,
-        )
+            _reject_legacy_values_in_frozen_tree_paths(
+                git_view=git_view,
+                object_directory=object_directory,
+                commit=commit,
+                legacy_values=catalog_legacy_values,
+            )
         _materialize_frozen_tree(
             git_view=git_view,
             object_directory=object_directory,

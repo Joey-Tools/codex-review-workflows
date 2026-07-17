@@ -637,6 +637,30 @@ class PublicPoolScannerTest(unittest.TestCase):
                 raw_occurrence_values=accepted,
             )
 
+    def test_overlapping_dynamic_occurrences_share_one_containment_domain(
+        self,
+    ) -> None:
+        short_raw = b"RuntimeOpaque" + b"A" * 16 + b"9!"
+        long_raw = b"Prefix" + short_raw + b"Suffix"
+        short = workspace._secret_reduction_descriptor(
+            short_raw,
+            {"generic-secret-assignment"},
+        )
+        long = workspace._secret_reduction_descriptor(
+            long_raw,
+            {"generic-secret-assignment"},
+        )
+
+        scan = workspace._scan_secret_value(
+            long_raw,
+            raw_occurrence_values=(short, long),
+        )
+
+        self.assertEqual(scan.raw_occurrence_counts[short], 1)
+        self.assertEqual(scan.unembedded_occurrence_counts[short], 0)
+        self.assertEqual(scan.raw_occurrence_counts[long], 1)
+        self.assertEqual(scan.unembedded_occurrence_counts[long], 1)
+
     def test_accepted_quoted_value_requires_a_complete_rhs(self) -> None:
         accepted = self.accepted[0]
         exact_assignment = assignment_bytes(b"access_token", accepted.value)
@@ -2779,6 +2803,30 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             self.prepare(repo=repo, base=base, head=head, catalog=catalog)
         self.assertNotIn(LEGACY_A, str(caught.exception))
 
+    def test_deleted_or_renamed_base_legacy_path_remains_blocked(self) -> None:
+        catalog = legacy_catalog(values=(LEGACY_A,))
+        storage = legacy_value_base64(LEGACY_A)
+        cases = {
+            "deleted-raw": (LEGACY_A, None),
+            "renamed-storage": (storage, "safe-name.txt"),
+        }
+        for label, (path_value, destination) in cases.items():
+            with self.subTest(case=label):
+                source = f"fixture-{path_value}.txt"
+                repo, base = self.new_repo({source: "base\n"})
+                if destination is None:
+                    (repo / source).unlink()
+                else:
+                    (repo / source).rename(repo / destination)
+                head = self.commit(repo)
+
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "not allowed in repository paths",
+                ) as caught:
+                    self.prepare(repo=repo, base=base, head=head, catalog=catalog)
+                self.assertNotIn(path_value, str(caught.exception))
+
     def test_legacy_add_and_copy_fail_count_gate(self) -> None:
         catalog = legacy_catalog(values=(LEGACY_A,))
         cases = {
@@ -3314,6 +3362,49 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                         catalog=catalog,
                         exemptions=("historical-fixtures",),
                     )
+
+    def test_reduced_dynamic_container_does_not_change_legacy_embedding(self) -> None:
+        catalog = legacy_catalog(values=(LEGACY_A,))
+        dynamic = "DynamicPrefixA9Z8" + LEGACY_A + "DynamicSuffixQ7W6"
+        repo, base = self.new_repo(
+            {"fixture.cfg": assignment_text("password", dynamic)}
+        )
+        (repo / "fixture.cfg").write_text(
+            assignment_text("access_token", LEGACY_A),
+            encoding="utf-8",
+        )
+        head = self.commit(repo)
+
+        review = self.prepare(
+            repo=repo,
+            base=base,
+            head=head,
+            catalog=catalog,
+            exemptions=("historical-fixtures",),
+        )
+        evidence = self.validate(review, catalog=catalog)
+        legacy = evidence["synthetic_tokens"]["legacy_counts"]
+        reductions = evidence["synthetic_tokens"]["secret_reductions"]
+        self.assertEqual(len(legacy), 1)
+        self.assertEqual(
+            (
+                legacy[0]["base_count"],
+                legacy[0]["head_count"],
+                legacy[0]["base_unembedded_count"],
+                legacy[0]["head_unembedded_count"],
+            ),
+            (1, 1, 1, 1),
+        )
+        self.assertEqual(len(reductions), 1)
+        self.assertEqual(
+            (
+                reductions[0]["base_count"],
+                reductions[0]["head_count"],
+                reductions[0]["base_unembedded_count"],
+                reductions[0]["head_unembedded_count"],
+            ),
+            (1, 0, 1, 0),
+        )
 
     def test_observed_legacy_value_must_not_overlap_authoring_pool(self) -> None:
         overlapping = AUTHORING_VALUES[0] + "_suffix"
