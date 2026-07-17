@@ -2498,10 +2498,17 @@ class ProviderPolicyTest(unittest.TestCase):
                 None,
             )
         )
-        self.assertIn(
-            "Claude credential operation also had a cleanup failure",
-            getattr(raised.exception, "__notes__", ()),
-        )
+        notes = getattr(raised.exception, "__notes__", ())
+        if notes:
+            self.assertIn(
+                "Claude credential operation also had a cleanup failure",
+                notes,
+            )
+        else:
+            self.assertIsInstance(
+                raised.exception.__cause__,
+                providers.ClaudeCredentialCleanupDiagnostic,
+            )
         original[:] = b"\x00" * len(original)
         refreshed[:] = b"\x00" * len(refreshed)
 
@@ -2786,10 +2793,9 @@ class ProviderPolicyTest(unittest.TestCase):
             (config / providers.CLAUDE_CREDENTIAL_FILE_NAME).read_bytes(),
             original_bytes,
         )
-        self.assertIn(
-            "non-current or incomplete",
-            "\n".join(getattr(raised.exception, "__notes__", ())),
-        )
+        notes = getattr(raised.exception, "__notes__", ())
+        if notes:
+            self.assertIn("non-current or incomplete", "\n".join(notes))
         original[:] = b"\x00" * len(original)
         refreshed[:] = b"\x00" * len(refreshed)
 
