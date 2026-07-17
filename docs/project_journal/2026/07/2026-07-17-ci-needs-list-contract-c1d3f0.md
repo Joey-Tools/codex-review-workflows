@@ -39,7 +39,7 @@ status context on additional compatibility and platform jobs.
 
 ## Validation Evidence
 
-- The canonical review-orchestration suite passed (`707` tests; `9` skipped).
+- The canonical review-orchestration suite passed (`708` tests; `9` skipped).
 - The synchronized private-overlay suite passed (`707` tests; `10` skipped).
 - `ruff check` and `git diff --check` passed for both copies.
 
