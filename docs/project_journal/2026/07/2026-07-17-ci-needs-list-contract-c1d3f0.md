@@ -26,9 +26,13 @@ status context on additional compatibility and platform jobs.
 - Scalar `needs: platform_tests` remains accepted for the canonical workflow.
 - List-form `needs` declarations containing `platform_tests` are accepted for
   synchronized overlays with additional direct dependencies.
+- Indentless YAML block sequences under `needs` are accepted when they remain
+  within the current job, including comments and the following job boundary.
 - Quoted dependency names are normalized consistently in scalar, block-list,
   and inline-list forms; YAML comments, including trailing comments, are
   ignored outside quoted values without truncating later dependencies.
+- A UTF-8 BOM is rejected before root-level defaults or job parsing, so it
+  cannot hide a custom default shell from the contract.
 - Every accepted direct dependency must expose its result and be checked for a
   successful outcome by the aggregate `test` job.
 - Step-scoped result variables count only when the same step checks them;
@@ -47,13 +51,16 @@ status context on additional compatibility and platform jobs.
   an incomplete YAML decoder. Blank lines and full-line comments cannot
   truncate the parsed job or step scope. Inherited workflow/job custom shells,
   echoed assertions, masked failures, disabled errexit, step custom shells,
-  and job-level tolerance are rejected.
+  and job-level tolerance are rejected. Inline `run:` scalars also reject
+  deeper-indented physical continuations, preventing folded commands from
+  appending an unvalidated success path after an exact first line.
 
 ## Validation Evidence
 
 - The canonical review-orchestration suite passed (`708` tests; `9` skipped).
 - The synchronized private-overlay suite passed (`708` tests; `10` skipped).
-- `ruff check` and `git diff --check` passed for both copies.
+- `ruff check`, Python compilation, `actionlint`, and `git diff --check` passed
+  for both copies.
 
 ## Next Steps
 

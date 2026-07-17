@@ -159,9 +159,17 @@ def _workflow_job_needs(workflow: str, job_name: str) -> tuple[str, ...]:
                 or dependency_line.lstrip().startswith("#")
             ):
                 continue
-            if dependency_line.startswith("      - "):
+            dependency_marker = next(
+                (
+                    marker
+                    for marker in ("      - ", "    - ")
+                    if dependency_line.startswith(marker)
+                ),
+                None,
+            )
+            if dependency_marker is not None:
                 dependency = _workflow_strip_yaml_comment(
-                    dependency_line.removeprefix("      - ").strip()
+                    dependency_line.removeprefix(dependency_marker).strip()
                 ).strip("'\"")
                 if dependency:
                     dependencies.append(dependency)
@@ -357,6 +365,19 @@ def _workflow_step_run_body(step: tuple[str, ...]) -> str:
             continue
         header = line.removeprefix(marker).strip()
         if not header or header[0] not in "|>":
+            run_indent = len(line) - len(line.lstrip())
+            for continuation_line in step[index + 1 :]:
+                if (
+                    not continuation_line.strip()
+                    or continuation_line.lstrip().startswith("#")
+                ):
+                    continue
+                continuation_indent = len(continuation_line) - len(
+                    continuation_line.lstrip()
+                )
+                if continuation_indent <= run_indent:
+                    break
+                return ""
             return header
         body: list[str] = []
         body_indent: int | None = None
@@ -373,6 +394,8 @@ def _workflow_step_run_body(step: tuple[str, ...]) -> str:
 
 
 def _workflow_job_success_guards(workflow: str, job_name: str) -> tuple[str, ...]:
+    if workflow.startswith("\ufeff"):
+        return ()
     job_lines = _workflow_job_lines(workflow, job_name)
     workflow_lines = tuple(workflow.splitlines())
     if _workflow_has_unsupported_mapping_key_syntax(workflow_lines):
@@ -745,6 +768,23 @@ class RepositoryContractTest(unittest.TestCase):
             "      - compatibility_tests\n"
             "      - platform_tests # Required status dependency.\n"
         )
+        indentless_block_list = (
+            "jobs:\n"
+            "  test:\n"
+            "    needs:\n"
+            "    - compatibility_tests\n"
+            "    # Comments do not end an indentless YAML block list.\n"
+            "\n"
+            "    - platform_tests # Required status dependency.\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - env:\n"
+            "          COMPATIBILITY_RESULT: ${{ needs.compatibility_tests.result }}\n"
+            "          PLATFORM_RESULT: ${{ needs.platform_tests.result }}\n"
+            "        run: |\n"
+            '          test "$COMPATIBILITY_RESULT" = "success"\n'
+            '          test "$PLATFORM_RESULT" = "success"\n'
+        )
         other_job_only = (
             "jobs:\n"
             "  platform_gate:\n"
@@ -853,11 +893,19 @@ class RepositoryContractTest(unittest.TestCase):
             ("compatibility_tests", "platform_tests"),
         )
         self.assertEqual(
+            _workflow_job_needs(indentless_block_list, "test"),
+            ("compatibility_tests", "platform_tests"),
+        )
+        self.assertEqual(
             _workflow_job_needs(other_job_only, "test"),
             ("compatibility_tests",),
         )
         self.assertEqual(
             _workflow_job_success_guards(list_form, "test"),
+            ("compatibility_tests", "platform_tests"),
+        )
+        self.assertEqual(
+            _workflow_job_success_guards(indentless_block_list, "test"),
             ("compatibility_tests", "platform_tests"),
         )
         self.assertEqual(_workflow_job_success_guards(split_step_guard, "test"), ())
@@ -1009,6 +1057,12 @@ class RepositoryContractTest(unittest.TestCase):
                 "    shell: bash {0}\n"
                 + guarded_workflow()
             ),
+            "bom-workflow-default-shell": (
+                "\ufeffdefaults:\n"
+                "  run:\n"
+                "    shell: bash {0}\n"
+                + guarded_workflow()
+            ),
             "workflow-environment": (
                 "env:\n"
                 "  BASH_ENV: /tmp/guard-bypass\n"
@@ -1076,6 +1130,12 @@ class RepositoryContractTest(unittest.TestCase):
             "masked-inline-command": guarded_workflow(
                 run_lines=(
                     '        run: test "$PLATFORM_RESULT" = "success" || true',
+                )
+            ),
+            "continued-inline-command": guarded_workflow(
+                run_lines=(
+                    '        run: test "$PLATFORM_RESULT" = "success"',
+                    "          ; true",
                 )
             ),
             "disabled-errexit": guarded_workflow(
