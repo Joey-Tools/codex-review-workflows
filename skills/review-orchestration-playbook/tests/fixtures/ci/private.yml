@@ -1,0 +1,154 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  platform_tests:
+    name: platform-tests (${{ matrix.os }})
+    needs:
+      - python-39-compatibility
+      - platform-safety
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install Python test dependencies
+        run: |
+          python3 -m pip install --disable-pip-version-check --no-input 'tomli==2.2.1; python_version < "3.11"'
+      - name: Install Linux isolation dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap gcc ripgrep socat
+      - name: Enable unprivileged user namespaces for Linux isolation test
+        if: runner.os == 'Linux'
+        run: |
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Compile synced review helper
+        run: |
+          python3 -m py_compile \
+            personal_codex/skills/review-orchestration-playbook/scripts/isolated_review \
+            personal_codex/skills/review-orchestration-playbook/scripts/review_runtime/*.py
+      - name: Check Linux launcher C syntax
+        run: |
+          cc -std=c11 -O2 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L -fsyntax-only personal_codex/skills/review-orchestration-playbook/scripts/review_runtime/claude_linux_launcher.c
+      - name: Verify canonical review workflow
+        run: |
+          python3 -m unittest discover \
+            -s personal_codex/skills/review-orchestration-playbook/tests \
+            -p 'test_*.py'
+      - name: Verify private overlay sync on macOS
+        if: runner.os == 'macOS'
+        run: |
+          python3 -m unittest discover \
+            -s tests \
+            -p 'test_private_overlay_sync.py'
+      - name: Run real Linux isolation integration test
+        if: runner.os == 'Linux'
+        env:
+          CODEX_REVIEW_RUN_LINUX_ISOLATION_INTEGRATION: "1"
+        run: |
+          python3 -m unittest -v personal_codex/skills/review-orchestration-playbook/tests/test_claude_linux.py
+      - name: Compile private overlay helpers
+        if: runner.os == 'Linux'
+        run: |
+          python3 -m py_compile \
+            scripts/codex_personal_sync.py \
+            scripts/build_personal_codex_package.py \
+            scripts/validate_sync_manifest_changes.py \
+            scripts/private_overlay_release.py \
+            scripts/sync_private_overlay_sources.py \
+            tests/test_private_overlay_package.py \
+            tests/test_private_overlay_sync.py \
+            tests/test_sync_manifest_changes.py
+      - name: Build and verify private overlay
+        if: runner.os == 'Linux'
+        run: |
+          python3 -m unittest discover -s tests
+      - name: Validate sync manifest changes
+        if: runner.os == 'Linux'
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python3 scripts/validate_sync_manifest_changes.py --base-ref "$BASE_REF"
+      - name: Verify waited-delivery review contract
+        if: runner.os == 'Linux'
+        run: |
+          python3 -m unittest discover \
+            -s personal_codex/skills/waited-delivery/tests \
+            -p 'test_*.py'
+
+  python-39-compatibility:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - name: Compile supported runtime
+        run: |
+          python3 -m py_compile \
+            scripts/codex_personal_sync.py \
+            scripts/build_personal_codex_package.py \
+            scripts/validate_sync_manifest_changes.py
+      - name: Run Python 3.9 compatibility regressions
+        run: |
+          python3 -m unittest \
+            tests.test_personal_sync_reconciliation_safety.PendingLinkTransactionSafetyTests.test_empty_record_empty_state_transaction_parses_and_recovers \
+            tests.test_personal_sync_reconciliation_safety.PendingLinkTransactionSafetyTests.test_oversized_json_integer_is_normalized_to_sync_error \
+            tests.test_package_builder_safety.PackageBuilderSafetyTests.test_manifest_parser_reports_deep_json_as_package_error \
+            tests.test_package_builder_safety.PackageBuilderSafetyTests.test_manifest_parser_reports_oversized_integer_as_package_error \
+            tests.test_release_manifest_baseline.ReleaseManifestBaselineTests.test_release_baseline_accepts_verified_release_history \
+            tests.test_sync_manifest_changes.SyncManifestChangeTests.test_manifest_transition_counts_same_target_change_once \
+            tests.test_sync_manifest_changes.ManifestSerializationSafetyTests.test_deep_raw_json_is_reported_as_validation_error \
+            tests.test_sync_manifest_changes.ManifestSerializationSafetyTests.test_oversized_integer_is_reported_as_validation_error
+
+  platform-safety:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Run platform reconciliation safety tests
+        run: python3 -m unittest tests.test_personal_sync_reconciliation_safety
+
+  test:
+    name: test
+    if: ${{ always() }}
+    needs:
+      - platform_tests
+      - python-39-compatibility
+      - platform-safety
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every platform test to pass
+        env:
+          PLATFORM_TESTS_RESULT: ${{ needs.platform_tests.result }}
+          PYTHON_39_RESULT: ${{ needs.python-39-compatibility.result }}
+          PLATFORM_SAFETY_RESULT: ${{ needs.platform-safety.result }}
+        run: |
+          test "$PLATFORM_TESTS_RESULT" = "success"
+          test "$PYTHON_39_RESULT" = "success"
+          test "$PLATFORM_SAFETY_RESULT" = "success"
