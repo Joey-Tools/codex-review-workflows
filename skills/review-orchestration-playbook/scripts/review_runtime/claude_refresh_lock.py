@@ -944,6 +944,7 @@ class ClaudeRefreshLockLease:
         self._cleanup_inconclusive: ClaudeRefreshLockCleanupInconclusive | None = None
         self._release_lock = threading.Lock()
         self._state_lock = threading.RLock()
+        self._operation_lock = threading.Lock()
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
         self._heartbeat_error: BaseException | None = None
@@ -970,7 +971,7 @@ class ClaudeRefreshLockLease:
             self._heartbeat_error = normalized
         return self._heartbeat_error
 
-    def _renew_and_assert_locked(self) -> None:
+    def _renew_and_assert(self) -> None:
         _assert_anchor(self._config_anchor, label="config directory")
         _assert_anchor(self._legacy_parent_anchor, label="legacy lock parent")
         for lock in self._locks:
@@ -980,6 +981,9 @@ class ClaudeRefreshLockLease:
         for lock in self._locks:
             _assert_lock(lock)
 
+    def _shutdown_timeout_seconds(self) -> float:
+        return max(self._protocol.update_seconds * 2.0, 1.0)
+
     def _heartbeat_loop(self) -> None:
         while not self._heartbeat_stop.wait(
             self._protocol.update_seconds
@@ -987,11 +991,16 @@ class ClaudeRefreshLockLease:
             with self._state_lock:
                 if self._release_started:
                     return
+            with self._operation_lock:
+                with self._state_lock:
+                    if self._release_started:
+                        return
                 try:
-                    self._renew_and_assert_locked()
+                    self._renew_and_assert()
                 except BaseException as error:
-                    self._record_failure(error)
-                    self._heartbeat_stop.set()
+                    with self._state_lock:
+                        self._record_failure(error)
+                        self._heartbeat_stop.set()
                     return
 
     def _start_heartbeat(self) -> None:
@@ -1030,14 +1039,28 @@ class ClaudeRefreshLockLease:
                 )
             if self._heartbeat_error is not None:
                 raise self._heartbeat_error
+        with self._operation_lock:
+            with self._state_lock:
+                if self._release_started:
+                    raise ClaudeRefreshLockCompromised(
+                        "Claude refresh-lock lease release already started"
+                    )
+                if self._heartbeat_error is not None:
+                    raise self._heartbeat_error
             try:
                 # Renew synchronously at the commit boundary. Even if earlier I/O
                 # was slow, Claude's 60-second stale detector now sees a fresh lock.
-                self._renew_and_assert_locked()
+                self._renew_and_assert()
             except BaseException as error:
-                failure = self._record_failure(error)
-                self._heartbeat_stop.set()
+                with self._state_lock:
+                    failure = self._record_failure(error)
+                    self._heartbeat_stop.set()
                 raise failure from None
+            with self._state_lock:
+                if self._release_started:
+                    raise ClaudeRefreshLockCompromised(
+                        "Claude refresh-lock lease release already started"
+                    )
 
     def release(self) -> None:
         with self._release_lock:
@@ -1088,7 +1111,7 @@ class ClaudeRefreshLockLease:
                             cleanup_inconclusive is not None
                         )
                         diagnostic = self._mark_cleanup_inconclusive(
-                            "Claude refresh-lock heartbeat did not stop after "
+                            "Claude refresh-lock operations did not quiesce after "
                             "two bounded cleanup attempts"
                         )
                         paths = _refresh_lock_recovery_paths(diagnostic)
@@ -1162,14 +1185,13 @@ class ClaudeRefreshLockLease:
             thread = self._heartbeat_thread
             heartbeat_error = self._heartbeat_error
 
+        shutdown_timeout = self._shutdown_timeout_seconds()
         errors: list[BaseException] = []
         if heartbeat_error is not None:
             errors.append(heartbeat_error)
         if thread is not None:
             try:
-                thread.join(
-                    timeout=max(self._protocol.update_seconds * 2.0, 1.0)
-                )
+                thread.join(timeout=shutdown_timeout)
             except BaseException as error:
                 errors.append(
                     _normalize_operation_error(
@@ -1177,7 +1199,14 @@ class ClaudeRefreshLockLease:
                         error,
                     )
                 )
-            if thread.is_alive():
+            thread_alive = thread.is_alive()
+            with self._state_lock:
+                final_heartbeat_error = self._heartbeat_error
+            if final_heartbeat_error is not None and all(
+                error is not final_heartbeat_error for error in errors
+            ):
+                errors.append(final_heartbeat_error)
+            if thread_alive:
                 errors.append(
                     ClaudeRefreshLockError(
                         "Claude refresh-lock heartbeat did not stop"
@@ -1186,55 +1215,79 @@ class ClaudeRefreshLockLease:
                 primary = _primary_error(errors)
                 assert primary is not None
                 raise primary
-        cleanup_diagnostic = self._mark_cleanup_inconclusive(
-            "Claude refresh-lock descriptor or lock cleanup did not complete"
-        )
-        with self._state_lock:
-            self._cleanup_started = True
-        cleanup_failed = False
-        for lock in reversed(self._locks):
-            try:
-                _remove_owned_lock(lock)
-            except BaseException as error:
-                cleanup_failed = True
-                errors.append(
-                    _normalize_operation_error(
-                        f"cannot release Claude {lock.label} refresh lock",
-                        error,
-                    )
-                )
-        closed_descriptors: set[int] = set()
-        for descriptor in (
-            *(lock.descriptor for lock in self._locks),
-            self._legacy_parent_anchor.descriptor,
-            self._config_anchor.descriptor,
-        ):
-            if descriptor in closed_descriptors:
-                continue
-            closed_descriptors.add(descriptor)
-            try:
-                os.close(descriptor)
-            except BaseException as error:
-                cleanup_failed = True
-                errors.append(
-                    _normalize_operation_error(
-                        "cannot close Claude refresh-lock descriptor",
-                        error,
-                    )
-                )
-        with self._state_lock:
-            self._released = not cleanup_failed
-            if not cleanup_failed:
-                self._cleanup_inconclusive = None
-        primary = _primary_error(errors)
-        if cleanup_failed:
-            assert primary is not None
-            attach_claude_refresh_lock_recovery(
-                primary,
-                cleanup_diagnostic,
+        operation_acquired = False
+        try:
+            operation_acquired = self._operation_lock.acquire(
+                timeout=shutdown_timeout
             )
-        if primary is not None:
+        except BaseException as error:
+            errors.append(
+                _normalize_operation_error(
+                    "cannot quiesce Claude refresh-lock operations",
+                    error,
+                )
+            )
+        if not operation_acquired:
+            errors.append(
+                ClaudeRefreshLockError(
+                    "Claude refresh-lock operations did not quiesce"
+                )
+            )
+            primary = _primary_error(errors)
+            assert primary is not None
             raise primary
+        try:
+            cleanup_diagnostic = self._mark_cleanup_inconclusive(
+                "Claude refresh-lock descriptor or lock cleanup did not complete"
+            )
+            with self._state_lock:
+                self._cleanup_started = True
+            cleanup_failed = False
+            for lock in reversed(self._locks):
+                try:
+                    _remove_owned_lock(lock)
+                except BaseException as error:
+                    cleanup_failed = True
+                    errors.append(
+                        _normalize_operation_error(
+                            f"cannot release Claude {lock.label} refresh lock",
+                            error,
+                        )
+                    )
+            closed_descriptors: set[int] = set()
+            for descriptor in (
+                *(lock.descriptor for lock in self._locks),
+                self._legacy_parent_anchor.descriptor,
+                self._config_anchor.descriptor,
+            ):
+                if descriptor in closed_descriptors:
+                    continue
+                closed_descriptors.add(descriptor)
+                try:
+                    os.close(descriptor)
+                except BaseException as error:
+                    cleanup_failed = True
+                    errors.append(
+                        _normalize_operation_error(
+                            "cannot close Claude refresh-lock descriptor",
+                            error,
+                        )
+                    )
+            with self._state_lock:
+                self._released = not cleanup_failed
+                if not cleanup_failed:
+                    self._cleanup_inconclusive = None
+            primary = _primary_error(errors)
+            if cleanup_failed:
+                assert primary is not None
+                attach_claude_refresh_lock_recovery(
+                    primary,
+                    cleanup_diagnostic,
+                )
+            if primary is not None:
+                raise primary
+        finally:
+            self._operation_lock.release()
 
 
 def acquire_claude_refresh_lock(
