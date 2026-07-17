@@ -172,6 +172,9 @@ class RepositoryContractTest(unittest.TestCase):
         ) + inspect.getsource(
             providers._persist_claude_macos_refreshed_credential_impl
         )
+        macos_recovery_report_source = inspect.getsource(
+            providers._record_claude_secondary_persistence_failure
+        )
         run_review_source = inspect.getsource(providers.run_review)
         auth_outcome_source = inspect.getsource(
             providers._finish_claude_auth_required
@@ -226,16 +229,31 @@ class RepositoryContractTest(unittest.TestCase):
             "_replace_claude_macos_recovery_credential",
             macos_runtime_source,
         )
-        self.assertIn("immediate-if-refreshed", macos_runtime_source)
+        self.assertIn(
+            "guarded-after-broker-quiescence",
+            macos_runtime_source,
+        )
+        self.assertIn(
+            "update_callback=stage_refreshed_credential",
+            macos_runtime_source,
+        )
+        self.assertNotIn(
+            "update_callback=accept_refreshed_credential",
+            macos_runtime_source,
+        )
         self.assertIn("_write_claude_keychain_credential", macos_persist_source)
         self.assertIn("_write_claude_file_credential", macos_persist_source)
         self.assertNotIn("require_unexpired=True", macos_runtime_source)
         self.assertNotIn("require_unexpired=True", macos_persist_source)
+        self.assertIn(
+            'authentication_report["recovery_cleanup_artifact"]',
+            macos_recovery_report_source,
+        )
 
         self.assertIn("stage_claude_credentials", linux_runtime_source)
         self.assertIn("writer_started", linux_runtime_source)
         self.assertIn("writer_quiescent", linux_runtime_source)
-        self.assertIn("writer_started.set()", attempt_source)
+        self.assertIn("on_process_started=writer_started.set", attempt_source)
         self.assertIn("writer_quiescent.set()", attempt_source)
         self.assertIn("retain_for_recovery", linux_staging_source)
         self.assertIn("writer_quiescent is not True", staged_lock_recovery_source)
@@ -278,6 +296,25 @@ class RepositoryContractTest(unittest.TestCase):
                 self.assertIn("macos", normalized)
                 self.assertIn("private recovery carrier", normalized)
                 self.assertIn("copilot fallback", normalized)
+
+        for name, policy in {
+            "AGENTS.md": agents,
+            "README.md": readme,
+            "SKILL.md": skill,
+            "helper-contract.md": helper_contract,
+            "claude-runtime-trust.md": runtime_trust,
+            "project journal": journal,
+        }.items():
+            with self.subTest(macos_quiescence_policy=name):
+                normalized = policy.lower()
+                self.assertRegex(normalized, r"quiesc(?:e|ence)")
+                self.assertIn("recovery_cleanup_artifact", policy)
+                self.assertNotIn("before acknowledging", normalized)
+                self.assertNotIn("every accepted rotation", normalized)
+                self.assertNotIn(
+                    "persist macos broker rotations before",
+                    normalized,
+                )
 
         protocol = claude_refresh_lock.CLAUDE_REFRESH_LOCK_PROTOCOL_2_1_211
         self.assertEqual(protocol.primary_lock_name, ".oauth_refresh.lock")
