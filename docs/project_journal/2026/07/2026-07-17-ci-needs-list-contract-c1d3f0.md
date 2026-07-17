@@ -27,20 +27,24 @@ status context on additional compatibility and platform jobs.
 - List-form `needs` declarations containing `platform_tests` are accepted for
   synchronized overlays with additional direct dependencies.
 - Quoted dependency names are normalized consistently in scalar, block-list,
-  and inline-list forms.
+  and inline-list forms; blank lines and comments within block lists are
+  ignored without truncating later dependencies.
 - Every accepted direct dependency must expose its result and be checked for a
   successful outcome by the aggregate `test` job.
 - Step-scoped result variables count only when the same step checks them;
-  job-scoped result variables remain available to every aggregate step.
+  job-scoped bindings are rejected because an earlier step can overwrite them
+  through `GITHUB_ENV`.
 - Success guards count only for unconditional, non-tolerant default-shell steps
-  whose non-empty commands are exact dependency-success assertions. Comments,
-  echoed assertions, masked failures, disabled errexit, custom shells, and
-  job-level tolerance are rejected.
+  whose non-empty commands are exact dependency-success assertions. The
+  required `always()` condition is scoped to the aggregate `test` job, and
+  inherited workflow/job custom shells, comments, echoed assertions, masked
+  failures, disabled errexit, step custom shells, and job-level tolerance are
+  rejected.
 
 ## Validation Evidence
 
 - The canonical review-orchestration suite passed (`708` tests; `9` skipped).
-- The synchronized private-overlay suite passed (`707` tests; `10` skipped).
+- The synchronized private-overlay suite passed (`708` tests; `10` skipped).
 - `ruff check` and `git diff --check` passed for both copies.
 
 ## Next Steps

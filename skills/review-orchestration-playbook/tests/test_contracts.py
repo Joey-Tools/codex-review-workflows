@@ -48,11 +48,19 @@ def _workflow_job_needs(workflow: str, job_name: str) -> tuple[str, ...]:
         if line == "    needs:":
             dependencies: list[str] = []
             for dependency_line in job_lines[index + 1 :]:
-                if not dependency_line.startswith("      - "):
-                    break
-                dependencies.append(
-                    dependency_line.removeprefix("      - ").strip().strip("'\"")
-                )
+                if (
+                    not dependency_line.strip()
+                    or dependency_line.lstrip().startswith("#")
+                ):
+                    continue
+                if dependency_line.startswith("      - "):
+                    dependencies.append(
+                        dependency_line.removeprefix("      - ")
+                        .strip()
+                        .strip("'\"")
+                    )
+                    continue
+                break
             return tuple(dependencies)
     return ()
 
@@ -125,6 +133,48 @@ def _workflow_job_top_level_values(
     )
 
 
+def _workflow_scope_has_unsafe_run_defaults(
+    lines: tuple[str, ...],
+    defaults_indent: str,
+) -> bool:
+    defaults_marker = f"{defaults_indent}defaults:"
+    run_marker = f"{defaults_indent}  run:"
+    shell_marker = f"{defaults_indent}    shell:"
+    in_defaults = False
+    in_run = False
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indentation = len(line) - len(line.lstrip())
+        if line.startswith(defaults_marker):
+            if line.removeprefix(defaults_marker).strip():
+                return True
+            in_defaults = True
+            in_run = False
+            continue
+        if not in_defaults:
+            continue
+        if indentation <= len(defaults_indent):
+            in_defaults = False
+            in_run = False
+            continue
+        if line.startswith(run_marker):
+            if line.removeprefix(run_marker).strip():
+                return True
+            in_run = True
+            continue
+        if not in_run:
+            continue
+        if indentation <= len(defaults_indent) + 2:
+            in_run = False
+            continue
+        if line.startswith(shell_marker):
+            return True
+    return False
+
+
 def _workflow_step_top_level_values(
     step: tuple[str, ...], key: str
 ) -> tuple[str, ...]:
@@ -168,12 +218,15 @@ def _workflow_step_run_body(step: tuple[str, ...]) -> str:
 
 def _workflow_job_success_guards(workflow: str, job_name: str) -> tuple[str, ...]:
     job_lines = _workflow_job_lines(workflow, job_name)
+    if _workflow_scope_has_unsafe_run_defaults(
+        tuple(workflow.splitlines()), ""
+    ) or _workflow_scope_has_unsafe_run_defaults(job_lines, "    "):
+        return ()
     job_continue_on_error = _workflow_job_top_level_values(
         job_lines, "continue-on-error"
     )
     if job_continue_on_error not in ((), ("false",)):
         return ()
-    job_bindings = _workflow_env_bindings(job_lines, "    ")
     guarded_dependencies: list[str] = []
     for step in _workflow_job_steps(job_lines):
         if _workflow_step_top_level_values(step, "if"):
@@ -186,8 +239,6 @@ def _workflow_job_success_guards(workflow: str, job_name: str) -> tuple[str, ...
         if _workflow_step_top_level_values(step, "shell"):
             continue
         step_bindings = _workflow_env_bindings(step, "        ")
-        effective_bindings = dict(job_bindings)
-        effective_bindings.update(step_bindings)
         run_body = _workflow_step_run_body(step)
         commands = tuple(line.strip() for line in run_body.splitlines() if line.strip())
         if not commands:
@@ -197,7 +248,7 @@ def _workflow_job_success_guards(workflow: str, job_name: str) -> tuple[str, ...
             dependency = next(
                 (
                     candidate
-                    for variable, candidate in effective_bindings.items()
+                    for variable, candidate in step_bindings.items()
                     if candidate is not None
                     and command == f'test "${variable}" = "success"'
                 ),
@@ -454,7 +505,11 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("name: platform-tests (${{ matrix.os }})", workflow)
         self.assertIn("\n  test:\n", workflow)
         self.assertIn("\n    name: test\n", workflow)
-        self.assertIn("if: ${{ always() }}", workflow)
+        test_job_lines = _workflow_job_lines(workflow, "test")
+        self.assertEqual(
+            _workflow_job_top_level_values(test_job_lines, "if"),
+            ("${{ always() }}",),
+        )
         dependencies = _workflow_job_needs(workflow, "test")
         self.assertIn("platform_tests", dependencies)
         self.assertEqual(
@@ -477,6 +532,8 @@ class RepositoryContractTest(unittest.TestCase):
             "  test:\n"
             "    needs:\n"
             "      - compatibility_tests\n"
+            "      # Comments do not end a YAML block list.\n"
+            "\n"
             '      - "platform_tests"\n'
             "    runs-on: ubuntu-latest\n"
             "    steps:\n"
@@ -520,6 +577,8 @@ class RepositoryContractTest(unittest.TestCase):
             "    env:\n"
             "      PLATFORM_RESULT: ${{ needs.platform_tests.result }}\n"
             "    steps:\n"
+            "      - name: Forge a later job environment value\n"
+            '        run: echo "PLATFORM_RESULT=success" >> "$GITHUB_ENV"\n'
             "      - name: Check result\n"
             "        run: test \"$PLATFORM_RESULT\" = \"success\"\n"
         )
@@ -555,6 +614,13 @@ class RepositoryContractTest(unittest.TestCase):
             "      - run: |\n"
             "          test \"$PLATFORM_RESULT\" = \"success\"\n"
         )
+        other_job_always = (
+            "jobs:\n"
+            "  platform_gate:\n"
+            "    if: ${{ always() }}\n"
+            "  test:\n"
+            "    needs: platform_tests\n"
+        )
 
         self.assertEqual(_workflow_job_needs(scalar, "test"), ("platform_tests",))
         self.assertEqual(
@@ -574,18 +640,21 @@ class RepositoryContractTest(unittest.TestCase):
             ("compatibility_tests", "platform_tests"),
         )
         self.assertEqual(_workflow_job_success_guards(split_step_guard, "test"), ())
-        self.assertEqual(
-            _workflow_job_success_guards(job_env_guard, "test"),
-            ("platform_tests",),
-        )
+        self.assertEqual(_workflow_job_success_guards(job_env_guard, "test"), ())
         self.assertEqual(
             _workflow_job_success_guards(shadowed_job_env_guard, "test"),
             (),
         )
         self.assertEqual(_workflow_job_success_guards(name_only_guard, "test"), ())
         self.assertEqual(
-            _workflow_job_success_guards(inline_block_run_guard, "test"),
-            ("platform_tests",),
+            _workflow_job_success_guards(inline_block_run_guard, "test"), ()
+        )
+        self.assertEqual(
+            _workflow_job_top_level_values(
+                _workflow_job_lines(other_job_always, "test"),
+                "if",
+            ),
+            (),
         )
 
     def test_ci_success_guard_parser_rejects_non_propagating_steps(self) -> None:
@@ -628,6 +697,19 @@ class RepositoryContractTest(unittest.TestCase):
                 job_properties=("continue-on-error: true",)
             ),
             "custom-shell": guarded_workflow(step_properties=("shell: bash {0}",)),
+            "workflow-default-shell": (
+                "defaults:\n"
+                "  run:\n"
+                "    shell: bash {0}\n"
+                + guarded_workflow()
+            ),
+            "job-default-shell": guarded_workflow(
+                job_properties=(
+                    "defaults:",
+                    "  run:",
+                    "    shell: bash {0}",
+                )
+            ),
             "commented-command": guarded_workflow(
                 run_lines=(
                     "        run: |",
@@ -660,6 +742,20 @@ class RepositoryContractTest(unittest.TestCase):
         safe_workflows = (
             guarded_workflow(step_properties=("continue-on-error: false",)),
             guarded_workflow(job_properties=("continue-on-error: false",)),
+            (
+                "defaults:\n"
+                "  run:\n"
+                "    working-directory: scripts\n"
+                + guarded_workflow()
+            ),
+            (
+                "jobs:\n"
+                "  other:\n"
+                "    defaults:\n"
+                "      run:\n"
+                "        shell: bash {0}\n"
+                + guarded_workflow().removeprefix("jobs:\n")
+            ),
         )
         for workflow in safe_workflows:
             self.assertEqual(
