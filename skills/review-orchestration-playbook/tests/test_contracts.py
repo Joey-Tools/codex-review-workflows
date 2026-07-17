@@ -114,6 +114,29 @@ def _workflow_job_steps(job_lines: tuple[str, ...]) -> tuple[tuple[str, ...], ..
     return tuple(tuple(step) for step in steps)
 
 
+def _workflow_job_top_level_values(
+    job_lines: tuple[str, ...], key: str
+) -> tuple[str, ...]:
+    marker = f"    {key}:"
+    return tuple(
+        line.removeprefix(marker).strip()
+        for line in job_lines
+        if line.startswith(marker)
+    )
+
+
+def _workflow_step_top_level_values(
+    step: tuple[str, ...], key: str
+) -> tuple[str, ...]:
+    markers = (f"      - {key}:", f"        {key}:")
+    values: list[str] = []
+    for line in step:
+        marker = next((candidate for candidate in markers if line.startswith(candidate)), None)
+        if marker is not None:
+            values.append(line.removeprefix(marker).strip())
+    return tuple(values)
+
+
 def _workflow_step_run_body(step: tuple[str, ...]) -> str:
     for index, line in enumerate(step):
         marker = next(
@@ -145,20 +168,48 @@ def _workflow_step_run_body(step: tuple[str, ...]) -> str:
 
 def _workflow_job_success_guards(workflow: str, job_name: str) -> tuple[str, ...]:
     job_lines = _workflow_job_lines(workflow, job_name)
+    job_continue_on_error = _workflow_job_top_level_values(
+        job_lines, "continue-on-error"
+    )
+    if job_continue_on_error not in ((), ("false",)):
+        return ()
     job_bindings = _workflow_env_bindings(job_lines, "    ")
     guarded_dependencies: list[str] = []
     for step in _workflow_job_steps(job_lines):
+        if _workflow_step_top_level_values(step, "if"):
+            continue
+        step_continue_on_error = _workflow_step_top_level_values(
+            step, "continue-on-error"
+        )
+        if step_continue_on_error not in ((), ("false",)):
+            continue
+        if _workflow_step_top_level_values(step, "shell"):
+            continue
         step_bindings = _workflow_env_bindings(step, "        ")
         effective_bindings = dict(job_bindings)
         effective_bindings.update(step_bindings)
         run_body = _workflow_step_run_body(step)
-        for variable, dependency in effective_bindings.items():
-            if (
-                dependency is not None
-                and dependency not in guarded_dependencies
-                and f'test "${variable}" = "success"' in run_body
-            ):
-                guarded_dependencies.append(dependency)
+        commands = tuple(line.strip() for line in run_body.splitlines() if line.strip())
+        if not commands:
+            continue
+        step_dependencies: list[str] = []
+        for command in commands:
+            dependency = next(
+                (
+                    candidate
+                    for variable, candidate in effective_bindings.items()
+                    if candidate is not None
+                    and command == f'test "${variable}" = "success"'
+                ),
+                None,
+            )
+            if dependency is None:
+                break
+            step_dependencies.append(dependency)
+        else:
+            for dependency in step_dependencies:
+                if dependency not in guarded_dependencies:
+                    guarded_dependencies.append(dependency)
     return tuple(guarded_dependencies)
 
 
@@ -529,6 +580,85 @@ class RepositoryContractTest(unittest.TestCase):
             _workflow_job_success_guards(inline_block_run_guard, "test"),
             ("platform_tests",),
         )
+
+    def test_ci_success_guard_parser_rejects_non_propagating_steps(self) -> None:
+        def guarded_workflow(
+            *,
+            first_step_line: str = "      - name: Check result",
+            step_properties: tuple[str, ...] = (),
+            run_lines: tuple[str, ...] = (
+                '        run: test "$PLATFORM_RESULT" = "success"',
+            ),
+            job_properties: tuple[str, ...] = (),
+        ) -> str:
+            return (
+                "jobs:\n"
+                "  test:\n"
+                "    needs: platform_tests\n"
+                + "".join(f"    {property_line}\n" for property_line in job_properties)
+                + "    steps:\n"
+                + f"{first_step_line}\n"
+                + "".join(f"        {property_line}\n" for property_line in step_properties)
+                + "        env:\n"
+                + "          PLATFORM_RESULT: ${{ needs.platform_tests.result }}\n"
+                + "".join(f"{line}\n" for line in run_lines)
+            )
+
+        unsafe_workflows = {
+            "conditional-after-name": guarded_workflow(
+                step_properties=("if: ${{ false }}",)
+            ),
+            "conditional-first": guarded_workflow(
+                first_step_line="      - if: ${{ false }}"
+            ),
+            "tolerated-after-name": guarded_workflow(
+                step_properties=("continue-on-error: true",)
+            ),
+            "tolerated-first": guarded_workflow(
+                first_step_line="      - continue-on-error: true"
+            ),
+            "tolerated-job": guarded_workflow(
+                job_properties=("continue-on-error: true",)
+            ),
+            "custom-shell": guarded_workflow(step_properties=("shell: bash {0}",)),
+            "commented-command": guarded_workflow(
+                run_lines=(
+                    "        run: |",
+                    '          # test "$PLATFORM_RESULT" = "success"',
+                )
+            ),
+            "echoed-command": guarded_workflow(
+                run_lines=(
+                    "        run: echo 'test \"$PLATFORM_RESULT\" = \"success\"'",
+                )
+            ),
+            "masked-inline-command": guarded_workflow(
+                run_lines=(
+                    '        run: test "$PLATFORM_RESULT" = "success" || true',
+                )
+            ),
+            "disabled-errexit": guarded_workflow(
+                run_lines=(
+                    "        run: |",
+                    "          set +e",
+                    '          test "$PLATFORM_RESULT" = "success"',
+                    "          true",
+                )
+            ),
+        }
+        for name, workflow in unsafe_workflows.items():
+            with self.subTest(name=name):
+                self.assertEqual(_workflow_job_success_guards(workflow, "test"), ())
+
+        safe_workflows = (
+            guarded_workflow(step_properties=("continue-on-error: false",)),
+            guarded_workflow(job_properties=("continue-on-error: false",)),
+        )
+        for workflow in safe_workflows:
+            self.assertEqual(
+                _workflow_job_success_guards(workflow, "test"),
+                ("platform_tests",),
+            )
 
     def test_helper_declares_and_tests_its_minimum_python_runtime(self) -> None:
         entrypoint = (SCRIPTS / "isolated_review").read_text(encoding="utf-8")

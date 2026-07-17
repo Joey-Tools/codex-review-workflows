@@ -32,11 +32,15 @@ status context on additional compatibility and platform jobs.
   successful outcome by the aggregate `test` job.
 - Step-scoped result variables count only when the same step checks them;
   job-scoped result variables remain available to every aggregate step.
+- Success guards count only for unconditional, non-tolerant default-shell steps
+  whose non-empty commands are exact dependency-success assertions. Comments,
+  echoed assertions, masked failures, disabled errexit, custom shells, and
+  job-level tolerance are rejected.
 
 ## Validation Evidence
 
-- The canonical review-orchestration suite passed (`706` tests; `9` skipped).
-- The synchronized private-overlay suite passed (`706` tests; `10` skipped).
+- The canonical review-orchestration suite passed (`707` tests; `9` skipped).
+- The synchronized private-overlay suite passed (`707` tests; `10` skipped).
 - `ruff check` and `git diff --check` passed for both copies.
 
 ## Next Steps
