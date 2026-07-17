@@ -1721,9 +1721,11 @@ def _parse_oauth_credential(payload: bytearray) -> float:
     )
     if not isinstance(value, dict):
         raise LinuxCredentialUnsafe("Claude credential JSON is not an object")
-    oauth = value.get("claudeAiOauth")
-    if not isinstance(oauth, dict):
+    if "claudeAiOauth" not in value:
         raise LinuxCredentialUnavailable("Claude local login is unavailable")
+    oauth = value["claudeAiOauth"]
+    if not isinstance(oauth, dict):
+        raise LinuxCredentialUnsafe("Claude credential JSON is malformed")
     access_token = oauth.get("accessToken")
     refresh_token = oauth.get("refreshToken")
     expires_at = oauth.get("expiresAt")

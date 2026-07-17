@@ -4724,6 +4724,12 @@ class CredentialStagingTest(unittest.TestCase):
             malformed = root / "malformed.json"
             malformed.write_text("{", encoding="utf-8")
             malformed.chmod(0o600)
+            malformed_oauth = root / "malformed-oauth.json"
+            malformed_oauth.write_text(
+                json.dumps({"claudeAiOauth": []}),
+                encoding="utf-8",
+            )
+            malformed_oauth.chmod(0o600)
 
             with self.assertRaises(claude_linux.LinuxCredentialUnavailable):
                 with claude_linux.stage_claude_credentials(
@@ -4757,6 +4763,16 @@ class CredentialStagingTest(unittest.TestCase):
                     pass
             with self.assertRaises(claude_linux.LinuxCredentialUnsafe):
                 with claude_linux.stage_claude_credentials(malformed, helper, now=now):
+                    pass
+            with self.assertRaisesRegex(
+                claude_linux.LinuxCredentialUnsafe,
+                "JSON is malformed",
+            ):
+                with claude_linux.stage_claude_credentials(
+                    malformed_oauth,
+                    helper,
+                    now=now,
+                ):
                     pass
 
     def test_deeply_nested_credential_is_malformed(self) -> None:
