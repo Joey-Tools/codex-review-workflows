@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import itertools
 import json
+import multiprocessing
 import os
 import pathlib
 import re
@@ -73,6 +74,141 @@ def claude_help_fixture(*, safe_mode: str | None = None) -> bytes:
             description = "Supported option."
         lines.append(f"  {option} <value>  {description}")
     return ("\n".join(lines) + "\n").encode()
+
+
+def _blocked_keychain_handler_worker(connection: object, mode: str) -> None:
+    send = getattr(connection, "send")
+    close = getattr(connection, "close")
+    capability = bytes.fromhex("01" * 32)
+    credential = bytearray(b"fixture-keychain-credential")
+    refreshed = oauth_credential_fixture(expires_in_seconds=7200)
+    callback_started = threading.Event()
+    block_callback = threading.Event()
+    retained_payload: bytes | None = None
+
+    def receive_exact(sock: socket.socket, length: int) -> bytes:
+        result = bytearray()
+        while len(result) < length:
+            chunk = sock.recv(length - len(result))
+            if not chunk:
+                raise RuntimeError("keychain broker closed unexpectedly")
+            result.extend(chunk)
+        return bytes(result)
+
+    def blocked_update(_updated: bytearray) -> bool:
+        callback_started.set()
+        block_callback.wait()
+        return False
+
+    def retain_update(updated: bytearray | None) -> BaseException | None:
+        nonlocal retained_payload
+        if updated is None:
+            return None
+        if mode == "recovery":
+            block_callback.wait()
+        retained_payload = bytes(updated)
+        failure = providers.ClaudeCredentialInspectionInconclusive(
+            "fixture recovery carrier retained"
+        )
+        setattr(failure, "_codex_claude_refresh_persistence_failed", True)
+        return failure
+
+    def recovery_timeout_error() -> BaseException:
+        failure = providers.ClaudeCredentialInspectionInconclusive(
+            "fixture recovery timeout"
+        )
+        setattr(failure, "_codex_claude_refresh_persistence_failed", True)
+        return failure
+
+    def write_update(port: int) -> None:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=2.0) as sock:
+                sock.sendall(
+                    capability
+                    + b"W"
+                    + len(refreshed).to_bytes(4, "big")
+                    + refreshed
+                )
+                with contextlib.suppress(OSError):
+                    sock.recv(1)
+        except OSError:
+            pass
+
+    def forward_signal(signum: int, _frame: object) -> None:
+        raise providers.ForwardedSignal(signum)
+
+    if mode == "signal":
+        signal.signal(signal.SIGTERM, forward_signal)
+
+    try:
+        with mock.patch.object(
+            providers,
+            "CLAUDE_KEYCHAIN_SERVER_SHUTDOWN_TIMEOUT_SECONDS",
+            0.15,
+        ), mock.patch.object(
+            providers,
+            "CLAUDE_KEYCHAIN_RECOVERY_TIMEOUT_SECONDS",
+            0.15,
+        ):
+            with providers._claude_keychain_credential_server(
+                credential,
+                capability,
+                update_callback=blocked_update,
+                quiescence_callbacks=(
+                    providers._ClaudeKeychainQuiescenceCallbacks(
+                        abandon=lambda: None,
+                        recover=retain_update,
+                        timeout_error=recovery_timeout_error,
+                    )
+                ),
+            ) as port:
+                with socket.create_connection(
+                    ("127.0.0.1", port),
+                    timeout=2.0,
+                ) as sock:
+                    sock.sendall(capability + b"R")
+                    length = int.from_bytes(receive_exact(sock, 4), "big")
+                    receive_exact(sock, length)
+                writer = threading.Thread(
+                    target=write_update,
+                    args=(port,),
+                    daemon=True,
+                )
+                writer.start()
+                if not callback_started.wait(timeout=2.0):
+                    raise RuntimeError("blocked update callback did not start")
+                send(("ready", mode))
+                if mode in {"timeout", "recovery"}:
+                    raise providers.ReviewTimeoutError("fixture review timeout")
+                while True:
+                    time.sleep(1.0)
+    except BaseException as error:
+        send(
+            (
+                "result",
+                type(error).__name__,
+                bool(
+                    getattr(
+                        error,
+                        (
+                            "_codex_claude_keychain_handler_"
+                            "quiescence_unproven"
+                        ),
+                        False,
+                    )
+                ),
+                bool(
+                    getattr(
+                        error,
+                        "_codex_claude_refresh_persistence_failed",
+                        False,
+                    )
+                ),
+                retained_payload == refreshed,
+            )
+        )
+    finally:
+        close()
 
 
 class ProviderPolicyTest(unittest.TestCase):
@@ -727,6 +863,103 @@ class ProviderPolicyTest(unittest.TestCase):
         thread.join.assert_not_called()
         self.assertEqual(credential, bytearray(len(credential)))
 
+    def test_keychain_broker_propagates_serve_failure_after_ready(self) -> None:
+        credential = bytearray(b"fixture-value")
+        serve_error = RuntimeError("serve loop failed")
+        server = mock.Mock()
+        server.server_address = ("127.0.0.1", 43211)
+        server.wait_until_serving.return_value = True
+        server.serve_forever.side_effect = serve_error
+        server.begin_closing.return_value = ()
+        server.wait_for_handlers.return_value = True
+        server.serve_error.return_value = serve_error
+        server.handler_errors.return_value = ()
+
+        with (
+            mock.patch.object(
+                providers,
+                "_ClaudeKeychainCredentialServer",
+                return_value=server,
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeCredentialInspectionInconclusive,
+                "cannot shut down",
+            ),
+        ):
+            with providers._claude_keychain_credential_server(
+                credential,
+                bytes.fromhex("01" * 32),
+            ):
+                pass
+
+        server.scrub_initial_credential.assert_called_once_with()
+        self.assertEqual(credential, bytearray(len(credential)))
+
+    @unittest.skipUnless(hasattr(signal, "SIGTERM"), "requires SIGTERM")
+    def test_blocked_keychain_handler_preserves_timeout_and_signal(self) -> None:
+        context = multiprocessing.get_context("spawn")
+        for mode, expected_error, recovery_completed in (
+            ("timeout", "ReviewTimeoutError", True),
+            ("signal", "ForwardedSignal", True),
+            ("recovery", "ReviewTimeoutError", False),
+        ):
+            with self.subTest(mode=mode):
+                parent, child = context.Pipe(duplex=False)
+                process = context.Process(
+                    target=_blocked_keychain_handler_worker,
+                    args=(child, mode),
+                )
+                process.start()
+                child.close()
+                messages: list[tuple[object, ...]] = []
+                try:
+                    self.assertTrue(
+                        parent.poll(5.0),
+                        "credential-server worker did not become ready",
+                    )
+                    ready = parent.recv()
+                    if (
+                        len(ready) >= 2
+                        and ready[0] == "result"
+                        and ready[1] == "ClaudeLoopbackUnavailable"
+                    ):
+                        process.join(timeout=2.0)
+                        self.skipTest(
+                            "loopback bind is unavailable in the current sandbox"
+                        )
+                    self.assertEqual(ready, ("ready", mode))
+                    if mode == "signal":
+                        os.kill(process.pid, signal.SIGTERM)
+                    self.assertTrue(
+                        parent.poll(5.0),
+                        "credential-server worker did not propagate control flow",
+                    )
+                    messages.append(parent.recv())
+                    process.join(timeout=2.0)
+                    self.assertFalse(
+                        process.is_alive(),
+                        "credential-server worker remained alive after deadline",
+                    )
+                finally:
+                    if process.is_alive():
+                        process.kill()
+                        process.join(timeout=2.0)
+                    parent.close()
+
+                self.assertEqual(process.exitcode, 0)
+                self.assertEqual(
+                    messages,
+                    [
+                        (
+                            "result",
+                            expected_error,
+                            True,
+                            True,
+                            recovery_completed,
+                        )
+                    ],
+                )
+
     def test_recv_exact_scrubs_partial_buffer_on_eof_or_error(self) -> None:
         class PartialSocket:
             def __init__(self, *, fail: bool) -> None:
@@ -749,6 +982,38 @@ class ProviderPolicyTest(unittest.TestCase):
                 sock = PartialSocket(fail=fail)
                 self.assertIsNone(providers._recv_exact(sock, 8))  # type: ignore[arg-type]
                 self.assertEqual(sock.buffer, bytearray(8))
+
+    def test_keychain_server_pending_generation_preserves_latest_update(
+        self,
+    ) -> None:
+        try:
+            server = providers._ClaudeKeychainCredentialServer(
+                None,
+                bytes.fromhex("01" * 32),
+                None,
+            )
+        except OSError:
+            self.skipTest("loopback bind is unavailable in the current sandbox")
+        first = bytearray(b"first-rotation")
+        second = bytearray(b"latest-rotation")
+        pending: bytearray | None = None
+        try:
+            first_generation = server.stage_pending_update(first)
+            second_generation = server.stage_pending_update(second)
+            assert first_generation is not None
+            assert second_generation is not None
+            server.clear_pending_update(first_generation)
+            pending = server.abandon_and_detach_pending_update()
+            self.assertEqual(pending, second)
+            server.clear_pending_update(second_generation)
+            self.assertIsNone(server.stage_pending_update(first))
+        finally:
+            if pending is not None:
+                pending[:] = b"\x00" * len(pending)
+            server.server_close()
+            server.scrub_initial_credential()
+            first[:] = b"\x00" * len(first)
+            second[:] = b"\x00" * len(second)
 
     def test_keychain_update_script_shape_margin_and_scrubbing(self) -> None:
         with mock.patch.object(
@@ -1063,7 +1328,8 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(stdin_update.returncode, 64)
         self.assertEqual(direct_update.returncode, 64)
         self.assertEqual(credential, bytearray(len(credential)))
-        self.assertFalse(providers._ClaudeKeychainCredentialServer.daemon_threads)
+        self.assertTrue(providers._ClaudeKeychainCredentialServer.daemon_threads)
+        self.assertFalse(providers._ClaudeKeychainCredentialServer.block_on_close)
 
     @mock.patch.object(providers, "run_bounded_capture")
     def test_keychain_prefetch_uses_fixed_service_and_account(
@@ -1893,7 +2159,7 @@ class ProviderPolicyTest(unittest.TestCase):
         persist_credential.return_value = updated_snapshot
 
         @contextlib.contextmanager
-        def broker(_credential, _capability, *, update_callback=None):
+        def broker(_credential, _capability, *, update_callback=None, **_kwargs):
             assert update_callback is not None
             self.assertTrue(update_callback(refreshed))
             yield 43211
@@ -1961,7 +2227,7 @@ class ProviderPolicyTest(unittest.TestCase):
         callback_payload: bytearray | None = None
 
         @contextlib.contextmanager
-        def broker(_credential, _capability, *, update_callback=None):
+        def broker(_credential, _capability, *, update_callback=None, **_kwargs):
             nonlocal callback_payload
             assert update_callback is not None
             callback_payload = bytearray(refreshed_bytes)
@@ -2103,7 +2369,7 @@ class ProviderPolicyTest(unittest.TestCase):
         second_bytes = bytes(second)
 
         @contextlib.contextmanager
-        def broker(_credential, _capability, *, update_callback=None):
+        def broker(_credential, _capability, *, update_callback=None, **_kwargs):
             assert update_callback is not None
             self.assertFalse(update_callback(first))
             first[:] = b"\x00" * len(first)
@@ -2183,7 +2449,7 @@ class ProviderPolicyTest(unittest.TestCase):
             real_write(descriptor, payload)
 
         @contextlib.contextmanager
-        def broker(_credential, _capability, *, update_callback=None):
+        def broker(_credential, _capability, *, update_callback=None, **_kwargs):
             assert update_callback is not None
             self.assertFalse(update_callback(first))
             first[:] = b"\x00" * len(first)
@@ -2269,7 +2535,7 @@ class ProviderPolicyTest(unittest.TestCase):
         callback_payload: bytearray | None = None
 
         @contextlib.contextmanager
-        def broker(_credential, _capability, *, update_callback=None):
+        def broker(_credential, _capability, *, update_callback=None, **_kwargs):
             nonlocal callback_payload
             assert update_callback is not None
             callback_payload = bytearray(refreshed_bytes)
@@ -2347,7 +2613,7 @@ class ProviderPolicyTest(unittest.TestCase):
         )
 
         @contextlib.contextmanager
-        def broker(_credential, _capability, *, update_callback=None):
+        def broker(_credential, _capability, *, update_callback=None, **_kwargs):
             assert update_callback is not None
             self.assertFalse(update_callback(bytearray(b"{}")))
             yield 43211
@@ -2386,6 +2652,198 @@ class ProviderPolicyTest(unittest.TestCase):
         persist.assert_not_called()
         retain.assert_not_called()
 
+    def test_shared_recovery_candidate_reports_concurrent_owner(self) -> None:
+        credential = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        expected = bytes(credential)
+        recovery_root = providers._claude_macos_recovery_root(self.review)
+        candidate = recovery_root / "claude-carrier-concurrent-owner"
+        owner_started_write = threading.Event()
+        release_owner = threading.Event()
+        owner_results: list[pathlib.Path] = []
+        owner_errors: list[BaseException] = []
+        real_write = providers._write_all_to_descriptor
+
+        def blocking_write(descriptor: int, payload: bytearray) -> None:
+            owner_started_write.set()
+            if not release_owner.wait(timeout=2.0):
+                raise RuntimeError("fixture recovery owner was not released")
+            real_write(descriptor, payload)
+
+        def retain_as_owner() -> None:
+            try:
+                owner_results.append(
+                    providers._retain_claude_macos_refreshed_credential(
+                        self.review,
+                        credential,
+                        requested_carrier_root=candidate,
+                    )
+                )
+            except BaseException as error:
+                owner_errors.append(error)
+
+        owner = threading.Thread(target=retain_as_owner)
+        with mock.patch.object(
+            providers,
+            "_write_all_to_descriptor",
+            side_effect=blocking_write,
+        ):
+            owner.start()
+            try:
+                self.assertTrue(owner_started_write.wait(timeout=2.0))
+                with self.assertRaises(
+                    providers.ClaudeCredentialInspectionInconclusive
+                ) as raised:
+                    providers._retain_claude_macos_refreshed_credential(
+                        self.review,
+                        bytearray(expected),
+                        requested_carrier_root=candidate,
+                    )
+            finally:
+                release_owner.set()
+                owner.join(timeout=2.0)
+
+        self.assertFalse(owner.is_alive())
+        self.assertEqual(owner_errors, [])
+        self.assertEqual(owner_results, [candidate])
+        self.assertEqual(
+            getattr(
+                raised.exception,
+                "_codex_claude_retained_credential_carrier",
+                None,
+            ),
+            str(candidate),
+        )
+        self.assert_macos_recovery_carrier(raised.exception, expected)
+        credential[:] = b"\x00" * len(credential)
+
+    @mock.patch.object(providers, "_persist_claude_macos_refreshed_credential")
+    @mock.patch.object(providers, "_claude_keychain_credential_server")
+    @mock.patch.object(providers, "_select_claude_macos_credential")
+    def test_unquiescent_handler_retains_latest_refreshed_credential(
+        self,
+        select_credential: mock.Mock,
+        credential_server: mock.Mock,
+        persist_credential: mock.Mock,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        refreshed_bytes = bytes(refreshed)
+        select_credential.return_value = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
+                keychain_digest=providers._claude_credential_digest(original),
+                file_digest=None,
+                file_snapshot=None,
+            ),
+        )
+        updated_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=providers._claude_credential_digest(refreshed),
+            file_digest=None,
+            file_snapshot=None,
+        )
+        persistence_started = threading.Event()
+        release_persistence = threading.Event()
+
+        def persist(*_args: object) -> providers._ClaudeMacOSCarrierSnapshot:
+            persistence_started.set()
+            if not release_persistence.wait(timeout=2.0):
+                raise RuntimeError("fixture persistence was not released")
+            return updated_snapshot
+
+        persist_credential.side_effect = persist
+
+        @contextlib.contextmanager
+        def broker(
+            _credential: bytearray,
+            _capability: bytes,
+            *,
+            update_callback: Callable[[bytearray], bool] | None = None,
+            quiescence_callbacks: (
+                providers._ClaudeKeychainQuiescenceCallbacks | None
+            ) = None,
+        ):
+            self.assertIsNotNone(update_callback)
+            self.assertIsNotNone(quiescence_callbacks)
+            callback_results: list[bool] = []
+            callback_thread: threading.Thread | None = None
+            try:
+                assert update_callback is not None
+                callback_thread = threading.Thread(
+                    target=lambda: callback_results.append(
+                        update_callback(refreshed)
+                    ),
+                )
+                callback_thread.start()
+                self.assertTrue(persistence_started.wait(timeout=2.0))
+                yield 43211
+            finally:
+                assert quiescence_callbacks is not None
+                try:
+                    persistence_error = (
+                        providers._bounded_claude_keychain_quiescence_recovery(
+                            quiescence_callbacks,
+                            bytearray(refreshed),
+                        )
+                    )
+                finally:
+                    release_persistence.set()
+                    if callback_thread is not None:
+                        callback_thread.join(timeout=2.0)
+                self.assertEqual(callback_results, [False])
+                failure = providers.ClaudeCredentialInspectionInconclusive(
+                    "fixture handler quiescence failure"
+                )
+                setattr(
+                    failure,
+                    (
+                        "_codex_claude_keychain_handler_"
+                        "quiescence_unproven"
+                    ),
+                    True,
+                )
+                if persistence_error is not None:
+                    providers._add_claude_persistence_note(
+                        failure,
+                        persistence_error,
+                    )
+                refreshed[:] = b"\x00" * len(refreshed)
+                raise failure
+
+        credential_server.side_effect = broker
+        common.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {"authentication": {}, "phase": "runtime-launching"},
+        )
+
+        with self.assertRaises(
+            providers.ClaudeCredentialInspectionInconclusive
+        ) as raised:
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+            ):
+                pass
+
+        carrier = self.assert_macos_recovery_carrier(
+            raised.exception,
+            refreshed_bytes,
+        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
+        self.assertEqual(
+            report["authentication"]["refresh_persistence"],
+            "failed-after-attempt",
+        )
+        self.assertEqual(
+            report["authentication"]["recovery_carrier"],
+            str(carrier),
+        )
+        self.assertEqual(original, b"\x00" * len(original))
+        self.assertEqual(refreshed, b"\x00" * len(refreshed))
+        persist_credential.assert_called_once()
+
     @mock.patch.object(
         providers,
         "_persist_claude_macos_refreshed_credential",
@@ -2414,7 +2872,7 @@ class ProviderPolicyTest(unittest.TestCase):
         )
 
         @contextlib.contextmanager
-        def broker(_credential, _capability, *, update_callback=None):
+        def broker(_credential, _capability, *, update_callback=None, **_kwargs):
             assert update_callback is not None
             self.assertFalse(update_callback(refreshed))
             refreshed[:] = b"\x00" * len(refreshed)
@@ -2474,7 +2932,7 @@ class ProviderPolicyTest(unittest.TestCase):
         forwarded = providers.ForwardedSignal(signal.SIGTERM)
 
         @contextlib.contextmanager
-        def broker(_credential, _capability, *, update_callback=None):
+        def broker(_credential, _capability, *, update_callback=None, **_kwargs):
             assert update_callback is not None
             self.assertFalse(update_callback(refreshed))
             refreshed[:] = b"\x00" * len(refreshed)
@@ -2536,7 +2994,7 @@ class ProviderPolicyTest(unittest.TestCase):
         forwarded = providers.ForwardedSignal(signal.SIGTERM)
 
         @contextlib.contextmanager
-        def broker(_credential, _capability, *, update_callback=None):
+        def broker(_credential, _capability, *, update_callback=None, **_kwargs):
             assert update_callback is not None
             self.assertFalse(update_callback(refreshed))
             refreshed[:] = b"\x00" * len(refreshed)
@@ -2634,7 +3092,7 @@ class ProviderPolicyTest(unittest.TestCase):
         persist_credential.side_effect = persist
 
         @contextlib.contextmanager
-        def broker(_credential, _capability, *, update_callback=None):
+        def broker(_credential, _capability, *, update_callback=None, **_kwargs):
             assert update_callback is not None
             self.assertTrue(update_callback(first))
             self.assertTrue(update_callback(second))
@@ -3216,7 +3674,7 @@ class ProviderPolicyTest(unittest.TestCase):
         )
 
         @contextlib.contextmanager
-        def broker(_credential, _capability, *, update_callback=None):
+        def broker(_credential, _capability, *, update_callback=None, **_kwargs):
             assert update_callback is not None
             self.assertFalse(update_callback(refreshed))
             yield 43211

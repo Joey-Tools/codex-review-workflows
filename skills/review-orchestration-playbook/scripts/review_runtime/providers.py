@@ -186,6 +186,10 @@ CLAUDE_KEYCHAIN_BROKER_CAPABILITY_BYTES = 32
 CLAUDE_KEYCHAIN_BROKER_TIMEOUT_SECONDS = 20.0
 CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES = 64 * 1024
 CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS = 5.0
+CLAUDE_KEYCHAIN_SERVER_START_TIMEOUT_SECONDS = 5.0
+CLAUDE_KEYCHAIN_SERVER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+CLAUDE_KEYCHAIN_RECOVERY_TIMEOUT_SECONDS = 5.0
+CLAUDE_KEYCHAIN_SERVER_POLL_INTERVAL_SECONDS = 0.05
 CLAUDE_CREDENTIAL_UPDATE_LOCK_TIMEOUT_SECONDS = 5.0
 CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES = 1024 * 1024
 CLAUDE_KEYCHAIN_SECURITY_STDIN_LIMIT_BYTES = 4032
@@ -2061,6 +2065,8 @@ def _claude_macos_recovery_root(review: ReviewWorkspace) -> pathlib.Path:
 def _retain_claude_macos_refreshed_credential(
     review: ReviewWorkspace,
     credential: bytearray,
+    *,
+    requested_carrier_root: pathlib.Path | None = None,
 ) -> pathlib.Path:
     _validate_claude_local_credential(
         credential,
@@ -2070,12 +2076,26 @@ def _retain_claude_macos_refreshed_credential(
     carrier_root: pathlib.Path | None = None
     config_dir: pathlib.Path | None = None
     try:
-        carrier_root = pathlib.Path(
-            tempfile.mkdtemp(
-                prefix="claude-carrier-",
-                dir=recovery_root,
+        if requested_carrier_root is None:
+            carrier_root = pathlib.Path(
+                tempfile.mkdtemp(
+                    prefix="claude-carrier-",
+                    dir=recovery_root,
+                )
             )
-        )
+        else:
+            if (
+                not requested_carrier_root.is_absolute()
+                or requested_carrier_root.parent != recovery_root
+                or not requested_carrier_root.name.startswith(
+                    "claude-carrier-"
+                )
+            ):
+                raise ClaudeCredentialInspectionInconclusive(
+                    "the requested macOS Claude recovery carrier path is unsafe"
+                )
+            requested_carrier_root.mkdir(mode=0o700)
+            carrier_root = requested_carrier_root
         _create_or_validate_claude_runtime_directory(
             carrier_root,
             private=True,
@@ -2090,6 +2110,26 @@ def _retain_claude_macos_refreshed_credential(
             "cannot create a private macOS Claude recovery carrier"
         )
         failure.__cause__ = error
+        candidate_root = carrier_root
+        if (
+            candidate_root is None
+            and requested_carrier_root is not None
+            and isinstance(error, FileExistsError)
+        ):
+            # Another recovery owner can win creation of the shared candidate.
+            # Report that exact path even though this caller never owned it.
+            candidate_root = requested_carrier_root
+        if candidate_root is not None:
+            setattr(
+                failure,
+                "_codex_claude_retained_credential_carrier",
+                str(candidate_root),
+            )
+            setattr(
+                failure,
+                "_codex_claude_refresh_persistence_failed",
+                True,
+            )
         cleanup_errors: list[BaseException] = []
         for directory in (config_dir, carrier_root):
             if directory is None:
@@ -2953,12 +2993,7 @@ class _ClaudeKeychainCredentialHandler(socketserver.BaseRequestHandler):
             return
         operation = _recv_exact(self.request, 1)
         if operation == b"R":
-            credential = bytearray()
-            with server.credential_lock:
-                if not server.consumed and server.credential is not None:
-                    server.consumed = True
-                    credential = server.credential
-                    server.credential = None
+            credential = server.take_initial_credential()
             try:
                 self.request.sendall(struct.pack("!I", len(credential)))
                 if credential:
@@ -2980,7 +3015,13 @@ class _ClaudeKeychainCredentialHandler(socketserver.BaseRequestHandler):
         if raw_credential is None:
             return
         updated_credential = raw_credential
+        pending_generation: int | None = None
         try:
+            pending_generation = server.stage_pending_update(
+                updated_credential
+            )
+            if pending_generation is None:
+                return
             with server.update_lock:
                 with server.credential_lock:
                     read_completed = server.consumed
@@ -2997,12 +3038,15 @@ class _ClaudeKeychainCredentialHandler(socketserver.BaseRequestHandler):
         except OSError:
             return
         finally:
+            if pending_generation is not None:
+                server.clear_pending_update(pending_generation)
             updated_credential[:] = b"\x00" * len(updated_credential)
 
 
 class _ClaudeKeychainCredentialServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
-    daemon_threads = False
+    daemon_threads = True
+    block_on_close = False
 
     def __init__(
         self,
@@ -3011,13 +3055,360 @@ class _ClaudeKeychainCredentialServer(socketserver.ThreadingTCPServer):
         update_callback: Callable[[bytearray], bool] | None,
     ) -> None:
         super().__init__(("127.0.0.1", 0), _ClaudeKeychainCredentialHandler)
-        self.credential = credential
+        self.credential = (
+            bytearray(credential) if credential is not None else None
+        )
         self.capability = capability
         self.credential_lock = threading.Lock()
         self.consumed = False
         self.update_callback = update_callback
         self.update_lock = threading.Lock()
         self.updated = False
+        self._handler_condition = threading.Condition()
+        self._handler_threads: set[threading.Thread] = set()
+        self._handler_sockets: dict[threading.Thread, socket.socket] = {}
+        self._handler_errors: list[BaseException] = []
+        self._closing = False
+        self._abandoned = threading.Event()
+        self._pending_update_lock = threading.Lock()
+        self._pending_update: tuple[int, bytearray] | None = None
+        self._pending_generation = 0
+        self._serve_condition = threading.Condition()
+        self._serving = False
+        self._serve_stopped = False
+        self._serve_error: BaseException | None = None
+
+    def process_request(
+        self,
+        request: socket.socket,
+        client_address: tuple[str, int],
+    ) -> None:
+        thread = threading.Thread(
+            target=self.process_request_thread,
+            args=(request, client_address),
+            daemon=True,
+            name="claude-review-keychain-handler",
+        )
+        with self._handler_condition:
+            if self._closing:
+                should_start = False
+            else:
+                self._handler_threads.add(thread)
+                self._handler_sockets[thread] = request
+                should_start = True
+        if not should_start:
+            self.shutdown_request(request)
+            return
+        try:
+            thread.start()
+        except BaseException:
+            with self._handler_condition:
+                self._handler_threads.discard(thread)
+                self._handler_sockets.pop(thread, None)
+                self._handler_condition.notify_all()
+            self.shutdown_request(request)
+            raise
+
+    def process_request_thread(
+        self,
+        request: socket.socket,
+        client_address: tuple[str, int],
+    ) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        except BaseException as error:
+            with self._handler_condition:
+                self._handler_errors.append(error)
+            raise
+        finally:
+            current = threading.current_thread()
+            with self._handler_condition:
+                self._handler_threads.discard(current)
+                self._handler_sockets.pop(current, None)
+                self._handler_condition.notify_all()
+
+    def handle_error(
+        self,
+        _request: socket.socket,
+        _client_address: tuple[str, int],
+    ) -> None:
+        error = sys.exc_info()[1]
+        if error is None:
+            return
+        with self._handler_condition:
+            self._handler_errors.append(error)
+
+    def handler_errors(self) -> tuple[BaseException, ...]:
+        with self._handler_condition:
+            return tuple(self._handler_errors)
+
+    def service_actions(self) -> None:
+        with self._serve_condition:
+            if not self._serving:
+                self._serving = True
+                self._serve_condition.notify_all()
+
+    def record_serve_stopped(self, error: BaseException | None) -> None:
+        with self._serve_condition:
+            self._serve_stopped = True
+            self._serve_error = error
+            self._serve_condition.notify_all()
+
+    def wait_until_serving(self, timeout: float) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._serve_condition:
+            while not self._serving and not self._serve_stopped:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._serve_condition.wait(timeout=remaining)
+            return self._serving and not self._serve_stopped
+
+    def serve_error(self) -> BaseException | None:
+        with self._serve_condition:
+            return self._serve_error
+
+    def wait_for_handlers(self, timeout: float) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._handler_condition:
+            while self._handler_threads:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._handler_condition.wait(timeout=remaining)
+            return not self._handler_threads
+
+    def begin_closing(self) -> tuple[socket.socket, ...]:
+        with self._handler_condition:
+            self._closing = True
+            return tuple(self._handler_sockets.values())
+
+    def take_initial_credential(self) -> bytearray:
+        with self.credential_lock:
+            if (
+                self._abandoned.is_set()
+                or self.consumed
+                or self.credential is None
+            ):
+                return bytearray()
+            self.consumed = True
+            credential = self.credential
+            self.credential = None
+            return credential
+
+    def stage_pending_update(self, credential: bytearray) -> int | None:
+        if self._abandoned.is_set():
+            return None
+        pending = bytearray(credential)
+        previous: bytearray | None = None
+        with self._pending_update_lock:
+            if self._abandoned.is_set():
+                pending[:] = b"\x00" * len(pending)
+                return None
+            if self._pending_update is not None:
+                _previous_generation, previous = self._pending_update
+            self._pending_generation += 1
+            generation = self._pending_generation
+            self._pending_update = (generation, pending)
+        if previous is not None:
+            previous[:] = b"\x00" * len(previous)
+        return generation
+
+    def clear_pending_update(self, generation: int) -> None:
+        pending: bytearray | None = None
+        with self._pending_update_lock:
+            if (
+                self._pending_update is not None
+                and self._pending_update[0] == generation
+            ):
+                _pending_generation, pending = self._pending_update
+                self._pending_update = None
+        if pending is not None:
+            pending[:] = b"\x00" * len(pending)
+
+    def abandon_and_detach_pending_update(self) -> bytearray | None:
+        self._abandoned.set()
+        initial_credential: bytearray | None = None
+        with self.credential_lock:
+            initial_credential = self.credential
+            self.credential = None
+        if initial_credential is not None:
+            initial_credential[:] = b"\x00" * len(initial_credential)
+        with self._pending_update_lock:
+            if self._pending_update is None:
+                return None
+            _generation, pending = self._pending_update
+            self._pending_update = None
+            return pending
+
+    def scrub_initial_credential(self) -> None:
+        credential: bytearray | None = None
+        with self.credential_lock:
+            credential = self.credential
+            self.credential = None
+        if credential is not None:
+            credential[:] = b"\x00" * len(credential)
+
+
+@dataclass(frozen=True)
+class _ClaudeKeychainServerShutdown:
+    quiescent: bool
+    pending_update: bytearray | None
+    errors: tuple[BaseException, ...]
+
+
+@dataclass(frozen=True)
+class _ClaudeKeychainQuiescenceCallbacks:
+    abandon: Callable[[], None]
+    recover: Callable[[bytearray | None], BaseException | None]
+    timeout_error: Callable[[], BaseException]
+
+
+def _bounded_claude_keychain_server_shutdown(
+    server: _ClaudeKeychainCredentialServer,
+    serve_thread: threading.Thread,
+) -> _ClaudeKeychainServerShutdown:
+    deadline = (
+        time.monotonic() + CLAUDE_KEYCHAIN_SERVER_SHUTDOWN_TIMEOUT_SECONDS
+    )
+    errors: list[BaseException] = []
+
+    def remaining() -> float:
+        return max(0.0, deadline - time.monotonic())
+
+    def request_shutdown() -> None:
+        try:
+            server.shutdown()
+        except BaseException as error:
+            errors.append(error)
+
+    try:
+        active_requests = server.begin_closing()
+    except BaseException as error:
+        errors.append(error)
+        active_requests = ()
+    for request in active_requests:
+        try:
+            request.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        except BaseException as error:
+            errors.append(error)
+        try:
+            request.close()
+        except OSError:
+            pass
+        except BaseException as error:
+            errors.append(error)
+
+    shutdown_thread = threading.Thread(
+        target=request_shutdown,
+        daemon=True,
+        name="claude-review-keychain-shutdown",
+    )
+    shutdown_started = False
+    try:
+        shutdown_thread.start()
+        shutdown_started = True
+    except BaseException as error:
+        errors.append(error)
+    if shutdown_started:
+        try:
+            shutdown_thread.join(timeout=remaining())
+        except BaseException as error:
+            errors.append(error)
+    try:
+        server.server_close()
+    except BaseException as error:
+        errors.append(error)
+    try:
+        serve_thread.join(timeout=remaining())
+    except BaseException as error:
+        errors.append(error)
+    try:
+        handlers_quiescent = server.wait_for_handlers(remaining())
+    except BaseException as error:
+        errors.append(error)
+        handlers_quiescent = False
+    shutdown_quiescent = (
+        shutdown_started and not shutdown_thread.is_alive()
+    )
+    serve_quiescent = not serve_thread.is_alive()
+    pending_update = None
+    quiescent = (
+        shutdown_quiescent and serve_quiescent and handlers_quiescent
+    )
+    serve_error = server.serve_error()
+    if serve_error is not None:
+        errors.append(serve_error)
+    errors.extend(server.handler_errors())
+    if not quiescent:
+        try:
+            pending_update = server.abandon_and_detach_pending_update()
+        except BaseException as error:
+            errors.append(error)
+    return _ClaudeKeychainServerShutdown(
+        quiescent=quiescent,
+        pending_update=pending_update,
+        errors=tuple(errors),
+    )
+
+
+def _bounded_claude_keychain_quiescence_recovery(
+    callbacks: _ClaudeKeychainQuiescenceCallbacks,
+    pending_update: bytearray | None,
+) -> BaseException | None:
+    try:
+        callbacks.abandon()
+    except BaseException as error:
+        if pending_update is not None:
+            pending_update[:] = b"\x00" * len(pending_update)
+        return error
+    completed = threading.Event()
+    result: list[BaseException | None] = []
+
+    def recover() -> None:
+        try:
+            try:
+                result.append(callbacks.recover(pending_update))
+            except BaseException as error:
+                result.append(error)
+        finally:
+            if pending_update is not None:
+                pending_update[:] = b"\x00" * len(pending_update)
+            completed.set()
+
+    recovery_thread = threading.Thread(
+        target=recover,
+        daemon=True,
+        name="claude-review-keychain-recovery",
+    )
+    try:
+        recovery_thread.start()
+    except BaseException as error:
+        if pending_update is not None:
+            pending_update[:] = b"\x00" * len(pending_update)
+        timeout_error = callbacks.timeout_error()
+        _attach_claude_credential_cleanup_failure(timeout_error, error)
+        return timeout_error
+    try:
+        recovery_completed = completed.wait(
+            timeout=CLAUDE_KEYCHAIN_RECOVERY_TIMEOUT_SECONDS
+        )
+    except BaseException as error:
+        timeout_error = callbacks.timeout_error()
+        if getattr(
+            timeout_error,
+            "_codex_claude_refresh_persistence_failed",
+            False,
+        ):
+            _add_claude_persistence_note(error, timeout_error)
+        else:
+            _attach_claude_credential_cleanup_failure(error, timeout_error)
+        return error
+    if not recovery_completed:
+        return callbacks.timeout_error()
+    return result[0] if result else None
 
 
 @contextlib.contextmanager
@@ -3025,6 +3416,7 @@ def _claude_keychain_credential_server(
     credential: bytearray | None,
     capability: bytes,
     update_callback: Callable[[bytearray], bool] | None = None,
+    quiescence_callbacks: _ClaudeKeychainQuiescenceCallbacks | None = None,
 ) -> Iterator[int]:
     if len(capability) != CLAUDE_KEYCHAIN_BROKER_CAPABILITY_BYTES:
         raise ReviewError("Claude Keychain broker capability has an invalid length")
@@ -3038,12 +3430,25 @@ def _claude_keychain_credential_server(
         raise ClaudeLoopbackUnavailable(
             f"Claude Keychain broker cannot bind loopback: {error}"
         ) from error
+    def serve() -> None:
+        serve_error: BaseException | None = None
+        try:
+            server.serve_forever(
+                poll_interval=CLAUDE_KEYCHAIN_SERVER_POLL_INTERVAL_SECONDS
+            )
+        except BaseException as error:
+            serve_error = error
+        finally:
+            server.record_serve_stopped(serve_error)
+
     thread = threading.Thread(
-        target=server.serve_forever,
+        target=serve,
         daemon=True,
         name="claude-review-keychain-broker",
     )
     thread_started = False
+    runtime_exposed = False
+    primary_error: BaseException | None = None
     try:
         try:
             thread.start()
@@ -3052,15 +3457,124 @@ def _claude_keychain_credential_server(
             raise ClaudeLoopbackUnavailable(
                 f"Claude Keychain broker cannot start: {error}"
             ) from error
+        if not server.wait_until_serving(
+            CLAUDE_KEYCHAIN_SERVER_START_TIMEOUT_SECONDS
+        ):
+            failure = ClaudeLoopbackUnavailable(
+                "Claude Keychain broker did not enter its serve loop"
+            )
+            serve_error = server.serve_error()
+            if serve_error is not None:
+                failure.__cause__ = serve_error
+            raise failure
+        runtime_exposed = True
         yield int(server.server_address[1])
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
+        shutdown_errors: list[BaseException] = []
+        shutdown = _ClaudeKeychainServerShutdown(
+            quiescent=True,
+            pending_update=None,
+            errors=(),
+        )
         if thread_started:
-            server.shutdown()
-        server.server_close()
-        if thread_started:
-            thread.join(timeout=5.0)
+            shutdown = _bounded_claude_keychain_server_shutdown(
+                server,
+                thread,
+            )
+            shutdown_errors.extend(shutdown.errors)
+        else:
+            try:
+                server.server_close()
+            except BaseException as error:
+                shutdown_errors.append(error)
+        if shutdown.quiescent:
+            try:
+                server.scrub_initial_credential()
+            except BaseException as error:
+                shutdown_errors.append(error)
         if credential is not None:
             credential[:] = b"\x00" * len(credential)
+        pending_update = shutdown.pending_update
+        if not shutdown.quiescent:
+            failure = ClaudeCredentialInspectionInconclusive(
+                "Claude Keychain broker handler quiescence could not be proven "
+                "before the shutdown deadline"
+            )
+            setattr(
+                failure,
+                "_codex_claude_keychain_handler_quiescence_unproven",
+                True,
+            )
+            retention_error: BaseException | None = None
+            if runtime_exposed and quiescence_callbacks is not None:
+                retention_error = (
+                    _bounded_claude_keychain_quiescence_recovery(
+                        quiescence_callbacks,
+                        pending_update,
+                    )
+                )
+                pending_update = None
+            if pending_update is not None:
+                pending_update[:] = b"\x00" * len(pending_update)
+            if retention_error is not None:
+                if getattr(
+                    retention_error,
+                    "_codex_claude_refresh_persistence_failed",
+                    False,
+                ):
+                    _add_claude_persistence_note(failure, retention_error)
+                else:
+                    _attach_claude_credential_cleanup_failure(
+                        failure,
+                        retention_error,
+                    )
+            for error in shutdown_errors:
+                _attach_claude_credential_cleanup_failure(failure, error)
+            candidates = [failure, *shutdown_errors]
+            if (
+                retention_error is not None
+                and _is_claude_control_flow_error(retention_error)
+            ):
+                candidates.append(retention_error)
+            for candidate in (primary_error, *candidates):
+                if candidate is None:
+                    continue
+                setattr(
+                    candidate,
+                    "_codex_claude_keychain_handler_quiescence_unproven",
+                    True,
+                )
+                if getattr(
+                    failure,
+                    "_codex_claude_refresh_persistence_failed",
+                    False,
+                ):
+                    _add_claude_persistence_note(candidate, failure)
+                elif candidate is not failure:
+                    add_note = getattr(candidate, "add_note", None)
+                    if callable(add_note):
+                        add_note(str(failure))
+            if primary_error is None and not any(
+                _is_claude_control_flow_error(candidate)
+                for candidate in candidates
+            ):
+                raise failure
+            _raise_or_attach_claude_credential_cleanup(
+                primary_error,
+                candidates,
+                message=(
+                    "cannot prove Claude Keychain broker handler quiescence"
+                ),
+            )
+        if shutdown.quiescent:
+            _raise_or_attach_claude_credential_cleanup(
+                primary_error,
+                shutdown_errors,
+                message="cannot shut down the Claude Keychain broker safely",
+            )
 
 
 @contextlib.contextmanager
@@ -3086,9 +3600,23 @@ def _claude_keychain_runtime(
         raise ReviewError("Claude macOS carrier snapshot is unavailable")
     persistence_errors: list[BaseException] = []
     persisted_updates = 0
+    runtime_state_lock = threading.Lock()
+    runtime_abandoned = False
+    quiescence_recovery_candidate: pathlib.Path | None = None
+    quiescence_recovery_replaces_existing = False
+
+    def new_recovery_candidate() -> pathlib.Path:
+        return (
+            review.container_dir
+            / "claude-runtime"
+            / "macos"
+            / f"claude-carrier-{secrets.token_hex(16)}"
+        )
 
     def accept_refreshed_credential(updated: bytearray) -> bool:
         nonlocal carrier_snapshot, persisted_updates
+        nonlocal quiescence_recovery_candidate
+        nonlocal quiescence_recovery_replaces_existing
         try:
             _validate_claude_local_credential(
                 updated,
@@ -3099,15 +3627,41 @@ def _claude_keychain_runtime(
                 "Claude produced a malformed refreshed OAuth credential"
             )
             malformed.__cause__ = error
-            persistence_errors.append(malformed)
+            with runtime_state_lock:
+                if not runtime_abandoned:
+                    persistence_errors.append(malformed)
             return False
-        if persistence_errors:
-            prior_error = persistence_errors[0]
+
+        with runtime_state_lock:
+            if runtime_abandoned:
+                return False
+            prior_error = (
+                persistence_errors[0] if persistence_errors else None
+            )
+            callback_carrier_snapshot = carrier_snapshot
+            callback_expected_credential = bytearray(expected_credential)
+        if prior_error is not None:
+            callback_expected_credential[:] = (
+                b"\x00" * len(callback_expected_credential)
+            )
             retained_candidate = getattr(
                 prior_error,
                 "_codex_claude_retained_credential_carrier",
                 None,
             )
+            recovery_candidate = (
+                pathlib.Path(retained_candidate)
+                if isinstance(retained_candidate, str)
+                else new_recovery_candidate()
+            )
+            with runtime_state_lock:
+                if runtime_abandoned:
+                    return False
+                quiescence_recovery_candidate = recovery_candidate
+                quiescence_recovery_replaces_existing = isinstance(
+                    retained_candidate,
+                    str,
+                )
             try:
                 if isinstance(retained_candidate, str):
                     _replace_claude_macos_recovery_credential(
@@ -3120,35 +3674,66 @@ def _claude_keychain_runtime(
                     retained_carrier = _retain_claude_macos_refreshed_credential(
                         review,
                         updated,
+                        requested_carrier_root=recovery_candidate,
                     )
             except BaseException as recovery_error:
                 if _is_claude_control_flow_error(prior_error):
-                    _add_claude_persistence_note(prior_error, recovery_error)
-                    persistence_errors[0] = prior_error
+                    replacement_error = prior_error
+                    deferred_persistence_note = recovery_error
                 elif _is_claude_control_flow_error(recovery_error):
                     _add_claude_persistence_note(recovery_error, prior_error)
-                    persistence_errors[0] = recovery_error
+                    replacement_error = recovery_error
+                    deferred_persistence_note = None
                 else:
-                    persistence_errors[0] = _failed_claude_macos_recovery_error(
+                    replacement_error = _failed_claude_macos_recovery_error(
                         prior_error,
                         recovery_error,
                     )
+                    deferred_persistence_note = None
+                with runtime_state_lock:
+                    if (
+                        not runtime_abandoned
+                        and persistence_errors
+                        and persistence_errors[0] is prior_error
+                    ):
+                        if deferred_persistence_note is not None:
+                            _add_claude_persistence_note(
+                                prior_error,
+                                deferred_persistence_note,
+                            )
+                        persistence_errors[0] = replacement_error
                 return False
             retained_error = _retained_claude_macos_credential_error(
                 retained_carrier,
                 prior_error,
             )
             if _is_claude_control_flow_error(prior_error):
-                _add_claude_persistence_note(prior_error, retained_error)
-                persistence_errors[0] = prior_error
+                replacement_error = prior_error
+                deferred_persistence_note = retained_error
             else:
-                persistence_errors[0] = retained_error
+                replacement_error = retained_error
+                deferred_persistence_note = None
+            with runtime_state_lock:
+                if (
+                    not runtime_abandoned
+                    and persistence_errors
+                    and persistence_errors[0] is prior_error
+                ):
+                    quiescence_recovery_replaces_existing = True
+                    if deferred_persistence_note is not None:
+                        _add_claude_persistence_note(
+                            prior_error,
+                            deferred_persistence_note,
+                        )
+                    persistence_errors[0] = replacement_error
             return False
         try:
             if (
                 (
                     selected.source == "macos-keychain"
-                    or _claude_macos_carriers_share_refresh_token(carrier_snapshot)
+                    or _claude_macos_carriers_share_refresh_token(
+                        callback_carrier_snapshot
+                    )
                 )
                 and not _claude_keychain_credential_has_refresh_margin(updated)
             ):
@@ -3160,8 +3745,8 @@ def _claude_keychain_runtime(
                 review,
                 selected,
                 updated,
-                expected_credential,
-                carrier_snapshot,
+                callback_expected_credential,
+                callback_carrier_snapshot,
                 refresh_lock_protocol,
             )
             if updated_snapshot is None:
@@ -3170,30 +3755,63 @@ def _claude_keychain_runtime(
                     "credential source changed or immediate writeback could not be "
                     "verified"
                 )
-            carrier_snapshot = updated_snapshot
-            expected_credential[:] = updated
-            persisted_updates += 1
-            return True
+            with runtime_state_lock:
+                if runtime_abandoned:
+                    return False
+                carrier_snapshot = updated_snapshot
+                expected_credential[:] = updated
+                persisted_updates += 1
+                return True
         except BaseException as error:
-            try:
-                retained_carrier = _retain_claude_macos_refreshed_credential(
-                    review,
-                    updated,
+            proposed_recovery_candidate = new_recovery_candidate()
+            with runtime_state_lock:
+                if runtime_abandoned:
+                    return False
+                if quiescence_recovery_candidate is None:
+                    quiescence_recovery_candidate = (
+                        proposed_recovery_candidate
+                    )
+                    quiescence_recovery_replaces_existing = False
+                callback_recovery_candidate = (
+                    quiescence_recovery_candidate
                 )
+                callback_replaces_existing = (
+                    quiescence_recovery_replaces_existing
+                )
+            assert callback_recovery_candidate is not None
+            try:
+                if callback_replaces_existing:
+                    _replace_claude_macos_recovery_credential(
+                        review,
+                        callback_recovery_candidate,
+                        updated,
+                    )
+                    retained_carrier = callback_recovery_candidate
+                else:
+                    retained_carrier = (
+                        _retain_claude_macos_refreshed_credential(
+                            review,
+                            updated,
+                            requested_carrier_root=(
+                                callback_recovery_candidate
+                            ),
+                        )
+                    )
             except BaseException as recovery_error:
                 if _is_claude_control_flow_error(error):
                     _add_claude_persistence_note(error, recovery_error)
-                    persistence_errors.append(error)
+                    persistence_error = error
                 elif _is_claude_control_flow_error(recovery_error):
                     _add_claude_persistence_note(recovery_error, error)
-                    persistence_errors.append(recovery_error)
+                    persistence_error = recovery_error
                 else:
-                    persistence_errors.append(
-                        _failed_claude_macos_recovery_error(
-                            error,
-                            recovery_error,
-                        )
+                    persistence_error = _failed_claude_macos_recovery_error(
+                        error,
+                        recovery_error,
                     )
+                with runtime_state_lock:
+                    if not runtime_abandoned:
+                        persistence_errors.append(persistence_error)
                 return False
             retained_error = _retained_claude_macos_credential_error(
                 retained_carrier,
@@ -3201,10 +3819,126 @@ def _claude_keychain_runtime(
             )
             if _is_claude_control_flow_error(error):
                 _add_claude_persistence_note(error, retained_error)
-                persistence_errors.append(error)
+                persistence_error = error
             else:
-                persistence_errors.append(retained_error)
+                persistence_error = retained_error
+            with runtime_state_lock:
+                if not runtime_abandoned:
+                    quiescence_recovery_replaces_existing = True
+                    persistence_errors.append(persistence_error)
             return False
+        finally:
+            callback_expected_credential[:] = (
+                b"\x00" * len(callback_expected_credential)
+            )
+
+    def abandon_unquiescent_handler() -> None:
+        nonlocal quiescence_recovery_candidate, runtime_abandoned
+        candidate = new_recovery_candidate()
+        with runtime_state_lock:
+            runtime_abandoned = True
+            if quiescence_recovery_candidate is None:
+                quiescence_recovery_candidate = candidate
+
+    def recover_unquiescent_handler(
+        updated: bytearray | None,
+    ) -> BaseException | None:
+        with runtime_state_lock:
+            recovery_candidate = quiescence_recovery_candidate
+            replace_existing = quiescence_recovery_replaces_existing
+        if updated is None:
+            return None
+        if recovery_candidate is None:
+            return ClaudeCredentialInspectionInconclusive(
+                "Claude Keychain recovery was not prepared before handler "
+                "shutdown"
+            )
+        quiescence_error = ClaudeCredentialInspectionInconclusive(
+            "Claude Keychain broker stopped before refreshed credential "
+            "writeback quiescence could be proven"
+        )
+        setattr(
+            quiescence_error,
+            "_codex_claude_keychain_handler_quiescence_unproven",
+            True,
+        )
+        try:
+            if replace_existing:
+                _replace_claude_macos_recovery_credential(
+                    review,
+                    recovery_candidate,
+                    updated,
+                )
+                retained_carrier = recovery_candidate
+            else:
+                retained_carrier = _retain_claude_macos_refreshed_credential(
+                    review,
+                    updated,
+                    requested_carrier_root=recovery_candidate,
+                )
+        except BaseException as recovery_error:
+            if not isinstance(
+                getattr(
+                    recovery_error,
+                    "_codex_claude_retained_credential_carrier",
+                    None,
+                ),
+                str,
+            ):
+                setattr(
+                    recovery_error,
+                    "_codex_claude_retained_credential_carrier",
+                    str(recovery_candidate),
+                )
+                setattr(
+                    recovery_error,
+                    "_codex_claude_refresh_persistence_failed",
+                    True,
+                )
+            if _is_claude_control_flow_error(recovery_error):
+                _add_claude_persistence_note(
+                    recovery_error,
+                    quiescence_error,
+                )
+                persistence_error = recovery_error
+            else:
+                persistence_error = _failed_claude_macos_recovery_error(
+                    quiescence_error,
+                    recovery_error,
+                )
+        else:
+            persistence_error = _retained_claude_macos_credential_error(
+                retained_carrier,
+                quiescence_error,
+            )
+        setattr(
+            persistence_error,
+            "_codex_claude_keychain_handler_quiescence_unproven",
+            True,
+        )
+        return persistence_error
+
+    def unquiescent_recovery_timeout_error() -> BaseException:
+        with runtime_state_lock:
+            recovery_candidate = quiescence_recovery_candidate
+        failure = ClaudeCredentialInspectionInconclusive(
+            "Claude Keychain broker recovery did not finish before the "
+            "shutdown deadline; a complete private recovery copy could not be "
+            "proven"
+        )
+        setattr(failure, "_codex_claude_refresh_persistence_failed", True)
+        setattr(
+            failure,
+            "_codex_claude_keychain_handler_quiescence_unproven",
+            True,
+        )
+        if recovery_candidate is not None:
+            setattr(
+                failure,
+                "_codex_claude_retained_credential_carrier",
+                str(recovery_candidate),
+            )
+        return failure
 
     capability = secrets.token_bytes(CLAUDE_KEYCHAIN_BROKER_CAPABILITY_BYTES)
     primary_error: BaseException | None = None
@@ -3213,6 +3947,11 @@ def _claude_keychain_runtime(
             selected.payload,
             capability,
             update_callback=accept_refreshed_credential,
+            quiescence_callbacks=_ClaudeKeychainQuiescenceCallbacks(
+                abandon=abandon_unquiescent_handler,
+                recover=recover_unquiescent_handler,
+                timeout_error=unquiescent_recovery_timeout_error,
+            ),
         ) as port:
             result[CLAUDE_KEYCHAIN_BROKER_PORT_ENV] = str(port)
             result[CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV] = capability.hex()
@@ -3233,25 +3972,71 @@ def _claude_keychain_runtime(
         raise
     finally:
         persistence_error: BaseException | None = None
+        with runtime_state_lock:
+            final_persistence_errors = tuple(persistence_errors)
+            final_carrier_snapshot = carrier_snapshot
+            final_persisted_updates = persisted_updates
+            final_runtime_abandoned = runtime_abandoned
         try:
             try:
-                if persistence_errors:
-                    persistence_error = persistence_errors[0]
-                    for secondary in persistence_errors[1:]:
+                if (
+                    final_runtime_abandoned
+                    and primary_error is not None
+                    and getattr(
+                        primary_error,
+                        "_codex_claude_refresh_persistence_failed",
+                        False,
+                    )
+                ):
+                    persistence_error = primary_error
+                    for secondary in final_persistence_errors:
+                        if secondary is not primary_error:
+                            _attach_claude_credential_cleanup_failure(
+                                persistence_error,
+                                secondary,
+                            )
+                elif final_persistence_errors:
+                    persistence_error = final_persistence_errors[0]
+                    for secondary in final_persistence_errors[1:]:
                         _attach_claude_credential_cleanup_failure(
                             persistence_error,
                             secondary,
                         )
+                elif final_runtime_abandoned:
+                    persistence_error = (
+                        ClaudeCredentialInspectionInconclusive(
+                            "Claude Keychain broker handler quiescence could not "
+                            "be proven before runtime cleanup"
+                        )
+                    )
+                    setattr(
+                        persistence_error,
+                        (
+                            "_codex_claude_keychain_handler_"
+                            "quiescence_unproven"
+                        ),
+                        True,
+                    )
+                    _update_claude_runtime_report(
+                        review,
+                        {
+                            "authentication": {
+                                "refresh_persistence": (
+                                    "broker-shutdown-inconclusive"
+                                ),
+                            }
+                        },
+                    )
                 elif not _claude_macos_carrier_snapshot_is_current(
                     review,
-                    carrier_snapshot,
+                    final_carrier_snapshot,
                     refresh_lock_protocol,
                 ):
                     raise ClaudeCredentialInspectionInconclusive(
                         "Claude credential carriers changed while the isolated "
                         "runtime was active"
                     )
-                elif persisted_updates:
+                elif final_persisted_updates:
                     _update_claude_runtime_report(
                         review,
                         {
@@ -3279,7 +4064,12 @@ def _claude_keychain_runtime(
             selected.payload[:] = b"\x00" * len(selected.payload)
         if persistence_error is not None:
             if primary_error is not None:
-                if (
+                if persistence_error is primary_error:
+                    _record_claude_secondary_persistence_failure(
+                        review,
+                        primary_error,
+                    )
+                elif (
                     not _is_claude_control_flow_error(primary_error)
                     and _is_claude_control_flow_error(persistence_error)
                 ):
@@ -3292,14 +4082,15 @@ def _claude_keychain_runtime(
                         persistence_error,
                     )
                     raise persistence_error
-                _add_claude_persistence_note(
-                    primary_error,
-                    persistence_error,
-                )
-                _record_claude_secondary_persistence_failure(
-                    review,
-                    primary_error,
-                )
+                else:
+                    _add_claude_persistence_note(
+                        primary_error,
+                        persistence_error,
+                    )
+                    _record_claude_secondary_persistence_failure(
+                        review,
+                        primary_error,
+                    )
             else:
                 if _is_claude_control_flow_error(persistence_error):
                     _record_claude_secondary_persistence_failure(
