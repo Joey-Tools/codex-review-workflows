@@ -689,14 +689,17 @@ report that exact artifact instead of losing its location. A later successful,
 read-back-verified replacement removes bounded stale update artifacts. If no
 complete recovery copy can be proven, retain and report the attempted private
 path for operator inspection without claiming that its credential is complete.
+If an incomplete update cannot be removed or safely inspected, report its exact
+path only as cleanup residue; never present it as a recoverable current credential.
 
 The current recovery credential and cleanup residue are separate report fields.
 Before a verified recovery commit, an exact complete uncommitted update is
 `authentication.recovery_artifact`. After a replacement is fully fsynced and
 read-back verified, `config/.credentials.json` is the current
 `authentication.recovery_artifact`. If deleting an older temp fails, its exact
-path is `authentication.recovery_cleanup_artifact`; the stale credential is
-never described as the newest or current recovery value.
+path is `authentication.recovery_cleanup_artifact`. An incomplete update that
+cannot be removed uses the same cleanup-only field. Neither an older nor an
+incomplete artifact is ever described as the newest or current recovery value.
 
 The `security -i` transport-size limit applies only when the selected source is
 the Keychain or when matching refresh-token digests require a file-selected
@@ -844,6 +847,7 @@ described as an enforced final launch.
 | Signed artifact has no exact credential-lock protocol entry, either macOS carrier changed, lock contention/heartbeat failed, or credential inspection was unstable | `inconclusive`; report the exact coordination/inspection gate and pause without a login prompt | No |
 | The macOS broker cannot prove handler quiescence, or its latest staged rotation cannot be completely guarded-written to every required host carrier | `inconclusive`; retain the private recovery carrier or exact complete update artifact, report only its path, and pause | No |
 | A verified macOS recovery replacement succeeds but deleting an older credential temp fails | `inconclusive`; report verified `config/.credentials.json` as `recovery_artifact`, report the old exact temp separately as `recovery_cleanup_artifact`, and pause | No |
+| An incomplete macOS recovery temp cannot be removed or safely inspected | `inconclusive`; keep the carrier, report the temp only as `recovery_cleanup_artifact`, and never claim it is a current credential | No |
 | A Linux/WSL2 staged rotation cannot be safely drained, recovered, or guarded-written to the host | `inconclusive`; retain the private recovery carrier, report its path, and pause | No |
 | Explicit override has the wrong version, platform, binary shape, capability contract, or lacks trusted GPG, probe sandbox, or trusted review tool prerequisites | `blocked` configuration error | No |
 | Wrong publisher fingerprint, invalid signature, checksum mismatch, contradictory safe-mode semantics, unsafe runtime metadata, or an isolation-boundary mismatch | `blocked` security error | No |

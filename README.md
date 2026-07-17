@@ -16,6 +16,8 @@ Local-login refresh writeback is enabled only for exact signed artifacts in the 
 
 Missing, malformed, unsafe, refresh-token-less, `Login expired`, HTTP 401, or refresh failure is `blocked-authentication`: the workflow pauses instead of falling back to Copilot, and tells the operator to run `claude auth login` for local login or unset/replace an explicit `ANTHROPIC_API_KEY`, as applicable. Only stderr and structured primary error fields are failure-classification evidence; repository-controlled partial result text can never authorize a model or Copilot fallback. Lock contention, carrier races, I/O uncertainty, and an uncatalogued lock protocol are inspection-inconclusive and do not imply a bad login. Copilot fallback remains available, with existing consent, only when the secure Claude runtime is deterministically absent/unavailable or Claude model entitlement blocks the pinned model chain.
 
+An incomplete macOS recovery temp is cleanup residue, not a recoverable credential. If it cannot be removed or safely inspected, the helper reports its exact path only as `authentication.recovery_cleanup_artifact`; only a complete uncommitted update or a verified committed replacement may be `authentication.recovery_artifact`.
+
 `synthetic-token-fixtures` selects exact authoring values from the review helper's fixed finite catalog. The helper catalog remains the only enforcement authority; skill templates contain placeholders only.
 
 ## Test

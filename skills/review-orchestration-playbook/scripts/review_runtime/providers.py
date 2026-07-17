@@ -2386,8 +2386,8 @@ def _mark_claude_macos_recovery_cleanup_artifact(
     add_note = getattr(error, "add_note", None)
     if callable(add_note):
         add_note(
-            "A stale macOS Claude recovery credential artifact remains at "
-            f"{artifact} for controlled cleanup."
+            "A non-current or incomplete macOS Claude recovery credential "
+            f"artifact remains at {artifact} for controlled cleanup."
         )
 
 
@@ -2448,9 +2448,9 @@ def _replace_claude_macos_recovery_credential(
     temporary_descriptor: int | None = None
     temporary_created = False
     temporary_complete = False
-    temporary_close_failed = False
     stale_update_artifacts: tuple[str, ...] = ()
     retained_update_artifact: pathlib.Path | None = None
+    retained_cleanup_artifact: pathlib.Path | None = None
     primary_error: BaseException | None = None
     try:
         config_descriptor = os.open(config_dir, directory_flags)
@@ -2518,7 +2518,6 @@ def _replace_claude_macos_recovery_credential(
         try:
             os.close(temporary_descriptor)
         except BaseException:
-            temporary_close_failed = True
             raise
         finally:
             temporary_descriptor = None
@@ -2592,7 +2591,6 @@ def _replace_claude_macos_recovery_credential(
             try:
                 os.close(temporary_descriptor)
             except BaseException as error:
-                temporary_close_failed = True
                 cleanup_errors.append(error)
             temporary_descriptor = None
         if temporary_created and config_descriptor is not None:
@@ -2604,24 +2602,37 @@ def _replace_claude_macos_recovery_credential(
                     follow_symlinks=False,
                 )
             except FileNotFoundError:
-                pass
+                temporary_created = False
             except BaseException as error:
-                retained_update_artifact = artifact
+                if temporary_complete:
+                    retained_update_artifact = artifact
+                else:
+                    retained_cleanup_artifact = artifact
                 cleanup_errors.append(error)
             else:
-                if temporary_complete or temporary_close_failed:
+                if temporary_complete:
                     retained_update_artifact = artifact
                 else:
                     try:
                         os.unlink(temporary_name, dir_fd=config_descriptor)
-                        os.fsync(config_descriptor)
                     except BaseException as error:
-                        retained_update_artifact = artifact
+                        retained_cleanup_artifact = artifact
                         cleanup_errors.append(error)
+                    else:
+                        temporary_created = False
+                        try:
+                            os.fsync(config_descriptor)
+                        except BaseException as error:
+                            cleanup_errors.append(error)
         if retained_update_artifact is not None and primary_error is not None:
             _mark_claude_macos_recovery_update_artifact(
                 primary_error,
                 retained_update_artifact,
+            )
+        if retained_cleanup_artifact is not None and primary_error is not None:
+            _mark_claude_macos_recovery_cleanup_artifact(
+                primary_error,
+                retained_cleanup_artifact,
             )
         if config_descriptor is not None:
             try:
@@ -2652,6 +2663,11 @@ def _replace_claude_macos_recovery_credential(
                 _mark_claude_macos_recovery_update_artifact(
                     cleanup_error,
                     retained_update_artifact,
+                )
+            if retained_cleanup_artifact is not None:
+                _mark_claude_macos_recovery_cleanup_artifact(
+                    cleanup_error,
+                    retained_cleanup_artifact,
                 )
             raise
 

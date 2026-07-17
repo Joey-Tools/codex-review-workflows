@@ -309,6 +309,7 @@ class RepositoryContractTest(unittest.TestCase):
                 normalized = policy.lower()
                 self.assertRegex(normalized, r"quiesc(?:e|ence)")
                 self.assertIn("recovery_cleanup_artifact", policy)
+                self.assertIn("incomplete", normalized)
                 self.assertNotIn("before acknowledging", normalized)
                 self.assertNotIn("every accepted rotation", normalized)
                 self.assertNotIn(

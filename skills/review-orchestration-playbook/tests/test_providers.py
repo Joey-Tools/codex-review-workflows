@@ -2441,6 +2441,358 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertTrue(pathlib.Path(retained).is_dir())
         credential[:] = b"\x00" * len(credential)
 
+    def test_incomplete_recovery_temp_fsync_failure_removes_temp_even_when_cleanup_fsync_fails(
+        self,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        original_bytes = bytes(original)
+        carrier = providers._retain_claude_macos_refreshed_credential(
+            self.review,
+            original,
+        )
+        config = carrier / "config"
+
+        def fail_recovery_fsync(descriptor: int) -> None:
+            metadata = os.fstat(descriptor)
+            if stat.S_ISREG(metadata.st_mode):
+                raise OSError("injected temporary credential fsync failure")
+            raise OSError("injected cleanup directory fsync failure")
+
+        with (
+            mock.patch.object(
+                providers.os,
+                "fsync",
+                side_effect=fail_recovery_fsync,
+            ),
+            self.assertRaisesRegex(
+                OSError,
+                "temporary credential fsync failure",
+            ) as raised,
+        ):
+            providers._replace_claude_macos_recovery_credential(
+                self.review,
+                carrier,
+                refreshed,
+            )
+
+        self.assertEqual(
+            (config / providers.CLAUDE_CREDENTIAL_FILE_NAME).read_bytes(),
+            original_bytes,
+        )
+        self.assertEqual(
+            sorted(path.name for path in config.iterdir()),
+            [providers.CLAUDE_CREDENTIAL_FILE_NAME],
+        )
+        self.assertIsNone(
+            getattr(
+                raised.exception,
+                "_codex_claude_retained_credential_artifact",
+                None,
+            )
+        )
+        self.assertIsNone(
+            getattr(
+                raised.exception,
+                "_codex_claude_retained_cleanup_artifact",
+                None,
+            )
+        )
+        self.assertIn(
+            "Claude credential operation also had a cleanup failure",
+            getattr(raised.exception, "__notes__", ()),
+        )
+        original[:] = b"\x00" * len(original)
+        refreshed[:] = b"\x00" * len(refreshed)
+
+    def test_incomplete_recovery_temp_metadata_failure_removes_temp(
+        self,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        original_bytes = bytes(original)
+        carrier = providers._retain_claude_macos_refreshed_credential(
+            self.review,
+            original,
+        )
+        config = carrier / "config"
+        real_fstat = providers.os.fstat
+
+        def fail_temporary_fstat(descriptor: int) -> os.stat_result:
+            metadata = real_fstat(descriptor)
+            if stat.S_ISREG(metadata.st_mode):
+                raise OSError("injected temporary credential metadata failure")
+            return metadata
+
+        with (
+            mock.patch.object(
+                providers.os,
+                "fstat",
+                side_effect=fail_temporary_fstat,
+            ),
+            self.assertRaisesRegex(
+                OSError,
+                "temporary credential metadata failure",
+            ) as raised,
+        ):
+            providers._replace_claude_macos_recovery_credential(
+                self.review,
+                carrier,
+                refreshed,
+            )
+
+        self.assertEqual(
+            (config / providers.CLAUDE_CREDENTIAL_FILE_NAME).read_bytes(),
+            original_bytes,
+        )
+        self.assertEqual(
+            sorted(path.name for path in config.iterdir()),
+            [providers.CLAUDE_CREDENTIAL_FILE_NAME],
+        )
+        self.assertIsNone(
+            getattr(
+                raised.exception,
+                "_codex_claude_retained_credential_artifact",
+                None,
+            )
+        )
+        self.assertIsNone(
+            getattr(
+                raised.exception,
+                "_codex_claude_retained_cleanup_artifact",
+                None,
+            )
+        )
+        original[:] = b"\x00" * len(original)
+        refreshed[:] = b"\x00" * len(refreshed)
+
+    def test_incomplete_recovery_temp_cleanup_stat_failure_reports_cleanup_artifact(
+        self,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        original_bytes = bytes(original)
+        carrier = providers._retain_claude_macos_refreshed_credential(
+            self.review,
+            original,
+        )
+        config = carrier / "config"
+        real_fsync = providers.os.fsync
+        real_stat = providers.os.stat
+
+        def fail_temporary_fsync(descriptor: int) -> None:
+            metadata = os.fstat(descriptor)
+            if stat.S_ISREG(metadata.st_mode):
+                raise OSError("injected temporary credential fsync failure")
+            real_fsync(descriptor)
+
+        def fail_temporary_cleanup_stat(
+            path: str | os.PathLike[str],
+            *args: object,
+            **kwargs: object,
+        ) -> os.stat_result:
+            if isinstance(path, str) and path.startswith(
+                providers.CLAUDE_MACOS_RECOVERY_UPDATE_PREFIX
+            ):
+                raise OSError("injected incomplete temp cleanup stat failure")
+            return real_stat(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                providers.os,
+                "fsync",
+                side_effect=fail_temporary_fsync,
+            ),
+            mock.patch.object(
+                providers.os,
+                "stat",
+                side_effect=fail_temporary_cleanup_stat,
+            ),
+            self.assertRaisesRegex(
+                OSError,
+                "temporary credential fsync failure",
+            ) as raised,
+        ):
+            providers._replace_claude_macos_recovery_credential(
+                self.review,
+                carrier,
+                refreshed,
+            )
+
+        artifact_value = getattr(
+            raised.exception,
+            "_codex_claude_retained_cleanup_artifact",
+            None,
+        )
+        self.assertIsInstance(artifact_value, str)
+        artifact = pathlib.Path(artifact_value)
+        self.assertTrue(artifact.exists())
+        self.assertEqual(artifact.parent, config)
+        self.assertIsNone(
+            getattr(
+                raised.exception,
+                "_codex_claude_retained_credential_artifact",
+                None,
+            )
+        )
+        self.assertEqual(
+            (config / providers.CLAUDE_CREDENTIAL_FILE_NAME).read_bytes(),
+            original_bytes,
+        )
+        original[:] = b"\x00" * len(original)
+        refreshed[:] = b"\x00" * len(refreshed)
+
+    def test_complete_recovery_temp_close_failure_retains_current_update(
+        self,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        original_bytes = bytes(original)
+        refreshed_bytes = bytes(refreshed)
+        carrier = providers._retain_claude_macos_refreshed_credential(
+            self.review,
+            original,
+        )
+        config = carrier / "config"
+        real_close = providers.os.close
+        real_fstat = providers.os.fstat
+        failed_descriptor: int | None = None
+
+        def fail_temporary_close(descriptor: int) -> None:
+            nonlocal failed_descriptor
+            metadata = real_fstat(descriptor)
+            if stat.S_ISREG(metadata.st_mode) and failed_descriptor is None:
+                failed_descriptor = descriptor
+                raise OSError("injected temporary credential close failure")
+            real_close(descriptor)
+
+        try:
+            with (
+                mock.patch.object(
+                    providers.os,
+                    "close",
+                    side_effect=fail_temporary_close,
+                ),
+                self.assertRaisesRegex(
+                    OSError,
+                    "temporary credential close failure",
+                ) as raised,
+            ):
+                providers._replace_claude_macos_recovery_credential(
+                    self.review,
+                    carrier,
+                    refreshed,
+                )
+        finally:
+            if failed_descriptor is not None:
+                real_close(failed_descriptor)
+
+        artifact_value = getattr(
+            raised.exception,
+            "_codex_claude_retained_credential_artifact",
+            None,
+        )
+        self.assertIsInstance(artifact_value, str)
+        artifact = pathlib.Path(artifact_value)
+        self.assertEqual(artifact.parent, config)
+        self.assertTrue(
+            artifact.name.startswith(
+                providers.CLAUDE_MACOS_RECOVERY_UPDATE_PREFIX
+            )
+        )
+        self.assertEqual(artifact.read_bytes(), refreshed_bytes)
+        self.assertEqual(
+            (config / providers.CLAUDE_CREDENTIAL_FILE_NAME).read_bytes(),
+            original_bytes,
+        )
+        self.assertIsNone(
+            getattr(
+                raised.exception,
+                "_codex_claude_retained_cleanup_artifact",
+                None,
+            )
+        )
+        original[:] = b"\x00" * len(original)
+        refreshed[:] = b"\x00" * len(refreshed)
+
+    def test_incomplete_recovery_temp_unlink_failure_reports_cleanup_artifact(
+        self,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        original_bytes = bytes(original)
+        carrier = providers._retain_claude_macos_refreshed_credential(
+            self.review,
+            original,
+        )
+        config = carrier / "config"
+        real_fsync = providers.os.fsync
+        real_unlink = providers.os.unlink
+
+        def fail_temporary_fsync(descriptor: int) -> None:
+            metadata = os.fstat(descriptor)
+            if stat.S_ISREG(metadata.st_mode):
+                raise OSError("injected temporary credential fsync failure")
+            real_fsync(descriptor)
+
+        def fail_temporary_unlink(
+            name: str,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            if name.startswith(providers.CLAUDE_MACOS_RECOVERY_UPDATE_PREFIX):
+                raise OSError("injected incomplete temp unlink failure")
+            real_unlink(name, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                providers.os,
+                "fsync",
+                side_effect=fail_temporary_fsync,
+            ),
+            mock.patch.object(
+                providers.os,
+                "unlink",
+                side_effect=fail_temporary_unlink,
+            ),
+            self.assertRaisesRegex(
+                OSError,
+                "temporary credential fsync failure",
+            ) as raised,
+        ):
+            providers._replace_claude_macos_recovery_credential(
+                self.review,
+                carrier,
+                refreshed,
+            )
+
+        artifact_value = getattr(
+            raised.exception,
+            "_codex_claude_retained_cleanup_artifact",
+            None,
+        )
+        self.assertIsInstance(artifact_value, str)
+        artifact = pathlib.Path(artifact_value)
+        self.assertTrue(artifact.exists())
+        self.assertEqual(artifact.parent, config)
+        self.assertIsNone(
+            getattr(
+                raised.exception,
+                "_codex_claude_retained_credential_artifact",
+                None,
+            )
+        )
+        self.assertEqual(
+            (config / providers.CLAUDE_CREDENTIAL_FILE_NAME).read_bytes(),
+            original_bytes,
+        )
+        self.assertIn(
+            "non-current or incomplete",
+            "\n".join(getattr(raised.exception, "__notes__", ())),
+        )
+        original[:] = b"\x00" * len(original)
+        refreshed[:] = b"\x00" * len(refreshed)
+
     def test_failed_writeback_retains_latest_staged_rotation(
         self,
     ) -> None:
