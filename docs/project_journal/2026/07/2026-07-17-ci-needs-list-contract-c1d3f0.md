@@ -5,7 +5,7 @@ status: completed
 created: 2026-07-17
 updated: 2026-07-17
 branch: codex/ci-direct-dependency-contract
-pr:
+pr: https://github.com/Joey-Tools/codex-review-workflows/pull/56
 supersedes: []
 superseded_by:
 ---
@@ -27,8 +27,8 @@ status context on additional compatibility and platform jobs.
 - List-form `needs` declarations containing `platform_tests` are accepted for
   synchronized overlays with additional direct dependencies.
 - Quoted dependency names are normalized consistently in scalar, block-list,
-  and inline-list forms; blank lines and comments within block lists are
-  ignored without truncating later dependencies.
+  and inline-list forms; YAML comments, including trailing comments, are
+  ignored outside quoted values without truncating later dependencies.
 - Every accepted direct dependency must expose its result and be checked for a
   successful outcome by the aggregate `test` job.
 - Step-scoped result variables count only when the same step checks them;
@@ -36,10 +36,18 @@ status context on additional compatibility and platform jobs.
   through `GITHUB_ENV`.
 - Success guards count only for unconditional, non-tolerant default-shell steps
   whose non-empty commands are exact dependency-success assertions. The
-  required `always()` condition is scoped to the aggregate `test` job, and
-  inherited workflow/job custom shells, comments, echoed assertions, masked
-  failures, disabled errexit, step custom shells, and job-level tolerance are
-  rejected.
+  aggregate job may contain only such guard steps, preventing earlier steps
+  from poisoning the default shell environment. Result bindings must use safe
+  shell identifiers ending in `_RESULT`, and every binding must come directly
+  from `needs.<job>.result`. The required `always()` condition is scoped to the
+  aggregate `test` job, which must run exactly once on `ubuntu-latest` without
+  a custom container, services, or matrix strategy. Ordinary, single-quoted,
+  and double-quoted control keys share the same semantics; escaped, explicit,
+  tagged, anchored, and aliased mapping keys fail closed rather than relying on
+  an incomplete YAML decoder. Blank lines and full-line comments cannot
+  truncate the parsed job or step scope. Inherited workflow/job custom shells,
+  echoed assertions, masked failures, disabled errexit, step custom shells,
+  and job-level tolerance are rejected.
 
 ## Validation Evidence
 

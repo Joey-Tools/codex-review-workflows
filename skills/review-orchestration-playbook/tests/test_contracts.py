@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import pathlib
+import re
 import subprocess
 import sys
 import unittest
@@ -20,13 +21,114 @@ sys.path.insert(0, str(SCRIPTS))
 from review_runtime import claude_linux, providers  # noqa: E402
 
 
+def _workflow_key_markers(
+    indent: str,
+    key: str,
+    *,
+    list_item: bool = False,
+) -> tuple[str, ...]:
+    prefix = f"{indent}- " if list_item else indent
+    return tuple(
+        f"{prefix}{spelling}"
+        for spelling in (key, f"'{key}'", f'"{key}"')
+    )
+
+
+def _workflow_matching_key_marker(
+    line: str,
+    indent: str,
+    key: str,
+    *,
+    list_item: bool = False,
+) -> str | None:
+    for key_prefix in _workflow_key_markers(
+        indent,
+        key,
+        list_item=list_item,
+    ):
+        if not line.startswith(key_prefix):
+            continue
+        suffix = line.removeprefix(key_prefix)
+        stripped_suffix = suffix.lstrip(" \t")
+        if not stripped_suffix.startswith(":"):
+            continue
+        spacing_length = len(suffix) - len(stripped_suffix)
+        return line[: len(key_prefix) + spacing_length + 1]
+    return None
+
+
+def _workflow_strip_yaml_comment(value: str) -> str:
+    in_single_quote = False
+    in_double_quote = False
+    escaped = False
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if in_double_quote:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_double_quote = False
+        elif in_single_quote:
+            if character == "'":
+                if index + 1 < len(value) and value[index + 1] == "'":
+                    index += 1
+                else:
+                    in_single_quote = False
+        elif character == '"':
+            in_double_quote = True
+        elif character == "'":
+            in_single_quote = True
+        elif character == "#" and (index == 0 or value[index - 1].isspace()):
+            return value[:index].rstrip()
+        index += 1
+    return value.rstrip()
+
+
+def _workflow_has_unsupported_mapping_key_syntax(lines: tuple[str, ...]) -> bool:
+    for line in lines:
+        candidate = line.lstrip()
+        if candidate.startswith("- "):
+            candidate = candidate.removeprefix("- ").lstrip()
+        if not candidate or candidate.startswith("#"):
+            continue
+        if candidate == "?" or candidate.startswith("? "):
+            return True
+        if candidate.startswith(("!", "&", "*")) and ":" in candidate:
+            return True
+        if _workflow_matching_key_marker(candidate, "", "<<") is not None:
+            return True
+        if not candidate.startswith('"'):
+            continue
+        escaped = False
+        index = 1
+        while index < len(candidate):
+            character = candidate[index]
+            if character == "\\":
+                escaped = True
+                index += 2
+                continue
+            if character == '"':
+                if escaped and candidate[index + 1 :].lstrip().startswith(":"):
+                    return True
+                break
+            index += 1
+        else:
+            if escaped:
+                return True
+    return False
+
+
 def _workflow_job_lines(workflow: str, job_name: str) -> tuple[str, ...]:
     marker = f"\n  {job_name}:\n"
     if marker not in workflow:
         return ()
     job_lines: list[str] = []
     for line in workflow.split(marker, 1)[1].splitlines():
-        if line.startswith("  ") and not line.startswith("    "):
+        ignorable = not line.strip() or line.lstrip().startswith("#")
+        if not ignorable and line.startswith("  ") and not line.startswith("    "):
             break
         job_lines.append(line)
     return tuple(job_lines)
@@ -36,8 +138,13 @@ def _workflow_job_needs(workflow: str, job_name: str) -> tuple[str, ...]:
     job_lines = _workflow_job_lines(workflow, job_name)
 
     for index, line in enumerate(job_lines):
-        if line.startswith("    needs: "):
-            scalar_or_inline = line.removeprefix("    needs: ").strip()
+        marker = _workflow_matching_key_marker(line, "    ", "needs")
+        if marker is None:
+            continue
+        scalar_or_inline = _workflow_strip_yaml_comment(
+            line.removeprefix(marker).strip()
+        )
+        if scalar_or_inline:
             if scalar_or_inline.startswith("[") and scalar_or_inline.endswith("]"):
                 return tuple(
                     dependency.strip().strip("'\"")
@@ -45,61 +152,93 @@ def _workflow_job_needs(workflow: str, job_name: str) -> tuple[str, ...]:
                     if dependency.strip()
                 )
             return (scalar_or_inline.strip("'\""),)
-        if line == "    needs:":
-            dependencies: list[str] = []
-            for dependency_line in job_lines[index + 1 :]:
-                if (
-                    not dependency_line.strip()
-                    or dependency_line.lstrip().startswith("#")
-                ):
-                    continue
-                if dependency_line.startswith("      - "):
-                    dependencies.append(
-                        dependency_line.removeprefix("      - ")
-                        .strip()
-                        .strip("'\"")
-                    )
-                    continue
-                break
-            return tuple(dependencies)
+        dependencies: list[str] = []
+        for dependency_line in job_lines[index + 1 :]:
+            if (
+                not dependency_line.strip()
+                or dependency_line.lstrip().startswith("#")
+            ):
+                continue
+            if dependency_line.startswith("      - "):
+                dependency = _workflow_strip_yaml_comment(
+                    dependency_line.removeprefix("      - ").strip()
+                ).strip("'\"")
+                if dependency:
+                    dependencies.append(dependency)
+                continue
+            break
+        return tuple(dependencies)
     return ()
 
 
 def _workflow_env_bindings(
     lines: tuple[str, ...],
     env_indent: str,
-) -> dict[str, str | None]:
-    marker = f"{env_indent}env:"
-    step_item_marker = f"{env_indent[:-2]}- env:" if env_indent else ""
+) -> dict[str, str] | None:
     variable_indent = f"{env_indent}  "
-    bindings: dict[str, str | None] = {}
+    bindings: dict[str, str] = {}
     in_env = False
     expression_prefix = "${{ needs."
     expression_suffix = ".result }}"
 
     for line in lines:
-        if line == marker or line == step_item_marker:
+        marker = _workflow_matching_key_marker(line, env_indent, "env")
+        step_item_marker = (
+            _workflow_matching_key_marker(
+                line,
+                env_indent[:-2],
+                "env",
+                list_item=True,
+            )
+            if env_indent
+            else None
+        )
+        if marker is not None or step_item_marker is not None:
             in_env = True
             continue
-        if not in_env or not line.strip():
+        if not in_env:
+            continue
+        if not line.strip() or line.lstrip().startswith("#"):
             continue
         indentation = len(line) - len(line.lstrip())
         if indentation <= len(env_indent):
             break
         if indentation != len(variable_indent):
-            continue
-        variable, separator, expression = line.strip().partition(": ")
-        if not separator:
-            continue
-        dependency = None
-        if expression.startswith(expression_prefix) and expression.endswith(
-            expression_suffix
+            return None
+        binding = line.removeprefix(variable_indent)
+        match = re.fullmatch(
+            r"(?P<variable>[A-Za-z_][A-Za-z0-9_]*_RESULT)"
+            r"[ \t]*:[ \t]+(?P<expression>.+)",
+            binding,
+        )
+        if match is None:
+            return None
+        variable = match.group("variable")
+        expression = match.group("expression").strip()
+        if variable in bindings:
+            return None
+        if not (
+            expression.startswith(expression_prefix)
+            and expression.endswith(expression_suffix)
         ):
-            dependency = expression[
-                len(expression_prefix) : -len(expression_suffix)
-            ]
+            return None
+        dependency = expression[len(expression_prefix) : -len(expression_suffix)]
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", dependency) is None:
+            return None
         bindings[variable] = dependency
     return bindings
+
+
+def _workflow_scope_has_key(
+    lines: tuple[str, ...],
+    indent: str,
+    key: str,
+) -> bool:
+    return any(
+        _workflow_matching_key_marker(line, indent, key) is not None
+        for line in lines
+        if line.strip() and not line.lstrip().startswith("#")
+    )
 
 
 def _workflow_job_steps(job_lines: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
@@ -112,7 +251,8 @@ def _workflow_job_steps(job_lines: tuple[str, ...]) -> tuple[tuple[str, ...], ..
     current_step: list[str] | None = None
     for line in job_lines[steps_index + 1 :]:
         indentation = len(line) - len(line.lstrip())
-        if line.strip() and indentation <= 4:
+        ignorable = not line.strip() or line.lstrip().startswith("#")
+        if not ignorable and indentation <= 4:
             break
         if line.startswith("      - "):
             current_step = [line]
@@ -125,21 +265,18 @@ def _workflow_job_steps(job_lines: tuple[str, ...]) -> tuple[tuple[str, ...], ..
 def _workflow_job_top_level_values(
     job_lines: tuple[str, ...], key: str
 ) -> tuple[str, ...]:
-    marker = f"    {key}:"
-    return tuple(
-        line.removeprefix(marker).strip()
-        for line in job_lines
-        if line.startswith(marker)
-    )
+    values: list[str] = []
+    for line in job_lines:
+        marker = _workflow_matching_key_marker(line, "    ", key)
+        if marker is not None:
+            values.append(line.removeprefix(marker).strip())
+    return tuple(values)
 
 
 def _workflow_scope_has_unsafe_run_defaults(
     lines: tuple[str, ...],
     defaults_indent: str,
 ) -> bool:
-    defaults_marker = f"{defaults_indent}defaults:"
-    run_marker = f"{defaults_indent}  run:"
-    shell_marker = f"{defaults_indent}    shell:"
     in_defaults = False
     in_run = False
 
@@ -148,7 +285,12 @@ def _workflow_scope_has_unsafe_run_defaults(
         if not stripped or stripped.startswith("#"):
             continue
         indentation = len(line) - len(line.lstrip())
-        if line.startswith(defaults_marker):
+        defaults_marker = _workflow_matching_key_marker(
+            line,
+            defaults_indent,
+            "defaults",
+        )
+        if defaults_marker is not None:
             if line.removeprefix(defaults_marker).strip():
                 return True
             in_defaults = True
@@ -160,7 +302,12 @@ def _workflow_scope_has_unsafe_run_defaults(
             in_defaults = False
             in_run = False
             continue
-        if line.startswith(run_marker):
+        run_marker = _workflow_matching_key_marker(
+            line,
+            f"{defaults_indent}  ",
+            "run",
+        )
+        if run_marker is not None:
             if line.removeprefix(run_marker).strip():
                 return True
             in_run = True
@@ -170,7 +317,14 @@ def _workflow_scope_has_unsafe_run_defaults(
         if indentation <= len(defaults_indent) + 2:
             in_run = False
             continue
-        if line.startswith(shell_marker):
+        if (
+            _workflow_matching_key_marker(
+                line,
+                f"{defaults_indent}    ",
+                "shell",
+            )
+            is not None
+        ):
             return True
     return False
 
@@ -178,10 +332,14 @@ def _workflow_scope_has_unsafe_run_defaults(
 def _workflow_step_top_level_values(
     step: tuple[str, ...], key: str
 ) -> tuple[str, ...]:
-    markers = (f"      - {key}:", f"        {key}:")
     values: list[str] = []
     for line in step:
-        marker = next((candidate for candidate in markers if line.startswith(candidate)), None)
+        marker = _workflow_matching_key_marker(
+            line,
+            "      ",
+            key,
+            list_item=True,
+        ) or _workflow_matching_key_marker(line, "        ", key)
         if marker is not None:
             values.append(line.removeprefix(marker).strip())
     return tuple(values)
@@ -189,14 +347,12 @@ def _workflow_step_top_level_values(
 
 def _workflow_step_run_body(step: tuple[str, ...]) -> str:
     for index, line in enumerate(step):
-        marker = next(
-            (
-                candidate
-                for candidate in ("        run:", "      - run:")
-                if line.startswith(candidate)
-            ),
-            None,
-        )
+        marker = _workflow_matching_key_marker(
+            line,
+            "      ",
+            "run",
+            list_item=True,
+        ) or _workflow_matching_key_marker(line, "        ", "run")
         if marker is None:
             continue
         header = line.removeprefix(marker).strip()
@@ -218,8 +374,24 @@ def _workflow_step_run_body(step: tuple[str, ...]) -> str:
 
 def _workflow_job_success_guards(workflow: str, job_name: str) -> tuple[str, ...]:
     job_lines = _workflow_job_lines(workflow, job_name)
+    workflow_lines = tuple(workflow.splitlines())
+    if _workflow_has_unsupported_mapping_key_syntax(workflow_lines):
+        return ()
+    if _workflow_job_top_level_values(job_lines, "runs-on") != ("ubuntu-latest",):
+        return ()
+    if any(
+        _workflow_scope_has_key(job_lines, "    ", key)
+        for key in ("container", "services", "strategy")
+    ):
+        return ()
+    if _workflow_scope_has_key(
+        workflow_lines,
+        "",
+        "env",
+    ) or _workflow_scope_has_key(job_lines, "    ", "env"):
+        return ()
     if _workflow_scope_has_unsafe_run_defaults(
-        tuple(workflow.splitlines()), ""
+        workflow_lines, ""
     ) or _workflow_scope_has_unsafe_run_defaults(job_lines, "    "):
         return ()
     job_continue_on_error = _workflow_job_top_level_values(
@@ -228,21 +400,28 @@ def _workflow_job_success_guards(workflow: str, job_name: str) -> tuple[str, ...
     if job_continue_on_error not in ((), ("false",)):
         return ()
     guarded_dependencies: list[str] = []
-    for step in _workflow_job_steps(job_lines):
+    steps = _workflow_job_steps(job_lines)
+    if not steps:
+        return ()
+    for step in steps:
         if _workflow_step_top_level_values(step, "if"):
-            continue
+            return ()
         step_continue_on_error = _workflow_step_top_level_values(
             step, "continue-on-error"
         )
         if step_continue_on_error not in ((), ("false",)):
-            continue
+            return ()
         if _workflow_step_top_level_values(step, "shell"):
-            continue
+            return ()
+        if _workflow_step_top_level_values(step, "env") != ("",):
+            return ()
         step_bindings = _workflow_env_bindings(step, "        ")
+        if not step_bindings:
+            return ()
         run_body = _workflow_step_run_body(step)
         commands = tuple(line.strip() for line in run_body.splitlines() if line.strip())
         if not commands:
-            continue
+            return ()
         step_dependencies: list[str] = []
         for command in commands:
             dependency = next(
@@ -255,12 +434,11 @@ def _workflow_job_success_guards(workflow: str, job_name: str) -> tuple[str, ...
                 None,
             )
             if dependency is None:
-                break
+                return ()
             step_dependencies.append(dependency)
-        else:
-            for dependency in step_dependencies:
-                if dependency not in guarded_dependencies:
-                    guarded_dependencies.append(dependency)
+        for dependency in step_dependencies:
+            if dependency not in guarded_dependencies:
+                guarded_dependencies.append(dependency)
     return tuple(guarded_dependencies)
 
 
@@ -527,6 +705,11 @@ class RepositoryContractTest(unittest.TestCase):
 
     def test_ci_dependency_parser_scopes_needs_to_the_selected_job(self) -> None:
         scalar = "jobs:\n  test:\n    needs: 'platform_tests'\n    runs-on: ubuntu-latest\n"
+        scalar_with_comment = (
+            "jobs:\n"
+            "  test:\n"
+            "    needs: platform_tests # Required status dependency.\n"
+        )
         list_form = (
             "jobs:\n"
             "  test:\n"
@@ -534,7 +717,7 @@ class RepositoryContractTest(unittest.TestCase):
             "      - compatibility_tests\n"
             "      # Comments do not end a YAML block list.\n"
             "\n"
-            '      - "platform_tests"\n'
+            '      - "platform_tests" # Required status dependency.\n'
             "    runs-on: ubuntu-latest\n"
             "    steps:\n"
             "      - env:\n"
@@ -549,6 +732,18 @@ class RepositoryContractTest(unittest.TestCase):
             "  test:\n"
             "    needs: [compatibility_tests, 'platform_tests']\n"
             "    runs-on: ubuntu-latest\n"
+        )
+        inline_list_with_comment = (
+            "jobs:\n"
+            "  test:\n"
+            "    needs: [compatibility_tests, 'platform_tests'] # Required jobs.\n"
+        )
+        quoted_block_header = (
+            "jobs:\n"
+            "  test:\n"
+            '    "needs" : # Required jobs.\n'
+            "      - compatibility_tests\n"
+            "      - platform_tests # Required status dependency.\n"
         )
         other_job_only = (
             "jobs:\n"
@@ -621,14 +816,40 @@ class RepositoryContractTest(unittest.TestCase):
             "  test:\n"
             "    needs: platform_tests\n"
         )
+        poisoned_step_environment = (
+            "jobs:\n"
+            "  test:\n"
+            "    needs: platform_tests\n"
+            "    steps:\n"
+            "      - name: Poison later default-shell steps\n"
+            "        run: |\n"
+            '          echo "BASH_ENV=$RUNNER_TEMP/guard-bypass" >> "$GITHUB_ENV"\n'
+            '          echo "test() { return 0; }" > "$RUNNER_TEMP/guard-bypass"\n'
+            "      - name: Check result\n"
+            "        env:\n"
+            "          PLATFORM_RESULT: ${{ needs.platform_tests.result }}\n"
+            '        run: test "$PLATFORM_RESULT" = "success"\n'
+        )
 
         self.assertEqual(_workflow_job_needs(scalar, "test"), ("platform_tests",))
+        self.assertEqual(
+            _workflow_job_needs(scalar_with_comment, "test"),
+            ("platform_tests",),
+        )
         self.assertEqual(
             _workflow_job_needs(list_form, "test"),
             ("compatibility_tests", "platform_tests"),
         )
         self.assertEqual(
             _workflow_job_needs(inline_list, "test"),
+            ("compatibility_tests", "platform_tests"),
+        )
+        self.assertEqual(
+            _workflow_job_needs(inline_list_with_comment, "test"),
+            ("compatibility_tests", "platform_tests"),
+        )
+        self.assertEqual(
+            _workflow_job_needs(quoted_block_header, "test"),
             ("compatibility_tests", "platform_tests"),
         )
         self.assertEqual(
@@ -656,6 +877,10 @@ class RepositoryContractTest(unittest.TestCase):
             ),
             (),
         )
+        self.assertEqual(
+            _workflow_job_success_guards(poisoned_step_environment, "test"),
+            (),
+        )
 
     def test_ci_success_guard_parser_rejects_non_propagating_steps(self) -> None:
         def guarded_workflow(
@@ -666,18 +891,27 @@ class RepositoryContractTest(unittest.TestCase):
                 '        run: test "$PLATFORM_RESULT" = "success"',
             ),
             job_properties: tuple[str, ...] = (),
+            extra_env_bindings: tuple[str, ...] = (),
+            result_variable: str = "PLATFORM_RESULT",
+            runs_on: str = "ubuntu-latest",
+            trailing_job_lines: tuple[str, ...] = (),
         ) -> str:
             return (
                 "jobs:\n"
                 "  test:\n"
                 "    needs: platform_tests\n"
+                + f"    runs-on: {runs_on}\n"
                 + "".join(f"    {property_line}\n" for property_line in job_properties)
                 + "    steps:\n"
                 + f"{first_step_line}\n"
                 + "".join(f"        {property_line}\n" for property_line in step_properties)
                 + "        env:\n"
-                + "          PLATFORM_RESULT: ${{ needs.platform_tests.result }}\n"
+                + f"          {result_variable}: ${{{{ needs.platform_tests.result }}}}\n"
+                + "".join(
+                    f"          {binding}\n" for binding in extra_env_bindings
+                )
                 + "".join(f"{line}\n" for line in run_lines)
+                + "".join(f"{line}\n" for line in trailing_job_lines)
             )
 
         unsafe_workflows = {
@@ -696,7 +930,60 @@ class RepositoryContractTest(unittest.TestCase):
             "tolerated-job": guarded_workflow(
                 job_properties=("continue-on-error: true",)
             ),
+            "dedented-job-comment-before-tolerance": guarded_workflow(
+                trailing_job_lines=(
+                    "  # This comment does not end the selected job.",
+                    "  ",
+                    "    continue-on-error: true",
+                )
+            ),
+            "dedented-step-comment-before-tolerance": guarded_workflow(
+                run_lines=(
+                    '        run: test "$PLATFORM_RESULT" = "success"',
+                    "    # This comment does not end the current step.",
+                    "    ",
+                    "        continue-on-error: true",
+                )
+            ),
             "custom-shell": guarded_workflow(step_properties=("shell: bash {0}",)),
+            "quoted-conditional": guarded_workflow(
+                step_properties=('"if": ${{ false }}',)
+            ),
+            "quoted-spaced-conditional": guarded_workflow(
+                step_properties=('"if" : ${{ false }}',)
+            ),
+            "escaped-quoted-conditional": guarded_workflow(
+                step_properties=('"i\\u0066" : ${{ false }}',)
+            ),
+            "explicit-conditional": guarded_workflow(
+                step_properties=(
+                    "? if",
+                    ": ${{ github.event_name == 'push' }}",
+                )
+            ),
+            "tagged-conditional": guarded_workflow(
+                step_properties=("!!str if: ${{ github.event_name == 'push' }}",)
+            ),
+            "anchored-conditional": guarded_workflow(
+                step_properties=(
+                    "&condition_key if: ${{ github.event_name == 'push' }}",
+                )
+            ),
+            "aliased-conditional": guarded_workflow(
+                first_step_line="      - name: &condition_key if",
+                step_properties=(
+                    "*condition_key: ${{ github.event_name == 'push' }}",
+                ),
+            ),
+            "quoted-tolerated-step": guarded_workflow(
+                step_properties=("'continue-on-error': true",)
+            ),
+            "quoted-tolerated-job": guarded_workflow(
+                job_properties=('"continue-on-error": true',)
+            ),
+            "quoted-custom-shell": guarded_workflow(
+                step_properties=('"shell": bash {0}',)
+            ),
             "workflow-default-shell": (
                 "defaults:\n"
                 "  run:\n"
@@ -708,6 +995,71 @@ class RepositoryContractTest(unittest.TestCase):
                     "defaults:",
                     "  run:",
                     "    shell: bash {0}",
+                )
+            ),
+            "quoted-workflow-default-shell": (
+                "'defaults':\n"
+                '  "run":\n'
+                "    'shell': bash {0}\n"
+                + guarded_workflow()
+            ),
+            "escaped-quoted-workflow-default-shell": (
+                '"def\\u0061ults":\n'
+                "  run:\n"
+                "    shell: bash {0}\n"
+                + guarded_workflow()
+            ),
+            "workflow-environment": (
+                "env:\n"
+                "  BASH_ENV: /tmp/guard-bypass\n"
+                + guarded_workflow()
+            ),
+            "tagged-workflow-environment": (
+                "!!str env:\n"
+                '  BASH_FUNC_test%%: "() { return 0; }"\n'
+                + guarded_workflow()
+            ),
+            "job-environment": guarded_workflow(
+                job_properties=(
+                    "'env':",
+                    "  BASH_ENV: /tmp/guard-bypass",
+                )
+            ),
+            "step-environment": guarded_workflow(
+                extra_env_bindings=("BASH_ENV: /tmp/guard-bypass",)
+            ),
+            "shell-startup-variable-as-result-binding": guarded_workflow(
+                result_variable="BASH_ENV",
+                run_lines=('        run: test "$BASH_ENV" = "success"',),
+            ),
+            "tab-separated-step-environment": guarded_workflow(
+                extra_env_bindings=('BASH_FUNC_test%%:\t"() { return 0; }"',)
+            ),
+            "shell-injected-environment-name": guarded_workflow(
+                result_variable='PATH";true;echo"',
+                run_lines=('        run: test "$PATH";true;echo"" = "success"',),
+            ),
+            "custom-runner": guarded_workflow(runs_on="self-hosted"),
+            "job-container-environment": guarded_workflow(
+                job_properties=(
+                    "container:",
+                    "  image: bash:latest",
+                    "  env:",
+                    '    BASH_FUNC_test%%: "() { return 0; }"',
+                )
+            ),
+            "job-services": guarded_workflow(
+                job_properties=(
+                    "services:",
+                    "  database:",
+                    "    image: postgres:latest",
+                )
+            ),
+            "job-strategy": guarded_workflow(
+                job_properties=(
+                    "strategy:",
+                    "  matrix:",
+                    "    shard: [one, two]",
                 )
             ),
             "commented-command": guarded_workflow(
@@ -741,6 +1093,7 @@ class RepositoryContractTest(unittest.TestCase):
 
         safe_workflows = (
             guarded_workflow(step_properties=("continue-on-error: false",)),
+            guarded_workflow(step_properties=('"continue-on-error": false',)),
             guarded_workflow(job_properties=("continue-on-error: false",)),
             (
                 "defaults:\n"
