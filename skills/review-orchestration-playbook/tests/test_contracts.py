@@ -359,6 +359,8 @@ def _workflow_scope_has_unsafe_run_defaults(
             if indentation <= run_indent:
                 run_indent = None
                 continue
+            if stripped.startswith(("{", "[")):
+                return True
             if (
                 _workflow_matching_key_marker(
                     nested_line,
@@ -1120,6 +1122,40 @@ class RepositoryContractTest(unittest.TestCase):
                     " run:",
                     "  shell: bash {0}",
                 )
+            ),
+            "workflow-flow-default-shell": (
+                "defaults:\n"
+                "  run:\n"
+                '    { shell: "bash -c \'exit 0\' {0}" }\n'
+                + guarded_workflow()
+            ),
+            "job-flow-default-shell": guarded_workflow(
+                job_properties=(
+                    "defaults:",
+                    "  run:",
+                    '    { shell: "bash -c \'exit 0\' {0}" }',
+                )
+            ),
+            "quoted-workflow-flow-default-shell": (
+                "defaults:\n"
+                "  run:\n"
+                '    { "shell": "bash -c \'exit 0\' {0}" }\n'
+                + guarded_workflow()
+            ),
+            "multiline-job-flow-default-shell": guarded_workflow(
+                job_properties=(
+                    "defaults:",
+                    "  run:",
+                    "    {",
+                    '      shell: "bash -c \'exit 0\' {0}",',
+                    "    }",
+                )
+            ),
+            "workflow-flow-default-sequence": (
+                "defaults:\n"
+                "  run:\n"
+                '    [ { shell: "bash -c \'exit 0\' {0}" } ]\n'
+                + guarded_workflow()
             ),
             "quoted-workflow-default-shell": (
                 "'defaults':\n"

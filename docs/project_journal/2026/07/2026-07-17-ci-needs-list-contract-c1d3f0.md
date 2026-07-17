@@ -55,6 +55,9 @@ status context on additional compatibility and platform jobs.
   truncate the parsed job or step scope. Inherited workflow/job custom shells,
   echoed assertions, masked failures, disabled errexit, step custom shells,
   and job-level tolerance are rejected regardless of legal YAML indentation.
+  Flow-style collections under `defaults.run` are rejected in workflow and job
+  scopes, including quoted-key and multiline flow mappings, because the
+  lightweight contract parser supports only ordinary block mappings there.
   Bare sequence-item steps are parsed and validated instead of being skipped,
   and folded `run: >` block scalars are rejected because YAML folding can join
   physical lines into a different shell command. Inline `run:` scalars also
@@ -67,6 +70,10 @@ status context on additional compatibility and platform jobs.
 - The synchronized private-overlay suite passed (`708` tests; `10` skipped).
 - `ruff check`, Python compilation, `actionlint`, and `git diff --check` passed
   for both copies.
+- The flow-collection regression update passed both focused contract files
+  (`17` tests each), Ruff, Python compilation, Actionlint checks for four valid
+  workflow/job flow-mapping variants, project-journal validation, and diff
+  checks.
 
 ## Next Steps
 
