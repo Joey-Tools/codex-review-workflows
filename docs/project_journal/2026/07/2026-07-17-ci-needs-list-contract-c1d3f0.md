@@ -28,6 +28,9 @@ status context on additional compatibility and platform jobs.
   synchronized overlays with additional direct dependencies.
 - Indentless YAML block sequences under `needs` are accepted when they remain
   within the current job, including comments and the following job boundary.
+- A sequence item may put one ordinary job-ID scalar on the indented line after
+  a bare dash. Any malformed, aliased, tagged, anchored, flow, block-scalar, or
+  mapping item invalidates the complete list instead of returning a prefix.
 - Quoted dependency names are normalized consistently in scalar, block-list,
   and inline-list forms; YAML comments, including trailing comments, are
   ignored outside quoted values without truncating later dependencies.
@@ -60,7 +63,14 @@ status context on additional compatibility and platform jobs.
   tags, merge keys, flow collections, block scalars, duplicate keys, and other
   unstructured nodes fail closed.
   Bare sequence-item steps are parsed and validated instead of being skipped,
-  and folded `run: >` block scalars are rejected because YAML folding can join
+  and the job must expose exactly one structural `steps` block header; ordinary
+  quoted, spaced, and commented spellings remain accepted. Mapping-key checks
+  skip literal/folded block-scalar payloads. Explicit indentation indicators
+  set the minimum payload indent even when the first non-empty line is deeper;
+  scalars without an indicator still infer it from that first line. Shell text
+  resembling tagged YAML therefore cannot poison an unrelated aggregate-job
+  contract.
+  Folded `run: >` block scalars are rejected because YAML folding can join
   physical lines into a different shell command. Inline `run:` scalars also
   reject deeper-indented physical continuations, preventing folded commands
   from appending an unvalidated success path after an exact first line.
@@ -75,6 +85,11 @@ status context on additional compatibility and platform jobs.
   (`17` tests each), Ruff, Python compilation, Actionlint checks for four valid
   flow-mapping variants and six valid alias/anchor/tag/block-scalar variants,
   project-journal validation, and diff checks.
+- The sequence/structure regression update passed both contract files (`17`
+  tests each), Ruff, Python compilation, and five Actionlint-valid needs,
+  `steps`, alias, and block-scalar-payload fixtures; project-journal validation
+  and diff checks also passed. The explicit-indentation payload regression also
+  passed focused contract tests, Ruff, and an Actionlint-valid de-indent fixture.
 
 ## Next Steps
 

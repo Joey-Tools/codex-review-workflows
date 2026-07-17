@@ -87,8 +87,53 @@ def _workflow_strip_yaml_comment(value: str) -> str:
     return value.rstrip()
 
 
+def _workflow_block_scalar_header_indents(
+    line: str,
+) -> tuple[int, int | None] | None:
+    indentation = len(line) - len(line.lstrip())
+    candidate = line.lstrip()
+    header_indent = indentation
+    if candidate.startswith("- "):
+        candidate = candidate.removeprefix("- ").lstrip()
+        header_indent += 2
+    candidate = _workflow_strip_yaml_comment(candidate).strip()
+    block_header = r"[|>](?:[1-9][+-]?|[+-][1-9]?|)"
+    match = re.fullmatch(rf"(?P<header>{block_header})", candidate)
+    if match is not None:
+        header_indent = indentation
+    key = r'''(?:[A-Za-z_][A-Za-z0-9_-]*|'[^']*'|"[^"\\]*")'''
+    if match is None:
+        match = re.fullmatch(
+            rf"{key}[ \t]*:[ \t]*(?P<header>{block_header})",
+            candidate,
+        )
+    if match is None:
+        return None
+    indentation_indicator = re.search(r"[1-9]", match.group("header"))
+    content_indent = (
+        header_indent + int(indentation_indicator.group())
+        if indentation_indicator is not None
+        else None
+    )
+    return header_indent, content_indent
+
+
 def _workflow_has_unsupported_mapping_key_syntax(lines: tuple[str, ...]) -> bool:
+    block_header_indent: int | None = None
+    block_content_indent: int | None = None
     for line in lines:
+        if block_header_indent is not None:
+            if not line.strip():
+                continue
+            indentation = len(line) - len(line.lstrip())
+            if block_content_indent is None and indentation > block_header_indent:
+                block_content_indent = indentation
+                continue
+            if block_content_indent is not None and indentation >= block_content_indent:
+                continue
+            block_header_indent = None
+            block_content_indent = None
+
         candidate = line.lstrip()
         if candidate.startswith("- "):
             candidate = candidate.removeprefix("- ").lstrip()
@@ -101,6 +146,9 @@ def _workflow_has_unsupported_mapping_key_syntax(lines: tuple[str, ...]) -> bool
         if _workflow_matching_key_marker(candidate, "", "<<") is not None:
             return True
         if not candidate.startswith('"'):
+            scalar_header_indents = _workflow_block_scalar_header_indents(line)
+            if scalar_header_indents is not None:
+                block_header_indent, block_content_indent = scalar_header_indents
             continue
         escaped = False
         index = 1
@@ -118,6 +166,9 @@ def _workflow_has_unsupported_mapping_key_syntax(lines: tuple[str, ...]) -> bool
         else:
             if escaped:
                 return True
+        scalar_header_indents = _workflow_block_scalar_header_indents(line)
+        if scalar_header_indents is not None:
+            block_header_indent, block_content_indent = scalar_header_indents
     return False
 
 
@@ -169,6 +220,119 @@ def _workflow_job_lines(workflow: str, job_name: str) -> tuple[str, ...]:
     return tuple(job_lines)
 
 
+def _workflow_dependency_scalar(value: str) -> str | None:
+    candidate = _workflow_strip_yaml_comment(value).strip()
+    if candidate[:1] in ("'", '"'):
+        if len(candidate) < 2 or candidate[-1] != candidate[0]:
+            return None
+        candidate = candidate[1:-1]
+    elif candidate[-1:] in ("'", '"'):
+        return None
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", candidate) is None:
+        return None
+    return candidate
+
+
+def _workflow_inline_sequence_values(value: str) -> tuple[str, ...] | None:
+    if not value.startswith("[") or not value.endswith("]"):
+        return None
+    items = value[1:-1].split(",")
+    values: list[str] = []
+    for item in items:
+        dependency = _workflow_dependency_scalar(item)
+        if dependency is None:
+            return None
+        values.append(dependency)
+    return tuple(values) if values else None
+
+
+def _workflow_sequence_item_value(line: str, indentation: int) -> str | None:
+    marker = f"{' ' * indentation}-"
+    if line == marker:
+        return ""
+    if line.startswith(f"{marker} "):
+        return line.removeprefix(f"{marker} ")
+    return None
+
+
+def _workflow_has_plain_mapping_key_at_indent(line: str, indentation: int) -> bool:
+    if len(line) - len(line.lstrip()) != indentation:
+        return False
+    candidate = line[indentation:]
+    key = r'''(?:[A-Za-z_][A-Za-z0-9_-]*|'[^']*'|"[^"\\]*")'''
+    return re.match(rf"{key}[ \t]*:", candidate) is not None
+
+
+def _workflow_sequence_values(
+    lines: tuple[str, ...],
+    key_indent: int,
+) -> tuple[str, ...] | None:
+    values: list[str] = []
+    sequence_indent: int | None = None
+    index = 0
+
+    while index < len(lines):
+        line = lines[index]
+        if not line.strip() or line.lstrip().startswith("#"):
+            index += 1
+            continue
+        indentation = len(line) - len(line.lstrip())
+        if sequence_indent is None:
+            if indentation < key_indent:
+                return None
+            item_value = _workflow_sequence_item_value(line, indentation)
+            if item_value is None:
+                return None
+            sequence_indent = indentation
+        else:
+            if indentation < sequence_indent:
+                if indentation < key_indent or _workflow_has_plain_mapping_key_at_indent(
+                    line,
+                    key_indent,
+                ):
+                    break
+                return None
+            if indentation > sequence_indent:
+                return None
+            item_value = _workflow_sequence_item_value(line, sequence_indent)
+            if item_value is None:
+                if sequence_indent == key_indent and _workflow_has_plain_mapping_key_at_indent(
+                    line,
+                    key_indent,
+                ):
+                    break
+                return None
+
+        candidate = _workflow_strip_yaml_comment(item_value).strip()
+        dependency = _workflow_dependency_scalar(candidate)
+        if dependency is not None:
+            values.append(dependency)
+            index += 1
+            continue
+        if candidate:
+            return None
+
+        nested_index = index + 1
+        while nested_index < len(lines) and (
+            not lines[nested_index].strip()
+            or lines[nested_index].lstrip().startswith("#")
+        ):
+            nested_index += 1
+        if nested_index >= len(lines):
+            return None
+        nested_line = lines[nested_index]
+        nested_indent = len(nested_line) - len(nested_line.lstrip())
+        if nested_indent <= sequence_indent:
+            return None
+        dependency = _workflow_dependency_scalar(nested_line.strip())
+        if dependency is None:
+            return None
+        values.append(dependency)
+        index = nested_index + 1
+
+    return tuple(values) if values else None
+
+
 def _workflow_job_needs(workflow: str, job_name: str) -> tuple[str, ...]:
     job_lines = _workflow_job_lines(workflow, job_name)
 
@@ -180,37 +344,13 @@ def _workflow_job_needs(workflow: str, job_name: str) -> tuple[str, ...]:
             line.removeprefix(marker).strip()
         )
         if scalar_or_inline:
-            if scalar_or_inline.startswith("[") and scalar_or_inline.endswith("]"):
-                return tuple(
-                    dependency.strip().strip("'\"")
-                    for dependency in scalar_or_inline[1:-1].split(",")
-                    if dependency.strip()
-                )
-            return (scalar_or_inline.strip("'\""),)
-        dependencies: list[str] = []
-        for dependency_line in job_lines[index + 1 :]:
-            if (
-                not dependency_line.strip()
-                or dependency_line.lstrip().startswith("#")
-            ):
-                continue
-            dependency_marker = next(
-                (
-                    marker
-                    for marker in ("      - ", "    - ")
-                    if dependency_line.startswith(marker)
-                ),
-                None,
-            )
-            if dependency_marker is not None:
-                dependency = _workflow_strip_yaml_comment(
-                    dependency_line.removeprefix(dependency_marker).strip()
-                ).strip("'\"")
-                if dependency:
-                    dependencies.append(dependency)
-                continue
-            break
-        return tuple(dependencies)
+            if scalar_or_inline.startswith("["):
+                return _workflow_inline_sequence_values(scalar_or_inline) or ()
+            dependency = _workflow_dependency_scalar(scalar_or_inline)
+            return (dependency,) if dependency is not None else ()
+        return (
+            _workflow_sequence_values(tuple(job_lines[index + 1 :]), 4) or ()
+        )
     return ()
 
 
@@ -285,10 +425,17 @@ def _workflow_scope_has_key(
 
 
 def _workflow_job_steps(job_lines: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
-    try:
-        steps_index = job_lines.index("    steps:")
-    except ValueError:
+    steps_indexes: list[int] = []
+    for index, line in enumerate(job_lines):
+        marker = _workflow_matching_key_marker(line, "    ", "steps")
+        if marker is None:
+            continue
+        if _workflow_strip_yaml_comment(line.removeprefix(marker).strip()):
+            return ()
+        steps_indexes.append(index)
+    if len(steps_indexes) != 1:
         return ()
+    steps_index = steps_indexes[0]
 
     steps: list[list[str]] = []
     current_step: list[str] | None = None
@@ -793,6 +940,22 @@ class RepositoryContractTest(unittest.TestCase):
         )
 
     def test_ci_dependency_parser_scopes_needs_to_the_selected_job(self) -> None:
+        def guarded_needs(*needs_lines: str) -> str:
+            return (
+                "jobs:\n"
+                "  test:\n"
+                "    needs:\n"
+                + "".join(f"{line}\n" for line in needs_lines)
+                + "    runs-on: ubuntu-latest\n"
+                "    steps:\n"
+                "      - env:\n"
+                "          COMPATIBILITY_RESULT: ${{ needs.compatibility_tests.result }}\n"
+                "          PLATFORM_RESULT: ${{ needs.platform_tests.result }}\n"
+                "        run: |\n"
+                '          test "$COMPATIBILITY_RESULT" = "success"\n'
+                '          test "$PLATFORM_RESULT" = "success"\n'
+            )
+
         scalar = "jobs:\n  test:\n    needs: 'platform_tests'\n    runs-on: ubuntu-latest\n"
         scalar_with_comment = (
             "jobs:\n"
@@ -850,6 +1013,58 @@ class RepositoryContractTest(unittest.TestCase):
             "        run: |\n"
             '          test "$COMPATIBILITY_RESULT" = "success"\n'
             '          test "$PLATFORM_RESULT" = "success"\n'
+        )
+        bare_dash_first = guarded_needs(
+            "      - # The scalar follows on the next physical line.",
+            "        # Comments do not create an empty sequence item.",
+            "        compatibility_tests",
+            "      - platform_tests",
+        )
+        bare_dash_middle = guarded_needs(
+            "      - compatibility_tests",
+            "      -",
+            '        "platform_tests"',
+        )
+        indentless_bare_dash = guarded_needs(
+            "    -",
+            "      compatibility_tests",
+            "    - platform_tests",
+        )
+        incomplete_bare_dash = guarded_needs(
+            "      - compatibility_tests",
+            "      -",
+        )
+        alias_after_prefix = (
+            "name: &platform_dependency platform_tests\n"
+            + guarded_needs(
+                "      - compatibility_tests",
+                "      - *platform_dependency",
+            )
+        )
+        inline_alias_after_prefix = (
+            "name: &platform_dependency platform_tests\n"
+            "jobs:\n"
+            "  test:\n"
+            "    needs: [compatibility_tests, *platform_dependency]\n"
+        )
+        unsupported_sequence_nodes = (
+            guarded_needs(
+                "      - compatibility_tests",
+                "      - !!str platform_tests",
+            ),
+            guarded_needs(
+                "      - compatibility_tests",
+                "      - [platform_tests]",
+            ),
+            guarded_needs(
+                "      - compatibility_tests",
+                "      - job: platform_tests",
+            ),
+            guarded_needs(
+                "      - compatibility_tests",
+                "      - |-",
+                "        platform_tests",
+            ),
         )
         other_job_only = (
             "jobs:\n"
@@ -979,6 +1194,22 @@ class RepositoryContractTest(unittest.TestCase):
             _workflow_job_needs(indentless_block_list, "test"),
             ("compatibility_tests", "platform_tests"),
         )
+        for workflow in (bare_dash_first, bare_dash_middle, indentless_bare_dash):
+            self.assertEqual(
+                _workflow_job_needs(workflow, "test"),
+                ("compatibility_tests", "platform_tests"),
+            )
+            self.assertEqual(
+                _workflow_job_success_guards(workflow, "test"),
+                ("compatibility_tests", "platform_tests"),
+            )
+        for workflow in (
+            incomplete_bare_dash,
+            alias_after_prefix,
+            inline_alias_after_prefix,
+            *unsupported_sequence_nodes,
+        ):
+            self.assertEqual(_workflow_job_needs(workflow, "test"), ())
         self.assertEqual(
             _workflow_job_needs(other_job_only, "test"),
             ("compatibility_tests",),
@@ -1033,6 +1264,7 @@ class RepositoryContractTest(unittest.TestCase):
             extra_env_bindings: tuple[str, ...] = (),
             result_variable: str = "PLATFORM_RESULT",
             runs_on: str = "ubuntu-latest",
+            steps_line: str = "    steps:",
             leading_step_lines: tuple[str, ...] = (),
             trailing_job_lines: tuple[str, ...] = (),
         ) -> str:
@@ -1042,7 +1274,7 @@ class RepositoryContractTest(unittest.TestCase):
                 "    needs: platform_tests\n"
                 + f"    runs-on: {runs_on}\n"
                 + "".join(f"    {property_line}\n" for property_line in job_properties)
-                + "    steps:\n"
+                + f"{steps_line}\n"
                 + "".join(f"{line}\n" for line in leading_step_lines)
                 + f"{first_step_line}\n"
                 + "".join(f"        {property_line}\n" for property_line in step_properties)
@@ -1090,6 +1322,13 @@ class RepositoryContractTest(unittest.TestCase):
             ),
             "tolerated-job": guarded_workflow(
                 job_properties=("continue-on-error: true",)
+            ),
+            "inline-steps": guarded_workflow(steps_line="    steps: []"),
+            "duplicate-steps": guarded_workflow(
+                trailing_job_lines=(
+                    "    'steps':",
+                    "      - run: true",
+                )
             ),
             "dedented-job-comment-before-tolerance": guarded_workflow(
                 trailing_job_lines=(
@@ -1374,6 +1613,17 @@ class RepositoryContractTest(unittest.TestCase):
                     "          true",
                 )
             ),
+            "aliased-steps": (
+                "jobs:\n"
+                "  platform_tests:\n"
+                "    runs-on: ubuntu-latest\n"
+                "    steps: &shared_steps\n"
+                "      - run: true\n"
+                "  test:\n"
+                "    needs: platform_tests\n"
+                "    runs-on: ubuntu-latest\n"
+                "    steps: *shared_steps\n"
+            ),
         }
         for name, workflow in unsafe_workflows.items():
             with self.subTest(name=name):
@@ -1383,6 +1633,10 @@ class RepositoryContractTest(unittest.TestCase):
             guarded_workflow(step_properties=("continue-on-error: false",)),
             guarded_workflow(step_properties=('"continue-on-error": false',)),
             guarded_workflow(job_properties=("continue-on-error: false",)),
+            guarded_workflow(steps_line='    "steps":'),
+            guarded_workflow(steps_line="    'steps':"),
+            guarded_workflow(steps_line="    steps :"),
+            guarded_workflow(steps_line="    steps: # Guard steps follow."),
             (
                 "defaults:\n"
                 "  run:\n"
@@ -1402,6 +1656,24 @@ class RepositoryContractTest(unittest.TestCase):
                     "  run:",
                     "    working-directory: scripts",
                 )
+            ),
+            (
+                "jobs:\n"
+                "  other:\n"
+                "    runs-on: ubuntu-latest\n"
+                "    steps:\n"
+                "      - run: |2-\n"
+                "            printf '%s\\n' 'more-indented first line'\n"
+                "          ! grep -q '^foo:' config.txt\n"
+                "      - 'run': >2+\n"
+                "            printf '%s\\n' 'more-indented folded first line'\n"
+                "          ! grep -q '^bar:' config.txt\n"
+                '      - "run" : |+2\n'
+                "            printf '%s\\n' 'more-indented quoted first line'\n"
+                "          ! grep -q '^baz:' config.txt\n"
+                "      - run: |\n"
+                "          ! grep -q '^implicit:' config.txt\n"
+                + guarded_workflow().removeprefix("jobs:\n")
             ),
             (
                 "jobs:\n"
