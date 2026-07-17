@@ -306,11 +306,11 @@ class SecretScanResult:
     accepted_candidates: dict[AcceptedSyntheticValue, set[bytes]]
     raw_occurrence_counts: Counter[AcceptedSyntheticValue]
     unembedded_occurrence_counts: Counter[AcceptedSyntheticValue]
-    incomplete_suffix: bool
+    incomplete_suffix_start: int | None
 
     @classmethod
     def empty(cls) -> "SecretScanResult":
-        return cls(None, Counter(), {}, Counter(), Counter(), False)
+        return cls(None, Counter(), {}, Counter(), Counter(), None)
 
     def merge(self, other: "SecretScanResult") -> None:
         if self.blocking_rule is None:
@@ -3098,7 +3098,7 @@ def _quoted_assignment_may_accept(
                 return False, skipped
             if not event_budget.consume_prefix_proof(record_size):
                 return False, skipped
-            if line_end < 0 and not suffix_context_complete:
+            if record_end == len(value) and not suffix_context_complete:
                 raise _IncompleteSecretScanSuffix
             skipped_diff_bytes += record_size
             cursor = record_end
@@ -4047,7 +4047,11 @@ def _scan_secret_value(
         if not minimum_end < end <= upper:
             continue
         if rule == _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE:
-            result.incomplete_suffix = True
+            if start is None:
+                raise ReviewError(
+                    "sensitive scanner lost an incomplete diff suffix boundary"
+                )
+            result.incomplete_suffix_start = start
             return result
         if (
             rule == "generic-secret-assignment"
@@ -4206,10 +4210,34 @@ def _stream_secret_scan(
             _event_budget=event_budget,
             _continue_after_blocking=_continue_after_blocking,
         )
-        if pending_scan.incomplete_suffix:
-            # Keep the current event boundary and discard provisional counts so
-            # the same assignment is evaluated once its diff record is complete.
-            next_committed_end = committed_end
+        if pending_scan.incomplete_suffix_start is not None:
+            safe_local_maximum = max(
+                local_minimum,
+                min(local_maximum, pending_scan.incomplete_suffix_start),
+            )
+            if safe_local_maximum > local_minimum:
+                committed_scan = _scan_secret_value(
+                    pending,
+                    accepted_values=accepted,
+                    minimum_end=local_minimum,
+                    maximum_end=safe_local_maximum,
+                    capture_accepted_candidates=capture_accepted_candidates,
+                    diff_surface=diff_surface,
+                    prefix_context_complete=pending_offset == 0,
+                    suffix_context_complete=at_end,
+                    _accepted_index=accepted_index,
+                    _event_budget=event_budget,
+                    _continue_after_blocking=_continue_after_blocking,
+                )
+                if committed_scan.incomplete_suffix_start is not None:
+                    raise ReviewError(
+                        "sensitive scanner could not establish a complete diff "
+                        "prefix"
+                    )
+                result.merge(committed_scan)
+            # Commit the complete prefix, but retain the deferred assignment
+            # inside the overlap so it is re-evaluated with the next read.
+            next_committed_end = pending_offset + safe_local_maximum
         else:
             result.merge(pending_scan)
         if result.blocking_rule is not None and not _continue_after_blocking:

@@ -27,8 +27,9 @@ the opposite-side replacement was longer than the trailing proof budget.
   their raw bytes remain covered by the scan's bounded-work accounting.
 - Declaration proof reconstructs the matching base or head prefix instead of
   always reconstructing the head side.
-- A non-final streaming window defers an assignment whose opposite-side record
-  is incomplete, without committing provisional counts or dropping the match.
+- A non-final streaming window carries the earliest deferred assignment
+  boundary forward, commits only the complete prefix before it, and retains the
+  match without merging provisional counts.
 - Security regressions keep scanning after opposite-side interleaving and
   continue to reject same-side or shared-context RHS continuations.
 
@@ -37,14 +38,18 @@ the opposite-side replacement was longer than the trailing proof budget.
 - The focused quoted-assignment regressions passed, including opposite-side
   interleaving, same-side and context continuations, base-prefix reconstruction,
   and both per-event and global proof budgets.
-- The streaming-boundary regression failed against the initial candidate and
-  passed after incomplete opposite-side records were deferred; the complete
-  EOF case remains accepted exactly once.
+- Streaming-boundary regressions failed against the initial candidates and now
+  cover both an incomplete record and a record whose newline is the final byte
+  of a non-final read; the complete EOF case remains accepted exactly once.
+- An eight-assignment segmented-stream regression proves that each complete
+  prefix advances the commit frontier and pending input stays bounded. An
+  independent 11.54 MiB probe reduced event consumption from `44` to `31` and
+  prefix-proof consumption from `36,773,130` to `14,819,754` bytes.
 - The previously blocked frozen `review.diff` passed the patched scanner in a
   redacted local probe.
-- The complete synthetic-token module passed (`86` tests).
+- The complete synthetic-token module passed (`87` tests).
 - The complete review-orchestration suite passed on the refreshed master
-  baseline (`711` tests; `9` skipped).
+  baseline (`712` tests; `9` skipped).
 - Full runtime/test `ruff check` and Python `compileall` passed.
 - Synthetic-token catalog validation returned `public-example-v1` as valid.
 - Skill validation, project-journal validation, and `git diff --check` passed.

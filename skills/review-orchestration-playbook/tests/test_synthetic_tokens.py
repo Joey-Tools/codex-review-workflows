@@ -1411,6 +1411,34 @@ class PublicPoolScannerTest(unittest.TestCase):
             "generic-secret-assignment",
         )
 
+        first_read_size = (
+            workspace.MAX_SECRET_PREFIX_PROOF_BYTES
+            + workspace.STREAM_SCAN_OVERLAP
+        )
+        boundary_prefix = padding + quoted_assignment
+        boundary_opposite = (
+            b"+"
+            + b"x" * (first_read_size - len(boundary_prefix) - 2)
+            + b"\n"
+        )
+        boundary_payload = (
+            boundary_prefix
+            + boundary_opposite
+            + b"     + "
+            + adjacent_secret
+            + b"\n"
+        )
+        boundary_scan = workspace._stream_secret_scan(
+            io.BytesIO(boundary_payload),
+            size=len(boundary_payload),
+            accepted_values=self.accepted,
+            diff_surface=True,
+        )
+        self.assertEqual(
+            boundary_scan.blocking_rule,
+            "generic-secret-assignment",
+        )
+
         safe_payload = (
             padding + quoted_assignment + opposite_record.removesuffix(b"\n")
         )
@@ -1422,6 +1450,68 @@ class PublicPoolScannerTest(unittest.TestCase):
         )
         self.assertIsNone(safe_scan.blocking_rule)
         self.assertEqual(safe_scan.accepted_counts[accepted], 1)
+
+    def test_diff_incomplete_suffix_commits_each_complete_prefix(self) -> None:
+        accepted = self.accepted[0]
+        proof_bytes = 4096
+        overlap = 256
+        first_read_size = proof_bytes + overlap
+        assignment = b'-OPENAI_API_KEY = "' + accepted.value + b'",\n'
+        opposite_start = b"+replacement("
+        padding_size = proof_bytes - len(assignment) - 64
+        padding = b" " + b"x" * (padding_size - 2) + b"\n"
+        first_prefix = padding + assignment + opposite_start
+        segments = [
+            first_prefix + b"x" * (first_read_size - len(first_prefix))
+        ]
+        assignment_count = 8
+        for _index in range(assignment_count - 1):
+            next_prefix = b"x" * 64 + b")\n" + assignment + opposite_start
+            segments.append(next_prefix + b"x" * (1024 - len(next_prefix)))
+        segments.append(b"x" * 64 + b")\n")
+
+        class SegmentedStream:
+            def __init__(self, chunks: list[bytes]) -> None:
+                self.chunks = list(chunks)
+
+            def read(self, size: int = -1) -> bytes:
+                if not self.chunks:
+                    return b""
+                chunk = self.chunks.pop(0)
+                if size >= 0 and len(chunk) > size:
+                    raise AssertionError("test segment exceeds requested read size")
+                return chunk
+
+        pending_lengths: list[int] = []
+        original_scan = workspace._scan_secret_value
+
+        def recording_scan(value: bytes, **kwargs):
+            pending_lengths.append(len(value))
+            return original_scan(value, **kwargs)
+
+        with (
+            mock.patch.object(
+                workspace,
+                "MAX_SECRET_PREFIX_PROOF_BYTES",
+                proof_bytes,
+            ),
+            mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", overlap),
+            mock.patch.object(
+                workspace,
+                "_scan_secret_value",
+                side_effect=recording_scan,
+            ),
+        ):
+            scan = workspace._stream_secret_scan(
+                SegmentedStream(segments),
+                accepted_values=self.accepted,
+                diff_surface=True,
+            )
+
+        self.assertIsNone(scan.blocking_rule)
+        self.assertEqual(scan.accepted_counts[accepted], assignment_count)
+        self.assertTrue(pending_lengths)
+        self.assertLessEqual(max(pending_lengths), first_read_size)
 
     def test_dense_accepted_surface_fails_closed_at_the_event_limit(self) -> None:
         accepted = self.accepted[0]
