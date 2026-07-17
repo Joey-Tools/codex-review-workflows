@@ -38,7 +38,8 @@ the opposite-side replacement was longer than the trailing proof budget.
 - The previously blocked frozen `review.diff` passed the patched scanner in a
   redacted local probe.
 - The complete synthetic-token module passed (`85` tests).
-- The complete review-orchestration suite passed (`707` tests; `9` skipped).
+- The complete review-orchestration suite passed on the refreshed master
+  baseline (`710` tests; `9` skipped).
 - Full runtime/test `ruff check` and Python `compileall` passed.
 - Synthetic-token catalog validation returned `public-example-v1` as valid.
 - Skill validation, project-journal validation, and `git diff --check` passed.
