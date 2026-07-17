@@ -3089,7 +3089,6 @@ def _quoted_assignment_may_accept(
             and value[cursor - 1] == 0x0A
             and value[cursor] in (0x2B, 0x2D)
             and value[cursor] != match_diff_side
-            and not value.startswith((b"+++ ", b"--- "), cursor)
         ):
             line_end = value.find(b"\n", cursor)
             record_end = len(value) if line_end < 0 else line_end + 1
@@ -3421,8 +3420,6 @@ def _quoted_assignment_may_accept(
         source_side = match_diff_side if match_diff_side is not None else 0x2B
         source_lines: list[bytes] = []
         for line in raw_prefix.splitlines(keepends=True):
-            if line.startswith((b"+++ ", b"--- ")):
-                return None
             if line.startswith(b" "):
                 source_lines.append(line[1:])
             elif line.startswith(bytes((source_side,))):

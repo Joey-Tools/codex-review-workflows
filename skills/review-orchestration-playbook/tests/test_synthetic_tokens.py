@@ -1288,6 +1288,14 @@ class PublicPoolScannerTest(unittest.TestCase):
                 b"+" + quoted_mapping + b"-" + long_replacement,
             ),
             (
+                "base-assignment-with-triple-plus-replacement",
+                b"-" + quoted_mapping + b"+++ replacement\n",
+            ),
+            (
+                "head-assignment-with-triple-minus-replacement",
+                b"+" + quoted_mapping + b"--- replacement\n",
+            ),
+            (
                 "base-assignment-with-next-base-field",
                 b"-"
                 + quoted_mapping
@@ -1307,6 +1315,42 @@ class PublicPoolScannerTest(unittest.TestCase):
             with self.subTest(accepted=label):
                 scan = workspace._scan_secret_value(
                     payload,
+                    accepted_values=self.accepted,
+                    diff_surface=True,
+                )
+                self.assertIsNone(scan.blocking_rule)
+                self.assertEqual(scan.accepted_counts[accepted], 1)
+
+        declaration_assignment = (
+            b'OPENAI_API_KEY = "' + accepted.value + b'",\n'
+        )
+        for label, hunk_header, opposite_record, source_side in (
+            (
+                "base-prefix-after-triple-plus",
+                b"@@ -1,3 +1,1 @@\n",
+                b"+++ replacement\n",
+                b"-",
+            ),
+            (
+                "head-prefix-after-triple-minus",
+                b"@@ -1,1 +1,3 @@\n",
+                b"--- replacement\n",
+                b"+",
+            ),
+        ):
+            with self.subTest(accepted=label):
+                scan = workspace._scan_secret_value(
+                    b"diff --git a/fixture.py b/fixture.py\n"
+                    b"--- a/fixture.py\n"
+                    b"+++ b/fixture.py\n"
+                    + hunk_header
+                    + opposite_record
+                    + source_side
+                    + declaration_assignment
+                    + source_side
+                    + b"def test_fixture():\n"
+                    + source_side
+                    + b"    pass\n",
                     accepted_values=self.accepted,
                     diff_surface=True,
                 )

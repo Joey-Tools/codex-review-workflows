@@ -5,7 +5,7 @@ status: completed
 created: 2026-07-17
 updated: 2026-07-17
 branch: codex/diff-placeholder-boundary
-pr:
+pr: https://github.com/Joey-Tools/codex-review-workflows/pull/59
 supersedes: []
 superseded_by:
 ---
@@ -27,6 +27,9 @@ the opposite-side replacement was longer than the trailing proof budget.
   their raw bytes remain covered by the scan's bounded-work accounting.
 - Declaration proof reconstructs the matching base or head prefix instead of
   always reconstructing the head side.
+- Once a hunk side is established, opposite-side records whose source content
+  begins with `++ ` or `-- ` remain hunk content instead of being mistaken for
+  `+++` or `---` file headers.
 - A non-final streaming window carries the earliest deferred assignment
   boundary forward, commits only the complete prefix before it, and retains the
   match without merging provisional counts.
@@ -37,7 +40,9 @@ the opposite-side replacement was longer than the trailing proof budget.
 
 - The focused quoted-assignment regressions passed, including opposite-side
   interleaving, same-side and context continuations, base-prefix reconstruction,
-  and both per-event and global proof budgets.
+  symmetric triple-prefix hunk content, and both per-event and global proof
+  budgets. The prefix cases include real file headers and a hunk boundary so
+  header metadata remains outside the reconstructed source.
 - Streaming-boundary regressions failed against the initial candidates and now
   cover both an incomplete record and a record whose newline is the final byte
   of a non-final read; the complete EOF case remains accepted exactly once.
