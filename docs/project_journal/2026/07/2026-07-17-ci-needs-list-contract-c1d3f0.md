@@ -70,6 +70,10 @@ status context on additional compatibility and platform jobs.
   scalars without an indicator still infer it from that first line. Shell text
   resembling tagged YAML therefore cannot poison an unrelated aggregate-job
   contract.
+  Literal `run` body collection uses the same explicit minimum instead of
+  locking its boundary to a more-indented first command. A later payload line
+  can no longer be hidden from validation to write `BASH_ENV` through
+  `GITHUB_ENV` and redefine `test` for a subsequent dependency-check step.
   Folded `run: >` block scalars are rejected because YAML folding can join
   physical lines into a different shell command. Inline `run:` scalars also
   reject deeper-indented physical continuations, preventing folded commands
@@ -90,6 +94,10 @@ status context on additional compatibility and platform jobs.
   `steps`, alias, and block-scalar-payload fixtures; project-journal validation
   and diff checks also passed. The explicit-indentation payload regression also
   passed focused contract tests, Ruff, and an Actionlint-valid de-indent fixture.
+- The explicit-indentation `run` regression passed both focused and complete
+  contract files (`17` tests each), Ruff, Python compilation, Actionlint 1.7.12
+  coverage for both chomping/indicator orders and quoted/sequence `run` keys,
+  project-journal validation, normalized copy comparison, and diff checks.
 
 ## Next Steps
 

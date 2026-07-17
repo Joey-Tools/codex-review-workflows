@@ -574,10 +574,11 @@ def _workflow_step_run_body(step: tuple[str, ...]) -> str:
         ) or _workflow_matching_key_marker(line, "        ", "run")
         if marker is None:
             continue
-        header = line.removeprefix(marker).strip()
-        if header.startswith(">"):
-            return ""
-        if not header or header[0] not in "|>":
+        header = _workflow_strip_yaml_comment(line.removeprefix(marker)).strip()
+        scalar_header_indents = _workflow_block_scalar_header_indents(line)
+        if scalar_header_indents is None:
+            if header[:1] in "|>":
+                return ""
             run_indent = len(line) - len(line.lstrip())
             for continuation_line in step[index + 1 :]:
                 if (
@@ -592,8 +593,10 @@ def _workflow_step_run_body(step: tuple[str, ...]) -> str:
                     break
                 return ""
             return header
+        if header.startswith(">"):
+            return ""
         body: list[str] = []
-        body_indent: int | None = None
+        _, body_indent = scalar_header_indents
         for body_line in step[index + 1 :]:
             indentation = len(body_line) - len(body_line.lstrip())
             if body_line.strip():
@@ -1307,6 +1310,28 @@ class RepositoryContractTest(unittest.TestCase):
                 + "".join(f"{line}\n" for line in workflow_tail)
             )
 
+        explicit_indent_cross_step_poison = (
+            "jobs:\n"
+            "  test:\n"
+            "    needs: [compatibility_tests, platform_tests]\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - name: Check compatibility and poison later shells\n"
+            "        env:\n"
+            "          COMPATIBILITY_RESULT: "
+            "${{ needs.compatibility_tests.result }}\n"
+            "        run: |2-\n"
+            '            test "$COMPATIBILITY_RESULT" = "success"\n'
+            "          printf '%s\\n' 'test() { return 0; }' > "
+            '"$RUNNER_TEMP/guard-bypass"\n'
+            '          echo "BASH_ENV=$RUNNER_TEMP/guard-bypass" >> "$GITHUB_ENV"\n'
+            "      - name: Check platform\n"
+            "        env:\n"
+            "          PLATFORM_RESULT: ${{ needs.platform_tests.result }}\n"
+            "        run: |-\n"
+            '          test "$PLATFORM_RESULT" = "success"\n'
+        )
+
         unsafe_workflows = {
             "conditional-after-name": guarded_workflow(
                 step_properties=("if: ${{ false }}",)
@@ -1597,6 +1622,7 @@ class RepositoryContractTest(unittest.TestCase):
                     '          test "$PLATFORM_RESULT" = "success"',
                 )
             ),
+            "explicit-indent-cross-step-poison": explicit_indent_cross_step_poison,
             "bare-dash-poisoning-step": guarded_workflow(
                 leading_step_lines=(
                     "      -",
@@ -1625,6 +1651,69 @@ class RepositoryContractTest(unittest.TestCase):
                 "    steps: *shared_steps\n"
             ),
         }
+
+        literal_block_scalar_steps = (
+            (
+                (
+                    "      - run: |2-",
+                    "            first command",
+                    "          second command",
+                ),
+                "first command\nsecond command",
+            ),
+            (
+                (
+                    "      - 'run': |-2",
+                    "            first quoted-key command",
+                    "          second quoted-key command",
+                ),
+                "first quoted-key command\nsecond quoted-key command",
+            ),
+            (
+                (
+                    "      - name: Nested quoted run key",
+                    '        "run" : |+2',
+                    "            first nested command",
+                    "          second nested command",
+                ),
+                "first nested command\nsecond nested command",
+            ),
+            (
+                (
+                    "      - name: Nested single-quoted run key",
+                    "        'run': |2+",
+                    "            first kept command",
+                    "          second kept command",
+                ),
+                "first kept command\nsecond kept command",
+            ),
+            (
+                (
+                    "      - run: |",
+                    "          first implicit command",
+                    "            second deeper implicit command",
+                ),
+                "first implicit command\nsecond deeper implicit command",
+            ),
+        )
+        self.assertEqual(
+            _workflow_block_scalar_header_indents("      - run: |"),
+            (8, None),
+        )
+        for step, expected_body in literal_block_scalar_steps:
+            self.assertEqual(_workflow_step_run_body(step), expected_body)
+        for folded_header in (">2+", ">+2"):
+            self.assertEqual(
+                _workflow_step_run_body(
+                    (
+                        f"      - run: {folded_header}",
+                        "            first folded command",
+                        "          second folded command",
+                    )
+                ),
+                "",
+            )
+
         for name, workflow in unsafe_workflows.items():
             with self.subTest(name=name):
                 self.assertEqual(_workflow_job_success_guards(workflow, "test"), ())
