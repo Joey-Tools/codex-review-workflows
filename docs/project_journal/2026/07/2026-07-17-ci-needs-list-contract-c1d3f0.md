@@ -23,10 +23,10 @@ snapshot byte for byte.
 - The canonical skill carries both reviewed fixtures under
   `tests/fixtures/ci/`: `canonical.yml` for `codex-review-workflows` and
   `private.yml` for the synchronized private overlay.
-- The contract selects its profile only from the skill's exact path relative to
-  the repository root: `skills/review-orchestration-playbook` or
-  `personal_codex/skills/review-orchestration-playbook`. Repository directory
-  names do not participate in profile selection, and unknown layouts fail.
+- One closed resolver recognizes only the exact supported skill-layout suffixes,
+  derives the repository root and profile together, and keeps the canonical and
+  private test files byte-identical. Repository directory names do not
+  participate in profile selection, and unknown layouts fail.
 - The selected repository's `.github/workflows/ci.yml` must equal the selected
   fixture as bytes. Any YAML spelling, job, step, default, shell, environment,
   dependency, or success-guard change therefore requires an intentional
@@ -40,10 +40,10 @@ snapshot byte for byte.
 
 ## Validation Evidence
 
-- Both focused contract files passed (`16` tests each) after the snapshot
+- Both focused contract files passed (`18` tests each) after the snapshot
   redesign.
-- The complete canonical review suite passed (`707` tests; `9` skipped), and
-  the synchronized private review suite passed (`707` tests; `10` skipped).
+- The complete canonical review suite passed (`709` tests; `9` skipped), and
+  the synchronized private review suite passed (`709` tests; `10` skipped).
 - The canonical and private fixtures were created from and byte-compared with
   their respective live CI workflows.
 - Ruff, Python compilation, Actionlint 1.7.12 for both live workflows, private
