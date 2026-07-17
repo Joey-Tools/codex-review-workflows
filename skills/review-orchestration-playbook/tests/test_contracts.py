@@ -228,6 +228,13 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             self.assertFalse((REPO_ROOT / relative).exists(), relative)
 
+    def test_healthy_bounded_wait_is_not_task_completion(self) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+
+        self.assertIn("only an intermediate poll, not task completion", skill)
+        self.assertIn("Keep the parent task active", skill)
+        self.assertIn("do not end the task merely because one wait window expires", skill)
+
     def test_models_are_pinned_in_runtime_and_clean_context_agent(self) -> None:
         self.assertEqual(providers.CODEX_MODELS, ("gpt-5.6-sol", "gpt-5.5"))
         self.assertEqual(providers.CODEX_REASONING_EFFORT, "xhigh")
