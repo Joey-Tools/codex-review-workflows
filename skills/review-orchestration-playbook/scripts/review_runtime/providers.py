@@ -1596,7 +1596,7 @@ def _select_claude_macos_credential(
                 or _claude_macos_carriers_share_refresh_token(carrier_snapshot)
             )
             and not _claude_keychain_credential_has_refresh_margin(
-                keychain_candidate.payload
+                selected.payload
             )
         ):
             raise ClaudeCredentialUnsafe(

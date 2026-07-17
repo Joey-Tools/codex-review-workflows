@@ -1338,7 +1338,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
     @mock.patch.object(providers, "_read_claude_macos_file_credential")
     @mock.patch.object(providers, "_read_claude_keychain_credential")
-    def test_oversized_keychain_still_blocks_shared_login_writeback(
+    def test_unselected_oversized_keychain_does_not_block_shared_login_writeback(
         self,
         read_keychain: mock.Mock,
         read_file: mock.Mock,
@@ -1351,6 +1351,34 @@ class ProviderPolicyTest(unittest.TestCase):
         file_credential = bytearray(
             oauth_credential_fixture(expires_in_seconds=3600)
         )
+        snapshot = providers._ClaudeCredentialFileSnapshot(
+            home=self.claude_pwd_home,
+            home_identity=(1,),
+            config_identity=(2,),
+            file_identity=(3,),
+        )
+        read_keychain.return_value = keychain
+        read_file.return_value = (file_credential, snapshot)
+
+        selected = providers._select_claude_macos_credential(self.review)
+
+        self.assertEqual(keychain, bytearray(len(keychain)))
+        self.assertEqual(selected.source, "pwd-home-credential-file")
+        selected.payload[:] = b"\x00" * len(selected.payload)
+
+    @mock.patch.object(providers, "_read_claude_macos_file_credential")
+    @mock.patch.object(providers, "_read_claude_keychain_credential")
+    def test_oversized_selected_file_blocks_shared_keychain_writeback(
+        self,
+        read_keychain: mock.Mock,
+        read_file: mock.Mock,
+    ) -> None:
+        keychain = bytearray(oauth_credential_fixture(expires_in_seconds=60))
+        file_value = json.loads(oauth_credential_fixture(expires_in_seconds=3600))
+        file_value["padding"] = "x" * (
+            providers.CLAUDE_KEYCHAIN_SECURITY_STDIN_LIMIT_BYTES
+        )
+        file_credential = bytearray(json.dumps(file_value).encode())
         snapshot = providers._ClaudeCredentialFileSnapshot(
             home=self.claude_pwd_home,
             home_identity=(1,),
