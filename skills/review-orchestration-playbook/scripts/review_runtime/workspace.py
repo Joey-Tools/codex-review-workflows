@@ -3771,14 +3771,24 @@ def _unquoted_assignment_may_accept(
 def _iter_secret_events(
     value: bytes,
     *,
+    minimum_end: int = 0,
+    maximum_end: int | None = None,
     diff_surface: bool = False,
     prefix_context_complete: bool = True,
     suffix_context_complete: bool = True,
     _event_budget: SecretScanBudget | None = None,
 ) -> Iterator[tuple[str, bytes | None, int, bool, int | None, int | None]]:
     event_budget = _event_budget or SecretScanBudget.default()
+
+    def match_is_committable(match: re.Match[bytes]) -> bool:
+        return minimum_end < match.end() and (
+            maximum_end is None or match.end() <= maximum_end
+        )
+
     for rule, pattern in SECRET_PATTERNS:
         for match in pattern.finditer(value):
+            if not match_is_committable(match):
+                continue
             event_budget.consume()
             start, candidate_end = match.span(0)
             yield rule, match.group(0), match.end(), True, start, candidate_end
@@ -3788,6 +3798,8 @@ def _iter_secret_events(
         ("generic-secret-assignment", OVERSIZED_SECRET_ASSIGNMENT_GAP),
     ):
         for match in pattern.finditer(value):
+            if not match_is_committable(match):
+                continue
             event_budget.consume()
             yield rule, None, match.end(), False, None, None
     for pattern in (
@@ -3795,6 +3807,8 @@ def _iter_secret_events(
         OVERSIZED_UNQUOTED_SECRET_ASSIGNMENT,
     ):
         for match in pattern.finditer(value):
+            if not match_is_committable(match):
+                continue
             event_budget.consume()
             yield (
                 "generic-secret-assignment",
@@ -3805,6 +3819,8 @@ def _iter_secret_events(
                 None,
             )
     for match in QUOTED_SECRET_ASSIGNMENT.finditer(value):
+        if not match_is_committable(match):
+            continue
         event_budget.consume()
         candidate = match.group(2)
         try:
@@ -3837,6 +3853,8 @@ def _iter_secret_events(
                 candidate_end,
             )
     for match in UNQUOTED_SECRET_ASSIGNMENT.finditer(value):
+        if not match_is_committable(match):
+            continue
         event_budget.consume()
         candidate = match.group(1)
         may_accept = _unquoted_assignment_may_accept(
@@ -4024,6 +4042,8 @@ def _scan_secret_value(
         if rule not in accepted_specific_rules:
             continue
         for match in pattern.finditer(value):
+            if match.end() > upper:
+                continue
             event_budget.consume()
             candidate = match.group(0)
             if _matching_accepted_values(
@@ -4036,6 +4056,8 @@ def _scan_secret_value(
 
     for rule, candidate, end, may_accept, start, candidate_end in _iter_secret_events(
         value,
+        minimum_end=minimum_end,
+        maximum_end=upper,
         diff_surface=diff_surface,
         prefix_context_complete=prefix_context_complete,
         suffix_context_complete=suffix_context_complete,

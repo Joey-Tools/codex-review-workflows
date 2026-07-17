@@ -33,6 +33,9 @@ the opposite-side replacement was longer than the trailing proof budget.
 - A non-final streaming window carries the earliest deferred assignment
   boundary forward, commits only the complete prefix before it, and retains the
   match without merging provisional counts.
+- Streaming event candidates are filtered to the current commit range before
+  consuming event or prefix-proof budget, while in-range candidates still use
+  the complete pending buffer as source context.
 - Security regressions keep scanning after opposite-side interleaving and
   continue to reject same-side or shared-context RHS continuations.
 
@@ -50,11 +53,15 @@ the opposite-side replacement was longer than the trailing proof budget.
   prefix advances the commit frontier and pending input stays bounded. An
   independent 11.54 MiB probe reduced event consumption from `44` to `31` and
   prefix-proof consumption from `36,773,130` to `14,819,754` bytes.
+- A bounded-budget red/green regression reproduces the deferred-match double
+  charge: the old path consumed `1,412` prefix-proof bytes and failed a valid
+  `1,200`-byte budget, while commit-range filtering consumes `1,092` bytes and
+  accepts the fixture exactly once.
 - The previously blocked frozen `review.diff` passed the patched scanner in a
   redacted local probe.
-- The complete synthetic-token module passed (`87` tests).
+- The complete synthetic-token module passed (`88` tests).
 - The complete review-orchestration suite passed on the refreshed master
-  baseline (`712` tests; `9` skipped).
+  baseline (`713` tests; `9` skipped).
 - Full runtime/test `ruff check` and Python `compileall` passed.
 - Synthetic-token catalog validation returned `public-example-v1` as valid.
 - Skill validation, project-journal validation, and `git diff --check` passed.

@@ -502,7 +502,10 @@ class PublicPoolScannerTest(unittest.TestCase):
         accepted = accepted_legacy_value(GITHUB_LEGACY, rule="github-token")
         candidate = GITHUB_LEGACY.encode("ascii")
         assignment_prefix = b'access_token = "'
-        first_read = 1024 * 1024
+        first_read = (
+            workspace.MAX_SECRET_PREFIX_PROOF_BYTES
+            + workspace.STREAM_SCAN_OVERLAP
+        )
         committed_end = first_read - workspace.STREAM_SCAN_OVERLAP
         candidate_start = committed_end - len(candidate)
         payload = (
@@ -1556,6 +1559,61 @@ class PublicPoolScannerTest(unittest.TestCase):
         self.assertEqual(scan.accepted_counts[accepted], assignment_count)
         self.assertTrue(pending_lengths)
         self.assertLessEqual(max(pending_lengths), first_read_size)
+
+    def test_diff_incomplete_suffix_does_not_recharge_deferred_match(
+        self,
+    ) -> None:
+        accepted = self.accepted[0]
+        proof_bytes = 4096
+        overlap = 256
+        first_read_size = proof_bytes + overlap
+        assignment = b'-OPENAI_API_KEY = "' + accepted.value + b'",\n'
+        opposite_start = b"+replacement("
+        padding_size = proof_bytes - len(assignment) - 64
+        padding = b" " + b"x" * (padding_size - 2) + b"\n"
+        first_prefix = padding + assignment + opposite_start
+        segments = [
+            first_prefix + b"x" * (first_read_size - len(first_prefix)),
+            b"x" * 64 + b")\n",
+        ]
+
+        class SegmentedStream:
+            def __init__(self, chunks: list[bytes]) -> None:
+                self.chunks = list(chunks)
+
+            def read(self, size: int = -1) -> bytes:
+                if not self.chunks:
+                    return b""
+                chunk = self.chunks.pop(0)
+                if size >= 0 and len(chunk) > size:
+                    raise AssertionError("test segment exceeds requested read size")
+                return chunk
+
+        budget = workspace.SecretScanBudget(
+            workspace.MAX_SECRET_SCAN_EVENTS,
+            remaining_prefix_proof_bytes=1200,
+        )
+        with (
+            mock.patch.object(
+                workspace,
+                "MAX_SECRET_PREFIX_PROOF_BYTES",
+                proof_bytes,
+            ),
+            mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", overlap),
+            mock.patch.object(
+                workspace.SecretScanBudget,
+                "default",
+                return_value=budget,
+            ),
+        ):
+            scan = workspace._stream_secret_scan(
+                SegmentedStream(segments),
+                accepted_values=self.accepted,
+                diff_surface=True,
+            )
+
+        self.assertIsNone(scan.blocking_rule)
+        self.assertEqual(scan.accepted_counts[accepted], 1)
 
     def test_dense_accepted_surface_fails_closed_at_the_event_limit(self) -> None:
         accepted = self.accepted[0]
