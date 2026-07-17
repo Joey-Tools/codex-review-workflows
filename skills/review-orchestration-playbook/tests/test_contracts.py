@@ -316,6 +316,40 @@ def _workflow_job_top_level_values(
     return tuple(values)
 
 
+def _workflow_run_defaults_block_is_unsafe(
+    lines: tuple[str, ...],
+    run_index: int,
+    run_indent: int,
+) -> bool:
+    child_indent: int | None = None
+    working_directory_seen = False
+
+    for line in lines[run_index + 1 :]:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indentation = len(line) - len(line.lstrip())
+        if indentation <= run_indent:
+            break
+        if child_indent is None:
+            child_indent = indentation
+        if indentation != child_indent:
+            return True
+        marker = _workflow_matching_key_marker(
+            line,
+            " " * child_indent,
+            "working-directory",
+        )
+        if marker is None or working_directory_seen:
+            return True
+        value = _workflow_strip_yaml_comment(line.removeprefix(marker).strip())
+        if not value or value.startswith(("*", "&", "!", "{", "[", "|", ">")):
+            return True
+        working_directory_seen = True
+
+    return not working_directory_seen
+
+
 def _workflow_scope_has_unsafe_run_defaults(
     lines: tuple[str, ...],
     defaults_indent: str,
@@ -333,8 +367,11 @@ def _workflow_scope_has_unsafe_run_defaults(
         ):
             return True
 
-        run_indent: int | None = None
-        for nested_line in lines[index + 1 :]:
+        run_seen = False
+        for nested_index, nested_line in enumerate(
+            lines[index + 1 :],
+            start=index + 1,
+        ):
             stripped = nested_line.strip()
             if not stripped or stripped.startswith("#"):
                 continue
@@ -348,28 +385,19 @@ def _workflow_scope_has_unsafe_run_defaults(
                 "run",
             )
             if run_marker is not None:
+                if run_seen:
+                    return True
                 if _workflow_strip_yaml_comment(
                     nested_line.removeprefix(run_marker).strip()
                 ):
                     return True
-                run_indent = indentation
-                continue
-            if run_indent is None:
-                continue
-            if indentation <= run_indent:
-                run_indent = None
-                continue
-            if stripped.startswith(("{", "[")):
-                return True
-            if (
-                _workflow_matching_key_marker(
-                    nested_line,
-                    nested_indent,
-                    "shell",
-                )
-                is not None
-            ):
-                return True
+                if _workflow_run_defaults_block_is_unsafe(
+                    lines,
+                    nested_index,
+                    indentation,
+                ):
+                    return True
+                run_seen = True
     return False
 
 
@@ -1027,6 +1055,26 @@ class RepositoryContractTest(unittest.TestCase):
                 + "".join(f"{line}\n" for line in trailing_job_lines)
             )
 
+        def anchored_shell_workflow(
+            *,
+            target_job_properties: tuple[str, ...] = (),
+            workflow_tail: tuple[str, ...] = (),
+        ) -> str:
+            return (
+                "jobs:\n"
+                "  platform_tests:\n"
+                "    runs-on: ubuntu-latest\n"
+                "    defaults:\n"
+                "      run: &evil\n"
+                '        shell: "bash -c \'exit 0\' {0}"\n'
+                "    steps:\n"
+                "      - run: true\n"
+                + guarded_workflow(
+                    job_properties=target_job_properties
+                ).removeprefix("jobs:\n")
+                + "".join(f"{line}\n" for line in workflow_tail)
+            )
+
         unsafe_workflows = {
             "conditional-after-name": guarded_workflow(
                 step_properties=("if: ${{ false }}",)
@@ -1155,6 +1203,59 @@ class RepositoryContractTest(unittest.TestCase):
                 "defaults:\n"
                 "  run:\n"
                 '    [ { shell: "bash -c \'exit 0\' {0}" } ]\n'
+                + guarded_workflow()
+            ),
+            "workflow-alias-default-shell": anchored_shell_workflow(
+                workflow_tail=(
+                    "defaults:",
+                    "  run:",
+                    "    *evil",
+                )
+            ),
+            "job-alias-default-shell": anchored_shell_workflow(
+                target_job_properties=(
+                    "defaults:",
+                    "  run:",
+                    "    *evil",
+                )
+            ),
+            "quoted-job-alias-default-shell": anchored_shell_workflow(
+                target_job_properties=(
+                    "'defaults':",
+                    '  "run":',
+                    "    *evil # Inherit the anchored custom shell.",
+                )
+            ),
+            "job-merge-default-shell": anchored_shell_workflow(
+                target_job_properties=(
+                    "defaults:",
+                    "  run:",
+                    "    <<: *evil",
+                )
+            ),
+            "tagged-working-directory": (
+                "defaults:\n"
+                "  run:\n"
+                "    working-directory: !!str scripts\n"
+                + guarded_workflow()
+            ),
+            "anchored-working-directory": (
+                "defaults:\n"
+                "  run:\n"
+                "    working-directory: &path scripts\n"
+                + guarded_workflow(
+                    job_properties=(
+                        "defaults:",
+                        "  run:",
+                        "    working-directory: *path",
+                    )
+                )
+            ),
+            "block-scalar-working-directory": (
+                "defaults:\n"
+                "  run:\n"
+                "    working-directory: |-\n"
+                "      scripts\n"
                 + guarded_workflow()
             ),
             "quoted-workflow-default-shell": (
@@ -1287,6 +1388,20 @@ class RepositoryContractTest(unittest.TestCase):
                 "  run:\n"
                 "    working-directory: scripts\n"
                 + guarded_workflow()
+            ),
+            (
+                "defaults:\n"
+                "  run:\n"
+                "    # Quoted keys and values remain ordinary block mappings.\n"
+                '    "working-directory": "scripts"\n'
+                + guarded_workflow()
+            ),
+            guarded_workflow(
+                job_properties=(
+                    "defaults:",
+                    "  run:",
+                    "    working-directory: scripts",
+                )
             ),
             (
                 "jobs:\n"
