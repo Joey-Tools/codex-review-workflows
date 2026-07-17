@@ -76,38 +76,58 @@ SECRET_PATTERNS = (
     ),
     (
         "anthropic-key",
-        re.compile(rb"\bsk-ant-(?:[A-Za-z0-9_-]{32,512}\b|[A-Za-z0-9_-]{513})"),
+        re.compile(
+            rb"\bsk-ant-(?:"
+            rb"[A-Za-z0-9_-]{32,512}(?![A-Za-z0-9_-])|[A-Za-z0-9_-]{513})"
+        ),
     ),
     (
         "openai-key",
-        re.compile(rb"\bsk-(?:proj-)?(?:[A-Za-z0-9_-]{32,512}\b|[A-Za-z0-9_-]{513})"),
+        re.compile(
+            rb"\bsk-(?:proj-)?(?:"
+            rb"[A-Za-z0-9_-]{32,512}(?![A-Za-z0-9_-])|[A-Za-z0-9_-]{513})"
+        ),
     ),
     (
         "github-token",
         re.compile(
             rb"\b(?:"
-            rb"gh[pousr]_(?:[A-Za-z0-9]{36,512}\b|[A-Za-z0-9]{513})"
-            rb"|github_pat_(?:[A-Za-z0-9_]{20,512}\b|[A-Za-z0-9_]{513})"
+            rb"gh[pousr]_(?:"
+            rb"[A-Za-z0-9]{36,512}(?![A-Za-z0-9])|[A-Za-z0-9]{513})"
+            rb"|github_pat_(?:"
+            rb"[A-Za-z0-9_]{20,512}(?![A-Za-z0-9_])|[A-Za-z0-9_]{513})"
             rb")"
         ),
     ),
     (
         "gitlab-token",
-        re.compile(rb"\bglpat-(?:[A-Za-z0-9_-]{20,512}\b|[A-Za-z0-9_-]{513})"),
+        re.compile(
+            rb"\bglpat-(?:"
+            rb"[A-Za-z0-9_-]{20,512}(?![A-Za-z0-9_-])|[A-Za-z0-9_-]{513})"
+        ),
     ),
     ("google-api-key", re.compile(rb"\bAIza[0-9A-Za-z_-]{35}\b")),
     ("npm-token", re.compile(rb"\bnpm_[A-Za-z0-9]{36}\b")),
     (
         "pypi-token",
-        re.compile(rb"\bpypi-(?:[A-Za-z0-9_-]{50,512}\b|[A-Za-z0-9_-]{513})"),
+        re.compile(
+            rb"\bpypi-(?:"
+            rb"[A-Za-z0-9_-]{50,512}(?![A-Za-z0-9_-])|[A-Za-z0-9_-]{513})"
+        ),
     ),
     (
         "slack-token",
-        re.compile(rb"\bxox[baprs]-(?:[A-Za-z0-9-]{20,512}\b|[A-Za-z0-9-]{513})"),
+        re.compile(
+            rb"\bxox[baprs]-(?:"
+            rb"[A-Za-z0-9-]{20,512}(?![A-Za-z0-9-])|[A-Za-z0-9-]{513})"
+        ),
     ),
     (
         "stripe-live-key",
-        re.compile(rb"\bsk_live_(?:[A-Za-z0-9]{16,512}\b|[A-Za-z0-9]{513})"),
+        re.compile(
+            rb"\bsk_live_(?:"
+            rb"[A-Za-z0-9]{16,512}(?![A-Za-z0-9])|[A-Za-z0-9]{513})"
+        ),
     ),
     (
         "jwt",
@@ -1769,8 +1789,19 @@ def _secret_count_manifests(
         head_count = head_scan.raw_occurrence_counts[descriptor]
         base_unembedded_count = base_scan.unembedded_occurrence_counts[descriptor]
         head_unembedded_count = head_scan.unembedded_occurrence_counts[descriptor]
-        if head_count >= base_count or head_unembedded_count > base_unembedded_count:
-            continue
+        rules = sorted(discovery.blocking_candidates[descriptor.value])
+        rule_label = ", ".join(rules)
+        if head_count >= base_count:
+            raise ReviewError(
+                "unregistered secret count did not strictly decrease for scanner "
+                f"rules {rule_label}: base={base_count}, head={head_count}"
+            )
+        if head_unembedded_count > base_unembedded_count:
+            raise ReviewError(
+                "unregistered secret unembedded count increased for scanner rules "
+                f"{rule_label}: base={base_unembedded_count}, "
+                f"head={head_unembedded_count}"
+            )
         allowed_reductions.append(descriptor)
         reduction_entries.append(
             {
@@ -1778,7 +1809,7 @@ def _secret_count_manifests(
                 "base_unembedded_count": base_unembedded_count,
                 "head_count": head_count,
                 "head_unembedded_count": head_unembedded_count,
-                "rules": sorted(discovery.blocking_candidates[descriptor.value]),
+                "rules": rules,
                 "value_length": descriptor.value_length,
                 "value_sha256": descriptor.value_sha256,
             }
@@ -3979,32 +4010,38 @@ def _unquoted_assignment_may_accept(
 
 
 def _provider_candidate_is_prefix_only(rule: str, candidate: bytes) -> bool:
-    prefix_lengths = {
-        "anthropic-key": (len(b"sk-ant-"),),
-        "openai-key": (len(b"sk-"), len(b"sk-proj-")),
+    prefixes = {
+        "anthropic-key": (b"sk-ant-",),
+        "openai-key": (b"sk-", b"sk-proj-"),
         "github-token": (
-            len(b"ghp_"),
-            len(b"gho_"),
-            len(b"ghu_"),
-            len(b"ghs_"),
-            len(b"ghr_"),
-            len(b"github_pat_"),
+            b"ghp_",
+            b"gho_",
+            b"ghu_",
+            b"ghs_",
+            b"ghr_",
+            b"github_pat_",
         ),
-        "gitlab-token": (len(b"glpat-"),),
-        "pypi-token": (len(b"pypi-"),),
+        "gitlab-token": (b"glpat-",),
+        "pypi-token": (b"pypi-",),
         "slack-token": (
-            len(b"xoxb-"),
-            len(b"xoxa-"),
-            len(b"xoxp-"),
-            len(b"xoxr-"),
-            len(b"xoxs-"),
+            b"xoxb-",
+            b"xoxa-",
+            b"xoxp-",
+            b"xoxr-",
+            b"xoxs-",
         ),
-        "stripe-live-key": (len(b"sk_live_"),),
+        "stripe-live-key": (b"sk_live_",),
     }
-    return any(
-        len(candidate) == prefix_length + 513
-        for prefix_length in prefix_lengths.get(rule, ())
+    actual_prefix = max(
+        (
+            prefix
+            for prefix in prefixes.get(rule, ())
+            if candidate.startswith(prefix)
+        ),
+        key=len,
+        default=None,
     )
+    return actual_prefix is not None and len(candidate) - len(actual_prefix) == 513
 
 
 def _iter_secret_events(
@@ -4282,16 +4319,17 @@ def _scan_secret_value(
         prefix_context_complete=prefix_context_complete,
         _event_budget=event_budget,
     ):
-        if not minimum_end < end <= upper:
-            continue
         if (
-            rule != "generic-secret-assignment"
+            end <= upper
+            and rule != "generic-secret-assignment"
             and may_accept
             and candidate is not None
             and start is not None
             and candidate_end is not None
         ):
             specific_spans.add((start, candidate_end, candidate))
+        if not minimum_end < end <= upper:
+            continue
         if (
             rule == "generic-secret-assignment"
             and may_accept

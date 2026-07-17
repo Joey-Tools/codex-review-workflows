@@ -57,13 +57,15 @@ Diagnostic and preflight evidence remain bounded audit surfaces. They use stable
 
 - Runtime preflight exhaustively captures bounded exact candidates across complete base and head trees, performs raw and unembedded counting, and persists range-bound public metadata plus helper-private candidate bytes for stateful head recounting.
 - Complete PEM blocks and AWS secret values have stable candidate identities; oversized provider prefixes, oversized assignments/JWTs, incomplete PEM blocks, and other uncountable events remain fail closed.
+- Dynamic candidates that do not satisfy the reduction inequalities are rejected during preparation, before a mutable materialized head or reviewer process exists.
+- Variable-length provider candidates prove their terminating byte against the provider body alphabet, select the longest actual prefix for the 513-byte fail-closed branch, and retain provider-specific spans across stream commit boundaries.
 - Reviewer-visible diff and prompt artifacts are integrity-bound but are not secret-egress filters. Text diffs retain deleted secret bytes in their original form.
 - Deleted sensitive paths are omitted from head-side changed-path findings and are allowed only when the complete materialized head remains free of sensitive paths.
 - Catalog authoring and explicitly selected legacy behavior remains unchanged.
 
 ## Validation
 
-- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests`: 724 tests passed, 9 skipped.
+- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests`: 732 tests passed, 9 skipped.
 - `ruff check` on changed runtime and test modules: passed.
 - `git diff --check`: passed.
 - Fixed-range Codex review and PR readiness evidence are recorded in the delivery thread and PR.

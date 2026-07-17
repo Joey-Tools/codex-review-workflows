@@ -1165,35 +1165,34 @@ class WorkspaceTest(unittest.TestCase):
         git(self.repo, "commit", "-m", "Change unrelated content")
         unrelated_head = git(self.repo, "rev-parse", "HEAD")
 
-        review = prepare_workspace(
-            repo=self.repo,
-            base_ref=sensitive_base,
-            head_ref=unrelated_head,
-        )
-        self.reviews.append(review)
-        with self.assertRaisesRegex(
-            ReviewError,
-            r"artifact -> <redacted symlink target>.*openai-key.*symlink-target",
-        ) as raised:
-            validate_external_workspace(review)
+        with self.assertRaisesRegex(ReviewError, "openai-key") as raised:
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=sensitive_base,
+                head_ref=unrelated_head,
+            )
         self.assertNotIn(secret, str(raised.exception))
 
     def test_secret_findings_escape_control_characters_in_snapshot_paths(self) -> None:
         secret = "AKIA" + "C" * 16
         file_name = "file\n\x1bname"
         symlink_name = "link\n\x1bname"
-        (self.repo / file_name).write_text(secret + "\n", encoding="utf-8")
-        (self.repo / symlink_name).symlink_to("sk-" + "D" * 40)
-        git(self.repo, "add", file_name, symlink_name)
-        git(self.repo, "commit", "-m", "Add control-character secret paths")
-        secret_head = git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "example.txt").write_text("three\n", encoding="utf-8")
+        git(self.repo, "add", "example.txt")
+        git(self.repo, "commit", "-m", "Prepare clean review range")
+        clean_head = git(self.repo, "rev-parse", "HEAD")
 
         review = prepare_workspace(
             repo=self.repo,
             base_ref=self.head,
-            head_ref=secret_head,
+            head_ref=clean_head,
         )
         self.reviews.append(review)
+        (review.workspace_root / file_name).write_text(
+            secret + "\n",
+            encoding="utf-8",
+        )
+        (review.workspace_root / symlink_name).symlink_to("sk-" + "D" * 40)
 
         with self.assertRaises(ReviewError) as raised:
             validate_external_workspace(review)

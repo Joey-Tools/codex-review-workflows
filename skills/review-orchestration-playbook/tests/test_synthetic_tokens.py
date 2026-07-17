@@ -529,7 +529,9 @@ class PublicPoolScannerTest(unittest.TestCase):
         accepted = accepted_legacy_value(GITHUB_LEGACY, rule="github-token")
         candidate = GITHUB_LEGACY.encode("ascii")
         assignment_prefix = b'access_token = "'
-        first_read = 1024 * 1024
+        first_read = (
+            workspace.MAX_SECRET_PREFIX_PROOF_BYTES + workspace.STREAM_SCAN_OVERLAP
+        )
         committed_end = first_read - workspace.STREAM_SCAN_OVERLAP
         candidate_start = committed_end - len(candidate)
         payload = (
@@ -543,9 +545,12 @@ class PublicPoolScannerTest(unittest.TestCase):
             io.BytesIO(payload),
             size=len(payload),
             accepted_values=(accepted,),
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
         )
         self.assertIsNone(scan.blocking_rule)
         self.assertEqual(scan.accepted_counts[accepted], 1)
+        self.assertEqual(len(scan.blocking_candidates), 0)
 
     def test_legacy_raw_occurrences_cross_stream_boundaries_and_survive_blocking(
         self,
@@ -1409,6 +1414,69 @@ class PublicPoolScannerTest(unittest.TestCase):
                 self.assertEqual(scan.blocking_rule, expected_rule)
                 self.assertFalse(scan.blocking_candidates)
 
+    def test_provider_body_continuation_cannot_be_captured_as_a_512_byte_prefix(
+        self,
+    ) -> None:
+        prefix = b"glpat-" + b"A" * 512
+        payload = prefix + b"-suffix"
+
+        scan = workspace._scan_secret_value(
+            payload,
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+
+        self.assertEqual(len(scan.blocking_candidates), 0)
+        self.assertEqual(scan.blocking_rule, "gitlab-token")
+
+    def test_provider_body_continuation_crossing_first_commit_is_not_captured(
+        self,
+    ) -> None:
+        first_read = (
+            workspace.MAX_SECRET_PREFIX_PROOF_BYTES + workspace.STREAM_SCAN_OVERLAP
+        )
+        committed_end = first_read - workspace.STREAM_SCAN_OVERLAP
+        candidate = b"glpat-" + b"A" * 512
+        candidate_start = committed_end - len(candidate)
+        payload = (
+            b"x" * (candidate_start - 1)
+            + b"\n"
+            + candidate
+            + b"-suffix\n"
+            + b"x" * workspace.STREAM_SCAN_OVERLAP
+        )
+        self.assertGreater(len(payload), first_read)
+
+        scan = workspace._stream_secret_scan(
+            io.BytesIO(payload),
+            size=len(payload),
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+
+        self.assertEqual(len(scan.blocking_candidates), 0)
+        self.assertEqual(scan.blocking_rule, "gitlab-token")
+
+    def test_valid_long_provider_candidates_are_not_prefix_only_by_total_length(
+        self,
+    ) -> None:
+        cases = (
+            ("openai-key", b"sk-proj-" + b"B" * 508),
+            ("github-token", b"github_pat_" + b"C" * 506),
+        )
+        for expected_rule, candidate in cases:
+            with self.subTest(rule=expected_rule):
+                scan = workspace._scan_secret_value(
+                    candidate,
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+                self.assertIsNone(scan.blocking_rule)
+                self.assertEqual(
+                    scan.blocking_candidates,
+                    {candidate: {expected_rule}},
+                )
+
     def test_audit_scan_captures_after_a_blocker_across_stream_chunks(self) -> None:
         accepted = accepted_legacy_value(LEGACY_A, rule="generic-secret-assignment")
         blocking = assignment_bytes(b"password", b"UnknownSecretValueA9Z8Y7")
@@ -1467,18 +1535,24 @@ class PublicPoolScannerTest(unittest.TestCase):
 
     def test_oversized_provider_patterns_have_bounded_prefix_matches(self) -> None:
         cases = (
-            ("anthropic-key", b"sk-ant-", b"A"),
-            ("openai-key", b"sk-proj-", b"B"),
-            ("github-token", b"ghp_", b"C"),
-            ("gitlab-token", b"glpat-", b"D"),
-            ("pypi-token", b"pypi-", b"E"),
-            ("slack-token", b"xoxb-", b"F"),
-            ("stripe-live-key", b"sk_live_", b"G"),
+            ("anthropic-key", b"sk-ant-", b"A", 4096),
+            ("openai-key", b"sk-proj-", b"B", 4096),
+            ("github-token", b"ghp_", b"C", 4096),
+            ("github-token", b"github_pat_", b"D", 513),
+            ("gitlab-token", b"glpat-", b"E", 4096),
+            ("pypi-token", b"pypi-", b"F", 4096),
+            ("slack-token", b"xoxb-", b"G", 4096),
+            ("stripe-live-key", b"sk_live_", b"H", 4096),
         )
-        for expected_rule, prefix, alphabet in cases:
+        for expected_rule, prefix, alphabet, body_length in cases:
             with self.subTest(rule=expected_rule):
-                scan = workspace._scan_secret_value(prefix + alphabet * 4096)
+                scan = workspace._scan_secret_value(
+                    prefix + alphabet * body_length,
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
                 self.assertEqual(scan.blocking_rule, expected_rule)
+                self.assertEqual(len(scan.blocking_candidates), 0)
 
     def test_oversized_jwt_segments_are_blocked(self) -> None:
         normal = b"A" * 12
@@ -2202,8 +2276,24 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                 head = self.commit(repo)
 
                 with self.assertRaisesRegex(ReviewError, rule):
-                    review = self.prepare(repo=repo, base=base, head=head)
-                    self.validate(review)
+                    self.prepare(repo=repo, base=base, head=head)
+
+    def test_preparation_rejects_two_to_one_shared_provider_prefix_replacement(
+        self,
+    ) -> None:
+        shared_prefix = b"glpat-" + b"D" * 512
+        base_fixture = b"\n".join(
+            (shared_prefix + b"-suffix-a", shared_prefix + b"-suffix-b")
+        )
+        head_fixture = shared_prefix + b"-suffix-c\n"
+        repo, base = self.new_repo(
+            {"fixture.txt": base_fixture.decode("ascii") + "\n"}
+        )
+        (repo / "fixture.txt").write_bytes(head_fixture)
+        head = self.commit(repo)
+
+        with self.assertRaisesRegex(ReviewError, "gitlab-token"):
+            self.prepare(repo=repo, base=base, head=head)
 
     def test_pem_reduction_uses_the_complete_block_as_candidate_identity(self) -> None:
         base_fixture = reduction_fixture("private-key", b"A") + reduction_fixture(
@@ -2454,9 +2544,8 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         )
         (repo / "README.md").write_text("head\n", encoding="utf-8")
         head = self.commit(repo)
-        review = self.prepare(repo=repo, base=base, head=head)
         with self.assertRaisesRegex(ReviewError, "generic-secret-assignment") as raised:
-            self.validate(review)
+            self.prepare(repo=repo, base=base, head=head)
         self.assertNotIn(unknown, str(raised.exception))
 
     def test_multi_value_legacy_unchanged_and_deleted_counts_pass(self) -> None:
@@ -2517,14 +2606,13 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         self.assertNotIn(LEGACY_PRINTABLE, serialized)
         self.assertNotIn(legacy_value_base64(LEGACY_PRINTABLE), serialized)
 
-        unselected_review = self.prepare(
-            repo=repo,
-            base=base,
-            head=head,
-            catalog=catalog,
-        )
         with self.assertRaisesRegex(ReviewError, "generic-secret-assignment"):
-            self.validate(unselected_review, catalog=catalog)
+            self.prepare(
+                repo=repo,
+                base=base,
+                head=head,
+                catalog=catalog,
+            )
 
     def test_legacy_counts_accept_authoring_values_but_not_unknown_secrets(
         self,
@@ -2556,15 +2644,14 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         )
         (unknown_repo / "README.md").write_text("head\n", encoding="utf-8")
         unknown_head = self.commit(unknown_repo)
-        unknown_review = self.prepare(
-            repo=unknown_repo,
-            base=unknown_base,
-            head=unknown_head,
-            catalog=catalog,
-            exemptions=("historical-fixtures",),
-        )
         with self.assertRaisesRegex(ReviewError, "generic-secret-assignment"):
-            self.validate(unknown_review, catalog=catalog)
+            self.prepare(
+                repo=unknown_repo,
+                base=unknown_base,
+                head=unknown_head,
+                catalog=catalog,
+                exemptions=("historical-fixtures",),
+            )
 
     def test_github_legacy_assignment_uses_the_provider_specific_exemption(
         self,
@@ -3151,6 +3238,17 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         with self.assertRaisesRegex(ReviewError, "count changed after preparation"):
             self.validate(review)
 
+    def test_materialized_head_cannot_remove_a_residual_reduced_secret(self) -> None:
+        fixture = reduction_fixture("generic-secret-assignment")
+        repo, base = self.new_repo({"fixture.cfg": fixture * 2})
+        (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
+        head = self.commit(repo)
+        review = self.prepare(repo=repo, base=base, head=head)
+
+        (review.workspace_root / "fixture.cfg").unlink()
+        with self.assertRaisesRegex(ReviewError, "count changed after preparation"):
+            self.validate(review)
+
     def test_overlapping_legacy_values_are_counted_independently(self) -> None:
         longer = LEGACY_A + "Suffix"
         catalog = legacy_catalog(values=(LEGACY_A, longer))
@@ -3256,14 +3354,13 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         )
         (secret_repo / "README.md").write_text("head\n", encoding="utf-8")
         secret_head = self.commit(secret_repo)
-        review = self.prepare(
-            repo=secret_repo,
-            base=secret_base,
-            head=secret_head,
-            catalog=catalog,
-        )
         with self.assertRaisesRegex(ReviewError, "generic-secret-assignment"):
-            self.validate(review, catalog=catalog)
+            self.prepare(
+                repo=secret_repo,
+                base=secret_base,
+                head=secret_head,
+                catalog=catalog,
+            )
 
     def test_prompt_only_secret_does_not_block_review_content(self) -> None:
         repo, base = self.new_repo({"README.md": "base\n"})
@@ -3367,15 +3464,14 @@ class SyntheticWorkspaceTest(unittest.TestCase):
 
         (repo / "README.md").write_text("review head\n", encoding="utf-8")
         review_head = self.commit(repo, "Review head")
-        review = self.prepare(
-            repo=repo,
-            base=tip,
-            head=review_head,
-            catalog=catalog,
-            exemptions=("historical-fixtures",),
-        )
         with self.assertRaisesRegex(ReviewError, "openai-key"):
-            self.validate(review, catalog=catalog)
+            self.prepare(
+                repo=repo,
+                base=tip,
+                head=review_head,
+                catalog=catalog,
+                exemptions=("historical-fixtures",),
+            )
 
         bad_payload = json.loads(json.dumps(payload))
         bad_payload["legacy_exemptions"][0]["values"][0]["source_occurrences"] = 1
