@@ -1265,6 +1265,116 @@ class PublicPoolScannerTest(unittest.TestCase):
                     "generic-secret-assignment",
                 )
 
+    def test_diff_quoted_assignment_respects_record_side(self) -> None:
+        accepted = self.accepted[0]
+        quoted_mapping = (
+            b'        "OPENAI_API_KEY": "' + accepted.value + b'",\n'
+        )
+        long_replacement = (
+            b"        replacement(" + b"argument, " * 40 + b")\n"
+        )
+        self.assertGreater(
+            len(long_replacement),
+            workspace.MAX_SECRET_ASSIGNMENT_TRAILING_BYTES,
+        )
+
+        for label, payload in (
+            (
+                "base-assignment-with-head-replacement",
+                b"-" + quoted_mapping + b"+" + long_replacement,
+            ),
+            (
+                "head-assignment-with-base-replacement",
+                b"+" + quoted_mapping + b"-" + long_replacement,
+            ),
+            (
+                "base-assignment-with-next-base-field",
+                b"-"
+                + quoted_mapping
+                + b"+"
+                + long_replacement
+                + b'-        "state": "expired",\n',
+            ),
+            (
+                "base-assignment-with-next-context-field",
+                b"-"
+                + quoted_mapping
+                + b"+"
+                + long_replacement
+                + b'         "state": "expired",\n',
+            ),
+        ):
+            with self.subTest(accepted=label):
+                scan = workspace._scan_secret_value(
+                    payload,
+                    accepted_values=self.accepted,
+                    diff_surface=True,
+                )
+                self.assertIsNone(scan.blocking_rule)
+                self.assertEqual(scan.accepted_counts[accepted], 1)
+
+        adjacent_secret = b'"ActualOpaque' + b'SecretA9Z8Y7"'
+        for label, continuation in (
+            ("context", b"     + " + adjacent_secret + b"\n"),
+            ("same-side", b"-    + " + adjacent_secret + b"\n"),
+        ):
+            with self.subTest(blocked_continuation=label):
+                scan = workspace._scan_secret_value(
+                    b"-"
+                    + quoted_mapping
+                    + b"+replacement()\n"
+                    + continuation,
+                    accepted_values=self.accepted,
+                    diff_surface=True,
+                )
+                self.assertEqual(
+                    scan.blocking_rule,
+                    "generic-secret-assignment",
+                )
+
+        incomplete_base_prefix = workspace._scan_secret_value(
+            b"@@ -1,3 +1,1 @@\n"
+            b"-configure(\n"
+            b"-"
+            + quoted_mapping
+            + b"+replacement()\n"
+            b"-def test_fixture():\n"
+            b"-    pass\n",
+            accepted_values=self.accepted,
+            diff_surface=True,
+        )
+        self.assertEqual(
+            incomplete_base_prefix.blocking_rule,
+            "generic-secret-assignment",
+        )
+
+        exhausted_budget = workspace.SecretScanBudget(
+            workspace.MAX_SECRET_SCAN_EVENTS,
+            remaining_prefix_proof_bytes=0,
+        )
+        with self.assertRaisesRegex(ReviewError, "prefix proof limit"):
+            workspace._scan_secret_value(
+                b"-" + quoted_mapping + b"+" + long_replacement,
+                accepted_values=self.accepted,
+                diff_surface=True,
+                _event_budget=exhausted_budget,
+            )
+
+        with mock.patch.object(
+            workspace,
+            "MAX_SECRET_PREFIX_PROOF_BYTES",
+            len(long_replacement) - 1,
+        ):
+            oversized_opposite_record = workspace._scan_secret_value(
+                b"-" + quoted_mapping + b"+" + long_replacement,
+                accepted_values=self.accepted,
+                diff_surface=True,
+            )
+        self.assertEqual(
+            oversized_opposite_record.blocking_rule,
+            "generic-secret-assignment",
+        )
+
     def test_dense_accepted_surface_fails_closed_at_the_event_limit(self) -> None:
         accepted = self.accepted[0]
         for label, value in (

@@ -3000,6 +3000,22 @@ def _quoted_assignment_may_accept(
     cursor = match.end()
     inspected = 0
     crossed_line_boundary = False
+    skipped_diff_bytes = 0
+    match_line_start = (
+        max(
+            value.rfind(b"\n", 0, match.start()),
+            value.rfind(b"\r", 0, match.start()),
+        )
+        + 1
+    )
+    match_diff_side: int | None = None
+    if (
+        diff_surface
+        and match_line_start < len(value)
+        and value[match_line_start] in (0x2B, 0x2D)
+        and not value.startswith((b"+++ ", b"--- "), match_line_start)
+    ):
+        match_diff_side = value[match_line_start]
 
     def advance(count: int) -> bool:
         nonlocal crossed_line_boundary, cursor, inspected
@@ -3054,7 +3070,37 @@ def _quoted_assignment_may_accept(
     def starts_literal() -> bool:
         return _starts_quoted_literal(value[cursor : cursor + 16])
 
+    def skip_opposite_diff_records() -> tuple[bool, bool]:
+        nonlocal crossed_line_boundary, cursor, skipped_diff_bytes
+        skipped = False
+        while (
+            match_diff_side is not None
+            and cursor < len(value)
+            and cursor > 0
+            and value[cursor - 1] == 0x0A
+            and value[cursor] in (0x2B, 0x2D)
+            and value[cursor] != match_diff_side
+            and not value.startswith((b"+++ ", b"--- "), cursor)
+        ):
+            line_end = value.find(b"\n", cursor)
+            record_end = len(value) if line_end < 0 else line_end + 1
+            record_size = record_end - cursor
+            if skipped_diff_bytes + record_size > MAX_SECRET_PREFIX_PROOF_BYTES:
+                return False, skipped
+            if not event_budget.consume_prefix_proof(record_size):
+                return False, skipped
+            skipped_diff_bytes += record_size
+            cursor = record_end
+            crossed_line_boundary = True
+            skipped = True
+        return True, skipped
+
     def trim_diff_record_prefix() -> bool:
+        skip_succeeded, skipped = skip_opposite_diff_records()
+        if not skip_succeeded:
+            return False
+        if skipped and not trim_space():
+            return False
         if (
             diff_surface
             and cursor < len(value)
@@ -3337,7 +3383,7 @@ def _quoted_assignment_may_accept(
             return index < limit and value[index] == 0x28
         return index < limit and value[index] in (0x28, 0x3A)
 
-    def diff_head_prefix() -> bytes | None:
+    def diff_source_prefix() -> bytes | None:
         lower_bound = max(0, cursor - MAX_SECRET_PREFIX_PROOF_BYTES)
         markers = (
             value.rfind(b"\n@@ ", lower_bound, cursor),
@@ -3361,26 +3407,28 @@ def _quoted_assignment_may_accept(
         raw_prefix = value[hunk_start:cursor]
         if not event_budget.consume_prefix_proof(len(raw_prefix)):
             return None
-        head_lines: list[bytes] = []
+        source_side = match_diff_side if match_diff_side is not None else 0x2B
+        source_lines: list[bytes] = []
         for line in raw_prefix.splitlines(keepends=True):
-            if line.startswith((b"+", b" ")):
-                if line.startswith(b"+++ "):
-                    return None
-                head_lines.append(line[1:])
-            elif line.startswith(b"-"):
-                if line.startswith(b"--- "):
-                    return None
+            if line.startswith((b"+++ ", b"--- ")):
+                return None
+            if line.startswith(b" "):
+                source_lines.append(line[1:])
+            elif line.startswith(bytes((source_side,))):
+                source_lines.append(line[1:])
+            elif line.startswith((b"+", b"-")):
+                continue
             elif line.startswith(b"\\ No newline at end of file"):
                 continue
             elif line:
                 return None
-        return b"".join(head_lines)
+        return b"".join(source_lines)
 
     def python_prefix_is_complete() -> bool:
         if not prefix_context_complete:
             return False
         if diff_surface:
-            prefix = diff_head_prefix()
+            prefix = diff_source_prefix()
             if prefix is None:
                 return False
         else:
