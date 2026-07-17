@@ -3017,13 +3017,50 @@ def _quoted_assignment_may_accept(
         )
         + 1
     )
+
+    def triple_prefix_is_hunk_content() -> bool:
+        lower_bound = max(
+            0,
+            match_line_start - MAX_SECRET_PREFIX_PROOF_BYTES,
+        )
+        if not event_budget.consume_prefix_proof(
+            match_line_start - lower_bound
+        ):
+            return False
+        hunk_marker = max(
+            value.rfind(b"\n@@ ", lower_bound, match_line_start),
+            value.rfind(b"\n@@@ ", lower_bound, match_line_start),
+        )
+        if (
+            lower_bound == 0
+            and prefix_context_complete
+            and value.startswith((b"@@ ", b"@@@ "))
+        ):
+            hunk_marker = max(hunk_marker, 0)
+        file_marker = value.rfind(
+            b"\ndiff --git ",
+            lower_bound,
+            match_line_start,
+        )
+        if (
+            lower_bound == 0
+            and prefix_context_complete
+            and value.startswith(b"diff --git ")
+        ):
+            file_marker = max(file_marker, 0)
+        return hunk_marker >= 0 and hunk_marker > file_marker
+
     match_diff_side: int | None = None
     if (
         diff_surface
         and match_line_start < len(value)
         and value[match_line_start] in (0x2B, 0x2D)
-        and not value.startswith((b"+++ ", b"--- "), match_line_start)
     ):
+        if value.startswith(
+            (b"+++ ", b"--- "),
+            match_line_start,
+        ) and not triple_prefix_is_hunk_content():
+            return False
         match_diff_side = value[match_line_start]
 
     def advance(count: int) -> bool:
@@ -3469,6 +3506,13 @@ def _quoted_assignment_may_accept(
     def starts_proven_python_declaration() -> bool:
         return starts_top_level_python_declaration() and python_prefix_is_complete()
 
+    def at_proven_end() -> bool:
+        if cursor != len(value):
+            return False
+        if diff_surface and crossed_line_boundary and not suffix_context_complete:
+            raise _IncompleteSecretScanSuffix
+        return True
+
     while True:
         while value.startswith((b")", b"]", b"}"), cursor):
             if not advance(1):
@@ -3483,7 +3527,7 @@ def _quoted_assignment_may_accept(
                 return False
             continue
         break
-    if cursor == len(value):
+    if at_proven_end():
         return True
     if value.startswith(b";", cursor):
         if not advance(1) or not trim_space():
@@ -3492,7 +3536,7 @@ def _quoted_assignment_may_accept(
             if not trim_continuation_trivia():
                 return False
         return (
-            cursor == len(value)
+            at_proven_end()
             or starts_diff_metadata_boundary()
             or starts_named_assignment()
             or starts_proven_python_declaration()
@@ -3515,7 +3559,7 @@ def _quoted_assignment_may_accept(
                     return False
                 continue
             break
-        if cursor == len(value):
+        if at_proven_end():
             return True
         if starts_diff_metadata_boundary():
             return True
@@ -3525,7 +3569,7 @@ def _quoted_assignment_may_accept(
             if starts_trivia() and not trim_continuation_trivia():
                 return False
             return (
-                cursor == len(value)
+                at_proven_end()
                 or starts_diff_metadata_boundary()
                 or starts_named_assignment()
                 or starts_proven_python_declaration()
@@ -4044,7 +4088,11 @@ def _scan_secret_value(
         for match in pattern.finditer(value):
             if match.end() > upper:
                 continue
-            event_budget.consume()
+            # Keep older provider spans available when the corresponding generic
+            # assignment ends across the commit frontier, but charge each
+            # provider event only in its own commit range.
+            if minimum_end < match.end():
+                event_budget.consume()
             candidate = match.group(0)
             if _matching_accepted_values(
                 rule=rule,

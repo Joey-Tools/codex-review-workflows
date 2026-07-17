@@ -515,13 +515,20 @@ class PublicPoolScannerTest(unittest.TestCase):
             + b'"\nstate = "expired"\n'
             + b"x" * workspace.STREAM_SCAN_OVERLAP
         )
-        scan = workspace._stream_secret_scan(
-            io.BytesIO(payload),
-            size=len(payload),
-            accepted_values=(accepted,),
-        )
+        event_budget = workspace.SecretScanBudget(3)
+        with mock.patch.object(
+            workspace.SecretScanBudget,
+            "default",
+            return_value=event_budget,
+        ):
+            scan = workspace._stream_secret_scan(
+                io.BytesIO(payload),
+                size=len(payload),
+                accepted_values=(accepted,),
+            )
         self.assertIsNone(scan.blocking_rule)
         self.assertEqual(scan.accepted_counts[accepted], 1)
+        self.assertEqual(event_budget.remaining, 0)
 
     def test_legacy_raw_occurrences_cross_stream_boundaries_and_survive_blocking(
         self,
@@ -1360,6 +1367,115 @@ class PublicPoolScannerTest(unittest.TestCase):
                 self.assertIsNone(scan.blocking_rule)
                 self.assertEqual(scan.accepted_counts[accepted], 1)
 
+        triple_assignment = (
+            b'OPENAI_API_KEY = "' + accepted.value + b'",\n'
+        )
+        for label, record_prefix, opposite_side in (
+            ("triple-plus-matched-record", b"+++ ", b"-"),
+            ("triple-minus-matched-record", b"--- ", b"+"),
+        ):
+            with self.subTest(accepted=label):
+                scan = workspace._scan_secret_value(
+                    b"diff --git a/fixture.py b/fixture.py\n"
+                    b"--- a/fixture.py\n"
+                    b"+++ b/fixture.py\n"
+                    b"@@ -1 +1 @@\n"
+                    + record_prefix
+                    + triple_assignment
+                    + opposite_side
+                    + long_replacement,
+                    accepted_values=self.accepted,
+                    diff_surface=True,
+                )
+                self.assertIsNone(scan.blocking_rule)
+                self.assertEqual(scan.accepted_counts[accepted], 1)
+
+        actual_file_header = workspace._scan_secret_value(
+            b"diff --git a/fixture.py b/fixture.py\n"
+            b"--- a/fixture.py\n"
+            b'+++ OPENAI_API_KEY = "'
+            + accepted.value
+            + b'",\n'
+            + b"@@ -1 +1 @@\n",
+            accepted_values=self.accepted,
+            diff_surface=True,
+        )
+        self.assertEqual(
+            actual_file_header.blocking_rule,
+            "generic-secret-assignment",
+        )
+
+        incomplete_prefix_hunk = workspace._scan_secret_value(
+            b"@@ -1 +1 @@\n"
+            b"+++ "
+            + triple_assignment
+            + b"-"
+            + long_replacement,
+            accepted_values=self.accepted,
+            diff_surface=True,
+            prefix_context_complete=False,
+        )
+        self.assertEqual(
+            incomplete_prefix_hunk.blocking_rule,
+            "generic-secret-assignment",
+        )
+
+        with mock.patch.object(
+            workspace,
+            "MAX_SECRET_PREFIX_PROOF_BYTES",
+            64,
+        ):
+            out_of_range_hunk = workspace._scan_secret_value(
+                b"@@ -1 +1 @@\n"
+                + b" "
+                + b"x" * 128
+                + b"\n+++ "
+                + triple_assignment,
+                accepted_values=self.accepted,
+                diff_surface=True,
+            )
+        self.assertEqual(
+            out_of_range_hunk.blocking_rule,
+            "generic-secret-assignment",
+        )
+
+        exhausted_hunk_budget = workspace.SecretScanBudget(
+            workspace.MAX_SECRET_SCAN_EVENTS,
+            remaining_prefix_proof_bytes=0,
+        )
+        with self.assertRaisesRegex(ReviewError, "prefix proof limit"):
+            workspace._scan_secret_value(
+                b"diff --git a/fixture.py b/fixture.py\n"
+                b"--- a/fixture.py\n"
+                b"+++ b/fixture.py\n"
+                b"@@ -1 +1 @@\n"
+                b"+++ "
+                + triple_assignment
+                + b"-"
+                + long_replacement,
+                accepted_values=self.accepted,
+                diff_surface=True,
+                _event_budget=exhausted_hunk_budget,
+            )
+
+        stale_hunk_before_file_header = workspace._scan_secret_value(
+            b"@@ -1 +1 @@\n"
+            b" context\n"
+            b"diff --git a/fixture.py b/fixture.py\n"
+            b'--- OPENAI_API_KEY = "'
+            + accepted.value
+            + b'",\n'
+            + b"+++ "
+            + long_replacement
+            + b"@@ -1 +1 @@\n",
+            accepted_values=self.accepted,
+            diff_surface=True,
+        )
+        self.assertEqual(
+            stale_hunk_before_file_header.blocking_rule,
+            "generic-secret-assignment",
+        )
+
         adjacent_secret = b'"ActualOpaque' + b'SecretA9Z8Y7"'
         for label, continuation in (
             ("context", b"     + " + adjacent_secret + b"\n"),
@@ -1486,6 +1602,58 @@ class PublicPoolScannerTest(unittest.TestCase):
             "generic-secret-assignment",
         )
 
+        head_boundary_prefix = padding + b"+" + quoted_assignment[1:]
+        for label, case_prefix, opposite_side, partial_record in (
+            ("base-marker", boundary_prefix, b"+", b"-"),
+            ("base-indented", boundary_prefix, b"+", b"-    "),
+            ("context-marker", boundary_prefix, b"+", b" "),
+            ("context-indented", boundary_prefix, b"+", b"     "),
+            ("head-marker", head_boundary_prefix, b"-", b"+"),
+            ("head-indented", head_boundary_prefix, b"-", b"+    "),
+        ):
+            with self.subTest(partial_record=label):
+                partial_opposite = (
+                    opposite_side
+                    + b"x"
+                    * (
+                        first_read_size
+                        - len(case_prefix)
+                        - len(partial_record)
+                        - 2
+                    )
+                    + b"\n"
+                )
+                partial_chunk = case_prefix + partial_opposite + partial_record
+                partial_payload = (
+                    partial_chunk + b"+ " + adjacent_secret + b"\n"
+                )
+                direct_scan = workspace._scan_secret_value(
+                    partial_chunk,
+                    accepted_values=self.accepted,
+                    diff_surface=True,
+                    suffix_context_complete=False,
+                )
+                self.assertIsNotNone(direct_scan.incomplete_suffix_start)
+                full_scan = workspace._scan_secret_value(
+                    partial_payload,
+                    accepted_values=self.accepted,
+                    diff_surface=True,
+                )
+                self.assertEqual(
+                    full_scan.blocking_rule,
+                    "generic-secret-assignment",
+                )
+                partial_scan = workspace._stream_secret_scan(
+                    io.BytesIO(partial_payload),
+                    size=len(partial_payload),
+                    accepted_values=self.accepted,
+                    diff_surface=True,
+                )
+                self.assertEqual(
+                    partial_scan.blocking_rule,
+                    "generic-secret-assignment",
+                )
+
         safe_payload = (
             padding + quoted_assignment + opposite_record.removesuffix(b"\n")
         )
@@ -1497,6 +1665,40 @@ class PublicPoolScannerTest(unittest.TestCase):
         )
         self.assertIsNone(safe_scan.blocking_rule)
         self.assertEqual(safe_scan.accepted_counts[accepted], 1)
+
+        safe_complete_payload = boundary_prefix + b"+replacement()\n"
+        safe_complete_scan = workspace._stream_secret_scan(
+            io.BytesIO(safe_complete_payload),
+            size=len(safe_complete_payload),
+            accepted_values=self.accepted,
+            diff_surface=True,
+        )
+        self.assertIsNone(safe_complete_scan.blocking_rule)
+        self.assertEqual(safe_complete_scan.accepted_counts[accepted], 1)
+
+        safe_partial_payload = (
+            boundary_prefix + b"+replacement()\n-    "
+        )
+        safe_partial_scan = workspace._stream_secret_scan(
+            io.BytesIO(safe_partial_payload),
+            size=len(safe_partial_payload),
+            accepted_values=self.accepted,
+            diff_surface=True,
+        )
+        self.assertIsNone(safe_partial_scan.blocking_rule)
+        self.assertEqual(safe_partial_scan.accepted_counts[accepted], 1)
+
+        safe_head_partial_payload = (
+            head_boundary_prefix + b"-replacement()\n+    "
+        )
+        safe_head_partial_scan = workspace._stream_secret_scan(
+            io.BytesIO(safe_head_partial_payload),
+            size=len(safe_head_partial_payload),
+            accepted_values=self.accepted,
+            diff_surface=True,
+        )
+        self.assertIsNone(safe_head_partial_scan.blocking_rule)
+        self.assertEqual(safe_head_partial_scan.accepted_counts[accepted], 1)
 
     def test_diff_incomplete_suffix_commits_each_complete_prefix(self) -> None:
         accepted = self.accepted[0]

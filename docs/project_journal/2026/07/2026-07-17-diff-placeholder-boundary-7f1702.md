@@ -30,12 +30,20 @@ the opposite-side replacement was longer than the trailing proof budget.
 - Once a hunk side is established, opposite-side records whose source content
   begins with `++ ` or `-- ` remain hunk content instead of being mistaken for
   `+++` or `---` file headers.
+- A matched `+++ ` or `--- ` record binds to a diff side only when bounded,
+  charged lookbehind proves a hunk after the latest `diff --git` boundary;
+  ambiguous file-header and incomplete-prefix cases fail closed.
 - A non-final streaming window carries the earliest deferred assignment
   boundary forward, commits only the complete prefix before it, and retains the
   match without merging provisional counts.
+- Any diff proof that crosses a line boundary and ends at a non-final buffer
+  boundary is deferred, including partial same-side and context records.
 - Streaming event candidates are filtered to the current commit range before
   consuming event or prefix-proof budget, while in-range candidates still use
   the complete pending buffer as source context.
+- Older provider-specific spans remain available to suppress a generic match
+  that ends across the commit frontier without charging the provider event
+  again.
 - Security regressions keep scanning after opposite-side interleaving and
   continue to reject same-side or shared-context RHS continuations.
 
@@ -57,6 +65,16 @@ the opposite-side replacement was longer than the trailing proof budget.
   charge: the old path consumed `1,412` prefix-proof bytes and failed a valid
   `1,200`-byte budget, while commit-range filtering consumes `1,092` bytes and
   accepts the fixture exactly once.
+- Partial-suffix regressions cover base/head marker-only and indented records,
+  shared context, direct non-final sentinel reporting, full/stream agreement,
+  and safe actual EOF cases. The old stream path accepted these boundary
+  payloads; the fixed path blocks the adjacent secret.
+- Triple-prefix match regressions cover both hunk sides, real file headers,
+  cross-file hunk reset, incomplete prefix context, bounded lookbehind, and an
+  exhausted prefix-proof budget.
+- A three-event provider-specific stream-boundary regression proves that a
+  committed provider span is retained for generic suppression without being
+  charged again in overlap.
 - The previously blocked frozen `review.diff` passed the patched scanner in a
   redacted local probe.
 - The complete synthetic-token module passed (`88` tests).
@@ -65,7 +83,8 @@ the opposite-side replacement was longer than the trailing proof budget.
 - Full runtime/test `ruff check` and Python `compileall` passed.
 - Synthetic-token catalog validation returned `public-example-v1` as valid.
 - Skill validation, project-journal validation, and `git diff --check` passed.
-- An independent read-only scanner review returned `No findings.`
+- Independent read-only follow-up reviews of the partial-suffix, hunk-proof,
+  and event-accounting changes returned `No findings.`
 
 ## Next Steps
 
