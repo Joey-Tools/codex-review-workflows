@@ -49,6 +49,7 @@ from .synthetic_tokens import (
 # bytes, then use a 513-byte prefix branch for oversized values. Keeping every event
 # end below this overlap prevents a match start from being discarded at a read boundary.
 STREAM_SCAN_OVERLAP = 8192
+STREAM_SCAN_CHUNK_BYTES = 1024 * 1024
 AWS_SECRET_KEY_NAME_PATTERN = rb"(?i)aws_secret_access_key"
 AWS_SECRET_KEY_PATTERN = re.compile(
     AWS_SECRET_KEY_NAME_PATTERN
@@ -348,6 +349,30 @@ class SecretScanBudget:
             )
         self.remaining_prefix_proof_bytes -= byte_count
         return True
+
+    def clone(self) -> "SecretScanBudget":
+        return SecretScanBudget(
+            self.remaining,
+            self.remaining_prefix_proof_bytes,
+        )
+
+    def commit_from(self, transaction: "SecretScanBudget") -> None:
+        if (
+            transaction.remaining > self.remaining
+            or transaction.remaining_prefix_proof_bytes
+            > self.remaining_prefix_proof_bytes
+        ):
+            raise ReviewError("sensitive scanner budget transaction is invalid")
+        self.remaining = transaction.remaining
+        self.remaining_prefix_proof_bytes = (
+            transaction.remaining_prefix_proof_bytes
+        )
+
+
+@dataclass(frozen=True)
+class DiffHunkContext:
+    source_start: int
+    retention_start: int
 
 
 @dataclass
@@ -2997,6 +3022,51 @@ def _starts_quoted_literal(value: bytes) -> bool:
     )
 
 
+def _bounded_diff_hunk_context_before(
+    value: bytes,
+    before: int,
+    *,
+    prefix_context_complete: bool,
+    lookbehind_bytes: int | None = None,
+) -> tuple[DiffHunkContext | None, int]:
+    if lookbehind_bytes is None:
+        lookbehind_bytes = MAX_SECRET_PREFIX_PROOF_BYTES
+    lower_bound = max(0, before - lookbehind_bytes)
+    hunk_marker = max(
+        value.rfind(b"\n@@ ", lower_bound, before),
+        value.rfind(b"\n@@@ ", lower_bound, before),
+    )
+    if (
+        lower_bound == 0
+        and prefix_context_complete
+        and value.startswith((b"@@ ", b"@@@ "))
+    ):
+        hunk_marker = max(hunk_marker, 0)
+    file_marker = value.rfind(
+        b"\ndiff --git ",
+        lower_bound,
+        before,
+    )
+    if (
+        lower_bound == 0
+        and prefix_context_complete
+        and value.startswith(b"diff --git ")
+    ):
+        file_marker = max(file_marker, 0)
+    if hunk_marker < 0 or hunk_marker <= file_marker:
+        return None, lower_bound
+    hunk_start = value.find(b"\n", hunk_marker + 1, before)
+    if hunk_start < 0:
+        return None, lower_bound
+    return (
+        DiffHunkContext(
+            source_start=hunk_start + 1,
+            retention_start=hunk_marker,
+        ),
+        lower_bound,
+    )
+
+
 def _quoted_assignment_may_accept(
     value: bytes,
     match: re.Match[bytes],
@@ -3019,36 +3089,16 @@ def _quoted_assignment_may_accept(
     )
 
     def triple_prefix_is_hunk_content() -> bool:
-        lower_bound = max(
-            0,
-            match_line_start - MAX_SECRET_PREFIX_PROOF_BYTES,
+        hunk_context, lower_bound = _bounded_diff_hunk_context_before(
+            value,
+            match_line_start,
+            prefix_context_complete=prefix_context_complete,
         )
         if not event_budget.consume_prefix_proof(
             match_line_start - lower_bound
         ):
             return False
-        hunk_marker = max(
-            value.rfind(b"\n@@ ", lower_bound, match_line_start),
-            value.rfind(b"\n@@@ ", lower_bound, match_line_start),
-        )
-        if (
-            lower_bound == 0
-            and prefix_context_complete
-            and value.startswith((b"@@ ", b"@@@ "))
-        ):
-            hunk_marker = max(hunk_marker, 0)
-        file_marker = value.rfind(
-            b"\ndiff --git ",
-            lower_bound,
-            match_line_start,
-        )
-        if (
-            lower_bound == 0
-            and prefix_context_complete
-            and value.startswith(b"diff --git ")
-        ):
-            file_marker = max(file_marker, 0)
-        return hunk_marker >= 0 and hunk_marker > file_marker
+        return hunk_context is not None
 
     match_diff_side: int | None = None
     if (
@@ -3431,28 +3481,26 @@ def _quoted_assignment_may_accept(
         return index < limit and value[index] in (0x28, 0x3A)
 
     def diff_source_prefix() -> bytes | None:
-        lower_bound = max(0, cursor - MAX_SECRET_PREFIX_PROOF_BYTES)
-        markers = (
-            value.rfind(b"\n@@ ", lower_bound, cursor),
-            value.rfind(b"\n@@@ ", lower_bound, cursor),
+        hunk_context, lower_bound = _bounded_diff_hunk_context_before(
+            value,
+            match_line_start,
+            prefix_context_complete=prefix_context_complete,
         )
-        marker = max(markers)
-        if marker >= 0:
-            hunk_start = value.find(b"\n", marker + 1, cursor)
-            if hunk_start < 0:
-                return None
-            hunk_start += 1
-        elif lower_bound == 0 and value.startswith((b"@@ ", b"@@@ ")):
-            hunk_start = value.find(b"\n", 0, cursor)
-            if hunk_start < 0:
-                return None
-            hunk_start += 1
-        elif lower_bound == 0:
+        if (
+            hunk_context is None
+            and lower_bound == 0
+            and prefix_context_complete
+        ):
             hunk_start = 0
-        else:
+        elif hunk_context is None:
             return None
+        else:
+            hunk_start = hunk_context.source_start
         raw_prefix = value[hunk_start:cursor]
-        if not event_budget.consume_prefix_proof(len(raw_prefix)):
+        source_proof_bytes = len(raw_prefix) - skipped_diff_bytes
+        if source_proof_bytes < 0 or not event_budget.consume_prefix_proof(
+            source_proof_bytes
+        ):
             return None
         source_side = match_diff_side if match_diff_side is not None else 0x2B
         source_lines: list[bytes] = []
@@ -3470,13 +3518,13 @@ def _quoted_assignment_may_accept(
         return b"".join(source_lines)
 
     def python_prefix_is_complete() -> bool:
-        if not prefix_context_complete:
-            return False
         if diff_surface:
             prefix = diff_source_prefix()
             if prefix is None:
                 return False
         else:
+            if not prefix_context_complete:
+                return False
             prefix = value[:cursor]
             if not event_budget.consume_prefix_proof(len(prefix)):
                 return False
@@ -4189,6 +4237,8 @@ def _stream_secret_scan(
     _occurrence_budget: LegacyOccurrenceBudget | None = None,
     _continue_after_blocking: bool = False,
 ) -> SecretScanResult:
+    if size is not None and size < 0:
+        raise ReviewError("sensitive scan size must be nonnegative")
     overlap = STREAM_SCAN_OVERLAP
     accepted = tuple(accepted_values)
     accepted_index = _accepted_index or _index_accepted_values(accepted)
@@ -4209,24 +4259,40 @@ def _stream_secret_scan(
     while True:
         if remaining == 0:
             chunk = b""
+            reached_eof = True
         else:
             preferred_read_size = (
                 MAX_SECRET_PREFIX_PROOF_BYTES + overlap
                 if total_read == 0
-                else 1024 * 1024
+                else STREAM_SCAN_CHUNK_BYTES
             )
             read_size = (
                 preferred_read_size
                 if remaining is None
                 else min(preferred_read_size, remaining)
             )
-            chunk = stream.read(read_size)
-        if not chunk and remaining not in (None, 0):
+            chunk_buffer = bytearray()
+            reached_eof = False
+            # Normalize transport-level short reads into bounded logical chunks
+            # so speculative suffix scans do not depend on stream fragmentation.
+            while len(chunk_buffer) < read_size:
+                requested = read_size - len(chunk_buffer)
+                part = stream.read(requested)
+                if not part:
+                    reached_eof = True
+                    break
+                if len(part) > requested:
+                    raise ReviewError(
+                        "sensitive scan stream returned more bytes than requested"
+                    )
+                chunk_buffer.extend(part)
+            chunk = bytes(chunk_buffer)
+        if reached_eof and remaining not in (None, 0):
             raise ReviewError("unexpected end of Git blob during sensitive scan")
         if remaining is not None:
             remaining -= len(chunk)
         total_read += len(chunk)
-        at_end = not chunk or remaining == 0
+        at_end = reached_eof or remaining == 0
         exact_pending += chunk
         next_committed_start = (
             total_read
@@ -4264,6 +4330,10 @@ def _stream_secret_scan(
         next_committed_end = total_read if at_end else max(0, total_read - overlap)
         local_minimum = max(0, committed_end - pending_offset)
         local_maximum = max(0, next_committed_end - pending_offset)
+        # A suffix scan is speculative until its full commit range is proven.
+        # Only the complete scan, or its safe-prefix replay, may spend the
+        # caller-visible logical budget.
+        pending_budget = event_budget.clone()
         pending_scan = _scan_secret_value(
             pending,
             accepted_values=accepted,
@@ -4274,7 +4344,7 @@ def _stream_secret_scan(
             prefix_context_complete=pending_offset == 0,
             suffix_context_complete=at_end,
             _accepted_index=accepted_index,
-            _event_budget=event_budget,
+            _event_budget=pending_budget,
             _continue_after_blocking=_continue_after_blocking,
         )
         if pending_scan.incomplete_suffix_start is not None:
@@ -4283,6 +4353,7 @@ def _stream_secret_scan(
                 min(local_maximum, pending_scan.incomplete_suffix_start),
             )
             if safe_local_maximum > local_minimum:
+                committed_budget = event_budget.clone()
                 committed_scan = _scan_secret_value(
                     pending,
                     accepted_values=accepted,
@@ -4293,7 +4364,7 @@ def _stream_secret_scan(
                     prefix_context_complete=pending_offset == 0,
                     suffix_context_complete=at_end,
                     _accepted_index=accepted_index,
-                    _event_budget=event_budget,
+                    _event_budget=committed_budget,
                     _continue_after_blocking=_continue_after_blocking,
                 )
                 if committed_scan.incomplete_suffix_start is not None:
@@ -4301,11 +4372,13 @@ def _stream_secret_scan(
                         "sensitive scanner could not establish a complete diff "
                         "prefix"
                     )
+                event_budget.commit_from(committed_budget)
                 result.merge(committed_scan)
             # Commit the complete prefix, but retain the deferred assignment
             # inside the overlap so it is re-evaluated with the next read.
             next_committed_end = pending_offset + safe_local_maximum
         else:
+            event_budget.commit_from(pending_budget)
             result.merge(pending_scan)
         if result.blocking_rule is not None and not _continue_after_blocking:
             blocked = True
@@ -4314,6 +4387,25 @@ def _stream_secret_scan(
         if at_end:
             break
         retain_from = max(pending_offset, committed_end - overlap)
+        if diff_surface and pending:
+            local_committed_end = min(
+                len(pending),
+                max(0, committed_end - pending_offset),
+            )
+            hunk_context, _lower_bound = _bounded_diff_hunk_context_before(
+                pending,
+                local_committed_end,
+                prefix_context_complete=pending_offset == 0,
+                # A future event may begin inside the retained overlap. Keep
+                # the latest enclosing hunk only while it can still fall
+                # inside that event's bounded proof window.
+                lookbehind_bytes=MAX_SECRET_PREFIX_PROOF_BYTES + overlap,
+            )
+            if hunk_context is not None:
+                retain_from = min(
+                    retain_from,
+                    pending_offset + hunk_context.retention_start,
+                )
         pending = pending[retain_from - pending_offset :]
         pending_offset = retain_from
     return result

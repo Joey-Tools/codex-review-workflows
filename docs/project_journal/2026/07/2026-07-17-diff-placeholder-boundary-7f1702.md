@@ -33,6 +33,13 @@ the opposite-side replacement was longer than the trailing proof budget.
 - A matched `+++ ` or `--- ` record binds to a diff side only when bounded,
   charged lookbehind proves a hunk after the latest `diff --git` boundary;
   ambiguous file-header and incomplete-prefix cases fail closed.
+- Declaration reconstruction anchors hunk proof before the matched assignment,
+  even after a long opposite-side record, and subtracts only opposite bytes that
+  were already charged while skipping that record.
+- Streaming retention carries the latest enclosing hunk across logical chunks
+  only while it remains within the proof window plus overlap. That retained
+  hunk is a local complete boundary; an arbitrary truncated no-hunk prefix
+  cannot fall back to offset zero, and a later `diff --git` invalidates it.
 - A non-final streaming window carries the earliest deferred assignment
   boundary forward, commits only the complete prefix before it, and retains the
   match without merging provisional counts.
@@ -44,6 +51,12 @@ the opposite-side replacement was longer than the trailing proof budget.
 - Older provider-specific spans remain available to suppress a generic match
   that ends across the commit frontier without charging the provider event
   again.
+- Streaming scans spend event and prefix-proof budgets transactionally: a
+  complete scan commits its budget, while an incomplete scan discards its
+  provisional work and commits only the replayed safe prefix.
+- Transport-level short reads are coalesced into bounded logical chunks before
+  scanning, so stream fragmentation cannot cause repeated speculative scans;
+  negative sizes, early EOF, and oversized reads fail closed.
 - Security regressions keep scanning after opposite-side interleaving and
   continue to reject same-side or shared-context RHS continuations.
 
@@ -72,19 +85,32 @@ the opposite-side replacement was longer than the trailing proof budget.
 - Triple-prefix match regressions cover both hunk sides, real file headers,
   cross-file hunk reset, incomplete prefix context, bounded lookbehind, and an
   exhausted prefix-proof budget.
+- A 4 KiB long-opposite-record regression accepts with the exact charged proof
+  allowance, leaves zero bytes, and fails when the allowance is one byte short.
+- A pattern-order regression places two safe unquoted assignments before one
+  deferred quoted assignment; all three logical events are committed exactly
+  once, closing the provisional/replay budget bypass.
+- A one-byte transport regression coalesces thousands of short reads into three
+  logical scanner calls, commits the completed opposite-record proof exactly
+  once, and fails when its proof allowance is one byte short.
+- Direct/stream equivalence regressions cover the reviewer-reported 4,812-byte
+  deferred-hunk payload and an assignment first seen in a later logical chunk;
+  both accept exactly once, while the same retained hunk followed by a new
+  `diff --git` remains blocked on both paths.
 - A three-event provider-specific stream-boundary regression proves that a
   committed provider span is retained for generic suppression without being
   charged again in overlap.
 - The previously blocked frozen `review.diff` passed the patched scanner in a
   redacted local probe.
-- The complete synthetic-token module passed (`88` tests).
+- The complete synthetic-token module passed (`91` tests).
 - The complete review-orchestration suite passed on the refreshed master
-  baseline (`713` tests; `9` skipped).
+  baseline (`716` tests; `9` skipped).
 - Full runtime/test `ruff check` and Python `compileall` passed.
 - Synthetic-token catalog validation returned `public-example-v1` as valid.
 - Skill validation, project-journal validation, and `git diff --check` passed.
 - Independent read-only follow-up reviews of the partial-suffix, hunk-proof,
-  and event-accounting changes returned `No findings.`
+  event-accounting, transactional-budget, short-read, EOF, raw-occurrence, and
+  bounded hunk-retention changes returned `No findings.`
 
 ## Next Steps
 
