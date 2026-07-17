@@ -91,6 +91,19 @@ class ClaudeRefreshLockTest(unittest.TestCase):
             except OSError:
                 pass
 
+    def _join_started_workers(
+        self,
+        *workers: threading.Thread,
+    ) -> list[str]:
+        alive: list[str] = []
+        for worker in workers:
+            if worker.ident is None:
+                continue
+            worker.join(timeout=2.0)
+            if worker.is_alive():
+                alive.append(worker.name)
+        return alive
+
     def test_acquires_exact_primary_and_realpath_legacy_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             config = self._config_dir(pathlib.Path(temporary))
@@ -252,6 +265,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     protocol=self.PROTOCOL,
                     timeout_seconds=0,
                 )
+                release_thread: threading.Thread | None = None
                 try:
                     self.assertTrue(real_wait(heartbeat_entered, 2.0))
                     thread = lease._heartbeat_thread
@@ -294,7 +308,16 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                         self.assertIn(str(path), str(release_errors[0]))
                 finally:
                     allow_heartbeat_exit.set()
-                    self._operator_cleanup_inconclusive_lease(lease)
+                    alive_workers = self._join_started_workers(
+                        *(
+                            (release_thread,)
+                            if release_thread is not None
+                            else ()
+                        )
+                    )
+                    if not alive_workers:
+                        self._operator_cleanup_inconclusive_lease(lease)
+                    self.assertEqual(alive_workers, [])
 
     def test_blocked_assert_retains_locks_after_bounded_release(self) -> None:
         assert_entered = threading.Event()
@@ -395,7 +418,13 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 self.assertIn("release already started", str(assert_errors[0]))
             finally:
                 allow_assert_exit.set()
-                self._operator_cleanup_inconclusive_lease(lease)
+                alive_workers = self._join_started_workers(
+                    assert_thread,
+                    release_thread,
+                )
+                if not alive_workers:
+                    self._operator_cleanup_inconclusive_lease(lease)
+                self.assertEqual(alive_workers, [])
 
     def test_release_observes_late_heartbeat_failure(self) -> None:
         heartbeat_entered = threading.Event()
@@ -475,8 +504,120 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     self.assertTrue(all(not path.exists() for path in lease.paths))
                 finally:
                     allow_heartbeat_failure.set()
-                    if not lease.released:
+                    alive_workers = self._join_started_workers(release_thread)
+                    if not alive_workers and not lease.released:
                         self._operator_cleanup_inconclusive_lease(lease)
+                    self.assertEqual(alive_workers, [])
+
+    def test_release_observes_late_assert_failure(self) -> None:
+        assert_entered = threading.Event()
+        allow_assert_failure = threading.Event()
+        release_waiting_for_operation = threading.Event()
+        assert_finished = threading.Event()
+        release_finished = threading.Event()
+        assert_errors: list[BaseException] = []
+        release_errors: list[BaseException] = []
+        compromise = claude_refresh_lock.ClaudeRefreshLockCompromised(
+            "injected late assertion compromise"
+        )
+
+        class ObservedOperationLock:
+            def __init__(self) -> None:
+                self._lock = threading.Lock()
+
+            def __enter__(self) -> ObservedOperationLock:
+                self._lock.acquire()
+                return self
+
+            def __exit__(
+                self,
+                _error_type: type[BaseException] | None,
+                _error: BaseException | None,
+                _traceback: object,
+            ) -> None:
+                self._lock.release()
+
+            def acquire(self, *, timeout: float = -1.0) -> bool:
+                release_waiting_for_operation.set()
+                return self._lock.acquire(timeout=timeout)
+
+            def release(self) -> None:
+                self._lock.release()
+
+        def fail_assert_after_release() -> None:
+            assert_entered.set()
+            allow_assert_failure.wait(timeout=10.0)
+            raise compromise
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = self._config_dir(pathlib.Path(temporary)).resolve()
+            lease = claude_refresh_lock.acquire_claude_refresh_lock(
+                config,
+                protocol=self.PROTOCOL,
+                timeout_seconds=0,
+            )
+            heartbeat = lease._heartbeat_thread
+            assert heartbeat is not None
+            lease._heartbeat_stop.set()
+            heartbeat.join(timeout=2.0)
+            self.assertFalse(heartbeat.is_alive())
+            lease._operation_lock = ObservedOperationLock()
+
+            def assert_lease() -> None:
+                try:
+                    lease.assert_held()
+                except BaseException as error:
+                    assert_errors.append(error)
+                finally:
+                    assert_finished.set()
+
+            def release_lease() -> None:
+                try:
+                    lease.release()
+                except BaseException as error:
+                    release_errors.append(error)
+                finally:
+                    release_finished.set()
+
+            assert_thread = threading.Thread(
+                target=assert_lease,
+                name="test-refresh-lock-late-assert-failure",
+                daemon=True,
+            )
+            release_thread = threading.Thread(
+                target=release_lease,
+                name="test-refresh-lock-late-assert-release",
+                daemon=True,
+            )
+            try:
+                with mock.patch.object(
+                    lease,
+                    "_renew_and_assert",
+                    side_effect=fail_assert_after_release,
+                ):
+                    assert_thread.start()
+                    self.assertTrue(assert_entered.wait(timeout=2.0))
+                    release_thread.start()
+                    self.assertTrue(
+                        release_waiting_for_operation.wait(timeout=2.0)
+                    )
+                    allow_assert_failure.set()
+                    self.assertTrue(assert_finished.wait(timeout=2.0))
+                    self.assertTrue(release_finished.wait(timeout=2.0))
+
+                self.assertEqual(assert_errors, [compromise])
+                self.assertEqual(release_errors, [compromise])
+                self.assertTrue(lease.released)
+                self.assertTrue(all(not path.exists() for path in lease.paths))
+            finally:
+                allow_assert_failure.set()
+                alive_workers = self._join_started_workers(
+                    assert_thread,
+                    release_thread,
+                )
+                if not alive_workers and not lease.released:
+                    self._operator_cleanup_inconclusive_lease(lease)
+                self.assertEqual(alive_workers, [])
 
     def test_release_retries_cleanup_after_transient_heartbeat_join_timeout(
         self,

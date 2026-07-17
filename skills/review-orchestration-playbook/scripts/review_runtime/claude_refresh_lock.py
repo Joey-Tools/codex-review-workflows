@@ -1237,6 +1237,12 @@ class ClaudeRefreshLockLease:
             assert primary is not None
             raise primary
         try:
+            with self._state_lock:
+                final_operation_error = self._heartbeat_error
+            if final_operation_error is not None and all(
+                error is not final_operation_error for error in errors
+            ):
+                errors.append(final_operation_error)
             cleanup_diagnostic = self._mark_cleanup_inconclusive(
                 "Claude refresh-lock descriptor or lock cleanup did not complete"
             )
