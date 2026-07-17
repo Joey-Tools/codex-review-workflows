@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import binascii
 import hashlib
 import json
 import math
@@ -46,14 +47,15 @@ from .synthetic_tokens import (
 
 
 # Provider patterns with variable-length bodies capture a complete value through 512
-# bytes, then use a 513-byte prefix branch for oversized values. Keeping every event
-# end below this overlap prevents a match start from being discarded at a read boundary.
-STREAM_SCAN_OVERLAP = 8192
+# bytes, then use a 513-byte prefix branch for oversized values. PEM candidates need
+# a larger bounded window so a complete private-key block can be used as an identity.
+MAX_PEM_SECRET_BYTES = 32 * 1024
+STREAM_SCAN_OVERLAP = 64 * 1024
 AWS_SECRET_KEY_NAME_PATTERN = rb"(?i)aws_secret_access_key"
 AWS_SECRET_KEY_PATTERN = re.compile(
     AWS_SECRET_KEY_NAME_PATTERN
     + rb"\s{0,256}[:=]\s{0,256}['\"]?"
-    + rb"[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])"
+    + rb"(?P<aws_secret>[A-Za-z0-9/+=]{40})(?![A-Za-z0-9/+=])"
 )
 OVERSIZED_AWS_SECRET_KEY_GAP = re.compile(
     AWS_SECRET_KEY_NAME_PATTERN + rb"(?:\s{257}|\s{0,256}[:=]\s{257})"
@@ -67,16 +69,6 @@ OVERSIZED_JWT_PATTERN = re.compile(
     rb")"
 )
 SECRET_PATTERNS = (
-    (
-        "pgp-private-key",
-        re.compile(rb"-----BEGIN PGP PRIVATE[ ]KEY BLOCK-----"),
-    ),
-    (
-        "private-key",
-        re.compile(
-            rb"-----BEGIN (?:ENCRYPTED |RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"
-        ),
-    ),
     ("aws-access-key", re.compile(rb"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
     (
         "aws-secret-key",
@@ -124,6 +116,10 @@ SECRET_PATTERNS = (
             rb"[A-Za-z0-9_-]{8,2048}\b"
         ),
     ),
+)
+PEM_PRIVATE_KEY_BEGIN = re.compile(
+    rb"-----BEGIN (?P<label>PGP PRIVATE KEY BLOCK|"
+    rb"(?:ENCRYPTED |RSA |EC |DSA |OPENSSH )?PRIVATE KEY)-----"
 )
 SECRET_KEY_NAME_PATTERN = (
     rb"(?i)(?:api[_-]?(?:key|token)|access[_-]?token|auth[_-]?token|"
@@ -189,6 +185,8 @@ MAX_CHANGED_METADATA_BYTES = 128 * 1024 * 1024
 MAX_CHANGED_ENTRIES = 100_000
 MAX_CHANGED_BLOB_SCAN_BYTES = 512 * 1024 * 1024
 MAX_SECRET_SCAN_EVENTS = 1_000_000
+MAX_SECRET_REDUCTION_CANDIDATES = 128
+MAX_SECRET_REDUCTION_CANDIDATE_BYTES = 32 * 1024
 MAX_LEGACY_OCCURRENCE_EVENTS = 1_000_000
 MAX_LEGACY_SEARCH_BYTES = 16 * 1024 * 1024 * 1024
 MAX_LEGACY_CONTAINMENT_CHECKS = 10_000_000
@@ -201,7 +199,7 @@ MAX_SYNTHETIC_EVIDENCE_ENTRIES = 512
 SYNTHETIC_MANIFEST_NAME = "synthetic-secret-manifest.json"
 SYNTHETIC_PRIVATE_MANIFEST_NAME = "synthetic-secret-state.json"
 SYNTHETIC_CHANGED_EVIDENCE_NAME = "synthetic-changed-evidence.json"
-SYNTHETIC_MANIFEST_SCHEMA_VERSION = 2
+SYNTHETIC_MANIFEST_SCHEMA_VERSION = 3
 CONTROL_ARTIFACT_STATE_NAME = "control-artifact-state.json"
 CONTROL_ARTIFACT_SCHEMA_VERSION = 2
 CONTROL_ARTIFACT_SPECS: dict[str, tuple[int, int | None]] = {
@@ -297,12 +295,13 @@ class SecretScanResult:
     blocking_rule: str | None
     accepted_counts: Counter[AcceptedSyntheticValue]
     accepted_candidates: dict[AcceptedSyntheticValue, set[bytes]]
+    blocking_candidates: dict[bytes, set[str]]
     raw_occurrence_counts: Counter[AcceptedSyntheticValue]
     unembedded_occurrence_counts: Counter[AcceptedSyntheticValue]
 
     @classmethod
     def empty(cls) -> "SecretScanResult":
-        return cls(None, Counter(), {}, Counter(), Counter())
+        return cls(None, Counter(), {}, {}, Counter(), Counter())
 
     def merge(self, other: "SecretScanResult") -> None:
         if self.blocking_rule is None:
@@ -312,6 +311,22 @@ class SecretScanResult:
         self.unembedded_occurrence_counts.update(other.unembedded_occurrence_counts)
         for accepted, values in other.accepted_candidates.items():
             self.accepted_candidates.setdefault(accepted, set()).update(values)
+        for candidate, rules in other.blocking_candidates.items():
+            if (
+                candidate not in self.blocking_candidates
+                and len(self.blocking_candidates) >= MAX_SECRET_REDUCTION_CANDIDATES
+            ):
+                raise ReviewError(
+                    "external review content has too many secret-reduction candidates"
+                )
+            self.blocking_candidates.setdefault(candidate, set()).update(rules)
+        if (
+            sum(map(len, self.blocking_candidates))
+            > MAX_SECRET_REDUCTION_CANDIDATE_BYTES
+        ):
+            raise ReviewError(
+                "external review secret-reduction candidates exceed the byte limit"
+            )
 
 
 @dataclass
@@ -1308,6 +1323,7 @@ def _write_frozen_changed_paths(
                 "--name-only",
                 "-z",
                 "--no-renames",
+                "--diff-filter=ACMRTUXB",
                 base_sha,
                 head_sha,
             ),
@@ -1457,6 +1473,8 @@ def _scan_batch_blob(
     accepted_values: Iterable[AcceptedSyntheticValue] = (),
     raw_occurrence_values: Iterable[AcceptedSyntheticValue] = (),
     capture_accepted_candidates: bool = False,
+    capture_blocking_candidates: bool = False,
+    reduced_secret_values: frozenset[bytes] = frozenset(),
     accepted_index: AcceptedValueIndex | None = None,
     event_budget: SecretScanBudget | None = None,
     exact_index: ExactValueIndex | None = None,
@@ -1486,6 +1504,8 @@ def _scan_batch_blob(
         accepted_values=accepted_values,
         raw_occurrence_values=raw_occurrence_values,
         capture_accepted_candidates=capture_accepted_candidates,
+        capture_blocking_candidates=capture_blocking_candidates,
+        reduced_secret_values=reduced_secret_values,
         _accepted_index=accepted_index,
         _event_budget=event_budget,
         _exact_index=exact_index,
@@ -1505,6 +1525,8 @@ def _scan_frozen_tree_values(
     accepted_values: Iterable[AcceptedSyntheticValue],
     raw_occurrence_values: Iterable[AcceptedSyntheticValue] = (),
     capture_accepted_candidates: bool = False,
+    capture_blocking_candidates: bool = False,
+    reduced_secret_values: frozenset[bytes] = frozenset(),
     _continue_after_blocking: bool = False,
 ) -> SecretScanResult:
     accepted = tuple(accepted_values)
@@ -1577,6 +1599,8 @@ def _scan_frozen_tree_values(
                     accepted_values=accepted,
                     raw_occurrence_values=raw_occurrences,
                     capture_accepted_candidates=capture_accepted_candidates,
+                    capture_blocking_candidates=capture_blocking_candidates,
+                    reduced_secret_values=reduced_secret_values,
                     accepted_index=accepted_index,
                     event_budget=event_budget,
                     exact_index=exact_index,
@@ -1609,7 +1633,23 @@ def _scan_frozen_tree_values(
     return result
 
 
-def _legacy_count_manifest(
+def _secret_reduction_descriptor(
+    candidate: bytes,
+    rules: set[str],
+) -> AcceptedSyntheticValue:
+    digest = hashlib.sha256(candidate).hexdigest()
+    return AcceptedSyntheticValue(
+        kind="secret-reduction",
+        catalog_version="dynamic-v1",
+        identifier=f"secret-reduction-{digest}",
+        rule=sorted(rules)[0],
+        value=candidate,
+        value_sha256=digest,
+        value_length=len(candidate),
+    )
+
+
+def _secret_count_manifests(
     *,
     git_view: pathlib.Path,
     object_directory: pathlib.Path,
@@ -1617,24 +1657,62 @@ def _legacy_count_manifest(
     head_sha: str,
     catalog: SyntheticTokenCatalog,
     exemptions: tuple[LegacyExemption, ...],
-) -> dict[str, Any]:
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    tuple[AcceptedSyntheticValue, ...],
+]:
     legacy_accepted = accepted_legacy_values(catalog, exemptions)
     authoring_accepted = accepted_authoring_values(catalog)
     scan_accepted = authoring_accepted + legacy_accepted
-    if legacy_accepted:
+    discovery = _scan_frozen_tree_values(
+        git_view=git_view,
+        object_directory=object_directory,
+        commit=base_sha,
+        accepted_values=scan_accepted,
+        capture_blocking_candidates=True,
+        _continue_after_blocking=True,
+    )
+    discovery.merge(
+        _scan_frozen_tree_values(
+            git_view=git_view,
+            object_directory=object_directory,
+            commit=head_sha,
+            accepted_values=scan_accepted,
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+    )
+    if discovery.blocking_rule is not None:
+        raise ReviewError(
+            "secret-reduction proof cannot extract a stable exact candidate for "
+            f"scanner rule {discovery.blocking_rule}"
+        )
+    reduction_descriptors = tuple(
+        _secret_reduction_descriptor(candidate, rules)
+        for candidate, rules in sorted(
+            discovery.blocking_candidates.items(),
+            key=lambda item: (hashlib.sha256(item[0]).hexdigest(), item[0]),
+        )
+    )
+    count_values = legacy_accepted + reduction_descriptors
+    discovered_values = frozenset(discovery.blocking_candidates)
+    if count_values:
         base_scan = _scan_frozen_tree_values(
             git_view=git_view,
             object_directory=object_directory,
             commit=base_sha,
             accepted_values=scan_accepted,
-            raw_occurrence_values=legacy_accepted,
+            raw_occurrence_values=count_values,
+            reduced_secret_values=discovered_values,
         )
         head_scan = _scan_frozen_tree_values(
             git_view=git_view,
             object_directory=object_directory,
             commit=head_sha,
             accepted_values=scan_accepted,
-            raw_occurrence_values=legacy_accepted,
+            raw_occurrence_values=count_values,
+            reduced_secret_values=discovered_values,
         )
     else:
         base_scan = SecretScanResult.empty()
@@ -1684,13 +1762,49 @@ def _legacy_count_manifest(
             )
     if len(entries) > MAX_SYNTHETIC_EVIDENCE_ENTRIES:
         raise ReviewError("legacy synthetic fixture evidence has too many entries")
-    return {
+    allowed_reductions: list[AcceptedSyntheticValue] = []
+    reduction_entries: list[dict[str, Any]] = []
+    for descriptor in reduction_descriptors:
+        base_count = base_scan.raw_occurrence_counts[descriptor]
+        head_count = head_scan.raw_occurrence_counts[descriptor]
+        base_unembedded_count = base_scan.unembedded_occurrence_counts[descriptor]
+        head_unembedded_count = head_scan.unembedded_occurrence_counts[descriptor]
+        if head_count >= base_count or head_unembedded_count > base_unembedded_count:
+            continue
+        allowed_reductions.append(descriptor)
+        reduction_entries.append(
+            {
+                "base_count": base_count,
+                "base_unembedded_count": base_unembedded_count,
+                "head_count": head_count,
+                "head_unembedded_count": head_unembedded_count,
+                "rules": sorted(discovery.blocking_candidates[descriptor.value]),
+                "value_length": descriptor.value_length,
+                "value_sha256": descriptor.value_sha256,
+            }
+        )
+    if len(entries) + len(reduction_entries) > MAX_SYNTHETIC_EVIDENCE_ENTRIES:
+        raise ReviewError("secret count evidence has too many entries")
+    public_manifest = {
+        "base_ref": base_sha,
         "catalog_schema_version": catalog.schema_version,
         "entries": entries,
+        "head_ref": head_sha,
         "pool_version": catalog.pool_version,
         "schema_version": SYNTHETIC_MANIFEST_SCHEMA_VERSION,
+        "secret_reductions": reduction_entries,
         "selected_exemptions": [item.identifier for item in exemptions],
     }
+    private_manifest = dict(public_manifest)
+    if allowed_reductions:
+        private_manifest["secret_reduction_values"] = [
+            {
+                "value_base64": base64.b64encode(descriptor.value).decode("ascii"),
+                "value_sha256": descriptor.value_sha256,
+            }
+            for descriptor in allowed_reductions
+        ]
+    return public_manifest, private_manifest, tuple(allowed_reductions)
 
 
 def _all_catalog_sensitive_values(
@@ -1712,6 +1826,7 @@ def _write_changed_blob_findings(
     accepted_destination: pathlib.Path,
     accepted_values: Iterable[AcceptedSyntheticValue],
     evidence_sensitive_values: Iterable[AcceptedSyntheticValue],
+    reduced_secret_values: frozenset[bytes] = frozenset(),
 ) -> None:
     accepted = tuple(accepted_values)
     accepted_index = _index_accepted_values(accepted)
@@ -1786,6 +1901,7 @@ def _write_changed_blob_findings(
                         object_id=object_id,
                         scanned_bytes=scanned_bytes,
                         accepted_values=accepted,
+                        reduced_secret_values=reduced_secret_values,
                         accepted_index=accepted_index,
                         event_budget=event_budget,
                     )
@@ -2265,8 +2381,13 @@ def _load_legacy_manifest(
     container_dir: pathlib.Path,
     catalog: SyntheticTokenCatalog,
     expected_artifact: ControlArtifactEvidence,
+    expected_base_ref: str,
+    expected_head_ref: str,
 ) -> tuple[
     tuple[LegacyExemption, ...],
+    tuple[AcceptedSyntheticValue, ...],
+    dict[AcceptedSyntheticValue, tuple[int, int, int, int]],
+    list[dict[str, Any]],
     tuple[AcceptedSyntheticValue, ...],
     dict[AcceptedSyntheticValue, tuple[int, int, int, int]],
     list[dict[str, Any]],
@@ -2274,7 +2395,7 @@ def _load_legacy_manifest(
     manifest_path = control_dir / SYNTHETIC_MANIFEST_NAME
     private_manifest_path = container_dir / SYNTHETIC_PRIVATE_MANIFEST_NAME
     if not manifest_path.exists() and not private_manifest_path.exists():
-        return (), (), {}, []
+        return (), (), {}, [], (), {}, []
     if not manifest_path.exists() or not private_manifest_path.exists():
         raise ReviewError("synthetic secret helper-private state is missing")
     workspace_manifest = _read_bounded_json(
@@ -2282,19 +2403,24 @@ def _load_legacy_manifest(
         label="synthetic secret manifest",
         expected_artifact=expected_artifact,
     )
-    manifest = _read_bounded_json(
+    private_manifest = _read_bounded_json(
         private_manifest_path,
         label="synthetic secret helper-private state",
     )
+    raw_reduction_values = private_manifest.pop("secret_reduction_values", [])
+    manifest = private_manifest
     if workspace_manifest != manifest:
         raise ReviewError(
             "synthetic secret manifest does not match helper-private state"
         )
     if set(manifest) != {
+        "base_ref",
         "catalog_schema_version",
         "entries",
+        "head_ref",
         "pool_version",
         "schema_version",
+        "secret_reductions",
         "selected_exemptions",
     }:
         raise ReviewError("synthetic secret manifest fields are invalid")
@@ -2304,8 +2430,12 @@ def _load_legacy_manifest(
         or type(manifest["catalog_schema_version"]) is not int
         or manifest["catalog_schema_version"] != catalog.schema_version
         or manifest["pool_version"] != catalog.pool_version
+        or manifest["base_ref"] != expected_base_ref
+        or manifest["head_ref"] != expected_head_ref
     ):
-        raise ReviewError("synthetic secret manifest catalog version is invalid")
+        raise ReviewError(
+            "synthetic secret manifest version or review range is invalid"
+        )
     selected_ids = manifest["selected_exemptions"]
     if not isinstance(selected_ids, list) or not all(
         isinstance(item, str) for item in selected_ids
@@ -2384,7 +2514,130 @@ def _load_legacy_manifest(
             raise ReviewError(
                 f"selected synthetic secret exemption is unused: {exemption.identifier}"
             )
-    return exemptions, accepted, counts, evidence
+    raw_reductions = manifest["secret_reductions"]
+    if (
+        not isinstance(raw_reductions, list)
+        or len(raw_entries) + len(raw_reductions) > MAX_SYNTHETIC_EVIDENCE_ENTRIES
+        or len(raw_reductions) > MAX_SECRET_REDUCTION_CANDIDATES
+        or not isinstance(raw_reduction_values, list)
+        or len(raw_reduction_values) > MAX_SECRET_REDUCTION_CANDIDATES
+    ):
+        raise ReviewError("secret-reduction manifest entries are invalid")
+    private_values: dict[str, bytes] = {}
+    for raw_private in raw_reduction_values:
+        if not isinstance(raw_private, dict) or set(raw_private) != {
+            "value_base64",
+            "value_sha256",
+        }:
+            raise ReviewError("secret-reduction helper-private entry is malformed")
+        digest = raw_private["value_sha256"]
+        encoded = raw_private["value_base64"]
+        if (
+            not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or not isinstance(encoded, str)
+        ):
+            raise ReviewError("secret-reduction helper-private entry is inconsistent")
+        try:
+            encoded_bytes = encoded.encode("ascii")
+            candidate = base64.b64decode(encoded_bytes, validate=True)
+        except (UnicodeEncodeError, binascii.Error, ValueError) as error:
+            raise ReviewError(
+                "secret-reduction helper-private entry is not canonical Base64"
+            ) from error
+        if (
+            base64.b64encode(candidate) != encoded_bytes
+            or not candidate
+            or len(candidate) > MAX_PEM_SECRET_BYTES
+            or hashlib.sha256(candidate).hexdigest() != digest
+            or digest in private_values
+        ):
+            raise ReviewError("secret-reduction helper-private entry is inconsistent")
+        private_values[digest] = candidate
+    reduction_rules = {rule for rule, _pattern in SECRET_PATTERNS} | {
+        "generic-secret-assignment",
+        "pgp-private-key",
+        "private-key",
+    }
+    reduction_values: list[AcceptedSyntheticValue] = []
+    reduction_counts: dict[AcceptedSyntheticValue, tuple[int, int, int, int]] = {}
+    reduction_evidence: list[dict[str, Any]] = []
+    seen_digests: set[str] = set()
+    for raw_entry in raw_reductions:
+        if not isinstance(raw_entry, dict) or set(raw_entry) != {
+            "base_count",
+            "base_unembedded_count",
+            "head_count",
+            "head_unembedded_count",
+            "rules",
+            "value_length",
+            "value_sha256",
+        }:
+            raise ReviewError("secret-reduction manifest entry is malformed")
+        digest = raw_entry["value_sha256"]
+        candidate = private_values.get(digest)
+        rules = raw_entry["rules"]
+        base_count = raw_entry["base_count"]
+        head_count = raw_entry["head_count"]
+        base_unembedded_count = raw_entry["base_unembedded_count"]
+        head_unembedded_count = raw_entry["head_unembedded_count"]
+        if (
+            not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or digest in seen_digests
+            or candidate is None
+            or type(raw_entry["value_length"]) is not int
+            or raw_entry["value_length"] != len(candidate)
+            or not isinstance(rules, list)
+            or not rules
+            or rules != sorted(set(rules))
+            or not all(
+                isinstance(rule, str) and rule in reduction_rules for rule in rules
+            )
+            or type(base_count) is not int
+            or type(head_count) is not int
+            or type(base_unembedded_count) is not int
+            or type(head_unembedded_count) is not int
+            or base_count <= 0
+            or head_count < 0
+            or head_count >= base_count
+            or base_unembedded_count < 0
+            or head_unembedded_count < 0
+            or head_unembedded_count > base_unembedded_count
+            or base_unembedded_count > base_count
+            or head_unembedded_count > head_count
+        ):
+            raise ReviewError("secret-reduction manifest entry is inconsistent")
+        seen_digests.add(digest)
+        descriptor = _secret_reduction_descriptor(candidate, set(rules))
+        reduction_values.append(descriptor)
+        reduction_counts[descriptor] = (
+            base_count,
+            head_count,
+            base_unembedded_count,
+            head_unembedded_count,
+        )
+        reduction_evidence.append(dict(raw_entry))
+    if seen_digests != set(private_values):
+        raise ReviewError(
+            "secret-reduction manifest does not match helper-private values"
+        )
+    if (
+        sum(len(value) for value in private_values.values())
+        > MAX_SECRET_REDUCTION_CANDIDATE_BYTES
+    ):
+        raise ReviewError(
+            "secret-reduction helper-private values exceed the byte limit"
+        )
+    return (
+        exemptions,
+        accepted,
+        counts,
+        evidence,
+        tuple(reduction_values),
+        reduction_counts,
+        reduction_evidence,
+    )
 
 
 def _load_changed_synthetic_evidence(
@@ -2474,15 +2727,35 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     )
     _inspect_control_directory(control_dir, expected=control_state.directory)
     control_artifacts = control_state.artifacts
-    _exemptions, legacy_values, legacy_counts, legacy_evidence = _load_legacy_manifest(
+    (
+        _exemptions,
+        legacy_values,
+        legacy_counts,
+        legacy_evidence,
+        reduction_values,
+        reduction_counts,
+        reduction_evidence,
+    ) = _load_legacy_manifest(
         control_dir=control_dir,
         container_dir=review.container_dir,
         catalog=catalog,
         expected_artifact=control_artifacts[SYNTHETIC_MANIFEST_NAME],
+        expected_base_ref=review.base_ref,
+        expected_head_ref=review.head_ref,
     )
     authoring_values = accepted_authoring_values(catalog)
     accepted_values = authoring_values + legacy_values
-    evidence_sensitive_values = _all_catalog_sensitive_values(catalog)
+    evidence_sensitive_values = (
+        _all_catalog_sensitive_values(catalog) + reduction_values
+    )
+    reduced_secret_values = frozenset(
+        descriptor.value
+        for descriptor in reduction_values
+        if descriptor.value is not None
+    )
+    counted_values = legacy_values + reduction_values
+    expected_counts = dict(legacy_counts)
+    expected_counts.update(reduction_counts)
     changed_accepted_evidence = _load_changed_synthetic_evidence(
         control_dir=control_dir,
         accepted_values=accepted_values,
@@ -2490,8 +2763,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
         expected_artifact=control_artifacts[SYNTHETIC_CHANGED_EVIDENCE_NAME],
     )
     accepted_index = _index_accepted_values(accepted_values)
-    authoring_index = _index_accepted_values(authoring_values)
-    legacy_exact_index = _index_exact_values(legacy_values)
+    counted_exact_index = _index_exact_values(counted_values)
     event_budget = SecretScanBudget.default()
     occurrence_budget = LegacyOccurrenceBudget.default()
     snapshot_byte_budget = FileScanByteBudget.snapshot()
@@ -2501,8 +2773,8 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     accepted_evidence_counts: Counter[tuple[AcceptedSyntheticValue, str, str, str]] = (
         Counter()
     )
-    frozen_head_legacy_counts: Counter[AcceptedSyntheticValue] = Counter()
-    frozen_head_legacy_unembedded_counts: Counter[AcceptedSyntheticValue] = Counter()
+    frozen_head_counts: Counter[AcceptedSyntheticValue] = Counter()
+    frozen_head_unembedded_counts: Counter[AcceptedSyntheticValue] = Counter()
 
     def record_finding(value: str) -> None:
         nonlocal sensitive_finding_count
@@ -2703,10 +2975,11 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
             target_scan = _scan_secret_value(
                 raw_target,
                 accepted_values=accepted_values,
-                raw_occurrence_values=legacy_values,
+                raw_occurrence_values=counted_values,
+                reduced_secret_values=reduced_secret_values,
                 _accepted_index=accepted_index,
                 _event_budget=event_budget,
-                _exact_index=legacy_exact_index,
+                _exact_index=counted_exact_index,
                 _occurrence_budget=occurrence_budget,
             )
             record_scan(
@@ -2717,8 +2990,8 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
                 finding_label=f"{path_display} -> <redacted symlink target>",
                 diagnostic_surface="symlink-target",
             )
-            frozen_head_legacy_counts.update(target_scan.raw_occurrence_counts)
-            frozen_head_legacy_unembedded_counts.update(
+            frozen_head_counts.update(target_scan.raw_occurrence_counts)
+            frozen_head_unembedded_counts.update(
                 target_scan.unembedded_occurrence_counts
             )
             continue
@@ -2727,10 +3000,11 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
         scan = _file_secret_scan(
             candidate,
             accepted_values=accepted_values,
-            raw_occurrence_values=legacy_values,
+            raw_occurrence_values=counted_values,
+            reduced_secret_values=reduced_secret_values,
             accepted_index=accepted_index,
             event_budget=event_budget,
-            exact_index=legacy_exact_index,
+            exact_index=counted_exact_index,
             occurrence_budget=occurrence_budget,
             max_bytes=MAX_SNAPSHOT_BLOB_BYTES,
             byte_budget=snapshot_byte_budget,
@@ -2743,62 +3017,47 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
             path_bytes=raw_relative,
             finding_label=path_display,
         )
-        frozen_head_legacy_counts.update(scan.raw_occurrence_counts)
-        frozen_head_legacy_unembedded_counts.update(scan.unembedded_occurrence_counts)
+        frozen_head_counts.update(scan.raw_occurrence_counts)
+        frozen_head_unembedded_counts.update(scan.unembedded_occurrence_counts)
 
     for accepted, (
         _base_count,
         expected_head_count,
         _base_unembedded_count,
         expected_head_unembedded_count,
-    ) in legacy_counts.items():
-        actual_head_count = frozen_head_legacy_counts[accepted]
+    ) in expected_counts.items():
+        actual_head_count = frozen_head_counts[accepted]
         if actual_head_count != expected_head_count:
             raise ReviewError(
-                "frozen head legacy synthetic fixture count changed after preparation "
+                "frozen head secret count changed after preparation "
                 f"for {accepted.identifier}: expected={expected_head_count}, "
                 f"actual={actual_head_count}"
             )
-        actual_head_unembedded_count = frozen_head_legacy_unembedded_counts[accepted]
+        actual_head_unembedded_count = frozen_head_unembedded_counts[accepted]
         if actual_head_unembedded_count != expected_head_unembedded_count:
             raise ReviewError(
-                "frozen head legacy synthetic fixture unembedded count changed "
+                "frozen head secret unembedded count changed "
                 f"after preparation for {accepted.identifier}: "
                 f"expected={expected_head_unembedded_count}, "
                 f"actual={actual_head_unembedded_count}"
             )
 
-    diff_scan = _file_secret_scan(
+    with _secure_file_reader(
         review.diff_file,
-        accepted_values=accepted_values,
-        diff_surface=True,
-        accepted_index=accepted_index,
-        event_budget=event_budget,
+        label="external review diff",
         max_bytes=MAX_DIFF_BYTES,
         expected_artifact=control_artifacts["review.diff"],
-    )
-    record_scan(
-        diff_scan,
-        surface="frozen-diff",
-        side="range",
-        path_bytes=b".codex-review/review.diff",
-        finding_label="review.diff",
-    )
-    prompt_scan = _file_secret_scan(
+    ) as (diff_handle, _diff_metadata):
+        while diff_handle.read(64 * 1024):
+            pass
+    with _secure_file_reader(
         review.prompt_file,
-        accepted_values=authoring_values,
-        accepted_index=authoring_index,
-        event_budget=event_budget,
+        label="external review prompt",
         max_bytes=MAX_REVIEW_PROMPT_BYTES,
         expected_artifact=control_artifacts["review.prompt"],
-    )
-    record_scan(
-        prompt_scan,
-        surface="review-prompt",
-        side="generated",
-        path_bytes=b".codex-review/review.prompt",
-        finding_label="review.prompt",
-    )
+    ) as (prompt_handle, _prompt_metadata):
+        while prompt_handle.read(64 * 1024):
+            pass
     if sensitive_finding_count:
         summary = ", ".join(sensitive_findings)
         if sensitive_finding_count > len(sensitive_findings):
@@ -2835,6 +3094,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
             "catalog_schema_version": catalog.schema_version,
             "legacy_counts": legacy_evidence,
             "pool_version": catalog.pool_version,
+            "secret_reductions": reduction_evidence,
         }
     }
     encoded_evidence = json.dumps(
@@ -2848,7 +3108,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     complete_preflight_evidence = {
         "review_range": f"{review.base_ref}..{review.head_ref}",
         "scope": "frozen tracked workspace, diff, and review prompt",
-        "status": "sensitive-content and escaping-symlink checks passed",
+        "status": "secret-delta and escaping-symlink checks passed",
     }
     complete_preflight_evidence.update(evidence)
     _reject_raw_values_in_evidence(
@@ -2910,6 +3170,8 @@ def _file_secret_scan(
     accepted_values: Iterable[AcceptedSyntheticValue] = (),
     raw_occurrence_values: Iterable[AcceptedSyntheticValue] = (),
     capture_accepted_candidates: bool = False,
+    capture_blocking_candidates: bool = False,
+    reduced_secret_values: frozenset[bytes] = frozenset(),
     diff_surface: bool = False,
     accepted_index: AcceptedValueIndex | None = None,
     event_budget: SecretScanBudget | None = None,
@@ -2919,6 +3181,7 @@ def _file_secret_scan(
     byte_budget: FileScanByteBudget | None = None,
     expected_artifact: ControlArtifactEvidence | None = None,
     diagnostic_path: str | None = None,
+    _continue_after_blocking: bool = False,
 ) -> SecretScanResult:
     path_display = (
         diagnostic_path
@@ -2939,11 +3202,14 @@ def _file_secret_scan(
             accepted_values=accepted_values,
             raw_occurrence_values=raw_occurrence_values,
             capture_accepted_candidates=capture_accepted_candidates,
+            capture_blocking_candidates=capture_blocking_candidates,
+            reduced_secret_values=reduced_secret_values,
             diff_surface=diff_surface,
             _accepted_index=accepted_index,
             _event_budget=event_budget,
             _exact_index=exact_index,
             _occurrence_budget=occurrence_budget,
+            _continue_after_blocking=_continue_after_blocking,
         )
 
 
@@ -3712,6 +3978,35 @@ def _unquoted_assignment_may_accept(
         return starts_named_assignment()
 
 
+def _provider_candidate_is_prefix_only(rule: str, candidate: bytes) -> bool:
+    prefix_lengths = {
+        "anthropic-key": (len(b"sk-ant-"),),
+        "openai-key": (len(b"sk-"), len(b"sk-proj-")),
+        "github-token": (
+            len(b"ghp_"),
+            len(b"gho_"),
+            len(b"ghu_"),
+            len(b"ghs_"),
+            len(b"ghr_"),
+            len(b"github_pat_"),
+        ),
+        "gitlab-token": (len(b"glpat-"),),
+        "pypi-token": (len(b"pypi-"),),
+        "slack-token": (
+            len(b"xoxb-"),
+            len(b"xoxa-"),
+            len(b"xoxp-"),
+            len(b"xoxr-"),
+            len(b"xoxs-"),
+        ),
+        "stripe-live-key": (len(b"sk_live_"),),
+    }
+    return any(
+        len(candidate) == prefix_length + 513
+        for prefix_length in prefix_lengths.get(rule, ())
+    )
+
+
 def _iter_secret_events(
     value: bytes,
     *,
@@ -3720,11 +4015,39 @@ def _iter_secret_events(
     _event_budget: SecretScanBudget | None = None,
 ) -> Iterator[tuple[str, bytes | None, int, bool, int | None, int | None]]:
     event_budget = _event_budget or SecretScanBudget.default()
+    for match in PEM_PRIVATE_KEY_BEGIN.finditer(value):
+        event_budget.consume()
+        start = match.start()
+        label = match.group("label")
+        rule = "pgp-private-key" if label == b"PGP PRIVATE KEY BLOCK" else "private-key"
+        end_marker = b"-----END " + label + b"-----"
+        search_end = min(len(value), start + MAX_PEM_SECRET_BYTES)
+        end_start = value.find(end_marker, match.end(), search_end)
+        if end_start >= 0:
+            candidate_end = end_start + len(end_marker)
+            yield (
+                rule,
+                value[start:candidate_end],
+                candidate_end,
+                True,
+                start,
+                candidate_end,
+            )
+            continue
+        if len(value) - start >= MAX_PEM_SECRET_BYTES:
+            yield rule, None, start + MAX_PEM_SECRET_BYTES, False, None, None
+        else:
+            yield rule, None, len(value), False, None, None
     for rule, pattern in SECRET_PATTERNS:
         for match in pattern.finditer(value):
             event_budget.consume()
-            start, candidate_end = match.span(0)
-            yield rule, match.group(0), match.end(), True, start, candidate_end
+            candidate_group: str | int = "aws_secret" if rule == "aws-secret-key" else 0
+            start, candidate_end = match.span(candidate_group)
+            candidate = match.group(candidate_group)
+            if _provider_candidate_is_prefix_only(rule, candidate):
+                yield rule, None, match.end(), False, None, None
+            else:
+                yield rule, candidate, match.end(), True, start, candidate_end
     for rule, pattern in (
         ("aws-secret-key", OVERSIZED_AWS_SECRET_KEY_GAP),
         ("jwt", OVERSIZED_JWT_PATTERN),
@@ -3919,6 +4242,8 @@ def _scan_secret_value(
     minimum_end: int = 0,
     maximum_end: int | None = None,
     capture_accepted_candidates: bool = False,
+    capture_blocking_candidates: bool = False,
+    reduced_secret_values: frozenset[bytes] = frozenset(),
     diff_surface: bool = False,
     prefix_context_complete: bool = True,
     _accepted_index: AcceptedValueIndex | None = None,
@@ -3927,9 +4252,12 @@ def _scan_secret_value(
     _occurrence_budget: LegacyOccurrenceBudget | None = None,
     _continue_after_blocking: bool = False,
 ) -> SecretScanResult:
-    if _continue_after_blocking and not capture_accepted_candidates:
+    if _continue_after_blocking and not (
+        capture_accepted_candidates or capture_blocking_candidates
+    ):
         raise ReviewError(
-            "exhaustive secret scanning requires accepted-candidate capture"
+            "exhaustive secret scanning requires accepted-candidate capture "
+            "or blocking-candidate capture"
         )
     result = SecretScanResult.empty()
     exact_index = _exact_index or _index_exact_values(raw_occurrence_values)
@@ -3946,23 +4274,7 @@ def _scan_secret_value(
     upper = len(value) if maximum_end is None else maximum_end
     accepted_index = _accepted_index or _index_accepted_values(accepted_values)
     event_budget = _event_budget or SecretScanBudget.default()
-    accepted_specific_spans: set[tuple[int, int, bytes]] = set()
-    accepted_specific_rules = {
-        rule for rule in accepted_index.rules if rule != "generic-secret-assignment"
-    }
-    for rule, pattern in SECRET_PATTERNS:
-        if rule not in accepted_specific_rules:
-            continue
-        for match in pattern.finditer(value):
-            event_budget.consume()
-            candidate = match.group(0)
-            if _matching_accepted_values(
-                rule=rule,
-                candidate=candidate,
-                accepted_index=accepted_index,
-            ):
-                start, candidate_end = match.span(0)
-                accepted_specific_spans.add((start, candidate_end, candidate))
+    specific_spans: set[tuple[int, int, bytes]] = set()
 
     for rule, candidate, end, may_accept, start, candidate_end in _iter_secret_events(
         value,
@@ -3973,12 +4285,20 @@ def _scan_secret_value(
         if not minimum_end < end <= upper:
             continue
         if (
+            rule != "generic-secret-assignment"
+            and may_accept
+            and candidate is not None
+            and start is not None
+            and candidate_end is not None
+        ):
+            specific_spans.add((start, candidate_end, candidate))
+        if (
             rule == "generic-secret-assignment"
             and may_accept
             and candidate is not None
             and start is not None
             and candidate_end is not None
-            and (start, candidate_end, candidate) in accepted_specific_spans
+            and (start, candidate_end, candidate) in specific_spans
         ):
             continue
         matches = (
@@ -3995,6 +4315,26 @@ def _scan_secret_value(
             result.accepted_counts[accepted] += 1
             if capture_accepted_candidates:
                 result.accepted_candidates.setdefault(accepted, set()).add(candidate)
+        elif (
+            may_accept and candidate is not None and candidate in reduced_secret_values
+        ):
+            continue
+        elif capture_blocking_candidates and may_accept and candidate is not None:
+            if (
+                candidate not in result.blocking_candidates
+                and len(result.blocking_candidates) >= MAX_SECRET_REDUCTION_CANDIDATES
+            ):
+                raise ReviewError(
+                    "external review content has too many secret-reduction candidates"
+                )
+            result.blocking_candidates.setdefault(candidate, set()).add(rule)
+            if (
+                sum(map(len, result.blocking_candidates))
+                > MAX_SECRET_REDUCTION_CANDIDATE_BYTES
+            ):
+                raise ReviewError(
+                    "external review secret-reduction candidates exceed the byte limit"
+                )
         elif result.blocking_rule is None:
             result.blocking_rule = rule
             if not _continue_after_blocking:
@@ -4034,6 +4374,8 @@ def _stream_secret_scan(
     accepted_values: Iterable[AcceptedSyntheticValue] = (),
     raw_occurrence_values: Iterable[AcceptedSyntheticValue] = (),
     capture_accepted_candidates: bool = False,
+    capture_blocking_candidates: bool = False,
+    reduced_secret_values: frozenset[bytes] = frozenset(),
     diff_surface: bool = False,
     _accepted_index: AcceptedValueIndex | None = None,
     _event_budget: SecretScanBudget | None = None,
@@ -4123,6 +4465,8 @@ def _stream_secret_scan(
                 minimum_end=local_minimum,
                 maximum_end=local_maximum,
                 capture_accepted_candidates=capture_accepted_candidates,
+                capture_blocking_candidates=capture_blocking_candidates,
+                reduced_secret_values=reduced_secret_values,
                 diff_surface=diff_surface,
                 prefix_context_complete=pending_offset == 0,
                 _accepted_index=accepted_index,
@@ -4413,12 +4757,12 @@ def prepare_workspace(
                 raise ReviewError(
                     f"the frozen {label} uses the reserved top-level .codex-review path"
                 )
-            _reject_legacy_values_in_frozen_tree_paths(
-                git_view=git_view,
-                object_directory=object_directory,
-                commit=commit,
-                legacy_values=catalog_legacy_values,
-            )
+        _reject_legacy_values_in_frozen_tree_paths(
+            git_view=git_view,
+            object_directory=object_directory,
+            commit=head_sha,
+            legacy_values=catalog_legacy_values,
+        )
         _materialize_frozen_tree(
             git_view=git_view,
             object_directory=object_directory,
@@ -4433,7 +4777,19 @@ def prepare_workspace(
                 "the frozen head uses the reserved top-level .codex-review path"
             )
         control_dir.mkdir(mode=0o700)
-        synthetic_manifest = _legacy_count_manifest(
+        diff_file = control_dir / "review.diff"
+        _write_frozen_diff(
+            git_view=git_view,
+            object_directory=object_directory,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            destination=diff_file,
+        )
+        (
+            synthetic_manifest,
+            private_synthetic_manifest,
+            secret_reductions,
+        ) = _secret_count_manifests(
             git_view=git_view,
             object_directory=object_directory,
             base_sha=base_sha,
@@ -4441,15 +4797,16 @@ def prepare_workspace(
             catalog=catalog,
             exemptions=selected_exemptions,
         )
+        manifest_sensitive_values = evidence_sensitive_values + secret_reductions
         _write_bounded_json(
             control_dir / SYNTHETIC_MANIFEST_NAME,
             synthetic_manifest,
             label="synthetic secret manifest",
-            accepted_values=evidence_sensitive_values,
+            accepted_values=manifest_sensitive_values,
         )
         _write_bounded_json(
             container / SYNTHETIC_PRIVATE_MANIFEST_NAME,
-            synthetic_manifest,
+            private_synthetic_manifest,
             label="synthetic secret helper-private state",
             accepted_values=evidence_sensitive_values,
         )
@@ -4471,14 +4828,11 @@ def prepare_workspace(
             accepted_destination=control_dir / SYNTHETIC_CHANGED_EVIDENCE_NAME,
             accepted_values=accepted_values,
             evidence_sensitive_values=evidence_sensitive_values,
-        )
-        diff_file = control_dir / "review.diff"
-        _write_frozen_diff(
-            git_view=git_view,
-            object_directory=object_directory,
-            base_sha=base_sha,
-            head_sha=head_sha,
-            destination=diff_file,
+            reduced_secret_values=frozenset(
+                descriptor.value
+                for descriptor in secret_reductions
+                if descriptor.value is not None
+            ),
         )
         shutil.rmtree(git_view)
 

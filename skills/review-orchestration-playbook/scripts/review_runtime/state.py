@@ -475,7 +475,7 @@ def _should_retain_fallback_workspace(
     return (
         preflight.get("review_range") == f"{review.base_ref}..{review.head_ref}"
         and preflight.get("status")
-        == "sensitive-content and escaping-symlink checks passed"
+        == "secret-delta and escaping-symlink checks passed"
     )
 
 

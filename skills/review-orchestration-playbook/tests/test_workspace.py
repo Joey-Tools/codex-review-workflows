@@ -44,6 +44,37 @@ def oauth_refresh_credential() -> str:
     return "1//" + "".join(("oauth", "-refresh", "-credential", "-value"))
 
 
+def unregistered_generic_credential() -> bytes:
+    return b"".join((b"Critical", b"Credential", b"Alpha", b"9!"))
+
+
+def second_unregistered_generic_credential() -> bytes:
+    return b"".join((b"Critical", b"Credential", b"Bravo", b"8!"))
+
+
+def unregistered_jwt_credential() -> bytes:
+    return b".".join((b"eyJ" + b"A" * 12, b"B" * 16, b"C" * 16))
+
+
+def unregistered_provider_credential() -> bytes:
+    return b"".join((b"sk", b"-", b"P" * 40))
+
+
+def unregistered_private_key() -> bytes:
+    label = b"".join((b"PRIVATE", b" KEY"))
+    return b"".join(
+        (
+            b"-----BEGIN ",
+            label,
+            b"-----\n",
+            b"Q" * 64,
+            b"\n-----END ",
+            label,
+            b"-----",
+        )
+    )
+
+
 def prepare_workspace(**kwargs):
     captured = []
     review = _prepare_workspace(ownership_handoff=captured.append, **kwargs)
@@ -86,6 +117,72 @@ class WorkspaceTest(unittest.TestCase):
             if review.workspace_root.exists():
                 cleanup_workspace(review, keep_container=False)
         self.temporary.cleanup()
+
+    def commit_bytes(self, relative: str, payload: bytes, message: str) -> str:
+        destination = self.repo / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(payload)
+        git(self.repo, "add", relative)
+        git(self.repo, "commit", "-m", message)
+        return git(self.repo, "rev-parse", "HEAD")
+
+    def remove_and_commit(self, relative: str, message: str) -> str:
+        git(self.repo, "rm", relative)
+        git(self.repo, "commit", "-m", message)
+        return git(self.repo, "rev-parse", "HEAD")
+
+    def prepare_range(self, base_ref: str, head_ref: str):
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=base_ref,
+            head_ref=head_ref,
+        )
+        self.reviews.append(review)
+        return review
+
+    def assert_control_evidence_omits(
+        self,
+        review,
+        raw_value: bytes,
+    ) -> None:
+        control_dir = review.workspace_root / ".codex-review"
+        artifacts = [
+            path
+            for path in control_dir.rglob("*")
+            if path.is_file() and path != review.diff_file
+        ]
+        artifacts.extend(
+            path for path in review.container_dir.iterdir() if path.is_file()
+        )
+        self.assertTrue(artifacts)
+        for artifact in artifacts:
+            with self.subTest(control_artifact=artifact.name):
+                self.assertNotIn(raw_value, artifact.read_bytes())
+
+    def assert_diff_retains_raw_deletion(self, review, raw_value: bytes) -> None:
+        diff = review.diff_file.read_bytes()
+        deleted_lines = [line for line in diff.splitlines() if line.startswith(b"-")]
+        for line in raw_value.splitlines():
+            self.assertTrue(
+                any(line in deleted_line for deleted_line in deleted_lines),
+                f"raw deletion line is absent from review.diff: {line!r}",
+            )
+        self.assertNotIn(b"<redacted", diff)
+
+    def assert_external_review_blocked(
+        self,
+        *,
+        base_ref: str,
+        head_ref: str,
+        rule: str,
+    ) -> None:
+        try:
+            review = self.prepare_range(base_ref, head_ref)
+        except ReviewError as error:
+            self.assertRegex(str(error), rule)
+            return
+        with self.assertRaisesRegex(ReviewError, rule):
+            validate_external_workspace(review)
 
     def test_git_environment_disables_lazy_fetch_and_prompts(self) -> None:
         environment = workspace_runtime._git_environment()
@@ -1110,8 +1207,10 @@ class WorkspaceTest(unittest.TestCase):
             diagnostic,
         )
 
-    def test_deleted_binary_secret_is_detected_from_base_blob(self) -> None:
-        secret = ("sk-" + "A" * 40).encode()
+    def test_deleted_binary_secret_is_allowed_without_control_evidence_leak(
+        self,
+    ) -> None:
+        secret = unregistered_provider_credential()
         binary = self.repo / "opaque.bin"
         binary.write_bytes(b"\0binary\0" + secret + b"\0")
         git(self.repo, "add", "opaque.bin")
@@ -1121,18 +1220,12 @@ class WorkspaceTest(unittest.TestCase):
         git(self.repo, "commit", "-m", "Remove binary credential")
         clean_head = git(self.repo, "rev-parse", "HEAD")
 
-        review = prepare_workspace(
-            repo=self.repo,
-            base_ref=secret_base,
-            head_ref=clean_head,
-        )
-        self.reviews.append(review)
-        findings = (
-            review.workspace_root / ".codex-review/changed-blob-findings.z"
-        ).read_bytes()
-        self.assertNotIn(secret, findings)
-        with self.assertRaisesRegex(ReviewError, "opaque.bin.*base-blob"):
-            validate_external_workspace(review)
+        review = self.prepare_range(secret_base, clean_head)
+        validate_external_workspace(review)
+
+        diff = review.diff_file.read_bytes()
+        self.assertIn(b"GIT binary patch", diff)
+        self.assert_control_evidence_omits(review, secret)
 
     def test_oauth_refresh_token_is_detected_in_head_content(self) -> None:
         credential = pathlib.Path(self.temporary.name) / "oauth.json"
@@ -1142,10 +1235,13 @@ class WorkspaceTest(unittest.TestCase):
         )
         self.assertEqual(_file_secret_rule(credential), "generic-secret-assignment")
 
-    def test_deleted_oauth_refresh_token_is_detected_from_base_blob(self) -> None:
+    def test_deleted_oauth_refresh_token_is_allowed_without_control_evidence_leak(
+        self,
+    ) -> None:
         credential = self.repo / "oauth.json"
+        raw_credential = oauth_refresh_credential()
         credential.write_text(
-            json.dumps({"refresh_token": oauth_refresh_credential()}) + "\n",
+            json.dumps({"refresh_token": raw_credential}) + "\n",
             encoding="utf-8",
         )
         git(self.repo, "add", "oauth.json")
@@ -1155,14 +1251,245 @@ class WorkspaceTest(unittest.TestCase):
         git(self.repo, "commit", "-m", "Remove OAuth credential")
         clean_head = git(self.repo, "rev-parse", "HEAD")
 
-        review = prepare_workspace(
-            repo=self.repo,
-            base_ref=credential_base,
-            head_ref=clean_head,
+        review = self.prepare_range(credential_base, clean_head)
+        validate_external_workspace(review)
+
+        raw_value = raw_credential.encode()
+        self.assert_diff_retains_raw_deletion(review, raw_value)
+        self.assert_control_evidence_omits(review, raw_value)
+
+    def test_unregistered_secret_reductions_are_allowed(self) -> None:
+        fixtures = (
+            (
+                "generic",
+                unregistered_generic_credential(),
+                lambda value: b'password = "' + value + b'"\n',
+            ),
+            (
+                "jwt",
+                unregistered_jwt_credential(),
+                lambda value: value + b"\n",
+            ),
+            (
+                "provider",
+                unregistered_provider_credential(),
+                lambda value: value + b"\n",
+            ),
+            (
+                "private-key",
+                unregistered_private_key(),
+                lambda value: value + b"\n",
+            ),
         )
-        self.reviews.append(review)
-        with self.assertRaisesRegex(ReviewError, "oauth.json.*base-blob"):
-            validate_external_workspace(review)
+
+        for name, raw_value, render in fixtures:
+            relative = f"secret-reduction-{name}.txt"
+            with self.subTest(secret_kind=name, transition="one-to-zero"):
+                one_base = self.commit_bytes(
+                    relative,
+                    render(raw_value),
+                    f"Add one {name} credential",
+                )
+                zero_head = self.remove_and_commit(
+                    relative,
+                    f"Remove one {name} credential",
+                )
+                review = self.prepare_range(one_base, zero_head)
+                validate_external_workspace(review)
+                self.assert_diff_retains_raw_deletion(review, raw_value)
+                self.assert_control_evidence_omits(review, raw_value)
+
+            with self.subTest(secret_kind=name, transition="two-to-one"):
+                two_base = self.commit_bytes(
+                    relative,
+                    render(raw_value) * 2,
+                    f"Add two {name} credentials",
+                )
+                one_head = self.commit_bytes(
+                    relative,
+                    render(raw_value),
+                    f"Reduce {name} credential count",
+                )
+                review = self.prepare_range(two_base, one_head)
+                validate_external_workspace(review)
+                self.assert_diff_retains_raw_deletion(review, raw_value)
+                self.assert_control_evidence_omits(review, raw_value)
+                self.remove_and_commit(
+                    relative,
+                    f"Clean up remaining {name} credential",
+                )
+
+    def test_unregistered_secret_addition_is_blocked(self) -> None:
+        raw_value = unregistered_generic_credential()
+        added_head = self.commit_bytes(
+            "added-secret.txt",
+            b'password = "' + raw_value + b'"\n',
+            "Add unregistered credential",
+        )
+
+        self.assert_external_review_blocked(
+            base_ref=self.head,
+            head_ref=added_head,
+            rule="generic-secret-assignment",
+        )
+
+    def test_unchanged_unregistered_secret_with_unrelated_change_is_blocked(
+        self,
+    ) -> None:
+        raw_value = unregistered_generic_credential()
+        secret_base = self.commit_bytes(
+            "retained-secret.txt",
+            b'password = "' + raw_value + b'"\n',
+            "Add retained credential",
+        )
+        unrelated_head = self.commit_bytes(
+            "unrelated.txt",
+            b"unrelated change\n",
+            "Make unrelated change",
+        )
+
+        self.assert_external_review_blocked(
+            base_ref=secret_base,
+            head_ref=unrelated_head,
+            rule="generic-secret-assignment",
+        )
+
+    def test_moved_unregistered_secret_is_blocked(self) -> None:
+        raw_value = unregistered_generic_credential()
+        old_path = "old-secret.txt"
+        new_path = "new-secret.txt"
+        secret_base = self.commit_bytes(
+            old_path,
+            b'password = "' + raw_value + b'"\n',
+            "Add credential before move",
+        )
+        git(self.repo, "mv", old_path, new_path)
+        git(self.repo, "commit", "-m", "Move credential")
+        moved_head = git(self.repo, "rev-parse", "HEAD")
+
+        self.assert_external_review_blocked(
+            base_ref=secret_base,
+            head_ref=moved_head,
+            rule="generic-secret-assignment",
+        )
+
+    def test_copied_unregistered_secret_count_increase_is_blocked(self) -> None:
+        raw_value = unregistered_generic_credential()
+        rendered = b'password = "' + raw_value + b'"\n'
+        secret_base = self.commit_bytes(
+            "source-secret.txt",
+            rendered,
+            "Add source credential",
+        )
+        copied_head = self.commit_bytes(
+            "copied-secret.txt",
+            rendered,
+            "Copy credential",
+        )
+
+        self.assert_external_review_blocked(
+            base_ref=secret_base,
+            head_ref=copied_head,
+            rule="generic-secret-assignment",
+        )
+
+    def test_replacing_two_secret_occurrences_with_a_new_secret_is_blocked(
+        self,
+    ) -> None:
+        first = unregistered_generic_credential()
+        second = second_unregistered_generic_credential()
+        first_rendered = b'password = "' + first + b'"\n'
+        secret_base = self.commit_bytes(
+            "replaced-secret.txt",
+            first_rendered * 2,
+            "Add repeated credential",
+        )
+        replaced_head = self.commit_bytes(
+            "replaced-secret.txt",
+            b'password = "' + second + b'"\n',
+            "Replace credential",
+        )
+
+        self.assert_external_review_blocked(
+            base_ref=secret_base,
+            head_ref=replaced_head,
+            rule="generic-secret-assignment",
+        )
+
+    def test_deleted_credential_path_is_allowed(self) -> None:
+        credential_base = self.commit_bytes(
+            "fixtures/.netrc",
+            b"machine example.invalid login reviewer\n",
+            "Add credential-shaped path",
+        )
+        clean_head = self.remove_and_commit(
+            "fixtures/.netrc",
+            "Remove credential-shaped path",
+        )
+
+        review = self.prepare_range(credential_base, clean_head)
+        validate_external_workspace(review)
+        self.assertIn(b"fixtures/.netrc", review.diff_file.read_bytes())
+
+    def test_new_and_retained_credential_paths_are_blocked(self) -> None:
+        added_head = self.commit_bytes(
+            "fixtures/.netrc",
+            b"machine example.invalid login reviewer\n",
+            "Add credential-shaped path",
+        )
+        with self.subTest(transition="new-sensitive-path"):
+            self.assert_external_review_blocked(
+                base_ref=self.head,
+                head_ref=added_head,
+                rule="credential-path",
+            )
+
+        retained_head = self.commit_bytes(
+            "unrelated-path-change.txt",
+            b"unrelated change\n",
+            "Make unrelated change with retained credential path",
+        )
+        with self.subTest(transition="retained-sensitive-path"):
+            self.assert_external_review_blocked(
+                base_ref=added_head,
+                head_ref=retained_head,
+                rule="credential-path",
+            )
+
+    def test_non_extractable_secret_deletions_fail_closed(self) -> None:
+        oversized_provider = b"".join((b"sk", b"-", b"O" * 513))
+        private_key_label = b"".join((b"PRIVATE", b" KEY"))
+        incomplete_private_key = b"".join(
+            (
+                b"-----BEGIN ",
+                private_key_label,
+                b"-----\n",
+                b"R" * 64,
+                b"\n",
+            )
+        )
+        fixtures = (
+            ("oversized-provider", oversized_provider, "openai-key"),
+            ("incomplete-private-key", incomplete_private_key, "private-key"),
+        )
+
+        for name, raw_value, rule in fixtures:
+            with self.subTest(secret_kind=name):
+                relative = f"non-extractable-{name}.txt"
+                secret_base = self.commit_bytes(
+                    relative,
+                    raw_value,
+                    f"Add {name} credential",
+                )
+                clean_head = self.remove_and_commit(
+                    relative,
+                    f"Remove {name} credential",
+                )
+                self.assert_external_review_blocked(
+                    base_ref=secret_base,
+                    head_ref=clean_head,
+                    rule=rule,
+                )
 
     def test_function_call_assignment_is_not_treated_as_literal_secret(self) -> None:
         source = pathlib.Path(self.temporary.name) / "source.py"

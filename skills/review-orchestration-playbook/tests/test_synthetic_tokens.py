@@ -50,6 +50,33 @@ JWT_LEGACY = "eyJ" + "A" * 12 + "." + "B" * 12 + "." + "C" * 12
 HIGH_ENTROPY = b"Aa9!" + b"Bb8@" + b"Cc7#" + b"Dd6$" + b"Ee5%"
 
 
+def reduction_secret(rule: str, marker: bytes = b"A") -> bytes:
+    if len(marker) != 1 or not marker.isalpha():
+        raise ValueError("marker must be one ASCII letter")
+    if rule == "generic-secret-assignment":
+        return b"RuntimeOpaque" + marker * 16 + b"9!"
+    if rule == "jwt":
+        return b"eyJ" + marker * 12 + b"." + marker * 12 + b"." + marker * 12
+    if rule == "github-token":
+        return b"ghp_" + marker * 36
+    if rule == "private-key":
+        return (
+            b"-----BEGIN "
+            + b"PRIVATE KEY-----\n"
+            + marker * 64
+            + b"\n-----END "
+            + b"PRIVATE KEY-----"
+        )
+    raise ValueError(f"unsupported secret reduction rule: {rule}")
+
+
+def reduction_fixture(rule: str, marker: bytes = b"A") -> str:
+    value = reduction_secret(rule, marker).decode("ascii")
+    if rule == "private-key":
+        return value + "\n"
+    return assignment_text("access_token", value)
+
+
 def assignment_bytes(key: bytes, value: bytes) -> bytes:
     return key + b' = "' + value + b'"'
 
@@ -1312,6 +1339,76 @@ class PublicPoolScannerTest(unittest.TestCase):
                 _continue_after_blocking=True,
             )
 
+    def test_blocking_candidate_capture_is_exhaustive_deduplicated_and_exact(
+        self,
+    ) -> None:
+        unknown_a = reduction_secret("generic-secret-assignment", b"A")
+        unknown_b = reduction_secret("generic-secret-assignment", b"B")
+        provider = reduction_secret("github-token", b"C")
+        private_key = reduction_secret("private-key", b"D")
+        payload = b"\n".join(
+            (
+                private_key,
+                assignment_bytes(b"access_token", unknown_a),
+                assignment_bytes(b"refresh_token", unknown_b),
+                assignment_bytes(b"api_token", provider),
+            )
+        )
+
+        scan = workspace._scan_secret_value(
+            payload,
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+
+        self.assertIsNone(scan.blocking_rule)
+        self.assertEqual(
+            scan.blocking_candidates,
+            {
+                unknown_a: {"generic-secret-assignment"},
+                unknown_b: {"generic-secret-assignment"},
+                provider: {"github-token"},
+                private_key: {"private-key"},
+            },
+        )
+
+    def test_unextractable_secret_shapes_remain_blockers_during_capture(self) -> None:
+        normal_jwt_segment = b"B" * 12
+        pem_begin = b"-----BEGIN " + b"PRIVATE KEY-----\n"
+        cases = (
+            ("provider-prefix", "github-token", b"ghp_" + b"A" * 513),
+            (
+                "oversized-jwt",
+                "jwt",
+                b"eyJ"
+                + b"C" * 2049
+                + b"."
+                + normal_jwt_segment
+                + b"."
+                + normal_jwt_segment,
+            ),
+            (
+                "oversized-generic",
+                "generic-secret-assignment",
+                assignment_bytes(b"password", b"D" * 513),
+            ),
+            ("unclosed-pem", "private-key", pem_begin + b"E" * 64),
+            (
+                "oversized-pem",
+                "private-key",
+                pem_begin + b"F" * workspace.MAX_PEM_SECRET_BYTES,
+            ),
+        )
+        for label, expected_rule, payload in cases:
+            with self.subTest(case=label):
+                scan = workspace._scan_secret_value(
+                    payload,
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+                self.assertEqual(scan.blocking_rule, expected_rule)
+                self.assertFalse(scan.blocking_candidates)
+
     def test_audit_scan_captures_after_a_blocker_across_stream_chunks(self) -> None:
         accepted = accepted_legacy_value(LEGACY_A, rule="generic-secret-assignment")
         blocking = assignment_bytes(b"password", b"UnknownSecretValueA9Z8Y7")
@@ -2032,6 +2129,95 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         self.assertTrue(all("value_sha256" in entry for entry in accepted))
         self.assertTrue(any(entry["token_id"] == "access-a" for entry in accepted))
 
+    def test_prepared_range_allows_only_strict_secret_count_reductions(self) -> None:
+        for rule in (
+            "generic-secret-assignment",
+            "jwt",
+            "github-token",
+        ):
+            for transition, head_count in (("delete", 0), ("partial", 1)):
+                with self.subTest(rule=rule, transition=transition):
+                    fixture = reduction_fixture(rule)
+                    repo, base = self.new_repo({"fixture.cfg": fixture * 2})
+                    if head_count:
+                        (repo / "fixture.cfg").write_text(
+                            fixture,
+                            encoding="utf-8",
+                        )
+                    else:
+                        (repo / "fixture.cfg").unlink()
+                    head = self.commit(repo)
+
+                    review = self.prepare(repo=repo, base=base, head=head)
+                    manifest_path = (
+                        review.workspace_root
+                        / ".codex-review"
+                        / workspace.SYNTHETIC_MANIFEST_NAME
+                    )
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    self.assertEqual(manifest["schema_version"], 3)
+                    self.assertEqual(len(manifest["secret_reductions"]), 1)
+                    reduction = manifest["secret_reductions"][0]
+                    self.assertEqual(
+                        (reduction["base_count"], reduction["head_count"]),
+                        (2, head_count),
+                    )
+                    self.assertEqual(reduction["rules"], [rule])
+
+                    evidence = self.validate(review)
+                    self.assertEqual(
+                        evidence["synthetic_tokens"]["secret_reductions"],
+                        manifest["secret_reductions"],
+                    )
+
+    def test_prepared_range_rejects_non_decreasing_secret_transitions(self) -> None:
+        cases = (
+            ("equal", "generic-secret-assignment"),
+            ("move", "jwt"),
+            ("copy", "github-token"),
+            ("add", "generic-secret-assignment"),
+            ("replace", "github-token"),
+        )
+        for transition, rule in cases:
+            with self.subTest(transition=transition, rule=rule):
+                fixture_a = reduction_fixture(rule, b"A")
+                fixture_b = reduction_fixture(rule, b"B")
+                base_files = (
+                    {"README.md": "base\n"}
+                    if transition == "add"
+                    else {"fixture.cfg": fixture_a}
+                )
+                repo, base = self.new_repo(base_files)
+                if transition == "equal":
+                    (repo / "README.md").write_text("head\n", encoding="utf-8")
+                elif transition == "move":
+                    (repo / "moved.cfg").write_text(fixture_a, encoding="utf-8")
+                    (repo / "fixture.cfg").unlink()
+                elif transition == "copy":
+                    (repo / "copied.cfg").write_text(fixture_a, encoding="utf-8")
+                elif transition == "add":
+                    (repo / "fixture.cfg").write_text(fixture_a, encoding="utf-8")
+                else:
+                    (repo / "fixture.cfg").write_text(fixture_b, encoding="utf-8")
+                head = self.commit(repo)
+
+                with self.assertRaisesRegex(ReviewError, rule):
+                    review = self.prepare(repo=repo, base=base, head=head)
+                    self.validate(review)
+
+    def test_pem_reduction_uses_the_complete_block_as_candidate_identity(self) -> None:
+        base_fixture = reduction_fixture("private-key", b"A") + reduction_fixture(
+            "private-key", b"B"
+        )
+        head_fixture = reduction_fixture("private-key", b"C")
+        repo, base = self.new_repo({"fixture.pem": base_fixture})
+        (repo / "fixture.pem").write_text(head_fixture, encoding="utf-8")
+        head = self.commit(repo)
+
+        with self.assertRaisesRegex(ReviewError, "private-key"):
+            review = self.prepare(repo=repo, base=base, head=head)
+            self.validate(review)
+
     def test_dynamic_path_digest_cannot_expose_an_authoring_value(self) -> None:
         relative = "fixture.cfg"
         raw_value = hashlib.sha256(relative.encode("ascii")).hexdigest()[:24]
@@ -2750,8 +2936,10 @@ class SyntheticWorkspaceTest(unittest.TestCase):
 
     def test_helper_private_control_state_blocks_artifact_tampering(self) -> None:
         replacements = {
-            "changed-paths.z": b"",
-            "changed-blob-findings.z": b"",
+            "changed-paths.z": b"tampered.txt\0",
+            "changed-blob-findings.z": (
+                b"head\0tampered.txt\0private-key\0"
+            ),
             workspace.SYNTHETIC_MANIFEST_NAME: b'{"entries":[]}\n',
             workspace.SYNTHETIC_CHANGED_EVIDENCE_NAME: (
                 b'{"entries":[],"schema_version":1}\n'
@@ -2895,6 +3083,74 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         ):
             self.validate(review, catalog=catalog)
 
+    def test_secret_reduction_manifest_tampering_fails_closed(self) -> None:
+        cases = (
+            ("range", "version or review range"),
+            ("digest", "helper-private entry is inconsistent"),
+            ("count", "count changed after preparation"),
+            ("private-base64", "not canonical Base64"),
+        )
+        for tamper, expected_message in cases:
+            with self.subTest(tamper=tamper):
+                fixture = reduction_fixture("generic-secret-assignment")
+                repo, base = self.new_repo({"fixture.cfg": fixture * 2})
+                (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
+                head = self.commit(repo)
+                review = self.prepare(repo=repo, base=base, head=head)
+                control_dir = review.workspace_root / ".codex-review"
+                public_path = control_dir / workspace.SYNTHETIC_MANIFEST_NAME
+                private_path = (
+                    review.container_dir / workspace.SYNTHETIC_PRIVATE_MANIFEST_NAME
+                )
+                public = json.loads(public_path.read_text(encoding="utf-8"))
+                private = json.loads(private_path.read_text(encoding="utf-8"))
+                self.assertEqual(public["schema_version"], 3)
+                self.assertEqual(private["schema_version"], 3)
+                self.assertEqual(len(private["secret_reduction_values"]), 1)
+
+                if tamper == "range":
+                    public["head_ref"] = "0" * 40
+                    private["head_ref"] = "0" * 40
+                elif tamper == "digest":
+                    public["secret_reductions"][0]["value_sha256"] = "0" * 64
+                    private["secret_reductions"][0]["value_sha256"] = "0" * 64
+                    private["secret_reduction_values"][0]["value_sha256"] = "0" * 64
+                elif tamper == "count":
+                    for manifest in (public, private):
+                        manifest["secret_reductions"][0]["base_count"] = 3
+                        manifest["secret_reductions"][0]["head_count"] = 2
+                else:
+                    private["secret_reduction_values"][0]["value_base64"] = "***"
+
+                if tamper != "private-base64":
+                    public_path.write_text(json.dumps(public), encoding="utf-8")
+                private_path.write_text(json.dumps(private), encoding="utf-8")
+                if tamper != "private-base64":
+                    control_state = workspace._build_control_artifact_state(
+                        control_dir=control_dir
+                    )
+                    state_path = (
+                        review.container_dir / workspace.CONTROL_ARTIFACT_STATE_NAME
+                    )
+                    state_path.write_text(json.dumps(control_state), encoding="utf-8")
+
+                with self.assertRaisesRegex(ReviewError, expected_message):
+                    self.validate(review)
+
+    def test_materialized_head_cannot_restore_a_reduced_secret(self) -> None:
+        fixture = reduction_fixture("generic-secret-assignment")
+        repo, base = self.new_repo({"fixture.cfg": fixture})
+        (repo / "fixture.cfg").unlink()
+        head = self.commit(repo)
+        review = self.prepare(repo=repo, base=base, head=head)
+
+        (review.workspace_root / "fixture.cfg").write_text(
+            fixture,
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ReviewError, "count changed after preparation"):
+            self.validate(review)
+
     def test_overlapping_legacy_values_are_counted_independently(self) -> None:
         longer = LEGACY_A + "Suffix"
         catalog = legacy_catalog(values=(LEGACY_A, longer))
@@ -3009,28 +3265,24 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         with self.assertRaisesRegex(ReviewError, "generic-secret-assignment"):
             self.validate(review, catalog=catalog)
 
-    def test_prompt_does_not_accept_selected_legacy_values(self) -> None:
-        catalog = legacy_catalog(values=(LEGACY_A,))
-        repo, base = self.new_repo(
-            {"fixture.cfg": assignment_text("access_token", LEGACY_A)}
-        )
+    def test_prompt_only_secret_does_not_block_review_content(self) -> None:
+        repo, base = self.new_repo({"README.md": "base\n"})
         (repo / "README.md").write_text("head\n", encoding="utf-8")
         head = self.commit(repo)
         prompt = self.root / "prompt-generic-secret-assignment.txt"
         prompt.write_text(
-            f'Review {{review_range}}\naccess_token = "{LEGACY_A}"\n',
+            "Review {review_range}\n"
+            + reduction_fixture("generic-secret-assignment"),
             encoding="utf-8",
         )
         review = self.prepare(
             repo=repo,
             base=base,
             head=head,
-            catalog=catalog,
-            exemptions=("historical-fixtures",),
             prompt_override=prompt,
         )
-        with self.assertRaisesRegex(ReviewError, "review.prompt"):
-            self.validate(review, catalog=catalog)
+        evidence = self.validate(review)
+        self.assertEqual(evidence["synthetic_tokens"]["secret_reductions"], [])
 
     def test_audit_master_cli_verifies_pinned_provenance_without_raw_value(
         self,
@@ -3244,7 +3496,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         head = self.commit(repo)
         review = self.prepare(repo=repo, base=base, head=head)
         with (
-            mock.patch.object(workspace, "MAX_SYNTHETIC_EVIDENCE_ENTRIES", 2),
+            mock.patch.object(workspace, "MAX_SYNTHETIC_EVIDENCE_ENTRIES", 1),
             self.assertRaisesRegex(
                 ReviewError,
                 "accepted synthetic-token evidence has too many entries",

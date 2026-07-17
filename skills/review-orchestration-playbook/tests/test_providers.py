@@ -91,11 +91,16 @@ class ProviderPolicyTest(unittest.TestCase):
         (control / "changed-paths.z").write_bytes(b"")
         (control / "changed-blob-findings.z").write_bytes(b"")
         catalog = workspace_runtime.load_catalog()
+        base_ref = "a" * 40
+        head_ref = "b" * 40
         synthetic_manifest = {
+            "base_ref": base_ref,
             "catalog_schema_version": catalog.schema_version,
             "entries": [],
+            "head_ref": head_ref,
             "pool_version": catalog.pool_version,
             "schema_version": workspace_runtime.SYNTHETIC_MANIFEST_SCHEMA_VERSION,
+            "secret_reductions": [],
             "selected_exemptions": [],
         }
         workspace_runtime._write_bounded_json(
@@ -119,8 +124,8 @@ class ProviderPolicyTest(unittest.TestCase):
             source_root=source_root,
             container_dir=container,
             workspace_root=workspace,
-            base_ref="a" * 40,
-            head_ref="b" * 40,
+            base_ref=base_ref,
+            head_ref=head_ref,
             diff_file=diff_file,
             prompt_file=prompt_file,
         )
@@ -5359,11 +5364,10 @@ class ProviderPolicyTest(unittest.TestCase):
         codex_attempt: mock.Mock,
     ) -> None:
         secret = "AKIA" + "B" * 16
-        self.review.diff_file.write_text(
-            "diff --git a/config b/config\n-AWS_KEY=" + secret + "\n",
+        (self.review.workspace_root / "config").write_text(
+            "AWS_KEY=" + secret + "\n",
             encoding="utf-8",
         )
-        self._refresh_control_artifact_state()
         outcome = providers.run_review(
             review=self.review,
             reviewer="codex",
@@ -5376,6 +5380,30 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         self.assertIn("sensitive content preflight", error)
         self.assertNotIn(secret, error)
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_prompt_only_secret_does_not_block_codex_preflight(
+        self,
+        run_model_chain: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        secret = "AKIA" + "C" * 16
+        self.review.prompt_file.write_text(
+            f"Review the removal of {secret}.\n",
+            encoding="utf-8",
+        )
+        self._refresh_control_artifact_state()
+        run_model_chain.return_value = ("success", "No findings.")
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="codex",
+        )
+
+        self.assertEqual(outcome.returncode, 0)
+        run_model_chain.assert_called_once()
+        self.assertTrue((self.review.container_dir / "preflight.json").is_file())
 
     @mock.patch.object(providers, "_review_environment", return_value={})
     @mock.patch.object(providers, "_run_model_chain")
@@ -5407,7 +5435,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(outcome.final_text, "No findings.")
 
     @mock.patch.object(providers, "resolve_reviewer_executable")
-    def test_deleted_generic_token_in_diff_blocks_external_reviewer(
+    def test_tampered_deleted_generic_token_diff_blocks_external_reviewer(
         self,
         resolve: mock.Mock,
     ) -> None:
@@ -5416,7 +5444,6 @@ class ProviderPolicyTest(unittest.TestCase):
             "diff --git a/config b/config\n-AUTH_TOKEN=" + token + "\n",
             encoding="utf-8",
         )
-        self._refresh_control_artifact_state()
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
@@ -5427,11 +5454,14 @@ class ProviderPolicyTest(unittest.TestCase):
         error = (self.review.container_dir / "runner-error.txt").read_text(
             encoding="utf-8"
         )
-        self.assertIn("review.diff (generic-secret-assignment)", error)
+        self.assertIn(
+            "external review diff does not match helper-private control state",
+            error,
+        )
         self.assertNotIn(token, error)
 
     @mock.patch.object(providers, "resolve_reviewer_executable")
-    def test_deleted_sensitive_path_blocks_external_reviewer(
+    def test_unproven_deleted_sensitive_path_record_blocks_external_reviewer(
         self,
         resolve: mock.Mock,
     ) -> None:

@@ -4798,7 +4798,7 @@ def run_review(
     preflight_evidence = {
         "review_range": f"{review.base_ref}..{review.head_ref}",
         "scope": "frozen tracked workspace, diff, and review prompt",
-        "status": "sensitive-content and escaping-symlink checks passed",
+        "status": "secret-delta and escaping-symlink checks passed",
     }
     preflight_evidence.update(synthetic_evidence)
     write_json(review.container_dir / "preflight.json", preflight_evidence)
@@ -4812,16 +4812,15 @@ def run_review(
                 "review_range": f"{review.base_ref}..{review.head_ref}",
                 "included": [
                     "tracked blobs materialized from the frozen head commit",
-                    "the generated frozen diff",
+                    "the generated frozen diff, including proven secret reductions",
                     "the review prompt and result",
                 ],
                 "excluded": [
-                    "credential paths and high-confidence secrets blocked by preflight",
                     "untracked files",
                     "unrelated repositories",
                     "broad workspace or home-directory content",
                 ],
-                "preflight": "sensitive-content and escaping-symlink checks passed",
+                "preflight": "secret-delta and escaping-symlink checks passed",
             },
         )
 

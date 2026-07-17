@@ -15,7 +15,7 @@ from unittest import mock
 SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from review_runtime import cleanup_worker, state  # noqa: E402
+from review_runtime import cleanup_worker, providers, state  # noqa: E402
 from review_runtime.common import ReviewError, write_json  # noqa: E402
 from review_runtime.workspace import (  # noqa: E402
     cleanup_workspace,
@@ -141,7 +141,7 @@ class StatefulLifecycleTest(unittest.TestCase):
             self.review.container_dir / "preflight.json",
             {
                 "review_range": f"{self.base}..{self.head}",
-                "status": "sensitive-content and escaping-symlink checks passed",
+                "status": "secret-delta and escaping-symlink checks passed",
             },
         )
 
@@ -409,6 +409,52 @@ time.sleep(0.2)
         self.assertEqual(exit_code, 0)
         unblock.assert_called_once_with()
         self.assertEqual((state_dir / state.EXIT_FILE).read_text().strip(), "0")
+
+    def test_runner_rejects_tampered_state_range_before_provider_launch(
+        self,
+    ) -> None:
+        state_dir = self.review.container_dir
+        (state_dir / state.STATE_MARKER).write_text(
+            "isolated-review-state-v1\n",
+            encoding="utf-8",
+        )
+        original_workspace = self.review.to_json()
+
+        for field, forged_ref in (
+            ("base_ref", "c" * 40),
+            ("head_ref", "d" * 40),
+        ):
+            with self.subTest(field=field):
+                forged_workspace = dict(original_workspace)
+                forged_workspace[field] = forged_ref
+                write_json(
+                    state_dir / state.STATE_FILE,
+                    {
+                        "version": 1,
+                        "reviewer": "codex",
+                        "workspace": forged_workspace,
+                    },
+                )
+                with (
+                    mock.patch.object(providers, "_run_model_chain") as launch,
+                    mock.patch.object(
+                        providers,
+                        "resolve_reviewer_executable",
+                    ) as resolve,
+                ):
+                    exit_code = state.run_state(state_dir=state_dir)
+
+                self.assertEqual(exit_code, 2)
+                launch.assert_not_called()
+                resolve.assert_not_called()
+                self.assertFalse((state_dir / "preflight.json").exists())
+                error = (state_dir / "runner-error.txt").read_text(
+                    encoding="utf-8"
+                )
+                self.assertIn(
+                    "synthetic secret manifest version or review range is invalid",
+                    error,
+                )
 
     def test_runner_installs_signal_handler_before_unblocking_inherited_mask(
         self,
