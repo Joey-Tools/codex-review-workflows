@@ -261,7 +261,7 @@ def run_bounded_capture(
     *,
     cwd: pathlib.Path | None = None,
     env: dict[str, str] | None = None,
-    stdin: bytes | None = None,
+    stdin: bytes | bytearray | None = None,
     timeout_seconds: float,
     stdout_limit_bytes: int,
     stderr_limit_bytes: int,
@@ -449,7 +449,7 @@ def _run_logged_process(
     *,
     cwd: pathlib.Path | None,
     env: dict[str, str] | None,
-    stdin: bytes | None,
+    stdin: bytes | bytearray | None,
     stdout_handle: BinaryIO,
     stderr_handle: BinaryIO,
     timeout_seconds: float | None = None,
@@ -537,7 +537,11 @@ def _run_logged_process(
                 drain_errors.append(error)
                 signal_process_group(process, signal.SIGTERM)
 
-        def write_stdin_bounded(stream: BinaryIO, payload: bytes) -> None:
+        def write_stdin_bounded(
+            stream: BinaryIO,
+            payload: bytes | bytearray,
+        ) -> None:
+            view = memoryview(payload)
             try:
                 descriptor = stream.fileno()
                 os.set_blocking(descriptor, False)
@@ -549,7 +553,7 @@ def _run_logged_process(
                     if not writable:
                         continue
                     try:
-                        written = os.write(descriptor, payload[offset:])
+                        written = os.write(descriptor, view[offset:])
                     except BlockingIOError:
                         continue
                     offset += written
@@ -560,6 +564,8 @@ def _run_logged_process(
             except Exception as error:
                 drain_errors.append(error)
                 signal_process_group(process, signal.SIGTERM)
+            finally:
+                view.release()
 
         thread_start_mask = block_forwarded_signals()
         try:

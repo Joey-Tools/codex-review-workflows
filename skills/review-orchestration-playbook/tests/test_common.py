@@ -193,6 +193,25 @@ class ChildEnvironmentTest(unittest.TestCase):
 
         self.assertEqual(completed.stdout, b"review prompt")
 
+    def test_bounded_capture_supports_mutable_stdin(self) -> None:
+        payload = bytearray(b"mutable review prompt")
+        completed = common.run_bounded_capture(
+            (
+                sys.executable,
+                "-c",
+                "import os,sys; os.write(1, sys.stdin.buffer.read())",
+            ),
+            stdin=payload,
+            timeout_seconds=5,
+            stdout_limit_bytes=4096,
+            stderr_limit_bytes=4096,
+        )
+
+        self.assertEqual(completed.stdout, payload)
+        payload[:] = b"\x00" * len(payload)
+        completed.stdout[:] = b"\x00" * len(completed.stdout)
+        completed.stderr[:] = b"\x00" * len(completed.stderr)
+
     @mock.patch.object(common.threading, "Thread")
     def test_failed_drain_thread_start_is_not_joined(
         self, thread_factory: mock.Mock

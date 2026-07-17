@@ -353,6 +353,12 @@ def run_state(
         )
         exit_code = outcome.returncode
     except ForwardedSignal as error:
+        if state_loaded and error.detail:
+            write_text_atomic(
+                state_dir / "runner-error.txt",
+                "review orchestration interrupted by signal "
+                f"{int(error.signum)}: {error.detail}\n",
+            )
         exit_code = 128 + int(error.signum)
     except Exception as error:
         if state_loaded:

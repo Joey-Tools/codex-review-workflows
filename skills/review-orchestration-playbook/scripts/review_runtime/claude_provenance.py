@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 CLAUDE_RELEASE_BASE_URL = "https://downloads.claude.ai/claude-code-releases"
 CLAUDE_RELEASE_KEY_FINGERPRINT = "31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE"
 CLAUDE_RELEASE_KEY_PATH = pathlib.Path(__file__).with_name("claude_code_release.asc")
-CLAUDE_MINIMUM_RELEASE = (2, 1, 187)
+CLAUDE_MINIMUM_RELEASE = (2, 1, 211)
 CLAUDE_MAXIMUM_RELEASE = (3, 0, 0)
 CLAUDE_MANIFEST_MAX_BYTES = 256 * 1024
 CLAUDE_SIGNATURE_MAX_BYTES = 64 * 1024
@@ -357,7 +357,7 @@ def require_supported_release_version(version: str) -> tuple[int, int, int]:
     if not (CLAUDE_MINIMUM_RELEASE <= parsed < CLAUDE_MAXIMUM_RELEASE):
         raise ClaudeProvenanceInvalid(
             "Claude Code version is outside the supported range "
-            f">=2.1.187,<3.0.0: {version}"
+            f">=2.1.211,<3.0.0: {version}"
         )
     return parsed  # type: ignore[return-value]
 

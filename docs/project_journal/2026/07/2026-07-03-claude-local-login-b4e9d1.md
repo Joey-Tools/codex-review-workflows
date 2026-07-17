@@ -3,11 +3,11 @@ id: 20260703-b4e9d1
 title: Default Claude Reviews To Local Login
 status: completed
 created: 2026-07-03
-updated: 2026-07-16
+updated: 2026-07-17
 branch: codex/claude-local-login
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/42
 supersedes: []
-superseded_by:
+superseded_by: 20260717-c17a11
 ---
 
 # Default Claude Reviews To Local Login

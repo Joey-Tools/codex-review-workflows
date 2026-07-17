@@ -22,7 +22,7 @@ from review_runtime import claude_provenance  # noqa: E402
 
 def artifact_for(payload: bytes) -> claude_provenance.ClaudeReleaseArtifact:
     return claude_provenance.ClaudeReleaseArtifact(
-        version="2.1.202",
+        version="2.1.211",
         platform_key="darwin-arm64",
         binary="claude",
         checksum=hashlib.sha256(payload).hexdigest(),
@@ -46,7 +46,7 @@ def verified_for(
 def manifest_for(
     payload: bytes,
     *,
-    version: str = "2.1.202",
+    version: str = "2.1.211",
     platform_key: str = "darwin-arm64",
     binary: str = "claude",
     checksum: str | None = None,
@@ -78,8 +78,8 @@ def completed(
 class ReleaseVersionTest(unittest.TestCase):
     def test_accepts_supported_floating_release_versions(self) -> None:
         self.assertEqual(
-            claude_provenance.require_supported_release_version("2.1.187"),
-            (2, 1, 187),
+            claude_provenance.require_supported_release_version("2.1.211"),
+            (2, 1, 211),
         )
         self.assertEqual(
             claude_provenance.require_supported_release_version("2.99.1000"),
@@ -87,7 +87,7 @@ class ReleaseVersionTest(unittest.TestCase):
         )
 
     def test_rejects_versions_outside_supported_major_range(self) -> None:
-        for version in ("2.1.186", "1.99.999", "3.0.0", "4.1.0"):
+        for version in ("2.1.210", "1.99.999", "3.0.0", "4.1.0"):
             with self.subTest(version=version):
                 with self.assertRaises(
                     claude_provenance.ClaudeProvenanceInvalid
@@ -96,13 +96,13 @@ class ReleaseVersionTest(unittest.TestCase):
 
     def test_rejects_non_release_or_noncanonical_semver(self) -> None:
         for version in (
-            "2.1.187-beta.1",
-            "2.1.187+build",
-            "v2.1.187",
-            "02.1.187",
-            "2.01.187",
+            "2.1.211-beta.1",
+            "2.1.211+build",
+            "v2.1.211",
+            "02.1.211",
+            "2.01.211",
             "2.1",
-            "2.1.187\n",
+            "2.1.211\n",
         ):
             with self.subTest(version=version):
                 with self.assertRaises(
@@ -112,10 +112,10 @@ class ReleaseVersionTest(unittest.TestCase):
 
     def test_builds_exact_version_urls(self) -> None:
         self.assertEqual(
-            claude_provenance.release_artifact_urls("2.1.202"),
+            claude_provenance.release_artifact_urls("2.1.211"),
             (
-                "https://downloads.claude.ai/claude-code-releases/2.1.202/manifest.json",
-                "https://downloads.claude.ai/claude-code-releases/2.1.202/manifest.json.sig",
+                "https://downloads.claude.ai/claude-code-releases/2.1.211/manifest.json",
+                "https://downloads.claude.ai/claude-code-releases/2.1.211/manifest.json.sig",
             ),
         )
 
@@ -389,7 +389,7 @@ class SignedManifestFetchTest(unittest.TestCase):
             return b"manifest" if url.endswith("manifest.json") else b"signature"
 
         bundle = claude_provenance.fetch_signed_manifest(
-            "2.1.202",
+            "2.1.211",
             fetcher=fetcher,
             timeout_seconds=3.5,
         )
@@ -400,12 +400,12 @@ class SignedManifestFetchTest(unittest.TestCase):
             calls,
             [
                 (
-                    "https://downloads.claude.ai/claude-code-releases/2.1.202/manifest.json",
+                    "https://downloads.claude.ai/claude-code-releases/2.1.211/manifest.json",
                     claude_provenance.CLAUDE_MANIFEST_MAX_BYTES,
                     3.5,
                 ),
                 (
-                    "https://downloads.claude.ai/claude-code-releases/2.1.202/manifest.json.sig",
+                    "https://downloads.claude.ai/claude-code-releases/2.1.211/manifest.json.sig",
                     claude_provenance.CLAUDE_SIGNATURE_MAX_BYTES,
                     3.5,
                 ),
@@ -426,7 +426,7 @@ class SignedManifestFetchTest(unittest.TestCase):
             claude_provenance.ClaudeProvenanceInvalid,
             "byte limit",
         ):
-            claude_provenance.fetch_signed_manifest("2.1.202", fetcher=fetcher)
+            claude_provenance.fetch_signed_manifest("2.1.211", fetcher=fetcher)
 
     def test_classifies_fetcher_failure_as_inconclusive(self) -> None:
         def fetcher(
@@ -442,7 +442,7 @@ class SignedManifestFetchTest(unittest.TestCase):
             claude_provenance.ClaudeProvenanceInconclusive,
             "network unavailable",
         ):
-            claude_provenance.fetch_signed_manifest("2.1.202", fetcher=fetcher)
+            claude_provenance.fetch_signed_manifest("2.1.211", fetcher=fetcher)
 
     def test_rejects_non_bytes_or_empty_fetcher_result(self) -> None:
         for payload in ("manifest", b""):
@@ -451,14 +451,14 @@ class SignedManifestFetchTest(unittest.TestCase):
                     claude_provenance.ClaudeProvenanceInvalid
                 ):
                     claude_provenance.fetch_signed_manifest(
-                        "2.1.202",
+                        "2.1.211",
                         fetcher=lambda *_args, **_kwargs: payload,
                     )
 
     def test_default_fetcher_rejects_redirects_from_exact_release_url(self) -> None:
         url = (
             "https://downloads.claude.ai/claude-code-releases/"
-            "2.1.202/manifest.json"
+            "2.1.211/manifest.json"
         )
         redirect = claude_provenance.urllib.error.HTTPError(
             url,
@@ -487,7 +487,7 @@ class SignedManifestFetchTest(unittest.TestCase):
     def test_default_fetcher_deadline_includes_url_open_and_headers(self) -> None:
         url = (
             "https://downloads.claude.ai/claude-code-releases/"
-            "2.1.202/manifest.json"
+            "2.1.211/manifest.json"
         )
         opener = mock.Mock()
 
@@ -517,7 +517,7 @@ class SignedManifestFetchTest(unittest.TestCase):
     def test_default_fetcher_reads_response_body_in_bounded_chunks(self) -> None:
         url = (
             "https://downloads.claude.ai/claude-code-releases/"
-            "2.1.202/manifest.json"
+            "2.1.211/manifest.json"
         )
         body = b"x" * (claude_provenance.CLAUDE_FETCH_CHUNK_BYTES + 3)
 
@@ -573,7 +573,7 @@ class SignedManifestFetchTest(unittest.TestCase):
     def test_default_fetcher_stops_slow_drip_at_total_deadline(self) -> None:
         url = (
             "https://downloads.claude.ai/claude-code-releases/"
-            "2.1.202/manifest.json.sig"
+            "2.1.211/manifest.json.sig"
         )
         clock = [10.0]
 
@@ -647,18 +647,18 @@ class ManifestParsingTest(unittest.TestCase):
     def test_parses_supported_platform_artifact(self) -> None:
         artifact = claude_provenance.parse_signed_manifest_artifact(
             manifest_for(self.payload, platform_key="linux-x64"),
-            version="2.1.202",
+            version="2.1.211",
             platform_key="linux-x64",
         )
 
-        self.assertEqual(artifact.version, "2.1.202")
+        self.assertEqual(artifact.version, "2.1.211")
         self.assertEqual(artifact.platform_key, "linux-x64")
         self.assertEqual(artifact.binary, "claude")
         self.assertEqual(artifact.size, len(self.payload))
 
     def test_rejects_duplicate_json_keys_at_any_depth(self) -> None:
         manifest = (
-            b'{"version":"2.1.202","platforms":{"darwin-arm64":'
+            b'{"version":"2.1.211","platforms":{"darwin-arm64":'
             b'{"binary":"claude","binary":"wrapper","checksum":"'
             + hashlib.sha256(self.payload).hexdigest().encode()
             + b'","size":24}}}'
@@ -670,7 +670,7 @@ class ManifestParsingTest(unittest.TestCase):
         ):
             claude_provenance.parse_signed_manifest_artifact(
                 manifest,
-                version="2.1.202",
+                version="2.1.211",
                 platform_key="darwin-arm64",
             )
 
@@ -686,7 +686,7 @@ class ManifestParsingTest(unittest.TestCase):
         ):
             claude_provenance.parse_signed_manifest_artifact(
                 manifest,
-                version="2.1.202",
+                version="2.1.211",
                 platform_key="darwin-arm64",
             )
 
@@ -697,7 +697,7 @@ class ManifestParsingTest(unittest.TestCase):
         ):
             claude_provenance.parse_signed_manifest_artifact(
                 manifest_for(self.payload, version="2.1.203"),
-                version="2.1.202",
+                version="2.1.211",
                 platform_key="darwin-arm64",
             )
 
@@ -712,7 +712,7 @@ class ManifestParsingTest(unittest.TestCase):
                     platform_key="win32-x64",
                     binary="claude.exe",
                 ),
-                version="2.1.202",
+                version="2.1.211",
                 platform_key="win32-x64",
             )
 
@@ -723,7 +723,7 @@ class ManifestParsingTest(unittest.TestCase):
         ):
             claude_provenance.parse_signed_manifest_artifact(
                 manifest_for(self.payload, binary="claude-wrapper"),
-                version="2.1.202",
+                version="2.1.211",
                 platform_key="darwin-arm64",
             )
 
@@ -734,7 +734,7 @@ class ManifestParsingTest(unittest.TestCase):
         ):
             claude_provenance.parse_signed_manifest_artifact(
                 manifest_for(self.payload, checksum="A" * 64),
-                version="2.1.202",
+                version="2.1.211",
                 platform_key="darwin-arm64",
             )
 
@@ -747,7 +747,7 @@ class ManifestParsingTest(unittest.TestCase):
                 ):
                     claude_provenance.parse_signed_manifest_artifact(
                         manifest_for(self.payload, size=size),
-                        version="2.1.202",
+                        version="2.1.211",
                         platform_key="darwin-arm64",
                     )
 
@@ -765,7 +765,7 @@ class GpgVerificationTest(unittest.TestCase):
         )
         self.root = pathlib.Path(self.temporary.name)
         self.bundle = claude_provenance.SignedClaudeManifest(
-            version="2.1.202",
+            version="2.1.211",
             manifest_url="https://downloads.claude.ai/manifest.json",
             signature_url="https://downloads.claude.ai/manifest.json.sig",
             manifest=b"{}",
@@ -2078,7 +2078,7 @@ class ExecutableVerificationTest(unittest.TestCase):
         ):
             result = claude_provenance.verify_claude_release(
                 self.executable,
-                version="2.1.202",
+                version="2.1.211",
                 platform_key="darwin-arm64",
                 gpg_temp_root=self.root,
                 fetcher=fetcher,
@@ -2089,7 +2089,7 @@ class ExecutableVerificationTest(unittest.TestCase):
         self.assertEqual(result.gpg_path, gpg_path)
         self.assertEqual(
             result.manifest_url,
-            "https://downloads.claude.ai/claude-code-releases/2.1.202/manifest.json",
+            "https://downloads.claude.ai/claude-code-releases/2.1.211/manifest.json",
         )
 
     def test_verified_manifest_cache_avoids_repeat_network_fetch(self) -> None:
@@ -2114,7 +2114,7 @@ class ExecutableVerificationTest(unittest.TestCase):
         ) as signature_verifier:
             claude_provenance.verify_claude_release(
                 self.executable,
-                version="2.1.202",
+                version="2.1.211",
                 platform_key="darwin-arm64",
                 gpg_temp_root=self.root,
                 fetcher=fetcher,
@@ -2122,7 +2122,7 @@ class ExecutableVerificationTest(unittest.TestCase):
             )
             claude_provenance.verify_claude_release(
                 self.executable,
-                version="2.1.202",
+                version="2.1.211",
                 platform_key="darwin-arm64",
                 gpg_temp_root=self.root,
                 fetcher=lambda *_args, **_kwargs: self.fail(
@@ -2134,7 +2134,7 @@ class ExecutableVerificationTest(unittest.TestCase):
         self.assertEqual(len(fetch_calls), 2)
         self.assertEqual(signature_verifier.call_count, 2)
         self.assertEqual(stat.S_IMODE(cache_dir.stat().st_mode), 0o700)
-        version_dir = cache_dir / "2.1.202"
+        version_dir = cache_dir / "2.1.211"
         self.assertEqual(stat.S_IMODE(version_dir.stat().st_mode), 0o700)
         for name in ("manifest.json", "manifest.json.sig", "ready.json"):
             self.assertEqual(
@@ -2165,18 +2165,18 @@ class ExecutableVerificationTest(unittest.TestCase):
             ):
                 claude_provenance.verify_claude_release(
                     self.executable,
-                    version="2.1.202",
+                    version="2.1.211",
                     platform_key="darwin-arm64",
                     gpg_temp_root=self.root,
                     fetcher=fetcher,
                     cache_dir=cache_dir,
                 )
 
-        self.assertFalse((cache_dir / "2.1.202" / "ready.json").exists())
+        self.assertFalse((cache_dir / "2.1.211" / "ready.json").exists())
 
     def test_cache_is_written_only_after_strict_manifest_parsing(self) -> None:
         cache_dir = self.root / "provenance-cache"
-        malformed_manifest = b'{"version":"2.1.202","platforms":NaN}'
+        malformed_manifest = b'{"version":"2.1.211","platforms":NaN}'
 
         def fetcher(
             url: str,
@@ -2198,14 +2198,14 @@ class ExecutableVerificationTest(unittest.TestCase):
             ):
                 claude_provenance.verify_claude_release(
                     self.executable,
-                    version="2.1.202",
+                    version="2.1.211",
                     platform_key="darwin-arm64",
                     gpg_temp_root=self.root,
                     fetcher=fetcher,
                     cache_dir=cache_dir,
                 )
 
-        self.assertFalse((cache_dir / "2.1.202" / "ready.json").exists())
+        self.assertFalse((cache_dir / "2.1.211" / "ready.json").exists())
 
     def test_rejects_corrupted_complete_cache_without_network_fallback(self) -> None:
         manifest = manifest_for(self.payload)
@@ -2227,14 +2227,14 @@ class ExecutableVerificationTest(unittest.TestCase):
         ):
             claude_provenance.verify_claude_release(
                 self.executable,
-                version="2.1.202",
+                version="2.1.211",
                 platform_key="darwin-arm64",
                 gpg_temp_root=self.root,
                 fetcher=fetcher,
                 cache_dir=cache_dir,
             )
 
-        cached_manifest = cache_dir / "2.1.202" / "manifest.json"
+        cached_manifest = cache_dir / "2.1.211" / "manifest.json"
         cached_manifest.write_bytes(b"tampered")
         cached_manifest.chmod(0o600)
         with self.assertRaisesRegex(
@@ -2243,7 +2243,7 @@ class ExecutableVerificationTest(unittest.TestCase):
         ):
             claude_provenance.verify_claude_release(
                 self.executable,
-                version="2.1.202",
+                version="2.1.211",
                 platform_key="darwin-arm64",
                 gpg_temp_root=self.root,
                 fetcher=lambda *_args, **_kwargs: self.fail(
@@ -2274,7 +2274,7 @@ class ExecutableSnapshotTest(unittest.TestCase):
         )
 
         expected_name = (
-            "claude-2.1.202-darwin-arm64-"
+            "claude-2.1.211-darwin-arm64-"
             f"{hashlib.sha256(self.payload).hexdigest()}"
         )
         self.assertEqual(result.executable, self.snapshot_root.resolve() / expected_name)

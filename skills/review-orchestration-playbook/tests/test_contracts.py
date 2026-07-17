@@ -17,7 +17,46 @@ REPO_ROOT = SKILL_ROOT.parents[1]
 SCRIPTS = SKILL_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from review_runtime import claude_linux, providers  # noqa: E402
+from review_runtime import (  # noqa: E402
+    claude_capabilities,
+    claude_linux,
+    claude_refresh_lock,
+    providers,
+)
+
+
+EXPECTED_CLAUDE_2_1_211_LOCK_ARTIFACTS = {
+    (
+        "2.1.211",
+        "darwin-arm64",
+        "5a728a76198b6eca7f3c7cdbff43bab44b77b48c2108f7a3107d889773382629",
+    ),
+    (
+        "2.1.211",
+        "darwin-x64",
+        "33049eb14cf4702b992b7eda41ec077fc6e76539f7fd046e6d32538757235da4",
+    ),
+    (
+        "2.1.211",
+        "linux-arm64",
+        "1fff7e8f947c07b19d10b1fbf714b7e547e9536253b9b58230d8adbc4624f867",
+    ),
+    (
+        "2.1.211",
+        "linux-x64",
+        "8272c8a474ac9ea1bc35f19b9f7c7e7dc4dc4eb6d5ad3e484b19335ac72446b2",
+    ),
+    (
+        "2.1.211",
+        "linux-arm64-musl",
+        "ca094a85ea464b2ebec2ecfcc9e2c056573d4ca95ebe12ffae2c7dccb722e17b",
+    ),
+    (
+        "2.1.211",
+        "linux-x64-musl",
+        "c99bd7934ac841d5be6ee7d3644cb63bccef2cd495c6c1bb982a1b1deac1b466",
+    ),
+}
 
 
 class RepositoryContractTest(unittest.TestCase):
@@ -88,13 +127,13 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("manifest checksum", helper_contract)
         self.assertIn("downloads.claude.ai", helper_contract)
         self.assertIn("deny-by-default Seatbelt profile", helper_contract)
-        self.assertIn("current-account Keychain item", helper_contract)
+        self.assertIn("current-account `Claude Code-credentials`", helper_contract)
         self.assertIn("helper-controlled proxy", helper_contract)
-        self.assertIn(">=2.1.187,<3.0.0", helper_contract)
+        self.assertIn(">=2.1.211,<3.0.0", helper_contract)
         self.assertIn("Linux and WSL2", helper_contract)
         self.assertNotIn("requires `ANTHROPIC_API_KEY`", skill)
 
-    def test_claude_oauth_freshness_is_per_model_attempt(self) -> None:
+    def test_claude_auth_carriers_refresh_without_a_freshness_gate(self) -> None:
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
         helper_contract = (SKILL_ROOT / "references/helper-contract.md").read_text(
             encoding="utf-8"
@@ -103,121 +142,200 @@ class RepositoryContractTest(unittest.TestCase):
             SKILL_ROOT / "references/claude-runtime-trust.md"
         ).read_text(encoding="utf-8")
 
-        self.assertEqual(providers.REVIEW_ATTEMPT_TIMEOUT_SECONDS, 1800.0)
-        self.assertEqual(providers.CLAUDE_AUTH_EXPIRY_MARGIN_SECONDS, 120.0)
-        self.assertEqual(
-            providers.CLAUDE_ATTEMPT_CREDENTIAL_VALIDITY_SECONDS,
-            1920.0,
+        egress_consent = (
+            SKILL_ROOT / "references/egress-consent.md"
+        ).read_text(encoding="utf-8")
+        agents = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        journal = (
+            REPO_ROOT
+            / "docs/project_journal/2026/07/"
+            / "2026-07-17-claude-auth-carriers-c17a11.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertEqual(claude_capabilities.CLAUDE_MINIMUM_VERSION, (2, 1, 211))
+        self.assertEqual(claude_linux.DEFAULT_CREDENTIAL_VALIDITY_SECONDS, 0.0)
+        self.assertFalse(hasattr(providers, "CLAUDE_AUTH_EXPIRY_MARGIN_SECONDS"))
+        self.assertFalse(
+            hasattr(providers, "CLAUDE_ATTEMPT_CREDENTIAL_VALIDITY_SECONDS")
         )
-        self.assertEqual(
-            claude_linux.DEFAULT_CREDENTIAL_VALIDITY_SECONDS,
-            providers.CLAUDE_ATTEMPT_CREDENTIAL_VALIDITY_SECONDS,
-        )
-        self.assertNotIn(
-            "attempt_count",
-            inspect.signature(
-                providers._validate_fresh_claude_keychain_credential
-            ).parameters,
-        )
+
         attempt_source = inspect.getsource(providers._claude_attempt)
-        warmup_source = inspect.getsource(providers._warm_claude_local_login)
+        pwd_home_source = inspect.getsource(providers._claude_pwd_home)
+        select_source = inspect.getsource(providers._select_claude_macos_credential)
+        validate_source = inspect.getsource(
+            providers._validate_claude_local_credential
+        )
+        macos_runtime_source = inspect.getsource(providers._claude_keychain_runtime)
+        macos_persist_source = inspect.getsource(
+            providers._persist_claude_macos_refreshed_credential
+        ) + inspect.getsource(
+            providers._persist_claude_macos_refreshed_credential_impl
+        )
         run_review_source = inspect.getsource(providers.run_review)
+        auth_outcome_source = inspect.getsource(
+            providers._finish_claude_auth_required
+        )
         linux_runtime_source = inspect.getsource(
             providers._claude_linux_review_runtime
         )
-        self.assertIn("_warm_claude_local_login", attempt_source)
-        self.assertIn("_prepare_claude_tls_environment", attempt_source)
-        self.assertIn("ClaudeKeychainBrokerUnavailable", attempt_source)
-        self.assertEqual(
-            attempt_source.count("ClaudeLoopbackUnavailable"),
-            2,
+        linux_command_source = inspect.getsource(claude_linux.build_sandbox_command)
+        keychain_write_source = inspect.getsource(
+            providers._write_claude_keychain_credential
         )
-        self.assertIn('"failure_class": "credential-read"', attempt_source)
-        self.assertEqual(
-            warmup_source.count(
-                "_require_fresh_claude_keychain_credential_for_auth_preflight"
-            ),
-            2,
+        file_write_source = inspect.getsource(
+            providers._write_claude_file_credential
         )
-        self.assertIn(
-            "isinstance(credential_error, ClaudeKeychainBrokerUnavailable)",
-            warmup_source,
+        linux_write_source = inspect.getsource(
+            claude_linux._writeback_refreshed_credential_impl
         )
-        self.assertIn("ClaudeAuthWarmupEntitlement", attempt_source)
-        self.assertIn("require_verified_model=True", attempt_source)
-        self.assertIn("CLAUDE_ATTEMPT_CREDENTIAL_VALIDITY_SECONDS", linux_runtime_source)
-        self.assertNotIn("_warm_claude_local_login", run_review_source)
-        self.assertNotIn("_prepare_claude_tls_environment", run_review_source)
-        self.assertEqual(
-            run_review_source.count("ClaudeKeychainBrokerUnavailable"),
-            2,
+        linux_staging_source = inspect.getsource(
+            claude_linux.stage_claude_credentials
         )
-        self.assertNotIn("_require_fresh_claude_linux_credential", run_review_source)
+        refresh_lock_source = inspect.getsource(
+            claude_refresh_lock.acquire_claude_refresh_lock
+        )
+        staged_lock_recovery_source = inspect.getsource(
+            claude_refresh_lock.recover_abandoned_staged_claude_refresh_locks
+        )
 
-        self.assertIn("current model attempt", skill)
+        self.assertNotIn("_warm_claude_local_login", attempt_source)
+        self.assertNotIn("authentication-preflight-entitlement", attempt_source)
+        self.assertNotIn("freshness-verified", attempt_source)
+        self.assertIn("_prepare_claude_tls_environment", attempt_source)
+        self.assertIn("_claude_keychain_runtime", attempt_source)
+        self.assertIn("_claude_linux_review_runtime", attempt_source)
+
+        self.assertIn("pwd.getpwuid(os.getuid()).pw_dir", pwd_home_source)
+        self.assertNotIn('os.environ.get("HOME")', pwd_home_source)
+        self.assertIn("_read_claude_keychain_credential", select_source)
+        self.assertIn("_read_claude_macos_file_credential", select_source)
+        self.assertIn("selected = max(", select_source)
+        self.assertIn("candidate.expires_at_ms", select_source)
+        self.assertIn("selected.carrier_snapshot", select_source)
+        self.assertIn("refreshToken", validate_source)
         self.assertIn(
-            "Local-login credential freshness is an attempt-boundary property",
-            helper_contract,
+            "_persist_claude_macos_refreshed_credential",
+            macos_runtime_source,
         )
         self.assertIn(
-            "complete 30-minute timeout plus the 2-minute safety margin",
-            helper_contract,
-        )
-        self.assertIn("current attempt's model", helper_contract)
-        self.assertIn("Every later Opus attempt repeats", helper_contract)
-        self.assertIn("API_KEY` skips local-login warmup and staging", helper_contract)
-        self.assertIn("returns exit `75`; it never authorizes Copilot", helper_contract)
-        self.assertIn(
-            "either the initial or post-warmup credential freshness read",
-            helper_contract,
+            "_retain_claude_macos_refreshed_credential",
+            macos_runtime_source,
         )
         self.assertIn(
-            "attempt-local restricted Keychain broker failure",
-            helper_contract,
+            "_replace_claude_macos_recovery_credential",
+            macos_runtime_source,
         )
+        self.assertIn("immediate-if-refreshed", macos_runtime_source)
+        self.assertIn("_write_claude_keychain_credential", macos_persist_source)
+        self.assertIn("_write_claude_file_credential", macos_persist_source)
+        self.assertNotIn("require_unexpired=True", macos_runtime_source)
+        self.assertNotIn("require_unexpired=True", macos_persist_source)
+
+        self.assertIn("stage_claude_credentials", linux_runtime_source)
+        self.assertIn("writer_started", linux_runtime_source)
+        self.assertIn("writer_quiescent", linux_runtime_source)
+        self.assertIn("writer_started.set()", attempt_source)
+        self.assertIn("writer_quiescent.set()", attempt_source)
+        self.assertIn("retain_for_recovery", linux_staging_source)
+        self.assertIn("writer_quiescent is not True", staged_lock_recovery_source)
+        self.assertIn("reversed(locks)", staged_lock_recovery_source)
+        self.assertNotIn("math.nextafter", linux_runtime_source)
+        self.assertNotIn("staged.expires_at_ms <= time.time()", linux_runtime_source)
+        self.assertNotIn("_require_fresh_claude_linux_credential", run_review_source)
+        self.assertEqual(str(claude_linux.SANDBOX_AUTH_ROOT), "/auth")
+        self.assertEqual(str(claude_linux.SANDBOX_CONFIG), "/auth/config")
         self.assertIn(
-            "A structured transient warmup remains inconclusive",
-            helper_contract,
+            '"CLAUDE_CONFIG_DIR": str(SANDBOX_CONFIG)',
+            linux_command_source,
         )
-        self.assertIn(
-            "credential-read timeout, output-limit, drain, or process-leak",
-            helper_contract,
+
+        carrier_policy_files = {
+            "README.md": readme,
+            "SKILL.md": skill,
+            "helper-contract.md": helper_contract,
+            "claude-runtime-trust.md": runtime_trust,
+            "project journal": journal,
+        }
+        for name, policy in carrier_policy_files.items():
+            with self.subTest(policy=name):
+                normalized = policy.lower()
+                self.assertIn("/auth/config", policy)
+                self.assertIn("final drain", normalized)
+                self.assertIn("recovery carrier", normalized)
+                self.assertNotIn("read(//config", normalized)
+                self.assertNotIn("at `/config`", policy)
+                self.assertNotIn("mounts only that carrier at `/config`", policy)
+
+        for name, policy in {
+            "SKILL.md": skill,
+            "helper-contract.md": helper_contract,
+            "claude-runtime-trust.md": runtime_trust,
+            "project journal": journal,
+        }.items():
+            with self.subTest(macos_recovery_policy=name):
+                normalized = policy.lower()
+                self.assertIn("macos", normalized)
+                self.assertIn("private recovery carrier", normalized)
+                self.assertIn("copilot fallback", normalized)
+
+        protocol = claude_refresh_lock.CLAUDE_REFRESH_LOCK_PROTOCOL_2_1_211
+        self.assertEqual(protocol.primary_lock_name, ".oauth_refresh.lock")
+        self.assertEqual(protocol.legacy_suffix, ".lock")
+        self.assertEqual(protocol.stale_seconds, 60.0)
+        self.assertEqual(protocol.update_seconds, 5.0)
+        self.assertEqual(
+            set(claude_refresh_lock.CERTIFIED_CLAUDE_REFRESH_LOCK_ARTIFACTS),
+            EXPECTED_CLAUDE_2_1_211_LOCK_ARTIFACTS,
         )
-        self.assertIn(
-            "only with `double-review` or `triple-review` consent",
-            helper_contract,
+        self.assertLess(
+            refresh_lock_source.index('label="primary"'),
+            refresh_lock_source.index('label="legacy"'),
         )
-        self.assertIn("At every model-attempt boundary", runtime_trust)
-        self.assertIn("authentication-preflight-inconclusive", runtime_trust)
-        self.assertIn("authentication-preflight-entitlement", runtime_trust)
-        self.assertIn("authentication-preflight-unavailable", runtime_trust)
-        self.assertIn(
-            "while the model whose inconclusive authentication gate failed is not",
-            runtime_trust,
+        for write_source in (keychain_write_source, file_write_source):
+            self.assertIn("claude_refresh_lock", write_source)
+            self.assertIn("_claude_macos_carriers_match", write_source)
+            self.assertIn("refresh_lock.assert_held()", write_source)
+            self.assertIn("refresh_lock_protocol", write_source)
+        self.assertIn("acquire_claude_refresh_lock", linux_write_source)
+        self.assertIn("refresh_lock.assert_held()", linux_write_source)
+        self.assertIn("refresh_lock_protocol", linux_write_source)
+        self.assertIn("_certified_claude_refresh_lock_protocol", attempt_source)
+        self.assertIn('env.get("ANTHROPIC_API_KEY")', attempt_source)
+
+        self.assertIn('"phase": "blocked-authentication"', auth_outcome_source)
+        self.assertIn("CLAUDE_AUTH_LOGIN_ACTION", auth_outcome_source)
+        self.assertIn("_finish_claude_auth_required", run_review_source)
+        self.assertIn("validate_external_workspace", run_review_source)
+        self.assertIn("sensitive-content and escaping-symlink checks passed", run_review_source)
+
+        current_policy = "\n".join(
+            (skill, helper_contract, runtime_trust, egress_consent, agents)
         )
-        self.assertIn(
-            "exact-model-verified entitlement denial",
-            helper_contract,
-        )
-        self.assertIn(
-            "with no final text and without claiming that the final broker",
-            helper_contract,
-        )
-        self.assertIn("explicitly in an error state", helper_contract)
-        self.assertIn(
-            "entitlement-shaped stderr is not fallback evidence",
-            helper_contract,
-        )
-        self.assertIn("overwrites any earlier entitlement model", helper_contract)
-        self.assertIn("full stdout/stderr is retained", helper_contract)
-        self.assertIn(
-            "authentication failure remains unavailable",
-            helper_contract,
-        )
-        self.assertIn(
-            "missing or mismatched model metadata stops the",
-            runtime_trust,
-        )
+        self.assertIn(">=2.1.211,<3.0.0", current_policy)
+        self.assertIn("pwd.getpwuid(os.getuid())", current_policy)
+        self.assertIn("empirically compatible", current_policy)
+        self.assertIn("not an officially guaranteed storage contract", current_policy)
+        self.assertIn("guarded writeback", current_policy)
+        self.assertIn("not an atomic compare-and-swap guarantee", current_policy)
+        self.assertIn("primary `.oauth_refresh.lock`", current_policy)
+        self.assertIn("legacy sibling lock", current_policy)
+        self.assertIn("bypass both locks", current_policy)
+        self.assertIn("credential-lock protocol catalog", current_policy)
+        self.assertIn("certified 5-second heartbeat", current_policy)
+        self.assertIn("both carriers", current_policy)
+        self.assertIn("inspection-inconclusive", current_policy)
+        self.assertIn("Access-token expiry alone is not login expiry", current_policy)
+        self.assertIn("blocked-authentication", current_policy)
+        self.assertIn("claude auth login", current_policy)
+        for policy in (skill, helper_contract, runtime_trust):
+            self.assertIn("claude auth login", policy)
+            self.assertIn("ANTHROPIC_API_KEY", policy)
+            self.assertIn("unset or replace", policy)
+        self.assertIn("secure Claude runtime is deterministically absent/unavailable", current_policy)
+        self.assertIn("model entitlement", current_policy)
+        self.assertNotIn("has no usable local/API authentication", current_policy)
+        self.assertNotIn("1920", current_policy)
 
     def test_claude_linux_file_tools_are_workspace_only_across_supported_versions(
         self,
@@ -236,7 +354,7 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertTrue({"Grep", "Glob"}.issubset(cli_denies))
         self.assertIn(
-            "Read(//config/**)",
+            "Read(//auth/**)",
             claude_linux.CLAUDE_LINUX_FILE_TOOL_DENY_RULES,
         )
         self.assertIn(
@@ -244,7 +362,7 @@ class RepositoryContractTest(unittest.TestCase):
             claude_linux.CLAUDE_LINUX_FILE_TOOL_DENY_RULES,
         )
         self.assertNotIn(
-            "Read(/config/**)",
+            "Read(/auth/**)",
             claude_linux.CLAUDE_LINUX_FILE_TOOL_DENY_RULES,
         )
 
@@ -440,15 +558,25 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 2)
         self.assertIn("--egress-consent", completed.stderr)
 
-    def test_approval_template_covers_both_copilot_fallback_reasons(self) -> None:
+    def test_approval_template_excludes_authentication_from_copilot_fallback(
+        self,
+    ) -> None:
         consent = (SKILL_ROOT / "references/egress-consent.md").read_text(
             encoding="utf-8"
         )
-        self.assertIn("if Claude Code is unavailable", consent)
         self.assertIn(
-            "all pinned Claude models are entitlement-blocked",
+            "secure Claude runtime is deterministically absent/unavailable",
             consent,
         )
+        self.assertIn(
+            "both pinned Claude Opus models are entitlement-blocked",
+            consent,
+        )
+        self.assertIn(
+            "Claude authentication failure pauses as `blocked-authentication`",
+            consent,
+        )
+        self.assertNotIn("has no usable local/API authentication", consent)
 
     def test_triple_review_consent_names_all_provider_organizations(self) -> None:
         candidates = [

@@ -5,6 +5,8 @@ import itertools
 import json
 import os
 import pathlib
+import re
+import signal
 import socket
 import socketserver
 import ssl
@@ -14,6 +16,7 @@ import tempfile
 import threading
 import time
 import unittest
+from collections.abc import Callable
 from unittest import mock
 
 try:
@@ -29,6 +32,7 @@ from review_runtime import (  # noqa: E402
     claude_capabilities,
     claude_linux,
     claude_provenance,
+    claude_refresh_lock,
     common,
     providers,
     workspace as workspace_runtime,
@@ -74,7 +78,7 @@ def claude_help_fixture(*, safe_mode: str | None = None) -> bytes:
 class ProviderPolicyTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
-        root = pathlib.Path(self.temporary.name)
+        root = pathlib.Path(self.temporary.name).resolve()
         # Security fixtures must not inherit a permissive host or CI umask.
         source_root = root / "source"
         source_root.mkdir(mode=0o700)
@@ -155,6 +159,14 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         for patcher in self.host_dependency_patchers:
             patcher.start()
+        self.claude_pwd_home = root / "pwd-home"
+        self.claude_pwd_home.mkdir(mode=0o700)
+        self.claude_pwd_home_patcher = mock.patch.object(
+            providers,
+            "_claude_pwd_home",
+            return_value=self.claude_pwd_home,
+        )
+        self.claude_pwd_home_patcher.start()
         self.native_macho_dependencies = providers._native_macho_dependencies
         self.native_dependency_patcher = mock.patch.object(
             providers,
@@ -203,21 +215,15 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         self.keychain_broker_patcher.start()
         self.claude_keychain_runtime = providers._claude_keychain_runtime
+        self.claude_refresh_lock_protocol = (
+            claude_refresh_lock.CLAUDE_REFRESH_LOCK_PROTOCOL_2_1_211
+        )
         self.keychain_runtime_patcher = mock.patch.object(
             providers,
             "_claude_keychain_runtime",
             side_effect=self.fake_claude_keychain_runtime,
         )
         self.keychain_runtime_patcher.start()
-        self.require_fresh_claude_keychain_credential = (
-            providers._require_fresh_claude_keychain_credential
-        )
-        self.warm_claude_local_login = providers._warm_claude_local_login
-        self.warmup_patcher = mock.patch.object(
-            providers,
-            "_warm_claude_local_login",
-        )
-        self.warmup = self.warmup_patcher.start()
 
     def _refresh_control_artifact_state(self) -> None:
         control_dir = self.review.workspace_root / ".codex-review"
@@ -231,7 +237,6 @@ class ProviderPolicyTest(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
-        self.warmup_patcher.stop()
         self.keychain_runtime_patcher.stop()
         self.keychain_broker_patcher.stop()
         self.trusted_release_patcher.stop()
@@ -239,6 +244,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.claude_linux_platform_patcher.stop()
         self.macos_platform_patcher.stop()
         self.native_dependency_patcher.stop()
+        self.claude_pwd_home_patcher.stop()
         for patcher in reversed(self.host_dependency_patchers):
             patcher.stop()
         self.temporary.cleanup()
@@ -262,12 +268,47 @@ class ProviderPolicyTest(unittest.TestCase):
         self,
         _review: ReviewWorkspace,
         env: dict[str, str],
+        _refresh_lock_protocol: providers.ClaudeRefreshLockProtocol | None,
     ):
         result = dict(env)
         if not result.get("ANTHROPIC_API_KEY"):
             result[providers.CLAUDE_KEYCHAIN_BROKER_PORT_ENV] = "43211"
             result[providers.CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV] = "00" * 32
         yield result
+
+    def test_credential_cleanup_signal_overrides_ordinary_primary(self) -> None:
+        primary = providers.ClaudeCredentialInspectionInconclusive(
+            "injected credential operation failure"
+        )
+        forwarded = providers.ForwardedSignal(signal.SIGTERM)
+
+        with self.assertRaises(providers.ForwardedSignal) as raised:
+            providers._raise_or_attach_claude_credential_cleanup(
+                primary,
+                [forwarded],
+                message="injected cleanup failure",
+            )
+
+        self.assertIs(raised.exception, forwarded)
+
+    def test_primary_credential_signal_precedes_cleanup_interrupt(self) -> None:
+        forwarded = providers.ForwardedSignal(signal.SIGTERM)
+        cleanup_interrupt = KeyboardInterrupt("injected cleanup interrupt")
+
+        providers._raise_or_attach_claude_credential_cleanup(
+            forwarded,
+            [cleanup_interrupt],
+            message="injected cleanup failure",
+        )
+
+        notes = getattr(forwarded, "__notes__", ())
+        if notes:
+            self.assertTrue(any("cleanup failure" in note for note in notes))
+        else:
+            self.assertIsInstance(
+                forwarded.__cause__,
+                providers.ClaudeCredentialCleanupDiagnostic,
+            )
 
     def attempt(
         self,
@@ -339,6 +380,40 @@ class ProviderPolicyTest(unittest.TestCase):
     def write_private_source(self, path: pathlib.Path, payload: bytes) -> None:
         path.write_bytes(payload)
         path.chmod(0o600)
+
+    def write_pwd_home_credential(self, payload: bytes) -> pathlib.Path:
+        config = self.claude_pwd_home / ".claude"
+        config.mkdir(mode=0o700, exist_ok=True)
+        config.chmod(0o700)
+        credential = config / providers.CLAUDE_CREDENTIAL_FILE_NAME
+        self.write_private_source(credential, payload)
+        return credential
+
+    def assert_macos_recovery_carrier(
+        self,
+        error: BaseException,
+        expected_credential: bytes,
+    ) -> pathlib.Path:
+        retained = getattr(
+            error,
+            "_codex_claude_retained_credential_carrier",
+            None,
+        )
+        self.assertIsInstance(retained, str)
+        carrier = pathlib.Path(retained)
+        self.assertTrue(carrier.is_absolute())
+        self.assertEqual(
+            carrier.parent,
+            self.review.container_dir / "claude-runtime" / "macos",
+        )
+        config = carrier / "config"
+        credential = config / providers.CLAUDE_CREDENTIAL_FILE_NAME
+        self.assertEqual(stat.S_IMODE(carrier.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(credential.stat().st_mode), 0o600)
+        self.assertEqual(credential.stat().st_nlink, 1)
+        self.assertEqual(credential.read_bytes(), expected_credential)
+        return carrier
 
     @staticmethod
     def host_ca_safety_rejection(error: ReviewError, *, source: str) -> bool:
@@ -612,7 +687,11 @@ class ProviderPolicyTest(unittest.TestCase):
             providers.ClaudeLoopbackUnavailable,
             "bind denied",
         ):
-            with self.claude_keychain_runtime(self.review, {}):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+            ):
                 self.fail("unavailable broker unexpectedly started")
 
         self.assertEqual(credential, bytearray(len(credential)))
@@ -648,6 +727,190 @@ class ProviderPolicyTest(unittest.TestCase):
         thread.join.assert_not_called()
         self.assertEqual(credential, bytearray(len(credential)))
 
+    def test_recv_exact_scrubs_partial_buffer_on_eof_or_error(self) -> None:
+        class PartialSocket:
+            def __init__(self, *, fail: bool) -> None:
+                self.fail = fail
+                self.calls = 0
+                self.buffer: bytearray | None = None
+
+            def recv_into(self, destination: memoryview, _length: int) -> int:
+                if self.calls == 0:
+                    self.calls += 1
+                    self.buffer = destination.obj
+                    destination[:3] = b"abc"
+                    return 3
+                if self.fail:
+                    raise OSError("fixture receive failure")
+                return 0
+
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                sock = PartialSocket(fail=fail)
+                self.assertIsNone(providers._recv_exact(sock, 8))  # type: ignore[arg-type]
+                self.assertEqual(sock.buffer, bytearray(8))
+
+    def test_keychain_update_script_shape_margin_and_scrubbing(self) -> None:
+        with mock.patch.object(
+            providers,
+            "_claude_keychain_account",
+            return_value="fixture-user",
+        ):
+            credential = bytearray(b"\x00\x7f\xff")
+            script = providers._claude_keychain_update_script(credential)
+            self.assertIsInstance(script, bytearray)
+            self.assertEqual(
+                script,
+                bytearray(
+                    b'add-generic-password -U -a "fixture-user" '
+                    b'-s "Claude Code-credentials" -X "007fff"\n'
+                ),
+            )
+            fixed_length = len(providers._claude_keychain_update_script_prefix()) + len(
+                providers.CLAUDE_KEYCHAIN_UPDATE_SCRIPT_SUFFIX
+            )
+            maximum_credential_length = (
+                providers.CLAUDE_KEYCHAIN_SECURITY_STDIN_LIMIT_BYTES - fixed_length
+            ) // 2
+            at_limit = bytearray(maximum_credential_length)
+            over_limit = bytearray(maximum_credential_length + 1)
+            self.assertTrue(
+                providers._claude_keychain_credential_has_refresh_margin(at_limit)
+            )
+            self.assertFalse(
+                providers._claude_keychain_credential_has_refresh_margin(over_limit)
+            )
+            for payload in (credential, script, at_limit, over_limit):
+                payload[:] = b"\x00" * len(payload)
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(providers, "run_bounded_capture")
+    @mock.patch.object(providers, "_read_claude_keychain_credential")
+    def test_keychain_writeback_scrubs_stdin_script(
+        self,
+        read_credential: mock.Mock,
+        run_command: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        credential = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        expected = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
+        carrier_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=providers._claude_credential_digest(expected),
+            file_digest=None,
+            file_snapshot=None,
+        )
+        read_credential.side_effect = lambda _review: bytearray(expected)
+        captured: dict[str, object] = {}
+        completed = common.BoundedCapture(
+            argv=(str(self.claude_keychain_client), "-i"),
+            returncode=0,
+            stdout=bytearray(b"fixture-output"),
+            stderr=bytearray(b"fixture-error"),
+        )
+
+        def capture_script(*_args: object, **kwargs: object) -> common.BoundedCapture:
+            script = kwargs["stdin"]
+            assert isinstance(script, bytearray)
+            captured["script"] = script
+            captured["snapshot"] = bytes(script)
+            return completed
+
+        run_command.side_effect = capture_script
+        with mock.patch.object(
+            providers,
+            "_claude_credential_update_lock",
+            side_effect=lambda _name: contextlib.nullcontext(),
+        ):
+            self.assertTrue(
+                providers._write_claude_keychain_credential(
+                    self.review,
+                    credential,
+                    expected,
+                    carrier_snapshot,
+                    self.claude_refresh_lock_protocol,
+                )
+            )
+
+        script = captured["script"]
+        assert isinstance(script, bytearray)
+        self.assertEqual(script, bytearray(len(script)))
+        snapshot = captured["snapshot"]
+        assert isinstance(snapshot, bytes)
+        self.assertTrue(snapshot.startswith(b"add-generic-password -U "))
+        self.assertTrue(snapshot.endswith(b'"\n'))
+        self.assertEqual(completed.stdout, bytearray(len(completed.stdout)))
+        self.assertEqual(completed.stderr, bytearray(len(completed.stderr)))
+
+        failed_capture: dict[str, bytearray] = {}
+
+        def fail_after_capture(
+            *_args: object,
+            **kwargs: object,
+        ) -> common.BoundedCapture:
+            script = kwargs["stdin"]
+            assert isinstance(script, bytearray)
+            failed_capture["script"] = script
+            raise OSError("fixture runner failure")
+
+        run_command.side_effect = fail_after_capture
+        with mock.patch.object(
+            providers,
+            "_claude_credential_update_lock",
+            side_effect=lambda _name: contextlib.nullcontext(),
+        ):
+            self.assertFalse(
+                providers._write_claude_keychain_credential(
+                    self.review,
+                    credential,
+                    expected,
+                    carrier_snapshot,
+                    self.claude_refresh_lock_protocol,
+                )
+            )
+        failed_script = failed_capture["script"]
+        self.assertEqual(failed_script, bytearray(len(failed_script)))
+        credential[:] = b"\x00" * len(credential)
+        expected[:] = b"\x00" * len(expected)
+
+    def test_helper_credential_lock_contention_is_inconclusive(self) -> None:
+        import fcntl
+
+        with (
+            mock.patch.object(
+                providers,
+                "CLAUDE_CREDENTIAL_UPDATE_LOCK_TIMEOUT_SECONDS",
+                0.0,
+            ),
+            mock.patch.object(
+                fcntl,
+                "flock",
+                side_effect=BlockingIOError(),
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeCredentialInspectionInconclusive,
+                "another isolated review",
+            ),
+        ):
+            with providers._claude_credential_update_lock("keychain"):
+                self.fail("contended helper lock unexpectedly acquired")
+
+    def test_helper_credential_lock_open_failure_is_inconclusive(self) -> None:
+        with (
+            mock.patch.object(
+                providers.os,
+                "open",
+                side_effect=OSError(5, "injected sensitive lock detail"),
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeCredentialInspectionInconclusive,
+                "cannot open the Claude credential update lock safely",
+            ) as raised,
+        ):
+            with providers._claude_credential_update_lock("keychain"):
+                self.fail("helper lock unexpectedly opened")
+
+        self.assertNotIn("injected sensitive lock detail", str(raised.exception))
+
     def test_claude_keychain_broker_serves_one_in_memory_value(self) -> None:
         if (
             sys.platform != "darwin"
@@ -665,11 +928,17 @@ class ProviderPolicyTest(unittest.TestCase):
         broker = broker_dir / "security"
         credential = bytearray(b"fixture-value")
         capability = bytes.fromhex("01" * 32)
+        updates: list[bytes] = []
+
+        def record_update(updated: bytearray) -> bool:
+            updates.append(bytes(updated))
+            return True
 
         try:
             context = providers._claude_keychain_credential_server(
                 credential,
                 capability,
+                update_callback=record_update,
             )
             with context as port:
                 prepared["TMPDIR"] = str(self.review.container_dir / "tmp")
@@ -700,6 +969,23 @@ class ProviderPolicyTest(unittest.TestCase):
                     self.assertEqual(unauthorized.recv(1), b"")
                 first = providers.run(query, env=prepared)
                 second = providers.run(query, env=prepared)
+                refreshed = oauth_credential_fixture()
+                update_script = (
+                    f'add-generic-password -U -a "{prepared["USER"]}" '
+                    f'-s "{providers.CLAUDE_KEYCHAIN_SERVICE}" '
+                    f'-X "{refreshed.hex()}"\n'
+                ).encode("ascii")
+                valid_update = providers.run(
+                    (
+                        str(providers.CLAUDE_PROBE_SANDBOX),
+                        "-p",
+                        profile,
+                        str(broker),
+                        "-i",
+                    ),
+                    env=prepared,
+                    stdin=update_script,
+                )
                 stdin_update = providers.run(
                     (
                         str(providers.CLAUDE_PROBE_SANDBOX),
@@ -734,6 +1020,8 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(first.returncode, 0)
         self.assertEqual(first.stdout, b"fixture-value\n")
         self.assertEqual(second.returncode, 44)
+        self.assertEqual(valid_update.returncode, 0)
+        self.assertEqual(updates, [refreshed])
         self.assertEqual(stdin_update.returncode, 64)
         self.assertEqual(direct_update.returncode, 64)
         self.assertEqual(credential, bytearray(len(credential)))
@@ -779,1134 +1067,2107 @@ class ProviderPolicyTest(unittest.TestCase):
             providers.CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
         )
 
-    @mock.patch.object(providers, "_read_claude_keychain_credential")
-    def test_keychain_preflight_rejects_stale_access_token(
+    @mock.patch.object(providers, "run_bounded_capture")
+    def test_keychain_exit_44_is_absent_but_other_errors_are_inconclusive(
         self,
-        read_credential: mock.Mock,
+        run_command: mock.Mock,
     ) -> None:
-        required_window = (
-            providers.REVIEW_ATTEMPT_TIMEOUT_SECONDS
-            + providers.CLAUDE_AUTH_EXPIRY_MARGIN_SECONDS
+        run_command.return_value = common.BoundedCapture(
+            argv=(),
+            returncode=44,
+            stdout=bytearray(),
+            stderr=bytearray(b"not found"),
         )
-        credential = bytearray(
-            oauth_credential_fixture(expires_in_seconds=required_window - 10)
-        )
-        read_credential.return_value = credential
+        self.assertIsNone(providers._read_claude_keychain_credential(self.review))
 
+        run_command.return_value = common.BoundedCapture(
+            argv=(),
+            returncode=36,
+            stdout=bytearray(),
+            stderr=bytearray(b"interaction denied"),
+        )
         with self.assertRaisesRegex(
-            providers.ClaudeKeychainCredentialUnavailable,
-            "cannot cover the current model attempt window",
+            providers.ClaudeCredentialInspectionInconclusive,
+            "status 36",
         ):
-            self.require_fresh_claude_keychain_credential(self.review)
+            providers._read_claude_keychain_credential(self.review)
 
-        self.assertEqual(credential, bytearray(len(credential)))
-
-    @mock.patch.object(providers, "_read_claude_keychain_credential")
-    def test_keychain_preflight_accepts_fresh_access_token(
-        self,
-        read_credential: mock.Mock,
-    ) -> None:
-        credential = bytearray(oauth_credential_fixture())
-        read_credential.return_value = credential
-
-        self.require_fresh_claude_keychain_credential(self.review)
-
-        self.assertEqual(credential, bytearray(len(credential)))
-
-    @mock.patch.object(providers, "_read_claude_keychain_credential")
-    def test_keychain_preflight_accepts_one_hour_token_for_single_attempt(
-        self,
-        read_credential: mock.Mock,
-    ) -> None:
-        credential = bytearray(
-            oauth_credential_fixture(expires_in_seconds=60 * 60)
+        payload = oauth_credential_fixture()
+        completed = common.BoundedCapture(
+            argv=(),
+            returncode=0,
+            stdout=bytearray(b" \t" + payload + b"\r\n"),
+            stderr=bytearray(),
         )
-        read_credential.return_value = credential
+        run_command.return_value = completed
+        credential = providers._read_claude_keychain_credential(self.review)
+        self.assertEqual(credential, bytearray(payload))
+        self.assertEqual(completed.stdout, bytearray(len(completed.stdout)))
+        assert credential is not None
+        credential[:] = b"\x00" * len(credential)
 
-        self.require_fresh_claude_keychain_credential(self.review)
+    @mock.patch.object(
+        providers,
+        "run_bounded_capture",
+        side_effect=OSError("temporary Keychain I/O failure"),
+    )
+    def test_keychain_io_failure_is_inconclusive(
+        self,
+        _run_command: mock.Mock,
+    ) -> None:
+        with self.assertRaisesRegex(
+            providers.ClaudeCredentialInspectionInconclusive,
+            "Keychain query failed",
+        ):
+            providers._read_claude_keychain_credential(self.review)
 
-        self.assertEqual(credential, bytearray(len(credential)))
+    def test_pwd_home_credential_reader_ignores_ambient_home_and_config(self) -> None:
+        payload = oauth_credential_fixture()
+        credential_path = self.write_pwd_home_credential(payload)
 
-    def test_fresh_local_login_does_not_run_authentication_warmup(self) -> None:
-        executable = pathlib.Path("/verified/claude")
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HOME": str(self.review.source_root / "ambient-home"),
+                "CLAUDE_CONFIG_DIR": str(self.review.source_root / "ambient-config"),
+            },
+        ):
+            result = providers._read_claude_macos_file_credential()
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        credential, snapshot = result
+        self.assertEqual(credential, bytearray(payload))
+        self.assertEqual(snapshot.home, self.claude_pwd_home)
+        self.assertEqual(stat.S_IMODE(credential_path.stat().st_mode), 0o600)
+        credential[:] = b"\x00" * len(credential)
+
+    def test_absolute_directory_walk_closes_each_owned_descriptor_once(self) -> None:
+        close_calls: list[int] = []
+
+        def close_descriptor(descriptor: int) -> None:
+            close_calls.append(descriptor)
+            if descriptor == 10:
+                raise KeyboardInterrupt
+
+        with (
+            mock.patch.object(providers.os, "open", side_effect=[10, 11]) as open_fd,
+            mock.patch.object(
+                providers.os,
+                "close",
+                side_effect=close_descriptor,
+            ),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            providers._open_absolute_directory_without_symlinks(
+                pathlib.Path("/fixture")
+            )
+
+        self.assertEqual(open_fd.call_count, 2)
+        self.assertEqual(close_calls, [10, 11])
+
+    def test_config_directory_cleanup_preserves_control_flow_and_closes_all(
+        self,
+    ) -> None:
+        home_metadata = mock.Mock(
+            st_mode=stat.S_IFDIR | 0o700,
+            st_uid=os.getuid(),
+        )
+        close_calls: list[int] = []
+
+        def close_descriptor(descriptor: int) -> None:
+            close_calls.append(descriptor)
+            if descriptor == 11:
+                raise OSError("injected config close failure")
+
         with (
             mock.patch.object(
                 providers,
-                "_require_fresh_claude_keychain_credential",
-            ) as require_fresh,
+                "_open_absolute_directory_without_symlinks",
+                return_value=10,
+            ),
+            mock.patch.object(providers.os, "open", return_value=11),
+            mock.patch.object(
+                providers.os,
+                "fstat",
+                side_effect=[home_metadata, SystemExit()],
+            ),
+            mock.patch.object(
+                providers.os,
+                "close",
+                side_effect=close_descriptor,
+            ),
+            self.assertRaises(SystemExit),
+        ):
+            providers._open_claude_credential_config_directory(
+                pathlib.Path("/fixture")
+            )
+
+        self.assertEqual(close_calls, [11, 10])
+
+    def test_missing_config_close_failure_does_not_retry_numeric_descriptor(
+        self,
+    ) -> None:
+        home_metadata = mock.Mock(
+            st_mode=stat.S_IFDIR | 0o700,
+            st_uid=os.getuid(),
+        )
+        with (
             mock.patch.object(
                 providers,
-                "_run_claude_auth_warmup",
-            ) as run_warmup,
+                "_open_absolute_directory_without_symlinks",
+                return_value=10,
+            ),
+            mock.patch.object(providers.os, "fstat", return_value=home_metadata),
+            mock.patch.object(
+                providers.os,
+                "open",
+                side_effect=FileNotFoundError,
+            ),
+            mock.patch.object(
+                providers.os,
+                "close",
+                side_effect=OSError("injected home close failure"),
+            ) as close_fd,
+            self.assertRaisesRegex(
+                providers.ClaudeCredentialInspectionInconclusive,
+                "credential home",
+            ),
         ):
-            self.warm_claude_local_login(
+            providers._open_claude_credential_config_directory(
+                pathlib.Path("/fixture")
+            )
+
+        close_fd.assert_called_once_with(10)
+
+    def test_credential_file_close_does_not_replace_primary_control_flow(
+        self,
+    ) -> None:
+        with (
+            mock.patch.object(providers.os, "open", return_value=10),
+            mock.patch.object(providers.os, "fstat", side_effect=KeyboardInterrupt),
+            mock.patch.object(providers.os, "close", side_effect=SystemExit),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            providers._read_claude_credential_file_from_directory(5)
+
+    def test_pwd_home_credential_reader_rejects_unsafe_file_or_directory(self) -> None:
+        credential_path = self.write_pwd_home_credential(oauth_credential_fixture())
+        credential_path.chmod(0o644)
+        with self.assertRaisesRegex(
+            providers.ClaudeCredentialUnsafe,
+            "exactly 0600",
+        ):
+            providers._read_claude_macos_file_credential()
+
+        credential_path.chmod(0o600)
+        credential_path.parent.chmod(0o777)
+        with self.assertRaisesRegex(
+            providers.ClaudeCredentialUnsafe,
+            "not group- or world-writable",
+        ):
+            providers._read_claude_macos_file_credential()
+
+    @mock.patch.object(providers, "_read_claude_macos_file_credential")
+    @mock.patch.object(providers, "_read_claude_keychain_credential")
+    def test_macos_credential_selection_uses_later_expiry_and_keychain_tie(
+        self,
+        read_keychain: mock.Mock,
+        read_file: mock.Mock,
+    ) -> None:
+        snapshot = providers._ClaudeCredentialFileSnapshot(
+            home=self.claude_pwd_home,
+            home_identity=(1, 2, os.getuid(), 0o700),
+            config_identity=(1, 3, os.getuid(), 0o700),
+            file_identity=(1, 4, os.getuid(), 0o600, 1, 10, 11, 12),
+        )
+        keychain = bytearray(oauth_credential_fixture(expires_in_seconds=60))
+        file_credential = bytearray(oauth_credential_fixture(expires_in_seconds=120))
+        read_keychain.return_value = keychain
+        read_file.return_value = (file_credential, snapshot)
+
+        selected = providers._select_claude_macos_credential(self.review)
+
+        self.assertEqual(selected.source, "pwd-home-credential-file")
+        assert selected.carrier_snapshot is not None
+        self.assertEqual(
+            selected.carrier_snapshot.keychain_refresh_digest,
+            selected.carrier_snapshot.file_refresh_digest,
+        )
+        self.assertEqual(keychain, bytearray(len(keychain)))
+        selected.payload[:] = b"\x00" * len(selected.payload)
+
+        tied = bytearray(oauth_credential_fixture(expires_in_seconds=300))
+        read_keychain.return_value = tied
+        read_file.return_value = (bytearray(tied), snapshot)
+        selected = providers._select_claude_macos_credential(self.review)
+        self.assertEqual(selected.source, "macos-keychain")
+        selected.payload[:] = b"\x00" * len(selected.payload)
+
+    @mock.patch.object(providers, "_read_claude_macos_file_credential")
+    @mock.patch.object(providers, "_read_claude_keychain_credential")
+    def test_unselected_distinct_keychain_size_does_not_block_file_login(
+        self,
+        read_keychain: mock.Mock,
+        read_file: mock.Mock,
+    ) -> None:
+        keychain_value = json.loads(oauth_credential_fixture(expires_in_seconds=60))
+        keychain_value["padding"] = "x" * (
+            providers.CLAUDE_KEYCHAIN_SECURITY_STDIN_LIMIT_BYTES
+        )
+        keychain = bytearray(json.dumps(keychain_value).encode())
+        file_value = json.loads(oauth_credential_fixture(expires_in_seconds=3600))
+        file_value["claudeAiOauth"]["refreshToken"] = (
+            "fixture-independent-file-refresh-value"
+        )
+        file_credential = bytearray(json.dumps(file_value).encode())
+        snapshot = providers._ClaudeCredentialFileSnapshot(
+            home=self.claude_pwd_home,
+            home_identity=(1,),
+            config_identity=(2,),
+            file_identity=(3,),
+        )
+        read_keychain.return_value = keychain
+        read_file.return_value = (file_credential, snapshot)
+
+        selected = providers._select_claude_macos_credential(self.review)
+
+        self.assertEqual(selected.source, "pwd-home-credential-file")
+        self.assertEqual(keychain, bytearray(len(keychain)))
+        selected.payload[:] = b"\x00" * len(selected.payload)
+
+    @mock.patch.object(providers, "_read_claude_macos_file_credential")
+    @mock.patch.object(providers, "_read_claude_keychain_credential")
+    def test_oversized_keychain_still_blocks_shared_login_writeback(
+        self,
+        read_keychain: mock.Mock,
+        read_file: mock.Mock,
+    ) -> None:
+        keychain_value = json.loads(oauth_credential_fixture(expires_in_seconds=60))
+        keychain_value["padding"] = "x" * (
+            providers.CLAUDE_KEYCHAIN_SECURITY_STDIN_LIMIT_BYTES
+        )
+        keychain = bytearray(json.dumps(keychain_value).encode())
+        file_credential = bytearray(
+            oauth_credential_fixture(expires_in_seconds=3600)
+        )
+        snapshot = providers._ClaudeCredentialFileSnapshot(
+            home=self.claude_pwd_home,
+            home_identity=(1,),
+            config_identity=(2,),
+            file_identity=(3,),
+        )
+        read_keychain.return_value = keychain
+        read_file.return_value = (file_credential, snapshot)
+
+        with self.assertRaisesRegex(
+            providers.ClaudeCredentialUnsafe,
+            "too large for safe refresh persistence",
+        ):
+            providers._select_claude_macos_credential(self.review)
+
+        self.assertEqual(keychain, bytearray(len(keychain)))
+        self.assertEqual(file_credential, bytearray(len(file_credential)))
+
+    def test_refresh_lock_protocol_requires_exact_verified_artifact_report(
+        self,
+    ) -> None:
+        version, platform_key, checksum = next(
+            iter(claude_refresh_lock.CERTIFIED_CLAUDE_REFRESH_LOCK_ARTIFACTS)
+        )
+        executable = self.review.container_dir / "verified-claude"
+        report = {
+            "schema": 1,
+            "version": version,
+            "platform": platform_key,
+            "sha256": checksum,
+            "verified_executable": str(executable),
+            "publisher_provenance": "anthropic-signed-manifest",
+        }
+        common.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            report,
+        )
+        self.assertIs(
+            providers._certified_claude_refresh_lock_protocol(
                 self.review,
                 executable,
-                {},
-                providers.CLAUDE_MODELS[0],
-            )
-
-        require_fresh.assert_called_once_with(self.review)
-        run_warmup.assert_not_called()
-
-    def test_keychain_preflight_rejects_unbounded_integer_expiry(self) -> None:
-        credential = bytearray(
-            json.dumps(
-                {
-                    "claudeAiOauth": {
-                        "access" + "Token": "fixture-" + "access-value",
-                        "refresh" + "Token": "fixture-" + "refresh-value",
-                        "expiresAt": 10**1000,
-                    }
-                }
-            ).encode()
+            ),
+            self.claude_refresh_lock_protocol,
         )
+
+        tampered_values = (
+            ("version", "2.9.999"),
+            ("platform", "linux-unknown"),
+            ("sha256", "0" + checksum[1:]),
+            ("verified_executable", str(executable) + "-other"),
+            ("publisher_provenance", "unverified"),
+        )
+        for field, value in tampered_values:
+            with self.subTest(field=field):
+                tampered = dict(report)
+                tampered[field] = value
+                common.write_json(
+                    self.review.container_dir / "claude-runtime.json",
+                    tampered,
+                )
+                with self.assertRaises(
+                    providers.ClaudeExecutableInspectionInconclusive
+                ):
+                    providers._certified_claude_refresh_lock_protocol(
+                        self.review,
+                        executable,
+                    )
+
+    @mock.patch.object(providers, "_read_claude_macos_file_credential")
+    @mock.patch.object(providers, "_read_claude_keychain_credential")
+    def test_malformed_secondary_source_blocks_valid_source(
+        self,
+        read_keychain: mock.Mock,
+        read_file: mock.Mock,
+    ) -> None:
+        keychain = bytearray(oauth_credential_fixture())
+        malformed = bytearray(b'{"claudeAiOauth":{}}')
+        snapshot = providers._ClaudeCredentialFileSnapshot(
+            home=self.claude_pwd_home,
+            home_identity=(1,),
+            config_identity=(2,),
+            file_identity=(3,),
+        )
+        read_keychain.return_value = keychain
+        read_file.return_value = (malformed, snapshot)
 
         with self.assertRaisesRegex(
-            providers.ClaudeKeychainCredentialUnavailable,
-            "cannot cover the current model attempt window",
+            providers.ClaudeCredentialUnsafe,
+            "pwd-home file credential is malformed",
         ):
-            providers._validate_fresh_claude_keychain_credential(credential)
+            providers._select_claude_macos_credential(self.review)
 
-    def test_each_local_login_model_attempt_refreshes_after_runtime_preparation(
+        self.assertEqual(keychain, bytearray(len(keychain)))
+        self.assertEqual(malformed, bytearray(len(malformed)))
+
+    @mock.patch.object(
+        providers,
+        "_read_claude_macos_file_credential",
+        return_value=None,
+    )
+    @mock.patch.object(providers, "_read_claude_keychain_credential")
+    def test_deeply_nested_credential_is_malformed(
         self,
+        read_keychain: mock.Mock,
+        _read_file: mock.Mock,
     ) -> None:
-        executable = self.review.container_dir / "verified-claude"
-        executable.write_bytes(b"snapshot")
+        depth = 10_000
+        credential = bytearray(
+            b'{"claudeAiOauth":'
+            + b"[" * depth
+            + b"0"
+            + b"]" * depth
+            + b"}"
+        )
+        read_keychain.return_value = credential
+
+        with self.assertRaisesRegex(
+            providers.ClaudeCredentialUnsafe,
+            "macOS Keychain credential is malformed",
+        ):
+            providers._select_claude_macos_credential(self.review)
+
+        self.assertEqual(credential, bytearray(len(credential)))
+        raw_credential = bytearray(
+            b'{"claudeAiOauth":'
+            + b"[" * depth
+            + b"0"
+            + b"]" * depth
+            + b"}"
+        )
+        with self.assertRaisesRegex(
+            providers.ClaudeCredentialUnsafe,
+            "refresh token is malformed",
+        ):
+            providers._claude_credential_refresh_digest(raw_credential)
+
+    @mock.patch.object(
+        providers,
+        "_read_claude_macos_file_credential",
+        return_value=None,
+    )
+    @mock.patch.object(providers, "_read_claude_keychain_credential")
+    def test_expired_access_token_remains_refreshable_in_final_runtime(
+        self,
+        read_keychain: mock.Mock,
+        _read_file: mock.Mock,
+    ) -> None:
+        credential = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        read_keychain.return_value = credential
+
+        selected = providers._select_claude_macos_credential(self.review)
+
+        self.assertEqual(selected.source, "macos-keychain")
+        self.assertLess(selected.expires_at_ms, time.time() * 1000)
+        selected.payload[:] = b"\x00" * len(selected.payload)
+
+    def test_credential_json_rejects_duplicate_keys_and_nonfinite_expiry(self) -> None:
+        duplicate = bytearray(
+            b'{"claudeAiOauth":{"accessToken":"a","accessToken":"b",'
+            b'"refreshToken":"r","expiresAt":1}}'
+        )
+        nonfinite = bytearray(
+            b'{"claudeAiOauth":{"accessToken":"a","refreshToken":"r",'
+            b'"expiresAt":NaN}}'
+        )
+        for payload in (duplicate, nonfinite):
+            with self.subTest(payload=payload), self.assertRaises(
+                providers.ClaudeCredentialUnsafe
+            ):
+                providers._validate_claude_local_credential(
+                    payload,
+                    source="fixture",
+                )
+
+    def test_file_refresh_writeback_is_atomic_0600_and_compare_guarded(self) -> None:
+        original = oauth_credential_fixture(expires_in_seconds=60)
+        credential_path = self.write_pwd_home_credential(original)
+        result = providers._read_claude_macos_file_credential()
+        assert result is not None
+        expected, snapshot = result
+        refreshed_value = json.loads(
+            oauth_credential_fixture(expires_in_seconds=-60)
+        )
+        refreshed_value["claudeAiOauth"]["refreshToken"] = (
+            "fixture-" + "rotated-refresh-value"
+        )
+        refreshed = bytearray(json.dumps(refreshed_value).encode())
+        carrier_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=None,
+            file_digest=providers._claude_credential_digest(expected),
+            file_snapshot=snapshot,
+        )
+
+        with mock.patch.object(
+            providers,
+            "_read_claude_keychain_credential",
+            return_value=None,
+        ):
+            self.assertTrue(providers._write_claude_file_credential(
+                self.review,
+                refreshed,
+                expected,
+                snapshot,
+                carrier_snapshot,
+                self.claude_refresh_lock_protocol,
+            ))
+        self.assertEqual(credential_path.read_bytes(), bytes(refreshed))
+        self.assertEqual(stat.S_IMODE(credential_path.stat().st_mode), 0o600)
+
+        result = providers._read_claude_macos_file_credential()
+        assert result is not None
+        stale_expected, stale_snapshot = result
+        replacement = oauth_credential_fixture(expires_in_seconds=1800)
+        self.write_private_source(credential_path, replacement)
+        newer = bytearray(oauth_credential_fixture(expires_in_seconds=10800))
+        stale_carrier_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=None,
+            file_digest=providers._claude_credential_digest(stale_expected),
+            file_snapshot=stale_snapshot,
+        )
+        with mock.patch.object(
+            providers,
+            "_read_claude_keychain_credential",
+            return_value=None,
+        ):
+            self.assertFalse(providers._write_claude_file_credential(
+                self.review,
+                newer,
+                stale_expected,
+                stale_snapshot,
+                stale_carrier_snapshot,
+                self.claude_refresh_lock_protocol,
+            ))
+        self.assertEqual(credential_path.read_bytes(), replacement)
+        for payload in (expected, refreshed, stale_expected, newer):
+            payload[:] = b"\x00" * len(payload)
+
+    def test_file_refresh_writeback_holds_claude_lock_at_commit(self) -> None:
+        original = oauth_credential_fixture(expires_in_seconds=60)
+        credential_path = self.write_pwd_home_credential(original)
+        result = providers._read_claude_macos_file_credential()
+        assert result is not None
+        expected, snapshot = result
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        carrier_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=None,
+            file_digest=providers._claude_credential_digest(expected),
+            file_snapshot=snapshot,
+        )
         events: list[str] = []
-
-        def prepare_tool(
-            _review: ReviewWorkspace,
-            env: dict[str, str],
-        ) -> dict[str, str]:
-            events.append("tool")
-            return dict(env)
-
-        def prepare_tls(
-            _review: ReviewWorkspace,
-            env: dict[str, str],
-        ) -> dict[str, str]:
-            events.append("tls")
-            return dict(env)
-
-        def warmup(
-            _review: ReviewWorkspace,
-            _executable: pathlib.Path,
-            _env: dict[str, str],
-            _model: str,
-        ) -> None:
-            events.append("warmup")
+        lease = mock.Mock(spec=["assert_held"])
+        lease.assert_held.side_effect = lambda: events.append("assert-held")
+        real_replace = os.replace
 
         @contextlib.contextmanager
-        def broker_runtime(
-            _review: ReviewWorkspace,
-            env: dict[str, str],
+        def coordinated_refresh_lock(
+            path: pathlib.Path,
+            *,
+            protocol: providers.ClaudeRefreshLockProtocol,
         ):
-            events.append("broker")
-            yield dict(env)
+            self.assertEqual(path, credential_path.parent)
+            self.assertIs(protocol, self.claude_refresh_lock_protocol)
+            events.append("lock-acquired")
+            yield lease
+            events.append("lock-released")
 
-        attempts = (
-            self.attempt("claude", providers.CLAUDE_MODELS[0], "entitlement"),
-            self.attempt(
-                "claude",
-                providers.CLAUDE_MODELS[1],
-                "success",
-                final_text="No findings.",
-            ),
-        )
-        completed = Completed(
-            argv=("claude",),
-            returncode=0,
-            stdout=b"{}",
-            stderr=b"",
-        )
-        self.warmup.side_effect = warmup
-        providers._claude_keychain_runtime.side_effect = broker_runtime
-
-        def runner(**kwargs) -> providers.Attempt:
-            return providers._claude_attempt(executable=executable, **kwargs)
+        def replace_after_assert(*args: object, **kwargs: object) -> None:
+            events.append("replace")
+            real_replace(*args, **kwargs)
 
         with (
             mock.patch.object(
                 providers,
-                "_with_claude_review_tool_path",
-                side_effect=prepare_tool,
+                "claude_refresh_lock",
+                side_effect=coordinated_refresh_lock,
+            ),
+            mock.patch.object(
+                providers.os,
+                "replace",
+                side_effect=replace_after_assert,
             ),
             mock.patch.object(
                 providers,
-                "_prepare_claude_tls_environment",
-                side_effect=prepare_tls,
+                "_read_claude_keychain_credential",
+                return_value=None,
             ),
-            mock.patch.object(
-                providers,
-                "_claude_connect_proxy",
-                return_value=contextlib.nullcontext(43210),
-            ),
-            mock.patch.object(
-                providers,
-                "_claude_review_sandbox_profile",
-                return_value="(version 1)",
-            ),
-            mock.patch.object(providers, "run", return_value=completed),
-            mock.patch.object(
-                providers,
-                "_parse_claude_output",
-                return_value=(None, None),
-            ),
-            mock.patch.object(
-                providers,
-                "_record_attempt",
-                side_effect=attempts,
-            ),
-            mock.patch.object(
-                providers,
-                "_update_claude_runtime_report",
-            ) as update_report,
         ):
-            category, final_text = providers._run_model_chain(
-                review=self.review,
-                models=providers.CLAUDE_MODELS,
-                runner=runner,
-                runtime="claude",
-                requested_effort=providers.CLAUDE_REASONING_EFFORT,
-                env={},
-                attempts=[],
+            self.assertTrue(
+                providers._write_claude_file_credential(
+                    self.review,
+                    refreshed,
+                    expected,
+                    snapshot,
+                    carrier_snapshot,
+                    self.claude_refresh_lock_protocol,
+                )
             )
 
-        self.assertEqual(category, "success")
-        self.assertEqual(final_text, "No findings.")
-        self.assertEqual(
-            events,
-            [
-                "tool",
-                "tls",
-                "warmup",
-                "broker",
-                "tool",
-                "tls",
-                "warmup",
-                "broker",
-            ],
+        self.assertLess(events.index("assert-held"), events.index("replace"))
+        self.assertEqual(events[0], "lock-acquired")
+        self.assertEqual(events[-1], "lock-released")
+        expected[:] = b"\x00" * len(expected)
+        refreshed[:] = b"\x00" * len(refreshed)
+
+    def test_file_refresh_temporary_close_preserves_control_flow(self) -> None:
+        original = oauth_credential_fixture(expires_in_seconds=60)
+        credential_path = self.write_pwd_home_credential(original)
+        result = providers._read_claude_macos_file_credential()
+        assert result is not None
+        expected, snapshot = result
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        carrier_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=None,
+            file_digest=providers._claude_credential_digest(expected),
+            file_snapshot=snapshot,
         )
-        self.assertEqual(self.warmup.call_count, len(providers.CLAUDE_MODELS))
-        self.assertEqual(
-            [call.args[3] for call in self.warmup.call_args_list],
-            list(providers.CLAUDE_MODELS),
+        real_close = os.close
+        temporary_descriptor: list[int] = []
+
+        def interrupt_write(descriptor: int, _payload: bytearray) -> None:
+            temporary_descriptor.append(descriptor)
+            raise KeyboardInterrupt
+
+        def close_with_temporary_failure(descriptor: int) -> None:
+            if temporary_descriptor and descriptor == temporary_descriptor[0]:
+                raise OSError("injected temporary close failure")
+            real_close(descriptor)
+
+        try:
+            with (
+                mock.patch.object(
+                    providers,
+                    "_read_claude_keychain_credential",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_write_all_to_descriptor",
+                    side_effect=interrupt_write,
+                ),
+                mock.patch.object(
+                    providers.os,
+                    "close",
+                    side_effect=close_with_temporary_failure,
+                ),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                providers._write_claude_file_credential(
+                    self.review,
+                    refreshed,
+                    expected,
+                    snapshot,
+                    carrier_snapshot,
+                    self.claude_refresh_lock_protocol,
+                )
+        finally:
+            if temporary_descriptor:
+                real_close(temporary_descriptor[0])
+
+        self.assertEqual(credential_path.read_bytes(), original)
+        expected[:] = b"\x00" * len(expected)
+        refreshed[:] = b"\x00" * len(refreshed)
+
+    def test_file_refresh_writeback_rejects_new_unselected_keychain_value(
+        self,
+    ) -> None:
+        original = oauth_credential_fixture(expires_in_seconds=60)
+        credential_path = self.write_pwd_home_credential(original)
+        result = providers._read_claude_macos_file_credential()
+        assert result is not None
+        expected, snapshot = result
+        carrier_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=None,
+            file_digest=providers._claude_credential_digest(expected),
+            file_snapshot=snapshot,
         )
-        self.assertEqual(
-            providers._claude_keychain_runtime.call_count,
-            len(providers.CLAUDE_MODELS),
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        concurrent_keychain = oauth_credential_fixture(expires_in_seconds=10800)
+
+        with mock.patch.object(
+            providers,
+            "_read_claude_keychain_credential",
+            side_effect=lambda _review: bytearray(concurrent_keychain),
+        ):
+            self.assertFalse(
+                providers._write_claude_file_credential(
+                    self.review,
+                    refreshed,
+                    expected,
+                    snapshot,
+                    carrier_snapshot,
+                    self.claude_refresh_lock_protocol,
+                )
+            )
+
+        self.assertEqual(credential_path.read_bytes(), original)
+        expected[:] = b"\x00" * len(expected)
+        refreshed[:] = b"\x00" * len(refreshed)
+
+    @mock.patch.object(
+        providers,
+        "_claude_macos_carrier_snapshot_is_current",
+        return_value=True,
+    )
+    @mock.patch.object(providers, "_persist_claude_macos_refreshed_credential")
+    @mock.patch.object(providers, "_claude_keychain_credential_server")
+    @mock.patch.object(providers, "_select_claude_macos_credential")
+    def test_final_runtime_persists_refresh_before_broker_acknowledgement(
+        self,
+        select_credential: mock.Mock,
+        credential_server: mock.Mock,
+        persist_credential: mock.Mock,
+        snapshot_is_current: mock.Mock,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        select_credential.return_value = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
+                keychain_digest=providers._claude_credential_digest(original),
+                file_digest=None,
+                file_snapshot=None,
+            ),
         )
-        authentication_updates = [
-            call.args[1]
-            for call in update_report.call_args_list
-            if call.args[1].get("phase") == "authentication-preflight-complete"
-        ]
-        self.assertEqual(
-            authentication_updates,
-            [
-                {
-                    "phase": "authentication-preflight-complete",
-                    "outer_sandbox": {"status": "pending-runtime-launch"},
-                    "authentication": {
-                        "status": "freshness-verified",
-                        "model": model,
-                        "validated_for_model": model,
-                    },
-                    "attempt": None,
-                }
-                for model in providers.CLAUDE_MODELS
-            ],
+        updated_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=providers._claude_credential_digest(refreshed),
+            file_digest=None,
+            file_snapshot=None,
+        )
+        persist_credential.return_value = updated_snapshot
+
+        @contextlib.contextmanager
+        def broker(_credential, _capability, *, update_callback=None):
+            assert update_callback is not None
+            self.assertTrue(update_callback(refreshed))
+            yield 43211
+
+        credential_server.side_effect = broker
+        write_json = {
+            "authentication": {},
+            "phase": "pending",
+        }
+        common.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            write_json,
         )
 
-    def test_final_credential_boundary_failures_do_not_launch_model(self) -> None:
-        executable = self.review.container_dir / "verified-claude"
-        executable.write_bytes(b"snapshot")
-        model = providers.CLAUDE_MODELS[0]
+        with self.claude_keychain_runtime(
+            self.review,
+            {},
+            self.claude_refresh_lock_protocol,
+        ) as runtime_env:
+            self.assertEqual(
+                runtime_env[providers.CLAUDE_KEYCHAIN_BROKER_PORT_ENV],
+                "43211",
+            )
+            persist_credential.assert_called_once()
+
+        snapshot_is_current.assert_called_once_with(
+            self.review,
+            updated_snapshot,
+            self.claude_refresh_lock_protocol,
+        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
+        self.assertEqual(report["authentication"]["source"], "macos-keychain")
+        self.assertEqual(
+            report["authentication"]["carrier"],
+            "one-shot-security-broker",
+        )
+        self.assertEqual(
+            report["authentication"]["refresh_persistence"],
+            "guarded-writeback-persisted",
+        )
+
+    def test_keychain_only_failed_writeback_retains_refreshed_credential(
+        self,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        refreshed_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
+        refreshed_value["claudeAiOauth"]["refreshToken"] = (
+            "fixture-keychain-recovery-refresh-value"
+        )
+        refreshed_bytes = json.dumps(refreshed_value).encode()
+        carrier_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=providers._claude_credential_digest(original),
+            file_digest=None,
+            file_snapshot=None,
+            keychain_refresh_digest=providers._claude_credential_refresh_digest(
+                original
+            ),
+        )
+        selected = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=carrier_snapshot,
+        )
+        callback_payload: bytearray | None = None
+
+        @contextlib.contextmanager
+        def broker(_credential, _capability, *, update_callback=None):
+            nonlocal callback_payload
+            assert update_callback is not None
+            callback_payload = bytearray(refreshed_bytes)
+            self.assertFalse(update_callback(callback_payload))
+            callback_payload[:] = b"\x00" * len(callback_payload)
+            yield 43211
+
+        lease = mock.Mock(spec=["assert_held"])
+        with (
+            mock.patch.object(
+                providers,
+                "_select_claude_macos_credential",
+                return_value=selected,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_credential_server",
+                side_effect=broker,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_coordination",
+                return_value=contextlib.nullcontext(lease),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_claude_keychain_credential",
+                side_effect=lambda _review: bytearray(original),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_claude_macos_file_credential",
+                return_value=None,
+            ),
+            mock.patch.object(
+                providers,
+                "_write_claude_keychain_credential",
+                return_value=False,
+            ) as write_keychain,
+            mock.patch.object(
+                providers,
+                "_read_claude_macos_carrier_snapshot",
+                return_value=carrier_snapshot,
+            ),
+            mock.patch.object(
+                providers,
+                "_write_claude_file_credential",
+            ) as write_file,
+            self.assertRaises(
+                providers.ClaudeCredentialInspectionInconclusive
+            ) as raised,
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+            ):
+                pass
+
+        assert callback_payload is not None
+        self.assertEqual(callback_payload, b"\x00" * len(callback_payload))
+        carrier = self.assert_macos_recovery_carrier(
+            raised.exception,
+            refreshed_bytes,
+        )
+        self.assertNotIn(
+            refreshed_value["claudeAiOauth"]["refreshToken"],
+            str(raised.exception),
+        )
+        self.assertEqual(
+            write_keychain.call_count,
+            providers.CLAUDE_MACOS_DUAL_CARRIER_KEYCHAIN_ATTEMPTS,
+        )
+        write_file.assert_not_called()
+        self.assertIn(str(carrier), str(raised.exception))
+
+    def test_recovery_carrier_requires_exact_payload_readback(self) -> None:
+        credential = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        real_read = providers._read_claude_credential_file_from_directory
+
+        def changed_readback(
+            config_descriptor: int,
+        ) -> tuple[bytearray, tuple[int, ...]] | None:
+            result = real_read(config_descriptor)
+            assert result is not None
+            payload, identity = result
+            payload[-1] = ord(" ")
+            return payload, identity
+
+        with (
+            mock.patch.object(
+                providers,
+                "_read_claude_credential_file_from_directory",
+                side_effect=changed_readback,
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeCredentialInspectionInconclusive,
+                "changed after write",
+            ) as raised,
+        ):
+            providers._retain_claude_macos_refreshed_credential(
+                self.review,
+                credential,
+            )
+
+        retained = getattr(
+            raised.exception,
+            "_codex_claude_retained_credential_carrier",
+            None,
+        )
+        self.assertIsInstance(retained, str)
+        self.assertTrue(pathlib.Path(retained).is_dir())
+        credential[:] = b"\x00" * len(credential)
+
+    def test_failed_writeback_replaces_recovery_carrier_with_latest_rotation(
+        self,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        selected = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
+                keychain_digest=providers._claude_credential_digest(original),
+                file_digest=None,
+                file_snapshot=None,
+            ),
+        )
+        first_value = json.loads(oauth_credential_fixture(expires_in_seconds=3600))
+        first_value["claudeAiOauth"]["refreshToken"] = (
+            "fixture-first-recovery-refresh-value"
+        )
+        first = bytearray(json.dumps(first_value).encode())
+        second_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
+        second_value["claudeAiOauth"]["refreshToken"] = (
+            "fixture-latest-recovery-refresh-value"
+        )
+        second = bytearray(json.dumps(second_value).encode())
+        second_bytes = bytes(second)
+
+        @contextlib.contextmanager
+        def broker(_credential, _capability, *, update_callback=None):
+            assert update_callback is not None
+            self.assertFalse(update_callback(first))
+            first[:] = b"\x00" * len(first)
+            self.assertFalse(update_callback(second))
+            second[:] = b"\x00" * len(second)
+            yield 43211
+
+        with (
+            mock.patch.object(
+                providers,
+                "_select_claude_macos_credential",
+                return_value=selected,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_credential_server",
+                side_effect=broker,
+            ),
+            mock.patch.object(
+                providers,
+                "_persist_claude_macos_refreshed_credential",
+                return_value=None,
+            ) as persist,
+            self.assertRaises(
+                providers.ClaudeCredentialInspectionInconclusive
+            ) as raised,
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+            ):
+                pass
+
+        carrier = self.assert_macos_recovery_carrier(
+            raised.exception,
+            second_bytes,
+        )
+        self.assertEqual(
+            list(carrier.parent.glob("claude-carrier-*")),
+            [carrier],
+        )
+        self.assertEqual(first, b"\x00" * len(first))
+        self.assertEqual(second, b"\x00" * len(second))
+        persist.assert_called_once()
+
+    def test_later_rotation_repairs_incomplete_recovery_carrier(self) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        selected = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
+                keychain_digest=providers._claude_credential_digest(original),
+                file_digest=None,
+                file_snapshot=None,
+            ),
+        )
+        first = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
+        second_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
+        second_value["claudeAiOauth"]["refreshToken"] = (
+            "fixture-repaired-recovery-refresh-value"
+        )
+        second = bytearray(json.dumps(second_value).encode())
+        second_bytes = bytes(second)
+        real_write = providers._write_all_to_descriptor
+        write_calls = 0
+
+        def fail_first_recovery_write(
+            descriptor: int,
+            payload: bytearray,
+        ) -> None:
+            nonlocal write_calls
+            write_calls += 1
+            if write_calls == 1:
+                raise OSError("injected initial recovery write failure")
+            real_write(descriptor, payload)
+
+        @contextlib.contextmanager
+        def broker(_credential, _capability, *, update_callback=None):
+            assert update_callback is not None
+            self.assertFalse(update_callback(first))
+            first[:] = b"\x00" * len(first)
+            self.assertFalse(update_callback(second))
+            second[:] = b"\x00" * len(second)
+            yield 43211
+
+        with (
+            mock.patch.object(
+                providers,
+                "_select_claude_macos_credential",
+                return_value=selected,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_credential_server",
+                side_effect=broker,
+            ),
+            mock.patch.object(
+                providers,
+                "_persist_claude_macos_refreshed_credential",
+                return_value=None,
+            ) as persist,
+            mock.patch.object(
+                providers,
+                "_write_all_to_descriptor",
+                side_effect=fail_first_recovery_write,
+            ),
+            self.assertRaises(
+                providers.ClaudeCredentialInspectionInconclusive
+            ) as raised,
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+            ):
+                pass
+
+        carrier = self.assert_macos_recovery_carrier(
+            raised.exception,
+            second_bytes,
+        )
+        self.assertEqual(
+            list(carrier.parent.glob("claude-carrier-*")),
+            [carrier],
+        )
+        self.assertNotIn(
+            "complete private recovery copy could be proven",
+            str(raised.exception),
+        )
+        self.assertEqual(write_calls, 2)
+        persist.assert_called_once()
+
+    def test_dual_carrier_file_first_failure_retains_refreshed_credential(
+        self,
+    ) -> None:
+        original_bytes = oauth_credential_fixture(expires_in_seconds=-60)
+        self.write_pwd_home_credential(original_bytes)
+        file_result = providers._read_claude_macos_file_credential()
+        assert file_result is not None
+        file_payload, file_snapshot = file_result
+        refresh_digest = providers._claude_credential_refresh_digest(file_payload)
+        carrier_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=providers._claude_credential_digest(file_payload),
+            file_digest=providers._claude_credential_digest(file_payload),
+            file_snapshot=file_snapshot,
+            keychain_refresh_digest=refresh_digest,
+            file_refresh_digest=refresh_digest,
+        )
+        selected = providers._ClaudeLocalCredential(
+            source="pwd-home-credential-file",
+            payload=file_payload,
+            expires_at_ms=0,
+            file_snapshot=file_snapshot,
+            carrier_snapshot=carrier_snapshot,
+        )
+        refreshed_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
+        refreshed_value["claudeAiOauth"]["refreshToken"] = (
+            "fixture-file-recovery-refresh-value"
+        )
+        refreshed_bytes = json.dumps(refreshed_value).encode()
+        callback_payload: bytearray | None = None
+
+        @contextlib.contextmanager
+        def broker(_credential, _capability, *, update_callback=None):
+            nonlocal callback_payload
+            assert update_callback is not None
+            callback_payload = bytearray(refreshed_bytes)
+            self.assertFalse(update_callback(callback_payload))
+            callback_payload[:] = b"\x00" * len(callback_payload)
+            yield 43211
+
+        lease = mock.Mock(spec=["assert_held"])
+        with (
+            mock.patch.object(
+                providers,
+                "_select_claude_macos_credential",
+                return_value=selected,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_credential_server",
+                side_effect=broker,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_coordination",
+                return_value=contextlib.nullcontext(lease),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_claude_keychain_credential",
+                side_effect=lambda _review: bytearray(original_bytes),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_claude_macos_file_credential",
+                side_effect=lambda: (bytearray(original_bytes), file_snapshot),
+            ),
+            mock.patch.object(
+                providers,
+                "_write_claude_file_credential",
+                return_value=False,
+            ) as write_file,
+            mock.patch.object(
+                providers,
+                "_write_claude_keychain_credential",
+            ) as write_keychain,
+            self.assertRaises(
+                providers.ClaudeCredentialInspectionInconclusive
+            ) as raised,
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+            ):
+                pass
+
+        assert callback_payload is not None
+        self.assertEqual(callback_payload, b"\x00" * len(callback_payload))
+        self.assert_macos_recovery_carrier(
+            raised.exception,
+            refreshed_bytes,
+        )
+        write_file.assert_called_once()
+        write_keychain.assert_not_called()
+
+    def test_malformed_refresh_does_not_create_recovery_carrier(self) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        selected = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
+                keychain_digest=providers._claude_credential_digest(original),
+                file_digest=None,
+                file_snapshot=None,
+            ),
+        )
+
+        @contextlib.contextmanager
+        def broker(_credential, _capability, *, update_callback=None):
+            assert update_callback is not None
+            self.assertFalse(update_callback(bytearray(b"{}")))
+            yield 43211
+
+        with (
+            mock.patch.object(
+                providers,
+                "_select_claude_macos_credential",
+                return_value=selected,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_credential_server",
+                side_effect=broker,
+            ),
+            mock.patch.object(
+                providers,
+                "_persist_claude_macos_refreshed_credential",
+            ) as persist,
+            mock.patch.object(
+                providers,
+                "_retain_claude_macos_refreshed_credential",
+            ) as retain,
+            self.assertRaisesRegex(
+                providers.ClaudeCredentialInspectionInconclusive,
+                "malformed refreshed",
+            ),
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+            ):
+                pass
+
+        persist.assert_not_called()
+        retain.assert_not_called()
+
+    @mock.patch.object(
+        providers,
+        "_persist_claude_macos_refreshed_credential",
+        return_value=None,
+    )
+    @mock.patch.object(providers, "_claude_keychain_credential_server")
+    @mock.patch.object(providers, "_select_claude_macos_credential")
+    def test_refresh_persistence_failure_does_not_override_primary_error(
+        self,
+        select_credential: mock.Mock,
+        credential_server: mock.Mock,
+        persist_credential: mock.Mock,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        refreshed_bytes = bytes(refreshed)
+        select_credential.return_value = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
+                keychain_digest=providers._claude_credential_digest(original),
+                file_digest=None,
+                file_snapshot=None,
+            ),
+        )
+
+        @contextlib.contextmanager
+        def broker(_credential, _capability, *, update_callback=None):
+            assert update_callback is not None
+            self.assertFalse(update_callback(refreshed))
+            refreshed[:] = b"\x00" * len(refreshed)
+            yield 43211
+
+        credential_server.side_effect = broker
+        primary = providers.ReviewTimeoutError("primary review timeout")
+        common.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {"authentication": {}, "phase": "runtime-launching"},
+        )
+        with self.assertRaises(providers.ReviewTimeoutError) as raised:
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+            ):
+                raise primary
+
+        self.assertIs(raised.exception, primary)
+        persist_credential.assert_called_once()
+        notes = getattr(primary, "__notes__", ())
+        if notes:
+            self.assertTrue(
+                any("persistence also failed" in note for note in notes)
+            )
+        carrier = self.assert_macos_recovery_carrier(
+            primary,
+            refreshed_bytes,
+        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
+        self.assertEqual(
+            report["authentication"]["recovery_carrier"],
+            str(carrier),
+        )
+
+    @mock.patch.object(providers, "_claude_keychain_credential_server")
+    @mock.patch.object(providers, "_select_claude_macos_credential")
+    def test_refresh_persistence_signal_overrides_primary_error(
+        self,
+        select_credential: mock.Mock,
+        credential_server: mock.Mock,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        refreshed_bytes = bytes(refreshed)
+        select_credential.return_value = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
+                keychain_digest=providers._claude_credential_digest(original),
+                file_digest=None,
+                file_snapshot=None,
+            ),
+        )
+        forwarded = providers.ForwardedSignal(signal.SIGTERM)
+
+        @contextlib.contextmanager
+        def broker(_credential, _capability, *, update_callback=None):
+            assert update_callback is not None
+            self.assertFalse(update_callback(refreshed))
+            refreshed[:] = b"\x00" * len(refreshed)
+            yield 43211
+
+        credential_server.side_effect = broker
+        primary = providers.ReviewTimeoutError("primary review timeout")
+        common.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {"authentication": {}, "phase": "runtime-launching"},
+        )
+        with (
+            mock.patch.object(
+                providers,
+                "_persist_claude_macos_refreshed_credential",
+                side_effect=forwarded,
+            ),
+            self.assertRaises(providers.ForwardedSignal) as raised,
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+            ):
+                raise primary
+
+        self.assertIs(raised.exception, forwarded)
+        carrier = self.assert_macos_recovery_carrier(
+            forwarded,
+            refreshed_bytes,
+        )
+        self.assertIn(str(carrier), forwarded.detail or "")
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
+        self.assertEqual(
+            report["authentication"]["recovery_carrier"],
+            str(carrier),
+        )
+
+    @mock.patch.object(providers, "_claude_keychain_credential_server")
+    @mock.patch.object(providers, "_select_claude_macos_credential")
+    def test_refresh_persistence_signal_without_body_error_reports_carrier(
+        self,
+        select_credential: mock.Mock,
+        credential_server: mock.Mock,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        refreshed_bytes = bytes(refreshed)
+        select_credential.return_value = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
+                keychain_digest=providers._claude_credential_digest(original),
+                file_digest=None,
+                file_snapshot=None,
+            ),
+        )
+        forwarded = providers.ForwardedSignal(signal.SIGTERM)
+
+        @contextlib.contextmanager
+        def broker(_credential, _capability, *, update_callback=None):
+            assert update_callback is not None
+            self.assertFalse(update_callback(refreshed))
+            refreshed[:] = b"\x00" * len(refreshed)
+            yield 43211
+
+        credential_server.side_effect = broker
+        common.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {"authentication": {}, "phase": "runtime-launching"},
+        )
+        with (
+            mock.patch.object(
+                providers,
+                "_persist_claude_macos_refreshed_credential",
+                side_effect=forwarded,
+            ),
+            self.assertRaises(providers.ForwardedSignal) as raised,
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+            ):
+                pass
+
+        self.assertIs(raised.exception, forwarded)
+        carrier = self.assert_macos_recovery_carrier(
+            forwarded,
+            refreshed_bytes,
+        )
+        self.assertIn(str(carrier), forwarded.detail or "")
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
+        self.assertEqual(
+            report["authentication"]["recovery_carrier"],
+            str(carrier),
+        )
+
+    @mock.patch.object(
+        providers,
+        "_claude_macos_carrier_snapshot_is_current",
+        return_value=True,
+    )
+    @mock.patch.object(providers, "_persist_claude_macos_refreshed_credential")
+    @mock.patch.object(providers, "_claude_keychain_credential_server")
+    @mock.patch.object(providers, "_select_claude_macos_credential")
+    def test_final_runtime_persists_each_rotation_and_advances_baseline(
+        self,
+        select_credential: mock.Mock,
+        credential_server: mock.Mock,
+        persist_credential: mock.Mock,
+        snapshot_is_current: mock.Mock,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        original_bytes = bytes(original)
+        first = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
+        second_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
+        second_value["claudeAiOauth"]["refreshToken"] = (
+            "fixture-second-rotated-refresh-value"
+        )
+        second = bytearray(json.dumps(second_value).encode())
+        initial_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=providers._claude_credential_digest(original),
+            file_digest=None,
+            file_snapshot=None,
+            keychain_refresh_digest=providers._claude_credential_refresh_digest(
+                original
+            ),
+        )
+        first_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=providers._claude_credential_digest(first),
+            file_digest=None,
+            file_snapshot=None,
+            keychain_refresh_digest=providers._claude_credential_refresh_digest(first),
+        )
+        second_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=providers._claude_credential_digest(second),
+            file_digest=None,
+            file_snapshot=None,
+            keychain_refresh_digest=providers._claude_credential_refresh_digest(second),
+        )
+        select_credential.return_value = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=initial_snapshot,
+        )
+        observed_baselines: list[bytes] = []
+
+        def persist(*args: object) -> providers._ClaudeMacOSCarrierSnapshot:
+            baseline = args[3]
+            assert isinstance(baseline, bytearray)
+            observed_baselines.append(bytes(baseline))
+            return (first_snapshot, second_snapshot)[len(observed_baselines) - 1]
+
+        persist_credential.side_effect = persist
+
+        @contextlib.contextmanager
+        def broker(_credential, _capability, *, update_callback=None):
+            assert update_callback is not None
+            self.assertTrue(update_callback(first))
+            self.assertTrue(update_callback(second))
+            yield 43211
+
+        credential_server.side_effect = broker
+        common.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {"authentication": {}, "phase": "pending"},
+        )
+
+        with self.claude_keychain_runtime(
+            self.review,
+            {},
+            self.claude_refresh_lock_protocol,
+        ):
+            pass
+
+        self.assertEqual(observed_baselines, [original_bytes, bytes(first)])
+        snapshot_is_current.assert_called_once_with(
+            self.review,
+            second_snapshot,
+            self.claude_refresh_lock_protocol,
+        )
+        first[:] = b"\x00" * len(first)
+        second[:] = b"\x00" * len(second)
+
+    def test_same_refresh_token_dual_write_uses_each_carrier_baseline(self) -> None:
+        keychain = bytearray(oauth_credential_fixture(expires_in_seconds=60))
+        file_credential = bytearray(oauth_credential_fixture(expires_in_seconds=120))
+        refreshed_value = json.loads(oauth_credential_fixture(expires_in_seconds=3600))
+        refreshed_value["claudeAiOauth"]["refreshToken"] = (
+            "fixture-dual-rotated-refresh-value"
+        )
+        refreshed = bytearray(json.dumps(refreshed_value).encode())
+        file_snapshot = providers._ClaudeCredentialFileSnapshot(
+            home=self.claude_pwd_home,
+            home_identity=(1,),
+            config_identity=(2,),
+            file_identity=(3,),
+        )
+        carrier_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=providers._claude_credential_digest(keychain),
+            file_digest=providers._claude_credential_digest(file_credential),
+            file_snapshot=file_snapshot,
+            keychain_refresh_digest=providers._claude_credential_refresh_digest(
+                keychain
+            ),
+            file_refresh_digest=providers._claude_credential_refresh_digest(
+                file_credential
+            ),
+        )
+        selected = providers._ClaudeLocalCredential(
+            source="pwd-home-credential-file",
+            payload=bytearray(file_credential),
+            expires_at_ms=0,
+            file_snapshot=file_snapshot,
+            carrier_snapshot=carrier_snapshot,
+        )
+        lease = mock.Mock(spec=["assert_held"])
+        expected_by_source: dict[str, bytes] = {}
+        refreshed_digest = providers._claude_credential_digest(refreshed)
+        updated_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=refreshed_digest,
+            file_digest=refreshed_digest,
+            file_snapshot=file_snapshot,
+            keychain_refresh_digest=providers._claude_credential_refresh_digest(
+                refreshed
+            ),
+            file_refresh_digest=providers._claude_credential_refresh_digest(refreshed),
+        )
+
+        def write_file(*args: object, **_kwargs: object) -> bool:
+            expected = args[2]
+            assert isinstance(expected, bytearray)
+            expected_by_source["file"] = bytes(expected)
+            return True
+
+        def write_keychain(*args: object, **_kwargs: object) -> bool:
+            expected = args[2]
+            assert isinstance(expected, bytearray)
+            expected_by_source["keychain"] = bytes(expected)
+            return True
+
+        with (
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_coordination",
+                return_value=contextlib.nullcontext(lease),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_claude_keychain_credential",
+                return_value=bytearray(keychain),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_claude_macos_file_credential",
+                return_value=(bytearray(file_credential), file_snapshot),
+            ),
+            mock.patch.object(
+                providers,
+                "_write_claude_file_credential",
+                side_effect=write_file,
+            ),
+            mock.patch.object(
+                providers,
+                "_write_claude_keychain_credential",
+                side_effect=write_keychain,
+            ),
+            mock.patch.object(
+                providers,
+                "_read_claude_macos_carrier_snapshot",
+                return_value=updated_snapshot,
+            ),
+        ):
+            result = providers._persist_claude_macos_refreshed_credential(
+                self.review,
+                selected,
+                refreshed,
+                selected.payload,
+                carrier_snapshot,
+                self.claude_refresh_lock_protocol,
+            )
+
+        self.assertIs(result, updated_snapshot)
+        self.assertEqual(expected_by_source["keychain"], bytes(keychain))
+        self.assertEqual(expected_by_source["file"], bytes(file_credential))
+        for payload in (keychain, file_credential, refreshed, selected.payload):
+            payload[:] = b"\x00" * len(payload)
+
+    def test_dual_write_reconciles_keychain_result_before_pausing(self) -> None:
         cases = (
             (
-                providers.ReviewTimeoutError("credential read timed out"),
-                providers.ClaudeAuthWarmupInconclusive,
-                "authentication-preflight-inconclusive",
-                "inconclusive",
-                "credential-read",
+                "ambiguous-success",
+                (False,),
+                ("complete",),
+                1,
+                False,
             ),
             (
-                providers.ReviewOutputLimitError(
-                    "credential read exceeded its output limit"
-                ),
-                providers.ClaudeAuthWarmupInconclusive,
-                "authentication-preflight-inconclusive",
-                "inconclusive",
-                "credential-read",
+                "bounded-retry",
+                (False, True),
+                ("partial", "complete"),
+                2,
+                False,
             ),
             (
-                providers.ReviewOutputDrainError("credential read did not drain"),
-                providers.ClaudeAuthWarmupInconclusive,
-                "authentication-preflight-inconclusive",
-                "inconclusive",
-                "credential-read",
-            ),
-            (
-                providers.ReviewProcessLeakError("credential read leaked a process"),
-                providers.ClaudeAuthWarmupInconclusive,
-                "authentication-preflight-inconclusive",
-                "inconclusive",
-                "credential-read",
-            ),
-            (
-                providers.ClaudeKeychainBrokerUnavailable(
-                    "credential broker disappeared"
-                ),
-                providers.ClaudeKeychainBrokerUnavailable,
-                "authentication-preflight-unavailable",
-                "unavailable",
-                None,
-            ),
-            (
-                providers.ClaudeKeychainCredentialUnavailable(
-                    "credential disappeared"
-                ),
-                providers.ClaudeKeychainCredentialUnavailable,
-                "authentication-preflight-unavailable",
-                "unavailable",
-                None,
-            ),
-            (
-                providers.ClaudeLoopbackUnavailable(
-                    "one-shot broker loopback disappeared"
-                ),
-                providers.ClaudeLoopbackUnavailable,
-                "authentication-preflight-unavailable",
-                "unavailable",
-                None,
+                "unresolved-partial",
+                (False, False),
+                ("partial", "partial"),
+                2,
+                True,
             ),
         )
-
-        for error, expected_error, phase, status, failure_class in cases:
-            with self.subTest(error_type=type(error).__name__):
-                providers.write_json(
-                    self.review.container_dir / "claude-runtime.json",
-                    {
-                        "phase": "publisher-and-capabilities-verified",
-                        "outer_sandbox": {"status": "pending-runtime-launch"},
-                        "authentication": {"status": "pending"},
-                    },
+        for (
+            label,
+            keychain_results,
+            readback_states,
+            expected_keychain_calls,
+            expect_pause,
+        ) in cases:
+            with self.subTest(label=label):
+                keychain = bytearray(oauth_credential_fixture(expires_in_seconds=60))
+                file_credential = bytearray(
+                    oauth_credential_fixture(expires_in_seconds=120)
                 )
-                self.warmup.reset_mock()
-                self.warmup.side_effect = None
-                self.warmup.return_value = None
-                providers._claude_keychain_runtime.reset_mock()
+                refreshed_value = json.loads(
+                    oauth_credential_fixture(expires_in_seconds=3600)
+                )
+                refreshed_value["claudeAiOauth"]["refreshToken"] = (
+                    "fixture-dual-reconciled-refresh-value"
+                )
+                refreshed = bytearray(json.dumps(refreshed_value).encode())
+                original_file_snapshot = providers._ClaudeCredentialFileSnapshot(
+                    home=self.claude_pwd_home,
+                    home_identity=(1,),
+                    config_identity=(2,),
+                    file_identity=(3,),
+                )
+                refreshed_file_snapshot = providers._ClaudeCredentialFileSnapshot(
+                    home=self.claude_pwd_home,
+                    home_identity=(1,),
+                    config_identity=(2,),
+                    file_identity=(4,),
+                )
+                carrier_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+                    keychain_digest=providers._claude_credential_digest(keychain),
+                    file_digest=providers._claude_credential_digest(file_credential),
+                    file_snapshot=original_file_snapshot,
+                    keychain_refresh_digest=(
+                        providers._claude_credential_refresh_digest(keychain)
+                    ),
+                    file_refresh_digest=(
+                        providers._claude_credential_refresh_digest(file_credential)
+                    ),
+                )
+                refreshed_digest = providers._claude_credential_digest(refreshed)
+                refreshed_refresh_digest = (
+                    providers._claude_credential_refresh_digest(refreshed)
+                )
+                partial_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+                    keychain_digest=carrier_snapshot.keychain_digest,
+                    file_digest=refreshed_digest,
+                    file_snapshot=refreshed_file_snapshot,
+                    keychain_refresh_digest=carrier_snapshot.keychain_refresh_digest,
+                    file_refresh_digest=refreshed_refresh_digest,
+                )
+                complete_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+                    keychain_digest=refreshed_digest,
+                    file_digest=refreshed_digest,
+                    file_snapshot=refreshed_file_snapshot,
+                    keychain_refresh_digest=refreshed_refresh_digest,
+                    file_refresh_digest=refreshed_refresh_digest,
+                )
+                readbacks = tuple(
+                    complete_snapshot if state == "complete" else partial_snapshot
+                    for state in readback_states
+                )
+                selected = providers._ClaudeLocalCredential(
+                    source="pwd-home-credential-file",
+                    payload=bytearray(file_credential),
+                    expires_at_ms=0,
+                    file_snapshot=original_file_snapshot,
+                    carrier_snapshot=carrier_snapshot,
+                )
+                lease = mock.Mock(spec=["assert_held"])
+                observed_keychain_baselines: list[bytes] = []
+                keychain_result_iterator = iter(keychain_results)
 
-                @contextlib.contextmanager
-                def failing_runtime(
-                    _review: ReviewWorkspace,
-                    _env: dict[str, str],
-                ):
-                    raise error
-                    yield {}
+                def write_keychain_side_effect(
+                    *args: object,
+                    **_kwargs: object,
+                ) -> bool:
+                    baseline = args[2]
+                    assert isinstance(baseline, bytearray)
+                    observed_keychain_baselines.append(bytes(baseline))
+                    return next(keychain_result_iterator)
 
-                providers._claude_keychain_runtime.side_effect = failing_runtime
                 with (
                     mock.patch.object(
                         providers,
-                        "_with_claude_review_tool_path",
-                        side_effect=lambda _review, env: dict(env),
+                        "_claude_macos_carrier_coordination",
+                        return_value=contextlib.nullcontext(lease),
                     ),
                     mock.patch.object(
                         providers,
-                        "_prepare_claude_tls_environment",
-                        side_effect=lambda _review, env: dict(env),
+                        "_read_claude_keychain_credential",
+                        return_value=bytearray(keychain),
                     ),
-                    mock.patch.object(providers, "run") as run_command,
-                    self.assertRaises(expected_error),
+                    mock.patch.object(
+                        providers,
+                        "_read_claude_macos_file_credential",
+                        return_value=(
+                            bytearray(file_credential),
+                            original_file_snapshot,
+                        ),
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_write_claude_file_credential",
+                        return_value=True,
+                    ) as write_file,
+                    mock.patch.object(
+                        providers,
+                        "_write_claude_keychain_credential",
+                        side_effect=write_keychain_side_effect,
+                    ) as write_keychain,
+                    mock.patch.object(
+                        providers,
+                        "_read_claude_macos_carrier_snapshot",
+                        side_effect=readbacks,
+                    ),
                 ):
-                    providers._claude_attempt(
-                        review=self.review,
-                        model=model,
-                        index=1,
-                        env={},
-                        executable=executable,
-                    )
+                    if expect_pause:
+                        with self.assertRaisesRegex(
+                            providers.ClaudeCredentialInspectionInconclusive,
+                            "refreshed file carrier was preserved",
+                        ):
+                            providers._persist_claude_macos_refreshed_credential(
+                                self.review,
+                                selected,
+                                refreshed,
+                                selected.payload,
+                                carrier_snapshot,
+                                self.claude_refresh_lock_protocol,
+                            )
+                    else:
+                        result = providers._persist_claude_macos_refreshed_credential(
+                            self.review,
+                            selected,
+                            refreshed,
+                            selected.payload,
+                            carrier_snapshot,
+                            self.claude_refresh_lock_protocol,
+                        )
+                        self.assertIs(result, complete_snapshot)
 
-                run_command.assert_not_called()
-                report = json.loads(
-                    (self.review.container_dir / "claude-runtime.json").read_text(
-                        encoding="utf-8"
-                    )
+                write_file.assert_called_once()
+                self.assertEqual(write_keychain.call_count, expected_keychain_calls)
+                self.assertEqual(
+                    observed_keychain_baselines,
+                    [bytes(keychain)] * expected_keychain_calls,
                 )
-                self.assertEqual(report["phase"], phase)
-                self.assertEqual(report["authentication"]["status"], status)
-                self.assertEqual(report["authentication"]["model"], model)
-                self.assertIsNone(
-                    report["authentication"]["validated_for_model"]
-                )
-                if failure_class is not None:
-                    self.assertEqual(
-                        report["authentication"]["failure_class"],
-                        failure_class,
-                    )
-                self.assertIsNone(report["attempt"])
-
-    @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
-    @mock.patch.object(
-        providers,
-        "_trusted_claude_ripgrep",
-        return_value=pathlib.Path("/bin/echo"),
-    )
-    @mock.patch.object(
-        providers,
-        "_claude_review_sandbox_profile",
-        return_value="(version 1)(deny default)",
-    )
-    @mock.patch.object(
-        providers,
-        "_claude_connect_proxy",
-        return_value=contextlib.nullcontext(43210),
-    )
-    @mock.patch.object(providers, "run")
-    def test_stale_local_login_uses_fixed_safe_mode_warmup(
-        self,
-        run_command: mock.Mock,
-        proxy: mock.Mock,
-        sandbox_profile: mock.Mock,
-        _rg: mock.Mock,
-        require_fresh: mock.Mock,
-    ) -> None:
-        require_fresh.side_effect = (
-            providers.ClaudeKeychainCredentialUnavailable("stale"),
-            None,
-        )
-        run_command.return_value = Completed(
-            argv=("claude",),
-            returncode=0,
-            stdout=b'OK',
-            stderr=b"",
-        )
-        home = self.review.container_dir / "claude-home"
-        temporary = self.review.container_dir / "tmp"
-        home.mkdir(exist_ok=True)
-        temporary.mkdir(exist_ok=True)
-
-        self.warm_claude_local_login(
-            self.review,
-            pathlib.Path("/bin/claude"),
-            {
-                "HOME": str(home),
-                "TMPDIR": str(temporary),
-                "PATH": "/untrusted",
-            },
-            providers.CLAUDE_MODELS[1],
-        )
-
-        argv = run_command.call_args.args[0]
-        self.assertIn("--safe-mode", argv)
-        self.assertEqual(
-            argv[argv.index("--model") + 1],
-            providers.CLAUDE_MODELS[1],
-        )
-        self.assertEqual(argv[argv.index("--permission-mode") + 1], "default")
-        self.assertEqual(argv[argv.index("--tools") + 1], "")
-        self.assertEqual(
-            argv[argv.index("--allowedTools") + 1],
-            "Read(./__claude_auth_warmup_no_files__)",
-        )
-        self.assertEqual(run_command.call_args.kwargs["stdin"], b"Reply with exactly OK.")
-        self.assertEqual(
-            run_command.call_args.kwargs["timeout_seconds"],
-            providers.CLAUDE_AUTH_WARMUP_TIMEOUT_SECONDS,
-        )
-        self.assertEqual(require_fresh.call_count, 2)
-        self.assertEqual(
-            proxy.call_args.kwargs["allowed_targets"],
-            providers.CLAUDE_AUTH_PROXY_TARGETS,
-        )
-        self.assertTrue(
-            sandbox_profile.call_args.kwargs["allow_direct_keychain"]
-        )
-        self.assertFalse(
-            sandbox_profile.call_args.kwargs["allow_workspace_read"]
-        )
-
-    @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
-    @mock.patch.object(providers, "_run_claude_auth_warmup")
-    def test_entitlement_login_warmup_preserves_model_evidence(
-        self,
-        warmup: mock.Mock,
-        require_fresh: mock.Mock,
-    ) -> None:
-        model = providers.CLAUDE_MODELS[0]
-        require_fresh.side_effect = (
-            providers.ClaudeKeychainCredentialUnavailable("stale"),
-            providers.ClaudeKeychainCredentialUnavailable("still stale"),
-        )
-        completed = Completed(
-            argv=("claude",),
-            returncode=1,
-            stdout=json.dumps(
-                {
-                    "type": "result",
-                    "subtype": "error_during_execution",
-                    "is_error": True,
-                    "error": {
-                        "code": "model_access_denied",
-                        "message": "request rejected",
-                    },
-                    "modelUsage": {model: {}},
-                }
-            ).encode(),
-            stderr=b"",
-        )
-        warmup.return_value = completed
-
-        with self.assertRaises(
-            providers.ClaudeAuthWarmupEntitlement
-        ) as raised:
-            self.warm_claude_local_login(
-                self.review,
-                pathlib.Path("/bin/claude"),
-                {},
-                model,
-            )
-
-        self.assertIs(raised.exception.completed, completed)
-        self.assertEqual(require_fresh.call_count, 2)
-
-    @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
-    @mock.patch.object(providers, "_run_claude_auth_warmup")
-    def test_successful_warmup_ignores_entitlement_wording_on_stderr(
-        self,
-        warmup: mock.Mock,
-        require_fresh: mock.Mock,
-    ) -> None:
-        model = providers.CLAUDE_MODELS[0]
-        require_fresh.side_effect = (
-            providers.ClaudeKeychainCredentialUnavailable("stale"),
-            None,
-        )
-        warmup.return_value = Completed(
-            argv=("claude",),
-            returncode=0,
-            stdout=json.dumps(
-                {
-                    "type": "result",
-                    "subtype": "success",
-                    "is_error": False,
-                    "result": "OK",
-                    "modelUsage": {model: {}},
-                }
-            ).encode(),
-            stderr=b"model is not available for an unrelated optional feature",
-        )
-
-        self.warm_claude_local_login(
-            self.review,
-            pathlib.Path("/bin/claude"),
-            {},
-            model,
-        )
-
-        self.assertEqual(require_fresh.call_count, 2)
-
-    def test_warmup_entitlement_records_verified_attempt_without_final_runtime(
-        self,
-    ) -> None:
-        model = providers.CLAUDE_MODELS[0]
-        executable = self.review.container_dir / "verified-claude"
-        executable.write_bytes(b"snapshot")
-        providers.write_json(
-            self.review.container_dir / "claude-runtime.json",
-            {
-                "phase": "publisher-and-capabilities-verified",
-                "authentication": {"status": "pending"},
-                "outer_sandbox": {"status": "pending-runtime-launch"},
-            },
-        )
-        completed = Completed(
-            argv=("claude",),
-            returncode=1,
-            stdout=json.dumps(
-                {
-                    "type": "result",
-                    "subtype": "error_during_execution",
-                    "is_error": True,
-                    "error": {
-                        "code": "model_access_denied",
-                        "message": "request rejected",
-                    },
-                    "modelUsage": {model: {}},
-                }
-            ).encode(),
-            stderr=b"",
-        )
-        self.warmup.side_effect = providers.ClaudeAuthWarmupEntitlement(
-            completed
-        )
-
-        with (
-            mock.patch.object(
-                providers,
-                "_with_claude_review_tool_path",
-                side_effect=lambda _review, env: dict(env),
-            ),
-            mock.patch.object(
-                providers,
-                "_prepare_claude_tls_environment",
-                side_effect=lambda _review, env: dict(env),
-            ),
-            mock.patch.object(providers, "run") as run_command,
-        ):
-            attempt = providers._claude_attempt(
-                review=self.review,
-                model=model,
-                index=1,
-                env={},
-                executable=executable,
-            )
-
-        self.assertEqual(attempt.category, "entitlement")
-        self.assertEqual(attempt.effective_model, model)
-        self.assertIsNone(attempt.final_text)
-        self.assertEqual(
-            pathlib.Path(attempt.stdout_path).read_bytes(),
-            completed.stdout,
-        )
-        self.assertEqual(
-            pathlib.Path(attempt.stderr_path).read_bytes(),
-            completed.stderr,
-        )
-        run_command.assert_not_called()
-        providers._claude_keychain_runtime.assert_not_called()
-        report = json.loads(
-            (self.review.container_dir / "claude-runtime.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        self.assertEqual(report["phase"], "authentication-preflight-entitlement")
-        self.assertEqual(report["authentication"]["status"], "model-entitlement")
-        self.assertIsNone(report["authentication"]["validated_for_model"])
-        self.assertEqual(report["attempt"]["category"], "entitlement")
-
-    def test_unverified_warmup_entitlement_cannot_enter_model_fallback(
-        self,
-    ) -> None:
-        executable = self.review.container_dir / "verified-claude"
-        executable.write_bytes(b"snapshot")
-        providers.write_json(
-            self.review.container_dir / "claude-runtime.json",
-            {
-                "phase": "publisher-and-capabilities-verified",
-                "authentication": {"status": "pending"},
-                "outer_sandbox": {"status": "pending-runtime-launch"},
-            },
-        )
-        completed = Completed(
-            argv=("claude",),
-            returncode=1,
-            stdout=json.dumps(
-                {
-                    "type": "result",
-                    "subtype": "error_during_execution",
-                    "is_error": True,
-                    "error": {
-                        "code": "model_access_denied",
-                        "message": "request rejected",
-                    },
-                }
-            ).encode(),
-            stderr=b"",
-        )
-        self.warmup.side_effect = providers.ClaudeAuthWarmupEntitlement(
-            completed
-        )
-
-        with (
-            mock.patch.object(
-                providers,
-                "_with_claude_review_tool_path",
-                side_effect=lambda _review, env: dict(env),
-            ),
-            mock.patch.object(
-                providers,
-                "_prepare_claude_tls_environment",
-                side_effect=lambda _review, env: dict(env),
-            ),
-            mock.patch.object(providers, "run") as run_command,
-        ):
-            attempts: list[providers.Attempt] = []
-            category, final_text = providers._run_model_chain(
-                review=self.review,
-                models=providers.CLAUDE_MODELS,
-                runner=lambda **kwargs: providers._claude_attempt(
-                    executable=executable,
-                    **kwargs,
-                ),
-                runtime="claude",
-                requested_effort=providers.CLAUDE_REASONING_EFFORT,
-                env={},
-                attempts=attempts,
-            )
-
-        self.assertEqual(category, "runtime-unverified")
-        self.assertIsNone(final_text)
-        self.assertEqual(len(attempts), 1)
-        self.assertEqual(attempts[0].category, "runtime-unverified")
-        self.assertEqual(self.warmup.call_count, 1)
-        run_command.assert_not_called()
-        providers._claude_keychain_runtime.assert_not_called()
-        report = json.loads(
-            (self.review.container_dir / "claude-runtime.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        self.assertEqual(
-            report["authentication"]["status"],
-            "model-entitlement-unverified",
-        )
-        self.assertIsNone(report["authentication"]["validated_for_model"])
-
-    def test_warmup_entitlement_rechecks_next_model_before_final_runtime(
-        self,
-    ) -> None:
-        first_model, second_model = providers.CLAUDE_MODELS
-        executable = self.review.container_dir / "verified-claude"
-        executable.write_bytes(b"snapshot")
-        providers.write_json(
-            self.review.container_dir / "claude-runtime.json",
-            {
-                "phase": "publisher-and-capabilities-verified",
-                "authentication": {"status": "pending"},
-                "outer_sandbox": {"status": "pending-runtime-launch"},
-            },
-        )
-        entitlement = Completed(
-            argv=("claude",),
-            returncode=1,
-            stdout=json.dumps(
-                {
-                    "type": "result",
-                    "subtype": "error_during_execution",
-                    "is_error": True,
-                    "error": {
-                        "code": "model_access_denied",
-                        "message": "request rejected",
-                    },
-                    "modelUsage": {first_model: {}},
-                }
-            ).encode(),
-            stderr=b"",
-        )
-        success = Completed(
-            argv=("claude",),
-            returncode=0,
-            stdout=json.dumps(
-                {
-                    "type": "result",
-                    "subtype": "success",
-                    "is_error": False,
-                    "result": "No findings.",
-                    "modelUsage": {second_model: {}},
-                }
-            ).encode(),
-            stderr=b"",
-        )
-        self.warmup.side_effect = (
-            providers.ClaudeAuthWarmupEntitlement(entitlement),
-            None,
-        )
-
-        with (
-            mock.patch.object(
-                providers,
-                "_with_claude_review_tool_path",
-                side_effect=lambda _review, env: dict(env),
-            ),
-            mock.patch.object(
-                providers,
-                "_prepare_claude_tls_environment",
-                side_effect=lambda _review, env: dict(env),
-            ),
-            mock.patch.object(
-                providers,
-                "_claude_connect_proxy",
-                return_value=contextlib.nullcontext(43210),
-            ),
-            mock.patch.object(
-                providers,
-                "_claude_review_sandbox_profile",
-                return_value="(version 1)",
-            ),
-            mock.patch.object(providers, "run", return_value=success) as run_command,
-        ):
-            attempts: list[providers.Attempt] = []
-            category, final_text = providers._run_model_chain(
-                review=self.review,
-                models=providers.CLAUDE_MODELS,
-                runner=lambda **kwargs: providers._claude_attempt(
-                    executable=executable,
-                    **kwargs,
-                ),
-                runtime="claude",
-                requested_effort=providers.CLAUDE_REASONING_EFFORT,
-                env={},
-                attempts=attempts,
-            )
-
-        self.assertEqual(category, "success")
-        self.assertEqual(final_text, "No findings.")
-        self.assertEqual(
-            [attempt.category for attempt in attempts],
-            ["entitlement", "success"],
-        )
-        self.assertEqual(
-            [call.args[3] for call in self.warmup.call_args_list],
-            list(providers.CLAUDE_MODELS),
-        )
-        run_command.assert_called_once()
-        self.assertEqual(providers._claude_keychain_runtime.call_count, 1)
-        report = json.loads(
-            (self.review.container_dir / "claude-runtime.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        self.assertEqual(report["authentication"]["model"], second_model)
-        self.assertEqual(
-            report["authentication"]["validated_for_model"],
-            second_model,
-        )
-
-    @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
-    @mock.patch.object(providers, "_run_claude_auth_warmup")
-    def test_transient_login_warmup_failure_is_inconclusive(
-        self,
-        warmup: mock.Mock,
-        require_fresh: mock.Mock,
-    ) -> None:
-        require_fresh.side_effect = (
-            providers.ClaudeKeychainCredentialUnavailable("stale"),
-            providers.ClaudeKeychainCredentialUnavailable("still stale"),
-        )
-        warmup.return_value = Completed(
-            argv=("claude",),
-            returncode=1,
-            stdout=json.dumps(
-                {
-                    "type": "result",
-                    "subtype": "error_during_execution",
-                    "is_error": True,
-                    "api_error_status": 429,
-                }
-            ).encode(),
-            stderr=b"",
-        )
-
-        with self.assertRaisesRegex(
-            providers.ClaudeAuthWarmupInconclusive,
-            "transient",
-        ):
-            self.warm_claude_local_login(
-                self.review,
-                pathlib.Path("/bin/claude"),
-                {},
-            providers.CLAUDE_MODELS[0],
-        )
-
-    @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
-    @mock.patch.object(providers, "_run_claude_auth_warmup")
-    def test_transient_warmup_remains_inconclusive_after_refresh(
-        self,
-        warmup: mock.Mock,
-        require_fresh: mock.Mock,
-    ) -> None:
-        require_fresh.side_effect = (
-            providers.ClaudeKeychainCredentialUnavailable("stale"),
-            None,
-        )
-        warmup.return_value = Completed(
-            argv=("claude",),
-            returncode=1,
-            stdout=json.dumps(
-                {
-                    "type": "result",
-                    "subtype": "error_during_execution",
-                    "is_error": True,
-                    "api_error_status": 429,
-                }
-            ).encode(),
-            stderr=b"",
-        )
-
-        with self.assertRaisesRegex(
-            providers.ClaudeAuthWarmupInconclusive,
-            "transient",
-        ):
-            self.warm_claude_local_login(
-                self.review,
-                pathlib.Path("/bin/claude"),
-                {},
-                providers.CLAUDE_MODELS[0],
-            )
-
-        self.assertEqual(require_fresh.call_count, 2)
-
-    @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
-    @mock.patch.object(providers, "_run_claude_auth_warmup")
-    def test_transient_warmup_precedes_post_read_broker_unavailable(
-        self,
-        warmup: mock.Mock,
-        require_fresh: mock.Mock,
-    ) -> None:
-        require_fresh.side_effect = (
-            providers.ClaudeKeychainCredentialUnavailable("stale"),
-            providers.ClaudeKeychainBrokerUnavailable(
-                "credential broker disappeared"
-            ),
-        )
-        warmup.return_value = Completed(
-            argv=("claude",),
-            returncode=1,
-            stdout=json.dumps(
-                {
-                    "type": "result",
-                    "subtype": "error_during_execution",
-                    "is_error": True,
-                    "api_error_status": 429,
-                }
-            ).encode(),
-            stderr=b"",
-        )
-
-        with self.assertRaisesRegex(
-            providers.ClaudeAuthWarmupInconclusive,
-            "transient",
-        ):
-            self.warm_claude_local_login(
-                self.review,
-                pathlib.Path("/bin/claude"),
-                {},
-                providers.CLAUDE_MODELS[0],
-            )
-
-        self.assertEqual(require_fresh.call_count, 2)
-
-    @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
-    @mock.patch.object(providers, "_run_claude_auth_warmup")
-    def test_successful_warmup_preserves_post_read_broker_unavailable(
-        self,
-        warmup: mock.Mock,
-        require_fresh: mock.Mock,
-    ) -> None:
-        broker_error = providers.ClaudeKeychainBrokerUnavailable(
-            "credential broker disappeared"
-        )
-        require_fresh.side_effect = (
-            providers.ClaudeKeychainCredentialUnavailable("stale"),
-            broker_error,
-        )
-        warmup.return_value = Completed(
-            argv=("claude",),
-            returncode=0,
-            stdout=json.dumps(
-                {
-                    "type": "result",
-                    "subtype": "success",
-                    "is_error": False,
-                    "result": "OK",
-                }
-            ).encode(),
-            stderr=b"",
-        )
-
-        with self.assertRaises(providers.ClaudeKeychainBrokerUnavailable) as raised:
-            self.warm_claude_local_login(
-                self.review,
-                pathlib.Path("/bin/claude"),
-                {},
-                providers.CLAUDE_MODELS[0],
-            )
-
-        self.assertIs(raised.exception, broker_error)
-        self.assertEqual(require_fresh.call_count, 2)
-
-    @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
-    @mock.patch.object(providers, "_run_claude_auth_warmup")
-    def test_warmup_supervision_failure_is_not_a_review_attempt(
-        self,
-        warmup: mock.Mock,
-        require_fresh: mock.Mock,
-    ) -> None:
-        for error_type in (
-            providers.ReviewTimeoutError,
-            providers.ReviewOutputLimitError,
-            providers.ReviewOutputDrainError,
-            providers.ReviewProcessLeakError,
-        ):
-            with self.subTest(error_type=error_type.__name__):
-                require_fresh.reset_mock()
-                warmup.reset_mock()
-                require_fresh.side_effect = (
-                    providers.ClaudeKeychainCredentialUnavailable("stale")
-                )
-                warmup.side_effect = error_type("warmup supervision failed")
-
-                with self.assertRaisesRegex(
-                    providers.ClaudeAuthWarmupInconclusive,
-                    "warmup was inconclusive",
+                for call in write_keychain.call_args_list:
+                    self.assertIs(call.kwargs["coordinated_refresh_lock"], lease)
+                for payload in (
+                    keychain,
+                    file_credential,
+                    refreshed,
+                    selected.payload,
                 ):
-                    self.warm_claude_local_login(
-                        self.review,
-                        pathlib.Path("/bin/claude"),
-                        {},
-                        providers.CLAUDE_MODELS[0],
-                    )
+                    payload[:] = b"\x00" * len(payload)
 
-                require_fresh.assert_called_once_with(self.review)
-                warmup.assert_called_once_with(
+    def test_keychain_only_ambiguous_write_preserves_unselected_file(self) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=60))
+        file_value = json.loads(oauth_credential_fixture(expires_in_seconds=30))
+        file_value["claudeAiOauth"]["refreshToken"] = (
+            "fixture-unselected-file-refresh-value"
+        )
+        file_credential = bytearray(json.dumps(file_value).encode())
+        file_snapshot = providers._ClaudeCredentialFileSnapshot(
+            home=self.claude_pwd_home,
+            home_identity=(1,),
+            config_identity=(2,),
+            file_identity=(3,),
+        )
+        refreshed_value = json.loads(oauth_credential_fixture(expires_in_seconds=3600))
+        refreshed_value["claudeAiOauth"]["refreshToken"] = (
+            "fixture-keychain-only-rotated-refresh-value"
+        )
+        refreshed = bytearray(json.dumps(refreshed_value).encode())
+        carrier_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=providers._claude_credential_digest(original),
+            file_digest=providers._claude_credential_digest(file_credential),
+            file_snapshot=file_snapshot,
+            keychain_refresh_digest=providers._claude_credential_refresh_digest(
+                original
+            ),
+            file_refresh_digest=providers._claude_credential_refresh_digest(
+                file_credential
+            ),
+        )
+        selected = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=bytearray(original),
+            expires_at_ms=0,
+            carrier_snapshot=carrier_snapshot,
+        )
+        refreshed_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=providers._claude_credential_digest(refreshed),
+            file_digest=carrier_snapshot.file_digest,
+            file_snapshot=file_snapshot,
+            keychain_refresh_digest=providers._claude_credential_refresh_digest(
+                refreshed
+            ),
+            file_refresh_digest=carrier_snapshot.file_refresh_digest,
+        )
+        lease = mock.Mock(spec=["assert_held"])
+
+        with (
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_coordination",
+                return_value=contextlib.nullcontext(lease),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_claude_keychain_credential",
+                return_value=bytearray(original),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_claude_macos_file_credential",
+                return_value=(bytearray(file_credential), file_snapshot),
+            ),
+            mock.patch.object(
+                providers,
+                "_write_claude_file_credential",
+            ) as write_file,
+            mock.patch.object(
+                providers,
+                "_write_claude_keychain_credential",
+                return_value=False,
+            ) as write_keychain,
+            mock.patch.object(
+                providers,
+                "_read_claude_macos_carrier_snapshot",
+                return_value=refreshed_snapshot,
+            ),
+        ):
+            result = providers._persist_claude_macos_refreshed_credential(
+                self.review,
+                selected,
+                refreshed,
+                selected.payload,
+                carrier_snapshot,
+                self.claude_refresh_lock_protocol,
+            )
+
+        self.assertIs(result, refreshed_snapshot)
+        write_file.assert_not_called()
+        write_keychain.assert_called_once()
+        for payload in (original, file_credential, refreshed, selected.payload):
+            payload[:] = b"\x00" * len(payload)
+
+    def test_dual_write_does_not_overwrite_unexpected_keychain_readback(
+        self,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=60))
+        refreshed_value = json.loads(oauth_credential_fixture(expires_in_seconds=3600))
+        refreshed_value["claudeAiOauth"]["refreshToken"] = (
+            "fixture-dual-unexpected-refresh-value"
+        )
+        refreshed = bytearray(json.dumps(refreshed_value).encode())
+        third_party = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        third_party_value = json.loads(third_party)
+        third_party_value["claudeAiOauth"]["refreshToken"] = (
+            "fixture-third-party-refresh-value"
+        )
+        third_party[:] = json.dumps(third_party_value).encode()
+        file_snapshot = providers._ClaudeCredentialFileSnapshot(
+            home=self.claude_pwd_home,
+            home_identity=(1,),
+            config_identity=(2,),
+            file_identity=(3,),
+        )
+        carrier_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=providers._claude_credential_digest(original),
+            file_digest=providers._claude_credential_digest(original),
+            file_snapshot=file_snapshot,
+            keychain_refresh_digest=providers._claude_credential_refresh_digest(
+                original
+            ),
+            file_refresh_digest=providers._claude_credential_refresh_digest(original),
+        )
+        selected = providers._ClaudeLocalCredential(
+            source="pwd-home-credential-file",
+            payload=bytearray(original),
+            expires_at_ms=0,
+            file_snapshot=file_snapshot,
+            carrier_snapshot=carrier_snapshot,
+        )
+        refreshed_digest = providers._claude_credential_digest(refreshed)
+        unexpected_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=providers._claude_credential_digest(third_party),
+            file_digest=refreshed_digest,
+            file_snapshot=file_snapshot,
+            keychain_refresh_digest=providers._claude_credential_refresh_digest(
+                third_party
+            ),
+            file_refresh_digest=providers._claude_credential_refresh_digest(refreshed),
+        )
+        lease = mock.Mock(spec=["assert_held"])
+
+        with (
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_coordination",
+                return_value=contextlib.nullcontext(lease),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_claude_keychain_credential",
+                return_value=bytearray(original),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_claude_macos_file_credential",
+                return_value=(bytearray(original), file_snapshot),
+            ),
+            mock.patch.object(
+                providers,
+                "_write_claude_file_credential",
+                return_value=True,
+            ),
+            mock.patch.object(
+                providers,
+                "_write_claude_keychain_credential",
+                return_value=False,
+            ) as write_keychain,
+            mock.patch.object(
+                providers,
+                "_read_claude_macos_carrier_snapshot",
+                return_value=unexpected_snapshot,
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeCredentialInspectionInconclusive,
+                "changed unexpectedly",
+            ),
+        ):
+            providers._persist_claude_macos_refreshed_credential(
+                self.review,
+                selected,
+                refreshed,
+                selected.payload,
+                carrier_snapshot,
+                self.claude_refresh_lock_protocol,
+            )
+
+        write_keychain.assert_called_once()
+        for payload in (original, refreshed, third_party, selected.payload):
+            payload[:] = b"\x00" * len(payload)
+
+    def test_same_refresh_token_preflights_keychain_size_before_dual_write(
+        self,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=60))
+        file_snapshot = providers._ClaudeCredentialFileSnapshot(
+            home=self.claude_pwd_home,
+            home_identity=(1,),
+            config_identity=(2,),
+            file_identity=(3,),
+        )
+        refresh_digest = providers._claude_credential_refresh_digest(original)
+        carrier_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=providers._claude_credential_digest(original),
+            file_digest=providers._claude_credential_digest(original),
+            file_snapshot=file_snapshot,
+            keychain_refresh_digest=refresh_digest,
+            file_refresh_digest=refresh_digest,
+        )
+        selected = providers._ClaudeLocalCredential(
+            source="pwd-home-credential-file",
+            payload=bytearray(original),
+            expires_at_ms=0,
+            file_snapshot=file_snapshot,
+            carrier_snapshot=carrier_snapshot,
+        )
+        oversized_value = json.loads(oauth_credential_fixture())
+        oversized_value["padding"] = "x" * (
+            providers.CLAUDE_KEYCHAIN_SECURITY_STDIN_LIMIT_BYTES
+        )
+        oversized = bytearray(json.dumps(oversized_value).encode())
+
+        with (
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_coordination",
+            ) as coordinate,
+            mock.patch.object(
+                providers,
+                "_write_claude_file_credential",
+            ) as write_file,
+            mock.patch.object(
+                providers,
+                "_write_claude_keychain_credential",
+            ) as write_keychain,
+        ):
+            self.assertIsNone(
+                providers._persist_claude_macos_refreshed_credential(
                     self.review,
-                    pathlib.Path("/bin/claude"),
-                    {},
-                    providers.CLAUDE_MODELS[0],
+                    selected,
+                    oversized,
+                    selected.payload,
+                    carrier_snapshot,
+                    self.claude_refresh_lock_protocol,
                 )
-
-    @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
-    @mock.patch.object(providers, "_run_claude_auth_warmup")
-    def test_initial_credential_read_supervision_is_preflight_inconclusive(
-        self,
-        warmup: mock.Mock,
-        require_fresh: mock.Mock,
-    ) -> None:
-        for error_type in (
-            providers.ReviewTimeoutError,
-            providers.ReviewOutputLimitError,
-            providers.ReviewOutputDrainError,
-            providers.ReviewProcessLeakError,
-        ):
-            with self.subTest(error_type=error_type.__name__):
-                require_fresh.reset_mock()
-                warmup.reset_mock()
-                require_fresh.side_effect = error_type(
-                    "credential read supervision failed"
-                )
-
-                with self.assertRaisesRegex(
-                    providers.ClaudeAuthWarmupInconclusive,
-                    "credential check was inconclusive",
-                ):
-                    self.warm_claude_local_login(
-                        self.review,
-                        pathlib.Path("/bin/claude"),
-                        {},
-                        providers.CLAUDE_MODELS[0],
-                    )
-
-                require_fresh.assert_called_once_with(self.review)
-                warmup.assert_not_called()
-
-    @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
-    @mock.patch.object(providers, "_run_claude_auth_warmup")
-    def test_post_warmup_credential_read_supervision_is_preflight_inconclusive(
-        self,
-        warmup: mock.Mock,
-        require_fresh: mock.Mock,
-    ) -> None:
-        warmup.return_value = Completed(
-            argv=("claude",),
-            returncode=0,
-            stdout=b"{}",
-            stderr=b"",
-        )
-        for error_type in (
-            providers.ReviewTimeoutError,
-            providers.ReviewOutputLimitError,
-            providers.ReviewOutputDrainError,
-            providers.ReviewProcessLeakError,
-        ):
-            with self.subTest(error_type=error_type.__name__):
-                require_fresh.reset_mock()
-                warmup.reset_mock()
-                require_fresh.side_effect = (
-                    providers.ClaudeKeychainCredentialUnavailable("stale"),
-                    error_type("credential read supervision failed"),
-                )
-
-                with self.assertRaisesRegex(
-                    providers.ClaudeAuthWarmupInconclusive,
-                    "credential check was inconclusive",
-                ):
-                    self.warm_claude_local_login(
-                        self.review,
-                        pathlib.Path("/bin/claude"),
-                        {},
-                        providers.CLAUDE_MODELS[0],
-                    )
-
-                self.assertEqual(require_fresh.call_count, 2)
-                warmup.assert_called_once_with(
-                    self.review,
-                    pathlib.Path("/bin/claude"),
-                    {},
-                    providers.CLAUDE_MODELS[0],
-                )
-
-    @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
-    @mock.patch.object(providers, "_run_claude_auth_warmup")
-    def test_auth_login_warmup_failure_remains_unavailable(
-        self,
-        warmup: mock.Mock,
-        require_fresh: mock.Mock,
-    ) -> None:
-        require_fresh.side_effect = (
-            providers.ClaudeKeychainCredentialUnavailable("stale"),
-            providers.ClaudeKeychainCredentialUnavailable("still stale"),
-        )
-        warmup.return_value = Completed(
-            argv=("claude",),
-            returncode=1,
-            stdout=b"",
-            stderr=b"authentication failed",
-        )
-
-        with self.assertRaisesRegex(
-            providers.ClaudeKeychainCredentialUnavailable,
-            "still stale",
-        ):
-            self.warm_claude_local_login(
-                self.review,
-                pathlib.Path("/bin/claude"),
-                {},
-                providers.CLAUDE_MODELS[0],
             )
 
-    @mock.patch.object(providers, "_require_fresh_claude_keychain_credential")
-    @mock.patch.object(providers, "_run_claude_auth_warmup")
-    def test_auth_warmup_remains_unavailable_after_credential_refresh(
-        self,
-        warmup: mock.Mock,
-        require_fresh: mock.Mock,
-    ) -> None:
-        require_fresh.side_effect = (
-            providers.ClaudeKeychainCredentialUnavailable("stale"),
-            None,
-        )
-        warmup.return_value = Completed(
-            argv=("claude",),
-            returncode=1,
-            stdout=b"",
-            stderr=b"authentication failed",
+        coordinate.assert_not_called()
+        write_file.assert_not_called()
+        write_keychain.assert_not_called()
+        for payload in (original, oversized, selected.payload):
+            payload[:] = b"\x00" * len(payload)
+
+    def test_runtime_body_error_yields_to_persistence_control_flow(self) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
+        selected = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
+                keychain_digest=providers._claude_credential_digest(original),
+                file_digest=None,
+                file_snapshot=None,
+            ),
         )
 
-        with self.assertRaisesRegex(
-            providers.ClaudeKeychainCredentialUnavailable,
-            "warmup reported an authentication failure",
+        @contextlib.contextmanager
+        def broker(_credential, _capability, *, update_callback=None):
+            assert update_callback is not None
+            self.assertFalse(update_callback(refreshed))
+            yield 43211
+
+        with (
+            mock.patch.object(
+                providers,
+                "_select_claude_macos_credential",
+                return_value=selected,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_credential_server",
+                side_effect=broker,
+            ),
+            mock.patch.object(
+                providers,
+                "_persist_claude_macos_refreshed_credential",
+                side_effect=KeyboardInterrupt(),
+            ),
+            self.assertRaises(KeyboardInterrupt),
         ):
-            self.warm_claude_local_login(
+            with self.claude_keychain_runtime(
                 self.review,
-                pathlib.Path("/bin/claude"),
                 {},
-                providers.CLAUDE_MODELS[0],
-            )
+                self.claude_refresh_lock_protocol,
+            ):
+                raise ValueError("fixture body failure")
 
-        self.assertEqual(require_fresh.call_count, 2)
+        refreshed[:] = b"\x00" * len(refreshed)
+
+    def test_final_macos_snapshot_unsafe_change_is_inconclusive(self) -> None:
+        carrier_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=b"digest",
+            file_digest=None,
+            file_snapshot=None,
+        )
+        lease = mock.Mock(spec=["assert_held"])
+        with (
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_coordination",
+                return_value=contextlib.nullcontext(lease),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_macos_carriers_match",
+                side_effect=providers.ClaudeCredentialUnsafe("fixture unsafe change"),
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeCredentialInspectionInconclusive,
+                "became unsafe",
+            ),
+        ):
+            providers._claude_macos_carrier_snapshot_is_current(
+                self.review,
+                carrier_snapshot,
+                self.claude_refresh_lock_protocol,
+            )
 
     @mock.patch.object(
         providers,
@@ -2026,6 +3287,50 @@ class ProviderPolicyTest(unittest.TestCase):
             "auth",
         )
 
+    def test_current_claude_auth_diagnostics_are_classified_as_auth(self) -> None:
+        diagnostics = (
+            "Login expired",
+            "Please run /login",
+            "Run claude auth login to continue",
+            "OAuth refresh failed",
+            "Token refresh failed",
+            "HTTP 401 Unauthorized",
+            "status 401",
+            "OAuth refresh failed after a network timeout",
+            "HTTP 401 while the service is temporarily unavailable",
+        )
+        for diagnostic in diagnostics:
+            with self.subTest(diagnostic=diagnostic):
+                self.assertEqual(
+                    providers.classify_failure("", diagnostic),
+                    "auth",
+                )
+        structured = json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "message": "request failed for the selected model",
+                "errors": ["Login expired · Please run /login"],
+                "result": "partial review text mentioning HTTP 503",
+            }
+        )
+        self.assertEqual(providers.classify_failure(structured, ""), "auth")
+
+        for code in providers.STRUCTURED_AUTH_CODES:
+            with self.subTest(code=code):
+                coded = json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "error_during_execution",
+                        "is_error": True,
+                        "code": code,
+                        "message": "model is not available for your account",
+                        "result": "the service is temporarily unavailable",
+                    }
+                )
+                self.assertEqual(providers.classify_failure(coded, ""), "auth")
+
     def test_auth_wins_over_entitlement_wording(self) -> None:
         self.assertEqual(
             providers.classify_failure(
@@ -2061,6 +3366,32 @@ class ProviderPolicyTest(unittest.TestCase):
             }
         )
         self.assertEqual(providers.classify_failure(stdout, "review failed"), "other")
+
+    def test_partial_result_is_never_failure_classification_evidence(self) -> None:
+        repository_controlled_fragments = (
+            "Login expired · Please run /login",
+            "HTTP 401 Unauthorized",
+            "authentication_error",
+            "Model is not available for your account",
+            "model_access_denied",
+            "HTTP 429 rate limit exceeded",
+            "the service is temporarily unavailable",
+        )
+        for fragment in repository_controlled_fragments:
+            with self.subTest(fragment=fragment):
+                stdout = json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "error_during_execution",
+                        "is_error": True,
+                        "message": "review failed",
+                        "result": fragment,
+                    }
+                )
+                self.assertEqual(
+                    providers.classify_failure(stdout, ""),
+                    "other",
+                )
 
     def test_structured_error_event_can_trigger_entitlement_fallback(self) -> None:
         stdout = json.dumps(
@@ -2125,6 +3456,35 @@ class ProviderPolicyTest(unittest.TestCase):
             }
         )
         self.assertEqual(providers.classify_failure(stdout, ""), "transient")
+
+    def test_claude_partial_auth_cannot_override_transient_error(self) -> None:
+        for status in (429, 503):
+            with self.subTest(status=status):
+                stdout = json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "error_during_execution",
+                        "is_error": True,
+                        "api_error_status": status,
+                        "result": "Login expired · Please run /login",
+                    }
+                )
+                self.assertEqual(
+                    providers.classify_failure(stdout, ""),
+                    "transient",
+                )
+
+    def test_claude_partial_auth_cannot_override_entitlement_error(self) -> None:
+        stdout = json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "errors": ["Model is not available for your account"],
+                "result": "Authentication failed: invalid token",
+            }
+        )
+        self.assertEqual(providers.classify_failure(stdout, ""), "entitlement")
 
     def test_structured_error_result_cannot_be_accepted_as_final_text(self) -> None:
         stdout = json.dumps(
@@ -3820,7 +5180,7 @@ class ProviderPolicyTest(unittest.TestCase):
     @mock.patch.object(
         providers,
         "resolve_reviewer_executable",
-        side_effect=(pathlib.Path("/bin/claude"), pathlib.Path("/bin/copilot")),
+        return_value=pathlib.Path("/bin/claude"),
     )
     @mock.patch.object(providers, "_copilot_attempt")
     @mock.patch.object(providers, "_claude_attempt")
@@ -4127,200 +5487,8 @@ class ProviderPolicyTest(unittest.TestCase):
         return_value=pathlib.Path("/bin/copilot"),
     )
     @mock.patch.object(providers, "_copilot_attempt")
-    def test_attempt_local_auth_unavailable_allows_authorized_copilot_fallback(
-        self,
-        copilot_attempt: mock.Mock,
-        resolve: mock.Mock,
-        _resolve_claude: mock.Mock,
-        _environment: mock.Mock,
-    ) -> None:
-        cases = (
-            providers.ClaudeKeychainCredentialUnavailable(
-                "credential remains stale"
-            ),
-            providers.ClaudeKeychainBrokerUnavailable(
-                "credential broker is unavailable"
-            ),
-            providers.ClaudeLoopbackUnavailable(
-                "authentication warmup loopback is unavailable"
-            ),
-        )
-        for error in cases:
-            with self.subTest(error_type=type(error).__name__):
-                self.warmup.reset_mock()
-                copilot_attempt.reset_mock()
-                resolve.reset_mock()
-                self.warmup.side_effect = error
-                copilot_attempt.return_value = self.attempt(
-                    "copilot",
-                    providers.COPILOT_MODELS[0],
-                    "success",
-                    final_text="No findings.",
-                )
-                providers.write_json(
-                    self.review.container_dir / "claude-runtime.json",
-                    {
-                        "phase": "publisher-and-capabilities-verified",
-                        "outer_sandbox": {"status": "pending-runtime-launch"},
-                        "authentication": {"status": "pending"},
-                    },
-                )
-
-                outcome = providers.run_review(
-                    review=self.review,
-                    reviewer="claude",
-                    egress_consent="double-review",
-                )
-
-                self.assertEqual(outcome.returncode, 0)
-                copilot_attempt.assert_called_once()
-                resolve.assert_called_once_with("copilot")
-                self.assertIn(
-                    str(error),
-                    (self.review.container_dir / "claude-skip.txt").read_text(
-                        encoding="utf-8"
-                    ),
-                )
-                report = json.loads(
-                    (self.review.container_dir / "claude-runtime.json").read_text(
-                        encoding="utf-8"
-                    )
-                )
-                self.assertEqual(
-                    report["phase"],
-                    "authentication-preflight-unavailable",
-                )
-                self.assertEqual(
-                    report["authentication"]["status"],
-                    "unavailable",
-                )
-
-    @mock.patch.object(providers, "child_environment", return_value={})
-    @mock.patch.object(
-        providers,
-        "_resolve_validated_claude_executable",
-        return_value=(pathlib.Path("/bin/claude"), {}),
-    )
-    @mock.patch.object(
-        providers,
-        "resolve_reviewer_executable",
-        return_value=pathlib.Path("/bin/copilot"),
-    )
-    @mock.patch.object(providers, "_copilot_attempt")
-    def test_transient_claude_warmup_failure_refuses_copilot_fallback(
-        self,
-        copilot_attempt: mock.Mock,
-        resolve: mock.Mock,
-        _resolve_claude: mock.Mock,
-        _environment: mock.Mock,
-    ) -> None:
-        self.warmup.side_effect = providers.ClaudeAuthWarmupInconclusive(
-            "transient refresh failure"
-        )
-
-        outcome = providers.run_review(
-            review=self.review,
-            reviewer="claude",
-            egress_consent="double-review",
-        )
-
-        self.assertEqual(outcome.returncode, 75)
-        copilot_attempt.assert_not_called()
-        resolve.assert_not_called()
-        self.assertIn(
-            "transient refresh failure",
-            (self.review.container_dir / "runner-error.txt").read_text(
-                encoding="utf-8"
-            ),
-        )
-
-    @mock.patch.object(providers, "child_environment", return_value={})
-    @mock.patch.object(
-        providers,
-        "_resolve_validated_claude_executable",
-        return_value=(pathlib.Path("/bin/claude"), {}),
-    )
-    @mock.patch.object(
-        providers,
-        "resolve_reviewer_executable",
-        return_value=pathlib.Path("/bin/copilot"),
-    )
-    @mock.patch.object(providers, "_copilot_attempt")
-    def test_unverified_warmup_entitlement_refuses_copilot_fallback(
-        self,
-        copilot_attempt: mock.Mock,
-        resolve: mock.Mock,
-        _resolve_claude: mock.Mock,
-        _environment: mock.Mock,
-    ) -> None:
-        completed = Completed(
-            argv=("claude",),
-            returncode=1,
-            stdout=json.dumps(
-                {
-                    "type": "result",
-                    "subtype": "error_during_execution",
-                    "is_error": True,
-                    "error": {
-                        "code": "model_access_denied",
-                        "message": "request rejected",
-                    },
-                }
-            ).encode(),
-            stderr=b"",
-        )
-        self.warmup.side_effect = providers.ClaudeAuthWarmupEntitlement(
-            completed
-        )
-
-        with (
-            mock.patch.object(
-                providers,
-                "_with_claude_review_tool_path",
-                side_effect=lambda _review, env: dict(env),
-            ),
-            mock.patch.object(
-                providers,
-                "_prepare_claude_tls_environment",
-                side_effect=lambda _review, env: dict(env),
-            ),
-            mock.patch.object(providers, "run") as run_command,
-        ):
-            outcome = providers.run_review(
-                review=self.review,
-                reviewer="claude",
-                egress_consent="double-review",
-            )
-
-        self.assertEqual(outcome.returncode, 1)
-        self.assertEqual(len(outcome.attempts), 1)
-        self.assertEqual(outcome.attempts[0].category, "runtime-unverified")
-        self.assertEqual(self.warmup.call_count, 1)
-        run_command.assert_not_called()
-        resolve.assert_not_called()
-        copilot_attempt.assert_not_called()
-        persisted = json.loads(
-            (self.review.container_dir / "attempts.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        self.assertEqual(len(persisted), 1)
-        self.assertEqual(persisted[0]["category"], "runtime-unverified")
-
-    @mock.patch.object(providers, "child_environment", return_value={})
-    @mock.patch.object(
-        providers,
-        "_resolve_validated_claude_executable",
-        return_value=(pathlib.Path("/bin/claude"), {}),
-    )
-    @mock.patch.object(
-        providers,
-        "resolve_reviewer_executable",
-        return_value=pathlib.Path("/bin/copilot"),
-    )
-    @mock.patch.object(providers, "_copilot_attempt")
     @mock.patch.object(providers, "_claude_attempt")
-    def test_second_model_warmup_inconclusive_preserves_first_attempt(
+    def test_attempt_local_auth_unavailable_blocks_without_copilot_fallback(
         self,
         claude_attempt: mock.Mock,
         copilot_attempt: mock.Mock,
@@ -4328,230 +5496,262 @@ class ProviderPolicyTest(unittest.TestCase):
         _resolve_claude: mock.Mock,
         _environment: mock.Mock,
     ) -> None:
-        first = self.attempt(
-            "claude",
-            providers.CLAUDE_MODELS[0],
-            "entitlement",
+        auth_error = providers.ClaudeKeychainCredentialUnavailable(
+            "credential refresh persistence failed"
         )
-        claude_attempt.side_effect = (
-            first,
-            providers.ClaudeAuthWarmupInconclusive(
-                "second model refresh was inconclusive"
+        setattr(
+            auth_error,
+            "_codex_claude_persistence_attempt",
+            self.attempt(
+                "claude",
+                providers.CLAUDE_MODELS[0],
+                "blocked-authentication",
             ),
         )
-
-        outcome = providers.run_review(
-            review=self.review,
-            reviewer="claude",
-            egress_consent="double-review",
-        )
-
-        self.assertEqual(outcome.returncode, 75)
-        self.assertEqual(outcome.attempts, (first,))
-        copilot_attempt.assert_not_called()
-        resolve.assert_not_called()
-        persisted = json.loads(
-            (self.review.container_dir / "attempts.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        self.assertEqual(len(persisted), 1)
-        self.assertEqual(persisted[0]["category"], "entitlement")
-        self.assertIn(
-            "second model refresh was inconclusive",
-            (self.review.container_dir / "runner-error.txt").read_text(
-                encoding="utf-8"
-            ),
-        )
-
-    def test_second_model_transient_warmup_precedes_broker_fallback(self) -> None:
-        first = self.attempt(
-            "claude",
-            providers.CLAUDE_MODELS[0],
-            "entitlement",
-        )
-        completed = Completed(
-            argv=("claude",),
-            returncode=1,
-            stdout=json.dumps(
-                {
-                    "type": "result",
-                    "subtype": "error_during_execution",
-                    "is_error": True,
-                    "api_error_status": 429,
-                }
-            ).encode(),
-            stderr=b"",
-        )
-
-        def claude_attempt(**kwargs) -> providers.Attempt:
-            if kwargs["model"] == providers.CLAUDE_MODELS[0]:
-                return first
-            self.warm_claude_local_login(
-                kwargs["review"],
-                pathlib.Path("/bin/claude"),
-                kwargs["env"],
-                kwargs["model"],
-            )
-            raise AssertionError("transient warmup unexpectedly returned")
-
-        with (
-            mock.patch.object(providers, "child_environment", return_value={}),
-            mock.patch.object(
-                providers,
-                "_resolve_validated_claude_executable",
-                return_value=(pathlib.Path("/bin/claude"), {}),
-            ),
-            mock.patch.object(
-                providers,
-                "_require_fresh_claude_keychain_credential",
-                side_effect=(
-                    providers.ClaudeKeychainCredentialUnavailable("stale"),
-                    providers.ClaudeKeychainBrokerUnavailable(
-                        "credential broker disappeared"
-                    ),
-                ),
-            ),
-            mock.patch.object(
-                providers,
-                "_run_claude_auth_warmup",
-                return_value=completed,
-            ),
-            mock.patch.object(
-                providers,
-                "_claude_attempt",
-                side_effect=claude_attempt,
-            ),
-            mock.patch.object(
-                providers,
-                "resolve_reviewer_executable",
-            ) as resolve,
-            mock.patch.object(providers, "_copilot_attempt") as copilot_attempt,
-        ):
-            outcome = providers.run_review(
-                review=self.review,
-                reviewer="claude",
-                egress_consent="triple-review",
-            )
-
-        self.assertEqual(outcome.returncode, 75)
-        self.assertEqual(outcome.attempts, (first,))
-        resolve.assert_not_called()
-        copilot_attempt.assert_not_called()
-        persisted = json.loads(
-            (self.review.container_dir / "attempts.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        self.assertEqual(len(persisted), 1)
-        self.assertEqual(persisted[0]["category"], "entitlement")
-
-    def test_second_model_warmup_inconclusive_updates_runtime_evidence(
-        self,
-    ) -> None:
-        executable = self.review.container_dir / "verified-claude"
-        executable.write_bytes(b"snapshot")
+        claude_attempt.side_effect = auth_error
         providers.write_json(
             self.review.container_dir / "claude-runtime.json",
             {
                 "phase": "publisher-and-capabilities-verified",
                 "authentication": {"status": "pending"},
-                "outer_sandbox": {"status": "pending-runtime-launch"},
             },
         )
-        first = self.attempt(
-            "claude",
-            providers.CLAUDE_MODELS[0],
-            "entitlement",
-        )
-        self.warmup.side_effect = (
-            None,
-            providers.ClaudeAuthWarmupInconclusive(
-                "second model refresh was inconclusive"
-            ),
-        )
-        completed = Completed(
-            argv=("claude",),
-            returncode=1,
-            stdout=b"{}",
-            stderr=b"model entitlement denied",
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
         )
 
-        with (
-            mock.patch.object(providers, "child_environment", return_value={}),
-            mock.patch.object(
-                providers,
-                "_resolve_validated_claude_executable",
-                return_value=(executable, {}),
-            ),
-            mock.patch.object(
-                providers,
-                "_with_claude_review_tool_path",
-                side_effect=lambda _review, env: dict(env),
-            ),
-            mock.patch.object(
-                providers,
-                "_prepare_claude_tls_environment",
-                side_effect=lambda _review, env: dict(env),
-            ),
-            mock.patch.object(
-                providers,
-                "_claude_connect_proxy",
-                return_value=contextlib.nullcontext(43210),
-            ),
-            mock.patch.object(
-                providers,
-                "_claude_review_sandbox_profile",
-                return_value="(version 1)",
-            ),
-            mock.patch.object(providers, "run", return_value=completed) as run_command,
-            mock.patch.object(
-                providers,
-                "_parse_claude_output",
-                return_value=(None, None),
-            ),
-            mock.patch.object(
-                providers,
-                "_record_attempt",
-                return_value=first,
-            ),
-            mock.patch.object(providers, "resolve_reviewer_executable") as resolve,
-            mock.patch.object(providers, "_copilot_attempt") as copilot_attempt,
-        ):
-            outcome = providers.run_review(
-                review=self.review,
-                reviewer="claude",
-                egress_consent="double-review",
+        self.assertEqual(outcome.returncode, 2)
+        self.assertEqual(len(outcome.attempts), 1)
+        self.assertEqual(outcome.attempts[0].category, "blocked-authentication")
+        copilot_attempt.assert_not_called()
+        resolve.assert_not_called()
+        error = (self.review.container_dir / "runner-error.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("claude auth login", error)
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
+        self.assertEqual(report["phase"], "blocked-authentication")
+        self.assertEqual(report["status"], "blocked-authentication")
+        self.assertEqual(report["category"], "blocked-authentication")
+        self.assertEqual(
+            report["authentication"]["status"],
+            "blocked-authentication",
+        )
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        return_value=(pathlib.Path("/bin/claude"), {}),
+    )
+    @mock.patch.object(providers, "_copilot_attempt")
+    @mock.patch.object(providers, "_claude_attempt")
+    def test_credential_io_race_is_inconclusive_without_copilot_fallback(
+        self,
+        claude_attempt: mock.Mock,
+        copilot_attempt: mock.Mock,
+        _resolve_claude: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        claude_attempt.side_effect = (
+            providers.ClaudeCredentialInspectionInconclusive(
+                "credential source changed while it was read"
             )
+        )
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
 
         self.assertEqual(outcome.returncode, 75)
-        self.assertEqual(outcome.attempts, (first,))
-        self.assertEqual(self.warmup.call_count, len(providers.CLAUDE_MODELS))
-        run_command.assert_called_once()
-        resolve.assert_not_called()
         copilot_attempt.assert_not_called()
-        report = json.loads(
-            (self.review.container_dir / "claude-runtime.json").read_text(
-                encoding="utf-8"
-            )
+        error = (self.review.container_dir / "runner-error.txt").read_text(
+            encoding="utf-8"
         )
-        self.assertEqual(
-            report["phase"],
-            "authentication-preflight-inconclusive",
+        self.assertIn("inconclusive", error)
+        self.assertNotIn("claude auth login", error)
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        return_value=(pathlib.Path("/bin/claude"), {}),
+    )
+    @mock.patch.object(providers, "_copilot_attempt")
+    @mock.patch.object(providers, "_claude_attempt")
+    def test_macos_refresh_recovery_pauses_without_copilot_fallback(
+        self,
+        claude_attempt: mock.Mock,
+        copilot_attempt: mock.Mock,
+        _resolve_claude: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        carrier = (
+            self.review.container_dir
+            / "claude-runtime"
+            / "macos"
+            / "claude-carrier-run-review"
         )
-        self.assertEqual(
-            report["authentication"],
+        config = carrier / "config"
+        config.mkdir(parents=True, mode=0o700)
+        credential = config / providers.CLAUDE_CREDENTIAL_FILE_NAME
+        credential_payload = oauth_credential_fixture(expires_in_seconds=7200)
+        self.write_private_source(credential, credential_payload)
+        error = providers.ClaudeCredentialInspectionInconclusive(
+            "guarded host writeback was not proven"
+        )
+        setattr(error, "_codex_claude_refresh_persistence_failed", True)
+        setattr(
+            error,
+            "_codex_claude_retained_credential_carrier",
+            str(carrier),
+        )
+        claude_attempt.side_effect = error
+        providers.write_json(
+            self.review.container_dir / "claude-runtime.json",
             {
-                "status": "inconclusive",
-                "model": providers.CLAUDE_MODELS[1],
-                "failure_class": "warmup",
-                "validated_for_model": None,
+                "phase": "runtime-launching",
+                "authentication": {"status": "sandbox-auth-staged"},
             },
         )
-        self.assertIsNone(report["attempt"])
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
+
+        self.assertEqual(outcome.returncode, 75)
+        copilot_attempt.assert_not_called()
+        runner_error = (self.review.container_dir / "runner-error.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(str(carrier), runner_error)
+        self.assertIn(
+            providers.CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC,
+            runner_error,
+        )
+        self.assertNotIn(
+            json.loads(credential_payload)["claudeAiOauth"]["refreshToken"],
+            runner_error,
+        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
-            report["outer_sandbox"]["status"],
-            "pending-runtime-launch",
+            report["authentication"]["recovery_carrier"],
+            str(carrier),
+        )
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        return_value=(pathlib.Path("/bin/claude"), {}),
+    )
+    @mock.patch.object(providers, "_copilot_attempt")
+    @mock.patch.object(providers, "_claude_attempt")
+    def test_timeout_reports_secondary_refresh_persistence_failure(
+        self,
+        claude_attempt: mock.Mock,
+        copilot_attempt: mock.Mock,
+        _resolve_claude: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        error = providers.ReviewTimeoutError("primary review timeout")
+        setattr(error, "_codex_claude_refresh_persistence_failed", True)
+        claude_attempt.side_effect = error
+        providers.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {
+                "phase": "runtime-launching",
+                "authentication": {"status": "sandbox-auth-staged"},
+            },
+        )
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
+
+        self.assertEqual(outcome.returncode, 75)
+        copilot_attempt.assert_not_called()
+        runner_error = (self.review.container_dir / "runner-error.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("primary review timeout", runner_error)
+        self.assertIn(providers.CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC, runner_error)
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
+        self.assertEqual(report["phase"], "attempt-inconclusive")
+        self.assertEqual(
+            report["authentication"]["refresh_persistence"],
+            "failed-after-attempt",
+        )
+        self.assertEqual(
+            report["authentication"]["secondary_diagnostic"],
+            providers.CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC,
+        )
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        return_value=(pathlib.Path("/bin/claude"), {}),
+    )
+    @mock.patch.object(providers, "_copilot_attempt")
+    @mock.patch.object(providers, "_claude_attempt")
+    def test_generic_review_error_preserves_recovery_carrier_diagnostic(
+        self,
+        claude_attempt: mock.Mock,
+        copilot_attempt: mock.Mock,
+        _resolve_claude: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        carrier = (
+            self.review.container_dir
+            / "claude-runtime"
+            / "linux"
+            / "claude-carrier-generic-error"
+        )
+        carrier.mkdir(parents=True, mode=0o700)
+        error = ReviewError("primary runtime validation failed")
+        setattr(error, "_codex_claude_refresh_persistence_failed", True)
+        setattr(
+            error,
+            "_codex_claude_retained_credential_carrier",
+            str(carrier),
+        )
+        claude_attempt.side_effect = error
+        providers.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {
+                "phase": "runtime-launching",
+                "authentication": {"status": "sandbox-auth-staged"},
+            },
+        )
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
+
+        self.assertEqual(outcome.returncode, 2)
+        copilot_attempt.assert_not_called()
+        runner_error = (self.review.container_dir / "runner-error.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("primary runtime validation failed", runner_error)
+        self.assertIn(providers.CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC, runner_error)
+        self.assertIn(str(carrier), runner_error)
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
+        self.assertEqual(
+            report["authentication"]["recovery_carrier"],
+            str(carrier),
         )
 
     @mock.patch.object(providers, "child_environment", return_value={})
@@ -4567,7 +5767,7 @@ class ProviderPolicyTest(unittest.TestCase):
     )
     @mock.patch.object(providers, "_copilot_attempt")
     @mock.patch.object(providers, "_claude_attempt")
-    def test_second_model_local_auth_unavailable_allows_authorized_fallback(
+    def test_second_model_credential_failure_blocks_authorized_fallback(
         self,
         claude_attempt: mock.Mock,
         copilot_attempt: mock.Mock,
@@ -4575,50 +5775,33 @@ class ProviderPolicyTest(unittest.TestCase):
         _resolve_claude: mock.Mock,
         _environment: mock.Mock,
     ) -> None:
-        errors = (
-            providers.ClaudeKeychainCredentialUnavailable(
-                "second model credential is unavailable"
-            ),
-            providers.ClaudeKeychainBrokerUnavailable(
-                "second model credential broker is unavailable"
-            ),
-            providers.ClaudeLoopbackUnavailable(
-                "second model authentication loopback is unavailable"
+        error = providers.ClaudeKeychainCredentialUnavailable(
+            "second model credential refresh failed"
+        )
+        first = self.attempt(
+            "claude",
+            providers.CLAUDE_MODELS[0],
+            "entitlement",
+        )
+        claude_attempt.side_effect = (first, error)
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="triple-review",
+        )
+
+        self.assertEqual(outcome.returncode, 2)
+        self.assertEqual(outcome.attempts, (first,))
+        self.assertEqual(claude_attempt.call_count, len(providers.CLAUDE_MODELS))
+        copilot_attempt.assert_not_called()
+        resolve.assert_not_called()
+        self.assertIn(
+            "claude auth login",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
             ),
         )
-        for error in errors:
-            with self.subTest(error_type=type(error).__name__):
-                claude_attempt.reset_mock()
-                copilot_attempt.reset_mock()
-                resolve.reset_mock()
-                first = self.attempt(
-                    "claude",
-                    providers.CLAUDE_MODELS[0],
-                    "entitlement",
-                )
-                claude_attempt.side_effect = (first, error)
-                copilot_attempt.return_value = self.attempt(
-                    "copilot",
-                    providers.COPILOT_MODELS[0],
-                    "success",
-                    final_text="No findings.",
-                )
-
-                outcome = providers.run_review(
-                    review=self.review,
-                    reviewer="claude",
-                    egress_consent="triple-review",
-                )
-
-                self.assertEqual(outcome.returncode, 0)
-                self.assertEqual(outcome.attempts[0], first)
-                self.assertEqual(outcome.attempts[1].runtime, "copilot")
-                self.assertEqual(
-                    claude_attempt.call_count,
-                    len(providers.CLAUDE_MODELS),
-                )
-                copilot_attempt.assert_called_once()
-                resolve.assert_called_once_with("copilot")
 
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(
@@ -4638,9 +5821,6 @@ class ProviderPolicyTest(unittest.TestCase):
         _environment: mock.Mock,
     ) -> None:
         errors = (
-            providers.ClaudeKeychainCredentialUnavailable(
-                "second model credential is unavailable"
-            ),
             providers.ClaudeKeychainBrokerUnavailable(
                 "second model credential broker is unavailable"
             ),
@@ -4927,11 +6107,146 @@ class ProviderPolicyTest(unittest.TestCase):
     @mock.patch.object(
         providers,
         "resolve_reviewer_executable",
-        side_effect=(pathlib.Path("/bin/claude"), pathlib.Path("/bin/copilot")),
+        return_value=pathlib.Path("/bin/claude"),
     )
     @mock.patch.object(providers, "_copilot_attempt")
     @mock.patch.object(providers, "_claude_attempt")
-    def test_claude_without_usable_auth_uses_authorized_copilot_fallback(
+    def test_partial_result_cannot_authorize_model_or_copilot_fallback(
+        self,
+        claude_attempt: mock.Mock,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        stdout = json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "message": "review failed",
+                "result": (
+                    "Repository text: authentication_error; model is not "
+                    "available for your account"
+                ),
+            }
+        )
+        claude_attempt.return_value = self.attempt(
+            "claude",
+            providers.CLAUDE_MODELS[0],
+            providers.classify_failure(stdout, ""),
+        )
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
+
+        self.assertEqual(outcome.returncode, 1)
+        claude_attempt.assert_called_once()
+        copilot_attempt.assert_not_called()
+        self.assertEqual(resolve.call_count, 1)
+        self.assertEqual(outcome.attempts[0].category, "other")
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "resolve_reviewer_executable",
+        return_value=pathlib.Path("/bin/claude"),
+    )
+    @mock.patch.object(providers, "_copilot_attempt")
+    @mock.patch.object(providers, "_claude_attempt")
+    def test_claude_auth_result_blocks_authorized_copilot_fallback(
+        self,
+        claude_attempt: mock.Mock,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        diagnostics = tuple(
+            ("", diagnostic)
+            for diagnostic in (
+                "Login expired",
+                "Please run /login",
+                "Run claude auth login to continue",
+                "OAuth refresh failed",
+                "Token refresh failed",
+                "HTTP 401 Unauthorized",
+                "OAuth refresh failed after a network timeout",
+                "HTTP 401 while the service is temporarily unavailable",
+            )
+        ) + (
+            (
+                json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "error_during_execution",
+                        "is_error": True,
+                        "message": "request failed for the selected model",
+                        "errors": ["Login expired · Please run /login"],
+                        "result": "partial review text mentioning HTTP 503",
+                    }
+                ),
+                "",
+            ),
+            (
+                json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "error_during_execution",
+                        "is_error": True,
+                        "code": "authentication_error",
+                        "message": "model is not available for your account",
+                        "result": "the service is temporarily unavailable",
+                    }
+                ),
+                "",
+            ),
+        )
+        for stdout, stderr in diagnostics:
+            with self.subTest(stdout=stdout, stderr=stderr):
+                claude_attempt.reset_mock()
+                copilot_attempt.reset_mock()
+                resolve.reset_mock()
+                claude_attempt.return_value = self.attempt(
+                    "claude",
+                    providers.CLAUDE_MODELS[0],
+                    providers.classify_failure(stdout, stderr),
+                )
+                outcome = providers.run_review(
+                    review=self.review,
+                    reviewer="claude",
+                    egress_consent="double-review",
+                )
+
+                self.assertEqual(outcome.returncode, 2)
+                claude_attempt.assert_called_once()
+                copilot_attempt.assert_not_called()
+                self.assertEqual(resolve.call_count, 1)
+                self.assertEqual(
+                    outcome.attempts[0].category,
+                    "blocked-authentication",
+                )
+                self.assertIn(
+                    "claude auth login",
+                    (self.review.container_dir / "runner-error.txt").read_text(
+                        encoding="utf-8"
+                    ),
+                )
+
+    @mock.patch.object(
+        providers,
+        "child_environment",
+        return_value={"ANTHROPIC_API_KEY": "fixture-api-key"},
+    )
+    @mock.patch.object(
+        providers,
+        "resolve_reviewer_executable",
+        return_value=pathlib.Path("/bin/claude"),
+    )
+    @mock.patch.object(providers, "_copilot_attempt")
+    @mock.patch.object(providers, "_claude_attempt")
+    def test_api_key_auth_failure_blocks_with_api_key_action(
         self,
         claude_attempt: mock.Mock,
         copilot_attempt: mock.Mock,
@@ -4941,13 +6256,7 @@ class ProviderPolicyTest(unittest.TestCase):
         claude_attempt.return_value = self.attempt(
             "claude",
             providers.CLAUDE_MODELS[0],
-            "auth",
-        )
-        copilot_attempt.return_value = self.attempt(
-            "copilot",
-            providers.COPILOT_MODELS[0],
-            "success",
-            final_text="No findings.",
+            providers.classify_failure("", "HTTP 401 invalid API key"),
         )
 
         outcome = providers.run_review(
@@ -4956,10 +6265,14 @@ class ProviderPolicyTest(unittest.TestCase):
             egress_consent="double-review",
         )
 
-        self.assertEqual(outcome.returncode, 0)
-        claude_attempt.assert_called_once()
-        copilot_attempt.assert_called_once()
-        self.assertEqual(resolve.call_count, 2)
+        self.assertEqual(outcome.returncode, 2)
+        copilot_attempt.assert_not_called()
+        self.assertEqual(resolve.call_count, 1)
+        error = (self.review.container_dir / "runner-error.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("Unset or replace `ANTHROPIC_API_KEY`", error)
+        self.assertNotIn("claude auth login", error)
 
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(providers, "resolve_reviewer_executable")
@@ -5879,7 +7192,7 @@ class ProviderPolicyTest(unittest.TestCase):
         run_probe.return_value = Completed(
             argv=("claude", "--version"),
             returncode=0,
-            stdout=b"2.1.188 (Claude Code)\n",
+            stdout=b"2.1.211 (Claude Code)\n",
             stderr=b"",
         )
 
@@ -5888,7 +7201,7 @@ class ProviderPolicyTest(unittest.TestCase):
             {"HOME": "/isolated/probe-home"},
         )
 
-        self.assertEqual(version.text, "2.1.188")
+        self.assertEqual(version.text, "2.1.211")
 
     @mock.patch.object(providers, "_run_claude_probe")
     def test_claude_identity_rejects_old_or_next_major_version(
@@ -5896,7 +7209,7 @@ class ProviderPolicyTest(unittest.TestCase):
         run_probe: mock.Mock,
     ) -> None:
         for output in (
-            b"2.1.186 (Claude Code)\n",
+            b"2.1.210 (Claude Code)\n",
             b"3.0.0 (Claude Code)\n",
         ):
             with self.subTest(output=output):
@@ -5908,7 +7221,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(
                     providers.InvalidReviewerExecutable,
-                    "supported >=2.1.187,<3 range",
+                    "supported >=2.1.211,<3 range",
                 ):
                     providers._require_claude_identity(
                         pathlib.Path("/bin/claude"),
@@ -6086,6 +7399,528 @@ class ProviderPolicyTest(unittest.TestCase):
                 ):
                     pass
 
+    def test_claude_linux_prelaunch_credential_failure_keeps_probe_pending(
+        self,
+    ) -> None:
+        executable = pathlib.Path("/verified/claude")
+
+        @contextlib.contextmanager
+        def failing_runtime():
+            raise providers.LinuxCredentialUnavailable("credential unavailable")
+            yield  # pragma: no cover
+
+        providers.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {
+                "phase": "publisher-and-capabilities-verified",
+                "outer_sandbox": {"status": "pending-runtime-launch"},
+                "authentication": {"status": "pending"},
+            },
+        )
+        with (
+            mock.patch.object(providers, "_is_claude_linux_host", return_value=True),
+            mock.patch.object(
+                providers,
+                "_with_claude_review_tool_path",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_prepare_claude_tls_environment",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_linux_review_runtime",
+                return_value=failing_runtime(),
+            ),
+            mock.patch.object(providers, "run") as run_command,
+            self.assertRaisesRegex(
+                providers.ClaudeKeychainCredentialUnavailable,
+                "credential unavailable",
+            ),
+        ):
+            providers._claude_attempt(
+                review=self.review,
+                model=providers.CLAUDE_MODELS[0],
+                index=1,
+                env={},
+                executable=executable,
+                refresh_lock_protocol=self.claude_refresh_lock_protocol,
+            )
+
+        run_command.assert_not_called()
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
+        self.assertEqual(report["phase"], "blocked-authentication")
+        self.assertEqual(
+            report["outer_sandbox"]["status"],
+            "pending-isolation-probe",
+        )
+        self.assertIsNone(report["attempt"])
+
+    def test_claude_linux_refresh_writeback_failure_blocks_authentication(
+        self,
+    ) -> None:
+        executable = pathlib.Path("/verified/claude")
+
+        @contextlib.contextmanager
+        def failing_runtime():
+            yield mock.Mock(argv=("sandbox",), env={})
+            raise providers.LinuxCredentialUnsafe(
+                "host credential changed before refresh writeback"
+            )
+
+        providers.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {
+                "phase": "publisher-and-capabilities-verified",
+                "authentication": {"status": "pending"},
+            },
+        )
+        with (
+            mock.patch.object(providers, "_is_claude_linux_host", return_value=True),
+            mock.patch.object(
+                providers,
+                "_with_claude_review_tool_path",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_prepare_claude_tls_environment",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_linux_review_runtime",
+                return_value=failing_runtime(),
+            ),
+            mock.patch.object(
+                providers,
+                "run",
+                return_value=Completed(
+                    argv=("sandbox",),
+                    returncode=0,
+                    stdout=b"{}",
+                    stderr=b"",
+                ),
+            ) as run_command,
+            self.assertRaisesRegex(
+                providers.ClaudeCredentialUnsafe,
+                "changed before refresh writeback",
+            ) as raised,
+        ):
+            providers._claude_attempt(
+                review=self.review,
+                model=providers.CLAUDE_MODELS[0],
+                index=1,
+                env={},
+                executable=executable,
+                refresh_lock_protocol=self.claude_refresh_lock_protocol,
+            )
+
+        run_command.assert_called_once()
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
+        self.assertEqual(report["phase"], "blocked-authentication")
+        self.assertEqual(report["status"], "blocked-authentication")
+        self.assertEqual(report["category"], "blocked-authentication")
+        self.assertEqual(
+            report["authentication"]["status"],
+            "blocked-authentication",
+        )
+        self.assertEqual(
+            report["authentication"]["failure_class"],
+            "refresh-persistence",
+        )
+        self.assertEqual(report["attempt"]["returncode"], 0)
+        attempt = getattr(
+            raised.exception,
+            "_codex_claude_persistence_attempt",
+        )
+        self.assertIsInstance(attempt, providers.Attempt)
+        self.assertEqual(attempt.category, "blocked-authentication")
+        self.assertEqual(attempt.returncode, 0)
+
+    def test_claude_linux_supervision_failure_does_not_claim_writer_quiescence(
+        self,
+    ) -> None:
+        executable = pathlib.Path("/verified/claude")
+        lifecycle_states: list[tuple[bool, bool]] = []
+
+        @contextlib.contextmanager
+        def observing_runtime(
+            *_args: object,
+            writer_started=None,
+            writer_quiescent=None,
+            **_kwargs: object,
+        ):
+            assert callable(writer_started)
+            assert callable(writer_quiescent)
+            self.assertFalse(writer_started())
+            self.assertFalse(writer_quiescent())
+            try:
+                yield mock.Mock(argv=("sandbox",), env={})
+            finally:
+                lifecycle_states.append(
+                    (writer_started(), writer_quiescent())
+                )
+
+        with (
+            mock.patch.object(providers, "_is_claude_linux_host", return_value=True),
+            mock.patch.object(
+                providers,
+                "_with_claude_review_tool_path",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_prepare_claude_tls_environment",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_linux_review_runtime",
+                side_effect=observing_runtime,
+            ),
+            mock.patch.object(
+                providers,
+                "run",
+                side_effect=providers.ReviewTimeoutError("review timed out"),
+            ),
+            self.assertRaises(providers.ReviewTimeoutError),
+        ):
+            providers._claude_attempt(
+                review=self.review,
+                model=providers.CLAUDE_MODELS[0],
+                index=1,
+                env={},
+                executable=executable,
+                refresh_lock_protocol=self.claude_refresh_lock_protocol,
+            )
+
+        self.assertEqual(lifecycle_states, [(True, False)])
+
+    def test_claude_persistence_diagnostic_reports_retained_private_carrier(
+        self,
+    ) -> None:
+        carrier = (
+            self.review.container_dir
+            / "claude-runtime"
+            / "linux"
+            / "claude-carrier-fixture"
+        )
+        carrier.mkdir(parents=True, mode=0o700)
+        providers.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {"authentication": {}},
+        )
+        error = providers.ReviewTimeoutError("review timed out")
+        setattr(error, "_codex_claude_refresh_persistence_failed", True)
+        setattr(
+            error,
+            "_codex_claude_retained_credential_carrier",
+            str(carrier),
+        )
+
+        diagnostic = providers._record_claude_secondary_persistence_failure(
+            self.review,
+            error,
+        )
+
+        assert diagnostic is not None
+        self.assertIn(str(carrier), diagnostic)
+        report = common.read_json(
+            self.review.container_dir / "claude-runtime.json"
+        )
+        self.assertEqual(
+            report["authentication"]["recovery_carrier"],
+            str(carrier),
+        )
+
+    def test_persistence_report_signal_overrides_original_error(self) -> None:
+        carrier = (
+            self.review.container_dir
+            / "claude-runtime"
+            / "macos"
+            / "claude-carrier-report-signal"
+        )
+        carrier.mkdir(parents=True, mode=0o700)
+        original = providers.ReviewTimeoutError("review timed out")
+        setattr(original, "_codex_claude_refresh_persistence_failed", True)
+        setattr(
+            original,
+            "_codex_claude_retained_credential_carrier",
+            str(carrier),
+        )
+        forwarded = providers.ForwardedSignal(signal.SIGTERM)
+
+        with (
+            mock.patch.object(
+                providers,
+                "_update_claude_runtime_report",
+                side_effect=forwarded,
+            ),
+            self.assertRaises(providers.ForwardedSignal) as raised,
+        ):
+            providers._record_claude_secondary_persistence_failure(
+                self.review,
+                original,
+            )
+
+        self.assertIs(raised.exception, forwarded)
+        self.assertIsNotNone(forwarded.detail)
+        self.assertIn(str(carrier), forwarded.detail or "")
+        self.assertEqual(
+            getattr(
+                forwarded,
+                "_codex_claude_retained_credential_carrier",
+                None,
+            ),
+            str(carrier),
+        )
+
+    def test_recovery_path_resolution_preserves_forwarded_signal(self) -> None:
+        error = providers.ClaudeCredentialInspectionInconclusive(
+            "guarded host writeback failed"
+        )
+        setattr(
+            error,
+            "_codex_claude_retained_credential_carrier",
+            str(self.review.container_dir / "claude-runtime" / "macos"),
+        )
+        forwarded = providers.ForwardedSignal(signal.SIGTERM)
+
+        with (
+            mock.patch.object(
+                pathlib.Path,
+                "resolve",
+                side_effect=forwarded,
+            ),
+            self.assertRaises(providers.ForwardedSignal) as raised,
+        ):
+            providers._validated_claude_retained_credential_carrier(
+                self.review,
+                error,
+            )
+
+        self.assertIs(raised.exception, forwarded)
+
+    def test_macos_inconclusive_report_signal_preserves_recovery_path(
+        self,
+    ) -> None:
+        carrier = (
+            self.review.container_dir
+            / "claude-runtime"
+            / "macos"
+            / "claude-carrier-inconclusive-report-signal"
+        )
+        carrier.mkdir(parents=True, mode=0o700)
+        persistence_error = providers.ClaudeCredentialInspectionInconclusive(
+            "guarded host writeback failed"
+        )
+        setattr(
+            persistence_error,
+            "_codex_claude_refresh_persistence_failed",
+            True,
+        )
+        setattr(
+            persistence_error,
+            "_codex_claude_retained_credential_carrier",
+            str(carrier),
+        )
+        forwarded = providers.ForwardedSignal(signal.SIGTERM)
+
+        with (
+            mock.patch.object(
+                providers,
+                "_update_claude_runtime_report",
+                side_effect=forwarded,
+            ),
+            self.assertRaises(providers.ForwardedSignal) as raised,
+        ):
+            providers._update_claude_runtime_report_preserving_persistence(
+                self.review,
+                {"phase": "authentication-inspection-inconclusive"},
+                persistence_error,
+            )
+
+        self.assertIs(raised.exception, forwarded)
+        self.assertIn(str(carrier), forwarded.detail or "")
+        self.assertEqual(
+            getattr(
+                forwarded,
+                "_codex_claude_retained_credential_carrier",
+                None,
+            ),
+            str(carrier),
+        )
+
+    def test_macos_inconclusive_report_error_preserves_recovery_path(
+        self,
+    ) -> None:
+        carrier = (
+            self.review.container_dir
+            / "claude-runtime"
+            / "macos"
+            / "claude-carrier-inconclusive-report-error"
+        )
+        carrier.mkdir(parents=True, mode=0o700)
+        persistence_error = providers.ClaudeCredentialInspectionInconclusive(
+            "guarded host writeback failed"
+        )
+        setattr(
+            persistence_error,
+            "_codex_claude_refresh_persistence_failed",
+            True,
+        )
+        setattr(
+            persistence_error,
+            "_codex_claude_retained_credential_carrier",
+            str(carrier),
+        )
+        report_error = OSError("runtime report write failed")
+
+        with (
+            mock.patch.object(
+                providers,
+                "_update_claude_runtime_report",
+                side_effect=report_error,
+            ),
+            self.assertRaises(
+                providers.ClaudeCredentialInspectionInconclusive
+            ) as raised,
+        ):
+            providers._update_claude_runtime_report_preserving_persistence(
+                self.review,
+                {"phase": "authentication-inspection-inconclusive"},
+                persistence_error,
+            )
+
+        self.assertIs(raised.exception.__cause__, report_error)
+        self.assertIn(str(carrier), str(raised.exception))
+        self.assertEqual(
+            getattr(
+                raised.exception,
+                "_codex_claude_retained_credential_carrier",
+                None,
+            ),
+            str(carrier),
+        )
+
+    def test_claude_persistence_diagnostic_populates_forwarded_signal_detail(
+        self,
+    ) -> None:
+        carrier = (
+            self.review.container_dir
+            / "claude-runtime"
+            / "linux"
+            / "claude-carrier-signal"
+        )
+        carrier.mkdir(parents=True, mode=0o700)
+        providers.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {"authentication": {}},
+        )
+        error = providers.ForwardedSignal(
+            signal.SIGTERM,
+            detail="review process group stopped",
+        )
+        setattr(error, "_codex_claude_refresh_persistence_failed", True)
+        setattr(
+            error,
+            "_codex_claude_retained_credential_carrier",
+            str(carrier),
+        )
+
+        diagnostic = providers._record_claude_secondary_persistence_failure(
+            self.review,
+            error,
+        )
+
+        assert diagnostic is not None
+        assert error.detail is not None
+        self.assertIn("review process group stopped", error.detail)
+        self.assertIn(str(carrier), error.detail)
+        report = common.read_json(
+            self.review.container_dir / "claude-runtime.json"
+        )
+        self.assertEqual(
+            report["authentication"]["recovery_carrier"],
+            str(carrier),
+        )
+
+    def test_claude_persistence_diagnostic_ignores_malformed_carrier_path(
+        self,
+    ) -> None:
+        providers.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {"authentication": {}},
+        )
+        error = providers.ForwardedSignal(signal.SIGTERM)
+        setattr(error, "_codex_claude_refresh_persistence_failed", True)
+        setattr(
+            error,
+            "_codex_claude_retained_credential_carrier",
+            "/malformed\0carrier",
+        )
+
+        diagnostic = providers._record_claude_secondary_persistence_failure(
+            self.review,
+            error,
+        )
+
+        self.assertEqual(
+            diagnostic,
+            providers.CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC,
+        )
+        self.assertEqual(error.detail, diagnostic)
+        report = common.read_json(
+            self.review.container_dir / "claude-runtime.json"
+        )
+        self.assertEqual(
+            report["authentication"]["refresh_persistence"],
+            "failed-after-attempt",
+        )
+        self.assertNotIn("recovery_carrier", report["authentication"])
+
+    def test_macos_coordination_surfaces_inconclusive_lock_cleanup_paths(
+        self,
+    ) -> None:
+        lock_path = pathlib.Path("/fixture/.claude/.oauth_refresh.lock")
+        cleanup_error = (
+            claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+                "helper-owned lock paths may remain at "
+                f"{lock_path}; confirm that no writer is active before cleanup"
+            )
+        )
+
+        @contextlib.contextmanager
+        def failing_refresh_lock(*_args: object, **_kwargs: object):
+            raise cleanup_error
+            yield  # pragma: no cover
+
+        with (
+            mock.patch.object(
+                providers,
+                "_claude_credential_update_lock",
+                side_effect=lambda _label: contextlib.nullcontext(),
+            ),
+            mock.patch.object(
+                providers,
+                "claude_refresh_lock",
+                side_effect=failing_refresh_lock,
+            ),
+            self.assertRaises(
+                providers.ClaudeCredentialInspectionInconclusive
+            ) as raised,
+        ):
+            with providers._claude_macos_carrier_coordination(
+                self.claude_refresh_lock_protocol
+            ):
+                self.fail("inconclusive cleanup unexpectedly yielded")
+
+        self.assertIn(str(lock_path), str(raised.exception))
+        self.assertIn("no writer is active", str(raised.exception))
+
     def test_claude_linux_stages_single_attempt_credential_each_time(
         self,
     ) -> None:
@@ -6097,6 +7932,7 @@ class ProviderPolicyTest(unittest.TestCase):
             rg=pathlib.Path("/usr/bin/rg"),
         )
         runtime_root = self.review.container_dir / "claude-runtime" / "linux"
+        runtime_root.mkdir(parents=True, exist_ok=True)
         source = self.review.source_root / ".claude" / ".credentials.json"
         staged = mock.Mock(config_dir=runtime_root / "staged-config")
         attempts = (
@@ -6114,10 +7950,32 @@ class ProviderPolicyTest(unittest.TestCase):
             stdout=b"{}",
             stderr=b"",
         )
-        self.assertEqual(
-            providers.CLAUDE_ATTEMPT_CREDENTIAL_VALIDITY_SECONDS,
-            32 * 60.0,
-        )
+        started_callbacks: list[Callable[[], bool]] = []
+        quiescence_callbacks: list[Callable[[], bool]] = []
+        lifecycle_exit_states: list[tuple[bool, bool]] = []
+
+        @contextlib.contextmanager
+        def staged_context(
+            writer_started: Callable[[], bool],
+            writer_quiescent: Callable[[], bool],
+        ):
+            try:
+                yield staged
+            finally:
+                lifecycle_exit_states.append(
+                    (writer_started(), writer_quiescent())
+                )
+
+        def stage_once(*_args: object, **kwargs: object):
+            writer_started = kwargs.get("writer_started")
+            writer_quiescent = kwargs.get("writer_quiescent")
+            assert callable(writer_started)
+            assert callable(writer_quiescent)
+            self.assertFalse(writer_started())
+            self.assertFalse(writer_quiescent())
+            started_callbacks.append(writer_started)
+            quiescence_callbacks.append(writer_quiescent)
+            return staged_context(writer_started, writer_quiescent)
 
         with contextlib.ExitStack() as stack:
             stack.enter_context(
@@ -6194,9 +8052,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 mock.patch.object(
                     providers,
                     "stage_claude_credentials",
-                    side_effect=lambda *_args, **_kwargs: contextlib.nullcontext(
-                        staged
-                    ),
+                    side_effect=stage_once,
                 )
             )
             stack.enter_context(
@@ -6255,6 +8111,7 @@ class ProviderPolicyTest(unittest.TestCase):
             def runner(**kwargs) -> providers.Attempt:
                 return providers._claude_attempt(
                     executable=executable,
+                    refresh_lock_protocol=self.claude_refresh_lock_protocol,
                     **kwargs,
                 )
 
@@ -6271,19 +8128,18 @@ class ProviderPolicyTest(unittest.TestCase):
             self.assertEqual(category, "success")
             self.assertEqual(final_text, "No findings.")
             self.assertEqual(recorded_attempts, list(attempts))
-            self.warmup.assert_not_called()
-
             self.assertEqual(
                 stage_credentials.call_count,
                 len(providers.CLAUDE_MODELS),
             )
             for call in stage_credentials.call_args_list:
                 self.assertEqual(call.args, (source, runtime_root))
-                self.assertEqual(
-                    call.kwargs["required_validity_seconds"],
-                    providers.REVIEW_ATTEMPT_TIMEOUT_SECONDS
-                    + providers.CLAUDE_AUTH_EXPIRY_MARGIN_SECONDS,
-                )
+            self.assertTrue(all(callback() for callback in started_callbacks))
+            self.assertTrue(all(callback() for callback in quiescence_callbacks))
+            self.assertEqual(
+                lifecycle_exit_states,
+                [(True, True)] * len(providers.CLAUDE_MODELS),
+            )
             for call in build_sandbox.call_args_list:
                 self.assertFalse(
                     call.args[0].node_extra_ca_certs_configured
@@ -6331,6 +8187,7 @@ class ProviderPolicyTest(unittest.TestCase):
             rg=pathlib.Path("/usr/bin/rg"),
         )
         runtime_root = self.review.container_dir / "claude-runtime" / "linux"
+        runtime_root.mkdir(parents=True, exist_ok=True)
         failure = providers.LinuxRuntimeInspectionInconclusive(
             "workspace symlink changed during inspection"
         )
@@ -7038,7 +8895,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 settings_denies
             )
         )
-        self.assertIn("Read(//config/**)", settings_denies)
+        self.assertIn("Read(//auth/**)", settings_denies)
         self.assertIn("Read(//proc/**)", settings_denies)
         self.assertNotIn("Read(/config/**)", settings_denies)
 
@@ -7111,7 +8968,7 @@ class ProviderPolicyTest(unittest.TestCase):
             Completed(
                 argv=("claude", "--version"),
                 returncode=0,
-                stdout=b"2.1.187 (Claude Code)\n",
+                stdout=b"2.1.211 (Claude Code)\n",
                 stderr=b"",
             ),
             Completed(
@@ -7147,6 +9004,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 "https_proxy": "http://lower-https:secret@proxy.invalid:8080",
                 "no_proxy": "lower-no-proxy.invalid",
             },
+            refresh_lock_protocol=self.claude_refresh_lock_protocol,
         )
         argv = run_command.call_args_list[2].args[0]
         self.assertIn("claude-opus-4-8", argv)
@@ -7292,7 +9150,7 @@ class ProviderPolicyTest(unittest.TestCase):
         providers.write_json(
             self.review.container_dir / "claude-runtime.json",
             {
-                "phase": "authentication-preflight-complete",
+                "phase": "publisher-and-capabilities-verified",
                 "outer_sandbox": {"status": "pending-runtime-launch"},
                 "gpg_verifier_trust": "fixed-path-native-host-tool",
             },
@@ -7340,7 +9198,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        self.assertEqual(report["phase"], "authentication-preflight-complete")
+        self.assertEqual(report["phase"], "authentication-source-pending")
         self.assertEqual(
             report["outer_sandbox"]["status"],
             "pending-runtime-launch",
@@ -7351,6 +9209,86 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         resolve_claude.assert_not_called()
         run_command.assert_not_called()
+
+    def test_claude_post_run_refresh_failure_reports_completed_attempt(self) -> None:
+        executable = self.review.container_dir / "verified-claude"
+        executable.write_bytes(b"snapshot")
+        providers.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {
+                "phase": "publisher-and-capabilities-verified",
+                "outer_sandbox": {"status": "pending-runtime-launch"},
+                "authentication": {"status": "pending"},
+            },
+        )
+        completed = Completed(
+            argv=("claude",),
+            returncode=0,
+            stdout=b"{}",
+            stderr=b"",
+        )
+
+        @contextlib.contextmanager
+        def runtime(_review, env, _refresh_lock_protocol):
+            yield dict(env)
+            raise providers.ClaudeKeychainCredentialUnavailable(
+                "refresh persistence failed"
+            )
+
+        with (
+            mock.patch.object(providers, "_is_claude_linux_host", return_value=False),
+            mock.patch.object(
+                providers,
+                "_with_claude_review_tool_path",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_prepare_claude_tls_environment",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(providers, "_claude_keychain_runtime", side_effect=runtime),
+            mock.patch.object(
+                providers,
+                "_claude_connect_proxy",
+                return_value=contextlib.nullcontext(43210),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_review_sandbox_profile",
+                return_value="(version 1)",
+            ),
+            mock.patch.object(providers, "run", return_value=completed),
+            self.assertRaisesRegex(
+                providers.ClaudeKeychainCredentialUnavailable,
+                "refresh persistence failed",
+            ) as raised,
+        ):
+            providers._claude_attempt(
+                review=self.review,
+                model=providers.CLAUDE_MODELS[0],
+                index=1,
+                env={},
+                executable=executable,
+                refresh_lock_protocol=self.claude_refresh_lock_protocol,
+            )
+
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
+        self.assertEqual(report["phase"], "blocked-authentication")
+        self.assertEqual(report["outer_sandbox"]["status"], "enforced-at-launch")
+        self.assertEqual(
+            report["authentication"]["failure_class"],
+            "refresh-persistence",
+        )
+        self.assertEqual(report["attempt"]["category"], "blocked-authentication")
+        self.assertEqual(report["attempt"]["returncode"], 0)
+        attempt = getattr(
+            raised.exception,
+            "_codex_claude_persistence_attempt",
+        )
+        self.assertIsInstance(attempt, providers.Attempt)
+        self.assertEqual(attempt.category, "blocked-authentication")
+        self.assertEqual(attempt.returncode, 0)
 
     def test_claude_malformed_result_finalizes_runtime_report(self) -> None:
         executable = self.review.container_dir / "verified-claude"
@@ -7407,7 +9345,6 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertEqual(attempt.category, "other")
         self.assertIsNone(attempt.final_text)
-        self.warmup.assert_not_called()
         report = json.loads(
             (self.review.container_dir / "claude-runtime.json").read_text(
                 encoding="utf-8"
@@ -7487,6 +9424,48 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertIn(f'(literal "{executable.resolve()}")', profile)
         self.assertNotIn(f'(subpath "{install_dir.resolve()}")', profile)
+
+    @mock.patch.object(
+        providers,
+        "_trusted_claude_ripgrep",
+        return_value=pathlib.Path("/bin/echo"),
+    )
+    def test_claude_review_sandbox_cannot_read_macos_recovery_carrier(
+        self,
+        _rg: mock.Mock,
+    ) -> None:
+        payload = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        carrier = providers._retain_claude_macos_refreshed_credential(
+            self.review,
+            payload,
+        )
+        payload[:] = b"\x00" * len(payload)
+
+        profile = providers._claude_review_sandbox_profile(
+            pathlib.Path("/bin/true"),
+            self.review,
+            {
+                "HOME": str(self.review.container_dir / "claude-home"),
+                "TMPDIR": str(self.review.container_dir / "tmp"),
+                "PATH": str(self.claude_broker.parent),
+                providers.CLAUDE_KEYCHAIN_BROKER_PORT_ENV: "43211",
+                providers.CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV: "00" * 32,
+            },
+            proxy_port=43210,
+        )
+
+        credential = carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
+        for private_path in (carrier.parent, carrier, credential.parent, credential):
+            self.assertNotIn(f'(literal "{private_path}")', profile)
+            self.assertNotIn(f'(subpath "{private_path}")', profile)
+        for allowed_subpath in re.findall(r'\(subpath "([^"]+)"\)', profile):
+            self.assertFalse(
+                providers.is_relative_to(
+                    credential.resolve(),
+                    pathlib.Path(allowed_subpath).resolve(),
+                ),
+                f"recovery credential is readable through {allowed_subpath}",
+            )
 
     @mock.patch.object(
         providers,
@@ -7598,39 +9577,6 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertNotIn("/usr/bin/security", profile)
         self.assertNotIn("com.apple.securityd.xpc", profile)
-
-    @mock.patch.object(
-        providers,
-        "_trusted_claude_ripgrep",
-        return_value=pathlib.Path("/bin/echo"),
-    )
-    def test_claude_auth_warmup_allows_only_direct_keychain_client(
-        self,
-        _rg: mock.Mock,
-    ) -> None:
-        profile = providers._claude_review_sandbox_profile(
-            pathlib.Path("/bin/true"),
-            self.review,
-            {
-                "HOME": str(self.review.container_dir / "claude-home"),
-                "TMPDIR": str(self.review.container_dir / "tmp"),
-                "PATH": "/usr/bin:/bin",
-            },
-            proxy_port=43210,
-            allow_direct_keychain=True,
-            allow_workspace_read=False,
-        )
-
-        self.assertIn(
-            f'(literal "{self.claude_keychain_client.resolve()}")',
-            profile,
-        )
-        self.assertIn("com.apple.securityd.xpc", profile)
-        self.assertNotIn(str(self.claude_broker.resolve()), profile)
-        self.assertNotIn(
-            f'(subpath "{self.review.workspace_root.resolve()}")',
-            profile,
-        )
 
     @mock.patch.object(
         providers,
@@ -8712,10 +10658,6 @@ class ProviderPolicyTest(unittest.TestCase):
     def test_claude_proxy_allows_api_and_oauth_refresh_targets(self) -> None:
         self.assertEqual(
             providers.CLAUDE_PROXY_TARGETS,
-            frozenset({("api.anthropic.com", 443)}),
-        )
-        self.assertEqual(
-            providers.CLAUDE_AUTH_PROXY_TARGETS,
             frozenset(
                 {
                     ("api.anthropic.com", 443),
@@ -8724,10 +10666,6 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
         )
         self.assertIn(
-            providers._parse_connect_target("platform.claude.com:443"),
-            providers.CLAUDE_AUTH_PROXY_TARGETS,
-        )
-        self.assertNotIn(
             providers._parse_connect_target("platform.claude.com:443"),
             providers.CLAUDE_PROXY_TARGETS,
         )
@@ -8758,7 +10696,7 @@ class ProviderPolicyTest(unittest.TestCase):
             Completed(
                 argv=("claude", "--version"),
                 returncode=0,
-                stdout=b"2.1.187 (Claude Code)\n",
+                stdout=b"2.1.211 (Claude Code)\n",
                 stderr=b"",
             ),
             Completed(
