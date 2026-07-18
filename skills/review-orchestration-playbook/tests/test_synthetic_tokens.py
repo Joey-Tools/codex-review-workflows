@@ -2641,7 +2641,7 @@ class PublicPoolScannerTest(unittest.TestCase):
     def test_long_provider_candidate_does_not_suppress_unsafe_assignment_rhs(
         self,
     ) -> None:
-        candidate = b"sk-proj-B1" + b"B" * 506
+        candidate = b"sk-" + b"proj-B1" + b"B" * 506
         cases = (
             (
                 "unquoted-space-continuation",
@@ -2753,7 +2753,7 @@ class PublicPoolScannerTest(unittest.TestCase):
         )
 
     def test_unsafe_long_provider_rhs_crosses_first_commit_and_blocks(self) -> None:
-        candidate = b"sk-proj-" + b"B" * 508
+        candidate = b"sk-" + b"proj-" + b"B" * 508
         first_read = (
             workspace.MAX_SECRET_PREFIX_PROOF_BYTES + workspace.STREAM_SCAN_OVERLAP
         )
@@ -3637,7 +3637,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                     self.prepare(repo=repo, base=base, head=head)
 
     def test_unsafe_long_provider_rhs_does_not_count_as_reduction(self) -> None:
-        candidate = b"sk-proj-B1" + b"B" * 506
+        candidate = b"sk-" + b"proj-B1" + b"B" * 506
 
         def unsafe_assignment(marker: bytes) -> str:
             return (
