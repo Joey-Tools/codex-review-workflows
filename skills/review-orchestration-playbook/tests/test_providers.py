@@ -1523,6 +1523,26 @@ class ProviderPolicyTest(unittest.TestCase):
         ):
             providers._read_claude_keychain_credential(self.review)
 
+    def test_late_keychain_client_loss_is_inconclusive(self) -> None:
+        cases = ("missing", "non-executable")
+        for condition in cases:
+            with self.subTest(condition=condition):
+                client = (
+                    self.claude_keychain_client.parent / f"security-{condition}"
+                )
+                if condition == "non-executable":
+                    client.write_bytes(b"fixture")
+                    client.chmod(0o600)
+
+                with (
+                    mock.patch.object(providers, "CLAUDE_KEYCHAIN_CLIENT", client),
+                    self.assertRaisesRegex(
+                        providers.ClaudeCredentialInspectionInconclusive,
+                        "requires /usr/bin/security",
+                    ),
+                ):
+                    providers._read_claude_keychain_credential(self.review)
+
     def test_pwd_home_credential_reader_ignores_ambient_home_and_config(self) -> None:
         payload = oauth_credential_fixture()
         credential_path = self.write_pwd_home_credential(payload)
@@ -4881,6 +4901,24 @@ class ProviderPolicyTest(unittest.TestCase):
 
     @mock.patch.object(
         providers,
+        "CLAUDE_KEYCHAIN_CLIENT",
+        pathlib.Path("/missing/security"),
+    )
+    def test_missing_keychain_client_during_prepare_is_unavailable(self) -> None:
+        with self.assertRaisesRegex(
+            providers.ClaudeKeychainBrokerUnavailable,
+            "requires /usr/bin/security",
+        ):
+            self.prepare_claude_keychain_broker(
+                self.review,
+                {
+                    "HOME": str(self.review.container_dir / "claude-home"),
+                    "PATH": "/usr/bin",
+                },
+            )
+
+    @mock.patch.object(
+        providers,
         "CLAUDE_KEYCHAIN_BROKER_COMPILER",
         pathlib.Path("/missing/clang"),
     )
@@ -7286,6 +7324,104 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn("inconclusive", error)
         self.assertNotIn("claude auth login", error)
 
+    def test_late_keychain_client_loss_pauses_double_and_triple_review(
+        self,
+    ) -> None:
+        snapshot = self.review.container_dir / "verified-claude"
+        snapshot.write_bytes(b"snapshot")
+        cases = (
+            ("double-review", "missing"),
+            ("triple-review", "non-executable"),
+        )
+
+        for consent, condition in cases:
+            with self.subTest(consent=consent, condition=condition):
+                client = self.claude_keychain_client.parent / (
+                    f"late-security-{condition}"
+                )
+                client.write_bytes(b"fixture")
+                client.chmod(0o700)
+
+                def prepare_broker(
+                    _review: ReviewWorkspace,
+                    env: dict[str, str],
+                ) -> dict[str, str]:
+                    self.assertTrue(client.is_file())
+                    self.assertTrue(os.access(client, os.X_OK))
+                    return dict(env)
+
+                def fail_after_preflight(**_kwargs: object) -> providers.Attempt:
+                    self.assertTrue(
+                        (self.review.container_dir / "preflight.json").is_file()
+                    )
+                    if condition == "missing":
+                        client.unlink()
+                    else:
+                        client.chmod(0o600)
+                    providers._read_claude_keychain_credential(self.review)
+                    raise AssertionError(
+                        "late Keychain inspection unexpectedly passed"
+                    )
+
+                with (
+                    mock.patch.object(
+                        providers,
+                        "child_environment",
+                        return_value={},
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "CLAUDE_KEYCHAIN_CLIENT",
+                        client,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_resolve_validated_claude_executable",
+                        return_value=(snapshot, {}),
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_prepare_claude_keychain_broker",
+                        side_effect=prepare_broker,
+                    ) as prepare,
+                    mock.patch.object(
+                        providers,
+                        "_claude_attempt",
+                        side_effect=fail_after_preflight,
+                    ) as claude_attempt,
+                    mock.patch.object(
+                        providers,
+                        "resolve_reviewer_executable",
+                        return_value=pathlib.Path("/bin/copilot"),
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_copilot_attempt",
+                        return_value=self.attempt(
+                            "copilot",
+                            providers.COPILOT_MODELS[0],
+                            "success",
+                            final_text="No findings.",
+                        ),
+                    ) as copilot_attempt,
+                ):
+                    outcome = providers.run_review(
+                        review=self.review,
+                        reviewer="claude",
+                        egress_consent=consent,
+                    )
+
+                self.assertEqual(outcome.returncode, 75)
+                prepare.assert_called_once()
+                claude_attempt.assert_called_once()
+                copilot_attempt.assert_not_called()
+                self.assertIn(
+                    "inconclusive",
+                    (self.review.container_dir / "runner-error.txt").read_text(
+                        encoding="utf-8"
+                    ),
+                )
+
     @mock.patch.object(providers, "child_environment", return_value={})
     @mock.patch.object(
         providers,
@@ -9258,6 +9394,81 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(attempt.category, "blocked-authentication")
         self.assertEqual(attempt.returncode, 0)
 
+    def test_claude_linux_auth_rejection_precedes_inspection_failure(
+        self,
+    ) -> None:
+        executable = pathlib.Path("/verified/claude")
+        completed = Completed(
+            argv=("sandbox",),
+            returncode=1,
+            stdout=b"",
+            stderr=b"HTTP 401 Unauthorized; please run /login",
+        )
+
+        def run_after_spawn(*_args: object, **kwargs: object) -> Completed:
+            on_process_started = kwargs.get("on_process_started")
+            assert callable(on_process_started)
+            on_process_started()
+            return completed
+
+        @contextlib.contextmanager
+        def failing_runtime():
+            yield mock.Mock(argv=("sandbox",), env={})
+            raise providers.LinuxCredentialInspectionInconclusive(
+                "final credential snapshot unavailable"
+            )
+
+        providers.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {
+                "phase": "publisher-and-capabilities-verified",
+                "authentication": {"status": "pending"},
+            },
+        )
+        with (
+            mock.patch.object(providers, "_is_claude_linux_host", return_value=True),
+            mock.patch.object(
+                providers,
+                "_with_claude_review_tool_path",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_prepare_claude_tls_environment",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_linux_review_runtime",
+                return_value=failing_runtime(),
+            ),
+            mock.patch.object(
+                providers,
+                "run",
+                side_effect=run_after_spawn,
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeKeychainCredentialUnavailable,
+                "rejected the configured credential",
+            ) as raised,
+        ):
+            providers._claude_attempt(
+                review=self.review,
+                model=providers.CLAUDE_MODELS[0],
+                index=1,
+                env={},
+                executable=executable,
+                refresh_lock_protocol=self.claude_refresh_lock_protocol,
+            )
+
+        attempt = getattr(
+            raised.exception,
+            "_codex_claude_persistence_attempt",
+        )
+        self.assertIsInstance(attempt, providers.Attempt)
+        self.assertEqual(attempt.category, "auth")
+        self.assertEqual(attempt.returncode, 1)
+
     def test_claude_linux_supervision_failure_does_not_claim_writer_quiescence(
         self,
     ) -> None:
@@ -11081,6 +11292,79 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIsInstance(attempt, providers.Attempt)
         self.assertEqual(attempt.category, "blocked-authentication")
         self.assertEqual(attempt.returncode, 0)
+
+    def test_claude_post_run_auth_rejection_precedes_inspection_failure(
+        self,
+    ) -> None:
+        executable = self.review.container_dir / "verified-claude"
+        executable.write_bytes(b"snapshot")
+        providers.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {
+                "phase": "publisher-and-capabilities-verified",
+                "outer_sandbox": {"status": "pending-runtime-launch"},
+                "authentication": {"status": "pending"},
+            },
+        )
+        completed = Completed(
+            argv=("claude",),
+            returncode=1,
+            stdout=b"",
+            stderr=b"Login expired; please run /login",
+        )
+
+        @contextlib.contextmanager
+        def runtime(_review, env, _refresh_lock_protocol):
+            yield dict(env)
+            raise providers.ClaudeCredentialInspectionInconclusive(
+                "final credential snapshot unavailable"
+            )
+
+        with (
+            mock.patch.object(providers, "_is_claude_linux_host", return_value=False),
+            mock.patch.object(
+                providers,
+                "_with_claude_review_tool_path",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_prepare_claude_tls_environment",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(providers, "_claude_keychain_runtime", side_effect=runtime),
+            mock.patch.object(
+                providers,
+                "_claude_connect_proxy",
+                return_value=contextlib.nullcontext(43210),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_review_sandbox_profile",
+                return_value="(version 1)",
+            ),
+            mock.patch.object(providers, "run", return_value=completed),
+            self.assertRaisesRegex(
+                providers.ClaudeKeychainCredentialUnavailable,
+                "rejected the configured credential",
+            ) as raised,
+        ):
+            providers._claude_attempt(
+                review=self.review,
+                model=providers.CLAUDE_MODELS[0],
+                index=1,
+                env={},
+                executable=executable,
+                refresh_lock_protocol=self.claude_refresh_lock_protocol,
+            )
+
+        attempt = getattr(
+            raised.exception,
+            "_codex_claude_persistence_attempt",
+        )
+        self.assertIsInstance(attempt, providers.Attempt)
+        self.assertEqual(attempt.category, "auth")
+        self.assertEqual(attempt.returncode, 1)
 
     def test_claude_malformed_result_finalizes_runtime_report(self) -> None:
         executable = self.review.container_dir / "verified-claude"

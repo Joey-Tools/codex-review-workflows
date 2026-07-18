@@ -1272,7 +1272,7 @@ def _read_claude_keychain_credential(
 ) -> bytearray | None:
     client = CLAUDE_KEYCHAIN_CLIENT
     if not client.is_file() or not os.access(client, os.X_OK):
-        raise ClaudeKeychainBrokerUnavailable(
+        raise ClaudeCredentialInspectionInconclusive(
             "Claude local-login review requires /usr/bin/security"
         )
     account = _claude_keychain_account()
@@ -7078,6 +7078,36 @@ def _claude_persistence_failed_attempt(
     )
 
 
+def _claude_auth_rejection_after_credential_inspection(
+    *,
+    review: ReviewWorkspace,
+    index: int,
+    model: str,
+    completed: Completed,
+    inspection_error: BaseException,
+) -> ClaudeKeychainCredentialUnavailable | None:
+    if classify_failure(completed.stdout, completed.stderr) != "auth":
+        return None
+    failure = ClaudeKeychainCredentialUnavailable(
+        "the restricted Claude runtime rejected the configured credential; "
+        "post-attempt credential inspection was also inconclusive"
+    )
+    setattr(
+        failure,
+        "_codex_claude_persistence_attempt",
+        _claude_persistence_failed_attempt(
+            review=review,
+            index=index,
+            model=model,
+            completed=completed,
+            category="auth",
+        ),
+    )
+    _propagate_claude_persistence_state(review, inspection_error, failure)
+    _attach_claude_credential_cleanup_failure(failure, inspection_error)
+    return failure
+
+
 def _record_attempt(
     *,
     review: ReviewWorkspace,
@@ -7916,6 +7946,18 @@ def _claude_attempt(
                     ),
                 },
             )
+            if completed is not None:
+                authentication_error = (
+                    _claude_auth_rejection_after_credential_inspection(
+                        review=review,
+                        index=index,
+                        model=model,
+                        completed=completed,
+                        inspection_error=error,
+                    )
+                )
+                if authentication_error is not None:
+                    raise authentication_error from error
             translated_error = ClaudeCredentialInspectionInconclusive(
                 f"Claude Linux credential inspection was inconclusive: {error}"
             )
@@ -8108,6 +8150,17 @@ def _claude_attempt(
                 error,
             )
             if completed is not None:
+                authentication_error = (
+                    _claude_auth_rejection_after_credential_inspection(
+                        review=review,
+                        index=index,
+                        model=model,
+                        completed=completed,
+                        inspection_error=error,
+                    )
+                )
+                if authentication_error is not None:
+                    raise authentication_error from error
                 setattr(
                     error,
                     "_codex_claude_persistence_attempt",
