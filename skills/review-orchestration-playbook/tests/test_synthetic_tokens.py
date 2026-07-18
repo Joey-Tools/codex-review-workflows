@@ -6739,6 +6739,46 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         self.assertNotIn(raw_value, str(caught.exception))
         self.assertNotIn(legacy_value_base64(raw_value), str(caught.exception))
 
+    def test_evidence_cannot_expose_dynamic_secret_storage_encoding(self) -> None:
+        raw_value = reduction_secret("generic-secret-assignment")
+        encoded_value = base64.b64encode(raw_value).decode("ascii")
+        accepted = (
+            workspace._secret_reduction_descriptor(
+                raw_value,
+                {"generic-secret-assignment"},
+            ),
+        )
+        evidence = {"dynamic": encoded_value}
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "would expose a raw synthetic value",
+        ) as caught:
+            workspace._reject_raw_values_in_evidence(
+                evidence,
+                accepted_values=accepted,
+                label="test evidence",
+            )
+        message = str(caught.exception)
+        self.assertNotIn(raw_value.decode("ascii"), message)
+        self.assertNotIn(encoded_value, message)
+
+        destination = self.root / "dynamic-secret-evidence.json"
+        with self.assertRaisesRegex(
+            ReviewError,
+            "would expose a raw synthetic value",
+        ) as caught:
+            workspace._write_bounded_json(
+                destination,
+                evidence,
+                label="test evidence",
+                accepted_values=accepted,
+            )
+        message = str(caught.exception)
+        self.assertNotIn(raw_value.decode("ascii"), message)
+        self.assertNotIn(encoded_value, message)
+        self.assertFalse(destination.exists())
+
     def test_evidence_cannot_expose_a_numeric_synthetic_value(self) -> None:
         integer_raw = "12345678" + "90123456"
         float_raw = "1.23456789" + "0123456"

@@ -283,6 +283,7 @@ MAX_REVIEW_PROMPT_BYTES = 64 * 1024
 MAX_SYNTHETIC_EVIDENCE_BYTES = 64 * 1024
 MAX_SYNTHETIC_EVIDENCE_ENTRIES = 512
 MAX_REVIEW_CLEANUP_DEPTH = 256
+REVIEW_CLEANUP_QUARANTINE_PREFIX = ".codex-review-cleanup-"
 SYNTHETIC_MANIFEST_NAME = "synthetic-secret-manifest.json"
 SYNTHETIC_PRIVATE_MANIFEST_NAME = "synthetic-secret-state.json"
 SYNTHETIC_CHANGED_EVIDENCE_NAME = "synthetic-changed-evidence.json"
@@ -1042,7 +1043,7 @@ def _quarantine_cleanup_entry(
     label: str,
     missing_is_error: bool,
 ) -> tuple[str | None, os.stat_result | None, list[str]]:
-    quarantine_name = f".codex-review-cleanup-{uuid.uuid4().hex}"
+    quarantine_name = f"{REVIEW_CLEANUP_QUARANTINE_PREFIX}{uuid.uuid4().hex}"
     try:
         os.rename(
             entry_name,
@@ -1142,6 +1143,11 @@ def _remove_open_directory_contents(
 
     for entry_name in entry_names:
         if entry_name in excluded_entry_names:
+            continue
+        if entry_name.startswith(REVIEW_CLEANUP_QUARANTINE_PREFIX):
+            cleanup_errors.append(
+                "pre-existing review cleanup quarantine requires manual recovery"
+            )
             continue
         try:
             entry_before = os.stat(
@@ -1712,7 +1718,7 @@ def _unlink_private_review_artifacts(
                     record_removal(artifact_name)
                 except ReviewError as error:
                     cleanup_errors.append(str(error))
-                    break
+                    continue
         finally:
             restore_signal_mask(removal_mask)
     return cleanup_errors
@@ -2867,13 +2873,12 @@ def _reject_raw_values_in_evidence(
     label: str,
 ) -> None:
     exact_values: list[bytes] = []
-    encoded_legacy_values: list[bytes] = []
+    encoded_exact_values: list[bytes] = []
     digest_values: dict[int, set[str]] = {}
     for accepted in accepted_values:
         if accepted.value is not None:
             exact_values.append(accepted.value)
-            if accepted.kind == "legacy":
-                encoded_legacy_values.append(base64.b64encode(accepted.value))
+            encoded_exact_values.append(base64.b64encode(accepted.value))
             continue
         digest_values.setdefault(accepted.value_length, set()).add(
             accepted.value_sha256
@@ -2881,7 +2886,7 @@ def _reject_raw_values_in_evidence(
     for metadata in set(_iter_evidence_strings(value)):
         if any(raw_value in metadata for raw_value in exact_values):
             raise ReviewError(f"{label} would expose a raw synthetic value")
-        if any(encoded_value in metadata for encoded_value in encoded_legacy_values):
+        if any(encoded_value in metadata for encoded_value in encoded_exact_values):
             raise ReviewError(f"{label} would expose a raw synthetic value")
         for length, digests in digest_values.items():
             if length > len(metadata):

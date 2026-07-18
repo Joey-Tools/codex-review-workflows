@@ -1258,6 +1258,63 @@ class WorkspaceTest(unittest.TestCase):
             )
         )
 
+    def test_private_cleanup_continues_after_removal_receipt_failure(self) -> None:
+        review = self.prepare_range(self.base, self.head)
+        container = review.container_dir
+        failed_name, recorded_name = workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
+        failed_path = container / failed_name
+        recorded_path = container / recorded_name
+        real_record_removal = workspace_runtime._record_private_artifact_removal_at
+        receipt_attempts = []
+
+        def fail_first_receipt(
+            container_descriptor: int,
+            *,
+            expected: workspace_runtime.PrivateCleanupEvidence,
+            artifact_name: str,
+        ) -> None:
+            receipt_attempts.append(artifact_name)
+            if artifact_name == failed_name:
+                raise ReviewError("receipt write denied")
+            real_record_removal(
+                container_descriptor,
+                expected=expected,
+                artifact_name=artifact_name,
+            )
+
+        with mock.patch.object(
+            workspace_runtime,
+            "_record_private_artifact_removal_at",
+            side_effect=fail_first_receipt,
+        ):
+            cleanup_error = workspace_runtime.remove_private_review_artifacts(
+                container,
+                expected=review.private_cleanup,
+            )
+
+        self.assertIn("receipt write denied", cleanup_error or "")
+        self.assertEqual(receipt_attempts, [failed_name, recorded_name])
+        self.assertFalse(failed_path.exists())
+        self.assertFalse(recorded_path.exists())
+        cleanup_state = workspace_runtime._load_control_artifact_state(
+            container_dir=container
+        )
+        self.assertEqual(cleanup_state.private_artifacts_removed, {recorded_name})
+
+        retry_error = workspace_runtime.remove_private_review_artifacts(
+            container,
+            expected=review.private_cleanup,
+        )
+
+        self.assertIn(
+            f"{failed_name}: expected helper-private artifact is missing",
+            retry_error or "",
+        )
+        retry_state = workspace_runtime._load_control_artifact_state(
+            container_dir=container
+        )
+        self.assertEqual(retry_state.private_artifacts_removed, {recorded_name})
+
     def test_removed_private_name_reappearance_is_preserved(self) -> None:
         review = self.prepare_range(self.base, self.head)
         self.assertIsNone(
@@ -1315,6 +1372,18 @@ class WorkspaceTest(unittest.TestCase):
         self.assertEqual(len(quarantines), 1)
         self.assertEqual(quarantines[0].read_text(encoding="utf-8"), "replacement\n")
 
+        retry_error = workspace_runtime._remove_partial_container(
+            container,
+            expected=expected_cleanup,
+        )
+
+        self.assertIn(
+            "pre-existing review cleanup quarantine requires manual recovery",
+            retry_error or "",
+        )
+        self.assertTrue(quarantines[0].exists())
+        self.assertEqual(quarantines[0].read_text(encoding="utf-8"), "replacement\n")
+
     def test_partial_cleanup_preserves_a_replacement_nested_directory(self) -> None:
         container = pathlib.Path(self.temporary.name) / "directory-race-container"
         container.mkdir(mode=0o700)
@@ -1356,6 +1425,18 @@ class WorkspaceTest(unittest.TestCase):
         self.assertEqual(list(moved_nested.iterdir()), [])
         quarantines = list(container.glob(".codex-review-cleanup-*/victim.txt"))
         self.assertEqual(len(quarantines), 1)
+        self.assertEqual(quarantines[0].read_text(encoding="utf-8"), "replacement\n")
+
+        retry_error = workspace_runtime._remove_partial_container(
+            container,
+            expected=expected_cleanup,
+        )
+
+        self.assertIn(
+            "pre-existing review cleanup quarantine requires manual recovery",
+            retry_error or "",
+        )
+        self.assertTrue(quarantines[0].exists())
         self.assertEqual(quarantines[0].read_text(encoding="utf-8"), "replacement\n")
 
     def test_partial_cleanup_bounds_depth_and_still_scrubs_private_files(

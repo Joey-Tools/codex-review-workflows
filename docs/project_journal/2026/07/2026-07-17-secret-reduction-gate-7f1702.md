@@ -87,9 +87,9 @@ Diagnostic and preflight evidence remain bounded audit surfaces. They use stable
 
 ## Validation
 
-- `python3 -m unittest skills/review-orchestration-playbook/tests/test_synthetic_tokens.py`: 192 tests passed.
-- Python 3.10.19 `test_workspace.py`: 79 tests passed.
-- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py'`: 854 tests passed, 9 skipped.
+- `python3 -m unittest skills/review-orchestration-playbook/tests/test_synthetic_tokens.py`: 193 tests passed.
+- Python 3.10.19 full suite: 856 tests passed, 9 skipped.
+- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py'`: 856 tests passed, 9 skipped.
 - `ruff check` on changed runtime and test modules: passed.
 - `git diff --check`: passed.
 - Fixed-range Codex review and PR readiness evidence are recorded in the delivery thread and PR.
