@@ -3229,6 +3229,256 @@ class CredentialStagingTest(unittest.TestCase):
                 expected_refresh_token=self.SYNTH_REFRESH_B,
             )
 
+    def test_stop_closes_background_writeback_after_candidate_read(
+        self,
+    ) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+            source = self._credential(
+                root / ".credentials.json",
+                expires_at_ms=(now - 60) * 1000,
+                access_token=self.SYNTH_ACCESS_EXPIRED,
+                refresh_token=self.SYNTH_REFRESH_A,
+            )
+            candidate_read = threading.Event()
+            release_candidate = threading.Event()
+            background_writeback_called = threading.Event()
+            real_read = claude_linux._read_staged_credential_under_lock
+            real_writeback = claude_linux._writeback_refreshed_credential
+            real_start = claude_linux._StagedCredentialWatcher.start
+            watchers: list[claude_linux._StagedCredentialWatcher] = []
+
+            def read_then_block(*args: object, **kwargs: object):
+                stable = real_read(*args, **kwargs)
+                if (
+                    stable is not None
+                    and threading.current_thread().name
+                    == "codex-claude-staged-credential-watcher"
+                ):
+                    candidate, _identity = stable
+                    value = json.loads(candidate)
+                    if (
+                        value["claudeAiOauth"]["refreshToken"]
+                        == self.SYNTH_REFRESH_B
+                    ):
+                        candidate_read.set()
+                        self.assertTrue(release_candidate.wait(timeout=5.0))
+                return stable
+
+            def observe_writeback(*args: object, **kwargs: object):
+                if (
+                    threading.current_thread().name
+                    == "codex-claude-staged-credential-watcher"
+                ):
+                    background_writeback_called.set()
+                return real_writeback(*args, **kwargs)
+
+            def start_and_capture(
+                watcher: claude_linux._StagedCredentialWatcher,
+            ) -> None:
+                watchers.append(watcher)
+                real_start(watcher)
+
+            with (
+                mock.patch.object(
+                    claude_linux,
+                    "STAGED_CREDENTIAL_POLL_SECONDS",
+                    0.01,
+                ),
+                mock.patch.object(
+                    claude_linux,
+                    "STAGED_CREDENTIAL_JOIN_TIMEOUT_SECONDS",
+                    0.01,
+                ),
+                mock.patch.object(
+                    claude_linux,
+                    "_read_staged_credential_under_lock",
+                    side_effect=read_then_block,
+                ),
+                mock.patch.object(
+                    claude_linux,
+                    "_writeback_refreshed_credential",
+                    side_effect=observe_writeback,
+                ),
+                mock.patch.object(
+                    claude_linux._StagedCredentialWatcher,
+                    "start",
+                    autospec=True,
+                    side_effect=start_and_capture,
+                ),
+            ):
+                manager = claude_linux.stage_claude_credentials(
+                    source,
+                    helper,
+                    now=now,
+                    refresh_lock_protocol=self.PROTOCOL,
+                )
+                staged = manager.__enter__()
+                rotated = self._credential(
+                    staged.config_dir / "post-read-stop-rotation.json",
+                    expires_at_ms=(now + 7200) * 1000,
+                    access_token=self.SYNTH_ACCESS_A,
+                    refresh_token=self.SYNTH_REFRESH_B,
+                )
+                rotated.replace(staged.credential_path)
+                self.assertTrue(candidate_read.wait(timeout=3.0))
+
+                exit_errors: list[BaseException] = []
+
+                def finish_context() -> None:
+                    try:
+                        manager.__exit__(None, None, None)
+                    except BaseException as error:
+                        exit_errors.append(error)
+
+                owner = threading.Thread(target=finish_context, daemon=True)
+                owner.start()
+                owner.join(timeout=1.0)
+                self.assertFalse(owner.is_alive())
+                self.assertEqual(len(exit_errors), 1)
+                self._assert_retained_recovery_carrier(
+                    error=exit_errors[0],
+                    staged=staged,
+                    helper=helper,
+                    expected_refresh_token=self.SYNTH_REFRESH_B,
+                )
+                try:
+                    release_candidate.set()
+                    self.assertEqual(len(watchers), 1)
+                    deadline = time.monotonic() + 3.0
+                    while (
+                        watchers[0].is_alive()
+                        and time.monotonic() < deadline
+                    ):
+                        time.sleep(0.01)
+                    self.assertFalse(watchers[0].is_alive())
+                    self.assertFalse(background_writeback_called.is_set())
+                    host = json.loads(source.read_text(encoding="utf-8"))
+                    self.assertEqual(
+                        host["claudeAiOauth"]["refreshToken"],
+                        self.SYNTH_REFRESH_A,
+                    )
+                finally:
+                    release_candidate.set()
+
+    def test_timeout_reports_admitted_background_writeback_ambiguity(
+        self,
+    ) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+            source = self._credential(
+                root / ".credentials.json",
+                expires_at_ms=(now - 60) * 1000,
+                access_token=self.SYNTH_ACCESS_EXPIRED,
+                refresh_token=self.SYNTH_REFRESH_A,
+            )
+            writeback_started = threading.Event()
+            release_writeback = threading.Event()
+            real_writeback = claude_linux._writeback_refreshed_credential_impl
+            real_start = claude_linux._StagedCredentialWatcher.start
+            watchers: list[claude_linux._StagedCredentialWatcher] = []
+
+            def block_background_writeback(
+                *args: object,
+                **kwargs: object,
+            ) -> object:
+                if (
+                    threading.current_thread().name
+                    == "codex-claude-staged-credential-watcher"
+                ):
+                    writeback_started.set()
+                    self.assertTrue(release_writeback.wait(timeout=5.0))
+                return real_writeback(*args, **kwargs)
+
+            def start_and_capture(
+                watcher: claude_linux._StagedCredentialWatcher,
+            ) -> None:
+                watchers.append(watcher)
+                real_start(watcher)
+
+            with (
+                mock.patch.object(
+                    claude_linux,
+                    "STAGED_CREDENTIAL_POLL_SECONDS",
+                    0.01,
+                ),
+                mock.patch.object(
+                    claude_linux,
+                    "STAGED_CREDENTIAL_JOIN_TIMEOUT_SECONDS",
+                    0.01,
+                ),
+                mock.patch.object(
+                    claude_linux,
+                    "_writeback_refreshed_credential_impl",
+                    side_effect=block_background_writeback,
+                ),
+                mock.patch.object(
+                    claude_linux._StagedCredentialWatcher,
+                    "start",
+                    autospec=True,
+                    side_effect=start_and_capture,
+                ),
+            ):
+                manager = claude_linux.stage_claude_credentials(
+                    source,
+                    helper,
+                    now=now,
+                    refresh_lock_protocol=self.PROTOCOL,
+                )
+                staged = manager.__enter__()
+                rotated = self._credential(
+                    staged.config_dir / "in-flight-rotation.json",
+                    expires_at_ms=(now + 7200) * 1000,
+                    access_token=self.SYNTH_ACCESS_A,
+                    refresh_token=self.SYNTH_REFRESH_B,
+                )
+                rotated.replace(staged.credential_path)
+                self.assertTrue(writeback_started.wait(timeout=3.0))
+
+                with self.assertRaisesRegex(
+                    claude_linux.LinuxCredentialInspectionInconclusive,
+                    "background host credential writeback was already in "
+                    "flight.*host credential state is ambiguous",
+                ) as raised:
+                    manager.__exit__(None, None, None)
+
+                self._assert_retained_recovery_carrier(
+                    error=raised.exception,
+                    staged=staged,
+                    helper=helper,
+                    expected_refresh_token=self.SYNTH_REFRESH_B,
+                )
+                self.assertTrue(
+                    getattr(
+                        raised.exception,
+                        "_codex_claude_host_writeback_in_flight_at_stop",
+                        False,
+                    )
+                )
+                try:
+                    release_writeback.set()
+                    self.assertEqual(len(watchers), 1)
+                    deadline = time.monotonic() + 3.0
+                    while (
+                        watchers[0].is_alive()
+                        and time.monotonic() < deadline
+                    ):
+                        time.sleep(0.01)
+                    self.assertFalse(watchers[0].is_alive())
+                    host = json.loads(source.read_text(encoding="utf-8"))
+                    self.assertEqual(
+                        host["claudeAiOauth"]["refreshToken"],
+                        self.SYNTH_REFRESH_B,
+                    )
+                finally:
+                    release_writeback.set()
+
     def test_forwarded_signal_process_exit_retains_unproven_carrier(self) -> None:
         now = time.time()
         with tempfile.TemporaryDirectory() as temporary:

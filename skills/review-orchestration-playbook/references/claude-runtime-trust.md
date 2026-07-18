@@ -846,15 +846,20 @@ host credential directory or a shared lock. If the supervisor times out or
 reports a process leak, lock recovery is unsafe, the retry fails, or guarded host
 writeback remains unproven while a staged update may be newer, retain the private
 carrier under the review container and record its recovery path without token
-contents. If the initial bounded watcher join itself times out, classify the
-attempt as inspection-inconclusive, retain the carrier immediately, and skip
-concurrent final drain, payload scrubbing, and carrier cleanup. The watcher is a
-daemon only for this handoff: normal paths still join it, while a filesystem
-operation that cannot return cannot keep the helper alive or silently delete
-the recovery copy. A control-flow signal is re-raised only after the retained
-path has been attached to its visible diagnostic. The parent uses the same
-artifact-certified primary and legacy host locks with heartbeat and rejects any
-external host change instead of adopting it. This
+contents. Stop first linearizes closure of new background-writeback admission,
+so a candidate whose last blocking read completes after closure cannot begin
+host writeback. If the initial bounded watcher join itself times out, classify
+the attempt as inspection-inconclusive, retain the carrier immediately, and
+skip concurrent final drain, payload scrubbing, and carrier cleanup. If a
+background writeback was admitted before stop and remains in flight, report
+host state as ambiguous because that already-started commit may still complete;
+do not claim an exclusive recovery handoff. The watcher is a daemon only so
+such an uninterruptible operation cannot keep the helper alive after the
+bounded failure report; normal paths still join it and the recovery copy is
+never silently deleted. A control-flow signal is re-raised only after the
+retained path has been attached to its visible diagnostic. The parent uses the
+same artifact-certified primary and legacy host locks with heartbeat and rejects
+any external host change instead of adopting it. This
 closes the commit race with supported Claude Code login/refresh writers but
 cannot atomically close it for unrelated writers that bypass both locks. Reject
 unsafe ownership,

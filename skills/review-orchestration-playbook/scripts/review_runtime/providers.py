@@ -3424,6 +3424,8 @@ def _persist_claude_macos_refreshed_credential_impl(
                             carriers_already_matched=True,
                         )
                     except Exception as error:
+                        if _is_claude_control_flow_error(error):
+                            raise
                         keychain_write_error = error
                         keychain_written = False
                     if keychain_written:
@@ -6210,81 +6212,209 @@ def _claude_keychain_runtime(
                 durable_carriers_for_cleanup[:-1]
             )
             try:
-                for stale_index, (
-                    durable_carrier,
-                    durable_digest,
-                ) in enumerate(stale_durable_cleanup_targets):
-                    try:
-                        _remove_claude_macos_recovery_carrier(
-                            review,
-                            durable_carrier,
-                            durable_digest,
+                latest_carrier_verified = False
+                latest_readback: bytearray | None = None
+                verification_error: BaseException | None = None
+                try:
+                    if not durable_carriers_for_cleanup:
+                        raise ClaudeCredentialInspectionInconclusive(
+                            "the latest durable recovery carrier is missing "
+                            "before host writeback"
                         )
-                    except BaseException as error:
-                        if _is_claude_control_flow_error(error):
-                            cleanup_stopped_early = (
-                                stale_index + 1
-                                < len(stale_durable_cleanup_targets)
+                    latest_carrier, latest_digest = (
+                        durable_carriers_for_cleanup[-1]
+                    )
+                    latest_readback = (
+                        _read_claude_macos_recovery_credential(
+                            review,
+                            latest_carrier,
+                        )
+                    )
+                    if (
+                        not hmac.compare_digest(
+                            _claude_credential_digest(latest_readback),
+                            latest_digest,
+                        )
+                        or not hmac.compare_digest(
+                            latest_readback,
+                            staged_for_commit,
+                        )
+                    ):
+                        raise ClaudeCredentialInspectionInconclusive(
+                            "the latest durable recovery carrier no longer "
+                            "matches the acknowledged Claude credential"
+                        )
+                    latest_carrier_verified = True
+                except BaseException as error:
+                    if _is_claude_control_flow_error(error):
+                        verification_error = error
+                    elif (
+                        isinstance(
+                            error,
+                            ClaudeCredentialInspectionInconclusive,
+                        )
+                        and "latest durable recovery carrier" in str(error)
+                    ):
+                        verification_error = error
+                    else:
+                        verification_error = (
+                            ClaudeCredentialInspectionInconclusive(
+                                "cannot re-verify the latest durable recovery "
+                                "carrier before host writeback"
                             )
-                            if cleanup_stopped_early:
-                                try:
-                                    recovery_root = (
-                                        _claude_macos_recovery_root(review)
-                                    )
-                                except BaseException as root_error:
-                                    error = (
-                                        _attach_claude_persistence_failure_preserving_control_flow(
-                                            error,
-                                            root_error,
+                        )
+                        verification_error.__cause__ = error
+                finally:
+                    if latest_readback is not None:
+                        latest_readback[:] = b"\x00" * len(latest_readback)
+
+                if verification_error is not None:
+                    for error in (*persistence_errors, verification_error):
+                        for attribute in (
+                            (
+                                "_codex_claude_retained_"
+                                "credential_carrier"
+                            ),
+                            (
+                                "_codex_claude_retained_"
+                                "credential_artifact"
+                            ),
+                        ):
+                            with contextlib.suppress(AttributeError):
+                                delattr(error, attribute)
+                        setattr(
+                            error,
+                            "_codex_claude_refresh_persistence_failed",
+                            True,
+                        )
+                    try:
+                        recovery_root = _claude_macos_recovery_root(review)
+                    except BaseException as root_error:
+                        verification_error = (
+                            _attach_claude_persistence_failure_preserving_control_flow(
+                                verification_error,
+                                root_error,
+                            )
+                        )
+                    else:
+                        _mark_claude_macos_recovery_cleanup_artifact(
+                            verification_error,
+                            recovery_root,
+                        )
+                        for error in persistence_errors:
+                            _mark_claude_macos_recovery_cleanup_artifact(
+                                error,
+                                recovery_root,
+                            )
+                    existing_control_flow = next(
+                        (
+                            error
+                            for error in persistence_errors
+                            if _is_claude_control_flow_error(error)
+                        ),
+                        None,
+                    )
+                    with runtime_state_lock:
+                        if (
+                            existing_control_flow is not None
+                            and not _is_claude_control_flow_error(
+                                verification_error
+                            )
+                        ):
+                            _attach_claude_credential_cleanup_failure(
+                                existing_control_flow,
+                                verification_error,
+                            )
+                            persistence_errors.remove(
+                                existing_control_flow
+                            )
+                            persistence_errors.insert(
+                                0,
+                                existing_control_flow,
+                            )
+                        else:
+                            persistence_errors.insert(
+                                0,
+                                verification_error,
+                            )
+                    persistence_control_flow = True
+
+                if latest_carrier_verified:
+                    for stale_index, (
+                        durable_carrier,
+                        durable_digest,
+                    ) in enumerate(stale_durable_cleanup_targets):
+                        try:
+                            _remove_claude_macos_recovery_carrier(
+                                review,
+                                durable_carrier,
+                                durable_digest,
+                            )
+                        except BaseException as error:
+                            if _is_claude_control_flow_error(error):
+                                cleanup_stopped_early = (
+                                    stale_index + 1
+                                    < len(stale_durable_cleanup_targets)
+                                )
+                                if cleanup_stopped_early:
+                                    try:
+                                        recovery_root = (
+                                            _claude_macos_recovery_root(review)
                                         )
-                                    )
-                                else:
+                                    except BaseException as root_error:
+                                        error = (
+                                            _attach_claude_persistence_failure_preserving_control_flow(
+                                                error,
+                                                root_error,
+                                            )
+                                        )
+                                    else:
+                                        _mark_claude_macos_recovery_cleanup_artifact(
+                                            error,
+                                            recovery_root,
+                                        )
+                                elif not isinstance(
+                                    getattr(
+                                        error,
+                                        (
+                                            "_codex_claude_retained_"
+                                            "cleanup_artifact"
+                                        ),
+                                        None,
+                                    ),
+                                    str,
+                                ):
                                     _mark_claude_macos_recovery_cleanup_artifact(
                                         error,
-                                        recovery_root,
+                                        durable_carrier,
                                     )
-                            elif not isinstance(
-                                getattr(
+                                latest_carrier = (
+                                    durable_carriers_for_cleanup[-1][0]
+                                )
+                                setattr(
                                     error,
                                     (
                                         "_codex_claude_retained_"
-                                        "cleanup_artifact"
+                                        "credential_carrier"
                                     ),
-                                    None,
-                                ),
-                                str,
-                            ):
-                                _mark_claude_macos_recovery_cleanup_artifact(
-                                    error,
-                                    durable_carrier,
+                                    str(latest_carrier),
                                 )
-                            latest_carrier = (
-                                durable_carriers_for_cleanup[-1][0]
-                            )
-                            setattr(
-                                error,
-                                (
-                                    "_codex_claude_retained_"
-                                    "credential_carrier"
-                                ),
-                                str(latest_carrier),
-                            )
-                            _mark_claude_macos_recovery_update_artifact(
-                                error,
-                                latest_carrier
-                                / "config"
-                                / CLAUDE_CREDENTIAL_FILE_NAME,
-                            )
-                            setattr(
-                                error,
-                                "_codex_claude_refresh_persistence_failed",
-                                True,
-                            )
-                            with runtime_state_lock:
-                                persistence_errors.insert(0, error)
-                            persistence_control_flow = True
-                            break
-                        stale_durable_cleanup_errors.append(error)
+                                _mark_claude_macos_recovery_update_artifact(
+                                    error,
+                                    latest_carrier
+                                    / "config"
+                                    / CLAUDE_CREDENTIAL_FILE_NAME,
+                                )
+                                setattr(
+                                    error,
+                                    "_codex_claude_refresh_persistence_failed",
+                                    True,
+                                )
+                                with runtime_state_lock:
+                                    persistence_errors.insert(0, error)
+                                persistence_control_flow = True
+                                break
+                            stale_durable_cleanup_errors.append(error)
                 if not persistence_control_flow:
                     try:
                         accepted = accept_refreshed_credential(

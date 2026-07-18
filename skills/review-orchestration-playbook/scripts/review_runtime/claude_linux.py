@@ -2704,6 +2704,10 @@ class _StagedCredentialWatcher:
         self._candidate_failure_started_at: float | None = None
         self._stop = threading.Event()
         self._drain_lock = threading.Lock()
+        self._background_writeback_state_lock = threading.Lock()
+        self._background_writeback_admission_open = True
+        self._background_writeback_in_flight = False
+        self._background_writeback_was_in_flight_at_stop = False
         self._failure_lock = threading.Lock()
         self._worker_failure: BaseException | None = None
         self._thread = threading.Thread(
@@ -2733,6 +2737,15 @@ class _StagedCredentialWatcher:
         stop_errors: list[BaseException] = []
         while True:
             try:
+                with self._background_writeback_state_lock:
+                    self._background_writeback_admission_open = False
+                    if self._background_writeback_in_flight:
+                        self._background_writeback_was_in_flight_at_stop = True
+                break
+            except BaseException as error:
+                stop_errors.append(error)
+        while True:
+            try:
                 if self._stop.is_set():
                     break
                 self._stop.set()
@@ -2746,6 +2759,10 @@ class _StagedCredentialWatcher:
 
     def is_alive(self) -> bool:
         return self._thread.is_alive()
+
+    def background_writeback_was_in_flight_at_stop(self) -> bool:
+        with self._background_writeback_state_lock:
+            return self._background_writeback_was_in_flight_at_stop
 
     def worker_failure(self) -> BaseException | None:
         with self._failure_lock:
@@ -2770,6 +2787,17 @@ class _StagedCredentialWatcher:
         with self._failure_lock:
             if self._worker_failure is None:
                 self._worker_failure = error
+
+    def _admit_background_writeback(self) -> bool:
+        with self._background_writeback_state_lock:
+            if not self._background_writeback_admission_open:
+                return False
+            self._background_writeback_in_flight = True
+            return True
+
+    def _finish_background_writeback(self) -> None:
+        with self._background_writeback_state_lock:
+            self._background_writeback_in_flight = False
 
     def _run(self) -> None:
         while not self._stop.wait(STAGED_CREDENTIAL_POLL_SECONDS):
@@ -2880,10 +2908,20 @@ class _StagedCredentialWatcher:
                 self._candidate_failure_observation = None
                 self._candidate_failure_started_at = None
                 adopted_candidate = False
+                background_writeback_admitted = False
                 try:
                     if candidate == self._baseline_payload and not final:
                         self._observed_identity = candidate_identity
                         return
+                    if not final:
+                        # Admission and stop closure share one state lock. Once
+                        # request_stop() wins this transition, a candidate that
+                        # was read earlier cannot start a new host writeback.
+                        background_writeback_admitted = (
+                            self._admit_background_writeback()
+                        )
+                        if not background_writeback_admitted:
+                            return
                     committed_identity = _writeback_refreshed_credential(
                         self._source,
                         self._staged,
@@ -2904,6 +2942,8 @@ class _StagedCredentialWatcher:
                     self._observed_identity = candidate_identity
                     return
                 finally:
+                    if background_writeback_admitted:
+                        self._finish_background_writeback()
                     if not adopted_candidate:
                         candidate[:] = b"\x00" * len(candidate)
 
@@ -2948,6 +2988,16 @@ def _retained_staged_credential_error(
         str(staged.carrier_root),
     )
     setattr(retained, "_codex_claude_refresh_persistence_failed", True)
+    if getattr(
+        error,
+        "_codex_claude_host_writeback_in_flight_at_stop",
+        False,
+    ):
+        setattr(
+            retained,
+            "_codex_claude_host_writeback_in_flight_at_stop",
+            True,
+        )
     retained.__cause__ = error
     return retained
 
@@ -3093,9 +3143,28 @@ def stage_claude_credentials(
                     writeback_error = watcher.request_stop()
                     watcher_stopped = watcher.wait_until_stopped()
                     if not watcher_stopped:
+                        if (
+                            watcher.background_writeback_was_in_flight_at_stop()
+                        ):
+                            unstopped = LinuxStagedCredentialWatcherUnstopped(
+                                "staged Claude credential watcher did not stop "
+                                "within its bounded join; a background host "
+                                "credential writeback was already in flight "
+                                "when stop closed new admission, so it may "
+                                "still complete and host credential state is "
+                                "ambiguous; refusing concurrent final drain "
+                                "or carrier cleanup"
+                            )
+                            setattr(
+                                unstopped,
+                                "_codex_claude_host_writeback_in_flight_at_stop",
+                                True,
+                            )
+                            raise unstopped
                         raise LinuxStagedCredentialWatcherUnstopped(
                             "staged Claude credential watcher did not stop "
-                            "within its bounded join; refusing concurrent "
+                            "within its bounded join after background "
+                            "writeback admission closed; refusing concurrent "
                             "final drain or carrier cleanup"
                         )
                     try:
@@ -3182,6 +3251,16 @@ def stage_claude_credentials(
                             "_codex_claude_refresh_persistence_failed",
                             True,
                         )
+                        if getattr(
+                            error,
+                            "_codex_claude_host_writeback_in_flight_at_stop",
+                            False,
+                        ):
+                            setattr(
+                                writeback_error,
+                                "_codex_claude_host_writeback_in_flight_at_stop",
+                                True,
+                            )
                     if not watcher_stopped:
                         cleanup_is_safe = not watcher.is_alive()
                 if cleanup_is_safe:

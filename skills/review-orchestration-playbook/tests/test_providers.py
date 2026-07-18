@@ -8319,6 +8319,273 @@ class ProviderPolicyTest(unittest.TestCase):
     )
     @mock.patch.object(providers, "_claude_keychain_credential_server")
     @mock.patch.object(providers, "_select_claude_macos_credential")
+    def test_latest_durable_carrier_is_verified_before_stale_cleanup(
+        self,
+        select_credential: mock.Mock,
+        credential_server: mock.Mock,
+        _snapshot_is_current: mock.Mock,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        first = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
+        latest_value = json.loads(
+            oauth_credential_fixture(expires_in_seconds=7200)
+        )
+        latest_value["claudeAiOauth"]["refreshToken"] = (
+            "fixture-latest-carrier-reverify"
+        )
+        latest = bytearray(json.dumps(latest_value).encode())
+        selected = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
+                keychain_digest=providers._claude_credential_digest(original),
+                file_digest=None,
+                file_snapshot=None,
+            ),
+        )
+        select_credential.return_value = selected
+        staged_carriers: list[pathlib.Path] = []
+
+        @contextlib.contextmanager
+        def broker(
+            _credential: bytearray,
+            _capability: bytes,
+            *,
+            update_callback: Callable[[bytearray], bool] | None = None,
+            **_kwargs: object,
+        ):
+            assert update_callback is not None
+            self.assertTrue(update_callback(first))
+            self.assertTrue(update_callback(latest))
+            recovery_root = providers._claude_macos_recovery_root(self.review)
+            staged_carriers.extend(
+                sorted(
+                    recovery_root.glob(
+                        f"{providers.CLAUDE_MACOS_DURABLE_STAGE_COMMITTED_PREFIX}*"
+                    )
+                )
+            )
+            self.assertEqual(len(staged_carriers), 2)
+            latest_credential = (
+                staged_carriers[-1]
+                / "config"
+                / providers.CLAUDE_CREDENTIAL_FILE_NAME
+            )
+            latest_credential.write_bytes(first)
+            yield 43211
+
+        credential_server.side_effect = broker
+        common.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {"authentication": {}, "phase": "runtime-launching"},
+        )
+        with (
+            mock.patch.object(
+                providers,
+                "_persist_claude_macos_refreshed_credential",
+                return_value=providers._ClaudeMacOSCarrierSnapshot(
+                    keychain_digest=providers._claude_credential_digest(latest),
+                    file_digest=None,
+                    file_snapshot=None,
+                ),
+            ) as persist,
+            mock.patch.object(
+                providers,
+                "_remove_claude_macos_recovery_carrier",
+            ) as remove,
+            self.assertRaisesRegex(
+                providers.ClaudeCredentialInspectionInconclusive,
+                "latest durable recovery carrier",
+            ) as raised,
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+            ):
+                pass
+
+        persist.assert_not_called()
+        remove.assert_not_called()
+        self.assertEqual(len(staged_carriers), 2)
+        self.assertTrue(all(carrier.is_dir() for carrier in staged_carriers))
+        recovery_root = providers._claude_macos_recovery_root(self.review)
+        self.assertEqual(
+            getattr(
+                raised.exception,
+                "_codex_claude_retained_cleanup_artifact",
+                None,
+            ),
+            str(recovery_root),
+        )
+        self.assertIsNone(
+            getattr(
+                raised.exception,
+                "_codex_claude_retained_credential_artifact",
+                None,
+            )
+        )
+        report = common.read_json(
+            self.review.container_dir / "claude-runtime.json"
+        )
+        self.assertEqual(
+            report["authentication"]["recovery_cleanup_artifact"],
+            str(recovery_root),
+        )
+        self.assertNotIn("recovery_artifact", report["authentication"])
+        for payload in (first, latest):
+            payload[:] = b"\x00" * len(payload)
+
+    @mock.patch.object(
+        providers,
+        "_claude_macos_carrier_snapshot_is_current",
+        return_value=True,
+    )
+    @mock.patch.object(providers, "_claude_keychain_credential_server")
+    @mock.patch.object(providers, "_select_claude_macos_credential")
+    def test_latest_durable_reverify_precedes_stale_cleanup_and_host_write(
+        self,
+        select_credential: mock.Mock,
+        credential_server: mock.Mock,
+        _snapshot_is_current: mock.Mock,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        first = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
+        latest_value = json.loads(
+            oauth_credential_fixture(expires_in_seconds=7200)
+        )
+        latest_value["claudeAiOauth"]["refreshToken"] = (
+            "fixture-latest-carrier-ordering"
+        )
+        latest = bytearray(json.dumps(latest_value).encode())
+        select_credential.return_value = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
+                keychain_digest=providers._claude_credential_digest(original),
+                file_digest=None,
+                file_snapshot=None,
+            ),
+        )
+        staged_carriers: list[pathlib.Path] = []
+        events: list[str] = []
+        finalizing = False
+
+        @contextlib.contextmanager
+        def broker(
+            _credential: bytearray,
+            _capability: bytes,
+            *,
+            update_callback: Callable[[bytearray], bool] | None = None,
+            **_kwargs: object,
+        ):
+            nonlocal finalizing
+            assert update_callback is not None
+            self.assertTrue(update_callback(first))
+            self.assertTrue(update_callback(latest))
+            recovery_root = providers._claude_macos_recovery_root(self.review)
+            staged_carriers.extend(
+                sorted(
+                    recovery_root.glob(
+                        f"{providers.CLAUDE_MACOS_DURABLE_STAGE_COMMITTED_PREFIX}*"
+                    )
+                )
+            )
+            self.assertEqual(len(staged_carriers), 2)
+            yield 43211
+            finalizing = True
+
+        real_read = providers._read_claude_macos_recovery_credential
+        real_remove = providers._remove_claude_macos_recovery_carrier
+
+        def read_with_order(
+            review: providers.ReviewWorkspace,
+            carrier: pathlib.Path,
+        ) -> bytearray:
+            if (
+                finalizing
+                and staged_carriers
+                and carrier == staged_carriers[-1]
+                and "reverify-latest" not in events
+            ):
+                events.append("reverify-latest")
+            return real_read(review, carrier)
+
+        def remove_with_order(
+            review: providers.ReviewWorkspace,
+            carrier: pathlib.Path,
+            digest: bytes,
+        ) -> None:
+            if finalizing and staged_carriers:
+                events.append(
+                    "remove-latest"
+                    if carrier == staged_carriers[-1]
+                    else "remove-stale"
+                )
+            real_remove(review, carrier, digest)
+
+        def persist_with_order(
+            *_args: object,
+            **_kwargs: object,
+        ) -> providers._ClaudeMacOSCarrierSnapshot:
+            events.append("persist-host")
+            return providers._ClaudeMacOSCarrierSnapshot(
+                keychain_digest=providers._claude_credential_digest(latest),
+                file_digest=None,
+                file_snapshot=None,
+            )
+
+        credential_server.side_effect = broker
+        common.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {"authentication": {}, "phase": "runtime-launching"},
+        )
+        with (
+            mock.patch.object(
+                providers,
+                "_read_claude_macos_recovery_credential",
+                side_effect=read_with_order,
+            ),
+            mock.patch.object(
+                providers,
+                "_remove_claude_macos_recovery_carrier",
+                side_effect=remove_with_order,
+            ),
+            mock.patch.object(
+                providers,
+                "_persist_claude_macos_refreshed_credential",
+                side_effect=persist_with_order,
+            ),
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+            ):
+                pass
+
+        self.assertEqual(
+            events,
+            [
+                "reverify-latest",
+                "remove-stale",
+                "persist-host",
+                "remove-latest",
+            ],
+        )
+        self.assertTrue(all(not carrier.exists() for carrier in staged_carriers))
+        for payload in (first, latest):
+            payload[:] = b"\x00" * len(payload)
+
+    @mock.patch.object(
+        providers,
+        "_claude_macos_carrier_snapshot_is_current",
+        return_value=True,
+    )
+    @mock.patch.object(providers, "_claude_keychain_credential_server")
+    @mock.patch.object(providers, "_select_claude_macos_credential")
     def test_durable_cleanup_control_flow_stops_before_host_write_or_latest_cleanup(
         self,
         select_credential: mock.Mock,
@@ -9462,6 +9729,75 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(expected_by_source["keychain"], bytes(keychain))
         self.assertEqual(expected_by_source["file"], bytes(file_credential))
         for payload in (keychain, file_credential, refreshed, selected.payload):
+            payload[:] = b"\x00" * len(payload)
+
+    def test_keychain_write_forwarded_signal_is_not_reconciled(self) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=60))
+        refreshed_value = json.loads(
+            oauth_credential_fixture(expires_in_seconds=3600)
+        )
+        refreshed_value["claudeAiOauth"]["refreshToken"] = (
+            "fixture-keychain-forwarded-signal-refresh"
+        )
+        refreshed = bytearray(json.dumps(refreshed_value).encode())
+        carrier_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=providers._claude_credential_digest(original),
+            file_digest=None,
+            file_snapshot=None,
+            keychain_refresh_digest=(
+                providers._claude_credential_refresh_digest(original)
+            ),
+            file_refresh_digest=None,
+        )
+        selected = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=bytearray(original),
+            expires_at_ms=0,
+            carrier_snapshot=carrier_snapshot,
+        )
+        lease = mock.Mock(spec=["assert_held"])
+        forwarded = providers.ForwardedSignal(signal.SIGTERM)
+
+        with (
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_coordination",
+                return_value=contextlib.nullcontext(lease),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_claude_keychain_credential",
+                return_value=bytearray(original),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_claude_macos_file_credential",
+                return_value=None,
+            ),
+            mock.patch.object(
+                providers,
+                "_write_claude_keychain_credential",
+                side_effect=forwarded,
+            ) as write_keychain,
+            mock.patch.object(
+                providers,
+                "_read_claude_macos_carrier_snapshot",
+            ) as readback,
+            self.assertRaises(providers.ForwardedSignal) as raised,
+        ):
+            providers._persist_claude_macos_refreshed_credential(
+                self.review,
+                selected,
+                refreshed,
+                selected.payload,
+                carrier_snapshot,
+                self.claude_refresh_lock_protocol,
+            )
+
+        self.assertIs(raised.exception, forwarded)
+        write_keychain.assert_called_once()
+        readback.assert_not_called()
+        for payload in (original, refreshed, selected.payload):
             payload[:] = b"\x00" * len(payload)
 
     def test_dual_write_reconciles_keychain_result_before_pausing(self) -> None:
