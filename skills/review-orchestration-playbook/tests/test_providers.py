@@ -2862,9 +2862,9 @@ class ProviderPolicyTest(unittest.TestCase):
         with (
             mock.patch.object(providers.os, "fsync") as fsync,
             mock.patch.object(
-                providers,
-                "_is_claude_macos_host",
-                return_value=True,
+                providers.sys,
+                "platform",
+                "darwin",
             ),
             mock.patch.object(
                 providers.importlib,
@@ -2882,9 +2882,9 @@ class ProviderPolicyTest(unittest.TestCase):
         with (
             mock.patch.object(providers.os, "fsync") as fsync,
             mock.patch.object(
-                providers,
-                "_is_claude_macos_host",
-                return_value=False,
+                providers.sys,
+                "platform",
+                "linux",
             ),
             mock.patch.object(
                 providers.importlib,
@@ -7371,9 +7371,9 @@ class ProviderPolicyTest(unittest.TestCase):
                 side_effect=track_fsync,
             ),
             mock.patch.object(
-                providers,
-                "_is_claude_macos_host",
-                return_value=True,
+                providers.sys,
+                "platform",
+                "darwin",
             ),
             mock.patch.object(
                 providers.importlib,
@@ -7451,9 +7451,9 @@ class ProviderPolicyTest(unittest.TestCase):
                 with contextlib.ExitStack() as stack:
                     stack.enter_context(
                         mock.patch.object(
-                            providers,
-                            "_is_claude_macos_host",
-                            return_value=True,
+                            providers.sys,
+                            "platform",
+                            "darwin",
                         )
                     )
                     stack.enter_context(
@@ -7560,9 +7560,9 @@ class ProviderPolicyTest(unittest.TestCase):
                 side_effect=broker,
             ),
             mock.patch.object(
-                providers,
-                "_is_claude_macos_host",
-                return_value=True,
+                providers.sys,
+                "platform",
+                "darwin",
             ),
             mock.patch.object(
                 providers.importlib,

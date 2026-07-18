@@ -673,7 +673,7 @@ def _create_or_validate_claude_runtime_directory(
 
 def _sync_claude_credential_descriptor(descriptor: int) -> None:
     os.fsync(descriptor)
-    if not _is_claude_macos_host():
+    if sys.platform != "darwin":
         return
     try:
         darwin_fcntl = importlib.import_module("fcntl")
