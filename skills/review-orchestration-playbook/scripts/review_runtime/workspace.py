@@ -4461,10 +4461,19 @@ def _iter_secret_events(
                 diff_surface=diff_surface,
                 allow_inline_hash_comment=True,
             )
-        if (not placeholder and _looks_like_unquoted_secret(candidate)) or (
-            placeholder and not may_accept
-        ):
-            start, candidate_end = match.span(1)
+        start, candidate_end = match.span(1)
+        exact_specific_candidate = _specific_spans is not None and (
+            start,
+            candidate_end,
+            candidate,
+        ) in _specific_spans
+        if (
+            not placeholder
+            and (
+                _looks_like_unquoted_secret(candidate)
+                or exact_specific_candidate
+            )
+        ) or (placeholder and not may_accept):
             yield (
                 "generic-secret-assignment",
                 candidate,
