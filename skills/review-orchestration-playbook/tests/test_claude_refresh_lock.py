@@ -1421,6 +1421,183 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     timeout_seconds=0,
                 )
 
+    def test_borrowed_directory_anchors_acquire_and_release_exact_locks(
+        self,
+    ) -> None:
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            config = self._config_dir(pathlib.Path(temporary).resolve())
+            config_fd = os.open(config, flags)
+            parent_fd = os.open(config.parent, flags)
+            try:
+                with mock.patch.object(
+                    claude_refresh_lock,
+                    "_open_directory_anchor",
+                    side_effect=AssertionError("path reopen is forbidden"),
+                ):
+                    lease = claude_refresh_lock.acquire_claude_refresh_lock(
+                        config,
+                        protocol=self.PROTOCOL,
+                        timeout_seconds=0,
+                        config_dir_fd=config_fd,
+                        legacy_parent_dir_fd=parent_fd,
+                    )
+                self.assertEqual(
+                    lease.paths,
+                    (
+                        config / ".oauth_refresh.lock",
+                        pathlib.Path(str(config) + ".lock"),
+                    ),
+                )
+                lease.assert_held()
+                lease.release()
+            finally:
+                os.close(parent_fd)
+                os.close(config_fd)
+
+    def test_borrowed_directory_anchors_use_retained_tree_after_path_retarget(
+        self,
+    ) -> None:
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            home = root / "home"
+            home.mkdir(mode=0o700)
+            config = self._config_dir(home)
+            replacement_home = root / "replacement-home"
+            replacement_home.mkdir(mode=0o700)
+            replacement_config = self._config_dir(replacement_home)
+            retained_home = root / "retained-home"
+            config_fd = os.open(config, flags)
+            parent_fd = os.open(home, flags)
+            try:
+                home.rename(retained_home)
+                home.symlink_to(replacement_home, target_is_directory=True)
+                lease = claude_refresh_lock.acquire_claude_refresh_lock(
+                    config,
+                    protocol=self.PROTOCOL,
+                    timeout_seconds=0,
+                    config_dir_fd=config_fd,
+                    legacy_parent_dir_fd=parent_fd,
+                )
+                retained_config = retained_home / ".claude"
+                self.assertTrue(
+                    (retained_config / ".oauth_refresh.lock").is_dir()
+                )
+                self.assertTrue(
+                    pathlib.Path(str(retained_config) + ".lock").is_dir()
+                )
+                self.assertFalse(
+                    (replacement_config / ".oauth_refresh.lock").exists()
+                )
+                self.assertFalse(
+                    pathlib.Path(str(replacement_config) + ".lock").exists()
+                )
+                lease.assert_held()
+                lease.release()
+                self.assertFalse(
+                    (retained_config / ".oauth_refresh.lock").exists()
+                )
+                self.assertFalse(
+                    pathlib.Path(str(retained_config) + ".lock").exists()
+                )
+            finally:
+                os.close(parent_fd)
+                os.close(config_fd)
+
+    def test_borrowed_anchor_cleanup_failure_omits_retargeted_path(self) -> None:
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            home = root / "home"
+            home.mkdir(mode=0o700)
+            config = self._config_dir(home)
+            replacement_home = root / "replacement-home"
+            replacement_home.mkdir(mode=0o700)
+            replacement_config = self._config_dir(replacement_home)
+            retained_home = root / "retained-home"
+            config_fd = os.open(config, flags)
+            parent_fd = os.open(home, flags)
+            try:
+                home.rename(retained_home)
+                home.symlink_to(replacement_home, target_is_directory=True)
+                lease = claude_refresh_lock.acquire_claude_refresh_lock(
+                    config,
+                    protocol=self.PROTOCOL,
+                    timeout_seconds=0,
+                    config_dir_fd=config_fd,
+                    legacy_parent_dir_fd=parent_fd,
+                )
+                with (
+                    mock.patch.object(
+                        claude_refresh_lock,
+                        "_remove_owned_lock",
+                        side_effect=claude_refresh_lock.ClaudeRefreshLockError(
+                            "injected descriptor-bound cleanup failure"
+                        ),
+                    ),
+                    self.assertRaises(
+                        claude_refresh_lock.ClaudeRefreshLockError
+                    ) as raised,
+                ):
+                    lease.release()
+
+                self.assertIsNone(
+                    claude_refresh_lock._refresh_lock_recovery_paths(
+                        raised.exception
+                    )
+                )
+                messages: list[str] = []
+                pending: list[BaseException] = [raised.exception]
+                seen: set[int] = set()
+                while pending:
+                    current = pending.pop()
+                    if id(current) in seen:
+                        continue
+                    seen.add(id(current))
+                    messages.append(str(current))
+                    messages.extend(getattr(current, "__notes__", ()))
+                    for chained in (current.__cause__, current.__context__):
+                        if isinstance(chained, BaseException):
+                            pending.append(chained)
+                self.assertTrue(
+                    any(
+                        "no authoritative pathname is available" in message
+                        for message in messages
+                    )
+                )
+                self.assertFalse(
+                    (replacement_config / ".oauth_refresh.lock").exists()
+                )
+                self.assertFalse(
+                    pathlib.Path(str(replacement_config) + ".lock").exists()
+                )
+                retained_config = retained_home / ".claude"
+                retained_primary = retained_config / ".oauth_refresh.lock"
+                retained_legacy = pathlib.Path(str(retained_config) + ".lock")
+                self.assertTrue(retained_primary.is_dir())
+                self.assertTrue(retained_legacy.is_dir())
+                retained_legacy.rmdir()
+                retained_primary.rmdir()
+            finally:
+                os.close(parent_fd)
+                os.close(config_fd)
+
     def test_release_never_removes_a_replacement_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             config = self._config_dir(pathlib.Path(temporary)).resolve()

@@ -2311,7 +2311,7 @@ class CredentialStagingTest(unittest.TestCase):
             encoding="utf-8",
         )
         path.chmod(0o600)
-        return path
+        return path.resolve(strict=True)
 
     def _assert_retained_recovery_carrier(
         self,
@@ -2374,6 +2374,315 @@ class CredentialStagingTest(unittest.TestCase):
 
             self.assertFalse(staged_dir.exists())
             self.assertEqual(source.read_bytes(), source_payload)
+
+    def test_rejects_credential_symlink_ancestor(self) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            real_home = root / "real-home"
+            config_dir = real_home / ".claude"
+            config_dir.mkdir(parents=True, mode=0o700)
+            self._credential(
+                config_dir / ".credentials.json",
+                expires_at_ms=(now + 7200) * 1000,
+            )
+            linked_home = root / "linked-home"
+            linked_home.symlink_to(real_home, target_is_directory=True)
+            linked_config = real_home / "linked-config"
+            linked_config.symlink_to(config_dir, target_is_directory=True)
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+
+            for label, candidate in (
+                (
+                    "early ancestor",
+                    linked_home / ".claude" / ".credentials.json",
+                ),
+                (
+                    "direct parent",
+                    linked_config / ".credentials.json",
+                ),
+            ):
+                with self.subTest(label=label):
+                    with self.assertRaisesRegex(
+                        claude_linux.LinuxCredentialUnsafe,
+                        "symlink",
+                    ):
+                        with claude_linux.stage_claude_credentials(
+                            candidate,
+                            helper,
+                            now=now,
+                        ):
+                            pass
+
+    def test_credential_ancestor_retarget_cannot_redirect_initial_read(
+        self,
+    ) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            home = root / "home"
+            config_dir = home / ".claude"
+            config_dir.mkdir(parents=True, mode=0o700)
+            source = self._credential(
+                config_dir / ".credentials.json",
+                expires_at_ms=(now + 7200) * 1000,
+                access_token=self.SYNTH_ACCESS_A,
+                refresh_token=self.SYNTH_REFRESH_A,
+            )
+            original_payload = source.read_bytes()
+
+            replacement_home = root / "replacement-home"
+            replacement_config = replacement_home / ".claude"
+            replacement_config.mkdir(parents=True, mode=0o700)
+            replacement_source = self._credential(
+                replacement_config / ".credentials.json",
+                expires_at_ms=(now + 7200) * 1000,
+                access_token=self.SYNTH_ACCESS_B,
+                refresh_token=self.SYNTH_REFRESH_B,
+            )
+            replacement_payload = replacement_source.read_bytes()
+            retained_home = root / "retained-home"
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+            real_validate = claude_linux._validate_private_directory
+            retargeted = False
+
+            def validate_then_retarget(
+                path: pathlib.Path,
+                *,
+                owner_uid: int,
+            ) -> pathlib.Path:
+                nonlocal retargeted
+                validated = real_validate(path, owner_uid=owner_uid)
+                if not retargeted:
+                    home.rename(retained_home)
+                    home.symlink_to(replacement_home, target_is_directory=True)
+                    retargeted = True
+                return validated
+
+            with (
+                mock.patch.object(
+                    claude_linux,
+                    "_validate_private_directory",
+                    side_effect=validate_then_retarget,
+                ),
+                self.assertRaisesRegex(
+                    claude_linux.LinuxCredentialInspectionInconclusive,
+                    "ancestor changed",
+                ),
+            ):
+                with claude_linux.stage_claude_credentials(
+                    source,
+                    helper,
+                    now=now,
+                ) as staged:
+                    self.assertEqual(
+                        staged.credential_path.read_bytes(),
+                        original_payload,
+                    )
+
+            self.assertTrue(retargeted)
+            self.assertEqual(
+                (retained_home / ".claude" / ".credentials.json").read_bytes(),
+                original_payload,
+            )
+            self.assertEqual(
+                (home / ".claude" / ".credentials.json").read_bytes(),
+                replacement_payload,
+            )
+            self.assertEqual(list(helper.iterdir()), [])
+
+    def test_credential_ancestor_retarget_cannot_redirect_writeback(
+        self,
+    ) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            home = root / "home"
+            config_dir = home / ".claude"
+            config_dir.mkdir(parents=True, mode=0o700)
+            source = self._credential(
+                config_dir / ".credentials.json",
+                expires_at_ms=(now - 60) * 1000,
+                access_token=self.SYNTH_ACCESS_EXPIRED,
+                refresh_token=self.SYNTH_REFRESH_A,
+            )
+            original_payload = source.read_bytes()
+
+            replacement_home = root / "replacement-home"
+            replacement_config = replacement_home / ".claude"
+            replacement_config.mkdir(parents=True, mode=0o700)
+            replacement_source = self._credential(
+                replacement_config / ".credentials.json",
+                expires_at_ms=(now + 7200) * 1000,
+                access_token=self.SYNTH_ACCESS_B,
+                refresh_token=self.SYNTH_REFRESH_B,
+            )
+            replacement_payload = replacement_source.read_bytes()
+            retained_home = root / "retained-home"
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+
+            with (
+                mock.patch.object(
+                    claude_linux,
+                    "STAGED_CREDENTIAL_POLL_SECONDS",
+                    60.0,
+                ),
+                self.assertRaises(
+                    claude_linux.LinuxCredentialInspectionInconclusive
+                ) as raised,
+            ):
+                with claude_linux.stage_claude_credentials(
+                    source,
+                    helper,
+                    now=now,
+                    refresh_lock_protocol=self.PROTOCOL,
+                ) as staged:
+                    self._credential(
+                        staged.credential_path,
+                        expires_at_ms=(now + 7200) * 1000,
+                        access_token=self.SYNTH_ACCESS_A,
+                        refresh_token=self.SYNTH_REFRESH_B,
+                    )
+                    home.rename(retained_home)
+                    home.symlink_to(replacement_home, target_is_directory=True)
+
+            self.assertEqual(
+                (
+                    retained_home / ".claude" / ".credentials.json"
+                ).read_bytes(),
+                original_payload,
+            )
+            self.assertEqual(
+                (home / ".claude" / ".credentials.json").read_bytes(),
+                replacement_payload,
+            )
+            self._assert_retained_recovery_carrier(
+                error=raised.exception,
+                staged=staged,
+                helper=helper,
+                expected_refresh_token=self.SYNTH_REFRESH_B,
+            )
+
+    def test_blocked_anchor_check_cannot_block_timeout_handoff(self) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            config_dir = root / ".claude"
+            config_dir.mkdir(mode=0o700)
+            source = self._credential(
+                config_dir / ".credentials.json",
+                expires_at_ms=(now + 7200) * 1000,
+            )
+            anchor = claude_linux._open_credential_directory_anchor(
+                source,
+                owner_uid=os.getuid(),
+            )
+            target_fd = anchor._descriptors[0]
+            real_fstat = claude_linux.os.fstat
+            inspection_entered = threading.Event()
+            release_inspection = threading.Event()
+            inspection_errors: list[BaseException] = []
+
+            def blocking_fstat(descriptor: int) -> os.stat_result:
+                if descriptor == target_fd and not inspection_entered.is_set():
+                    inspection_entered.set()
+                    if not release_inspection.wait(timeout=2.0):
+                        raise TimeoutError("anchor inspection fixture timed out")
+                return real_fstat(descriptor)
+
+            def inspect_anchor() -> None:
+                try:
+                    anchor.assert_stable(owner_uid=os.getuid())
+                except BaseException as error:
+                    inspection_errors.append(error)
+
+            inspection_worker = threading.Thread(target=inspect_anchor)
+            detach_worker = threading.Thread(target=anchor.detach_to_watcher)
+            detached_before_release = False
+            try:
+                with mock.patch.object(
+                    claude_linux.os,
+                    "fstat",
+                    side_effect=blocking_fstat,
+                ):
+                    inspection_worker.start()
+                    self.assertTrue(inspection_entered.wait(timeout=1.0))
+                    detach_worker.start()
+                    detach_worker.join(timeout=0.2)
+                    detached_before_release = not detach_worker.is_alive()
+                    release_inspection.set()
+                    inspection_worker.join(timeout=1.0)
+                    detach_worker.join(timeout=1.0)
+                self.assertFalse(inspection_worker.is_alive())
+                self.assertFalse(detach_worker.is_alive())
+                self.assertTrue(detached_before_release)
+                self.assertEqual(inspection_errors, [])
+            finally:
+                release_inspection.set()
+                inspection_worker.join(timeout=1.0)
+                if detach_worker.ident is not None:
+                    detach_worker.join(timeout=1.0)
+                if anchor.detached_to_watcher:
+                    anchor.close_if_detached()
+                else:
+                    anchor.close_if_owned()
+
+    def test_source_anchor_timeout_handoff_closes_in_both_interleavings(
+        self,
+    ) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            for cleanup_first in (True, False):
+                with self.subTest(cleanup_first=cleanup_first):
+                    config_dir = root / f"config-{cleanup_first}"
+                    config_dir.mkdir(mode=0o700)
+                    source = self._credential(
+                        config_dir / ".credentials.json",
+                        expires_at_ms=(now + 7200) * 1000,
+                    )
+                    anchor = claude_linux._open_credential_directory_anchor(
+                        source,
+                        owner_uid=os.getuid(),
+                    )
+                    staged = claude_linux.StagedCredential(
+                        config_dir,
+                        config_dir,
+                        source,
+                        (now + 7200) * 1000,
+                    )
+                    watcher = claude_linux._StagedCredentialWatcher(
+                        source=source,
+                        source_anchor=anchor,
+                        staged=staged,
+                        original_payload=bytearray(b"{}"),
+                        original_identity=mock.Mock(),
+                        parent_identity=anchor.identity,
+                        owner_uid=os.getuid(),
+                        refresh_lock_protocol=self.PROTOCOL,
+                    )
+                    try:
+                        if cleanup_first:
+                            watcher._close_source_anchor_after_worker()
+                            watcher.retain_source_anchor_after_timeout()
+                        else:
+                            watcher.retain_source_anchor_after_timeout()
+                            self.assertIsInstance(anchor.descriptor, int)
+                            watcher._close_source_anchor_after_worker()
+                        with self.assertRaisesRegex(
+                            claude_linux.LinuxCredentialInspectionInconclusive,
+                            "anchor is closed",
+                        ):
+                            _ = anchor.descriptor
+                    finally:
+                        watcher.scrub()
+                        if anchor.detached_to_watcher:
+                            anchor.close_if_detached()
+                        else:
+                            anchor.close_if_owned()
 
     def test_default_accepts_one_second_remaining(self) -> None:
         now = time.time()
@@ -3229,6 +3538,94 @@ class CredentialStagingTest(unittest.TestCase):
                 expected_refresh_token=self.SYNTH_REFRESH_B,
             )
 
+    def test_timeout_handoff_close_failure_retains_recovery_carrier(
+        self,
+    ) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+            source = self._credential(
+                root / ".credentials.json",
+                expires_at_ms=(now - 60) * 1000,
+                access_token=self.SYNTH_ACCESS_EXPIRED,
+                refresh_token=self.SYNTH_REFRESH_A,
+            )
+            watchers: list[claude_linux._StagedCredentialWatcher] = []
+
+            def capture_without_starting(
+                watcher: claude_linux._StagedCredentialWatcher,
+            ) -> None:
+                watchers.append(watcher)
+
+            def detach_then_fail_close(
+                watcher: claude_linux._StagedCredentialWatcher,
+            ) -> None:
+                watcher._source_anchor.detach_to_watcher()
+                with watcher._source_anchor_handoff_lock:
+                    watcher._source_anchor_cleanup_reached = True
+                raise claude_linux.LinuxCredentialInspectionInconclusive(
+                    "injected descriptor-chain close failure"
+                )
+
+            with (
+                mock.patch.object(
+                    claude_linux._StagedCredentialWatcher,
+                    "start",
+                    autospec=True,
+                    side_effect=capture_without_starting,
+                ),
+                mock.patch.object(
+                    claude_linux._StagedCredentialWatcher,
+                    "request_stop",
+                    autospec=True,
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    claude_linux._StagedCredentialWatcher,
+                    "wait_until_stopped",
+                    autospec=True,
+                    return_value=False,
+                ),
+                mock.patch.object(
+                    claude_linux._StagedCredentialWatcher,
+                    "retain_source_anchor_after_timeout",
+                    autospec=True,
+                    side_effect=detach_then_fail_close,
+                ),
+                mock.patch.object(
+                    claude_linux._StagedCredentialWatcher,
+                    "is_alive",
+                    autospec=True,
+                    return_value=False,
+                ),
+                self.assertRaises(
+                    claude_linux.LinuxCredentialInspectionInconclusive
+                ) as raised,
+            ):
+                with claude_linux.stage_claude_credentials(
+                    source,
+                    helper,
+                    now=now,
+                    refresh_lock_protocol=self.PROTOCOL,
+                ) as staged:
+                    self._credential(
+                        staged.credential_path,
+                        expires_at_ms=(now + 7200) * 1000,
+                        access_token=self.SYNTH_ACCESS_A,
+                        refresh_token=self.SYNTH_REFRESH_B,
+                    )
+
+            self.assertEqual(len(watchers), 1)
+            self._assert_retained_recovery_carrier(
+                error=raised.exception,
+                staged=staged,
+                helper=helper,
+                expected_refresh_token=self.SYNTH_REFRESH_B,
+            )
+            watchers[0]._source_anchor.close_if_detached()
+
     def test_stop_closes_background_writeback_after_candidate_read(
         self,
     ) -> None:
@@ -3800,6 +4197,7 @@ class CredentialStagingTest(unittest.TestCase):
         ):
             claude_linux._writeback_refreshed_credential(
                 pathlib.Path("/fixture/.credentials.json"),
+                mock.Mock(),
                 staged,
                 bytearray(b"{}"),
                 mock.Mock(),
@@ -4123,7 +4521,12 @@ class CredentialStagingTest(unittest.TestCase):
                             claude_linux.STAGED_CREDENTIAL_LOCK_TIMEOUT_SECONDS
                         ),
                     ),
-                    mock.call(source.parent, protocol=self.PROTOCOL),
+                    mock.call(
+                        source.parent,
+                        protocol=self.PROTOCOL,
+                        config_dir_fd=mock.ANY,
+                        legacy_parent_dir_fd=mock.ANY,
+                    ),
                 ],
             )
             self.assertEqual(source.read_bytes(), original_payload)
@@ -5048,7 +5451,7 @@ class CredentialStagingTest(unittest.TestCase):
     ) -> None:
         now = time.time()
         with tempfile.TemporaryDirectory() as temporary:
-            root = pathlib.Path(temporary)
+            root = pathlib.Path(temporary).resolve()
             helper = root / "helper"
             helper.mkdir(mode=0o700)
             stale = self._credential(
@@ -5078,7 +5481,10 @@ class CredentialStagingTest(unittest.TestCase):
             with self.assertRaisesRegex(claude_linux.LinuxCredentialUnsafe, "0600"):
                 with claude_linux.stage_claude_credentials(permissive, helper, now=now):
                     pass
-            with self.assertRaises(claude_linux.LinuxCredentialUnsafe):
+            with self.assertRaisesRegex(
+                claude_linux.LinuxCredentialUnsafe,
+                "must not be a symlink",
+            ):
                 with claude_linux.stage_claude_credentials(symlink, helper, now=now):
                     pass
             with self.assertRaisesRegex(
@@ -5097,7 +5503,7 @@ class CredentialStagingTest(unittest.TestCase):
     ) -> None:
         now = time.time()
         with tempfile.TemporaryDirectory() as temporary:
-            root = pathlib.Path(temporary)
+            root = pathlib.Path(temporary).resolve()
             helper = root / "helper"
             helper.mkdir(mode=0o700)
             missing_token = root / "missing-token.json"
@@ -5176,7 +5582,7 @@ class CredentialStagingTest(unittest.TestCase):
     def test_deeply_nested_credential_is_malformed(self) -> None:
         now = time.time()
         with tempfile.TemporaryDirectory() as temporary:
-            root = pathlib.Path(temporary)
+            root = pathlib.Path(temporary).resolve()
             helper = root / "helper"
             helper.mkdir(mode=0o700)
             nested = root / "deeply-nested.json"
@@ -5206,7 +5612,7 @@ class CredentialStagingTest(unittest.TestCase):
     def test_unpaired_surrogate_token_is_unsafe(self) -> None:
         now = time.time()
         with tempfile.TemporaryDirectory() as temporary:
-            root = pathlib.Path(temporary)
+            root = pathlib.Path(temporary).resolve()
             helper = root / "helper"
             helper.mkdir(mode=0o700)
             credential = root / "surrogate-token.json"

@@ -872,7 +872,22 @@ On Linux and WSL2, every model attempt validates the documented Claude Code
 credential file as a non-symlink regular file owned by the current user with
 exact mode `0600`. Access and refresh tokens must be non-empty UTF-8-encodable
 strings without unpaired surrogates; the same parser rejects an unsafe staged
-rotation before host writeback. For that attempt, copy it into a new helper-owned writable
+rotation before host writeback. Before the first credential read, the helper
+opens every absolute directory component from the filesystem root through the
+credential parent with `O_DIRECTORY|O_NOFOLLOW`, retains that complete
+descriptor chain for the attempt, and rejects a symlink at any ancestor or the
+credential leaf. Reads, directory locking, refresh-lock mutation, replacement,
+and parent-directory sync stay relative to those retained descriptors; the
+helper revalidates every path edge before commit and after sync, so retargeting
+an earlier ancestor cannot redirect a read or write into a replacement tree.
+The refresh-lock helper's borrowed anchors are descriptor-only; the credential
+anchor owns complete edge revalidation. If cleanup of a descriptor-bound lock
+fails after path movement, the helper publishes no lexical cleanup path because
+that pathname is no longer authoritative; it pauses with an identity-only
+recovery warning instead of directing cleanup at a replacement tree. On watcher timeout, an explicit
+cleanup-reached handoff makes either the parent or the exiting worker close the
+descriptor chain, whichever completes the ownership transition last, without
+waiting behind filesystem inspection. For that attempt, copy it into a new helper-owned writable
 `/auth` carrier root with private config at `/auth/config`; the original host
 credential is never mounted. The layout permits the primary lock under the
 config plus the legacy sibling `/auth/config.lock`. Before binding the carrier
@@ -916,7 +931,7 @@ closes the commit race with supported Claude Code login/refresh writers but
 cannot atomically close it for unrelated writers that bypass both locks. Reject
 unsafe ownership,
 mode, symlink, path-race, size, or JSON structure, and never persist or print
-credential contents in review state. The source descriptor must close
+credential contents in review state. Every retained source descriptor must close
 successfully before a validated payload is returned; close failure zeroes the
 in-memory copy, preserves any earlier validation/control-flow error, and fails
 closed without retrying the same numeric descriptor.

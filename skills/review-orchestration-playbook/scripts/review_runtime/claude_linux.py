@@ -251,6 +251,127 @@ class _CredentialParentIdentity:
     gid: int
 
 
+class _CredentialDirectoryAnchor:
+    """Retain every no-follow directory edge leading to a credential parent."""
+
+    def __init__(
+        self,
+        *,
+        path: pathlib.Path,
+        components: tuple[str, ...],
+        descriptors: tuple[int, ...],
+        identities: tuple[_CredentialParentIdentity, ...],
+    ) -> None:
+        self.path = path
+        self.components = components
+        self._descriptors = descriptors
+        self.identities = identities
+        self._state_lock = threading.Lock()
+        self._detached_to_watcher = False
+
+    @property
+    def descriptor(self) -> int:
+        with self._state_lock:
+            if not self._descriptors:
+                raise LinuxCredentialInspectionInconclusive(
+                    "Claude credential directory anchor is closed"
+                )
+            return self._descriptors[-1]
+
+    @property
+    def legacy_parent_descriptor(self) -> int:
+        with self._state_lock:
+            if not self._descriptors:
+                raise LinuxCredentialInspectionInconclusive(
+                    "Claude credential directory anchor is closed"
+                )
+            return (
+                self._descriptors[-2]
+                if len(self._descriptors) > 1
+                else self._descriptors[0]
+            )
+
+    @property
+    def identity(self) -> _CredentialParentIdentity:
+        return self.identities[-1]
+
+    @property
+    def detached_to_watcher(self) -> bool:
+        with self._state_lock:
+            return self._detached_to_watcher
+
+    def assert_stable(self, *, owner_uid: int) -> None:
+        with self._state_lock:
+            if not self._descriptors:
+                raise LinuxCredentialInspectionInconclusive(
+                    "Claude credential directory anchor is closed"
+                )
+            descriptors = self._descriptors
+        try:
+            current_metadata = tuple(
+                os.fstat(descriptor) for descriptor in descriptors
+            )
+            current_identities = tuple(
+                _credential_directory_identity(metadata)
+                for metadata in current_metadata
+            )
+            edge_identities = tuple(
+                _credential_directory_identity(
+                    os.stat(
+                        component,
+                        dir_fd=descriptors[index],
+                        follow_symlinks=False,
+                    )
+                )
+                for index, component in enumerate(self.components)
+            )
+        except OSError as error:
+            raise LinuxCredentialInspectionInconclusive(
+                "Claude credential directory ancestor changed"
+            ) from error
+        if current_identities != self.identities or edge_identities != tuple(
+            self.identities[1:]
+        ):
+            raise LinuxCredentialInspectionInconclusive(
+                "Claude credential directory ancestor changed"
+            )
+        _validate_credential_parent_metadata(
+            current_metadata[-1],
+            owner_uid=owner_uid,
+        )
+
+    def detach_to_watcher(self) -> None:
+        with self._state_lock:
+            self._detached_to_watcher = True
+
+    def close_if_owned(self) -> None:
+        self._close(detached=False)
+
+    def close_if_detached(self) -> None:
+        self._close(detached=True)
+
+    def _close(self, *, detached: bool) -> None:
+        with self._state_lock:
+            if self._detached_to_watcher is not detached or not self._descriptors:
+                return
+            descriptors = self._descriptors
+            self._descriptors = ()
+        cleanup_errors: list[BaseException] = []
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except BaseException as error:
+                cleanup_errors.append(error)
+        primary = _primary_cleanup_error(cleanup_errors)
+        if primary is None:
+            return
+        if _is_control_flow_error(primary):
+            raise primary
+        raise LinuxCredentialInspectionInconclusive(
+            "cannot close Claude credential directory anchors"
+        ) from primary
+
+
 @dataclass(frozen=True)
 class SandboxSpec:
     host: LinuxHost
@@ -1664,6 +1785,37 @@ def _validate_credential_file_metadata(
         raise LinuxCredentialUnsafe("Claude credential has an invalid size")
 
 
+def _credential_directory_identity(
+    metadata: os.stat_result,
+) -> _CredentialParentIdentity:
+    return _CredentialParentIdentity(
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        mode=metadata.st_mode,
+        uid=metadata.st_uid,
+        gid=metadata.st_gid,
+    )
+
+
+def _validate_credential_parent_metadata(
+    metadata: os.stat_result,
+    *,
+    owner_uid: int,
+) -> None:
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise LinuxCredentialUnsafe(
+            "Claude credential parent is not a real directory"
+        )
+    if metadata.st_uid not in {0, owner_uid}:
+        raise LinuxCredentialUnsafe(
+            "Claude credential parent has an untrusted owner"
+        )
+    if metadata.st_mode & 0o022:
+        raise LinuxCredentialUnsafe(
+            "Claude credential parent must not be group- or world-writable"
+        )
+
+
 def _credential_parent_identity(
     path: pathlib.Path,
     *,
@@ -1679,25 +1831,113 @@ def _credential_parent_identity(
         raise LinuxCredentialInspectionInconclusive(
             f"cannot inspect Claude credential directory {path}: {error}"
         ) from error
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+    _validate_credential_parent_metadata(metadata, owner_uid=owner_uid)
+    return _credential_directory_identity(metadata)
+
+
+def _open_credential_directory_anchor(
+    source: pathlib.Path,
+    *,
+    owner_uid: int,
+) -> _CredentialDirectoryAnchor:
+    parent = source.parent
+    if (
+        not source.is_absolute()
+        or not source.name
+        or any(part in {".", ".."} for part in source.parts)
+    ):
         raise LinuxCredentialUnsafe(
-            "Claude credential parent is not a real directory"
+            "Claude credential path must be absolute without traversal"
         )
-    if metadata.st_uid not in {0, owner_uid}:
-        raise LinuxCredentialUnsafe(
-            "Claude credential parent has an untrusted owner"
-        )
-    if metadata.st_mode & 0o022:
-        raise LinuxCredentialUnsafe(
-            "Claude credential parent must not be group- or world-writable"
-        )
-    return _CredentialParentIdentity(
-        device=metadata.st_dev,
-        inode=metadata.st_ino,
-        mode=metadata.st_mode,
-        uid=metadata.st_uid,
-        gid=metadata.st_gid,
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
     )
+    components = tuple(parent.parts[1:])
+    descriptors: list[int] = []
+    identities: list[_CredentialParentIdentity] = []
+    try:
+        root_descriptor = os.open(parent.anchor, flags)
+        descriptors.append(root_descriptor)
+        root_metadata = os.fstat(root_descriptor)
+        if not stat.S_ISDIR(root_metadata.st_mode):
+            raise LinuxCredentialUnsafe(
+                "Claude credential root is not a real directory"
+            )
+        identities.append(_credential_directory_identity(root_metadata))
+        for component in components:
+            parent_descriptor = descriptors[-1]
+            before = os.stat(
+                component,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if stat.S_ISLNK(before.st_mode):
+                raise LinuxCredentialUnsafe(
+                    "Claude credential directory ancestor must not be a symlink"
+                )
+            if not stat.S_ISDIR(before.st_mode):
+                raise LinuxCredentialUnsafe(
+                    "Claude credential directory ancestor is not a real directory"
+                )
+            descriptor = os.open(component, flags, dir_fd=parent_descriptor)
+            descriptors.append(descriptor)
+            current = os.fstat(descriptor)
+            after = os.stat(
+                component,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            current_identity = _credential_directory_identity(current)
+            if (
+                _credential_directory_identity(before) != current_identity
+                or _credential_directory_identity(after) != current_identity
+            ):
+                raise LinuxCredentialInspectionInconclusive(
+                    "Claude credential directory ancestor changed while opened"
+                )
+            identities.append(current_identity)
+        _validate_credential_parent_metadata(
+            os.fstat(descriptors[-1]),
+            owner_uid=owner_uid,
+        )
+        anchor = _CredentialDirectoryAnchor(
+            path=parent,
+            components=components,
+            descriptors=tuple(descriptors),
+            identities=tuple(identities),
+        )
+        anchor.assert_stable(owner_uid=owner_uid)
+        return anchor
+    except BaseException as error:
+        if isinstance(error, LinuxCredentialError) or _is_control_flow_error(error):
+            failure = error
+        elif isinstance(error, FileNotFoundError):
+            failure = LinuxCredentialUnavailable(
+                f"Claude credential directory is unavailable: {parent}"
+            )
+            failure.__cause__ = error
+        elif isinstance(error, OSError) and error.errno == errno.ELOOP:
+            failure = LinuxCredentialUnsafe(
+                "Claude credential directory ancestor must not be a symlink"
+            )
+            failure.__cause__ = error
+        else:
+            failure = LinuxCredentialInspectionInconclusive(
+                f"cannot safely open Claude credential directory {parent}"
+            )
+            failure.__cause__ = error
+        cleanup_errors: list[BaseException] = []
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        primary = _primary_cleanup_error([failure, *cleanup_errors])
+        assert primary is not None
+        raise primary
 
 
 def _parse_oauth_credential(payload: bytearray) -> float:
@@ -2257,68 +2497,54 @@ def _create_private_credential_update(
     return candidate
 
 
-def _open_locked_credential_parent(
-    source: pathlib.Path,
+def _lock_credential_parent(
+    source_anchor: _CredentialDirectoryAnchor,
     expected: _CredentialParentIdentity,
     *,
     owner_uid: int,
-) -> int:
+) -> None:
     try:
         import fcntl
     except ImportError as error:
         raise LinuxCredentialUnsafe(
             "Claude credential writeback locking is unavailable"
         ) from error
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
+    source_anchor.assert_stable(owner_uid=owner_uid)
+    descriptor = source_anchor.descriptor
     try:
-        fd = os.open(source.parent, flags)
+        metadata = os.fstat(descriptor)
     except OSError as error:
         raise LinuxCredentialUnsafe(
-            f"cannot safely open Claude credential directory: {error}"
+            f"cannot inspect anchored Claude credential directory: {error}"
         ) from error
-    try:
-        metadata = os.fstat(fd)
-        if not stat.S_ISDIR(metadata.st_mode):
-            raise LinuxCredentialUnsafe(
-                "Claude credential parent is not a real directory"
-            )
-        if metadata.st_uid not in {0, owner_uid} or metadata.st_mode & 0o022:
-            raise LinuxCredentialUnsafe("Claude credential parent became unsafe")
-        current = _CredentialParentIdentity(
-            device=metadata.st_dev,
-            inode=metadata.st_ino,
-            mode=metadata.st_mode,
-            uid=metadata.st_uid,
-            gid=metadata.st_gid,
+    _validate_credential_parent_metadata(metadata, owner_uid=owner_uid)
+    if _credential_directory_identity(metadata) != expected:
+        raise LinuxCredentialUnsafe(
+            "Claude credential parent changed concurrently"
         )
-        if current != expected:
-            raise LinuxCredentialUnsafe(
-                "Claude credential parent changed concurrently"
-            )
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise LinuxCredentialUnsafe(
-                "another Claude credential writeback is already active"
-            ) from error
-        except OSError as error:
-            raise LinuxCredentialUnsafe(
-                f"cannot lock Claude credential directory: {error}"
-            ) from error
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        raise LinuxCredentialUnsafe(
+            "another Claude credential writeback is already active"
+        ) from error
+    except OSError as error:
+        raise LinuxCredentialUnsafe(
+            f"cannot lock Claude credential directory: {error}"
+        ) from error
+
+
+def _unlock_credential_parent(source_anchor: _CredentialDirectoryAnchor) -> None:
+    try:
+        import fcntl
+
+        fcntl.flock(source_anchor.descriptor, fcntl.LOCK_UN)
     except BaseException as error:
-        try:
-            os.close(fd)
-        except BaseException as close_error:
-            primary_error = _primary_cleanup_error([error, close_error])
-            if primary_error is not error:
-                raise primary_error
-        raise
-    return fd
+        if _is_control_flow_error(error):
+            raise
+        raise LinuxCredentialInspectionInconclusive(
+            f"cannot unlock Claude credential directory: {error}"
+        ) from error
 
 
 def _credential_source_identity_at(
@@ -2348,6 +2574,7 @@ def _credential_source_identity_at(
 
 def _writeback_refreshed_credential_impl(
     source: pathlib.Path,
+    source_anchor: _CredentialDirectoryAnchor,
     staged: StagedCredential,
     original_payload: bytearray,
     original_identity: _CredentialFileIdentity,
@@ -2389,6 +2616,8 @@ def _writeback_refreshed_credential_impl(
             refresh_lock = acquire_claude_refresh_lock(
                 source.parent,
                 protocol=refresh_lock_protocol,
+                config_dir_fd=source_anchor.descriptor,
+                legacy_parent_dir_fd=source_anchor.legacy_parent_descriptor,
             )
         except ClaudeRefreshLockStale as error:
             raise LinuxCredentialStaleRefreshLock(
@@ -2399,17 +2628,19 @@ def _writeback_refreshed_credential_impl(
             raise LinuxCredentialInspectionInconclusive(
                 f"cannot coordinate Claude credential refresh writeback: {error}"
             ) from error
-        parent_fd: int | None = None
+        parent_fd = source_anchor.descriptor
+        parent_locked = False
         current_payload: bytearray | None = None
         candidate: str | None = None
         operation_error: BaseException | None = None
         try:
             try:
-                parent_fd = _open_locked_credential_parent(
-                    source,
+                _lock_credential_parent(
+                    source_anchor,
                     parent_identity,
                     owner_uid=owner_uid,
                 )
+                parent_locked = True
                 (
                     current_payload,
                     _current_expires_at_ms,
@@ -2466,6 +2697,7 @@ def _writeback_refreshed_credential_impl(
                     "Claude credential source changed concurrently; refusing "
                     "refresh writeback"
                 )
+            source_anchor.assert_stable(owner_uid=owner_uid)
             try:
                 refresh_lock.assert_held()
             except ClaudeRefreshLockError as error:
@@ -2514,30 +2746,31 @@ def _writeback_refreshed_credential_impl(
                 raise LinuxCredentialInspectionInconclusive(
                     "Claude credential writeback committed but directory sync failed"
                 ) from error
+            source_anchor.assert_stable(owner_uid=owner_uid)
             return committed_identity
         except BaseException as error:
             operation_error = error
         finally:
             payload_error: BaseException | None = None
             candidate_cleanup_error: BaseException | None = None
-            close_error: BaseException | None = None
+            unlock_error: BaseException | None = None
             refresh_lock_error: BaseException | None = None
             if current_payload is not None:
                 try:
                     current_payload[:] = b"\x00" * len(current_payload)
                 except BaseException as error:
                     payload_error = error
-            if candidate is not None and parent_fd is not None:
+            if candidate is not None:
                 candidate_cleanup_error = _discard_private_file_at(
                     parent_fd,
                     candidate,
                     None,
                 )
-            if parent_fd is not None:
+            if parent_locked:
                 try:
-                    os.close(parent_fd)
+                    _unlock_credential_parent(source_anchor)
                 except BaseException as error:
-                    close_error = error
+                    unlock_error = error
             try:
                 refresh_lock.release()
             except ClaudeRefreshLockError as error:
@@ -2554,7 +2787,7 @@ def _writeback_refreshed_credential_impl(
                         operation_error,
                         payload_error,
                         candidate_cleanup_error,
-                        close_error,
+                        unlock_error,
                         refresh_lock_error,
                     )
                     if error is not None
@@ -2569,6 +2802,7 @@ def _writeback_refreshed_credential_impl(
 
 def _writeback_refreshed_credential(
     source: pathlib.Path,
+    source_anchor: _CredentialDirectoryAnchor,
     staged: StagedCredential,
     original_payload: bytearray,
     original_identity: _CredentialFileIdentity,
@@ -2583,6 +2817,7 @@ def _writeback_refreshed_credential(
     try:
         return _writeback_refreshed_credential_impl(
             source,
+            source_anchor,
             staged,
             original_payload,
             original_identity,
@@ -2690,6 +2925,7 @@ class _StagedCredentialWatcher:
         self,
         *,
         source: pathlib.Path,
+        source_anchor: _CredentialDirectoryAnchor,
         staged: StagedCredential,
         original_payload: bytearray,
         original_identity: _CredentialFileIdentity,
@@ -2698,6 +2934,7 @@ class _StagedCredentialWatcher:
         refresh_lock_protocol: ClaudeRefreshLockProtocol,
     ) -> None:
         self._source = source
+        self._source_anchor = source_anchor
         self._staged = staged
         self._baseline_payload = bytearray(original_payload)
         self._baseline_identity = original_identity
@@ -2717,6 +2954,8 @@ class _StagedCredentialWatcher:
         self._background_writeback_was_in_flight_at_stop = False
         self._failure_lock = threading.Lock()
         self._worker_failure: BaseException | None = None
+        self._source_anchor_handoff_lock = threading.Lock()
+        self._source_anchor_cleanup_reached = False
         self._thread = threading.Thread(
             target=self._run,
             name="codex-claude-staged-credential-watcher",
@@ -2778,6 +3017,20 @@ class _StagedCredentialWatcher:
     def scrub(self) -> None:
         self._baseline_payload[:] = b"\x00" * len(self._baseline_payload)
 
+    def retain_source_anchor_after_timeout(self) -> None:
+        with self._source_anchor_handoff_lock:
+            self._source_anchor.detach_to_watcher()
+            close_here = self._source_anchor_cleanup_reached
+        if close_here:
+            self._source_anchor.close_if_detached()
+
+    def _close_source_anchor_after_worker(self) -> None:
+        with self._source_anchor_handoff_lock:
+            self._source_anchor_cleanup_reached = True
+            close_here = self._source_anchor.detached_to_watcher
+        if close_here:
+            self._source_anchor.close_if_detached()
+
     def final_drain(self) -> None:
         self._drain(final=True)
 
@@ -2807,13 +3060,19 @@ class _StagedCredentialWatcher:
             self._background_writeback_in_flight = False
 
     def _run(self) -> None:
-        while not self._stop.wait(STAGED_CREDENTIAL_POLL_SECONDS):
+        try:
+            while not self._stop.wait(STAGED_CREDENTIAL_POLL_SECONDS):
+                try:
+                    self._drain(final=False)
+                except BaseException as error:
+                    self._record_worker_failure(error)
+                    self._stop.set()
+                    return
+        finally:
             try:
-                self._drain(final=False)
+                self._close_source_anchor_after_worker()
             except BaseException as error:
                 self._record_worker_failure(error)
-                self._stop.set()
-                return
 
     def _retry_candidate_error(
         self,
@@ -2931,6 +3190,7 @@ class _StagedCredentialWatcher:
                             return
                     committed_identity = _writeback_refreshed_credential(
                         self._source,
+                        self._source_anchor,
                         self._staged,
                         self._baseline_payload,
                         self._baseline_identity,
@@ -3072,16 +3332,67 @@ def stage_claude_credentials(
         )
     owner_uid = os.getuid()
     source = source.absolute()
-    parent_identity = _credential_parent_identity(
-        source.parent,
+    source_anchor = _open_credential_directory_anchor(
+        source,
         owner_uid=owner_uid,
     )
+    failure: BaseException | None = None
+    try:
+        with _stage_claude_credentials_anchored(
+            source,
+            helper_root,
+            source_anchor=source_anchor,
+            now=now,
+            required_validity_seconds=required_validity_seconds,
+            refresh_lock_protocol=refresh_lock_protocol,
+            writer_started=writer_started,
+            writer_quiescent=writer_quiescent,
+        ) as staged:
+            yield staged
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        if not source_anchor.detached_to_watcher:
+            anchor_errors: list[BaseException] = []
+            try:
+                source_anchor.assert_stable(owner_uid=owner_uid)
+            except BaseException as error:
+                anchor_errors.append(error)
+            try:
+                source_anchor.close_if_owned()
+            except BaseException as error:
+                anchor_errors.append(error)
+            anchor_error = _primary_cleanup_error(anchor_errors)
+            if anchor_error is not None:
+                if failure is None:
+                    raise anchor_error
+                primary = _primary_cleanup_error([failure, anchor_error])
+                if primary is not failure:
+                    raise primary
+
+
+@contextlib.contextmanager
+def _stage_claude_credentials_anchored(
+    source: pathlib.Path,
+    helper_root: pathlib.Path,
+    *,
+    source_anchor: _CredentialDirectoryAnchor,
+    now: float | None,
+    required_validity_seconds: float,
+    refresh_lock_protocol: ClaudeRefreshLockProtocol | None,
+    writer_started: Callable[[], bool] | None,
+    writer_quiescent: Callable[[], bool] | None,
+) -> Iterator[StagedCredential]:
+    owner_uid = os.getuid()
+    parent_identity = source_anchor.identity
     private_root = _validate_private_directory(helper_root, owner_uid=owner_uid)
     payload, expires_at_ms, original_identity = _read_valid_credential(
         source,
         owner_uid=owner_uid,
         now=time.time() if now is None else now,
         required_validity_seconds=required_validity_seconds,
+        dir_fd=source_anchor.descriptor,
     )
     staged: StagedCredential | None = None
     carrier_root: pathlib.Path | None = None
@@ -3109,6 +3420,7 @@ def stage_claude_credentials(
         if refresh_lock_protocol is not None:
             watcher = _StagedCredentialWatcher(
                 source=source,
+                source_anchor=source_anchor,
                 staged=staged,
                 original_payload=payload,
                 original_identity=original_identity,
@@ -3150,6 +3462,10 @@ def stage_claude_credentials(
                     writeback_error = watcher.request_stop()
                     watcher_stopped = watcher.wait_until_stopped()
                     if not watcher_stopped:
+                        # The recovery carrier becomes authoritative before
+                        # descriptor ownership handoff can itself fail.
+                        retain_for_recovery = True
+                        watcher.retain_source_anchor_after_timeout()
                         if (
                             watcher.background_writeback_was_in_flight_at_stop()
                         ):
@@ -3217,7 +3533,8 @@ def stage_claude_credentials(
                         raise primary
                 except BaseException as error:
                     should_retain = (
-                        isinstance(
+                        retain_for_recovery
+                        or isinstance(
                             error,
                             (
                                 LinuxStagedCredentialRefreshLockBlocked,
@@ -3285,6 +3602,7 @@ def stage_claude_credentials(
                 try:
                     _writeback_refreshed_credential(
                         source,
+                        source_anchor,
                         staged,
                         payload,
                         original_identity,

@@ -136,6 +136,7 @@ class _DirectoryAnchor:
     path: pathlib.Path
     descriptor: int
     identity: _DirectoryIdentity
+    verify_path_identity: bool = True
 
 
 @dataclass
@@ -244,11 +245,40 @@ def _refresh_lock_recovery_paths(
     return None
 
 
+def _has_descriptor_bound_refresh_lock_cleanup(error: BaseException) -> bool:
+    pending = [error]
+    seen: set[int] = set()
+    while pending and len(seen) < 16:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if getattr(
+            current,
+            "_codex_claude_refresh_lock_descriptor_bound",
+            False,
+        ) is True:
+            return True
+        for chained in (current.__cause__, current.__context__):
+            if isinstance(chained, BaseException):
+                pending.append(chained)
+    return False
+
+
 def _refresh_lock_recovery_diagnostic(paths: tuple[str, ...]) -> str:
     return (
         "Claude refresh-lock cleanup is inconclusive; helper-owned lock paths "
         f"may remain at {', '.join(paths)}. Pause and confirm that no Claude "
         "credential writer is active before controlled cleanup."
+    )
+
+
+def _descriptor_bound_refresh_lock_recovery_diagnostic() -> str:
+    return (
+        "Claude refresh-lock cleanup is inconclusive; descriptor-bound lock "
+        "directories may remain, but no authoritative pathname is available. "
+        "Pause and independently identify the retained directory tree after "
+        "confirming that no Claude credential writer is active."
     )
 
 
@@ -260,9 +290,17 @@ def attach_claude_refresh_lock_recovery(
 
     paths = _refresh_lock_recovery_paths(cleanup_error)
     if paths is None:
-        return
-    setattr(error, "_codex_claude_refresh_lock_paths", paths)
-    diagnostic = _refresh_lock_recovery_diagnostic(paths)
+        if not _has_descriptor_bound_refresh_lock_cleanup(cleanup_error):
+            return
+        setattr(
+            error,
+            "_codex_claude_refresh_lock_descriptor_bound",
+            True,
+        )
+        diagnostic = _descriptor_bound_refresh_lock_recovery_diagnostic()
+    else:
+        setattr(error, "_codex_claude_refresh_lock_paths", paths)
+        diagnostic = _refresh_lock_recovery_diagnostic(paths)
     if isinstance(error, ForwardedSignal):
         if error.detail is None:
             error.detail = diagnostic
@@ -399,17 +437,86 @@ def _open_directory_anchor(
         raise
 
 
+def _open_directory_anchor_at(
+    path: pathlib.Path,
+    descriptor: int,
+    *,
+    require_private: bool,
+    label: str,
+) -> _DirectoryAnchor:
+    """Duplicate a caller-owned directory anchor without reopening its path."""
+
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        before = os.fstat(descriptor)
+        anchored_descriptor = os.open(".", flags, dir_fd=descriptor)
+    except OSError as error:
+        raise _safe_filesystem_error(
+            f"cannot inspect anchored Claude {label}",
+            error,
+        ) from None
+    try:
+        current = os.fstat(anchored_descriptor)
+        after = os.fstat(descriptor)
+        identity = _directory_identity(current)
+        if not (
+            _matches_directory_identity(before, identity)
+            and _matches_directory_identity(after, identity)
+        ):
+            raise ClaudeRefreshLockUnsafe(
+                f"anchored Claude {label} changed during inspection"
+            )
+        if require_private and (
+            identity.uid != os.getuid() or identity.mode & 0o022
+        ):
+            raise ClaudeRefreshLockUnsafe(
+                f"Claude {label} must be current-user-owned and not writable by others"
+            )
+        if not require_private:
+            private_owner = identity.uid == os.getuid() and not (identity.mode & 0o022)
+            sticky_system_tmp = identity.uid == 0 and identity.mode == 0o1777
+            if not (private_owner or sticky_system_tmp):
+                raise ClaudeRefreshLockUnsafe(f"Claude {label} is writable by others")
+        return _DirectoryAnchor(
+            path=path,
+            descriptor=anchored_descriptor,
+            identity=identity,
+            verify_path_identity=False,
+        )
+    except BaseException as primary_error:
+        try:
+            os.close(anchored_descriptor)
+        except BaseException as cleanup_error:
+            _attach_cleanup_or_raise(
+                primary_error,
+                cleanup_error,
+                message="cannot close anchored Claude directory",
+            )
+        raise
+
+
 def _assert_anchor(anchor: _DirectoryAnchor, *, label: str) -> None:
     try:
         descriptor_metadata = os.fstat(anchor.descriptor)
-        path_metadata = os.stat(anchor.path, follow_symlinks=False)
+        path_metadata = (
+            os.stat(anchor.path, follow_symlinks=False)
+            if anchor.verify_path_identity
+            else None
+        )
     except OSError:
         raise ClaudeRefreshLockCompromised(
             f"Claude {label} is no longer stable"
         ) from None
-    if not (
-        _matches_directory_identity(descriptor_metadata, anchor.identity)
-        and _matches_directory_identity(path_metadata, anchor.identity)
+    if not _matches_directory_identity(descriptor_metadata, anchor.identity):
+        raise ClaudeRefreshLockCompromised(f"Claude {label} was replaced or changed")
+    if path_metadata is not None and not _matches_directory_identity(
+        path_metadata,
+        anchor.identity,
     ):
         raise ClaudeRefreshLockCompromised(f"Claude {label} was replaced or changed")
 
@@ -1115,7 +1222,6 @@ class ClaudeRefreshLockLease:
                             "two bounded cleanup attempts"
                         )
                         paths = _refresh_lock_recovery_paths(diagnostic)
-                        assert paths is not None
                         control_flow = next(
                             (
                                 error
@@ -1125,11 +1231,12 @@ class ClaudeRefreshLockLease:
                             None,
                         )
                         if control_flow is not None:
-                            setattr(
-                                control_flow,
-                                "_codex_claude_refresh_lock_paths",
-                                paths,
-                            )
+                            if paths is not None:
+                                setattr(
+                                    control_flow,
+                                    "_codex_claude_refresh_lock_paths",
+                                    paths,
+                                )
                             if isinstance(control_flow, ForwardedSignal):
                                 if control_flow.detail:
                                     control_flow.detail = (
@@ -1159,15 +1266,30 @@ class ClaudeRefreshLockLease:
         with self._state_lock:
             if self._cleanup_inconclusive is not None:
                 return self._cleanup_inconclusive
-            paths = tuple(str(path) for path in self.paths)
-            diagnostic = ClaudeRefreshLockCleanupInconclusive(
-                f"{reason}; {_refresh_lock_recovery_diagnostic(paths)}"
+            path_diagnostics_are_authoritative = (
+                self._config_anchor.verify_path_identity
+                and self._legacy_parent_anchor.verify_path_identity
             )
-            setattr(
-                diagnostic,
-                "_codex_claude_refresh_lock_paths",
-                paths,
-            )
+            if path_diagnostics_are_authoritative:
+                paths = tuple(str(path) for path in self.paths)
+                diagnostic = ClaudeRefreshLockCleanupInconclusive(
+                    f"{reason}; {_refresh_lock_recovery_diagnostic(paths)}"
+                )
+                setattr(
+                    diagnostic,
+                    "_codex_claude_refresh_lock_paths",
+                    paths,
+                )
+            else:
+                diagnostic = ClaudeRefreshLockCleanupInconclusive(
+                    f"{reason}; "
+                    f"{_descriptor_bound_refresh_lock_recovery_diagnostic()}"
+                )
+                setattr(
+                    diagnostic,
+                    "_codex_claude_refresh_lock_descriptor_bound",
+                    True,
+                )
             self._cleanup_inconclusive = diagnostic
             return diagnostic
 
@@ -1302,6 +1424,8 @@ def acquire_claude_refresh_lock(
     protocol: ClaudeRefreshLockProtocol,
     timeout_seconds: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
     retry_interval_seconds: float = DEFAULT_RETRY_INTERVAL_SECONDS,
+    config_dir_fd: int | None = None,
+    legacy_parent_dir_fd: int | None = None,
 ) -> ClaudeRefreshLockLease:
     """Acquire Claude's current and legacy directory locks in protocol order."""
 
@@ -1311,37 +1435,71 @@ def acquire_claude_refresh_lock(
     if not isinstance(raw_path, str) or not os.path.isabs(raw_path):
         raise ClaudeRefreshLockUnsafe("Claude config directory must be an absolute path")
     requested_path = pathlib.Path(raw_path)
-    try:
-        requested_metadata = os.stat(requested_path, follow_symlinks=False)
-        if stat.S_ISLNK(requested_metadata.st_mode):
-            raise ClaudeRefreshLockUnsafe("Claude config directory must not be a symlink")
-        canonical_path = pathlib.Path(os.path.realpath(raw_path))
-        canonical_metadata = os.stat(canonical_path, follow_symlinks=False)
-    except ClaudeRefreshLockUnsafe:
-        raise
-    except OSError as error:
-        raise _safe_filesystem_error("cannot resolve Claude config directory", error) from None
-    if not (
-        stat.S_ISDIR(requested_metadata.st_mode)
-        and requested_metadata.st_dev == canonical_metadata.st_dev
-        and requested_metadata.st_ino == canonical_metadata.st_ino
-    ):
-        raise ClaudeRefreshLockUnsafe("Claude config directory resolution is unstable")
+    if any(part in {".", ".."} for part in requested_path.parts):
+        raise ClaudeRefreshLockUnsafe(
+            "Claude config directory must not contain path traversal"
+        )
+    anchored = config_dir_fd is not None or legacy_parent_dir_fd is not None
+    if anchored and (config_dir_fd is None or legacy_parent_dir_fd is None):
+        raise ClaudeRefreshLockUnsafe(
+            "Claude config and legacy-parent directory anchors must be provided together"
+        )
+    if anchored:
+        canonical_path = requested_path
+    else:
+        try:
+            requested_metadata = os.stat(requested_path, follow_symlinks=False)
+            if stat.S_ISLNK(requested_metadata.st_mode):
+                raise ClaudeRefreshLockUnsafe(
+                    "Claude config directory must not be a symlink"
+                )
+            canonical_path = pathlib.Path(os.path.realpath(raw_path))
+            canonical_metadata = os.stat(canonical_path, follow_symlinks=False)
+        except ClaudeRefreshLockUnsafe:
+            raise
+        except OSError as error:
+            raise _safe_filesystem_error(
+                "cannot resolve Claude config directory", error
+            ) from None
+        if not (
+            stat.S_ISDIR(requested_metadata.st_mode)
+            and requested_metadata.st_dev == canonical_metadata.st_dev
+            and requested_metadata.st_ino == canonical_metadata.st_ino
+        ):
+            raise ClaudeRefreshLockUnsafe(
+                "Claude config directory resolution is unstable"
+            )
 
     config_anchor: _DirectoryAnchor | None = None
     parent_anchor: _DirectoryAnchor | None = None
     lease: ClaudeRefreshLockLease | None = None
     try:
-        config_anchor = _open_directory_anchor(
-            canonical_path,
-            require_private=True,
-            label="config directory",
-        )
-        parent_anchor = _open_directory_anchor(
-            canonical_path.parent,
-            require_private=False,
-            label="legacy lock parent",
-        )
+        if anchored:
+            assert config_dir_fd is not None
+            assert legacy_parent_dir_fd is not None
+            config_anchor = _open_directory_anchor_at(
+                canonical_path,
+                config_dir_fd,
+                require_private=True,
+                label="config directory",
+            )
+            parent_anchor = _open_directory_anchor_at(
+                canonical_path.parent,
+                legacy_parent_dir_fd,
+                require_private=False,
+                label="legacy lock parent",
+            )
+        else:
+            config_anchor = _open_directory_anchor(
+                canonical_path,
+                require_private=True,
+                label="config directory",
+            )
+            parent_anchor = _open_directory_anchor(
+                canonical_path.parent,
+                require_private=False,
+                label="legacy lock parent",
+            )
         deadline = time.monotonic() + timeout_seconds
         primary_path = canonical_path / protocol.primary_lock_name
         primary = _acquire_one(

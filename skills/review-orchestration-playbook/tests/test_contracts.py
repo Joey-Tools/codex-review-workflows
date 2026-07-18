@@ -224,6 +224,9 @@ class RepositoryContractTest(unittest.TestCase):
         linux_staging_source = inspect.getsource(
             claude_linux.stage_claude_credentials
         )
+        linux_anchored_staging_source = inspect.getsource(
+            claude_linux._stage_claude_credentials_anchored
+        )
         refresh_lock_source = inspect.getsource(
             claude_refresh_lock.acquire_claude_refresh_lock
         )
@@ -285,7 +288,10 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("writer_quiescent", linux_runtime_source)
         self.assertIn("on_process_started=writer_started.set", attempt_source)
         self.assertIn("writer_quiescent.set()", attempt_source)
-        self.assertIn("retain_for_recovery", linux_staging_source)
+        self.assertIn(
+            "retain_for_recovery",
+            linux_staging_source + linux_anchored_staging_source,
+        )
         self.assertIn("writer_quiescent is not True", staged_lock_recovery_source)
         self.assertIn("reversed(locks)", staged_lock_recovery_source)
         self.assertNotIn("math.nextafter", linux_runtime_source)
