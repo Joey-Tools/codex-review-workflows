@@ -148,16 +148,22 @@ explicitly configured Claude Code candidate:
     in a fresh outer sandbox; never rediscover or fall back to the mutable source
     installation between Opus attempts. The trusted runtime may refresh only
     inside the temporary carrier. On macOS, atomically reserve attempt-scoped
-    durable-journal quota before any filesystem write for every structurally
-    valid `W` generation, then commit it to its own helper-private recovery
+    durable-journal quota before any filesystem write for every generation
+    admitted to durable staging, then commit it to its own helper-private recovery
     carrier. The journal is bounded to eight generations and 8 MiB of payload.
-    Every reservation consumes generation and byte quota for the rest of the
-    attempt, even if the write or publication fails. At the locked generation
-    linearization point, publish and
+    The last generation and 1 MiB are reserved for one terminal recovery
+    generation, and every reservation consumes generation and byte quota for
+    the rest of the attempt even if the write or publication fails. At the
+    locked generation linearization point, publish and
     acknowledge it only if it is still current and the runtime is not
-    abandoned. Reaching either journal cap NACKs the generation, invalidates any
-    older staged host-writeback candidate, marks credential inspection
-    inconclusive, and pauses without Copilot fallback. A superseded or failed
+    abandoned. When an update would consume the terminal reserve, the broker
+    atomically proves that it is still the current pending generation, closes
+    later `W` admission, commits that exact payload to the final journal slot,
+    and NACKs without publication or host writeback. Later `W` requests receive
+    an explicit NACK before their callback or filesystem work. The terminal
+    generation invalidates any older staged host-writeback candidate, marks
+    credential inspection inconclusive, and pauses without Copilot fallback.
+    A superseded or failed
     generation is not acknowledged, but its carrier remains in the bounded
     journal until post-quiescence finalization or failure recovery.
     On Darwin, every file and directory synchronization in that commit performs
@@ -681,8 +687,8 @@ the candidate with the later expiry even when both access tokens are already
 expired, then load that payload into the broker. The broker serves the initial
 fixed lookup once and accepts only the exact bounded credential-store update
 forms needed for refresh. Concurrent updates receive monotonic generations.
-Every structurally valid `W` generation that enters the update callback first
-atomically reserves generation and payload-byte quota before any filesystem
+Every `W` generation admitted to durable staging first atomically reserves
+generation and payload-byte quota before any filesystem
 write. The attempt-scoped durable journal accepts at most eight generations and
 8 MiB of payload. A reservation remains consumed for the rest of the attempt,
 including when the later filesystem write or generation publication fails. The
@@ -693,12 +699,20 @@ each such synchronization runs `fsync` and then requires `F_FULLFSYNC`; the
 same barrier covers pwd-home host-file replacement before the final recovery
 carrier can be removed. A missing command or failed full sync is
 credential-inspection-inconclusive and cannot authorize acknowledgement or
-cleanup. Only after
-that durable commit does the broker enter the generation
+cleanup. If the final carrier rename completed before a full-sync or identity
+check failed, only an exact re-proof of the acknowledged path and payload digest
+may retain it as recovery-only evidence; it is never published for host
+writeback. Only after that durable commit does the broker enter the generation
 linearization point under the current-generation lock. It publishes and
 acknowledges the generation only if it is still current and the runtime is not
-abandoned. Reaching either journal cap returns a NACK before filesystem work,
-invalidates any older staged host-writeback candidate, records
+abandoned. The eighth generation and final 1 MiB are reserved for terminal
+recovery. When an update would enter that reserve, the server atomically closes
+later update admission only if that update is still the current pending
+generation, commits the exact payload into the terminal slot, and returns a
+NACK without calling the publication linearization point. A superseded
+candidate consumes no quota or filesystem work; later `W` requests are
+explicitly NACKed before their callback. The terminal generation invalidates
+any older staged host-writeback candidate, records
 credential-inspection-inconclusive, and pauses without Copilot fallback. A
 superseded, abandoned, or failed generation returns failure without
 acknowledgement, but its carrier remains in the bounded journal until

@@ -2873,10 +2873,7 @@ def _commit_claude_macos_durable_stage(
         mark_stage_failure(
             error,
             retained_path,
-            payload_verified=(
-                pending_verified
-                and (not renamed or committed_identity_verified)
-            ),
+            payload_verified=pending_verified,
         )
         raise
     finally:
@@ -2901,10 +2898,7 @@ def _commit_claude_macos_durable_stage(
             mark_stage_failure(
                 cleanup_error,
                 retained_path,
-                payload_verified=(
-                    pending_verified
-                    and (not renamed or committed_identity_verified)
-                ),
+                payload_verified=pending_verified,
             )
             raise
 
@@ -4645,6 +4639,8 @@ class _ClaudeKeychainCredentialHandler(socketserver.BaseRequestHandler):
                 updated_credential
             )
             if pending_generation is None:
+                if server.pending_updates_closed():
+                    self.request.sendall(b"\x01")
                 return
             with server.update_lock:
                 with server.credential_lock:
@@ -4663,6 +4659,9 @@ class _ClaudeKeychainCredentialHandler(socketserver.BaseRequestHandler):
                         lambda publish: server.commit_pending_update(
                             pending_generation,
                             publish,
+                        ),
+                        lambda: server.claim_terminal_pending_update(
+                            pending_generation
                         ),
                     )
                     if success:
@@ -4686,7 +4685,11 @@ class _ClaudeKeychainCredentialServer(socketserver.ThreadingTCPServer):
         credential: bytearray | None,
         capability: bytes,
         update_callback: Callable[
-            [bytearray, Callable[[Callable[[], bool]], bool]],
+            [
+                bytearray,
+                Callable[[Callable[[], bool]], bool],
+                Callable[[], bool],
+            ],
             bool,
         ]
         | None,
@@ -4710,6 +4713,7 @@ class _ClaudeKeychainCredentialServer(socketserver.ThreadingTCPServer):
         self._pending_update_lock = threading.Lock()
         self._pending_update: tuple[int, bytearray] | None = None
         self._pending_generation = 0
+        self._updates_closed = False
         self._serve_condition = threading.Condition()
         self._serving = False
         self._serve_stopped = False
@@ -4839,7 +4843,7 @@ class _ClaudeKeychainCredentialServer(socketserver.ThreadingTCPServer):
         pending = bytearray(credential)
         previous: bytearray | None = None
         with self._pending_update_lock:
-            if self._abandoned.is_set():
+            if self._abandoned.is_set() or self._updates_closed:
                 pending[:] = b"\x00" * len(pending)
                 return None
             if self._pending_update is not None:
@@ -4850,6 +4854,22 @@ class _ClaudeKeychainCredentialServer(socketserver.ThreadingTCPServer):
         if previous is not None:
             previous[:] = b"\x00" * len(previous)
         return generation
+
+    def pending_updates_closed(self) -> bool:
+        with self._pending_update_lock:
+            return self._updates_closed
+
+    def claim_terminal_pending_update(self, generation: int) -> bool:
+        with self._pending_update_lock:
+            if (
+                self._abandoned.is_set()
+                or self._updates_closed
+                or self._pending_update is None
+                or self._pending_update[0] != generation
+            ):
+                return False
+            self._updates_closed = True
+            return True
 
     def clear_pending_update(self, generation: int) -> None:
         pending: bytearray | None = None
@@ -4997,6 +5017,7 @@ class _ClaudeMacOSDurableStage:
     committed_carrier: pathlib.Path
     credential_digest: bytes
     completed: _ClaudeThreadEvent
+    terminal: bool = False
     committed: bool = False
     error: BaseException | None = None
     cleanup_after_completion: bool = False
@@ -5850,6 +5871,7 @@ def _claude_keychain_runtime(
     def stage_refreshed_credential(
         updated: bytearray,
         commit_pending: Callable[[Callable[[], bool]], bool] | None = None,
+        claim_terminal: Callable[[], bool] | None = None,
     ) -> bool:
         nonlocal durable_stage_generation, staged_credential
         nonlocal durable_stage_reserved_generations
@@ -5910,38 +5932,105 @@ def _claude_keychain_runtime(
             return False
         quota_failure: ClaudeCredentialInspectionInconclusive | None = None
         quota_retained_entry: tuple[pathlib.Path, bytes] | None = None
+        terminal_generation = False
         generation: int | None = None
+        requested_bytes = len(updated)
         with runtime_state_lock:
             if runtime_is_abandoned():
                 return False
             if durable_stage_quota_exhausted_error is not None:
                 return False
-            requested_bytes = len(updated)
-            if (
+            normal_generation_limit = max(
+                0,
+                CLAUDE_MACOS_DURABLE_STAGE_MAX_GENERATIONS - 1,
+            )
+            normal_byte_limit = max(
+                0,
+                CLAUDE_MACOS_DURABLE_STAGE_MAX_BYTES
+                - CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES,
+            )
+            terminal_generation = (
                 durable_stage_reserved_generations
-                >= CLAUDE_MACOS_DURABLE_STAGE_MAX_GENERATIONS
+                >= normal_generation_limit
                 or durable_stage_reserved_bytes + requested_bytes
-                > CLAUDE_MACOS_DURABLE_STAGE_MAX_BYTES
-            ):
+                > normal_byte_limit
+            )
+            if not terminal_generation:
+                durable_stage_reserved_generations += 1
+                durable_stage_reserved_bytes += requested_bytes
+                durable_stage_generation += 1
+                generation = durable_stage_generation
+        if terminal_generation:
+            try:
+                terminal_claimed = (
+                    True if claim_terminal is None else claim_terminal()
+                )
+            except BaseException as claim_error:
+                if _is_claude_control_flow_error(claim_error):
+                    raise
+                claim_failure = ClaudeCredentialInspectionInconclusive(
+                    "the terminal macOS Claude durable-stage generation "
+                    "could not close later broker updates"
+                )
+                claim_failure.__cause__ = claim_error
+                setattr(
+                    claim_failure,
+                    "_codex_claude_refresh_persistence_failed",
+                    True,
+                )
+                with runtime_state_lock:
+                    if durable_stage_carriers:
+                        quota_retained_entry = durable_stage_carriers[-1]
+                if quota_retained_entry is not None:
+                    retained_carrier, retained_digest = quota_retained_entry
+                    setattr(
+                        claim_failure,
+                        "_codex_claude_retained_credential_carrier",
+                        str(retained_carrier),
+                    )
+                    _mark_claude_macos_recovery_update_artifact(
+                        claim_failure,
+                        retained_carrier
+                        / "config"
+                        / CLAUDE_CREDENTIAL_FILE_NAME,
+                        expected_digest=retained_digest,
+                    )
+                with runtime_state_lock:
+                    if not runtime_is_abandoned():
+                        persistence_errors.append(claim_failure)
+                return False
+            if not terminal_claimed:
+                return False
+            with runtime_state_lock:
+                if runtime_is_abandoned():
+                    return False
+                if durable_stage_quota_exhausted_error is not None:
+                    return False
                 exhausted = ClaudeCredentialInspectionInconclusive(
                     "the bounded macOS Claude durable-stage journal is full; "
-                    "the refreshed credential was not acknowledged"
+                    "the terminal refreshed credential was retained for "
+                    "recovery but not acknowledged"
                 )
                 setattr(
                     exhausted,
                     "_codex_claude_refresh_persistence_failed",
                     True,
                 )
-                if durable_stage_carriers:
-                    quota_retained_entry = durable_stage_carriers[-1]
                 durable_stage_quota_exhausted_error = exhausted
                 quota_failure = exhausted
-            else:
-                durable_stage_reserved_generations += 1
-                durable_stage_reserved_bytes += requested_bytes
-                durable_stage_generation += 1
-                generation = durable_stage_generation
-        if quota_failure is not None:
+                if (
+                    durable_stage_reserved_generations
+                    < CLAUDE_MACOS_DURABLE_STAGE_MAX_GENERATIONS
+                    and durable_stage_reserved_bytes + requested_bytes
+                    <= CLAUDE_MACOS_DURABLE_STAGE_MAX_BYTES
+                ):
+                    durable_stage_reserved_generations += 1
+                    durable_stage_reserved_bytes += requested_bytes
+                    durable_stage_generation += 1
+                    generation = durable_stage_generation
+                elif durable_stage_carriers:
+                    quota_retained_entry = durable_stage_carriers[-1]
+        if quota_failure is not None and generation is None:
             if quota_retained_entry is not None:
                 retained_carrier, retained_digest = quota_retained_entry
                 setattr(
@@ -5978,6 +6067,7 @@ def _claude_keychain_runtime(
                 committed_carrier=acknowledged_carrier,
                 credential_digest=_claude_credential_digest(updated),
                 completed=_ClaudeThreadEvent(),
+                terminal=terminal_generation,
             )
             with runtime_state_lock:
                 if runtime_is_abandoned():
@@ -6248,6 +6338,31 @@ def _claude_keychain_runtime(
                     )
                     with runtime_state_lock:
                         persistence_errors.append(retained)
+            return False
+
+        if terminal_generation:
+            assert quota_failure is not None
+            staged[:] = b"\x00" * len(staged)
+            setattr(
+                quota_failure,
+                "_codex_claude_retained_credential_carrier",
+                str(committed_carrier),
+            )
+            _mark_claude_macos_recovery_update_artifact(
+                quota_failure,
+                committed_carrier
+                / "config"
+                / CLAUDE_CREDENTIAL_FILE_NAME,
+                expected_digest=stage.credential_digest,
+            )
+            with runtime_state_lock:
+                terminal_abandoned = runtime_is_abandoned()
+                if terminal_abandoned:
+                    transfer_abandoned_stage_locked(stage)
+                elif durable_stage_inflight is stage:
+                    durable_stage_inflight = None
+                if not terminal_abandoned:
+                    persistence_errors.append(quota_failure)
             return False
 
         def publish_current_generation() -> bool:
@@ -7274,13 +7389,20 @@ def _claude_keychain_runtime(
                     and recovery_expectation is not None
                     and recovery_expectation.carrier == recovery_candidate
                 )
-                inflight_stage = quiescence_durable_stage
+                inflight_stage = (
+                    quiescence_durable_stage or durable_stage_inflight
+                )
+                unresolved_inflight_stage = (
+                    inflight_stage is not None
+                    and not inflight_stage.recovery_decided.is_set()
+                )
+                if unresolved_inflight_stage and inflight_stage.terminal:
+                    recovery_candidate = None
+                    recovery_expectation = None
+                    recovery_proven = False
                 recovery_cleanup_scope_required = (
                     bool(durable_stage_carriers)
-                    or (
-                        inflight_stage is not None
-                        and not inflight_stage.recovery_decided.is_set()
-                    )
+                    or unresolved_inflight_stage
                 )
         except BaseException as state_error:
             failure = (

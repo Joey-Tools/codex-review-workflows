@@ -99,6 +99,7 @@ def _blocked_keychain_handler_worker(connection: object, mode: str) -> None:
     def blocked_update(
         _updated: bytearray,
         commit_pending: Callable[[Callable[[], bool]], bool],
+        _claim_terminal: Callable[[], bool],
     ) -> bool:
         callback_started.set()
         block_callback.wait()
@@ -1638,6 +1639,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 def update_callback(
                     updated: bytearray,
                     commit_pending: Callable[[Callable[[], bool]], bool],
+                    _claim_terminal: Callable[[], bool],
                 ) -> bool:
                     callback_payloads.append(bytes(updated))
                     newer_called.set()
@@ -1738,6 +1740,7 @@ class ProviderPolicyTest(unittest.TestCase):
         def update_callback(
             updated: bytearray,
             commit_pending: Callable[[Callable[[], bool]], bool],
+            _claim_terminal: Callable[[], bool],
         ) -> bool:
             payload = bytes(updated)
             callback_payloads.append(payload)
@@ -1816,6 +1819,158 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(callback_payloads, [older, newer])
         self.assertEqual(responses[older], b"\x01")
         self.assertEqual(responses[newer], b"\x00")
+
+    def test_keychain_server_terminal_update_closes_later_admission(
+        self,
+    ) -> None:
+        capability = bytes.fromhex("01" * 32)
+        first = b"terminal-rotation"
+        later = b"later-rotation"
+        callback_payloads: list[bytes] = []
+
+        def update_callback(
+            updated: bytearray,
+            _commit_pending: Callable[[Callable[[], bool]], bool],
+            claim_terminal: Callable[[], bool],
+        ) -> bool:
+            callback_payloads.append(bytes(updated))
+            self.assertTrue(claim_terminal())
+            return False
+
+        try:
+            server = providers._ClaudeKeychainCredentialServer(
+                None,
+                capability,
+                update_callback,
+            )
+        except OSError:
+            self.skipTest("loopback bind is unavailable in the current sandbox")
+        with server.credential_lock:
+            server.consumed = True
+
+        def write_update(payload: bytes) -> bytes:
+            with socket.create_connection(
+                ("127.0.0.1", int(server.server_address[1])),
+                timeout=2.0,
+            ) as sock:
+                sock.sendall(
+                    capability
+                    + b"W"
+                    + len(payload).to_bytes(4, "big")
+                    + payload
+                )
+                return sock.recv(1)
+
+        serve_thread = threading.Thread(
+            target=server.serve_forever,
+            kwargs={"poll_interval": 0.01},
+            daemon=True,
+        )
+        serve_thread.start()
+        try:
+            self.assertEqual(write_update(first), b"\x01")
+            self.assertEqual(write_update(later), b"\x01")
+        finally:
+            server.shutdown()
+            server.server_close()
+            serve_thread.join(timeout=2.0)
+
+        self.assertFalse(serve_thread.is_alive())
+        self.assertEqual(callback_payloads, [first])
+
+    def test_keychain_server_only_latest_update_can_claim_terminal_slot(
+        self,
+    ) -> None:
+        capability = bytes.fromhex("01" * 32)
+        older = b"older-terminal-candidate"
+        newer = b"newer-terminal-candidate"
+        older_callback_started = threading.Event()
+        release_older_callback = threading.Event()
+        newer_staged = threading.Event()
+        callback_payloads: list[bytes] = []
+        claim_results: list[tuple[bytes, bool]] = []
+        responses: dict[bytes, bytes] = {}
+
+        def update_callback(
+            updated: bytearray,
+            _commit_pending: Callable[[Callable[[], bool]], bool],
+            claim_terminal: Callable[[], bool],
+        ) -> bool:
+            payload = bytes(updated)
+            callback_payloads.append(payload)
+            if payload == older:
+                older_callback_started.set()
+                if not release_older_callback.wait(timeout=2.0):
+                    raise RuntimeError(
+                        "fixture older terminal candidate was not released"
+                    )
+            claim_results.append((payload, claim_terminal()))
+            return False
+
+        try:
+            server = providers._ClaudeKeychainCredentialServer(
+                None,
+                capability,
+                update_callback,
+            )
+        except OSError:
+            self.skipTest("loopback bind is unavailable in the current sandbox")
+        with server.credential_lock:
+            server.consumed = True
+        real_stage = server.stage_pending_update
+
+        def observe_stage(credential: bytearray) -> int | None:
+            generation = real_stage(credential)
+            if bytes(credential) == newer:
+                newer_staged.set()
+            return generation
+
+        def write_update(payload: bytes) -> None:
+            with socket.create_connection(
+                ("127.0.0.1", int(server.server_address[1])),
+                timeout=2.0,
+            ) as sock:
+                sock.sendall(
+                    capability
+                    + b"W"
+                    + len(payload).to_bytes(4, "big")
+                    + payload
+                )
+                responses[payload] = sock.recv(1)
+
+        serve_thread = threading.Thread(
+            target=server.serve_forever,
+            kwargs={"poll_interval": 0.01},
+            daemon=True,
+        )
+        older_thread = threading.Thread(target=write_update, args=(older,))
+        newer_thread = threading.Thread(target=write_update, args=(newer,))
+        with mock.patch.object(
+            server,
+            "stage_pending_update",
+            side_effect=observe_stage,
+        ):
+            serve_thread.start()
+            older_thread.start()
+            try:
+                self.assertTrue(older_callback_started.wait(timeout=2.0))
+                newer_thread.start()
+                self.assertTrue(newer_staged.wait(timeout=2.0))
+            finally:
+                release_older_callback.set()
+                older_thread.join(timeout=2.0)
+                if newer_thread.ident is not None:
+                    newer_thread.join(timeout=2.0)
+                server.shutdown()
+                server.server_close()
+                serve_thread.join(timeout=2.0)
+
+        self.assertFalse(older_thread.is_alive())
+        self.assertFalse(newer_thread.is_alive())
+        self.assertFalse(serve_thread.is_alive())
+        self.assertEqual(callback_payloads, [older, newer])
+        self.assertEqual(claim_results, [(older, False), (newer, True)])
+        self.assertEqual(responses, {older: b"\x01", newer: b"\x01"})
 
     def test_keychain_update_script_shape_margin_and_scrubbing(self) -> None:
         with mock.patch.object(
@@ -2038,6 +2193,7 @@ class ProviderPolicyTest(unittest.TestCase):
         def record_update(
             updated: bytearray,
             commit_pending: Callable[[Callable[[], bool]], bool],
+            _claim_terminal: Callable[[], bool],
         ) -> bool:
             def publish() -> bool:
                 updates.append(bytes(updated))
@@ -5973,6 +6129,13 @@ class ProviderPolicyTest(unittest.TestCase):
             update_values.append(bytearray(json.dumps(value).encode()))
         first, second, third = update_values
         second_bytes = bytes(second)
+        third_bytes = bytes(third)
+        generation_cap = 3
+        byte_cap = (
+            len(first)
+            + len(second)
+            + providers.CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES
+        )
         selected = providers._ClaudeLocalCredential(
             source="macos-keychain",
             payload=original,
@@ -5984,6 +6147,8 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
         )
         tracked_bytearrays: list[bytearray] = []
+        publication_calls = 0
+        terminal_claim_calls = 0
         real_bytearray = bytearray
 
         def tracked_bytearray(
@@ -5997,9 +6162,25 @@ class ProviderPolicyTest(unittest.TestCase):
 
         @contextlib.contextmanager
         def broker(_credential, _capability, *, update_callback=None, **_kwargs):
+            nonlocal publication_calls, terminal_claim_calls
             assert update_callback is not None
-            self.assertTrue(update_callback(first))
-            self.assertTrue(update_callback(second))
+
+            def commit_pending(publish: Callable[[], bool]) -> bool:
+                nonlocal publication_calls
+                publication_calls += 1
+                return publish()
+
+            def claim_terminal() -> bool:
+                nonlocal terminal_claim_calls
+                terminal_claim_calls += 1
+                return True
+
+            self.assertTrue(
+                update_callback(first, commit_pending, claim_terminal)
+            )
+            self.assertTrue(
+                update_callback(second, commit_pending, claim_terminal)
+            )
             recovery_root = providers._claude_macos_recovery_root(self.review)
             carriers = sorted(
                 recovery_root.glob(
@@ -6029,10 +6210,41 @@ class ProviderPolicyTest(unittest.TestCase):
                 if candidate == second_bytes
             ]
             self.assertEqual(len(staged_copies), 1)
-            self.assertFalse(update_callback(third))
+            self.assertFalse(
+                update_callback(third, commit_pending, claim_terminal)
+            )
             self.assertEqual(
                 staged_copies[0],
                 b"\x00" * len(second_bytes),
+            )
+            carriers = sorted(
+                recovery_root.glob(
+                    f"{providers.CLAUDE_MACOS_DURABLE_STAGE_COMMITTED_PREFIX}*"
+                )
+            )
+            self.assertEqual(len(carriers), 3)
+            self.assertLessEqual(len(carriers), generation_cap)
+            self.assertLessEqual(
+                sum(
+                    (
+                        carrier
+                        / "config"
+                        / providers.CLAUDE_CREDENTIAL_FILE_NAME
+                    ).stat().st_size
+                    for carrier in carriers
+                ),
+                byte_cap,
+            )
+            self.assertIn(
+                third_bytes,
+                [
+                    (
+                        carrier
+                        / "config"
+                        / providers.CLAUDE_CREDENTIAL_FILE_NAME
+                    ).read_bytes()
+                    for carrier in carriers
+                ],
             )
             yield 43211
 
@@ -6054,12 +6266,12 @@ class ProviderPolicyTest(unittest.TestCase):
             mock.patch.object(
                 providers,
                 "CLAUDE_MACOS_DURABLE_STAGE_MAX_GENERATIONS",
-                2,
+                generation_cap,
             ),
             mock.patch.object(
                 providers,
                 "CLAUDE_MACOS_DURABLE_STAGE_MAX_BYTES",
-                sum(len(value) for value in update_values),
+                byte_cap,
             ),
             mock.patch.object(
                 providers,
@@ -6093,9 +6305,11 @@ class ProviderPolicyTest(unittest.TestCase):
             ):
                 pass
 
-        self.assertEqual((retain.call_count, commit.call_count), (2, 2))
+        self.assertEqual((retain.call_count, commit.call_count), (3, 3))
+        self.assertEqual(publication_calls, 2)
+        self.assertEqual(terminal_claim_calls, 1)
         persist.assert_not_called()
-        self.assert_macos_recovery_carrier(raised.exception, second_bytes)
+        self.assert_macos_recovery_carrier(raised.exception, third_bytes)
 
     def test_quota_proof_capture_does_not_hold_runtime_state_lock(
         self,
@@ -6115,7 +6329,6 @@ class ProviderPolicyTest(unittest.TestCase):
             "fixture-lock-free-proof-second"
         )
         second = bytearray(json.dumps(second_value).encode())
-        first_digest = providers._claude_credential_digest(first)
         selected = providers._ClaudeLocalCredential(
             source="macos-keychain",
             payload=original,
@@ -6162,6 +6375,7 @@ class ProviderPolicyTest(unittest.TestCase):
             assert update_callback is not None
             assert quiescence_callbacks is not None
             self.assertTrue(update_callback(first))
+            recovery_root = providers._claude_macos_recovery_root(self.review)
 
             def reject_second() -> None:
                 try:
@@ -6177,9 +6391,22 @@ class ProviderPolicyTest(unittest.TestCase):
             timeout_proof = providers._get_claude_retained_credential_proof(
                 timeout_error
             )
-            self.assertIsNotNone(timeout_proof)
-            assert timeout_proof is not None
-            self.assertEqual(timeout_proof.digest, first_digest)
+            self.assertIsNone(timeout_proof)
+            self.assertIsNone(
+                getattr(
+                    timeout_error,
+                    "_codex_claude_retained_credential_carrier",
+                    None,
+                )
+            )
+            self.assertEqual(
+                getattr(
+                    timeout_error,
+                    "_codex_claude_retained_cleanup_artifact",
+                    None,
+                ),
+                str(recovery_root),
+            )
             captured["timeout"] = timeout_error
             release_capture.set()
             update_thread.join(timeout=2.0)
@@ -6206,7 +6433,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 mock.patch.object(
                     providers,
                     "CLAUDE_MACOS_DURABLE_STAGE_MAX_GENERATIONS",
-                    1,
+                    2,
                 ),
                 mock.patch.object(
                     providers,
@@ -6252,7 +6479,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 f"fixture-quota-cleanup-refresh-{generation}"
             )
             updates.append(bytearray(json.dumps(value).encode()))
-        latest_bytes = bytes(updates[2])
+        latest_bytes = bytes(updates[3])
         selected = providers._ClaudeLocalCredential(
             source="macos-keychain",
             payload=original,
@@ -6300,12 +6527,13 @@ class ProviderPolicyTest(unittest.TestCase):
             mock.patch.object(
                 providers,
                 "CLAUDE_MACOS_DURABLE_STAGE_MAX_GENERATIONS",
-                3,
+                4,
             ),
             mock.patch.object(
                 providers,
                 "CLAUDE_MACOS_DURABLE_STAGE_MAX_BYTES",
-                sum(len(update) for update in updates),
+                sum(len(update) for update in updates[:3])
+                + providers.CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES,
             ),
             mock.patch.object(
                 providers,
@@ -6329,7 +6557,7 @@ class ProviderPolicyTest(unittest.TestCase):
             raised.exception,
             latest_bytes,
         )
-        self.assertEqual(latest_carrier, complete_carriers[-1])
+        self.assertNotIn(latest_carrier, complete_carriers)
         recovery_root = providers._claude_macos_recovery_root(self.review)
         self.assertEqual(list(recovery_root.iterdir()), [latest_carrier])
         report = common.read_json(
@@ -6411,13 +6639,25 @@ class ProviderPolicyTest(unittest.TestCase):
             )
             self.assertEqual(len(complete_carriers), 3)
             self.assertFalse(update_callback(updates[3]))
+            all_carriers = sorted(
+                recovery_root.glob(
+                    f"{providers.CLAUDE_MACOS_DURABLE_STAGE_COMMITTED_PREFIX}*"
+                )
+            )
+            self.assertEqual(len(all_carriers), 4)
+            terminal_carrier = next(
+                carrier
+                for carrier in all_carriers
+                if carrier not in complete_carriers
+            )
+            complete_carriers.append(terminal_carrier)
             latest_artifact = (
-                complete_carriers[-1]
+                terminal_carrier
                 / "config"
                 / providers.CLAUDE_CREDENTIAL_FILE_NAME
             )
             replacement = latest_artifact.with_name("replacement.json")
-            replacement.write_bytes(updates[2])
+            replacement.write_bytes(updates[3])
             replacement.chmod(0o600)
             os.replace(replacement, latest_artifact)
             fail_capture = True
@@ -6441,12 +6681,13 @@ class ProviderPolicyTest(unittest.TestCase):
             mock.patch.object(
                 providers,
                 "CLAUDE_MACOS_DURABLE_STAGE_MAX_GENERATIONS",
-                3,
+                4,
             ),
             mock.patch.object(
                 providers,
                 "CLAUDE_MACOS_DURABLE_STAGE_MAX_BYTES",
-                sum(len(update) for update in updates),
+                sum(len(update) for update in updates[:3])
+                + providers.CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES,
             ),
             mock.patch.object(
                 providers,
@@ -6527,7 +6768,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 f"fixture-quota-cleanup-failure-{generation}"
             )
             updates.append(bytearray(json.dumps(value).encode()))
-        latest_bytes = bytes(updates[2])
+        latest_bytes = bytes(updates[3])
         selected = providers._ClaudeLocalCredential(
             source="macos-keychain",
             payload=original,
@@ -6587,12 +6828,13 @@ class ProviderPolicyTest(unittest.TestCase):
             mock.patch.object(
                 providers,
                 "CLAUDE_MACOS_DURABLE_STAGE_MAX_GENERATIONS",
-                3,
+                4,
             ),
             mock.patch.object(
                 providers,
                 "CLAUDE_MACOS_DURABLE_STAGE_MAX_BYTES",
-                sum(len(update) for update in updates),
+                sum(len(update) for update in updates[:3])
+                + providers.CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES,
             ),
             mock.patch.object(
                 providers,
@@ -6621,7 +6863,7 @@ class ProviderPolicyTest(unittest.TestCase):
             raised.exception,
             latest_bytes,
         )
-        self.assertEqual(latest_carrier, complete_carriers[-1])
+        self.assertNotIn(latest_carrier, complete_carriers)
         self.assertEqual(
             getattr(
                 raised.exception,
@@ -6632,7 +6874,7 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         self.assertEqual(
             cleanup_attempts,
-            complete_carriers[:-1],
+            complete_carriers,
         )
         recovery_root = providers._claude_macos_recovery_root(self.review)
         self.assertEqual(
@@ -6684,7 +6926,7 @@ class ProviderPolicyTest(unittest.TestCase):
                         f"fixture-non-staged-control-flow-{label}-{generation}"
                     )
                     updates.append(bytearray(json.dumps(value).encode()))
-                latest_bytes = bytes(updates[2])
+                latest_bytes = bytes(updates[3])
                 selected = providers._ClaudeLocalCredential(
                     source="macos-keychain",
                     payload=original,
@@ -6714,14 +6956,14 @@ class ProviderPolicyTest(unittest.TestCase):
                     before = set(recovery_root.glob("claude-carrier-*"))
                     for update in updates[:3]:
                         self.assertTrue(update_callback(update))
+                    self.assertFalse(update_callback(updates[3]))
                     staged_carriers.extend(
                         sorted(
                             set(recovery_root.glob("claude-carrier-*"))
                             - before
                         )
                     )
-                    self.assertEqual(len(staged_carriers), 3)
-                    self.assertFalse(update_callback(updates[3]))
+                    self.assertEqual(len(staged_carriers), 4)
                     for update in updates:
                         update[:] = b"\x00" * len(update)
                     yield 43211
@@ -6744,12 +6986,13 @@ class ProviderPolicyTest(unittest.TestCase):
                     mock.patch.object(
                         providers,
                         "CLAUDE_MACOS_DURABLE_STAGE_MAX_GENERATIONS",
-                        3,
+                        4,
                     ),
                     mock.patch.object(
                         providers,
                         "CLAUDE_MACOS_DURABLE_STAGE_MAX_BYTES",
-                        sum(len(update) for update in updates),
+                        sum(len(update) for update in updates[:3])
+                        + providers.CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES,
                     ),
                     mock.patch.object(
                         providers,
@@ -6774,6 +7017,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 self.assertEqual(remove.call_args.args[1], staged_carriers[0])
                 self.assertTrue(staged_carriers[1].is_dir())
                 self.assertTrue(staged_carriers[2].is_dir())
+                self.assertTrue(staged_carriers[3].is_dir())
                 persist.assert_not_called()
                 recovery_root = providers._claude_macos_recovery_root(
                     self.review
@@ -6852,7 +7096,8 @@ class ProviderPolicyTest(unittest.TestCase):
             mock.patch.object(
                 providers,
                 "CLAUDE_MACOS_DURABLE_STAGE_MAX_BYTES",
-                sum(len(value) for value in updates),
+                sum(len(value) for value in updates)
+                + providers.CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES,
             ),
             mock.patch.object(
                 providers,
@@ -7081,7 +7326,9 @@ class ProviderPolicyTest(unittest.TestCase):
             mock.patch.object(
                 providers,
                 "CLAUDE_MACOS_DURABLE_STAGE_MAX_BYTES",
-                len(first) + sum(len(update) for update in later),
+                len(first)
+                + sum(len(update) for update in later)
+                + providers.CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES,
             ),
             mock.patch.object(
                 providers,
@@ -7412,7 +7659,11 @@ class ProviderPolicyTest(unittest.TestCase):
             recovery_metadata.st_ino,
         )
 
-        for failure_kind in ("success", "fullsync-failure"):
+        for failure_kind in (
+            "success",
+            "fullsync-failure",
+            "post-rename-stat-failure",
+        ):
             with self.subTest(failure_kind=failure_kind):
                 pending = recovery_root / (
                     providers.CLAUDE_MACOS_DURABLE_STAGE_PENDING_PREFIX
@@ -7431,6 +7682,8 @@ class ProviderPolicyTest(unittest.TestCase):
                 )
                 events: list[str] = []
                 real_rename = providers.os.rename
+                real_stat = providers.os.stat
+                post_rename_stat_failed = False
 
                 def track_rename(*args: object, **kwargs: object) -> None:
                     events.append("rename")
@@ -7444,6 +7697,23 @@ class ProviderPolicyTest(unittest.TestCase):
                         if failure_kind == "fullsync-failure":
                             raise OSError("injected recovery root F_FULLFSYNC failure")
                     return 0
+
+                def fail_once_after_rename(
+                    path: object,
+                    *args: object,
+                    **kwargs: object,
+                ) -> os.stat_result:
+                    nonlocal post_rename_stat_failed
+                    if (
+                        failure_kind == "post-rename-stat-failure"
+                        and events
+                        and events[0] == "rename"
+                        and path == committed.name
+                        and not post_rename_stat_failed
+                    ):
+                        post_rename_stat_failed = True
+                        raise OSError("injected post-rename stat failure")
+                    return real_stat(path, *args, **kwargs)
 
                 darwin_fcntl = mock.Mock()
                 darwin_fcntl.F_FULLFSYNC = 51
@@ -7470,11 +7740,23 @@ class ProviderPolicyTest(unittest.TestCase):
                             side_effect=track_rename,
                         )
                     )
-                    if failure_kind == "fullsync-failure":
-                        stack.enter_context(
+                    stack.enter_context(
+                        mock.patch.object(
+                            providers.os,
+                            "stat",
+                            side_effect=fail_once_after_rename,
+                        )
+                    )
+                    raised = None
+                    if failure_kind != "success":
+                        raised = stack.enter_context(
                             self.assertRaisesRegex(
                                 OSError,
-                                "F_FULLFSYNC failure",
+                                (
+                                    "F_FULLFSYNC failure"
+                                    if failure_kind == "fullsync-failure"
+                                    else "post-rename stat failure"
+                                ),
                             )
                         )
                     result = providers._commit_claude_macos_durable_stage(
@@ -7486,6 +7768,15 @@ class ProviderPolicyTest(unittest.TestCase):
                 self.assertEqual(events[:2], ["rename", "fullsync"])
                 if failure_kind == "success":
                     self.assertEqual(result, committed)
+                else:
+                    assert raised is not None
+                    self.assertEqual(
+                        self.assert_macos_recovery_carrier(
+                            raised.exception,
+                            bytes(credential),
+                        ),
+                        committed,
+                    )
 
         credential[:] = b"\x00" * len(credential)
 
@@ -7576,7 +7867,7 @@ class ProviderPolicyTest(unittest.TestCase):
             self.assertRaisesRegex(
                 providers.ClaudeCredentialInspectionInconclusive,
                 "runtime I/O was inconclusive",
-            ),
+            ) as raised,
         ):
             with self.claude_keychain_runtime(
                 self.review,
@@ -7589,6 +7880,15 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(publication_calls, 0)
         self.assertGreaterEqual(recovery_fullsyncs, 2)
         persist.assert_not_called()
+        retained = self.assert_macos_recovery_carrier(
+            raised.exception,
+            bytes(refreshed),
+        )
+        self.assertTrue(
+            retained.name.startswith(
+                providers.CLAUDE_MACOS_DURABLE_STAGE_COMMITTED_PREFIX
+            )
+        )
         refreshed[:] = b"\x00" * len(refreshed)
 
     def test_durable_stage_rejects_swapped_or_looping_workspace_ancestor(
@@ -7776,8 +8076,19 @@ class ProviderPolicyTest(unittest.TestCase):
         refreshed_bytes = bytes(refreshed)
 
         for label, byte_limit, accepted in (
-            ("exact", len(refreshed_bytes), True),
-            ("plus-one", len(refreshed_bytes) - 1, False),
+            (
+                "exact",
+                providers.CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES
+                + len(refreshed_bytes),
+                True,
+            ),
+            (
+                "plus-one",
+                providers.CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES
+                + len(refreshed_bytes)
+                - 1,
+                False,
+            ),
         ):
             with self.subTest(label=label):
                 original = bytearray(
@@ -7888,27 +8199,26 @@ class ProviderPolicyTest(unittest.TestCase):
                     self.assertEqual((retain.call_count, commit.call_count), (1, 1))
                     persist.assert_called_once()
                 else:
-                    retain.assert_not_called()
-                    commit.assert_not_called()
+                    self.assertEqual((retain.call_count, commit.call_count), (1, 1))
                     persist.assert_not_called()
-                    for attribute in (
-                        "_codex_claude_retained_credential_carrier",
-                        "_codex_claude_retained_credential_artifact",
-                        "_codex_claude_retained_cleanup_artifact",
-                    ):
-                        self.assertIsNone(
-                            getattr(raised.exception, attribute, None)
-                        )
+                    terminal_carrier = self.assert_macos_recovery_carrier(
+                        raised.exception,
+                        refreshed_bytes,
+                    )
                     report = common.read_json(
                         self.review.container_dir / "claude-runtime.json"
                     )
-                    self.assertNotIn(
-                        "recovery_artifact",
-                        report["authentication"],
+                    self.assertEqual(
+                        report["authentication"]["recovery_carrier"],
+                        str(terminal_carrier),
                     )
-                    self.assertNotIn(
-                        "recovery_cleanup_artifact",
-                        report["authentication"],
+                    self.assertEqual(
+                        report["authentication"]["recovery_artifact"],
+                        str(
+                            terminal_carrier
+                            / "config"
+                            / providers.CLAUDE_CREDENTIAL_FILE_NAME
+                        ),
                     )
 
     def test_later_rotation_repairs_incomplete_recovery_carrier(self) -> None:
@@ -12624,7 +12934,7 @@ class ProviderPolicyTest(unittest.TestCase):
                         )
                         self.assertEqual(
                             len(staged_carriers),
-                            4 if cleanup_mode == "staged" else 3,
+                            4,
                         )
                         yield 43211
 
@@ -12632,7 +12942,7 @@ class ProviderPolicyTest(unittest.TestCase):
                         self.review.container_dir / "claude-runtime.json",
                         {"authentication": {}, "phase": "runtime-launching"},
                     )
-                    generation_limit = 4 if cleanup_mode == "staged" else 3
+                    generation_limit = 5 if cleanup_mode == "staged" else 4
                     with (
                         mock.patch.object(
                             providers,
@@ -12652,7 +12962,8 @@ class ProviderPolicyTest(unittest.TestCase):
                         mock.patch.object(
                             providers,
                             "CLAUDE_MACOS_DURABLE_STAGE_MAX_BYTES",
-                            sum(len(update) for update in updates),
+                            sum(len(update) for update in updates)
+                            + providers.CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES,
                         ),
                         mock.patch.object(
                             providers,
@@ -12856,12 +13167,13 @@ class ProviderPolicyTest(unittest.TestCase):
                     mock.patch.object(
                         providers,
                         "CLAUDE_MACOS_DURABLE_STAGE_MAX_GENERATIONS",
-                        4,
+                        5,
                     ),
                     mock.patch.object(
                         providers,
                         "CLAUDE_MACOS_DURABLE_STAGE_MAX_BYTES",
-                        sum(len(update) for update in updates),
+                        sum(len(update) for update in updates)
+                        + providers.CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES,
                     ),
                     mock.patch.object(
                         providers,
