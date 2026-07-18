@@ -19026,6 +19026,131 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(attempt.category, "auth")
         self.assertEqual(attempt.returncode, 1)
 
+    def test_claude_persistence_attempt_log_failures_are_best_effort(
+        self,
+    ) -> None:
+        completed = Completed(
+            argv=("sandbox",),
+            returncode=1,
+            stdout=b"",
+            stderr=b"",
+        )
+        failure_patches = (
+            (
+                "attempt-directory",
+                mock.patch.object(
+                    pathlib.Path,
+                    "mkdir",
+                    side_effect=OSError("attempt directory unavailable"),
+                ),
+            ),
+            (
+                "empty-log",
+                mock.patch.object(
+                    pathlib.Path,
+                    "touch",
+                    side_effect=OSError("attempt log unavailable"),
+                ),
+            ),
+            (
+                "append",
+                mock.patch.object(
+                    providers,
+                    "_append_attempt_diagnostic",
+                    side_effect=OSError("attempt diagnostic unavailable"),
+                ),
+            ),
+        )
+
+        for index, (label, failure_patch) in enumerate(
+            failure_patches,
+            start=1,
+        ):
+            with self.subTest(label=label), failure_patch:
+                attempt = providers._claude_persistence_failed_attempt(
+                    review=self.review,
+                    index=index,
+                    model=providers.CLAUDE_MODELS[0],
+                    completed=completed,
+                    category="inconclusive",
+                )
+
+                self.assertEqual(attempt.category, "inconclusive")
+                self.assertEqual(attempt.returncode, 1)
+
+    def test_auth_rejection_preserves_recovery_when_attempt_log_fails(
+        self,
+    ) -> None:
+        completed = Completed(
+            argv=("sandbox",),
+            returncode=1,
+            stdout=b"",
+            stderr=b"HTTP 401 Unauthorized; please run /login",
+        )
+        carrier = (
+            self.review.container_dir
+            / "claude-runtime"
+            / "linux"
+            / "claude-carrier-attempt-log-failure"
+        )
+        carrier.mkdir(parents=True, mode=0o700)
+        inspection_error = providers.LinuxCredentialInspectionInconclusive(
+            "final credential snapshot unavailable"
+        )
+        setattr(
+            inspection_error,
+            "_codex_claude_refresh_persistence_failed",
+            True,
+        )
+        setattr(
+            inspection_error,
+            "_codex_claude_retained_credential_carrier",
+            str(carrier),
+        )
+
+        with mock.patch.object(
+            providers,
+            "_append_attempt_diagnostic",
+            side_effect=OSError("attempt diagnostic unavailable"),
+        ):
+            failure = (
+                providers._claude_auth_rejection_after_credential_inspection(
+                    review=self.review,
+                    index=1,
+                    model=providers.CLAUDE_MODELS[0],
+                    completed=completed,
+                    inspection_error=inspection_error,
+                )
+            )
+
+        self.assertIsInstance(
+            failure,
+            providers.ClaudeKeychainCredentialUnavailable,
+        )
+        assert failure is not None
+        self.assertEqual(
+            getattr(
+                failure,
+                "_codex_claude_retained_credential_carrier",
+                None,
+            ),
+            str(carrier),
+        )
+        self.assertIs(
+            getattr(
+                failure,
+                "_codex_claude_refresh_persistence_failed",
+                False,
+            ),
+            True,
+        )
+        attempt = getattr(
+            failure,
+            "_codex_claude_persistence_attempt",
+        )
+        self.assertIsInstance(attempt, providers.Attempt)
+        self.assertEqual(attempt.category, "auth")
+
     def test_claude_linux_report_error_preserves_recovery_carrier(
         self,
     ) -> None:

@@ -11122,13 +11122,25 @@ def _codex_permissions_match(
     return minimal_seen and not remaining_paths and not remaining_globs
 
 
-def _attempt_paths(
+def _attempt_paths_without_io(
     review: ReviewWorkspace, index: int, runtime: str, model: str
 ) -> tuple[pathlib.Path, pathlib.Path]:
     safe_model = re.sub(r"[^A-Za-z0-9_.-]+", "-", model)
     prefix = review.container_dir / "attempts" / f"{index:02d}-{runtime}-{safe_model}"
-    prefix.parent.mkdir(parents=True, exist_ok=True)
     return pathlib.Path(f"{prefix}.stdout.log"), pathlib.Path(f"{prefix}.stderr.log")
+
+
+def _attempt_paths(
+    review: ReviewWorkspace, index: int, runtime: str, model: str
+) -> tuple[pathlib.Path, pathlib.Path]:
+    stdout_path, stderr_path = _attempt_paths_without_io(
+        review,
+        index,
+        runtime,
+        model,
+    )
+    stdout_path.parent.mkdir(parents=True, exist_ok=True)
+    return stdout_path, stderr_path
 
 
 def _append_attempt_diagnostic(path: pathlib.Path, message: str) -> None:
@@ -11146,14 +11158,23 @@ def _claude_persistence_failed_attempt(
     completed: Completed,
     category: str = "blocked-authentication",
 ) -> Attempt:
-    stdout_path, stderr_path = _attempt_paths(review, index, "claude", model)
-    stdout_path.touch(exist_ok=True)
-    stderr_path.touch(exist_ok=True)
-    _append_attempt_diagnostic(
-        stderr_path,
-        "Claude credential refresh persistence was not safely completed after "
-        "the runtime attempt.",
+    stdout_path, stderr_path = _attempt_paths_without_io(
+        review,
+        index,
+        "claude",
+        model,
     )
+    try:
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        stdout_path.touch(exist_ok=True)
+        stderr_path.touch(exist_ok=True)
+        _append_attempt_diagnostic(
+            stderr_path,
+            "Claude credential refresh persistence was not safely completed after "
+            "the runtime attempt.",
+        )
+    except OSError:
+        pass
     return Attempt(
         runtime="claude",
         requested_model=model,

@@ -353,6 +353,44 @@ class RepositoryContractTest(unittest.TestCase):
                     normalized,
                 )
 
+        for name, policy in {
+            "AGENTS.md": agents,
+            "README.md": readme,
+            "SKILL.md": skill,
+            "helper-contract.md": helper_contract,
+            "claude-runtime-trust.md": runtime_trust,
+            "project journal": journal,
+        }.items():
+            with self.subTest(macos_terminal_reserve_policy=name):
+                normalized = policy.lower()
+                self.assertIn("admitted to durable staging", normalized)
+                self.assertIn("last generation and 1 mib", normalized)
+                self.assertNotIn(
+                    "reaching either journal cap nacks the generation",
+                    normalized,
+                )
+                self.assertNotIn(
+                    "nack the generation before filesystem work",
+                    normalized,
+                )
+
+        self.assertIn(
+            "durably stages its exact payload",
+            skill,
+        )
+        self.assertIn(
+            "later requests are NACKed before callbacks",
+            skill,
+        )
+        self.assertIn(
+            "durably stage that current update in the terminal recovery slot",
+            runtime_trust,
+        )
+        self.assertIn(
+            "NACK later requests before their callbacks or filesystem work",
+            runtime_trust,
+        )
+
         protocol = claude_refresh_lock.CLAUDE_REFRESH_LOCK_PROTOCOL_2_1_211
         self.assertEqual(protocol.primary_lock_name, ".oauth_refresh.lock")
         self.assertEqual(protocol.legacy_suffix, ".lock")
