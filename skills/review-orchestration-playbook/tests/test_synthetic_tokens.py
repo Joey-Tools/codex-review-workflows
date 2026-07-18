@@ -2638,6 +2638,70 @@ class PublicPoolScannerTest(unittest.TestCase):
                         "generic-secret-assignment",
                     )
 
+    def test_long_provider_candidate_does_not_suppress_unsafe_assignment_rhs(
+        self,
+    ) -> None:
+        candidate = b"sk-proj-B1" + b"B" * 506
+        cases = (
+            (
+                "unquoted-space-continuation",
+                b"api_token = " + candidate + b" \\" + b"\ncontinued\n",
+                False,
+            ),
+            (
+                "unquoted-space-operator",
+                b"api_token = " + candidate + b" + continued\n",
+                False,
+            ),
+            (
+                "unquoted-double-quote",
+                b"api_token = " + candidate + b'"continued"\n',
+                False,
+            ),
+            (
+                "unquoted-single-quote",
+                b"api_token = " + candidate + b"'continued'\n",
+                False,
+            ),
+            (
+                "unquoted-backslash",
+                b"api_token = " + candidate + b"\\continued\n",
+                False,
+            ),
+            (
+                "unquoted-backtick",
+                b"api_token = " + candidate + b"`continued`\n",
+                False,
+            ),
+            (
+                "quoted-operator",
+                assignment_bytes(b"api_token", candidate) + b" + continued\n",
+                False,
+            ),
+            (
+                "diff-same-side-continuation",
+                b"+api_token = " + candidate + b"\n+  + continued\n",
+                True,
+            ),
+        )
+        for label, payload, diff_surface in cases:
+            with self.subTest(case=label):
+                scan = workspace._scan_secret_value(
+                    payload,
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                    diff_surface=diff_surface,
+                )
+
+                self.assertEqual(
+                    scan.blocking_rule,
+                    "generic-secret-assignment",
+                )
+                self.assertEqual(
+                    scan.blocking_candidates,
+                    {candidate: {"openai-key"}},
+                )
+
     def test_complete_anthropic_candidate_suppresses_openai_prefix_only_event(
         self,
     ) -> None:
@@ -2670,7 +2734,7 @@ class PublicPoolScannerTest(unittest.TestCase):
             + b"\n"
             + assignment_prefix
             + candidate
-            + b'"\n'
+            + b'"\nstate = ok\n'
             + b"x" * workspace.STREAM_SCAN_OVERLAP
         )
         self.assertGreater(len(payload), first_read)
@@ -2687,6 +2751,46 @@ class PublicPoolScannerTest(unittest.TestCase):
             scan.blocking_candidates,
             {candidate: {"openai-key"}},
         )
+
+    def test_unsafe_long_provider_rhs_crosses_first_commit_and_blocks(self) -> None:
+        candidate = b"sk-proj-" + b"B" * 508
+        first_read = (
+            workspace.MAX_SECRET_PREFIX_PROOF_BYTES + workspace.STREAM_SCAN_OVERLAP
+        )
+        committed_end = first_read - workspace.STREAM_SCAN_OVERLAP
+        candidate_start = committed_end - 513
+        cases = (
+            ("quoted", b'api_token = "', b'" + continued\n'),
+            ("unquoted", b"api_token = ", b" \\" + b"\ncontinued\n"),
+        )
+        for label, assignment_prefix, continuation in cases:
+            with self.subTest(case=label):
+                line_start = candidate_start - len(assignment_prefix)
+                payload = (
+                    b"x" * (line_start - 1)
+                    + b"\n"
+                    + assignment_prefix
+                    + candidate
+                    + continuation
+                    + b"x" * workspace.STREAM_SCAN_OVERLAP
+                )
+                self.assertGreater(len(payload), first_read)
+
+                scan = workspace._stream_secret_scan(
+                    io.BytesIO(payload),
+                    size=len(payload),
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+
+                self.assertEqual(
+                    scan.blocking_rule,
+                    "generic-secret-assignment",
+                )
+                self.assertEqual(
+                    scan.blocking_candidates,
+                    {candidate: {"openai-key"}},
+                )
 
     def test_audit_scan_captures_after_a_blocker_across_stream_chunks(self) -> None:
         accepted = accepted_legacy_value(LEGACY_A, rule="generic-secret-assignment")
@@ -3531,6 +3635,34 @@ class SyntheticWorkspaceTest(unittest.TestCase):
 
                 with self.assertRaisesRegex(ReviewError, "google-api-key"):
                     self.prepare(repo=repo, base=base, head=head)
+
+    def test_unsafe_long_provider_rhs_does_not_count_as_reduction(self) -> None:
+        candidate = b"sk-proj-B1" + b"B" * 506
+
+        def unsafe_assignment(marker: bytes) -> str:
+            return (
+                b"api_token = "
+                + candidate
+                + b" \\"
+                + b"\n"
+                + marker
+                + b"\n"
+            ).decode("ascii")
+
+        repo, base = self.new_repo(
+            {
+                "fixture.txt": unsafe_assignment(b"continued-a")
+                + unsafe_assignment(b"continued-b")
+            }
+        )
+        (repo / "fixture.txt").write_text(
+            unsafe_assignment(b"continued-c"),
+            encoding="utf-8",
+        )
+        head = self.commit(repo)
+
+        with self.assertRaisesRegex(ReviewError, "generic-secret-assignment"):
+            self.prepare(repo=repo, base=base, head=head)
 
     def test_prepared_range_rejects_non_decreasing_secret_transitions(self) -> None:
         cases = (

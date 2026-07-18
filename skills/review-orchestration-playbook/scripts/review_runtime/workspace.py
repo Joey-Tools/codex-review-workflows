@@ -177,7 +177,6 @@ UNQUOTED_SECRET_ASSIGNMENT = re.compile(
 OVERSIZED_UNQUOTED_SECRET_ASSIGNMENT = re.compile(
     SECRET_KEY_PATTERN + rb"(?:" + GENERIC_SECRET_VALUE_BYTE_CLASS + rb"){513}"
 )
-GENERIC_SECRET_VALUE_BYTE = re.compile(GENERIC_SECRET_VALUE_BYTE_CLASS)
 PLACEHOLDER_SECRET_PATTERN = re.compile(
     rb"(?:"
     rb"\$\{[A-Za-z_][A-Za-z0-9_]*\}"
@@ -3386,21 +3385,22 @@ def _bounded_diff_hunk_context_before(
 
 def _quoted_assignment_may_accept(
     value: bytes,
-    match: re.Match[bytes],
     *,
+    assignment_start: int,
+    assignment_end: int,
     diff_surface: bool = False,
     prefix_context_complete: bool = True,
     suffix_context_complete: bool = True,
     event_budget: SecretScanBudget,
 ) -> bool:
-    cursor = match.end()
+    cursor = assignment_end
     inspected = 0
     crossed_line_boundary = False
     skipped_diff_bytes = 0
     match_line_start = (
         max(
-            value.rfind(b"\n", 0, match.start()),
-            value.rfind(b"\r", 0, match.start()),
+            value.rfind(b"\n", 0, assignment_start),
+            value.rfind(b"\r", 0, assignment_start),
         )
         + 1
     )
@@ -3543,7 +3543,7 @@ def _quoted_assignment_may_accept(
         )
 
     def source_literal_quote() -> int | None:
-        start = match.start()
+        start = assignment_start
         lookbehind_start = max(0, start - MAX_SECRET_ASSIGNMENT_TRAILING_BYTES)
         last_line_break = max(
             value.rfind(b"\n", lookbehind_start, start),
@@ -3952,12 +3952,13 @@ def _quoted_assignment_may_accept(
 
 def _unquoted_assignment_may_accept(
     value: bytes,
-    match: re.Match[bytes],
     *,
+    assignment_start: int,
+    assignment_end: int,
     diff_surface: bool = False,
     allow_inline_hash_comment: bool = False,
 ) -> bool:
-    cursor = match.end()
+    cursor = assignment_end
     inspected = 0
 
     def advance(count: int) -> bool:
@@ -4062,11 +4063,11 @@ def _unquoted_assignment_may_accept(
 
     lookbehind_start = max(
         0,
-        match.start() - MAX_SECRET_ASSIGNMENT_TRAILING_BYTES,
+        assignment_start - MAX_SECRET_ASSIGNMENT_TRAILING_BYTES,
     )
     last_line_break = max(
-        value.rfind(b"\n", lookbehind_start, match.start()),
-        value.rfind(b"\r", lookbehind_start, match.start()),
+        value.rfind(b"\n", lookbehind_start, assignment_start),
+        value.rfind(b"\r", lookbehind_start, assignment_start),
     )
     if last_line_break < 0 and lookbehind_start > 0:
         return False
@@ -4079,19 +4080,19 @@ def _unquoted_assignment_may_accept(
     ):
         content_start += 1
     key_start = content_start
-    while key_start < match.start() and value[key_start] == 0x20:
+    while key_start < assignment_start and value[key_start] == 0x20:
         key_start += 1
-    if key_start < match.start() and value[key_start] == 0x09:
+    if key_start < assignment_start and value[key_start] == 0x09:
         return False
     while (
-        key_start + 1 < match.start()
+        key_start + 1 < assignment_start
         and value[key_start] in (0x2D, 0x3F)
         and value[key_start + 1] in (0x20, 0x09)
     ):
         key_start += 1
-        while key_start < match.start() and value[key_start] == 0x20:
+        while key_start < assignment_start and value[key_start] == 0x20:
             key_start += 1
-        if key_start < match.start() and value[key_start] == 0x09:
+        if key_start < assignment_start and value[key_start] == 0x09:
             return False
     key_indentation = key_start - content_start
 
@@ -4209,20 +4210,39 @@ def _provider_candidate_is_prefix_only(rule: str, candidate: bytes) -> bool:
 def _oversized_assignment_is_exact_specific_candidate(
     value: bytes,
     *,
+    assignment_start: int,
     candidate_start: int,
     prefix_end: int,
     quote: bytes | None,
     long_specific_candidate_ends: dict[int, set[int]],
+    diff_surface: bool,
+    prefix_context_complete: bool,
+    suffix_context_complete: bool,
+    event_budget: SecretScanBudget,
 ) -> bool:
     for specific_end in long_specific_candidate_ends.get(candidate_start, ()):
         if specific_end < prefix_end:
             continue
         if quote is not None:
-            if value[specific_end : specific_end + 1] == quote:
+            if value[specific_end : specific_end + 1] == quote and (
+                _quoted_assignment_may_accept(
+                    value,
+                    assignment_start=assignment_start,
+                    assignment_end=specific_end + 1,
+                    diff_surface=diff_surface,
+                    prefix_context_complete=prefix_context_complete,
+                    suffix_context_complete=suffix_context_complete,
+                    event_budget=event_budget,
+                )
+            ):
                 return True
             continue
-        next_byte = value[specific_end : specific_end + 1]
-        if not next_byte or GENERIC_SECRET_VALUE_BYTE.fullmatch(next_byte) is None:
+        if _unquoted_assignment_may_accept(
+            value,
+            assignment_start=assignment_start,
+            assignment_end=specific_end,
+            diff_surface=diff_surface,
+        ):
             return True
     return False
 
@@ -4351,13 +4371,32 @@ def _iter_secret_events(
                 continue
             event_budget.consume()
             candidate_start = match.end() - 513
-            if _oversized_assignment_is_exact_specific_candidate(
-                value,
-                candidate_start=candidate_start,
-                prefix_end=match.end(),
-                quote=match.group(1) if quoted else None,
-                long_specific_candidate_ends=long_specific_candidate_ends,
-            ):
+            try:
+                exact_specific_candidate = (
+                    _oversized_assignment_is_exact_specific_candidate(
+                        value,
+                        assignment_start=match.start(),
+                        candidate_start=candidate_start,
+                        prefix_end=match.end(),
+                        quote=match.group(1) if quoted else None,
+                        long_specific_candidate_ends=long_specific_candidate_ends,
+                        diff_surface=diff_surface,
+                        prefix_context_complete=prefix_context_complete,
+                        suffix_context_complete=suffix_context_complete,
+                        event_budget=event_budget,
+                    )
+                )
+            except _IncompleteSecretScanSuffix:
+                yield (
+                    _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE,
+                    None,
+                    match.end(),
+                    False,
+                    match.start(),
+                    None,
+                )
+                continue
+            if exact_specific_candidate:
                 continue
             yield (
                 "generic-secret-assignment",
@@ -4375,7 +4414,8 @@ def _iter_secret_events(
         try:
             may_accept = _quoted_assignment_may_accept(
                 value,
-                match,
+                assignment_start=match.start(),
+                assignment_end=match.end(),
                 diff_surface=diff_surface,
                 prefix_context_complete=prefix_context_complete,
                 suffix_context_complete=suffix_context_complete,
@@ -4408,14 +4448,16 @@ def _iter_secret_events(
         candidate = match.group(1)
         may_accept = _unquoted_assignment_may_accept(
             value,
-            match,
+            assignment_start=match.start(),
+            assignment_end=match.end(),
             diff_surface=diff_surface,
         )
         placeholder = _is_placeholder_secret(candidate.lower())
         if placeholder and not may_accept:
             may_accept = _unquoted_assignment_may_accept(
                 value,
-                match,
+                assignment_start=match.start(),
+                assignment_end=match.end(),
                 diff_surface=diff_surface,
                 allow_inline_hash_comment=True,
             )
