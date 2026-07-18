@@ -5220,15 +5220,21 @@ def _iter_secret_events(
                 yield rule, None, match.end(), False, None, None
             else:
                 yield rule, candidate, match.end(), True, start, candidate_end
+    specific_ranges = sorted(
+        {
+            (start, candidate_end)
+            for start, candidate_end, _candidate in (_specific_spans or ())
+        }
+    )
+    specific_max_end_by_start: dict[int, int] = {}
+    for start, candidate_end in specific_ranges:
+        specific_max_end_by_start[start] = candidate_end
     # A dot-continued three-part prefix is not a stable identity unless the
     # earlier complete-pattern pass proved one bounded five-part JWE.
     for match in JWE_CONTINUATION_PATTERN.finditer(value):
         if not match_is_committable(match):
             continue
-        if any(
-            start == match.start() and end > match.end()
-            for start, end, _candidate in (_specific_spans or ())
-        ):
+        if specific_max_end_by_start.get(match.start(), -1) > match.end():
             continue
         event_budget.consume()
         yield "jwt", None, match.end(), False, None, None
@@ -5288,12 +5294,6 @@ def _iter_secret_events(
                 None,
                 None,
             )
-    specific_ranges = sorted(
-        {
-            (start, candidate_end)
-            for start, candidate_end, _candidate in (_specific_spans or ())
-        }
-    )
     pending_specific_ranges = tuple(
         specific_range
         for specific_range in specific_ranges

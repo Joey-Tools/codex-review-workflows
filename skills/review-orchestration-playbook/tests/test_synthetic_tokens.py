@@ -4268,6 +4268,47 @@ class PublicPoolScannerTest(unittest.TestCase):
                 self.assertEqual(malformed_scan.blocking_rule, "jwt")
                 self.assertFalse(malformed_scan.blocking_candidates)
 
+    def test_dense_jwe_scan_indexes_specific_spans_once(self) -> None:
+        class IterationCountingSet(set[tuple[int, int, bytes]]):
+            def __init__(self) -> None:
+                super().__init__()
+                self.iterations = 0
+
+            def __iter__(self):
+                self.iterations += 1
+                return super().__iter__()
+
+        candidate_count = 256
+        candidates = tuple(
+            b"eyJ"
+            + b"A" * 12
+            + b".."
+            + f"{index:012x}".encode("ascii")
+            + b"."
+            + b"D" * 12
+            + b"."
+            + b"E" * 12
+            for index in range(candidate_count)
+        )
+        spans = IterationCountingSet()
+
+        events = tuple(
+            workspace._iter_secret_events(
+                b"\n".join(candidates),
+                _specific_spans=spans,
+            )
+        )
+
+        self.assertEqual(spans.iterations, 1)
+        self.assertEqual(len(spans), candidate_count)
+        self.assertEqual(
+            sum(
+                rule == "jwt" and candidate is not None
+                for rule, candidate, *_ in events
+            ),
+            candidate_count,
+        )
+
     def test_oversized_assignment_gap_crossing_stream_boundary_is_blocked(self) -> None:
         boundary = 1024 * 1024
         token_start = boundary - (workspace.STREAM_SCAN_OVERLAP * 3)

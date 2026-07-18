@@ -61,7 +61,7 @@ Diagnostic and preflight evidence remain bounded audit surfaces. They use stable
 - Variable-length provider candidates prove their terminating byte against the provider body alphabet, select the longest actual prefix for the 513-byte fail-closed branch, and retain provider-specific spans across stream commit boundaries.
 - Fixed-length AWS access-key and npm-token candidates use provider-body termination rather than a generic word boundary. A following underscore or other non-body byte therefore preserves both the exact provider span and the complete longer RHS identity.
 - Google API-key candidates capture the complete 35-to-512-byte provider body; a 513-byte prefix remains fail closed, so Base64url punctuation cannot truncate distinct longer values into one reduction candidate.
-- Three-part JWT candidates require a stable non-dot boundary, while bounded five-part compact JWE candidates are captured as one complete identity, including empty encrypted-key or ciphertext segments. Four-part, six-or-more-part, and oversized continuations remain fail closed instead of being reduced through a shared three-part prefix.
+- Three-part JWT candidates require a stable non-dot boundary, while bounded five-part compact JWE candidates are captured as one complete identity, including empty encrypted-key or ciphertext segments. Four-part, six-or-more-part, and oversized continuations remain fail closed instead of being reduced through a shared three-part prefix. The scanner builds its complete-candidate range index once and resolves each JWE continuation by an O(1) `start -> max_end` lookup, avoiding quadratic work on dense inputs.
 - A generic oversized-assignment event is suppressed only when its 513-byte prefix is proven to be the beginning of one complete provider-specific candidate that exactly fills the quoted or unquoted right-hand side, including across stream commit boundaries; any trailing generic value byte still blocks.
 - The oversized-assignment exemption reuses the ordinary quoted or unquoted logical-RHS parser, so whitespace, operators, shell continuations, quote transitions, backslashes, backticks, and unsafe diff continuations remain fail closed after a long provider candidate.
 - Exact provider-specific spans still pass through generic quoted or unquoted RHS validation when their short values fall below the generic entropy heuristic. A safe exact RHS is deduplicated only after the parser accepts it; operators, shell continuations, unsafe diff continuations, and other rejected tails remain generic-assignment blockers.
@@ -82,7 +82,7 @@ Diagnostic and preflight evidence remain bounded audit surfaces. They use stable
 
 ## Validation
 
-- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests`: 809 tests passed, 9 skipped.
+- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests`: 810 tests passed, 9 skipped.
 - `ruff check` on changed runtime and test modules: passed.
 - `git diff --check`: passed.
 - Fixed-range Codex review and PR readiness evidence are recorded in the delivery thread and PR.
