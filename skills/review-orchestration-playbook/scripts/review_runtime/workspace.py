@@ -67,9 +67,13 @@ OVERSIZED_JWT_PATTERN = re.compile(
     rb"\b(?:"
     rb"eyJ[A-Za-z0-9_-]{2049}"
     rb"|eyJ[A-Za-z0-9_-]{8,2048}\.[A-Za-z0-9_-]{2049}"
-    rb"|eyJ[A-Za-z0-9_-]{8,2048}\.[A-Za-z0-9_-]{8,2048}\."
+    rb"|eyJ[A-Za-z0-9_-]{8,2048}\.[A-Za-z0-9_-]{0,2048}\."
     rb"[A-Za-z0-9_-]{2049}"
     rb")"
+)
+JWE_CONTINUATION_PATTERN = re.compile(
+    rb"\beyJ[A-Za-z0-9_-]{8,2048}\.[A-Za-z0-9_-]{0,2048}\."
+    rb"[A-Za-z0-9_-]{0,2048}\."
 )
 # Complete shared-prefix rules must precede broader overlapping sentinel rules.
 SECRET_PATTERNS = (
@@ -148,8 +152,16 @@ SECRET_PATTERNS = (
     (
         "jwt",
         re.compile(
+            rb"\beyJ[A-Za-z0-9_-]{8,2048}\.[A-Za-z0-9_-]{0,2048}\."
+            rb"[A-Za-z0-9_-]{0,2048}\.[A-Za-z0-9_-]{0,2048}\."
+            rb"[A-Za-z0-9_-]{0,2048}(?![A-Za-z0-9_.-])"
+        ),
+    ),
+    (
+        "jwt",
+        re.compile(
             rb"\beyJ[A-Za-z0-9_-]{8,2048}\.[A-Za-z0-9_-]{8,2048}\."
-            rb"[A-Za-z0-9_-]{8,2048}(?![A-Za-z0-9_-])"
+            rb"[A-Za-z0-9_-]{8,2048}(?![A-Za-z0-9_.-])"
         ),
     ),
 )
@@ -5208,6 +5220,18 @@ def _iter_secret_events(
                 yield rule, None, match.end(), False, None, None
             else:
                 yield rule, candidate, match.end(), True, start, candidate_end
+    # A dot-continued three-part prefix is not a stable identity unless the
+    # earlier complete-pattern pass proved one bounded five-part JWE.
+    for match in JWE_CONTINUATION_PATTERN.finditer(value):
+        if not match_is_committable(match):
+            continue
+        if any(
+            start == match.start() and end > match.end()
+            for start, end, _candidate in (_specific_spans or ())
+        ):
+            continue
+        event_budget.consume()
+        yield "jwt", None, match.end(), False, None, None
     for rule, pattern in (
         ("aws-secret-key", OVERSIZED_AWS_SECRET_KEY_GAP),
         ("jwt", OVERSIZED_JWT_PATTERN),

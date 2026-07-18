@@ -4240,6 +4240,34 @@ class PublicPoolScannerTest(unittest.TestCase):
         self.assertEqual(scan.blocking_candidates, {candidate: {"jwt"}})
         self.assertNotIn(shorter, scan.blocking_candidates)
 
+    def test_jwe_uses_the_complete_five_segment_candidate(self) -> None:
+        shared_prefix = b"eyJ" + b"A" * 12 + b".." + b"C" * 12
+        candidate = shared_prefix + b"." + b"D" * 12 + b"." + b"E" * 12
+
+        scan = workspace._scan_secret_value(
+            candidate,
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+
+        self.assertIsNone(scan.blocking_rule)
+        self.assertEqual(scan.blocking_candidates, {candidate: {"jwt"}})
+        self.assertNotIn(shared_prefix, scan.blocking_candidates)
+
+        malformed_candidates = (
+            shared_prefix + b"." + b"D" * 12,
+            candidate + b"." + b"F" * 12,
+        )
+        for malformed in malformed_candidates:
+            with self.subTest(segments=malformed.count(b".") + 1):
+                malformed_scan = workspace._scan_secret_value(
+                    malformed,
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+                self.assertEqual(malformed_scan.blocking_rule, "jwt")
+                self.assertFalse(malformed_scan.blocking_candidates)
+
     def test_oversized_assignment_gap_crossing_stream_boundary_is_blocked(self) -> None:
         boundary = 1024 * 1024
         token_start = boundary - (workspace.STREAM_SCAN_OVERLAP * 3)
@@ -5132,6 +5160,24 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             ReviewError,
             "unregistered secret unembedded count increased",
         ):
+            self.prepare(repo=repo, base=base, head=head)
+
+    def test_jwe_shared_prefix_replacement_does_not_count_as_reduction(self) -> None:
+        shared_prefix = "eyJ" + "A" * 12 + ".." + "C" * 12
+
+        def jwe(fourth: str, fifth: str) -> str:
+            return f"{shared_prefix}.{fourth * 12}.{fifth * 12}"
+
+        repo, base = self.new_repo(
+            {"fixture.txt": f"{jwe('D', 'E')}\n{jwe('F', 'G')}\n"}
+        )
+        (repo / "fixture.txt").write_text(
+            f"{jwe('H', 'I')}\n",
+            encoding="utf-8",
+        )
+        head = self.commit(repo)
+
+        with self.assertRaisesRegex(ReviewError, "jwt"):
             self.prepare(repo=repo, base=base, head=head)
 
     def test_google_api_key_suffix_replacement_does_not_count_as_reduction(
