@@ -2737,6 +2737,40 @@ class PublicPoolScannerTest(unittest.TestCase):
                     "jwt",
                 )
 
+    def test_jwt_base64url_suffix_crosses_stream_commit_boundary(self) -> None:
+        shorter = reduction_secret("jwt")
+        candidate = shorter + b"-"
+        proof_bytes = 512
+        overlap = 128
+        committed_end = proof_bytes
+        candidate_start = committed_end - len(shorter)
+        payload = (
+            b"x" * (candidate_start - 1)
+            + b"\n"
+            + candidate
+            + b"!\n"
+            + b"x" * overlap
+        )
+        with (
+            mock.patch.object(
+                workspace,
+                "MAX_SECRET_PREFIX_PROOF_BYTES",
+                proof_bytes,
+            ),
+            mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", overlap),
+            mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 256),
+        ):
+            scan = workspace._stream_secret_scan(
+                io.BytesIO(payload),
+                size=len(payload),
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+
+        self.assertIsNone(scan.blocking_rule)
+        self.assertEqual(scan.blocking_candidates, {candidate: {"jwt"}})
+        self.assertNotIn(shorter, scan.blocking_candidates)
+
     def test_oversized_assignment_gap_crossing_stream_boundary_is_blocked(self) -> None:
         boundary = 1024 * 1024
         token_start = boundary - (workspace.STREAM_SCAN_OVERLAP * 3)
@@ -3411,6 +3445,21 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                         evidence["synthetic_tokens"]["secret_reductions"],
                         manifest["secret_reductions"],
                     )
+
+    def test_jwt_base64url_suffix_extraction_does_not_count_as_reduction(self) -> None:
+        shorter = reduction_secret("jwt").decode("ascii")
+        longer = shorter + "-"
+        repo, base = self.new_repo(
+            {"fixture.txt": (longer + "!\n") * 2}
+        )
+        (repo / "fixture.txt").write_text(shorter + "!\n", encoding="utf-8")
+        head = self.commit(repo)
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "unregistered secret unembedded count increased",
+        ):
+            self.prepare(repo=repo, base=base, head=head)
 
     def test_prepared_range_rejects_non_decreasing_secret_transitions(self) -> None:
         cases = (

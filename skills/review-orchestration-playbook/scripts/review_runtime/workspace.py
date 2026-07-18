@@ -136,7 +136,7 @@ SECRET_PATTERNS = (
         "jwt",
         re.compile(
             rb"\beyJ[A-Za-z0-9_-]{8,2048}\.[A-Za-z0-9_-]{8,2048}\."
-            rb"[A-Za-z0-9_-]{8,2048}\b"
+            rb"[A-Za-z0-9_-]{8,2048}(?![A-Za-z0-9_-])"
         ),
     ),
 )
