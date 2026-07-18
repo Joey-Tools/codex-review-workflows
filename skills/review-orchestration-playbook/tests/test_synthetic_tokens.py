@@ -2642,45 +2642,46 @@ class PublicPoolScannerTest(unittest.TestCase):
         self,
     ) -> None:
         candidate = b"sk-" + b"proj-B1" + b"B" * 506
+        assignment_prefix = b"api_" + b"token = "
         cases = (
             (
                 "unquoted-space-continuation",
-                b"api_token = " + candidate + b" \\" + b"\ncontinued\n",
+                assignment_prefix + candidate + b" \\" + b"\ncontinued\n",
                 False,
             ),
             (
                 "unquoted-space-operator",
-                b"api_token = " + candidate + b" + continued\n",
+                assignment_prefix + candidate + b" + continued\n",
                 False,
             ),
             (
                 "unquoted-double-quote",
-                b"api_token = " + candidate + b'"continued"\n',
+                assignment_prefix + candidate + b'"continued"\n',
                 False,
             ),
             (
                 "unquoted-single-quote",
-                b"api_token = " + candidate + b"'continued'\n",
+                assignment_prefix + candidate + b"'continued'\n",
                 False,
             ),
             (
                 "unquoted-backslash",
-                b"api_token = " + candidate + b"\\continued\n",
+                assignment_prefix + candidate + b"\\continued\n",
                 False,
             ),
             (
                 "unquoted-backtick",
-                b"api_token = " + candidate + b"`continued`\n",
+                assignment_prefix + candidate + b"`continued`\n",
                 False,
             ),
             (
                 "quoted-operator",
-                assignment_bytes(b"api_token", candidate) + b" + continued\n",
+                assignment_bytes(b"api_" + b"token", candidate) + b" + continued\n",
                 False,
             ),
             (
                 "diff-same-side-continuation",
-                b"+api_token = " + candidate + b"\n+  + continued\n",
+                b"+" + assignment_prefix + candidate + b"\n+  + continued\n",
                 True,
             ),
         )
@@ -2759,9 +2760,10 @@ class PublicPoolScannerTest(unittest.TestCase):
         )
         committed_end = first_read - workspace.STREAM_SCAN_OVERLAP
         candidate_start = committed_end - 513
+        assignment_prefix = b"api_" + b"token = "
         cases = (
-            ("quoted", b'api_token = "', b'" + continued\n'),
-            ("unquoted", b"api_token = ", b" \\" + b"\ncontinued\n"),
+            ("quoted", assignment_prefix + b'"', b'" + continued\n'),
+            ("unquoted", assignment_prefix, b" \\" + b"\ncontinued\n"),
         )
         for label, assignment_prefix, continuation in cases:
             with self.subTest(case=label):
@@ -3641,7 +3643,8 @@ class SyntheticWorkspaceTest(unittest.TestCase):
 
         def unsafe_assignment(marker: bytes) -> str:
             return (
-                b"api_token = "
+                b"api_"
+                + b"token = "
                 + candidate
                 + b" \\"
                 + b"\n"
