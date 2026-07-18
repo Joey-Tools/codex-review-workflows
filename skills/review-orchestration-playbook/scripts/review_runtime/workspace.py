@@ -2801,6 +2801,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
         expected_artifact=control_artifacts[SYNTHETIC_CHANGED_EVIDENCE_NAME],
     )
     accepted_index = _index_accepted_values(accepted_values)
+    authoring_index = _index_accepted_values(authoring_values)
     counted_exact_index = _index_exact_values(counted_values)
     event_budget = SecretScanBudget.default()
     occurrence_budget = LegacyOccurrenceBudget.default()
@@ -3088,14 +3089,21 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     ) as (diff_handle, _diff_metadata):
         while diff_handle.read(64 * 1024):
             pass
-    with _secure_file_reader(
+    prompt_scan = _file_secret_scan(
         review.prompt_file,
-        label="external review prompt",
+        accepted_values=authoring_values,
+        accepted_index=authoring_index,
+        event_budget=event_budget,
         max_bytes=MAX_REVIEW_PROMPT_BYTES,
         expected_artifact=control_artifacts["review.prompt"],
-    ) as (prompt_handle, _prompt_metadata):
-        while prompt_handle.read(64 * 1024):
-            pass
+    )
+    record_scan(
+        prompt_scan,
+        surface="review-prompt",
+        side="generated",
+        path_bytes=b".codex-review/review.prompt",
+        finding_label="review.prompt",
+    )
     if sensitive_finding_count:
         summary = ", ".join(sensitive_findings)
         if sensitive_finding_count > len(sensitive_findings):

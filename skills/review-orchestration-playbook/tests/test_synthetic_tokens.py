@@ -3563,10 +3563,11 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                 catalog=catalog,
             )
 
-    def test_prompt_only_secret_does_not_block_review_content(self) -> None:
+    def test_prompt_only_generic_secret_blocks_review_content(self) -> None:
         repo, base = self.new_repo({"README.md": "base\n"})
         (repo / "README.md").write_text("head\n", encoding="utf-8")
         head = self.commit(repo)
+        secret = reduction_secret("generic-secret-assignment").decode("ascii")
         prompt = self.root / "prompt-generic-secret-assignment.txt"
         prompt.write_text(
             "Review {review_range}\n"
@@ -3579,8 +3580,94 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             head=head,
             prompt_override=prompt,
         )
+        with self.assertRaisesRegex(
+            ReviewError,
+            r"review\.prompt \(generic-secret-assignment\)",
+        ) as caught:
+            self.validate(review)
+        self.assertNotIn(secret, str(caught.exception))
+
+    def test_prompt_accepts_exact_authoring_value(self) -> None:
+        repo, base = self.new_repo({"README.md": "base\n"})
+        (repo / "README.md").write_text("head\n", encoding="utf-8")
+        head = self.commit(repo)
+        prompt = self.root / "prompt-authoring-value.txt"
+        prompt.write_text(
+            "Review {review_range}\n"
+            + assignment_text("access_token", AUTHORING_VALUES[0]),
+            encoding="utf-8",
+        )
+        review = self.prepare(
+            repo=repo,
+            base=base,
+            head=head,
+            prompt_override=prompt,
+        )
+
         evidence = self.validate(review)
-        self.assertEqual(evidence["synthetic_tokens"]["secret_reductions"], [])
+        encoded = json.dumps(evidence, sort_keys=True)
+        self.assertNotIn(AUTHORING_VALUES[0], encoded)
+        prompt_entries = [
+            entry
+            for entry in evidence["synthetic_tokens"]["accepted"]
+            if entry["surface"] == "review-prompt"
+        ]
+        self.assertEqual(len(prompt_entries), 1)
+        self.assertEqual(prompt_entries[0]["side"], "generated")
+        self.assertEqual(prompt_entries[0]["token_id"], "access-a")
+
+    def test_prompt_does_not_accept_selected_legacy_values(self) -> None:
+        catalog = legacy_catalog(values=(LEGACY_A,))
+        repo, base = self.new_repo(
+            {"fixture.cfg": assignment_text("access_token", LEGACY_A)}
+        )
+        (repo / "README.md").write_text("head\n", encoding="utf-8")
+        head = self.commit(repo)
+        prompt = self.root / "prompt-selected-legacy.txt"
+        prompt.write_text(
+            f'Review {{review_range}}\naccess_token = "{LEGACY_A}"\n',
+            encoding="utf-8",
+        )
+        review = self.prepare(
+            repo=repo,
+            base=base,
+            head=head,
+            catalog=catalog,
+            exemptions=("historical-fixtures",),
+            prompt_override=prompt,
+        )
+        with self.assertRaisesRegex(
+            ReviewError,
+            r"review\.prompt \(generic-secret-assignment\)",
+        ) as caught:
+            self.validate(review, catalog=catalog)
+        error = str(caught.exception)
+        self.assertNotIn(LEGACY_A, error)
+        self.assertNotIn(legacy_value_base64(LEGACY_A), error)
+
+    def test_strictly_reduced_tracked_secret_still_blocks_identical_prompt(self) -> None:
+        fixture = reduction_fixture("generic-secret-assignment")
+        secret = reduction_secret("generic-secret-assignment").decode("ascii")
+        repo, base = self.new_repo({"fixture.cfg": fixture * 2})
+        (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
+        head = self.commit(repo)
+        prompt = self.root / "prompt-reduced-secret.txt"
+        prompt.write_text(
+            "Review {review_range}\n" + fixture,
+            encoding="utf-8",
+        )
+        review = self.prepare(
+            repo=repo,
+            base=base,
+            head=head,
+            prompt_override=prompt,
+        )
+        with self.assertRaisesRegex(
+            ReviewError,
+            r"review\.prompt \(generic-secret-assignment\)",
+        ) as caught:
+            self.validate(review)
+        self.assertNotIn(secret, str(caught.exception))
 
     def test_audit_master_cli_verifies_pinned_provenance_without_raw_value(
         self,

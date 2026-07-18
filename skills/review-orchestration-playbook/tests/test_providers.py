@@ -5383,10 +5383,10 @@ class ProviderPolicyTest(unittest.TestCase):
 
     @mock.patch.object(providers, "_review_environment", return_value={})
     @mock.patch.object(providers, "_run_model_chain")
-    def test_prompt_only_secret_does_not_block_codex_preflight(
+    def test_prompt_only_provider_secret_blocks_codex_preflight(
         self,
         run_model_chain: mock.Mock,
-        _environment: mock.Mock,
+        environment: mock.Mock,
     ) -> None:
         secret = "AKIA" + "C" * 16
         self.review.prompt_file.write_text(
@@ -5401,9 +5401,15 @@ class ProviderPolicyTest(unittest.TestCase):
             reviewer="codex",
         )
 
-        self.assertEqual(outcome.returncode, 0)
-        run_model_chain.assert_called_once()
-        self.assertTrue((self.review.container_dir / "preflight.json").is_file())
+        self.assertEqual(outcome.returncode, 2)
+        run_model_chain.assert_not_called()
+        environment.assert_not_called()
+        self.assertFalse((self.review.container_dir / "preflight.json").exists())
+        error = (self.review.container_dir / "runner-error.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("review.prompt (aws-access-key)", error)
+        self.assertNotIn(secret, error)
 
     @mock.patch.object(providers, "_review_environment", return_value={})
     @mock.patch.object(providers, "_run_model_chain")
