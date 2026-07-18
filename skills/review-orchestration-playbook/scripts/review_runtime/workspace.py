@@ -19,8 +19,9 @@ import uuid
 from bisect import bisect_left
 from collections import Counter, deque
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
-from typing import Any, BinaryIO, Callable, Iterable, Iterator
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Any, BinaryIO, Callable, Iterable, Iterator, Mapping
 
 from .common import (
     TRUSTED_PATH,
@@ -288,7 +289,7 @@ SYNTHETIC_CHANGED_EVIDENCE_NAME = "synthetic-changed-evidence.json"
 SYNTHETIC_MANIFEST_SCHEMA_VERSION = 4
 SECRET_REDUCTION_PROVENANCE_SCHEME = "path-surface-offset-sha256-v1"
 CONTROL_ARTIFACT_STATE_NAME = "control-artifact-state.json"
-CONTROL_ARTIFACT_SCHEMA_VERSION = 3
+CONTROL_ARTIFACT_SCHEMA_VERSION = 4
 CHANGED_PATH_DIGESTS_NAME = "changed-path-digests.z"
 PRIVATE_CHANGED_PATHS_NAME = "changed-paths-private.z"
 PRIVATE_HELPER_ARTIFACT_NAMES = (
@@ -331,6 +332,38 @@ def symlink_target_stays_within_workspace(
 
 
 @dataclass(frozen=True)
+class CleanupIdentity:
+    device: int
+    inode: int
+
+    def to_json(self) -> dict[str, int]:
+        return {"device": self.device, "inode": self.inode}
+
+
+@dataclass(frozen=True)
+class PrivateCleanupEvidence:
+    container: CleanupIdentity
+    artifacts: Mapping[str, CleanupIdentity]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "artifacts",
+            MappingProxyType(dict(self.artifacts)),
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "artifacts": [
+                {"name": name, **identity.to_json()}
+                for name, identity in sorted(self.artifacts.items())
+            ],
+            "container": self.container.to_json(),
+            "schema_version": 1,
+        }
+
+
+@dataclass(frozen=True)
 class ReviewWorkspace:
     source_root: pathlib.Path
     container_dir: pathlib.Path
@@ -339,12 +372,37 @@ class ReviewWorkspace:
     head_ref: str
     diff_file: pathlib.Path
     prompt_file: pathlib.Path
+    private_cleanup: PrivateCleanupEvidence
 
-    def to_json(self) -> dict[str, str]:
-        return {key: str(value) for key, value in asdict(self).items()}
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "base_ref": self.base_ref,
+            "container_dir": str(self.container_dir),
+            "diff_file": str(self.diff_file),
+            "head_ref": self.head_ref,
+            "private_cleanup": self.private_cleanup.to_json(),
+            "prompt_file": str(self.prompt_file),
+            "source_root": str(self.source_root),
+            "workspace_root": str(self.workspace_root),
+        }
 
     @classmethod
-    def from_json(cls, value: dict[str, str]) -> "ReviewWorkspace":
+    def from_json(cls, value: dict[str, Any]) -> "ReviewWorkspace":
+        expected_fields = {
+            "base_ref",
+            "container_dir",
+            "diff_file",
+            "head_ref",
+            "private_cleanup",
+            "prompt_file",
+            "source_root",
+            "workspace_root",
+        }
+        if set(value) != expected_fields:
+            raise ValueError("workspace fields are invalid")
+        text_fields = expected_fields - {"private_cleanup"}
+        if any(not isinstance(value[field], str) for field in text_fields):
+            raise ValueError("workspace text fields are invalid")
         return cls(
             source_root=pathlib.Path(value["source_root"]),
             container_dir=pathlib.Path(value["container_dir"]),
@@ -353,6 +411,10 @@ class ReviewWorkspace:
             head_ref=value["head_ref"],
             diff_file=pathlib.Path(value["diff_file"]),
             prompt_file=pathlib.Path(value["prompt_file"]),
+            private_cleanup=_parse_private_cleanup_evidence(
+                value["private_cleanup"],
+                require_all=True,
+            ),
         )
 
 
@@ -362,6 +424,14 @@ class ControlArtifactEvidence:
     sha256: str
     size: int
     record_count: int | None
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "record_count": self.record_count,
+            "sha256": self.sha256,
+            "size": self.size,
+        }
 
 
 @dataclass(frozen=True)
@@ -376,11 +446,44 @@ class ControlDirectoryEvidence:
     entry_count: int
     entry_names_sha256: str
 
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "ctime_ns": self.ctime_ns,
+            "device": self.device,
+            "entry_count": self.entry_count,
+            "entry_names_sha256": self.entry_names_sha256,
+            "inode": self.inode,
+            "link_count": self.link_count,
+            "mode": self.mode,
+            "mtime_ns": self.mtime_ns,
+            "uid": self.uid,
+        }
+
 
 @dataclass(frozen=True)
 class ControlArtifactState:
     artifacts: dict[str, ControlArtifactEvidence]
     directory: ControlDirectoryEvidence
+    private_cleanup: PrivateCleanupEvidence
+    private_artifacts_removed: frozenset[str]
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "artifacts": [
+                artifact.to_json()
+                for artifact in sorted(
+                    self.artifacts.values(),
+                    key=lambda item: item.name,
+                )
+            ],
+            "directory": self.directory.to_json(),
+            "private_cleanup": {
+                "binding": self.private_cleanup.to_json(),
+                "removed": sorted(self.private_artifacts_removed),
+                "schema_version": 1,
+            },
+            "schema_version": CONTROL_ARTIFACT_SCHEMA_VERSION,
+        }
 
 
 class _IncompleteSecretScanSuffix(Exception):
@@ -831,6 +934,94 @@ def _private_cleanup_identity(metadata: os.stat_result) -> tuple[int, int]:
     return metadata.st_dev, metadata.st_ino
 
 
+def _cleanup_identity_evidence(metadata: os.stat_result) -> CleanupIdentity:
+    return CleanupIdentity(device=metadata.st_dev, inode=metadata.st_ino)
+
+
+def _private_artifact_metadata_at(
+    container_descriptor: int,
+    artifact_name: str,
+) -> os.stat_result:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        artifact_before = os.stat(
+            artifact_name,
+            dir_fd=container_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        raise
+    except OSError as error:
+        raise ReviewError(
+            f"cannot inspect helper-private artifact {artifact_name}: {error}"
+        ) from error
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            artifact_name,
+            flags,
+            dir_fd=container_descriptor,
+        )
+        artifact_opened = os.fstat(descriptor)
+        artifact_after = os.stat(
+            artifact_name,
+            dir_fd=container_descriptor,
+            follow_symlinks=False,
+        )
+        for metadata in (artifact_before, artifact_opened, artifact_after):
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise ReviewError(
+                    f"helper-private artifact {artifact_name} is not a "
+                    "regular file with one link"
+                )
+            if metadata.st_uid != os.geteuid():
+                raise ReviewError(
+                    f"helper-private artifact {artifact_name} has an unexpected owner"
+                )
+            if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                raise ReviewError(
+                    f"helper-private artifact {artifact_name} must not be "
+                    "group or other writable"
+                )
+        if (
+            len(
+                {
+                    _private_cleanup_identity(artifact_before),
+                    _private_cleanup_identity(artifact_opened),
+                    _private_cleanup_identity(artifact_after),
+                }
+            )
+            != 1
+        ):
+            raise ReviewError(
+                f"helper-private artifact {artifact_name} changed while opening"
+            )
+        return artifact_opened
+    except FileNotFoundError:
+        raise
+    except OSError as error:
+        raise ReviewError(
+            f"cannot securely open helper-private artifact {artifact_name}: {error}"
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _private_artifact_identity_at(
+    container_descriptor: int,
+    artifact_name: str,
+) -> CleanupIdentity:
+    return _cleanup_identity_evidence(
+        _private_artifact_metadata_at(container_descriptor, artifact_name)
+    )
+
+
 def _private_cleanup_directory_flags() -> int:
     return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 
@@ -1089,13 +1280,48 @@ def _remove_open_directory_tree(
     label: str,
     require_private_mode: bool,
     excluded_entry_names: frozenset[str] = frozenset(),
+    final_entry_names: frozenset[str] = frozenset(),
 ) -> list[str]:
     cleanup_errors = _remove_open_directory_contents(
         directory_descriptor,
-        excluded_entry_names=excluded_entry_names,
+        excluded_entry_names=excluded_entry_names | final_entry_names,
     )
     if cleanup_errors:
         return cleanup_errors
+
+    for final_entry_name in sorted(final_entry_names):
+        try:
+            final_entry_metadata = os.stat(
+                final_entry_name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            return [f"cannot inspect final review cleanup entry: {error}"]
+        if stat.S_ISDIR(final_entry_metadata.st_mode):
+            return ["final review cleanup entry is unexpectedly a directory"]
+        quarantine_name, _, quarantine_errors = _quarantine_cleanup_entry(
+            directory_descriptor,
+            final_entry_name,
+            final_entry_metadata,
+            label="final review cleanup entry",
+            missing_is_error=True,
+        )
+        if quarantine_errors or quarantine_name is None:
+            return quarantine_errors
+        cleanup_errors.extend(
+            _remove_quarantined_cleanup_entry(
+                directory_descriptor,
+                quarantine_name,
+                final_entry_metadata,
+                label="final review cleanup entry",
+                is_directory=False,
+            )
+        )
+        if cleanup_errors:
+            return cleanup_errors
 
     try:
         remaining_entry_names = os.listdir(directory_descriptor)
@@ -1345,39 +1571,322 @@ def _operate_on_private_review_container(
     return "; ".join(cleanup_errors) or None
 
 
+def _capture_private_cleanup_evidence(
+    container: pathlib.Path,
+    *,
+    expected_container: CleanupIdentity | None = None,
+    require_all: bool,
+) -> PrivateCleanupEvidence:
+    captured: PrivateCleanupEvidence | None = None
+
+    def capture(
+        _parent_descriptor: int,
+        container_descriptor: int,
+    ) -> list[str]:
+        nonlocal captured
+        container_identity = _cleanup_identity_evidence(os.fstat(container_descriptor))
+        if expected_container is not None and container_identity != expected_container:
+            return ["private artifact container does not match preparation identity"]
+        artifacts: dict[str, CleanupIdentity] = {}
+        errors: list[str] = []
+        for artifact_name in PRIVATE_HELPER_ARTIFACT_NAMES:
+            try:
+                artifacts[artifact_name] = _private_artifact_identity_at(
+                    container_descriptor,
+                    artifact_name,
+                )
+            except FileNotFoundError:
+                if require_all:
+                    errors.append(f"helper-private artifact {artifact_name} is missing")
+            except ReviewError as error:
+                errors.append(str(error))
+        if not errors:
+            captured = PrivateCleanupEvidence(
+                container=container_identity,
+                artifacts=artifacts,
+            )
+        return errors
+
+    capture_error = _operate_on_private_review_container(container, capture)
+    if capture_error:
+        raise ReviewError(capture_error)
+    if captured is None:
+        raise ReviewError("private cleanup evidence could not be captured")
+    return captured
+
+
 def _unlink_private_review_artifacts(
     _parent_descriptor: int,
     container_descriptor: int,
+    *,
+    expected: PrivateCleanupEvidence,
+    removed: frozenset[str],
+    record_removal: Callable[[str], None] | None,
 ) -> list[str]:
+    container_identity = _cleanup_identity_evidence(os.fstat(container_descriptor))
+    if container_identity != expected.container:
+        return ["private artifact container does not match preparation identity"]
     cleanup_errors: list[str] = []
+    removable: dict[str, os.stat_result] = {}
     for artifact_name in PRIVATE_HELPER_ARTIFACT_NAMES:
+        expected_identity = expected.artifacts.get(artifact_name)
+        if artifact_name in removed:
+            try:
+                os.stat(
+                    artifact_name,
+                    dir_fd=container_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                cleanup_errors.append(f"{artifact_name}: {error}")
+            else:
+                cleanup_errors.append(
+                    f"{artifact_name}: helper-private artifact reappeared after "
+                    "its recorded removal"
+                )
+            continue
+        if expected_identity is None:
+            try:
+                os.stat(
+                    artifact_name,
+                    dir_fd=container_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                cleanup_errors.append(f"{artifact_name}: {error}")
+            else:
+                cleanup_errors.append(
+                    f"{artifact_name}: no preparation identity is available"
+                )
+            continue
         try:
-            os.unlink(artifact_name, dir_fd=container_descriptor)
+            current_metadata = _private_artifact_metadata_at(
+                container_descriptor,
+                artifact_name,
+            )
         except FileNotFoundError:
-            pass
-        except OSError as error:
-            cleanup_errors.append(f"{artifact_name}: {error}")
+            cleanup_errors.append(
+                f"{artifact_name}: expected helper-private artifact is missing"
+            )
+        except ReviewError as error:
+            cleanup_errors.append(str(error))
+        else:
+            if _cleanup_identity_evidence(current_metadata) != expected_identity:
+                cleanup_errors.append(
+                    f"{artifact_name}: helper-private artifact does not match "
+                    "preparation identity"
+                )
+            else:
+                removable[artifact_name] = current_metadata
+    for artifact_name, artifact_metadata in removable.items():
+        removal_mask = block_forwarded_signals()
+        try:
+            quarantine_name, quarantined, artifact_errors = _quarantine_cleanup_entry(
+                container_descriptor,
+                artifact_name,
+                artifact_metadata,
+                label=f"helper-private artifact {artifact_name}",
+                missing_is_error=True,
+            )
+            if artifact_errors or quarantine_name is None or quarantined is None:
+                cleanup_errors.extend(artifact_errors)
+                continue
+            artifact_errors.extend(
+                _remove_quarantined_cleanup_entry(
+                    container_descriptor,
+                    quarantine_name,
+                    artifact_metadata,
+                    label=f"helper-private artifact {artifact_name}",
+                    is_directory=False,
+                )
+            )
+            cleanup_errors.extend(artifact_errors)
+            if artifact_errors:
+                continue
+            if record_removal is not None:
+                try:
+                    record_removal(artifact_name)
+                except ReviewError as error:
+                    cleanup_errors.append(str(error))
+                    break
+        finally:
+            restore_signal_mask(removal_mask)
     return cleanup_errors
 
 
-def remove_private_review_artifacts(container: pathlib.Path) -> str | None:
+def _load_bound_private_cleanup_state_at(
+    container_descriptor: int,
+    *,
+    expected: PrivateCleanupEvidence,
+) -> ControlArtifactState:
+    state = _load_control_artifact_state_at(container_descriptor)
+    if state.private_cleanup != expected:
+        raise ReviewError(
+            "helper-private cleanup state does not match preparation identity"
+        )
+    return state
+
+
+def load_bound_private_cleanup_state(
+    container: pathlib.Path,
+    *,
+    expected: PrivateCleanupEvidence,
+) -> ControlArtifactState:
+    captured: ControlArtifactState | None = None
+
+    def load_bound_state(
+        _parent_descriptor: int,
+        container_descriptor: int,
+    ) -> list[str]:
+        nonlocal captured
+        if (
+            _cleanup_identity_evidence(os.fstat(container_descriptor))
+            != expected.container
+        ):
+            return ["private artifact container does not match preparation identity"]
+        try:
+            captured = _load_bound_private_cleanup_state_at(
+                container_descriptor,
+                expected=expected,
+            )
+        except ReviewError as error:
+            return [str(error)]
+        return []
+
+    load_error = _operate_on_private_review_container(container, load_bound_state)
+    if load_error:
+        raise ReviewError(load_error)
+    if captured is None:
+        raise ReviewError("helper-private cleanup state could not be loaded")
+    return captured
+
+
+def _record_private_artifact_removal_at(
+    container_descriptor: int,
+    *,
+    expected: PrivateCleanupEvidence,
+    artifact_name: str,
+) -> None:
+    state = _load_bound_private_cleanup_state_at(
+        container_descriptor,
+        expected=expected,
+    )
+    if artifact_name in state.private_artifacts_removed:
+        return
+    removed = frozenset((*state.private_artifacts_removed, artifact_name))
+    _write_control_artifact_state_at(
+        container_descriptor,
+        ControlArtifactState(
+            artifacts=state.artifacts,
+            directory=state.directory,
+            private_cleanup=state.private_cleanup,
+            private_artifacts_removed=removed,
+        ),
+    )
+    persisted = _load_bound_private_cleanup_state_at(
+        container_descriptor,
+        expected=expected,
+    )
+    if persisted.private_artifacts_removed != removed:
+        raise ReviewError("helper-private cleanup receipt did not persist")
+
+
+def remove_private_review_artifacts(
+    container: pathlib.Path,
+    *,
+    expected: PrivateCleanupEvidence,
+) -> str | None:
+    def unlink_bound_artifacts(
+        parent_descriptor: int,
+        container_descriptor: int,
+    ) -> list[str]:
+        if (
+            _cleanup_identity_evidence(os.fstat(container_descriptor))
+            != expected.container
+        ):
+            return ["private artifact container does not match preparation identity"]
+        try:
+            cleanup_state = _load_bound_private_cleanup_state_at(
+                container_descriptor,
+                expected=expected,
+            )
+        except ReviewError as error:
+            return [str(error)]
+        removed = set(cleanup_state.private_artifacts_removed)
+
+        def record_removal(artifact_name: str) -> None:
+            _record_private_artifact_removal_at(
+                container_descriptor,
+                expected=expected,
+                artifact_name=artifact_name,
+            )
+            removed.add(artifact_name)
+
+        cleanup_errors = _unlink_private_review_artifacts(
+            parent_descriptor,
+            container_descriptor,
+            expected=expected,
+            removed=frozenset(removed),
+            record_removal=record_removal,
+        )
+        if cleanup_errors:
+            return cleanup_errors
+        try:
+            final_state = _load_bound_private_cleanup_state_at(
+                container_descriptor,
+                expected=expected,
+            )
+        except ReviewError as error:
+            return [str(error)]
+        if final_state.private_artifacts_removed != frozenset(
+            PRIVATE_HELPER_ARTIFACT_NAMES
+        ):
+            return ["helper-private artifact removal receipts are incomplete"]
+        return []
+
     return _operate_on_private_review_container(
         container,
-        _unlink_private_review_artifacts,
+        unlink_bound_artifacts,
     )
 
 
-def _remove_review_container_tree(container: pathlib.Path) -> str | None:
+def _remove_review_container_tree(
+    container: pathlib.Path,
+    *,
+    expected: PrivateCleanupEvidence,
+    use_control_state: bool,
+) -> str | None:
+    if use_control_state:
+        private_cleanup_error = remove_private_review_artifacts(
+            container,
+            expected=expected,
+        )
+        if private_cleanup_error:
+            return private_cleanup_error
+
     def remove_tree(
         parent_descriptor: int,
         container_descriptor: int,
     ) -> list[str]:
-        private_cleanup_errors = _unlink_private_review_artifacts(
-            parent_descriptor,
-            container_descriptor,
-        )
-        if private_cleanup_errors:
-            return private_cleanup_errors
+        if (
+            _cleanup_identity_evidence(os.fstat(container_descriptor))
+            != expected.container
+        ):
+            return ["private artifact container does not match preparation identity"]
+        if not use_control_state:
+            private_cleanup_errors = _unlink_private_review_artifacts(
+                parent_descriptor,
+                container_descriptor,
+                expected=expected,
+                removed=frozenset(),
+                record_removal=None,
+            )
+            if private_cleanup_errors:
+                return private_cleanup_errors
         cleanup_errors = _remove_open_directory_tree(
             parent_descriptor,
             container_descriptor,
@@ -1385,20 +1894,27 @@ def _remove_review_container_tree(container: pathlib.Path) -> str | None:
             label="private artifact container",
             require_private_mode=True,
             excluded_entry_names=frozenset(PRIVATE_HELPER_ARTIFACT_NAMES),
-        )
-        cleanup_errors.extend(
-            _unlink_private_review_artifacts(
-                parent_descriptor,
-                container_descriptor,
-            )
+            final_entry_names=(
+                frozenset({CONTROL_ARTIFACT_STATE_NAME})
+                if use_control_state
+                else frozenset()
+            ),
         )
         return cleanup_errors
 
     return _operate_on_private_review_container(container, remove_tree)
 
 
-def _remove_partial_container(container: pathlib.Path) -> str | None:
-    return _remove_review_container_tree(container)
+def _remove_partial_container(
+    container: pathlib.Path,
+    *,
+    expected: PrivateCleanupEvidence,
+) -> str | None:
+    return _remove_review_container_tree(
+        container,
+        expected=expected,
+        use_control_state=False,
+    )
 
 
 def _bound_private_cleanup_target(review: ReviewWorkspace) -> pathlib.Path | None:
@@ -1420,12 +1936,14 @@ def _retained_container_detail(container: pathlib.Path, cleanup_error: str) -> s
 
 def _new_container(
     source_root: pathlib.Path,
-) -> tuple[pathlib.Path, set[signal.Signals] | None]:
+) -> tuple[pathlib.Path, int, CleanupIdentity, set[signal.Signals] | None]:
     handoff_mask = block_forwarded_signals()
     stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
     suffix = uuid.uuid4().hex[:10]
     review_root = source_root / ".codex-tmp"
     container: pathlib.Path | None = None
+    container_descriptor: int | None = None
+    container_identity: CleanupIdentity | None = None
     try:
         try:
             os.mkdir(review_root, mode=0o700)
@@ -1474,6 +1992,19 @@ def _new_container(
             container = review_root / name
             os.mkdir(name, mode=0o700, dir_fd=root_fd)
             descriptor_status = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+            container_descriptor = os.open(
+                name,
+                _private_cleanup_directory_flags(),
+                dir_fd=root_fd,
+            )
+            opened_status = os.fstat(container_descriptor)
+            if _private_cleanup_identity(descriptor_status) != (
+                _private_cleanup_identity(opened_status)
+            ):
+                raise ReviewError(
+                    "private review container changed while opening it securely"
+                )
+            container_identity = _cleanup_identity_evidence(opened_status)
             path_status = os.lstat(container)
             if (descriptor_status.st_dev, descriptor_status.st_ino) != (
                 path_status.st_dev,
@@ -1484,11 +2015,24 @@ def _new_container(
                 )
         finally:
             os.close(root_fd)
-        return container, handoff_mask
+        if container_descriptor is None or container_identity is None:
+            raise ReviewError("private review container identity was not captured")
+        return container, container_descriptor, container_identity, handoff_mask
     except BaseException as error:
         cleanup_error: str | None = None
-        if container is not None:
-            cleanup_error = _remove_partial_container(container)
+        if container_descriptor is not None:
+            os.close(container_descriptor)
+            container_descriptor = None
+        if container is not None and container_identity is not None:
+            cleanup_error = _remove_partial_container(
+                container,
+                expected=PrivateCleanupEvidence(
+                    container=container_identity,
+                    artifacts={},
+                ),
+            )
+        elif container is not None:
+            cleanup_error = "private container identity was not captured"
         cleanup_signal = (
             consume_pending_forwarded_signal() if handoff_mask is not None else None
         )
@@ -2024,7 +2568,12 @@ def _materialize_frozen_tree(
             )
 
 
-def _open_new_private_binary(path: pathlib.Path) -> BinaryIO:
+def _open_new_private_binary(
+    path: pathlib.Path,
+    *,
+    identity_handoff: Callable[[CleanupIdentity], None] | None = None,
+    parent_descriptor: int | None = None,
+) -> BinaryIO:
     flags = (
         os.O_WRONLY
         | os.O_CREAT
@@ -2032,12 +2581,34 @@ def _open_new_private_binary(path: pathlib.Path) -> BinaryIO:
         | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_NOFOLLOW", 0)
     )
-    descriptor = os.open(path, flags, 0o600)
+    creation_mask = block_forwarded_signals() if identity_handoff is not None else None
+    descriptor: int | None = None
     try:
-        return os.fdopen(descriptor, "wb")
+        target: pathlib.Path | str = (
+            path.name if parent_descriptor is not None else path
+        )
+        descriptor = os.open(
+            target,
+            flags,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        if identity_handoff is not None:
+            identity_handoff(_cleanup_identity_evidence(os.fstat(descriptor)))
+        if creation_mask is not None:
+            mask_to_restore = creation_mask
+            creation_mask = None
+            restore_signal_mask(mask_to_restore)
+        handle = os.fdopen(descriptor, "wb")
+        descriptor = None
+        return handle
     except BaseException:
-        os.close(descriptor)
+        if descriptor is not None:
+            os.close(descriptor)
         raise
+    finally:
+        if creation_mask is not None:
+            restore_signal_mask(creation_mask)
 
 
 def _write_frozen_diff(
@@ -2139,10 +2710,16 @@ def _write_frozen_changed_paths(
     destination: pathlib.Path,
     private_destination: pathlib.Path,
     evidence_sensitive_values: Iterable[AcceptedSyntheticValue],
+    private_identity_handoff: Callable[[CleanupIdentity], None] | None = None,
+    private_parent_descriptor: int | None = None,
 ) -> None:
     digest_evidence: list[str] = []
     with (
-        _open_new_private_binary(private_destination) as output,
+        _open_new_private_binary(
+            private_destination,
+            identity_handoff=private_identity_handoff,
+            parent_descriptor=private_parent_descriptor,
+        ) as output,
         tempfile.TemporaryFile() as error_output,
     ):
         _write_limited_diff_metadata(
@@ -2188,13 +2765,12 @@ def _write_frozen_changed_paths(
     )
 
 
-def _write_bounded_json(
-    path: pathlib.Path,
+def _bounded_json_bytes(
     value: dict[str, Any],
     *,
     label: str,
     accepted_values: Iterable[AcceptedSyntheticValue] = (),
-) -> None:
+) -> bytes:
     try:
         encoded = (
             json.dumps(
@@ -2208,14 +2784,54 @@ def _write_bounded_json(
         )
     except (TypeError, ValueError) as error:
         raise ReviewError(f"{label} is not safely JSON serializable") from error
-    if len(encoded.encode("utf-8")) > MAX_SYNTHETIC_EVIDENCE_BYTES:
+    encoded_bytes = encoded.encode("utf-8")
+    if len(encoded_bytes) > MAX_SYNTHETIC_EVIDENCE_BYTES:
         raise ReviewError(f"{label} exceeds the audit evidence size limit")
     _reject_raw_values_in_evidence(
         value,
         accepted_values=accepted_values,
         label=label,
     )
-    write_text_atomic(path, encoded)
+    return encoded_bytes
+
+
+def _write_bounded_json(
+    path: pathlib.Path,
+    value: dict[str, Any],
+    *,
+    label: str,
+    accepted_values: Iterable[AcceptedSyntheticValue] = (),
+) -> None:
+    encoded = _bounded_json_bytes(
+        value,
+        label=label,
+        accepted_values=accepted_values,
+    )
+    write_text_atomic(path, encoded.decode("utf-8"))
+
+
+def _write_private_bounded_json(
+    path: pathlib.Path,
+    value: dict[str, Any],
+    *,
+    label: str,
+    accepted_values: Iterable[AcceptedSyntheticValue] = (),
+    identity_handoff: Callable[[CleanupIdentity], None],
+    parent_descriptor: int,
+) -> None:
+    encoded = _bounded_json_bytes(
+        value,
+        label=label,
+        accepted_values=accepted_values,
+    )
+    with _open_new_private_binary(
+        path,
+        identity_handoff=identity_handoff,
+        parent_descriptor=parent_descriptor,
+    ) as handle:
+        handle.write(encoded)
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _iter_evidence_strings(value: Any) -> Iterator[bytes]:
@@ -3095,6 +3711,7 @@ def _secure_file_reader(
     label: str,
     max_bytes: int | None = None,
     expected_artifact: ControlArtifactEvidence | None = None,
+    expected_identity: CleanupIdentity | None = None,
 ) -> Iterator[tuple[_DigestingReader, os.stat_result]]:
     flags = (
         os.O_RDONLY
@@ -3117,6 +3734,11 @@ def _secure_file_reader(
             raise ReviewError(f"{label} must be owned by the current user")
         if initial.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
             raise ReviewError(f"{label} must not be group or other writable")
+        if (
+            expected_identity is not None
+            and _cleanup_identity_evidence(initial) != expected_identity
+        ):
+            raise ReviewError(f"{label} does not match preparation identity")
         if max_bytes is not None and initial.st_size > max_bytes:
             raise ReviewError(f"{label} exceeds its review size limit")
         if expected_artifact is not None:
@@ -3169,6 +3791,7 @@ def _read_bounded_json(
     *,
     label: str,
     expected_artifact: ControlArtifactEvidence | None = None,
+    expected_identity: CleanupIdentity | None = None,
 ) -> dict[str, Any]:
     chunks: list[bytes] = []
     with _secure_file_reader(
@@ -3176,10 +3799,81 @@ def _read_bounded_json(
         label=label,
         max_bytes=MAX_SYNTHETIC_EVIDENCE_BYTES,
         expected_artifact=expected_artifact,
+        expected_identity=expected_identity,
     ) as (reader, _metadata):
         while chunk := reader.read(64 * 1024):
             chunks.append(chunk)
     encoded = b"".join(chunks)
+    try:
+        value = json.loads(
+            encoded.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_object,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReviewError(f"{label} is not valid JSON") from error
+    if not isinstance(value, dict):
+        raise ReviewError(f"{label} must be a JSON object")
+    return value
+
+
+def _read_bounded_json_at(
+    directory_descriptor: int,
+    name: str,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    descriptor: int | None = None
+    handle: BinaryIO | None = None
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory_descriptor)
+        initial = os.fstat(descriptor)
+        if not stat.S_ISREG(initial.st_mode) or initial.st_nlink != 1:
+            raise ReviewError(f"{label} is not a regular file with one link")
+        if initial.st_uid != os.geteuid():
+            raise ReviewError(f"{label} has an unexpected owner")
+        if initial.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise ReviewError(f"{label} must not be group or other writable")
+        if initial.st_size > MAX_SYNTHETIC_EVIDENCE_BYTES:
+            raise ReviewError(f"{label} exceeds the audit evidence size limit")
+        handle = os.fdopen(descriptor, "rb")
+        descriptor = None
+        encoded = handle.read(MAX_SYNTHETIC_EVIDENCE_BYTES + 1)
+        if len(encoded) != initial.st_size:
+            raise ReviewError(f"{label} changed while it was read")
+        final = os.fstat(handle.fileno())
+        if (
+            initial.st_dev,
+            initial.st_ino,
+            initial.st_mode,
+            initial.st_nlink,
+            initial.st_uid,
+            initial.st_size,
+            initial.st_mtime_ns,
+            initial.st_ctime_ns,
+        ) != (
+            final.st_dev,
+            final.st_ino,
+            final.st_mode,
+            final.st_nlink,
+            final.st_uid,
+            final.st_size,
+            final.st_mtime_ns,
+            final.st_ctime_ns,
+        ):
+            raise ReviewError(f"{label} changed while it was read")
+    except OSError as error:
+        raise ReviewError(f"cannot read {label}: {error}") from error
+    finally:
+        if handle is not None:
+            handle.close()
+        elif descriptor is not None:
+            os.close(descriptor)
     try:
         value = json.loads(
             encoded.decode("utf-8"),
@@ -3273,9 +3967,10 @@ def _inspect_control_directory(
 def _build_control_artifact_state(
     *,
     control_dir: pathlib.Path,
+    private_cleanup: PrivateCleanupEvidence,
 ) -> dict[str, Any]:
     directory = _inspect_control_directory(control_dir)
-    entries: list[dict[str, Any]] = []
+    artifacts: dict[str, ControlArtifactEvidence] = {}
     for name in sorted(CONTROL_ARTIFACT_SPECS):
         max_bytes, record_limit = CONTROL_ARTIFACT_SPECS[name]
         record_count: int | None = 0 if record_limit is not None else None
@@ -3304,42 +3999,111 @@ def _build_control_artifact_state(
                 raise ReviewError(
                     "generated changed-blob findings are not complete record triples"
                 )
-        entries.append(
-            {
-                "name": name,
-                "record_count": record_count,
-                "sha256": artifact_sha256,
-                "size": metadata.st_size,
-            }
+        artifacts[name] = ControlArtifactEvidence(
+            name=name,
+            record_count=record_count,
+            sha256=artifact_sha256,
+            size=metadata.st_size,
         )
     _inspect_control_directory(control_dir, expected=directory)
-    return {
-        "artifacts": entries,
-        "directory": {
-            "ctime_ns": directory.ctime_ns,
-            "device": directory.device,
-            "entry_count": directory.entry_count,
-            "entry_names_sha256": directory.entry_names_sha256,
-            "inode": directory.inode,
-            "link_count": directory.link_count,
-            "mode": directory.mode,
-            "mtime_ns": directory.mtime_ns,
-            "uid": directory.uid,
-        },
-        "schema_version": CONTROL_ARTIFACT_SCHEMA_VERSION,
-    }
+    return ControlArtifactState(
+        artifacts=artifacts,
+        directory=directory,
+        private_cleanup=private_cleanup,
+        private_artifacts_removed=frozenset(),
+    ).to_json()
 
 
-def _load_control_artifact_state(
-    *,
-    container_dir: pathlib.Path,
-) -> ControlArtifactState:
-    payload = _read_bounded_json(
-        container_dir / CONTROL_ARTIFACT_STATE_NAME,
-        label="helper-private review control state",
-    )
+def _parse_cleanup_identity(value: Any, *, label: str) -> CleanupIdentity:
     if (
-        set(payload) != {"artifacts", "directory", "schema_version"}
+        not isinstance(value, dict)
+        or set(value) != {"device", "inode"}
+        or type(value["device"]) is not int
+        or type(value["inode"]) is not int
+        or value["device"] < 0
+        or value["inode"] <= 0
+    ):
+        raise ReviewError(f"{label} is invalid")
+    return CleanupIdentity(device=value["device"], inode=value["inode"])
+
+
+def _parse_private_cleanup_evidence(
+    value: Any,
+    *,
+    require_all: bool,
+) -> PrivateCleanupEvidence:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"artifacts", "container", "schema_version"}
+        or value.get("schema_version") != 1
+        or not isinstance(value["artifacts"], list)
+        or len(value["artifacts"]) > len(PRIVATE_HELPER_ARTIFACT_NAMES)
+    ):
+        raise ReviewError("helper-private cleanup identity state is malformed")
+    container = _parse_cleanup_identity(
+        value["container"],
+        label="helper-private container cleanup identity",
+    )
+    artifacts: dict[str, CleanupIdentity] = {}
+    for raw_artifact in value["artifacts"]:
+        if not isinstance(raw_artifact, dict) or set(raw_artifact) != {
+            "device",
+            "inode",
+            "name",
+        }:
+            raise ReviewError("helper-private artifact cleanup identity is malformed")
+        name = raw_artifact["name"]
+        if (
+            not isinstance(name, str)
+            or name not in PRIVATE_HELPER_ARTIFACT_NAMES
+            or name in artifacts
+        ):
+            raise ReviewError("helper-private artifact cleanup identity is invalid")
+        artifacts[name] = _parse_cleanup_identity(
+            {"device": raw_artifact["device"], "inode": raw_artifact["inode"]},
+            label=f"helper-private artifact cleanup identity {name}",
+        )
+    if require_all and set(artifacts) != set(PRIVATE_HELPER_ARTIFACT_NAMES):
+        raise ReviewError("helper-private artifact cleanup identities are incomplete")
+    return PrivateCleanupEvidence(container=container, artifacts=artifacts)
+
+
+def parse_private_cleanup_evidence(value: Any) -> PrivateCleanupEvidence:
+    return _parse_private_cleanup_evidence(value, require_all=True)
+
+
+def _parse_private_cleanup_state(
+    value: Any,
+) -> tuple[PrivateCleanupEvidence, frozenset[str]]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"binding", "removed", "schema_version"}
+        or value.get("schema_version") != 1
+        or not isinstance(value["removed"], list)
+    ):
+        raise ReviewError("helper-private cleanup state is malformed")
+    removed_items = value["removed"]
+    if (
+        any(
+            not isinstance(item, str) or item not in PRIVATE_HELPER_ARTIFACT_NAMES
+            for item in removed_items
+        )
+        or len(set(removed_items)) != len(removed_items)
+        or removed_items != sorted(removed_items)
+    ):
+        raise ReviewError("helper-private cleanup removal receipts are invalid")
+    return (
+        _parse_private_cleanup_evidence(
+            value["binding"],
+            require_all=True,
+        ),
+        frozenset(removed_items),
+    )
+
+
+def _parse_control_artifact_state(payload: dict[str, Any]) -> ControlArtifactState:
+    if (
+        set(payload) != {"artifacts", "directory", "private_cleanup", "schema_version"}
         or payload.get("schema_version") != CONTROL_ARTIFACT_SCHEMA_VERSION
     ):
         raise ReviewError("helper-private review control state fields are invalid")
@@ -3439,7 +4203,95 @@ def _load_control_artifact_state(
         )
     if set(artifacts) != set(CONTROL_ARTIFACT_SPECS):
         raise ReviewError("helper-private review control state is incomplete")
-    return ControlArtifactState(artifacts=artifacts, directory=directory)
+    private_cleanup, private_artifacts_removed = _parse_private_cleanup_state(
+        payload["private_cleanup"]
+    )
+    return ControlArtifactState(
+        artifacts=artifacts,
+        directory=directory,
+        private_cleanup=private_cleanup,
+        private_artifacts_removed=private_artifacts_removed,
+    )
+
+
+def _load_control_artifact_state(
+    *,
+    container_dir: pathlib.Path,
+) -> ControlArtifactState:
+    return _parse_control_artifact_state(
+        _read_bounded_json(
+            container_dir / CONTROL_ARTIFACT_STATE_NAME,
+            label="helper-private review control state",
+        )
+    )
+
+
+def _load_control_artifact_state_at(
+    container_descriptor: int,
+) -> ControlArtifactState:
+    return _parse_control_artifact_state(
+        _read_bounded_json_at(
+            container_descriptor,
+            CONTROL_ARTIFACT_STATE_NAME,
+            label="helper-private review control state",
+        )
+    )
+
+
+def _write_control_artifact_state_at(
+    container_descriptor: int,
+    state: ControlArtifactState,
+) -> None:
+    encoded = _bounded_json_bytes(
+        state.to_json(),
+        label="helper-private review control state",
+    )
+    temporary_name = f".{CONTROL_ARTIFACT_STATE_NAME}.{uuid.uuid4().hex}"
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor: int | None = None
+    handle: BinaryIO | None = None
+    try:
+        descriptor = os.open(
+            temporary_name,
+            flags,
+            0o600,
+            dir_fd=container_descriptor,
+        )
+        handle = os.fdopen(descriptor, "wb")
+        descriptor = None
+        handle.write(encoded)
+        handle.flush()
+        os.fsync(handle.fileno())
+        handle.close()
+        handle = None
+        os.replace(
+            temporary_name,
+            CONTROL_ARTIFACT_STATE_NAME,
+            src_dir_fd=container_descriptor,
+            dst_dir_fd=container_descriptor,
+        )
+        os.fsync(container_descriptor)
+    except OSError as error:
+        raise ReviewError(
+            f"cannot persist helper-private cleanup receipt: {error}"
+        ) from error
+    finally:
+        if handle is not None:
+            handle.close()
+        elif descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_name, dir_fd=container_descriptor)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
 
 
 def _load_legacy_manifest(
@@ -3448,6 +4300,7 @@ def _load_legacy_manifest(
     container_dir: pathlib.Path,
     catalog: SyntheticTokenCatalog,
     expected_artifact: ControlArtifactEvidence,
+    expected_private_identity: CleanupIdentity,
     expected_base_ref: str,
     expected_head_ref: str,
 ) -> tuple[
@@ -3483,6 +4336,7 @@ def _load_legacy_manifest(
     private_manifest = _read_bounded_json(
         private_manifest_path,
         label="synthetic secret helper-private state",
+        expected_identity=expected_private_identity,
     )
     raw_reduction_values = private_manifest.pop("secret_reduction_values", [])
     manifest = private_manifest
@@ -3805,15 +4659,29 @@ def _load_changed_synthetic_evidence(
 
 def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     validate_workspace_layout(review)
+    control_state = load_bound_private_cleanup_state(
+        review.container_dir,
+        expected=review.private_cleanup,
+    )
+    if control_state.private_artifacts_removed:
+        raise ReviewError(
+            "helper-private artifacts were removed before external review validation"
+        )
+    current_private_cleanup = _capture_private_cleanup_evidence(
+        review.container_dir,
+        expected_container=review.private_cleanup.container,
+        require_all=True,
+    )
+    if current_private_cleanup != review.private_cleanup:
+        raise ReviewError(
+            "helper-private artifacts do not match preparation identities"
+        )
     workspace_root = review.workspace_root.resolve(strict=True)
     control_dir = workspace_root / ".codex-review"
     catalog = load_catalog()
     validate_authoring_catalog_scanner_contract(catalog)
     catalog_legacy_path_matcher = _legacy_path_matcher(
         accepted_legacy_values(catalog, catalog.legacy_exemptions)
-    )
-    control_state = _load_control_artifact_state(
-        container_dir=review.container_dir,
     )
     _inspect_control_directory(control_dir, expected=control_state.directory)
     control_artifacts = control_state.artifacts
@@ -3831,6 +4699,9 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
         container_dir=review.container_dir,
         catalog=catalog,
         expected_artifact=control_artifacts[SYNTHETIC_MANIFEST_NAME],
+        expected_private_identity=review.private_cleanup.artifacts[
+            SYNTHETIC_PRIVATE_MANIFEST_NAME
+        ],
         expected_base_ref=review.base_ref,
         expected_head_ref=review.head_ref,
     )
@@ -3954,6 +4825,9 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
             private_changed_paths_file,
             label="helper-private frozen changed paths",
             max_bytes=MAX_CHANGED_METADATA_BYTES,
+            expected_identity=review.private_cleanup.artifacts[
+                PRIVATE_CHANGED_PATHS_NAME
+            ],
         ) as (path_handle, _path_metadata),
     ):
         digest_records = _iter_nul_records(
@@ -8030,7 +8904,27 @@ def prepare_workspace(
     )
     catalog_legacy_value_matcher = _legacy_path_matcher(catalog_legacy_values)
     evidence_sensitive_values = _all_catalog_sensitive_values(catalog)
-    container, handoff_mask = _new_container(source_root)
+    (
+        container,
+        container_descriptor,
+        container_identity,
+        handoff_mask,
+    ) = _new_container(source_root)
+    private_artifact_identities: dict[str, CleanupIdentity] = {}
+
+    def private_identity_handoff(
+        artifact_name: str,
+    ) -> Callable[[CleanupIdentity], None]:
+        def accept(identity: CleanupIdentity) -> None:
+            if artifact_name in private_artifact_identities:
+                raise ReviewError(
+                    f"helper-private artifact identity was handed off twice: "
+                    f"{artifact_name}"
+                )
+            private_artifact_identities[artifact_name] = identity
+
+        return accept
+
     ownership_transferred = False
 
     try:
@@ -8098,11 +8992,13 @@ def prepare_workspace(
             label="synthetic secret manifest",
             accepted_values=manifest_sensitive_values,
         )
-        _write_bounded_json(
+        _write_private_bounded_json(
             container / SYNTHETIC_PRIVATE_MANIFEST_NAME,
             private_synthetic_manifest,
             label="synthetic secret helper-private state",
             accepted_values=evidence_sensitive_values,
+            identity_handoff=private_identity_handoff(SYNTHETIC_PRIVATE_MANIFEST_NAME),
+            parent_descriptor=container_descriptor,
         )
         changed_path_digests_file = control_dir / CHANGED_PATH_DIGESTS_NAME
         _write_frozen_changed_paths(
@@ -8113,6 +9009,10 @@ def prepare_workspace(
             destination=changed_path_digests_file,
             private_destination=container / PRIVATE_CHANGED_PATHS_NAME,
             evidence_sensitive_values=manifest_sensitive_values,
+            private_identity_handoff=private_identity_handoff(
+                PRIVATE_CHANGED_PATHS_NAME
+            ),
+            private_parent_descriptor=container_descriptor,
         )
         changed_blob_findings = control_dir / "changed-blob-findings.z"
         _write_changed_blob_findings(
@@ -8156,8 +9056,15 @@ def prepare_workspace(
             )
         _validate_prompt_size(prompt)
         write_text_atomic(prompt_file, prompt)
+        if set(private_artifact_identities) != set(PRIVATE_HELPER_ARTIFACT_NAMES):
+            raise ReviewError("helper-private preparation identities are incomplete")
+        private_cleanup = PrivateCleanupEvidence(
+            container=container_identity,
+            artifacts=private_artifact_identities,
+        )
         control_artifact_state = _build_control_artifact_state(
             control_dir=control_dir,
+            private_cleanup=private_cleanup,
         )
         _write_bounded_json(
             container / CONTROL_ARTIFACT_STATE_NAME,
@@ -8173,6 +9080,7 @@ def prepare_workspace(
             head_ref=head_sha,
             diff_file=diff_file,
             prompt_file=prompt_file,
+            private_cleanup=private_cleanup,
         )
         validate_workspace_layout(review)
         ownership_mask = block_forwarded_signals()
@@ -8189,7 +9097,16 @@ def prepare_workspace(
         cleanup_signal: signal.Signals | None = None
         cleanup_error: str | None = None
         try:
-            cleanup_error = _remove_partial_container(container)
+            if container_descriptor is not None:
+                os.close(container_descriptor)
+                container_descriptor = None
+            cleanup_error = _remove_partial_container(
+                container,
+                expected=PrivateCleanupEvidence(
+                    container=container_identity,
+                    artifacts=private_artifact_identities,
+                ),
+            )
             if cleanup_mask is not None:
                 cleanup_signal = consume_pending_forwarded_signal()
         finally:
@@ -8213,6 +9130,8 @@ def prepare_workspace(
             ) from error
         raise
     finally:
+        if container_descriptor is not None:
+            os.close(container_descriptor)
         if handoff_mask is not None:
             restore_signal_mask(handoff_mask)
 
@@ -8233,38 +9152,43 @@ def cleanup_workspace(review: ReviewWorkspace, *, keep_container: bool) -> str |
     if private_cleanup_target is not None:
         if validation_error is not None:
             private_cleanup_error = remove_private_review_artifacts(
-                private_cleanup_target
+                private_cleanup_target,
+                expected=review.private_cleanup,
             )
         elif keep_container:
+            private_cleanup_error = remove_private_review_artifacts(
+                private_cleanup_target,
+                expected=review.private_cleanup,
+            )
 
             def remove_workspace(
-                parent_descriptor: int,
+                _parent_descriptor: int,
                 container_descriptor: int,
             ) -> list[str]:
-                tree_errors: list[str] = []
-                tree_errors.extend(
-                    _remove_named_directory_tree(
-                        container_descriptor,
-                        "workspace",
-                        label="review workspace",
-                        require_private_mode=False,
-                    )
+                if (
+                    _cleanup_identity_evidence(os.fstat(container_descriptor))
+                    != review.private_cleanup.container
+                ):
+                    return [
+                        "private artifact container does not match preparation identity"
+                    ]
+                return _remove_named_directory_tree(
+                    container_descriptor,
+                    "workspace",
+                    label="review workspace",
+                    require_private_mode=False,
                 )
-                tree_errors.extend(
-                    _unlink_private_review_artifacts(
-                        parent_descriptor,
-                        container_descriptor,
-                    )
-                )
-                return tree_errors
 
-            private_cleanup_error = _operate_on_private_review_container(
-                private_cleanup_target,
-                remove_workspace,
-            )
+            if private_cleanup_error is None:
+                private_cleanup_error = _operate_on_private_review_container(
+                    private_cleanup_target,
+                    remove_workspace,
+                )
         else:
             private_cleanup_error = _remove_review_container_tree(
-                private_cleanup_target
+                private_cleanup_target,
+                expected=review.private_cleanup,
+                use_control_state=True,
             )
         if private_cleanup_error:
             cleanup_errors.append(private_cleanup_error)

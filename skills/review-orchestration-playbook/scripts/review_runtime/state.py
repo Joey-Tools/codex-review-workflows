@@ -30,8 +30,12 @@ from .common import (
 )
 from .providers import run_review
 from .workspace import (
+    PRIVATE_HELPER_ARTIFACT_NAMES,
+    PrivateCleanupEvidence,
     ReviewWorkspace,
     cleanup_workspace,
+    load_bound_private_cleanup_state,
+    parse_private_cleanup_evidence,
     prepare_workspace,
     remove_private_review_artifacts,
     validate_workspace_layout,
@@ -40,6 +44,8 @@ from .workspace import (
 
 STATE_FILE = "state.json"
 STATE_MARKER = ".isolated-review-state"
+STATE_SCHEMA_VERSION = 2
+STATE_MARKER_SCHEMA_VERSION = 2
 EXIT_FILE = "exit-code"
 LOCK_FILE = "runner.lock"
 CLEANUP_LOCK_FILE = "cleanup.lock"
@@ -56,6 +62,40 @@ def _state_path(state_dir: pathlib.Path) -> pathlib.Path:
     return state_dir / STATE_FILE
 
 
+def _state_marker_payload(review: ReviewWorkspace) -> dict[str, Any]:
+    return {
+        "container_dir": str(review.container_dir),
+        "private_cleanup": review.private_cleanup.to_json(),
+        "version": STATE_MARKER_SCHEMA_VERSION,
+    }
+
+
+def _write_state_marker(review: ReviewWorkspace) -> None:
+    write_json(
+        review.container_dir / STATE_MARKER,
+        _state_marker_payload(review),
+    )
+
+
+def _load_state_marker_cleanup(
+    state_dir: pathlib.Path,
+) -> PrivateCleanupEvidence:
+    resolved_state_dir = state_dir.expanduser().resolve(strict=False)
+    marker = read_json(resolved_state_dir / STATE_MARKER)
+    if set(marker) != {"container_dir", "private_cleanup", "version"}:
+        raise ReviewError("isolated-review state marker fields are invalid")
+    if marker.get("version") != STATE_MARKER_SCHEMA_VERSION:
+        raise ReviewError("isolated-review state marker version is invalid")
+    container_dir = marker["container_dir"]
+    if (
+        not isinstance(container_dir, str)
+        or pathlib.Path(container_dir).expanduser().resolve(strict=False)
+        != resolved_state_dir
+    ):
+        raise ReviewError("isolated-review state marker container is invalid")
+    return parse_private_cleanup_evidence(marker["private_cleanup"])
+
+
 def load_state(state_dir: pathlib.Path) -> dict[str, Any]:
     return read_json(_state_path(state_dir))
 
@@ -65,18 +105,29 @@ def load_review_state(
 ) -> tuple[dict[str, Any], ReviewWorkspace]:
     resolved_state_dir = state_dir.expanduser().resolve()
     state = load_state(resolved_state_dir)
+    if state.get("version") != STATE_SCHEMA_VERSION:
+        raise ReviewError("review state version is invalid")
     review_value = state.get("workspace")
     if not isinstance(review_value, dict):
         raise ReviewError("review state does not contain a workspace object")
     try:
         review = ReviewWorkspace.from_json(review_value)
-    except (KeyError, TypeError, ValueError) as error:
+    except (KeyError, TypeError, ValueError, ReviewError) as error:
         raise ReviewError(
             f"review state contains an invalid workspace: {error}"
         ) from error
     validate_workspace_layout(review)
     if review.container_dir.resolve(strict=False) != resolved_state_dir:
         raise ReviewError("review state container does not match its state directory")
+    marker_cleanup = _load_state_marker_cleanup(resolved_state_dir)
+    if marker_cleanup != review.private_cleanup:
+        raise ReviewError(
+            "review state cleanup identity does not match its state marker"
+        )
+    load_bound_private_cleanup_state(
+        review.container_dir,
+        expected=review.private_cleanup,
+    )
     return state, review
 
 
@@ -193,11 +244,11 @@ def start(
         if review is None:
             raise ReviewError("workspace ownership handoff did not complete")
         state_dir = review.container_dir
-        write_text_atomic(state_dir / STATE_MARKER, "isolated-review-state-v1\n")
+        _write_state_marker(review)
         stdout_path = state_dir / "runner.stdout.log"
         stderr_path = state_dir / "runner.stderr.log"
         state: dict[str, Any] = {
-            "version": 1,
+            "version": STATE_SCHEMA_VERSION,
             "reviewer": reviewer,
             "workspace": review.to_json(),
             "keep_workspace": keep_workspace,
@@ -468,12 +519,18 @@ def _should_retain_fallback_workspace(
         return False
     try:
         preflight = read_json(state_dir / "preflight.json")
+        cleanup_state = load_bound_private_cleanup_state(
+            review.container_dir,
+            expected=review.private_cleanup,
+        )
     except ReviewError:
         return False
     return (
         preflight.get("review_range") == f"{review.base_ref}..{review.head_ref}"
         and preflight.get("private_artifacts") == "removed"
         and preflight.get("status") == "secret-delta and escaping-symlink checks passed"
+        and cleanup_state.private_artifacts_removed
+        == frozenset(PRIVATE_HELPER_ARTIFACT_NAMES)
     )
 
 
@@ -547,7 +604,17 @@ def _cleanup_terminal_workspace(
             except ReviewError as state_error:
                 if not force or not (state_dir / STATE_MARKER).is_file():
                     raise
-                private_cleanup_error = remove_private_review_artifacts(state_dir)
+                try:
+                    marker_cleanup = _load_state_marker_cleanup(state_dir)
+                except ReviewError as marker_error:
+                    raise ReviewError(
+                        f"{state_error}; private artifact cleanup identity failed: "
+                        f"{marker_error}"
+                    ) from state_error
+                private_cleanup_error = remove_private_review_artifacts(
+                    state_dir,
+                    expected=marker_cleanup,
+                )
                 if private_cleanup_error:
                     raise ReviewError(
                         f"{state_error}; private artifact cleanup failed: "
@@ -564,7 +631,10 @@ def _cleanup_terminal_workspace(
             )
             should_keep = not force and (keep_workspace or retain_for_fallback)
             if should_keep:
-                cleanup_error = remove_private_review_artifacts(review.container_dir)
+                cleanup_error = remove_private_review_artifacts(
+                    review.container_dir,
+                    expected=review.private_cleanup,
+                )
                 cleanup_completed = True
             else:
                 cleanup_completed, cleanup_error = _cleanup_before_deadline(

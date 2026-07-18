@@ -4793,7 +4793,8 @@ def run_review(
         preflight_evidence = build_preflight_evidence(review, synthetic_evidence)
     except ReviewError as error:
         private_cleanup_error = remove_private_review_artifacts(
-            review.container_dir
+            review.container_dir,
+            expected=review.private_cleanup,
         )
         cleanup_suffix = (
             f"; private artifact cleanup failed: {private_cleanup_error}"
@@ -4806,7 +4807,10 @@ def run_review(
         )
         return Outcome(2, None, tuple())
 
-    private_cleanup_error = remove_private_review_artifacts(review.container_dir)
+    private_cleanup_error = remove_private_review_artifacts(
+        review.container_dir,
+        expected=review.private_cleanup,
+    )
     if private_cleanup_error:
         write_text_atomic(
             review.container_dir / "runner-error.txt",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import hashlib
 import itertools
 import json
@@ -131,6 +132,10 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         prompt_file = control / "review.prompt"
         prompt_file.write_text("Review this diff.\n", encoding="utf-8")
+        private_cleanup = workspace_runtime._capture_private_cleanup_evidence(
+            container,
+            require_all=True,
+        )
         self.review = ReviewWorkspace(
             source_root=source_root,
             container_dir=container,
@@ -139,6 +144,7 @@ class ProviderPolicyTest(unittest.TestCase):
             head_ref=head_ref,
             diff_file=diff_file,
             prompt_file=prompt_file,
+            private_cleanup=private_cleanup,
         )
         self.private_review_artifacts = {
             name: (container / name).read_bytes()
@@ -243,6 +249,7 @@ class ProviderPolicyTest(unittest.TestCase):
         control_dir = self.review.workspace_root / ".codex-review"
         state = workspace_runtime._build_control_artifact_state(
             control_dir=control_dir,
+            private_cleanup=self.review.private_cleanup,
         )
         workspace_runtime._write_bounded_json(
             self.review.container_dir / workspace_runtime.CONTROL_ARTIFACT_STATE_NAME,
@@ -253,6 +260,16 @@ class ProviderPolicyTest(unittest.TestCase):
     def _restore_private_review_artifacts(self) -> None:
         for name, payload in self.private_review_artifacts.items():
             (self.review.container_dir / name).write_bytes(payload)
+        private_cleanup = workspace_runtime._capture_private_cleanup_evidence(
+            self.review.container_dir,
+            expected_container=self.review.private_cleanup.container,
+            require_all=True,
+        )
+        self.review = dataclasses.replace(
+            self.review,
+            private_cleanup=private_cleanup,
+        )
+        self._refresh_control_artifact_state()
 
     def tearDown(self) -> None:
         self.warmup_patcher.stop()
@@ -5475,6 +5492,79 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         self.assertIn("private artifact cleanup failed", error)
 
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_private_artifact_replacement_blocks_codex_before_launch(
+        self,
+        run_model_chain: mock.Mock,
+        environment: mock.Mock,
+    ) -> None:
+        for artifact_name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES:
+            with self.subTest(artifact_name=artifact_name):
+                artifact = self.review.container_dir / artifact_name
+                moved_artifact = self.review.container_dir / f"{artifact_name}.moved"
+                original_payload = artifact.read_bytes()
+                artifact.rename(moved_artifact)
+                artifact.write_bytes(original_payload)
+                artifact.chmod(0o600)
+
+                outcome = providers.run_review(
+                    review=self.review,
+                    reviewer="codex",
+                )
+
+                self.assertEqual(outcome.returncode, 2)
+                self.assertEqual(artifact.read_bytes(), original_payload)
+                self.assertEqual(moved_artifact.read_bytes(), original_payload)
+                self.assertFalse(
+                    (self.review.container_dir / "preflight.json").exists()
+                )
+                error = (
+                    self.review.container_dir / "runner-error.txt"
+                ).read_text(encoding="utf-8")
+                self.assertIn("do not match preparation identities", error)
+                self.assertIn("does not match preparation identity", error)
+
+                artifact.unlink()
+                moved_artifact.rename(artifact)
+                self._restore_private_review_artifacts()
+        run_model_chain.assert_not_called()
+        environment.assert_not_called()
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_private_container_replacement_blocks_codex_before_launch(
+        self,
+        run_model_chain: mock.Mock,
+        environment: mock.Mock,
+    ) -> None:
+        container = self.review.container_dir
+        moved_container = container.with_name(f"{container.name}-moved")
+        container.rename(moved_container)
+        container.mkdir(mode=0o700)
+        victim = container / "replacement-victim"
+        victim.write_text("keep me\n", encoding="utf-8")
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="codex",
+        )
+
+        self.assertEqual(outcome.returncode, 2)
+        run_model_chain.assert_not_called()
+        environment.assert_not_called()
+        self.assertEqual(victim.read_text(encoding="utf-8"), "keep me\n")
+        self.assertTrue(
+            all(
+                (moved_container / name).exists()
+                for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
+            )
+        )
+        self.assertFalse((container / "preflight.json").exists())
+        self.assertFalse((moved_container / "preflight.json").exists())
+        error = (container / "runner-error.txt").read_text(encoding="utf-8")
+        self.assertIn("container does not match preparation identity", error)
+
     @mock.patch.object(providers, "_run_model_chain")
     def test_preflight_builder_failure_scrubs_private_artifacts(
         self,
@@ -6730,6 +6820,7 @@ class ProviderPolicyTest(unittest.TestCase):
             head_ref="b" * 40,
             diff_file=root / "review.diff",
             prompt_file=root / "review.prompt",
+            private_cleanup=self.review.private_cleanup,
         )
         host = providers.LinuxHost(
             claude_linux.LinuxHostKind.WSL2,

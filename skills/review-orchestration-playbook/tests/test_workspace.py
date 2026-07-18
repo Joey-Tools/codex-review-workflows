@@ -83,6 +83,28 @@ def prepare_workspace(**kwargs):
     return review
 
 
+def cleanup_evidence(
+    container: pathlib.Path,
+) -> workspace_runtime.PrivateCleanupEvidence:
+    container_status = os.lstat(container)
+    artifacts = {}
+    for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES:
+        path = container / name
+        if path.is_file() and not path.is_symlink():
+            status = os.lstat(path)
+            artifacts[name] = workspace_runtime.CleanupIdentity(
+                device=status.st_dev,
+                inode=status.st_ino,
+            )
+    return workspace_runtime.PrivateCleanupEvidence(
+        container=workspace_runtime.CleanupIdentity(
+            device=container_status.st_dev,
+            inode=container_status.st_ino,
+        ),
+        artifacts=artifacts,
+    )
+
+
 class WorkspaceTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -701,6 +723,13 @@ class WorkspaceTest(unittest.TestCase):
         def write_empty_changed_paths(**kwargs) -> None:
             kwargs["destination"].touch()
             kwargs["private_destination"].touch()
+            status = kwargs["private_destination"].stat()
+            kwargs["private_identity_handoff"](
+                workspace_runtime.CleanupIdentity(
+                    device=status.st_dev,
+                    inode=status.st_ino,
+                )
+            )
 
         with (
             mock.patch.object(
@@ -725,6 +754,13 @@ class WorkspaceTest(unittest.TestCase):
         def write_empty_changed_paths(**kwargs) -> None:
             kwargs["destination"].touch()
             kwargs["private_destination"].touch()
+            status = kwargs["private_destination"].stat()
+            kwargs["private_identity_handoff"](
+                workspace_runtime.CleanupIdentity(
+                    device=status.st_dev,
+                    inode=status.st_ino,
+                )
+            )
 
         with (
             mock.patch.object(
@@ -901,13 +937,17 @@ class WorkspaceTest(unittest.TestCase):
         private_manifest = container / workspace_runtime.SYNTHETIC_PRIVATE_MANIFEST_NAME
         private_paths.write_bytes(b"private-path\x00")
         private_manifest.write_bytes(b"private-manifest")
+        expected_cleanup = cleanup_evidence(container)
 
         with mock.patch.object(
             workspace_runtime,
             "_remove_open_directory_contents",
             return_value=["permission denied"],
         ) as remove_contents:
-            cleanup_error = workspace_runtime._remove_partial_container(container)
+            cleanup_error = workspace_runtime._remove_partial_container(
+                container,
+                expected=expected_cleanup,
+            )
 
         self.assertIn("permission denied", cleanup_error or "")
         remove_contents.assert_called_once_with(
@@ -934,7 +974,8 @@ class WorkspaceTest(unittest.TestCase):
         symlink_container.symlink_to(symlink_target, target_is_directory=True)
 
         symlink_error = workspace_runtime.remove_private_review_artifacts(
-            symlink_container
+            symlink_container,
+            expected=cleanup_evidence(symlink_target),
         )
 
         self.assertIsNotNone(symlink_error)
@@ -943,10 +984,18 @@ class WorkspaceTest(unittest.TestCase):
 
         private_paths.write_bytes(b"private-path\x00")
         private_manifest.write_bytes(b"private-manifest")
+        expected_cleanup = cleanup_evidence(container)
         real_unlink = os.unlink
+        failed_private_unlink = False
 
         def fail_first_unlink(path, *args, **kwargs):
-            if path == workspace_runtime.SYNTHETIC_PRIVATE_MANIFEST_NAME:
+            nonlocal failed_private_unlink
+            if (
+                not failed_private_unlink
+                and isinstance(path, str)
+                and path.startswith(".codex-review-cleanup-")
+            ):
+                failed_private_unlink = True
                 raise PermissionError("manifest unlink denied")
             return real_unlink(path, *args, **kwargs)
 
@@ -955,22 +1004,27 @@ class WorkspaceTest(unittest.TestCase):
             "unlink",
             side_effect=fail_first_unlink,
         ):
-            first_unlink_error = workspace_runtime.remove_private_review_artifacts(
-                container
+            first_unlink_error = workspace_runtime._remove_partial_container(
+                container,
+                expected=expected_cleanup,
             )
 
         self.assertIn("manifest unlink denied", first_unlink_error or "")
-        self.assertTrue(private_manifest.exists())
+        self.assertFalse(private_manifest.exists())
         self.assertFalse(private_paths.exists())
+        retained_manifest = next(container.glob(".codex-review-cleanup-*"))
+        self.assertEqual(retained_manifest.read_bytes(), b"private-manifest")
 
-        private_manifest.unlink()
+        retained_manifest.unlink()
         private_manifest.mkdir()
         nested_private = private_manifest / "nested.txt"
         nested_private.write_text("do not recurse\n", encoding="utf-8")
         private_paths.write_bytes(b"private-path\x00")
+        expected_cleanup = cleanup_evidence(container)
 
-        directory_artifact_error = workspace_runtime.remove_private_review_artifacts(
-            container
+        directory_artifact_error = workspace_runtime._remove_partial_container(
+            container,
+            expected=expected_cleanup,
         )
 
         self.assertIsNotNone(directory_artifact_error)
@@ -978,7 +1032,9 @@ class WorkspaceTest(unittest.TestCase):
         self.assertFalse(private_paths.exists())
 
         missing_parent_error = workspace_runtime.remove_private_review_artifacts(
-            pathlib.Path(self.temporary.name) / "missing-parent/isolated-review-missing"
+            pathlib.Path(self.temporary.name)
+            / "missing-parent/isolated-review-missing",
+            expected=expected_cleanup,
         )
         self.assertIn("parent is missing", missing_parent_error or "")
 
@@ -992,6 +1048,7 @@ class WorkspaceTest(unittest.TestCase):
             original_container / workspace_runtime.SYNTHETIC_PRIVATE_MANIFEST_NAME
         )
         original_private.write_bytes(b"original")
+        original_cleanup = cleanup_evidence(original_container)
         moved_review_root = source_root / ".codex-tmp-original"
         review_root.rename(moved_review_root)
         outside_root = pathlib.Path(self.temporary.name) / "outside-review-root"
@@ -1009,7 +1066,8 @@ class WorkspaceTest(unittest.TestCase):
         review_root.symlink_to(outside_root, target_is_directory=True)
 
         swapped_parent_error = workspace_runtime.remove_private_review_artifacts(
-            original_container
+            original_container,
+            expected=original_cleanup,
         )
 
         self.assertIsNotNone(swapped_parent_error)
@@ -1030,13 +1088,15 @@ class WorkspaceTest(unittest.TestCase):
             head_ref=self.head,
             diff_file=original_container / "workspace/.codex-review/review.diff",
             prompt_file=original_container / "workspace/.codex-review/review.prompt",
+            private_cleanup=original_cleanup,
         )
         swapped_cleanup_error = workspace_runtime.cleanup_workspace(
             swapped_review,
             keep_container=False,
         )
         partial_cleanup_error = workspace_runtime._remove_partial_container(
-            original_container
+            original_container,
+            expected=original_cleanup,
         )
 
         self.assertIsNotNone(swapped_cleanup_error)
@@ -1044,19 +1104,27 @@ class WorkspaceTest(unittest.TestCase):
         self.assertTrue(outside_victim.exists())
         self.assertTrue(outside_private.exists())
 
-    def test_partial_cleanup_keeps_a_failed_private_unlink_at_its_fixed_name(
+    def test_partial_cleanup_keeps_a_failed_private_unlink_in_quarantine(
         self,
     ) -> None:
         container = pathlib.Path(self.temporary.name) / "private-unlink-container"
         container.mkdir(mode=0o700)
         private_manifest = container / workspace_runtime.SYNTHETIC_PRIVATE_MANIFEST_NAME
         private_manifest.write_bytes(b"private")
+        expected_cleanup = cleanup_evidence(container)
         ordinary = container / "ordinary.txt"
         ordinary.write_text("ordinary\n", encoding="utf-8")
         real_unlink = os.unlink
+        failed_private_unlink = False
 
         def fail_private_unlink(path, *args, **kwargs):
-            if path == workspace_runtime.SYNTHETIC_PRIVATE_MANIFEST_NAME:
+            nonlocal failed_private_unlink
+            if (
+                not failed_private_unlink
+                and isinstance(path, str)
+                and path.startswith(".codex-review-cleanup-")
+            ):
+                failed_private_unlink = True
                 raise PermissionError("private unlink denied")
             return real_unlink(path, *args, **kwargs)
 
@@ -1065,12 +1133,17 @@ class WorkspaceTest(unittest.TestCase):
             "unlink",
             side_effect=fail_private_unlink,
         ):
-            cleanup_error = workspace_runtime._remove_partial_container(container)
+            cleanup_error = workspace_runtime._remove_partial_container(
+                container,
+                expected=expected_cleanup,
+            )
 
         self.assertIn("private unlink denied", cleanup_error or "")
-        self.assertTrue(private_manifest.exists())
+        self.assertFalse(private_manifest.exists())
         self.assertTrue(ordinary.exists())
-        self.assertEqual(list(container.glob(".codex-review-cleanup-*")), [])
+        retained = list(container.glob(".codex-review-cleanup-*"))
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0].read_bytes(), b"private")
 
     def test_cleanup_does_not_remove_a_replacement_container(self) -> None:
         review = self.prepare_range(self.base, self.head)
@@ -1115,12 +1188,103 @@ class WorkspaceTest(unittest.TestCase):
         self.assertEqual(len(quarantines), 1)
         self.assertEqual(quarantines[0].read_text(encoding="utf-8"), "replacement\n")
 
+    def test_private_cleanup_rejects_container_replaced_before_cleanup(self) -> None:
+        review = self.prepare_range(self.base, self.head)
+        container = review.container_dir
+        moved_container = container.with_name(container.name + "-moved-before-cleanup")
+        container.rename(moved_container)
+        container.mkdir(mode=0o700)
+        replacement = container / "replacement.txt"
+        replacement.write_text("replacement\n", encoding="utf-8")
+
+        cleanup_error = workspace_runtime.remove_private_review_artifacts(
+            container,
+            expected=review.private_cleanup,
+        )
+
+        self.assertIn("does not match preparation identity", cleanup_error or "")
+        self.assertTrue(replacement.exists())
+        self.assertTrue(
+            all(
+                (moved_container / name).exists()
+                for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
+            )
+        )
+
+    def test_private_cleanup_receipts_distinguish_removed_from_moved(self) -> None:
+        review = self.prepare_range(self.base, self.head)
+        container = review.container_dir
+        moved_name = workspace_runtime.SYNTHETIC_PRIVATE_MANIFEST_NAME
+        moved = container / f"{moved_name}.moved"
+        original = container / moved_name
+        original.rename(moved)
+        replacement = container / moved_name
+        replacement.write_bytes(b"replacement")
+        other_name = workspace_runtime.PRIVATE_CHANGED_PATHS_NAME
+
+        first_error = workspace_runtime.remove_private_review_artifacts(
+            container,
+            expected=review.private_cleanup,
+        )
+
+        self.assertIn("does not match preparation identity", first_error or "")
+        self.assertEqual(replacement.read_bytes(), b"replacement")
+        self.assertTrue(moved.exists())
+        self.assertFalse((container / other_name).exists())
+        cleanup_state = workspace_runtime._load_control_artifact_state(
+            container_dir=container
+        )
+        self.assertEqual(cleanup_state.private_artifacts_removed, {other_name})
+
+        replacement.unlink()
+        moved.rename(original)
+        self.assertIsNone(
+            workspace_runtime.remove_private_review_artifacts(
+                container,
+                expected=review.private_cleanup,
+            )
+        )
+        final_state = workspace_runtime._load_control_artifact_state(
+            container_dir=container
+        )
+        self.assertEqual(
+            final_state.private_artifacts_removed,
+            frozenset(workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES),
+        )
+        self.assertIsNone(
+            workspace_runtime.remove_private_review_artifacts(
+                container,
+                expected=review.private_cleanup,
+            )
+        )
+
+    def test_removed_private_name_reappearance_is_preserved(self) -> None:
+        review = self.prepare_range(self.base, self.head)
+        self.assertIsNone(
+            workspace_runtime.remove_private_review_artifacts(
+                review.container_dir,
+                expected=review.private_cleanup,
+            )
+        )
+        name = workspace_runtime.SYNTHETIC_PRIVATE_MANIFEST_NAME
+        replacement = review.container_dir / name
+        replacement.write_bytes(b"replacement")
+
+        cleanup_error = workspace_runtime.remove_private_review_artifacts(
+            review.container_dir,
+            expected=review.private_cleanup,
+        )
+
+        self.assertIn("reappeared after its recorded removal", cleanup_error or "")
+        self.assertEqual(replacement.read_bytes(), b"replacement")
+
     def test_partial_cleanup_preserves_a_replacement_file(self) -> None:
         container = pathlib.Path(self.temporary.name) / "file-race-container"
         container.mkdir(mode=0o700)
         target = container / "target.txt"
         target.write_text("original\n", encoding="utf-8")
         moved_target = container / "target-moved.txt"
+        expected_cleanup = cleanup_evidence(container)
         real_rename = os.rename
         swapped = False
 
@@ -1137,7 +1301,10 @@ class WorkspaceTest(unittest.TestCase):
             "rename",
             side_effect=swap_before_quarantine,
         ):
-            cleanup_error = workspace_runtime._remove_partial_container(container)
+            cleanup_error = workspace_runtime._remove_partial_container(
+                container,
+                expected=expected_cleanup,
+            )
 
         self.assertIn(
             "review cleanup entry changed before removal", cleanup_error or ""
@@ -1155,6 +1322,7 @@ class WorkspaceTest(unittest.TestCase):
         nested.mkdir()
         (nested / "original.txt").write_text("original\n", encoding="utf-8")
         moved_nested = container / "nested-moved"
+        expected_cleanup = cleanup_evidence(container)
         real_rename = os.rename
         swapped = False
 
@@ -1175,7 +1343,10 @@ class WorkspaceTest(unittest.TestCase):
             "rename",
             side_effect=swap_before_quarantine,
         ):
-            cleanup_error = workspace_runtime._remove_partial_container(container)
+            cleanup_error = workspace_runtime._remove_partial_container(
+                container,
+                expected=expected_cleanup,
+            )
 
         self.assertIn(
             "review cleanup directory entry changed before removal",
@@ -1203,13 +1374,17 @@ class WorkspaceTest(unittest.TestCase):
         )
         for path in private_artifacts:
             path.write_bytes(b"private")
+        expected_cleanup = cleanup_evidence(container)
 
         with mock.patch.object(
             workspace_runtime,
             "MAX_REVIEW_CLEANUP_DEPTH",
             4,
         ):
-            cleanup_error = workspace_runtime._remove_partial_container(container)
+            cleanup_error = workspace_runtime._remove_partial_container(
+                container,
+                expected=expected_cleanup,
+            )
 
         self.assertIn("directory depth exceeds the safety limit", cleanup_error or "")
         self.assertTrue(container.exists())
@@ -1226,8 +1401,12 @@ class WorkspaceTest(unittest.TestCase):
         nested = container / "nested"
         nested.mkdir()
         (nested / "outside-link").symlink_to(outside, target_is_directory=True)
+        expected_cleanup = cleanup_evidence(container)
 
-        cleanup_error = workspace_runtime._remove_partial_container(container)
+        cleanup_error = workspace_runtime._remove_partial_container(
+            container,
+            expected=expected_cleanup,
+        )
 
         self.assertIsNone(cleanup_error)
         self.assertFalse(container.exists())
@@ -1298,6 +1477,7 @@ class WorkspaceTest(unittest.TestCase):
             head_ref=self.head,
             diff_file=external_container / "review.diff",
             prompt_file=external_container / "review.prompt",
+            private_cleanup=cleanup_evidence(external_container),
         )
 
         with self.assertRaises(ReviewError):
@@ -1349,7 +1529,7 @@ class WorkspaceTest(unittest.TestCase):
         def interrupt_ownership_restore(_mask):
             nonlocal restore_calls
             restore_calls += 1
-            if restore_calls == 2:
+            if captured:
                 raise ForwardedSignal(signal.SIGTERM)
 
         with (

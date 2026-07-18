@@ -6003,6 +6003,20 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         self.assertFalse(review.workspace_root.exists())
         self.assertFalse(private_paths.exists())
         self.assertFalse(private_manifest.exists())
+        state = json.loads(
+            (review.container_dir / workspace.CONTROL_ARTIFACT_STATE_NAME).read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(state["schema_version"], 4)
+        self.assertEqual(
+            state["private_cleanup"],
+            {
+                "binding": review.private_cleanup.to_json(),
+                "removed": sorted(workspace.PRIVATE_HELPER_ARTIFACT_NAMES),
+                "schema_version": 1,
+            },
+        )
 
     def test_retained_container_removes_private_paths_when_cleanup_fails(
         self,
@@ -7520,6 +7534,15 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         review = self.prepare(repo=repo, base=base, head=head)
         state_path = review.container_dir / workspace.CONTROL_ARTIFACT_STATE_NAME
         payload = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["schema_version"], 4)
+        self.assertEqual(
+            payload["private_cleanup"],
+            {
+                "binding": review.private_cleanup.to_json(),
+                "removed": [],
+                "schema_version": 1,
+            },
+        )
         self.assertEqual(
             payload["directory"]["entry_count"],
             len(workspace.CONTROL_ARTIFACT_SPECS),
@@ -7667,7 +7690,8 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                 private_path.write_text(json.dumps(private), encoding="utf-8")
                 if tamper != "private-base64":
                     control_state = workspace._build_control_artifact_state(
-                        control_dir=control_dir
+                        control_dir=control_dir,
+                        private_cleanup=review.private_cleanup,
                     )
                     state_path = (
                         review.container_dir / workspace.CONTROL_ARTIFACT_STATE_NAME

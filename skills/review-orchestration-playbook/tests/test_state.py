@@ -89,14 +89,11 @@ class StatefulLifecycleTest(unittest.TestCase):
 
     def write_completed_state(self) -> None:
         state_dir = self.review.container_dir
-        (state_dir / state.STATE_MARKER).write_text(
-            "isolated-review-state-v1\n",
-            encoding="utf-8",
-        )
+        state._write_state_marker(self.review)
         write_json(
             state_dir / state.STATE_FILE,
             {
-                "version": 1,
+                "version": state.STATE_SCHEMA_VERSION,
                 "reviewer": "claude",
                 "egress_consent": "double-review",
                 "workspace": self.review.to_json(),
@@ -110,6 +107,35 @@ class StatefulLifecycleTest(unittest.TestCase):
         )
         (state_dir / state.EXIT_FILE).write_text("0\n", encoding="utf-8")
         (state_dir / "final.txt").write_text("No findings.\n", encoding="utf-8")
+
+    def test_state_marker_round_trips_private_cleanup_identity(self) -> None:
+        state._write_state_marker(self.review)
+
+        self.assertEqual(
+            state._load_state_marker_cleanup(self.review.container_dir),
+            self.review.private_cleanup,
+        )
+
+    def test_marker_control_identity_mismatch_fails_closed(self) -> None:
+        self.write_completed_state()
+        forged_cleanup = self.review.private_cleanup.to_json()
+        forged_cleanup["container"]["inode"] += 1
+
+        marker = state._state_marker_payload(self.review)
+        marker["private_cleanup"] = forged_cleanup
+        write_json(self.review.container_dir / state.STATE_MARKER, marker)
+
+        current = state.load_state(self.review.container_dir)
+        forged_workspace = self.review.to_json()
+        forged_workspace["private_cleanup"] = forged_cleanup
+        current["workspace"] = forged_workspace
+        write_json(self.review.container_dir / state.STATE_FILE, current)
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "private artifact container does not match preparation identity",
+        ):
+            state.load_review_state(self.review.container_dir)
 
     def test_final_returns_artifact_and_cleans_detached_workspace(self) -> None:
         self.write_completed_state()
@@ -182,6 +208,12 @@ class StatefulLifecycleTest(unittest.TestCase):
                 "review_range": f"{self.base}..{self.head}",
                 "status": "secret-delta and escaping-symlink checks passed",
             },
+        )
+        self.assertIsNone(
+            state.remove_private_review_artifacts(
+                self.review.container_dir,
+                expected=self.review.private_cleanup,
+            )
         )
 
         exit_code, text = state.final(self.review.container_dir)
@@ -540,7 +572,10 @@ class StatefulLifecycleTest(unittest.TestCase):
                 timeout_seconds=state.FINAL_CLEANUP_TIMEOUT_SECONDS,
             )
 
-        remove_private.assert_called_once_with(self.review.container_dir)
+        remove_private.assert_called_once_with(
+            self.review.container_dir,
+            expected=self.review.private_cleanup,
+        )
 
     def test_explicit_cleanup_does_not_scrub_while_runner_lock_is_held(self) -> None:
         self.write_completed_state()
@@ -593,14 +628,11 @@ time.sleep(0.2)
 
     def test_runner_unblocks_signals_inherited_from_stateful_start(self) -> None:
         state_dir = self.review.container_dir
-        (state_dir / state.STATE_MARKER).write_text(
-            "isolated-review-state-v1\n",
-            encoding="utf-8",
-        )
+        state._write_state_marker(self.review)
         write_json(
             state_dir / state.STATE_FILE,
             {
-                "version": 1,
+                "version": state.STATE_SCHEMA_VERSION,
                 "reviewer": "codex",
                 "workspace": self.review.to_json(),
             },
@@ -624,68 +656,60 @@ time.sleep(0.2)
     def test_runner_rejects_tampered_state_range_before_provider_launch(
         self,
     ) -> None:
-        state_dir = self.review.container_dir
-        (state_dir / state.STATE_MARKER).write_text(
-            "isolated-review-state-v1\n",
-            encoding="utf-8",
-        )
-        original_workspace = self.review.to_json()
-        private_artifacts = {
-            path: path.read_bytes()
-            for path in (
-                state_dir / PRIVATE_CHANGED_PATHS_NAME,
-                state_dir / SYNTHETIC_PRIVATE_MANIFEST_NAME,
-            )
-        }
-
         for field, forged_ref in (
             ("base_ref", "c" * 40),
             ("head_ref", "d" * 40),
         ):
             with self.subTest(field=field):
-                for path, payload in private_artifacts.items():
-                    path.write_bytes(payload)
-                forged_workspace = dict(original_workspace)
-                forged_workspace[field] = forged_ref
-                write_json(
-                    state_dir / state.STATE_FILE,
-                    {
-                        "version": 1,
-                        "reviewer": "codex",
-                        "workspace": forged_workspace,
-                    },
+                review = prepare_workspace(
+                    repo=self.repo,
+                    base_ref=self.base,
+                    head_ref=self.head,
                 )
-                with (
-                    mock.patch.object(providers, "_run_model_chain") as launch,
-                    mock.patch.object(
-                        providers,
-                        "resolve_reviewer_executable",
-                    ) as resolve,
-                ):
-                    exit_code = state.run_state(state_dir=state_dir)
+                state_dir = review.container_dir
+                try:
+                    state._write_state_marker(review)
+                    forged_workspace = review.to_json()
+                    forged_workspace[field] = forged_ref
+                    write_json(
+                        state_dir / state.STATE_FILE,
+                        {
+                            "version": state.STATE_SCHEMA_VERSION,
+                            "reviewer": "codex",
+                            "workspace": forged_workspace,
+                        },
+                    )
+                    with (
+                        mock.patch.object(providers, "_run_model_chain") as launch,
+                        mock.patch.object(
+                            providers,
+                            "resolve_reviewer_executable",
+                        ) as resolve,
+                    ):
+                        exit_code = state.run_state(state_dir=state_dir)
 
-                self.assertEqual(exit_code, 2)
-                launch.assert_not_called()
-                resolve.assert_not_called()
-                self.assertFalse((state_dir / "preflight.json").exists())
-                error = (state_dir / "runner-error.txt").read_text(encoding="utf-8")
-                self.assertIn(
-                    "synthetic secret manifest version or review range is invalid",
-                    error,
-                )
+                    self.assertEqual(exit_code, 2)
+                    launch.assert_not_called()
+                    resolve.assert_not_called()
+                    self.assertFalse((state_dir / "preflight.json").exists())
+                    error = (state_dir / "runner-error.txt").read_text(encoding="utf-8")
+                    self.assertIn(
+                        "synthetic secret manifest version or review range is invalid",
+                        error,
+                    )
+                finally:
+                    if review.workspace_root.exists():
+                        cleanup_workspace(review, keep_container=False)
 
     def test_runner_installs_signal_handler_before_unblocking_inherited_mask(
         self,
     ) -> None:
         state_dir = self.review.container_dir
-        (state_dir / state.STATE_MARKER).write_text(
-            "isolated-review-state-v1\n",
-            encoding="utf-8",
-        )
+        state._write_state_marker(self.review)
         write_json(
             state_dir / state.STATE_FILE,
             {
-                "version": 1,
+                "version": state.STATE_SCHEMA_VERSION,
                 "reviewer": "codex",
                 "workspace": self.review.to_json(),
             },
@@ -1127,14 +1151,11 @@ time.sleep(0.2)
 
     def test_runner_records_signal_between_reviewer_attempts(self) -> None:
         state_dir = self.review.container_dir
-        (state_dir / state.STATE_MARKER).write_text(
-            "isolated-review-state-v1\n",
-            encoding="utf-8",
-        )
+        state._write_state_marker(self.review)
         write_json(
             state_dir / state.STATE_FILE,
             {
-                "version": 1,
+                "version": state.STATE_SCHEMA_VERSION,
                 "reviewer": "codex",
                 "workspace": self.review.to_json(),
             },
@@ -1167,14 +1188,11 @@ time.sleep(0.2)
 
     def test_runner_defers_signal_while_blocking_for_terminal_publish(self) -> None:
         state_dir = self.review.container_dir
-        (state_dir / state.STATE_MARKER).write_text(
-            "isolated-review-state-v1\n",
-            encoding="utf-8",
-        )
+        state._write_state_marker(self.review)
         write_json(
             state_dir / state.STATE_FILE,
             {
-                "version": 1,
+                "version": state.STATE_SCHEMA_VERSION,
                 "reviewer": "codex",
                 "workspace": self.review.to_json(),
             },
@@ -1223,14 +1241,11 @@ time.sleep(0.2)
 
     def test_terminal_runner_keeps_signals_blocked_through_process_exit(self) -> None:
         state_dir = self.review.container_dir
-        (state_dir / state.STATE_MARKER).write_text(
-            "isolated-review-state-v1\n",
-            encoding="utf-8",
-        )
+        state._write_state_marker(self.review)
         write_json(
             state_dir / state.STATE_FILE,
             {
-                "version": 1,
+                "version": state.STATE_SCHEMA_VERSION,
                 "reviewer": "codex",
                 "workspace": self.review.to_json(),
             },

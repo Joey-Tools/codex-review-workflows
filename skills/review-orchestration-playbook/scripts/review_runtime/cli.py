@@ -257,7 +257,8 @@ def _run_foreground(args: argparse.Namespace) -> int:
             if review is not None:
                 if args.keep_workspace:
                     cleanup_error = remove_private_review_artifacts(
-                        review.container_dir
+                        review.container_dir,
+                        expected=review.private_cleanup,
                     )
                     print(
                         f"kept review workspace: {review.container_dir}",

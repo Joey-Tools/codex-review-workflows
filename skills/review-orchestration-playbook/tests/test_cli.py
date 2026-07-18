@@ -15,7 +15,12 @@ SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from review_runtime import cli, providers  # noqa: E402
-from review_runtime.workspace import ReviewWorkspace  # noqa: E402
+from review_runtime.workspace import (  # noqa: E402
+    PRIVATE_HELPER_ARTIFACT_NAMES,
+    CleanupIdentity,
+    PrivateCleanupEvidence,
+    ReviewWorkspace,
+)
 
 
 def prepared_workspace(review):
@@ -24,6 +29,16 @@ def prepared_workspace(review):
         return review
 
     return prepare
+
+
+def private_cleanup_evidence() -> PrivateCleanupEvidence:
+    return PrivateCleanupEvidence(
+        container=CleanupIdentity(device=1, inode=1),
+        artifacts={
+            name: CleanupIdentity(device=1, inode=index + 2)
+            for index, name in enumerate(PRIVATE_HELPER_ARTIFACT_NAMES)
+        },
+    )
 
 
 class ForegroundCleanupTest(unittest.TestCase):
@@ -131,6 +146,7 @@ class ForegroundCleanupTest(unittest.TestCase):
             / ".codex-tmp/isolated-review-test/workspace/.codex-review/review.diff",
             prompt_file=root
             / ".codex-tmp/isolated-review-test/workspace/.codex-review/review.prompt",
+            private_cleanup=private_cleanup_evidence(),
         )
         args = argparse.Namespace(
             repo=str(root),
@@ -179,6 +195,7 @@ class ForegroundCleanupTest(unittest.TestCase):
                 / ".codex-tmp/isolated-review-test/workspace/.codex-review/review.diff",
                 prompt_file=root
                 / ".codex-tmp/isolated-review-test/workspace/.codex-review/review.prompt",
+                private_cleanup=private_cleanup_evidence(),
             )
             args = argparse.Namespace(
                 repo=str(root),
@@ -224,6 +241,7 @@ class ForegroundCleanupTest(unittest.TestCase):
             / ".codex-tmp/isolated-review-test/workspace/.codex-review/review.diff",
             prompt_file=root
             / ".codex-tmp/isolated-review-test/workspace/.codex-review/review.prompt",
+            private_cleanup=private_cleanup_evidence(),
         )
         args = argparse.Namespace(
             repo=str(root),
@@ -257,7 +275,10 @@ class ForegroundCleanupTest(unittest.TestCase):
             returncode = cli._run_foreground(args)
 
         self.assertEqual(returncode, 1)
-        remove_private.assert_called_once_with(review.container_dir)
+        remove_private.assert_called_once_with(
+            review.container_dir,
+            expected=review.private_cleanup,
+        )
         self.assertIn("cleanup failed", stderr.getvalue())
         self.assertIn("kept review workspace", stderr.getvalue())
 
