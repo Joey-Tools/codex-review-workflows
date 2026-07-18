@@ -48,9 +48,11 @@ from .synthetic_tokens import (
 
 # Provider patterns with variable-length bodies capture a complete value through 512
 # bytes, then use a 513-byte prefix branch for oversized values. PEM candidates need
-# a larger bounded window so a complete private-key block can be used as an identity.
+# a larger bounded window so a complete private-key block can be used as an identity;
+# keeping every event end below the overlap preserves its start across read boundaries.
 MAX_PEM_SECRET_BYTES = 32 * 1024
 STREAM_SCAN_OVERLAP = 64 * 1024
+STREAM_SCAN_CHUNK_BYTES = 1024 * 1024
 AWS_SECRET_KEY_NAME_PATTERN = rb"(?i)aws_secret_access_key"
 AWS_SECRET_KEY_PATTERN = re.compile(
     AWS_SECRET_KEY_NAME_PATTERN
@@ -317,6 +319,13 @@ class ControlArtifactState:
     directory: ControlDirectoryEvidence
 
 
+class _IncompleteSecretScanSuffix(Exception):
+    pass
+
+
+_INCOMPLETE_SECRET_SCAN_SUFFIX_RULE = "__incomplete-secret-scan-suffix__"
+
+
 @dataclass
 class SecretScanResult:
     blocking_rule: str | None
@@ -325,10 +334,11 @@ class SecretScanResult:
     blocking_candidates: dict[bytes, set[str]]
     raw_occurrence_counts: Counter[AcceptedSyntheticValue]
     unembedded_occurrence_counts: Counter[AcceptedSyntheticValue]
+    incomplete_suffix_start: int | None
 
     @classmethod
     def empty(cls) -> "SecretScanResult":
-        return cls(None, Counter(), {}, {}, Counter(), Counter())
+        return cls(None, Counter(), {}, {}, Counter(), Counter(), None)
 
     def merge(self, other: "SecretScanResult") -> None:
         if self.blocking_rule is None:
@@ -382,6 +392,28 @@ class SecretScanBudget:
             )
         self.remaining_prefix_proof_bytes -= byte_count
         return True
+
+    def clone(self) -> "SecretScanBudget":
+        return SecretScanBudget(
+            self.remaining,
+            self.remaining_prefix_proof_bytes,
+        )
+
+    def commit_from(self, transaction: "SecretScanBudget") -> None:
+        if (
+            transaction.remaining > self.remaining
+            or transaction.remaining_prefix_proof_bytes
+            > self.remaining_prefix_proof_bytes
+        ):
+            raise ReviewError("sensitive scanner budget transaction is invalid")
+        self.remaining = transaction.remaining
+        self.remaining_prefix_proof_bytes = transaction.remaining_prefix_proof_bytes
+
+
+@dataclass(frozen=True)
+class DiffHunkContext:
+    source_start: int
+    retention_start: int
 
 
 @dataclass
@@ -3301,17 +3333,97 @@ def _starts_quoted_literal(value: bytes) -> bool:
     )
 
 
+def _bounded_diff_hunk_context_before(
+    value: bytes,
+    before: int,
+    *,
+    prefix_context_complete: bool,
+    lookbehind_bytes: int | None = None,
+) -> tuple[DiffHunkContext | None, int]:
+    if lookbehind_bytes is None:
+        lookbehind_bytes = MAX_SECRET_PREFIX_PROOF_BYTES
+    lower_bound = max(0, before - lookbehind_bytes)
+    hunk_marker = max(
+        value.rfind(b"\n@@ ", lower_bound, before),
+        value.rfind(b"\n@@@ ", lower_bound, before),
+    )
+    if (
+        lower_bound == 0
+        and prefix_context_complete
+        and value.startswith((b"@@ ", b"@@@ "))
+    ):
+        hunk_marker = max(hunk_marker, 0)
+    file_marker = value.rfind(
+        b"\ndiff --git ",
+        lower_bound,
+        before,
+    )
+    if (
+        lower_bound == 0
+        and prefix_context_complete
+        and value.startswith(b"diff --git ")
+    ):
+        file_marker = max(file_marker, 0)
+    if hunk_marker < 0 or hunk_marker <= file_marker:
+        return None, lower_bound
+    hunk_start = value.find(b"\n", hunk_marker + 1, before)
+    if hunk_start < 0:
+        return None, lower_bound
+    return (
+        DiffHunkContext(
+            source_start=hunk_start + 1,
+            retention_start=hunk_marker,
+        ),
+        lower_bound,
+    )
+
+
 def _quoted_assignment_may_accept(
     value: bytes,
     match: re.Match[bytes],
     *,
     diff_surface: bool = False,
     prefix_context_complete: bool = True,
+    suffix_context_complete: bool = True,
     event_budget: SecretScanBudget,
 ) -> bool:
     cursor = match.end()
     inspected = 0
     crossed_line_boundary = False
+    skipped_diff_bytes = 0
+    match_line_start = (
+        max(
+            value.rfind(b"\n", 0, match.start()),
+            value.rfind(b"\r", 0, match.start()),
+        )
+        + 1
+    )
+
+    def triple_prefix_is_hunk_content() -> bool:
+        hunk_context, lower_bound = _bounded_diff_hunk_context_before(
+            value,
+            match_line_start,
+            prefix_context_complete=prefix_context_complete,
+        )
+        if not event_budget.consume_prefix_proof(match_line_start - lower_bound):
+            return False
+        return hunk_context is not None
+
+    match_diff_side: int | None = None
+    if (
+        diff_surface
+        and match_line_start < len(value)
+        and value[match_line_start] in (0x2B, 0x2D)
+    ):
+        if (
+            value.startswith(
+                (b"+++ ", b"--- "),
+                match_line_start,
+            )
+            and not triple_prefix_is_hunk_content()
+        ):
+            return False
+        match_diff_side = value[match_line_start]
 
     def advance(count: int) -> bool:
         nonlocal crossed_line_boundary, cursor, inspected
@@ -3366,7 +3478,38 @@ def _quoted_assignment_may_accept(
     def starts_literal() -> bool:
         return _starts_quoted_literal(value[cursor : cursor + 16])
 
+    def skip_opposite_diff_records() -> tuple[bool, bool]:
+        nonlocal crossed_line_boundary, cursor, skipped_diff_bytes
+        skipped = False
+        while (
+            match_diff_side is not None
+            and cursor < len(value)
+            and cursor > 0
+            and value[cursor - 1] == 0x0A
+            and value[cursor] in (0x2B, 0x2D)
+            and value[cursor] != match_diff_side
+        ):
+            line_end = value.find(b"\n", cursor)
+            record_end = len(value) if line_end < 0 else line_end + 1
+            record_size = record_end - cursor
+            if skipped_diff_bytes + record_size > MAX_SECRET_PREFIX_PROOF_BYTES:
+                return False, skipped
+            if not event_budget.consume_prefix_proof(record_size):
+                return False, skipped
+            if record_end == len(value) and not suffix_context_complete:
+                raise _IncompleteSecretScanSuffix
+            skipped_diff_bytes += record_size
+            cursor = record_end
+            crossed_line_boundary = True
+            skipped = True
+        return True, skipped
+
     def trim_diff_record_prefix() -> bool:
+        skip_succeeded, skipped = skip_opposite_diff_records()
+        if not skip_succeeded:
+            return False
+        if skipped and not trim_space():
+            return False
         if (
             diff_surface
             and cursor < len(value)
@@ -3649,53 +3792,47 @@ def _quoted_assignment_may_accept(
             return index < limit and value[index] == 0x28
         return index < limit and value[index] in (0x28, 0x3A)
 
-    def diff_head_prefix() -> bytes | None:
-        lower_bound = max(0, cursor - MAX_SECRET_PREFIX_PROOF_BYTES)
-        markers = (
-            value.rfind(b"\n@@ ", lower_bound, cursor),
-            value.rfind(b"\n@@@ ", lower_bound, cursor),
+    def diff_source_prefix() -> bytes | None:
+        hunk_context, lower_bound = _bounded_diff_hunk_context_before(
+            value,
+            match_line_start,
+            prefix_context_complete=prefix_context_complete,
         )
-        marker = max(markers)
-        if marker >= 0:
-            hunk_start = value.find(b"\n", marker + 1, cursor)
-            if hunk_start < 0:
-                return None
-            hunk_start += 1
-        elif lower_bound == 0 and value.startswith((b"@@ ", b"@@@ ")):
-            hunk_start = value.find(b"\n", 0, cursor)
-            if hunk_start < 0:
-                return None
-            hunk_start += 1
-        elif lower_bound == 0:
+        if hunk_context is None and lower_bound == 0 and prefix_context_complete:
             hunk_start = 0
+        elif hunk_context is None:
+            return None
         else:
-            return None
+            hunk_start = hunk_context.source_start
         raw_prefix = value[hunk_start:cursor]
-        if not event_budget.consume_prefix_proof(len(raw_prefix)):
+        source_proof_bytes = len(raw_prefix) - skipped_diff_bytes
+        if source_proof_bytes < 0 or not event_budget.consume_prefix_proof(
+            source_proof_bytes
+        ):
             return None
-        head_lines: list[bytes] = []
+        source_side = match_diff_side if match_diff_side is not None else 0x2B
+        source_lines: list[bytes] = []
         for line in raw_prefix.splitlines(keepends=True):
-            if line.startswith((b"+", b" ")):
-                if line.startswith(b"+++ "):
-                    return None
-                head_lines.append(line[1:])
-            elif line.startswith(b"-"):
-                if line.startswith(b"--- "):
-                    return None
+            if line.startswith(b" "):
+                source_lines.append(line[1:])
+            elif line.startswith(bytes((source_side,))):
+                source_lines.append(line[1:])
+            elif line.startswith((b"+", b"-")):
+                continue
             elif line.startswith(b"\\ No newline at end of file"):
                 continue
             elif line:
                 return None
-        return b"".join(head_lines)
+        return b"".join(source_lines)
 
     def python_prefix_is_complete() -> bool:
-        if not prefix_context_complete:
-            return False
         if diff_surface:
-            prefix = diff_head_prefix()
+            prefix = diff_source_prefix()
             if prefix is None:
                 return False
         else:
+            if not prefix_context_complete:
+                return False
             prefix = value[:cursor]
             if not event_budget.consume_prefix_proof(len(prefix)):
                 return False
@@ -3725,6 +3862,13 @@ def _quoted_assignment_may_accept(
     def starts_proven_python_declaration() -> bool:
         return starts_top_level_python_declaration() and python_prefix_is_complete()
 
+    def at_proven_end() -> bool:
+        if cursor != len(value):
+            return False
+        if diff_surface and crossed_line_boundary and not suffix_context_complete:
+            raise _IncompleteSecretScanSuffix
+        return True
+
     while True:
         while value.startswith((b")", b"]", b"}"), cursor):
             if not advance(1):
@@ -3739,7 +3883,7 @@ def _quoted_assignment_may_accept(
                 return False
             continue
         break
-    if cursor == len(value):
+    if at_proven_end():
         return True
     if value.startswith(b";", cursor):
         if not advance(1) or not trim_space():
@@ -3748,7 +3892,7 @@ def _quoted_assignment_may_accept(
             if not trim_continuation_trivia():
                 return False
         return (
-            cursor == len(value)
+            at_proven_end()
             or starts_diff_metadata_boundary()
             or starts_named_assignment()
             or starts_proven_python_declaration()
@@ -3771,7 +3915,7 @@ def _quoted_assignment_may_accept(
                     return False
                 continue
             break
-        if cursor == len(value):
+        if at_proven_end():
             return True
         if starts_diff_metadata_boundary():
             return True
@@ -3781,7 +3925,7 @@ def _quoted_assignment_may_accept(
             if starts_trivia() and not trim_continuation_trivia():
                 return False
             return (
-                cursor == len(value)
+                at_proven_end()
                 or starts_diff_metadata_boundary()
                 or starts_named_assignment()
                 or starts_proven_python_declaration()
@@ -4048,11 +4192,7 @@ def _provider_candidate_is_prefix_only(rule: str, candidate: bytes) -> bool:
         "stripe-live-key": (b"sk_live_",),
     }
     actual_prefix = max(
-        (
-            prefix
-            for prefix in prefixes.get(rule, ())
-            if candidate.startswith(prefix)
-        ),
+        (prefix for prefix in prefixes.get(rule, ()) if candidate.startswith(prefix)),
         key=len,
         default=None,
     )
@@ -4093,14 +4233,25 @@ def _record_long_specific_candidate(
 def _iter_secret_events(
     value: bytes,
     *,
+    minimum_end: int = 0,
+    maximum_end: int | None = None,
     diff_surface: bool = False,
     prefix_context_complete: bool = True,
+    suffix_context_complete: bool = True,
     _event_budget: SecretScanBudget | None = None,
+    _specific_spans: set[tuple[int, int, bytes]] | None = None,
+    _accepted_specific_rules: frozenset[str] = frozenset(),
 ) -> Iterator[tuple[str, bytes | None, int, bool, int | None, int | None]]:
     event_budget = _event_budget or SecretScanBudget.default()
+
+    def end_is_committable(end: int) -> bool:
+        return minimum_end < end and (maximum_end is None or end <= maximum_end)
+
+    def match_is_committable(match: re.Match[bytes]) -> bool:
+        return end_is_committable(match.end())
+
     long_specific_candidate_ends: dict[int, set[int]] = {}
     for match in PEM_PRIVATE_KEY_BEGIN.finditer(value):
-        event_budget.consume()
         start = match.start()
         label = match.group("label")
         rule = "pgp-private-key" if label == b"PGP PRIVATE KEY BLOCK" else "private-key"
@@ -4109,31 +4260,63 @@ def _iter_secret_events(
         end_start = value.find(end_marker, match.end(), search_end)
         if end_start >= 0:
             candidate_end = end_start + len(end_marker)
+            candidate = value[start:candidate_end]
             _record_long_specific_candidate(
                 long_specific_candidate_ends,
                 start=start,
                 end=candidate_end,
             )
+            if _specific_spans is not None and (
+                maximum_end is None or candidate_end <= maximum_end
+            ):
+                _specific_spans.add((start, candidate_end, candidate))
+            if not end_is_committable(candidate_end):
+                continue
+            if rule in _accepted_specific_rules:
+                event_budget.consume()
+            event_budget.consume()
             yield (
                 rule,
-                value[start:candidate_end],
+                candidate,
                 candidate_end,
                 True,
                 start,
                 candidate_end,
             )
             continue
-        if len(value) - start >= MAX_PEM_SECRET_BYTES:
-            yield rule, None, start + MAX_PEM_SECRET_BYTES, False, None, None
-        else:
-            yield rule, None, len(value), False, None, None
+        event_end = (
+            start + MAX_PEM_SECRET_BYTES
+            if len(value) - start >= MAX_PEM_SECRET_BYTES
+            else len(value)
+        )
+        if not end_is_committable(event_end):
+            continue
+        if rule in _accepted_specific_rules:
+            event_budget.consume()
+        event_budget.consume()
+        yield rule, None, event_end, False, None, None
     for rule, pattern in SECRET_PATTERNS:
         for match in pattern.finditer(value):
-            event_budget.consume()
             candidate_group: str | int = "aws_secret" if rule == "aws-secret-key" else 0
             start, candidate_end = match.span(candidate_group)
             candidate = match.group(candidate_group)
-            if _provider_candidate_is_prefix_only(rule, candidate):
+            prefix_only = _provider_candidate_is_prefix_only(rule, candidate)
+            if not prefix_only:
+                _record_long_specific_candidate(
+                    long_specific_candidate_ends,
+                    start=start,
+                    end=candidate_end,
+                )
+                if _specific_spans is not None and (
+                    maximum_end is None or match.end() <= maximum_end
+                ):
+                    _specific_spans.add((start, candidate_end, candidate))
+            if not match_is_committable(match):
+                continue
+            if rule in _accepted_specific_rules:
+                event_budget.consume()
+            event_budget.consume()
+            if prefix_only:
                 if any(
                     end >= match.end()
                     for end in long_specific_candidate_ends.get(start, ())
@@ -4141,11 +4324,6 @@ def _iter_secret_events(
                     continue
                 yield rule, None, match.end(), False, None, None
             else:
-                _record_long_specific_candidate(
-                    long_specific_candidate_ends,
-                    start=start,
-                    end=candidate_end,
-                )
                 yield rule, candidate, match.end(), True, start, candidate_end
     for rule, pattern in (
         ("aws-secret-key", OVERSIZED_AWS_SECRET_KEY_GAP),
@@ -4153,6 +4331,8 @@ def _iter_secret_events(
         ("generic-secret-assignment", OVERSIZED_SECRET_ASSIGNMENT_GAP),
     ):
         for match in pattern.finditer(value):
+            if not match_is_committable(match):
+                continue
             event_budget.consume()
             yield rule, None, match.end(), False, None, None
     for pattern, quoted in (
@@ -4160,6 +4340,8 @@ def _iter_secret_events(
         (OVERSIZED_UNQUOTED_SECRET_ASSIGNMENT, False),
     ):
         for match in pattern.finditer(value):
+            if not match_is_committable(match):
+                continue
             event_budget.consume()
             candidate_start = match.end() - 513
             if _oversized_assignment_is_exact_specific_candidate(
@@ -4179,15 +4361,29 @@ def _iter_secret_events(
                 None,
             )
     for match in QUOTED_SECRET_ASSIGNMENT.finditer(value):
+        if not match_is_committable(match):
+            continue
         event_budget.consume()
         candidate = match.group(2)
-        may_accept = _quoted_assignment_may_accept(
-            value,
-            match,
-            diff_surface=diff_surface,
-            prefix_context_complete=prefix_context_complete,
-            event_budget=event_budget,
-        )
+        try:
+            may_accept = _quoted_assignment_may_accept(
+                value,
+                match,
+                diff_surface=diff_surface,
+                prefix_context_complete=prefix_context_complete,
+                suffix_context_complete=suffix_context_complete,
+                event_budget=event_budget,
+            )
+        except _IncompleteSecretScanSuffix:
+            yield (
+                _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE,
+                None,
+                match.end(),
+                False,
+                match.start(),
+                None,
+            )
+            continue
         if not may_accept or not _is_placeholder_secret(candidate.lower()):
             start, candidate_end = match.span(2)
             yield (
@@ -4199,6 +4395,8 @@ def _iter_secret_events(
                 candidate_end,
             )
     for match in UNQUOTED_SECRET_ASSIGNMENT.finditer(value):
+        if not match_is_committable(match):
+            continue
         event_budget.consume()
         candidate = match.group(1)
         may_accept = _unquoted_assignment_may_accept(
@@ -4361,6 +4559,7 @@ def _scan_secret_value(
     reduced_secret_values: frozenset[bytes] = frozenset(),
     diff_surface: bool = False,
     prefix_context_complete: bool = True,
+    suffix_context_complete: bool = True,
     _accepted_index: AcceptedValueIndex | None = None,
     _event_budget: SecretScanBudget | None = None,
     _exact_index: ExactValueIndex | None = None,
@@ -4390,24 +4589,30 @@ def _scan_secret_value(
     accepted_index = _accepted_index or _index_accepted_values(accepted_values)
     event_budget = _event_budget or SecretScanBudget.default()
     specific_spans: set[tuple[int, int, bytes]] = set()
+    accepted_specific_rules = frozenset(
+        rule for rule in accepted_index.rules if rule != "generic-secret-assignment"
+    )
 
     for rule, candidate, end, may_accept, start, candidate_end in _iter_secret_events(
         value,
+        minimum_end=minimum_end,
+        maximum_end=upper,
         diff_surface=diff_surface,
         prefix_context_complete=prefix_context_complete,
+        suffix_context_complete=suffix_context_complete,
         _event_budget=event_budget,
+        _specific_spans=specific_spans,
+        _accepted_specific_rules=accepted_specific_rules,
     ):
-        if (
-            end <= upper
-            and rule != "generic-secret-assignment"
-            and may_accept
-            and candidate is not None
-            and start is not None
-            and candidate_end is not None
-        ):
-            specific_spans.add((start, candidate_end, candidate))
         if not minimum_end < end <= upper:
             continue
+        if rule == _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE:
+            if start is None:
+                raise ReviewError(
+                    "sensitive scanner lost an incomplete diff suffix boundary"
+                )
+            result.incomplete_suffix_start = start
+            return result
         if (
             rule == "generic-secret-assignment"
             and may_accept
@@ -4499,6 +4704,8 @@ def _stream_secret_scan(
     _occurrence_budget: LegacyOccurrenceBudget | None = None,
     _continue_after_blocking: bool = False,
 ) -> SecretScanResult:
+    if size is not None and size < 0:
+        raise ReviewError("sensitive scan size must be nonnegative")
     overlap = STREAM_SCAN_OVERLAP
     accepted = tuple(accepted_values)
     accepted_index = _accepted_index or _index_accepted_values(accepted)
@@ -4519,24 +4726,40 @@ def _stream_secret_scan(
     while True:
         if remaining == 0:
             chunk = b""
+            reached_eof = True
         else:
             preferred_read_size = (
                 MAX_SECRET_PREFIX_PROOF_BYTES + overlap
                 if total_read == 0
-                else 1024 * 1024
+                else STREAM_SCAN_CHUNK_BYTES
             )
             read_size = (
                 preferred_read_size
                 if remaining is None
                 else min(preferred_read_size, remaining)
             )
-            chunk = stream.read(read_size)
-        if not chunk and remaining not in (None, 0):
+            chunk_buffer = bytearray()
+            reached_eof = False
+            # Normalize transport-level short reads into bounded logical chunks
+            # so speculative suffix scans do not depend on stream fragmentation.
+            while len(chunk_buffer) < read_size:
+                requested = read_size - len(chunk_buffer)
+                part = stream.read(requested)
+                if not part:
+                    reached_eof = True
+                    break
+                if len(part) > requested:
+                    raise ReviewError(
+                        "sensitive scan stream returned more bytes than requested"
+                    )
+                chunk_buffer.extend(part)
+            chunk = bytes(chunk_buffer)
+        if reached_eof and remaining not in (None, 0):
             raise ReviewError("unexpected end of Git blob during sensitive scan")
         if remaining is not None:
             remaining -= len(chunk)
         total_read += len(chunk)
-        at_end = not chunk or remaining == 0
+        at_end = reached_eof or remaining == 0
         exact_pending += chunk
         next_committed_start = (
             total_read
@@ -4574,22 +4797,59 @@ def _stream_secret_scan(
         next_committed_end = total_read if at_end else max(0, total_read - overlap)
         local_minimum = max(0, committed_end - pending_offset)
         local_maximum = max(0, next_committed_end - pending_offset)
-        result.merge(
-            _scan_secret_value(
-                pending,
-                accepted_values=accepted,
-                minimum_end=local_minimum,
-                maximum_end=local_maximum,
-                capture_accepted_candidates=capture_accepted_candidates,
-                capture_blocking_candidates=capture_blocking_candidates,
-                reduced_secret_values=reduced_secret_values,
-                diff_surface=diff_surface,
-                prefix_context_complete=pending_offset == 0,
-                _accepted_index=accepted_index,
-                _event_budget=event_budget,
-                _continue_after_blocking=_continue_after_blocking,
-            )
+        # A suffix scan is speculative until its full commit range is proven.
+        # Only the complete scan, or its safe-prefix replay, may spend the
+        # caller-visible logical budget.
+        pending_budget = event_budget.clone()
+        pending_scan = _scan_secret_value(
+            pending,
+            accepted_values=accepted,
+            minimum_end=local_minimum,
+            maximum_end=local_maximum,
+            capture_accepted_candidates=capture_accepted_candidates,
+            capture_blocking_candidates=capture_blocking_candidates,
+            reduced_secret_values=reduced_secret_values,
+            diff_surface=diff_surface,
+            prefix_context_complete=pending_offset == 0,
+            suffix_context_complete=at_end,
+            _accepted_index=accepted_index,
+            _event_budget=pending_budget,
+            _continue_after_blocking=_continue_after_blocking,
         )
+        if pending_scan.incomplete_suffix_start is not None:
+            safe_local_maximum = max(
+                local_minimum,
+                min(local_maximum, pending_scan.incomplete_suffix_start),
+            )
+            if safe_local_maximum > local_minimum:
+                committed_budget = event_budget.clone()
+                committed_scan = _scan_secret_value(
+                    pending,
+                    accepted_values=accepted,
+                    minimum_end=local_minimum,
+                    maximum_end=safe_local_maximum,
+                    capture_accepted_candidates=capture_accepted_candidates,
+                    capture_blocking_candidates=capture_blocking_candidates,
+                    reduced_secret_values=reduced_secret_values,
+                    diff_surface=diff_surface,
+                    prefix_context_complete=pending_offset == 0,
+                    suffix_context_complete=at_end,
+                    _accepted_index=accepted_index,
+                    _event_budget=committed_budget,
+                    _continue_after_blocking=_continue_after_blocking,
+                )
+                if committed_scan.incomplete_suffix_start is not None:
+                    raise ReviewError(
+                        "sensitive scanner could not establish a complete diff prefix"
+                    )
+                event_budget.commit_from(committed_budget)
+                result.merge(committed_scan)
+            # Commit the complete prefix, but retain the deferred assignment
+            # inside the overlap so it is re-evaluated with the next read.
+            next_committed_end = pending_offset + safe_local_maximum
+        else:
+            event_budget.commit_from(pending_budget)
+            result.merge(pending_scan)
         if result.blocking_rule is not None and not _continue_after_blocking:
             blocked = True
             pending = b""
@@ -4597,6 +4857,25 @@ def _stream_secret_scan(
         if at_end:
             break
         retain_from = max(pending_offset, committed_end - overlap)
+        if diff_surface and pending:
+            local_committed_end = min(
+                len(pending),
+                max(0, committed_end - pending_offset),
+            )
+            hunk_context, _lower_bound = _bounded_diff_hunk_context_before(
+                pending,
+                local_committed_end,
+                prefix_context_complete=pending_offset == 0,
+                # A future event may begin inside the retained overlap. Keep
+                # the latest enclosing hunk only while it can still fall
+                # inside that event's bounded proof window.
+                lookbehind_bytes=MAX_SECRET_PREFIX_PROOF_BYTES + overlap,
+            )
+            if hunk_context is not None:
+                retain_from = min(
+                    retain_from,
+                    pending_offset + hunk_context.retention_start,
+                )
         pending = pending[retain_from - pending_offset :]
         pending_offset = retain_from
     return result
