@@ -884,6 +884,40 @@ class WorkspaceTest(unittest.TestCase):
         review_root = self.repo / ".codex-tmp"
         self.assertEqual(len(list(review_root.glob("isolated-review-*"))), 1)
 
+    def test_partial_cleanup_removes_private_paths_when_rmtree_fails(self) -> None:
+        container = pathlib.Path(self.temporary.name) / "partial-container"
+        container.mkdir()
+        private_paths = container / workspace_runtime.PRIVATE_CHANGED_PATHS_NAME
+        private_paths.write_bytes(b"private-path\x00")
+
+        with mock.patch.object(
+            workspace_runtime.shutil,
+            "rmtree",
+            side_effect=PermissionError("permission denied"),
+        ) as remove_tree:
+            cleanup_error = workspace_runtime._remove_partial_container(container)
+
+        self.assertIn("permission denied", cleanup_error or "")
+        remove_tree.assert_called_once_with(container)
+        self.assertTrue(container.exists())
+        self.assertFalse(private_paths.exists())
+
+        symlink_target = pathlib.Path(self.temporary.name) / "symlink-target"
+        symlink_target.mkdir()
+        target_private_paths = (
+            symlink_target / workspace_runtime.PRIVATE_CHANGED_PATHS_NAME
+        )
+        target_private_paths.write_bytes(b"outside\x00")
+        symlink_container = pathlib.Path(self.temporary.name) / "container-link"
+        symlink_container.symlink_to(symlink_target, target_is_directory=True)
+
+        symlink_error = workspace_runtime._remove_private_changed_paths(
+            symlink_container
+        )
+
+        self.assertIsNotNone(symlink_error)
+        self.assertTrue(target_private_paths.exists())
+
     def test_container_handoff_signal_cleans_private_snapshot(self) -> None:
         restore_calls = 0
 

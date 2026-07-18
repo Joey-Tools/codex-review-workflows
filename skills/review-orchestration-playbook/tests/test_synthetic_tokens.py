@@ -814,6 +814,34 @@ class PublicPoolScannerTest(unittest.TestCase):
                 + b"',\n+def test_fixture():\n+    pass\n",
             ),
             (
+                "unclosed-call-after-sibling",
+                b"configure(" + exact_assignment + b', state="expired"\n',
+            ),
+            (
+                "unclosed-call-after-sibling-string-closer",
+                b"configure(" + exact_assignment + b', state=")"\n',
+            ),
+            (
+                "unclosed-json-after-sibling",
+                b'{"access_token": "' + accepted.value + b'", "state": "expired"\n',
+            ),
+            (
+                "unclosed-json-array-after-sibling",
+                b'[{"access_token": "' + accepted.value + b'", "state": "expired"}\n',
+            ),
+            (
+                "diff-unclosed-call-after-sibling",
+                b"+configure(\n+    " + exact_assignment + b',\n+    state="expired"\n',
+            ),
+            (
+                "source-literal-unclosed-logical-call-after-sibling",
+                b"payload = b'configure(" + exact_assignment + b', state="expired"\'\n',
+            ),
+            (
+                "source-literal-missing-outer-quote-after-sibling",
+                b"payload = b'configure(" + exact_assignment + b', state="expired")\n',
+            ),
+            (
                 "indented-declaration",
                 b'{"access_token": "'
                 + accepted.value
@@ -888,6 +916,37 @@ class PublicPoolScannerTest(unittest.TestCase):
         )
         self.assertIsNone(keyword_argument.blocking_rule)
         self.assertEqual(keyword_argument.accepted_counts[accepted], 1)
+
+        source_sibling = workspace._scan_secret_value(
+            b"payload = b'configure(" + exact_assignment + b', state="expired")\'\n',
+            accepted_values=self.accepted,
+        )
+        self.assertIsNone(source_sibling.blocking_rule)
+        self.assertEqual(source_sibling.accepted_counts[accepted], 1)
+
+        triple_source_sibling = workspace._scan_secret_value(
+            b"payload = b'''configure("
+            + exact_assignment
+            + b", state=\"expired\")'''\n",
+            accepted_values=self.accepted,
+        )
+        self.assertIsNone(triple_source_sibling.blocking_rule)
+        self.assertEqual(triple_source_sibling.accepted_counts[accepted], 1)
+
+        physical_source_sibling = workspace._scan_secret_value(
+            b"payload = (b'configure(" + exact_assignment + b', state="expired")\')\n',
+            accepted_values=self.accepted,
+        )
+        self.assertIsNone(physical_source_sibling.blocking_rule)
+        self.assertEqual(physical_source_sibling.accepted_counts[accepted], 1)
+
+        diff_sibling = workspace._scan_secret_value(
+            b"+configure(\n+    " + exact_assignment + b',\n+    state="expired"\n+)\n',
+            accepted_values=self.accepted,
+            diff_surface=True,
+        )
+        self.assertIsNone(diff_sibling.blocking_rule)
+        self.assertEqual(diff_sibling.accepted_counts[accepted], 1)
 
         trailing_comma = workspace._scan_secret_value(
             b"configure(" + exact_assignment + b",)",
@@ -1345,14 +1404,68 @@ class PublicPoolScannerTest(unittest.TestCase):
                     "generic-secret-assignment",
                 )
 
+    def test_source_literal_mapping_key_requires_complete_same_side_wrappers(
+        self,
+    ) -> None:
+        accepted = self.accepted[0]
+        complete_payload = (
+            b'payload = b\'{"OPENAI_API_KEY": "' + accepted.value + b"\"}'\n"
+        )
+        for label, payload, diff_surface in (
+            ("plain", complete_payload, False),
+            ("same-side-diff", b"+" + complete_payload, True),
+        ):
+            with self.subTest(complete=label):
+                complete = workspace._scan_secret_value(
+                    payload,
+                    accepted_values=self.accepted,
+                    diff_surface=diff_surface,
+                )
+                self.assertIsNone(complete.blocking_rule)
+                self.assertEqual(complete.accepted_counts[accepted], 1)
+
+        cases = (
+            (
+                "missing-outer-quote",
+                b'payload = b\'{"OPENAI_API_KEY": "' + accepted.value + b'"}\n',
+                False,
+            ),
+            (
+                "missing-logical-object-closer",
+                b'payload = b\'{"OPENAI_API_KEY": "' + accepted.value + b"\"'\n",
+                False,
+            ),
+            (
+                "escaped-mapping-key-opener",
+                b"payload = b'{"
+                + b'\\"OPENAI_API_KEY": "'
+                + accepted.value
+                + b"\"}'\n",
+                False,
+            ),
+            (
+                "opposite-side-wrapper-closers",
+                b'+payload = b\'{"OPENAI_API_KEY": "' + accepted.value + b"\"\n-}'\n",
+                True,
+            ),
+        )
+        for label, payload, diff_surface in cases:
+            with self.subTest(case=label):
+                scan = workspace._scan_secret_value(
+                    payload,
+                    accepted_values=self.accepted,
+                    diff_surface=diff_surface,
+                )
+                self.assertEqual(
+                    scan.blocking_rule,
+                    "generic-secret-assignment",
+                )
+                self.assertEqual(scan.accepted_counts[accepted], 0)
+
     def test_diff_quoted_assignment_respects_record_side(self) -> None:
         accepted = self.accepted[0]
-        quoted_mapping = (
-            b'        "OPENAI_API_KEY": "' + accepted.value + b'",\n'
-        )
-        long_replacement = (
-            b"        replacement(" + b"argument, " * 40 + b")\n"
-        )
+        quoted_mapping = b'        "OPENAI_API_KEY": "' + accepted.value + b'",\n'
+        long_replacement = b"        replacement(" + b"argument, " * 40 + b")\n"
         self.assertGreater(
             len(long_replacement),
             workspace.MAX_SECRET_ASSIGNMENT_TRAILING_BYTES,
@@ -1401,9 +1514,7 @@ class PublicPoolScannerTest(unittest.TestCase):
                 self.assertIsNone(scan.blocking_rule)
                 self.assertEqual(scan.accepted_counts[accepted], 1)
 
-        declaration_assignment = (
-            b'OPENAI_API_KEY = "' + accepted.value + b'",\n'
-        )
+        declaration_assignment = b'OPENAI_API_KEY = "' + accepted.value + b'",\n'
         for label, hunk_header, opposite_record, source_side in (
             (
                 "base-prefix-after-triple-plus",
@@ -1437,9 +1548,7 @@ class PublicPoolScannerTest(unittest.TestCase):
                 self.assertIsNone(scan.blocking_rule)
                 self.assertEqual(scan.accepted_counts[accepted], 1)
 
-        triple_assignment = (
-            b'OPENAI_API_KEY = "' + accepted.value + b'",\n'
-        )
+        triple_assignment = b'OPENAI_API_KEY = "' + accepted.value + b'",\n'
         for label, record_prefix, opposite_side in (
             ("triple-plus-matched-record", b"+++ ", b"-"),
             ("triple-minus-matched-record", b"--- ", b"+"),
@@ -1463,10 +1572,7 @@ class PublicPoolScannerTest(unittest.TestCase):
         actual_file_header = workspace._scan_secret_value(
             b"diff --git a/fixture.py b/fixture.py\n"
             b"--- a/fixture.py\n"
-            b'+++ OPENAI_API_KEY = "'
-            + accepted.value
-            + b'",\n'
-            + b"@@ -1 +1 @@\n",
+            b'+++ OPENAI_API_KEY = "' + accepted.value + b'",\n' + b"@@ -1 +1 @@\n",
             accepted_values=self.accepted,
             diff_surface=True,
         )
@@ -1476,11 +1582,7 @@ class PublicPoolScannerTest(unittest.TestCase):
         )
 
         incomplete_prefix_hunk = workspace._scan_secret_value(
-            b"@@ -1 +1 @@\n"
-            b"+++ "
-            + triple_assignment
-            + b"-"
-            + long_replacement,
+            b"@@ -1 +1 @@\n+++ " + triple_assignment + b"-" + long_replacement,
             accepted_values=self.accepted,
             diff_surface=True,
             prefix_context_complete=False,
@@ -1496,11 +1598,7 @@ class PublicPoolScannerTest(unittest.TestCase):
             64,
         ):
             out_of_range_hunk = workspace._scan_secret_value(
-                b"@@ -1 +1 @@\n"
-                + b" "
-                + b"x" * 128
-                + b"\n+++ "
-                + triple_assignment,
+                b"@@ -1 +1 @@\n" + b" " + b"x" * 128 + b"\n+++ " + triple_assignment,
                 accepted_values=self.accepted,
                 diff_surface=True,
             )
@@ -1519,10 +1617,7 @@ class PublicPoolScannerTest(unittest.TestCase):
                 b"--- a/fixture.py\n"
                 b"+++ b/fixture.py\n"
                 b"@@ -1 +1 @@\n"
-                b"+++ "
-                + triple_assignment
-                + b"-"
-                + long_replacement,
+                b"+++ " + triple_assignment + b"-" + long_replacement,
                 accepted_values=self.accepted,
                 diff_surface=True,
                 _event_budget=exhausted_hunk_budget,
@@ -1547,21 +1642,14 @@ class PublicPoolScannerTest(unittest.TestCase):
         )
 
         proof_bytes = 4096
-        long_opposite_record = (
-            b"+" + b"x" * (proof_bytes - 2) + b"\n"
-        )
+        long_opposite_record = b"+" + b"x" * (proof_bytes - 2) + b"\n"
         long_opposite_payload = (
             b"@@ -1,3 +1,1 @@\n"
-            b"-"
-            + triple_assignment
-            + long_opposite_record
-            + b"-def test_fixture():\n"
+            b"-" + triple_assignment + long_opposite_record + b"-def test_fixture():\n"
             b"-    pass\n"
         )
         exact_proof_budget = (
-            len(long_opposite_record)
-            + len(b"-" + triple_assignment)
-            + 1
+            len(long_opposite_record) + len(b"-" + triple_assignment) + 1
         )
         long_opposite_budget = workspace.SecretScanBudget(
             workspace.MAX_SECRET_SCAN_EVENTS,
@@ -1792,21 +1880,17 @@ class PublicPoolScannerTest(unittest.TestCase):
             boundary_value = hunk_header + b"x" * (
                 retention_lookbehind + 1 - len(hunk_header)
             )
-            exact_context, exact_lower = (
-                workspace._bounded_diff_hunk_context_before(
-                    boundary_value,
-                    retention_lookbehind,
-                    prefix_context_complete=True,
-                    lookbehind_bytes=retention_lookbehind,
-                )
+            exact_context, exact_lower = workspace._bounded_diff_hunk_context_before(
+                boundary_value,
+                retention_lookbehind,
+                prefix_context_complete=True,
+                lookbehind_bytes=retention_lookbehind,
             )
-            over_context, over_lower = (
-                workspace._bounded_diff_hunk_context_before(
-                    boundary_value,
-                    retention_lookbehind + 1,
-                    prefix_context_complete=True,
-                    lookbehind_bytes=retention_lookbehind,
-                )
+            over_context, over_lower = workspace._bounded_diff_hunk_context_before(
+                boundary_value,
+                retention_lookbehind + 1,
+                prefix_context_complete=True,
+                lookbehind_bytes=retention_lookbehind,
             )
             self.assertIsNotNone(exact_context)
             self.assertEqual(exact_lower, 0)
@@ -1820,10 +1904,7 @@ class PublicPoolScannerTest(unittest.TestCase):
         ):
             with self.subTest(blocked_continuation=label):
                 scan = workspace._scan_secret_value(
-                    b"-"
-                    + quoted_mapping
-                    + b"+replacement()\n"
-                    + continuation,
+                    b"-" + quoted_mapping + b"+replacement()\n" + continuation,
                     accepted_values=self.accepted,
                     diff_surface=True,
                 )
@@ -1835,9 +1916,7 @@ class PublicPoolScannerTest(unittest.TestCase):
         incomplete_base_prefix = workspace._scan_secret_value(
             b"@@ -1,3 +1,1 @@\n"
             b"-configure(\n"
-            b"-"
-            + quoted_mapping
-            + b"+replacement()\n"
+            b"-" + quoted_mapping + b"+replacement()\n"
             b"-def test_fixture():\n"
             b"-    pass\n",
             accepted_values=self.accepted,
@@ -1875,19 +1954,18 @@ class PublicPoolScannerTest(unittest.TestCase):
             "generic-secret-assignment",
         )
 
+    @mock.patch.object(workspace, "MAX_SECRET_PREFIX_PROOF_BYTES", 8192)
+    @mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", 256)
+    @mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 1024)
     def test_diff_opposite_record_continuation_survives_stream_boundary(
         self,
     ) -> None:
         accepted = self.accepted[0]
-        quoted_assignment = (
-            b'-OPENAI_API_KEY = "' + accepted.value + b'",\n'
-        )
+        quoted_assignment = b'-OPENAI_API_KEY = "' + accepted.value + b'",\n'
         padding_size = workspace.MAX_SECRET_PREFIX_PROOF_BYTES - 1024
         padding = b" " + b"x" * padding_size + b"\n"
         opposite_record = (
-            b"+replacement("
-            + b"x" * (workspace.STREAM_SCAN_OVERLAP + 4096)
-            + b")\n"
+            b"+replacement(" + b"x" * (workspace.STREAM_SCAN_OVERLAP + 4096) + b")\n"
         )
         adjacent_secret = b'"ActualOpaque' + b'SecretA9Z8Y7"'
         payload = (
@@ -1912,21 +1990,14 @@ class PublicPoolScannerTest(unittest.TestCase):
         )
 
         first_read_size = (
-            workspace.MAX_SECRET_PREFIX_PROOF_BYTES
-            + workspace.STREAM_SCAN_OVERLAP
+            workspace.MAX_SECRET_PREFIX_PROOF_BYTES + workspace.STREAM_SCAN_OVERLAP
         )
         boundary_prefix = padding + quoted_assignment
         boundary_opposite = (
-            b"+"
-            + b"x" * (first_read_size - len(boundary_prefix) - 2)
-            + b"\n"
+            b"+" + b"x" * (first_read_size - len(boundary_prefix) - 2) + b"\n"
         )
         boundary_payload = (
-            boundary_prefix
-            + boundary_opposite
-            + b"     + "
-            + adjacent_secret
-            + b"\n"
+            boundary_prefix + boundary_opposite + b"     + " + adjacent_secret + b"\n"
         )
         boundary_scan = workspace._stream_secret_scan(
             io.BytesIO(boundary_payload),
@@ -1952,18 +2023,11 @@ class PublicPoolScannerTest(unittest.TestCase):
                 partial_opposite = (
                     opposite_side
                     + b"x"
-                    * (
-                        first_read_size
-                        - len(case_prefix)
-                        - len(partial_record)
-                        - 2
-                    )
+                    * (first_read_size - len(case_prefix) - len(partial_record) - 2)
                     + b"\n"
                 )
                 partial_chunk = case_prefix + partial_opposite + partial_record
-                partial_payload = (
-                    partial_chunk + b"+ " + adjacent_secret + b"\n"
-                )
+                partial_payload = partial_chunk + b"+ " + adjacent_secret + b"\n"
                 direct_scan = workspace._scan_secret_value(
                     partial_chunk,
                     accepted_values=self.accepted,
@@ -1991,9 +2055,7 @@ class PublicPoolScannerTest(unittest.TestCase):
                     "generic-secret-assignment",
                 )
 
-        safe_payload = (
-            padding + quoted_assignment + opposite_record.removesuffix(b"\n")
-        )
+        safe_payload = padding + quoted_assignment + opposite_record.removesuffix(b"\n")
         safe_scan = workspace._stream_secret_scan(
             io.BytesIO(safe_payload),
             size=len(safe_payload),
@@ -2013,9 +2075,7 @@ class PublicPoolScannerTest(unittest.TestCase):
         self.assertIsNone(safe_complete_scan.blocking_rule)
         self.assertEqual(safe_complete_scan.accepted_counts[accepted], 1)
 
-        safe_partial_payload = (
-            boundary_prefix + b"+replacement()\n-    "
-        )
+        safe_partial_payload = boundary_prefix + b"+replacement()\n-    "
         safe_partial_scan = workspace._stream_secret_scan(
             io.BytesIO(safe_partial_payload),
             size=len(safe_partial_payload),
@@ -2025,9 +2085,7 @@ class PublicPoolScannerTest(unittest.TestCase):
         self.assertIsNone(safe_partial_scan.blocking_rule)
         self.assertEqual(safe_partial_scan.accepted_counts[accepted], 1)
 
-        safe_head_partial_payload = (
-            head_boundary_prefix + b"-replacement()\n+    "
-        )
+        safe_head_partial_payload = head_boundary_prefix + b"-replacement()\n+    "
         safe_head_partial_scan = workspace._stream_secret_scan(
             io.BytesIO(safe_head_partial_payload),
             size=len(safe_head_partial_payload),
@@ -2039,18 +2097,19 @@ class PublicPoolScannerTest(unittest.TestCase):
 
     def test_diff_incomplete_suffix_commits_each_complete_prefix(self) -> None:
         accepted = self.accepted[0]
-        proof_bytes = 4096
+        proof_bytes = 16 * 1024
         overlap = 256
         first_read_size = proof_bytes + overlap
         assignment = b'-OPENAI_API_KEY = "' + accepted.value + b'",\n'
         opposite_start = b"+replacement("
-        padding_size = proof_bytes - len(assignment) - 64
-        padding = b" " + b"x" * (padding_size - 2) + b"\n"
-        first_prefix = padding + assignment + opposite_start
-        segments = [
-            first_prefix + b"x" * (first_read_size - len(first_prefix))
-        ]
         assignment_count = 8
+        hunk_header = f"@@ -1,{assignment_count} +1,{assignment_count} @@\n".encode(
+            "ascii"
+        )
+        padding_size = proof_bytes - len(hunk_header) - len(assignment) - 64
+        padding = b" " + b"x" * (padding_size - 2) + b"\n"
+        first_prefix = padding + hunk_header + assignment + opposite_start
+        segments = [first_prefix + b"x" * (first_read_size - len(first_prefix))]
         for _index in range(assignment_count - 1):
             next_prefix = b"x" * 64 + b")\n" + assignment + opposite_start
             segments.append(next_prefix + b"x" * (1024 - len(next_prefix)))
@@ -2069,11 +2128,21 @@ class PublicPoolScannerTest(unittest.TestCase):
                 return chunk
 
         pending_lengths: list[int] = []
+        scan_calls: list[tuple[bytes, int, int | None, int | None]] = []
         original_scan = workspace._scan_secret_value
 
         def recording_scan(value: bytes, **kwargs):
             pending_lengths.append(len(value))
-            return original_scan(value, **kwargs)
+            result = original_scan(value, **kwargs)
+            scan_calls.append(
+                (
+                    value,
+                    kwargs.get("minimum_end", 0),
+                    kwargs.get("maximum_end"),
+                    result.incomplete_suffix_start,
+                )
+            )
+            return result
 
         with (
             mock.patch.object(
@@ -2099,6 +2168,90 @@ class PublicPoolScannerTest(unittest.TestCase):
         self.assertEqual(scan.accepted_counts[accepted], assignment_count)
         self.assertTrue(pending_lengths)
         self.assertLessEqual(max(pending_lengths), first_read_size)
+        incomplete_calls = [
+            (index, value, minimum_end, incomplete_start)
+            for index, (
+                value,
+                minimum_end,
+                _maximum_end,
+                incomplete_start,
+            ) in enumerate(scan_calls)
+            if incomplete_start is not None
+        ]
+        self.assertEqual(len(incomplete_calls), assignment_count)
+        incomplete_minimums = [
+            minimum_end
+            for _index, _value, minimum_end, _incomplete_start in incomplete_calls
+        ]
+        self.assertEqual(incomplete_minimums, sorted(incomplete_minimums))
+        self.assertEqual(len(set(incomplete_minimums)), assignment_count)
+        for index, value, minimum_end, incomplete_start in incomplete_calls:
+            self.assertIsNotNone(
+                workspace.QUOTED_SECRET_ASSIGNMENT.match(value, incomplete_start)
+            )
+            replay_value, replay_minimum, replay_maximum, replay_incomplete = (
+                scan_calls[index + 1]
+            )
+            self.assertEqual(replay_value, value)
+            self.assertEqual(replay_minimum, minimum_end)
+            self.assertEqual(replay_maximum, incomplete_start)
+            self.assertIsNone(replay_incomplete)
+
+        pem_proof_bytes = 4096
+        pem_overlap = 256
+        pem_first_read = pem_proof_bytes + pem_overlap
+        pem_assignment = b'-OPENAI_API_KEY = "' + accepted.value + b'",\n'
+        pem_begin = b"------BEGIN PRIVATE KEY-----\n"
+        pem_begin_line_start = pem_proof_bytes - pem_overlap - 512
+        pem_assignment_line_start = pem_proof_bytes - 128
+        pem_padding = b" " + b"x" * (pem_begin_line_start - 2) + b"\n"
+        pem_gap_size = pem_assignment_line_start - pem_begin_line_start - len(pem_begin)
+        pem_gap = b"-" + b"A" * (pem_gap_size - 2) + b"\n"
+        pem_prefix = pem_padding + pem_begin + pem_gap + pem_assignment
+        pem_opposite_start = b"+replacement("
+        pem_first_chunk = (
+            pem_prefix
+            + pem_opposite_start
+            + b"x" * (pem_first_read - len(pem_prefix) - len(pem_opposite_start))
+        )
+        pem_second_chunk = b"x" * 64 + b")\n+-----END PRIVATE KEY-----\n"
+        pem_payload = pem_first_chunk + pem_second_chunk
+        pem_begin_match = workspace.PEM_PRIVATE_KEY_BEGIN.search(pem_first_chunk)
+        pem_assignment_match = workspace.QUOTED_SECRET_ASSIGNMENT.search(
+            pem_first_chunk
+        )
+        self.assertIsNotNone(pem_begin_match)
+        self.assertIsNotNone(pem_assignment_match)
+        self.assertEqual(len(pem_first_chunk), pem_first_read)
+        self.assertLessEqual(pem_assignment_match.end(), pem_proof_bytes)
+        self.assertGreater(
+            pem_assignment_match.start() - pem_begin_match.start(),
+            pem_overlap,
+        )
+
+        with (
+            mock.patch.object(
+                workspace,
+                "MAX_SECRET_PREFIX_PROOF_BYTES",
+                pem_proof_bytes,
+            ),
+            mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", pem_overlap),
+            mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 1024),
+        ):
+            pem_direct = workspace._scan_secret_value(
+                pem_payload,
+                accepted_values=self.accepted,
+                diff_surface=True,
+            )
+            pem_stream = workspace._stream_secret_scan(
+                io.BytesIO(pem_payload),
+                size=len(pem_payload),
+                accepted_values=self.accepted,
+                diff_surface=True,
+            )
+
+        self.assertEqual(pem_direct.blocking_rule, "private-key")
+        self.assertEqual(pem_stream.blocking_rule, "private-key")
 
     def test_diff_incomplete_suffix_does_not_recharge_deferred_match(
         self,
@@ -2131,7 +2284,7 @@ class PublicPoolScannerTest(unittest.TestCase):
 
         budget = workspace.SecretScanBudget(
             workspace.MAX_SECRET_SCAN_EVENTS,
-            remaining_prefix_proof_bytes=1200,
+            remaining_prefix_proof_bytes=proof_bytes + 1200,
         )
         with (
             mock.patch.object(
@@ -2163,21 +2316,16 @@ class PublicPoolScannerTest(unittest.TestCase):
         overlap = 256
         first_read_size = proof_bytes + overlap
         safe_assignments = (
-            b"access_token = "
+            b"-access_token = "
             + accepted.value
-            + b"\naccess_token = "
+            + b"\n-access_token = "
             + accepted.value
             + b"\n"
         )
-        deferred_assignment = (
-            b'-OPENAI_API_KEY = "' + accepted.value + b'",\n'
-        )
+        deferred_assignment = b'-OPENAI_API_KEY = "' + accepted.value + b'",\n'
         opposite_start = b"+replacement("
         padding_size = (
-            proof_bytes
-            - len(safe_assignments)
-            - len(deferred_assignment)
-            - 64
+            proof_bytes - len(safe_assignments) - len(deferred_assignment) - 64
         )
         first_prefix = (
             b" "
@@ -2187,9 +2335,7 @@ class PublicPoolScannerTest(unittest.TestCase):
             + deferred_assignment
             + opposite_start
         )
-        first_chunk = first_prefix + b"x" * (
-            first_read_size - len(first_prefix)
-        )
+        first_chunk = first_prefix + b"x" * (first_read_size - len(first_prefix))
         payload = first_chunk + b"x" * 64 + b")\n"
         budget = workspace.SecretScanBudget(3)
 
@@ -2246,23 +2392,22 @@ class PublicPoolScannerTest(unittest.TestCase):
         opposite_record = b"+replacement(" + b"x" * 512 + b")\n"
         padding_size = proof_bytes - len(assignment) - 64
         payload = (
-            b" "
-            + b"x" * (padding_size - 2)
-            + b"\n"
-            + assignment
-            + opposite_record
+            b" " + b"x" * (padding_size - 2) + b"\n" + assignment + opposite_record
         )
+        assignment_match = workspace.QUOTED_SECRET_ASSIGNMENT.search(payload)
+        self.assertIsNotNone(assignment_match)
+        exact_proof_budget = assignment_match.start() + len(opposite_record)
         direct_budget = workspace.SecretScanBudget(
             1,
-            remaining_prefix_proof_bytes=len(opposite_record),
+            remaining_prefix_proof_bytes=exact_proof_budget,
         )
         bytesio_budget = workspace.SecretScanBudget(
             1,
-            remaining_prefix_proof_bytes=len(opposite_record),
+            remaining_prefix_proof_bytes=exact_proof_budget,
         )
         short_read_budget = workspace.SecretScanBudget(
             1,
-            remaining_prefix_proof_bytes=len(opposite_record),
+            remaining_prefix_proof_bytes=exact_proof_budget,
         )
 
         class OneByteReadStream(io.BytesIO):
@@ -2368,7 +2513,7 @@ class PublicPoolScannerTest(unittest.TestCase):
                 "default",
                 return_value=workspace.SecretScanBudget(
                     workspace.MAX_SECRET_SCAN_EVENTS,
-                    remaining_prefix_proof_bytes=len(opposite_record) - 1,
+                    remaining_prefix_proof_bytes=exact_proof_budget - 1,
                 ),
             ),
             self.assertRaisesRegex(ReviewError, "prefix proof limit"),
@@ -2379,6 +2524,41 @@ class PublicPoolScannerTest(unittest.TestCase):
                 accepted_values=self.accepted,
                 diff_surface=True,
             )
+
+    def test_diff_source_proof_watermark_preserves_per_assignment_limit(
+        self,
+    ) -> None:
+        accepted = self.accepted[0]
+        payload = (
+            b"@@ -1,3 +1,1 @@\n"
+            b"-#"
+            + b"x" * 12
+            + b"\n"
+            + b'-OPENAI_API_KEY = "'
+            + accepted.value
+            + b'",\n'
+            + b"-def test_fixture():\n"
+            + b"-    pass\n"
+        )
+        budget = workspace.SecretScanBudget(
+            workspace.MAX_SECRET_SCAN_EVENTS,
+            remaining_prefix_proof_bytes=workspace.MAX_SECRET_PREFIX_PROOF_TOTAL_BYTES,
+        )
+
+        with mock.patch.object(
+            workspace,
+            "MAX_SECRET_PREFIX_PROOF_BYTES",
+            64,
+        ):
+            scan = workspace._scan_secret_value(
+                payload,
+                accepted_values=self.accepted,
+                diff_surface=True,
+                _event_budget=budget,
+            )
+
+        self.assertEqual(scan.blocking_rule, "generic-secret-assignment")
+        self.assertEqual(scan.accepted_counts[accepted], 0)
 
     def test_stream_scan_rejects_invalid_known_size(self) -> None:
         with self.assertRaisesRegex(ReviewError, "size must be nonnegative"):
@@ -2889,18 +3069,96 @@ class PublicPoolScannerTest(unittest.TestCase):
                 b'[{"api_token": "' + candidate + b'")]\n',
             ),
             (
-                "diff-external-function-mismatch",
-                b"@@ -1 +1 @@\n"
-                + b'+configure(api_token = "'
+                "external-function-missing",
+                b'configure(api_token = "' + candidate + b'"\n',
+            ),
+            (
+                "external-json-missing",
+                b'[{"api_token": "' + candidate + b'"}\n',
+            ),
+            (
+                "external-function-missing-after-sibling",
+                b'configure(api_token = "' + candidate + b'", state = "expired"\n',
+            ),
+            (
+                "external-function-string-closer-after-sibling",
+                b'configure(api_token = "' + candidate + b'", state = ")"\n',
+            ),
+            (
+                "external-json-missing-after-sibling",
+                b'[{"api_token": "' + candidate + b'", "state": "expired"}\n',
+            ),
+            (
+                "unclosed-source-string-across-line",
+                b'payload = "\napi_token = "' + candidate + b'"\n',
+            ),
+            (
+                "unclosed-triple-source-string",
+                b'payload = """\napi_token = "' + candidate + b'"\n',
+            ),
+            (
+                "escaped-source-string-prefix",
+                b'payload = "prefix\\n api_token = "' + candidate + b'"\n',
+            ),
+            (
+                "unclosed-block-comment-prefix",
+                b'/* fixture api_token = "' + candidate + b'"\n',
+            ),
+            (
+                "unclosed-line-comment-prefix",
+                b'// fixture api_token = "' + candidate + b'"',
+            ),
+            (
+                "unclosed-hash-comment-prefix",
+                b'# fixture api_token = "' + candidate + b'"',
+            ),
+            (
+                "nested-source-marker",
+                b'payload = "br\'configure(api_token = "'
                 + candidate
-                + b'"]\n',
+                + b'", state = "expired")\'\n',
+            ),
+            (
+                "triple-source-missing-logical-closer",
+                b"payload = b'''configure(api_token = \""
+                + candidate
+                + b"\", state = \"expired\"'''\n",
+            ),
+            (
+                "external-function-missing-before-statement",
+                b'configure(api_token = "' + candidate + b'"\nstate = "expired"\n',
+            ),
+            (
+                "diff-external-function-mismatch",
+                b"@@ -1 +1 @@\n" + b'+configure(api_token = "' + candidate + b'"]\n',
             ),
             (
                 "diff-external-json-mismatch",
-                b"@@ -1 +1 @@\n"
-                + b'+[{"api_token": "'
+                b"@@ -1 +1 @@\n" + b'+[{"api_token": "' + candidate + b'")]\n',
+            ),
+            (
+                "diff-external-function-missing",
+                b"@@ -1 +1 @@\n" + b'+configure(api_token = "' + candidate + b'"\n',
+            ),
+            (
+                "diff-external-json-missing",
+                b"@@ -1 +1 @@\n" + b'+[{"api_token": "' + candidate + b'"}\n',
+            ),
+            (
+                "diff-external-function-missing-after-sibling",
+                b"@@ -1 +1,2 @@\n"
+                + b'+configure(api_token = "'
                 + candidate
-                + b'")]\n',
+                + b'",\n'
+                + b'+    state = "expired"\n',
+            ),
+            (
+                "diff-external-function-opposite-only-closer",
+                b"@@ -1 +1,2 @@\n"
+                + b'+configure(api_token = "'
+                + candidate
+                + b'"\n'
+                + b"-)\n",
             ),
         )
         for label, payload in cases:
@@ -2923,19 +3181,70 @@ class PublicPoolScannerTest(unittest.TestCase):
 
     def test_unclosed_rhs_wrapper_preserves_incomplete_suffix_state(self) -> None:
         candidate = b"ghp_" + b"A" * 36
-        scan = workspace._scan_secret_value(
+        cases = (
             b"api_token = (" + candidate,
-            capture_blocking_candidates=True,
-            _continue_after_blocking=True,
-            suffix_context_complete=False,
+            b'configure(api_token = "' + candidate + b'"',
+            b'[{"api_token": "' + candidate + b'"}',
+            b'configure(api_token = "' + candidate + b'", state = "expired"',
+            b'[{"api_token": "' + candidate + b'", "state": "expired"}',
         )
+        for payload in cases:
+            with self.subTest(payload=payload):
+                scan = workspace._scan_secret_value(
+                    payload,
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                    suffix_context_complete=False,
+                )
 
-        self.assertIsNone(scan.blocking_rule)
-        self.assertIsNotNone(scan.incomplete_suffix_start)
-        self.assertEqual(
-            scan.blocking_candidates,
-            {candidate: {"github-token"}},
+                self.assertIsNone(scan.blocking_rule)
+                self.assertIsNotNone(scan.incomplete_suffix_start)
+                self.assertEqual(
+                    scan.blocking_candidates,
+                    {candidate: {"github-token"}},
+                )
+
+    def test_provider_rhs_discovery_is_bounded_by_specific_spans_and_budget(
+        self,
+    ) -> None:
+        class ForbiddenPattern:
+            def finditer(self, _value: bytes):
+                raise AssertionError("assignment discovery should be skipped")
+
+        repeated_keys = b"password=" * (256 * 1024 // len(b"password="))
+        with mock.patch.object(
+            workspace,
+            "SECRET_ASSIGNMENT_PREFIX",
+            ForbiddenPattern(),
+        ):
+            scan = workspace._scan_secret_value(repeated_keys)
+        self.assertEqual(scan.blocking_rule, "generic-secret-assignment")
+
+        candidate = b"ghp_" + b"A" * 36
+        committed_payload = candidate + b"\n" + repeated_keys
+        with mock.patch.object(
+            workspace,
+            "SECRET_ASSIGNMENT_PREFIX",
+            ForbiddenPattern(),
+        ):
+            committed_scan = workspace._scan_secret_value(
+                committed_payload,
+                minimum_end=len(committed_payload),
+            )
+        self.assertIsNone(committed_scan.blocking_rule)
+
+        provider_payload = b"password=" * 64 + candidate + b"\n"
+        budget = workspace.SecretScanBudget(
+            workspace.MAX_SECRET_SCAN_EVENTS,
+            remaining_prefix_proof_bytes=64,
         )
+        with self.assertRaisesRegex(ReviewError, "prefix proof limit"):
+            workspace._scan_secret_value(
+                provider_payload,
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+                _event_budget=budget,
+            )
 
     def test_short_provider_candidate_keeps_incomplete_quoted_rhs_blocker(
         self,
@@ -2945,47 +3254,32 @@ class PublicPoolScannerTest(unittest.TestCase):
         cases = (
             (
                 "shell-continuation",
-                assignment_prefix + candidate + b"\\\ncontinued\"\n",
+                assignment_prefix + candidate + b'\\\ncontinued"\n',
                 False,
             ),
             (
                 "diff-same-side-continuation",
-                b"+"
-                + assignment_prefix
-                + candidate
-                + b"\\\n+continued\"\n",
+                b"+" + assignment_prefix + candidate + b'\\\n+continued"\n',
                 True,
             ),
             (
                 "single-quote-crlf",
-                b"api_"
-                + b"token = '"
-                + candidate
-                + b"\\\r\ncontinued'\r\n",
+                b"api_" + b"token = '" + candidate + b"\\\r\ncontinued'\r\n",
                 False,
             ),
             (
                 "raw-prefix",
-                b"api_"
-                + b'token = r"'
-                + candidate
-                + b"\\\ncontinued\"\n",
+                b"api_" + b'token = r"' + candidate + b'\\\ncontinued"\n',
                 False,
             ),
             (
                 "triple-quoted",
-                b"api_"
-                + b'token = """'
-                + candidate
-                + b"\ncontinued\"\"\"\n",
+                b"api_" + b'token = """' + candidate + b'\ncontinued"""\n',
                 False,
             ),
             (
                 "provider-on-later-line",
-                b"api_"
-                + b'token = "\\\n'
-                + candidate
-                + b"\\\ncontinued\"\n",
+                b"api_" + b'token = "\\\n' + candidate + b'\\\ncontinued"\n',
                 False,
             ),
             (
@@ -3019,21 +3313,15 @@ class PublicPoolScannerTest(unittest.TestCase):
         cases = (
             (
                 "double-quoted",
-                b'api_token = "prefix\\"wrap/'
-                + candidate
-                + b'+alpha"\n',
+                b'api_token = "prefix\\"wrap/' + candidate + b'+alpha"\n',
             ),
             (
                 "single-quoted",
-                b"api_token = 'prefix\\'wrap/"
-                + candidate
-                + b"+alpha'\n",
+                b"api_token = 'prefix\\'wrap/" + candidate + b"+alpha'\n",
             ),
             (
                 "triple-quoted",
-                b'api_token = """prefix\\"""wrap/'
-                + candidate
-                + b'+alpha"""\n',
+                b'api_token = """prefix\\"""wrap/' + candidate + b'+alpha"""\n',
             ),
         )
         for label, payload in cases:
@@ -3068,9 +3356,7 @@ class PublicPoolScannerTest(unittest.TestCase):
             ),
             (
                 "triple-first-literal",
-                b'api_token = """x""" "wrap/'
-                + candidate
-                + b'+alpha"\n',
+                b'api_token = """x""" "wrap/' + candidate + b'+alpha"\n',
             ),
             (
                 "operator",
@@ -3109,9 +3395,7 @@ class PublicPoolScannerTest(unittest.TestCase):
             ),
             (
                 "multiline",
-                b'api_token = (\n    "wrap/'
-                + candidate
-                + b'+alpha"\n)\n',
+                b'api_token = (\n    "wrap/' + candidate + b'+alpha"\n)\n',
             ),
             (
                 "nested",
@@ -3123,9 +3407,7 @@ class PublicPoolScannerTest(unittest.TestCase):
             ),
             (
                 "prefix-expression",
-                b'api_token = fallback or "wrap/'
-                + candidate
-                + b'+alpha"\n',
+                b'api_token = fallback or "wrap/' + candidate + b'+alpha"\n',
             ),
             (
                 "unquoted-wrapper",
@@ -3183,49 +3465,41 @@ class PublicPoolScannerTest(unittest.TestCase):
         cases = (
             (
                 "trailing-operator",
-                b"api_token = prefix +\n  \"wrap/"
-                + candidate
-                + b'+alpha"\n',
+                b'api_token = prefix +\n  "wrap/' + candidate + b'+alpha"\n',
                 False,
             ),
             (
                 "leading-operator",
-                b"api_token = prefix\n  + \"wrap/"
-                + candidate
-                + b'+alpha"\n',
+                b'api_token = prefix\n  + "wrap/' + candidate + b'+alpha"\n',
                 False,
             ),
             (
                 "ternary",
-                b"api_token = condition ?\n  \"wrap/"
+                b'api_token = condition ?\n  "wrap/'
                 + candidate
                 + b'+alpha" : fallback\n',
                 False,
             ),
             (
                 "block-comment",
-                b"api_token = prefix + /* comment\n  */ \"wrap/"
+                b'api_token = prefix + /* comment\n  */ "wrap/'
                 + candidate
                 + b'+alpha"\n',
                 False,
             ),
             (
                 "line-comment",
-                b"api_token = prefix + // comment\n  \"wrap/"
-                + candidate
-                + b'+alpha"\n',
+                b'api_token = prefix + // comment\n  "wrap/' + candidate + b'+alpha"\n',
                 False,
             ),
             (
                 "blank-line",
-                b"api_token = prefix +\n\n  \"wrap/"
-                + candidate
-                + b'+alpha"\n',
+                b'api_token = prefix +\n\n  "wrap/' + candidate + b'+alpha"\n',
                 False,
             ),
             (
                 "comment-only-line",
-                b"api_token = prefix +\n  // comment\n  \"wrap/"
+                b'api_token = prefix +\n  // comment\n  "wrap/'
                 + candidate
                 + b'+alpha"\n',
                 False,
@@ -3259,9 +3533,7 @@ class PublicPoolScannerTest(unittest.TestCase):
             ),
             (
                 "javascript-template",
-                b"api_token = `prefix\nwrap/"
-                + candidate
-                + b"+alpha`\n",
+                b"api_token = `prefix\nwrap/" + candidate + b"+alpha`\n",
                 False,
             ),
         )
@@ -3317,6 +3589,46 @@ class PublicPoolScannerTest(unittest.TestCase):
         )
         self.assertEqual(
             scan.blocking_candidates,
+            {candidate: {"github-token"}},
+        )
+
+        proof_bytes = 512
+        overlap = 128
+        assignment_start = 80
+        candidate_start = 500
+        assignment_prefix = b'api_token = "'
+        frontier_payload = (
+            b"x" * (assignment_start - 1)
+            + b"\n"
+            + assignment_prefix
+            + b"y" * (candidate_start - assignment_start - len(assignment_prefix) - 1)
+            + b"/"
+            + candidate
+            + b'+alpha"\n'
+            + b"x" * 256
+        )
+        with (
+            mock.patch.object(
+                workspace,
+                "MAX_SECRET_PREFIX_PROOF_BYTES",
+                proof_bytes,
+            ),
+            mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", overlap),
+            mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 256),
+        ):
+            frontier_scan = workspace._stream_secret_scan(
+                io.BytesIO(frontier_payload),
+                size=len(frontier_payload),
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+
+        self.assertEqual(
+            frontier_scan.blocking_rule,
+            "generic-secret-assignment",
+        )
+        self.assertEqual(
+            frontier_scan.blocking_candidates,
             {candidate: {"github-token"}},
         )
 
@@ -3384,17 +3696,11 @@ class PublicPoolScannerTest(unittest.TestCase):
             (b'configure(api_token = "' + candidate + b'")\n', False),
             (b'[{"api_token": "' + candidate + b'"}]\n', False),
             (
-                b"@@ -1 +1 @@\n"
-                + b'+configure(api_token = "'
-                + candidate
-                + b'")\n',
+                b"@@ -1 +1 @@\n" + b'+configure(api_token = "' + candidate + b'")\n',
                 True,
             ),
             (
-                b"@@ -1 +1 @@\n"
-                + b'+[{"api_token": "'
-                + candidate
-                + b'"}]\n',
+                b"@@ -1 +1 @@\n" + b'+[{"api_token": "' + candidate + b'"}]\n',
                 True,
             ),
         )
@@ -3430,9 +3736,7 @@ class PublicPoolScannerTest(unittest.TestCase):
     def test_completed_quoted_assignment_does_not_capture_next_assignment(self) -> None:
         candidate = b"ghp_" + b"A" * 36
         scan = workspace._scan_secret_value(
-            b'api_token = "placeholder"\nother_token = '
-            + candidate
-            + b"\n",
+            b'api_token = "placeholder"\nother_token = ' + candidate + b"\n",
             capture_blocking_candidates=True,
             _continue_after_blocking=True,
         )
@@ -3654,7 +3958,7 @@ class PublicPoolScannerTest(unittest.TestCase):
             + b"\n"
             + assignment_prefix
             + candidate
-            + b"\\\ncontinued\"\n"
+            + b'\\\ncontinued"\n'
             + b"x" * overlap
         )
         self.assertGreater(len(payload), proof_bytes + overlap)
@@ -3712,6 +4016,121 @@ class PublicPoolScannerTest(unittest.TestCase):
         self.assertEqual(audit.accepted_counts[accepted], 1)
         self.assertEqual(audit.accepted_candidates[accepted], {accepted.value})
 
+        no_prior_blocker = workspace._stream_secret_scan(
+            io.BytesIO(b"\n" * (first_read + 128) + later),
+            accepted_values=(accepted,),
+            capture_accepted_candidates=True,
+            _continue_after_blocking=True,
+        )
+        self.assertEqual(
+            no_prior_blocker.blocking_rule,
+            "generic-secret-assignment",
+        )
+        self.assertFalse(no_prior_blocker.accepted_counts)
+        self.assertFalse(no_prior_blocker.accepted_candidates)
+
+        capture_only = workspace._scan_secret_value(
+            b"unproven prefix\n" + later,
+            accepted_values=(accepted,),
+            prefix_context_complete=False,
+            capture_accepted_candidates=True,
+            _continue_after_blocking=True,
+            _capture_only_legacy_evidence=True,
+        )
+        self.assertEqual(
+            capture_only.blocking_rule,
+            "generic-secret-assignment",
+        )
+        self.assertEqual(capture_only.accepted_counts[accepted], 1)
+
+        local_capture_lengths: list[int] = []
+        original_quoted_acceptance = workspace._quoted_assignment_may_accept
+
+        def recording_quoted_acceptance(value: bytes, **kwargs):
+            if kwargs.get("assignment_start") == 0:
+                local_capture_lengths.append(len(value))
+            return original_quoted_acceptance(value, **kwargs)
+
+        with mock.patch.object(
+            workspace,
+            "_quoted_assignment_may_accept",
+            side_effect=recording_quoted_acceptance,
+        ):
+            bounded_capture_only = workspace._scan_secret_value(
+                b"x" * 4096 + b"\n" + later + b'\nstate = "expired"\n' + b"x" * 4096,
+                accepted_values=(accepted,),
+                prefix_context_complete=False,
+                capture_accepted_candidates=True,
+                _continue_after_blocking=True,
+                _capture_only_legacy_evidence=True,
+            )
+        self.assertEqual(
+            bounded_capture_only.blocking_rule,
+            "generic-secret-assignment",
+        )
+        self.assertEqual(bounded_capture_only.accepted_counts[accepted], 1)
+        self.assertTrue(local_capture_lengths)
+        self.assertLessEqual(
+            max(local_capture_lengths),
+            len(later) + workspace.MAX_SECRET_ASSIGNMENT_TRAILING_BYTES + 1,
+        )
+
+        wrapper_capture_only = workspace._scan_secret_value(
+            b"configure(\n" + later,
+            accepted_values=(accepted,),
+            prefix_context_complete=False,
+            capture_accepted_candidates=True,
+            _continue_after_blocking=True,
+            _capture_only_legacy_evidence=True,
+        )
+        self.assertEqual(
+            wrapper_capture_only.blocking_rule,
+            "generic-secret-assignment",
+        )
+        self.assertEqual(wrapper_capture_only.accepted_counts[accepted], 1)
+
+        reduced_capture_only = workspace._scan_secret_value(
+            b"unproven prefix\n" + later,
+            accepted_values=(accepted,),
+            reduced_secret_values=frozenset((accepted.value,)),
+            prefix_context_complete=False,
+            capture_accepted_candidates=True,
+            _continue_after_blocking=True,
+            _capture_only_legacy_evidence=True,
+        )
+        self.assertEqual(
+            reduced_capture_only.blocking_rule,
+            "generic-secret-assignment",
+        )
+        self.assertEqual(reduced_capture_only.accepted_counts[accepted], 1)
+
+        authoring = self.accepted[0]
+        authoring_capture_only = workspace._scan_secret_value(
+            b"unproven prefix\n" + assignment_bytes(b"access_token", authoring.value),
+            accepted_values=(authoring,),
+            prefix_context_complete=False,
+            capture_accepted_candidates=True,
+            _continue_after_blocking=True,
+            _capture_only_legacy_evidence=True,
+        )
+        self.assertEqual(
+            authoring_capture_only.blocking_rule,
+            "generic-secret-assignment",
+        )
+        self.assertFalse(authoring_capture_only.accepted_counts)
+
+        incomplete_capture_only = workspace._scan_secret_value(
+            b"unproven prefix\n" + later[:-1],
+            accepted_values=(accepted,),
+            prefix_context_complete=False,
+            suffix_context_complete=False,
+            capture_accepted_candidates=True,
+            _continue_after_blocking=True,
+            _capture_only_legacy_evidence=True,
+        )
+        self.assertIsNone(incomplete_capture_only.blocking_rule)
+        self.assertFalse(incomplete_capture_only.accepted_counts)
+
         unsafe = workspace._scan_secret_value(
             assignment_bytes(b"refresh_token", accepted.value) + b' + "adjacent"\n',
             accepted_values=(accepted,),
@@ -3721,6 +4140,22 @@ class PublicPoolScannerTest(unittest.TestCase):
         self.assertEqual(unsafe.blocking_rule, "generic-secret-assignment")
         self.assertFalse(unsafe.accepted_counts)
         self.assertFalse(unsafe.accepted_candidates)
+
+        unsafe_capture_only = workspace._scan_secret_value(
+            b"unproven prefix\n"
+            + assignment_bytes(b"refresh_token", accepted.value)
+            + b' + "adjacent"\n',
+            accepted_values=(accepted,),
+            prefix_context_complete=False,
+            capture_accepted_candidates=True,
+            _continue_after_blocking=True,
+            _capture_only_legacy_evidence=True,
+        )
+        self.assertEqual(
+            unsafe_capture_only.blocking_rule,
+            "generic-secret-assignment",
+        )
+        self.assertFalse(unsafe_capture_only.accepted_counts)
 
     def test_oversized_provider_token_crossing_stream_boundary_is_blocked(self) -> None:
         boundary = 1024 * 1024
@@ -3782,11 +4217,7 @@ class PublicPoolScannerTest(unittest.TestCase):
         committed_end = proof_bytes
         candidate_start = committed_end - len(shorter)
         payload = (
-            b"x" * (candidate_start - 1)
-            + b"\n"
-            + candidate
-            + b"!\n"
-            + b"x" * overlap
+            b"x" * (candidate_start - 1) + b"\n" + candidate + b"!\n" + b"x" * overlap
         )
         with (
             mock.patch.object(
@@ -4569,9 +5000,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             b"",
         )
         self.assertEqual(
-            (
-                review.container_dir / workspace.PRIVATE_CHANGED_PATHS_NAME
-            ).read_bytes(),
+            (review.container_dir / workspace.PRIVATE_CHANGED_PATHS_NAME).read_bytes(),
             b"",
         )
         self.validate(review)
@@ -4631,12 +5060,50 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         self.assertTrue(review.workspace_root.exists())
         self.assertFalse(private_paths.exists())
 
+    def test_cleanup_validation_failure_removes_helper_private_paths(self) -> None:
+        repo, base = self.new_repo({"README.md": "base\n"})
+        (repo / "README.md").write_text("head\n", encoding="utf-8")
+        head = self.commit(repo)
+        review = self.prepare(repo=repo, base=base, head=head)
+        private_paths = review.container_dir / workspace.PRIVATE_CHANGED_PATHS_NAME
+        self.assertTrue(private_paths.exists())
+
+        with (
+            mock.patch.object(
+                workspace,
+                "validate_workspace_layout",
+                side_effect=ReviewError("layout invalid"),
+            ),
+            self.assertRaisesRegex(ReviewError, "layout invalid"),
+        ):
+            workspace.cleanup_workspace(review, keep_container=True)
+
+        self.assertTrue(review.container_dir.exists())
+        self.assertTrue(review.workspace_root.exists())
+        self.assertFalse(private_paths.exists())
+
+        with (
+            mock.patch.object(
+                workspace,
+                "validate_workspace_layout",
+                side_effect=ReviewError("layout invalid"),
+            ),
+            mock.patch.object(
+                workspace,
+                "_remove_private_changed_paths",
+                return_value="unlink denied",
+            ),
+            self.assertRaisesRegex(
+                ReviewError,
+                "layout invalid; private path cleanup failed: unlink denied",
+            ),
+        ):
+            workspace.cleanup_workspace(review, keep_container=True)
+
     def test_jwt_base64url_suffix_extraction_does_not_count_as_reduction(self) -> None:
         shorter = reduction_secret("jwt").decode("ascii")
         longer = shorter + "-"
-        repo, base = self.new_repo(
-            {"fixture.txt": (longer + "!\n") * 2}
-        )
+        repo, base = self.new_repo({"fixture.txt": (longer + "!\n") * 2})
         (repo / "fixture.txt").write_text(shorter + "!\n", encoding="utf-8")
         head = self.commit(repo)
 
@@ -4659,8 +5126,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                 repo, base = self.new_repo(
                     {
                         "fixture.txt": (
-                            f"{truncated}{suffixes[0]}\n"
-                            f"{truncated}{suffixes[1]}\n"
+                            f"{truncated}{suffixes[0]}\n{truncated}{suffixes[1]}\n"
                         )
                     }
                 )
@@ -4678,13 +5144,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
 
         def unsafe_assignment(marker: bytes) -> str:
             return (
-                b"api_"
-                + b"token = "
-                + candidate
-                + b" \\"
-                + b"\n"
-                + marker
-                + b"\n"
+                b"api_" + b"token = " + candidate + b" \\" + b"\n" + marker + b"\n"
             ).decode("ascii")
 
         repo, base = self.new_repo(
@@ -4707,13 +5167,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
 
         def unsafe_assignment(marker: bytes) -> str:
             return (
-                b"api_"
-                + b"token = "
-                + candidate
-                + b" \\"
-                + b"\n"
-                + marker
-                + b"\n"
+                b"api_" + b"token = " + candidate + b" \\" + b"\n" + marker + b"\n"
             ).decode("ascii")
 
         repo, base = self.new_repo(
@@ -4738,13 +5192,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
 
         def incomplete_assignment(marker: bytes) -> str:
             return (
-                b"api_"
-                + b'token = "'
-                + candidate
-                + b"\\"
-                + b"\n"
-                + marker
-                + b'"\n'
+                b"api_" + b'token = "' + candidate + b"\\" + b"\n" + marker + b'"\n'
             ).decode("ascii")
 
         repo, base = self.new_repo(
@@ -4776,6 +5224,22 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                 "external-json-mismatch",
                 b'[{"api_token": "' + candidate + b'")]\n',
             ),
+            (
+                "external-function-missing",
+                b'configure(api_token = "' + candidate + b'"\n',
+            ),
+            (
+                "external-json-missing",
+                b'[{"api_token": "' + candidate + b'"}\n',
+            ),
+            (
+                "external-function-missing-after-sibling",
+                b'configure(api_token = "' + candidate + b'", state = "expired"\n',
+            ),
+            (
+                "external-json-missing-after-sibling",
+                b'[{"api_token": "' + candidate + b'", "state": "expired"}\n',
+            ),
         )
         for label, raw_fixture in cases:
             with self.subTest(case=label):
@@ -4796,15 +5260,10 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         candidate = b"ghp_" + b"A" * 36
 
         def assignment(suffix: bytes) -> str:
-            return (
-                b"api_" + b"token = " + candidate + suffix + b"\n"
-            ).decode("ascii")
+            return (b"api_" + b"token = " + candidate + suffix + b"\n").decode("ascii")
 
         repo, base = self.new_repo(
-            {
-                "fixture.txt": assignment(b"+alpha")
-                + assignment(b"+bravo")
-            }
+            {"fixture.txt": assignment(b"+alpha") + assignment(b"+bravo")}
         )
         (repo / "fixture.txt").write_text(
             assignment(b"+charlie"),
@@ -4819,9 +5278,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         self,
     ) -> None:
         candidate = b"ghp_" + b"A" * 36
-        fixture = (
-            b"api_" + b"token = " + candidate + b"+alpha\n"
-        ).decode("ascii")
+        fixture = (b"api_" + b"token = " + candidate + b"+alpha\n").decode("ascii")
         repo, base = self.new_repo({"fixture.txt": fixture * 2})
         (repo / "fixture.txt").write_text(fixture, encoding="utf-8")
         head = self.commit(repo)
@@ -4852,15 +5309,12 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             with self.subTest(rule=rule):
 
                 def assignment(suffix: bytes) -> str:
-                    return (
-                        b"api_" + b"token = " + candidate + suffix + b"\n"
-                    ).decode("ascii")
+                    return (b"api_" + b"token = " + candidate + suffix + b"\n").decode(
+                        "ascii"
+                    )
 
                 repo, base = self.new_repo(
-                    {
-                        "fixture.txt": assignment(b"_alpha")
-                        + assignment(b"_bravo")
-                    }
+                    {"fixture.txt": assignment(b"_alpha") + assignment(b"_bravo")}
                 )
                 (repo / "fixture.txt").write_text(
                     assignment(b"_charlie"),
@@ -4883,9 +5337,9 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         )
         for rule, candidate in cases:
             with self.subTest(rule=rule):
-                fixture = (
-                    b"api_" + b"token = " + candidate + b"_suffix\n"
-                ).decode("ascii")
+                fixture = (b"api_" + b"token = " + candidate + b"_suffix\n").decode(
+                    "ascii"
+                )
                 repo, base = self.new_repo({"fixture.txt": fixture * 2})
                 (repo / "fixture.txt").write_text(fixture, encoding="utf-8")
                 head = self.commit(repo)
@@ -4947,9 +5401,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             (shared_prefix + b"-suffix-a", shared_prefix + b"-suffix-b")
         )
         head_fixture = shared_prefix + b"-suffix-c\n"
-        repo, base = self.new_repo(
-            {"fixture.txt": base_fixture.decode("ascii") + "\n"}
-        )
+        repo, base = self.new_repo({"fixture.txt": base_fixture.decode("ascii") + "\n"})
         (repo / "fixture.txt").write_bytes(head_fixture)
         head = self.commit(repo)
 
@@ -5709,9 +6161,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
     def test_helper_private_control_state_blocks_artifact_tampering(self) -> None:
         replacements = {
             workspace.CHANGED_PATH_DIGESTS_NAME: b"tampered.txt\0",
-            "changed-blob-findings.z": (
-                b"head\0tampered.txt\0private-key\0"
-            ),
+            "changed-blob-findings.z": (b"head\0tampered.txt\0private-key\0"),
             workspace.SYNTHETIC_MANIFEST_NAME: b'{"entries":[]}\n',
             workspace.SYNTHETIC_CHANGED_EVIDENCE_NAME: (
                 b'{"entries":[],"schema_version":1}\n'
@@ -6143,15 +6593,14 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                 catalog=catalog,
             )
 
-    def test_prompt_only_generic_secret_blocks_review_content(self) -> None:
+    def test_prompt_only_generic_secret_is_trusted_review_input(self) -> None:
         repo, base = self.new_repo({"README.md": "base\n"})
         (repo / "README.md").write_text("head\n", encoding="utf-8")
         head = self.commit(repo)
         secret = reduction_secret("generic-secret-assignment").decode("ascii")
         prompt = self.root / "prompt-generic-secret-assignment.txt"
         prompt.write_text(
-            "Review {review_range}\n"
-            + reduction_fixture("generic-secret-assignment"),
+            "Review {review_range}\n" + reduction_fixture("generic-secret-assignment"),
             encoding="utf-8",
         )
         review = self.prepare(
@@ -6160,14 +6609,16 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             head=head,
             prompt_override=prompt,
         )
-        with self.assertRaisesRegex(
-            ReviewError,
-            r"review\.prompt \(generic-secret-assignment\)",
-        ) as caught:
-            self.validate(review)
-        self.assertNotIn(secret, str(caught.exception))
+        evidence = self.validate(review)
+        self.assertIn(secret, review.prompt_file.read_text(encoding="utf-8"))
+        self.assertFalse(
+            any(
+                entry["surface"] == "review-prompt"
+                for entry in evidence["synthetic_tokens"]["accepted"]
+            )
+        )
 
-    def test_prompt_accepts_exact_authoring_value(self) -> None:
+    def test_prompt_with_authoring_value_is_integrity_only(self) -> None:
         repo, base = self.new_repo({"README.md": "base\n"})
         (repo / "README.md").write_text("head\n", encoding="utf-8")
         head = self.commit(repo)
@@ -6187,16 +6638,18 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         evidence = self.validate(review)
         encoded = json.dumps(evidence, sort_keys=True)
         self.assertNotIn(AUTHORING_VALUES[0], encoded)
-        prompt_entries = [
-            entry
-            for entry in evidence["synthetic_tokens"]["accepted"]
-            if entry["surface"] == "review-prompt"
-        ]
-        self.assertEqual(len(prompt_entries), 1)
-        self.assertEqual(prompt_entries[0]["side"], "generated")
-        self.assertEqual(prompt_entries[0]["token_id"], "access-a")
+        self.assertFalse(
+            any(
+                entry["surface"] == "review-prompt"
+                for entry in evidence["synthetic_tokens"]["accepted"]
+            )
+        )
+        self.assertIn(
+            AUTHORING_VALUES[0],
+            review.prompt_file.read_text(encoding="utf-8"),
+        )
 
-    def test_prompt_does_not_accept_selected_legacy_values(self) -> None:
+    def test_prompt_with_selected_legacy_value_is_trusted_input(self) -> None:
         catalog = legacy_catalog(values=(LEGACY_A,))
         repo, base = self.new_repo(
             {"fixture.cfg": assignment_text("access_token", LEGACY_A)}
@@ -6216,16 +6669,18 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             exemptions=("historical-fixtures",),
             prompt_override=prompt,
         )
-        with self.assertRaisesRegex(
-            ReviewError,
-            r"review\.prompt \(generic-secret-assignment\)",
-        ) as caught:
-            self.validate(review, catalog=catalog)
-        error = str(caught.exception)
-        self.assertNotIn(LEGACY_A, error)
-        self.assertNotIn(legacy_value_base64(LEGACY_A), error)
+        evidence = self.validate(review, catalog=catalog)
+        self.assertIn(LEGACY_A, review.prompt_file.read_text(encoding="utf-8"))
+        self.assertFalse(
+            any(
+                entry["surface"] == "review-prompt"
+                for entry in evidence["synthetic_tokens"]["accepted"]
+            )
+        )
 
-    def test_strictly_reduced_tracked_secret_still_blocks_identical_prompt(self) -> None:
+    def test_strictly_reduced_tracked_secret_is_allowed_in_prompt(
+        self,
+    ) -> None:
         fixture = reduction_fixture("generic-secret-assignment")
         secret = reduction_secret("generic-secret-assignment").decode("ascii")
         repo, base = self.new_repo({"fixture.cfg": fixture * 2})
@@ -6242,12 +6697,18 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             head=head,
             prompt_override=prompt,
         )
-        with self.assertRaisesRegex(
-            ReviewError,
-            r"review\.prompt \(generic-secret-assignment\)",
-        ) as caught:
-            self.validate(review)
-        self.assertNotIn(secret, str(caught.exception))
+        evidence = self.validate(review)
+        self.assertIn(secret, review.prompt_file.read_text(encoding="utf-8"))
+        self.assertEqual(
+            len(evidence["synthetic_tokens"]["secret_reductions"]),
+            1,
+        )
+        self.assertFalse(
+            any(
+                entry["surface"] == "review-prompt"
+                for entry in evidence["synthetic_tokens"]["accepted"]
+            )
+        )
 
     def test_audit_master_cli_verifies_pinned_provenance_without_raw_value(
         self,
