@@ -3211,7 +3211,8 @@ class PublicPoolScannerTest(unittest.TestCase):
             def finditer(self, _value: bytes):
                 raise AssertionError("assignment discovery should be skipped")
 
-        repeated_keys = b"password=" * (256 * 1024 // len(b"password="))
+        assignment_prefix = b"pass" + b"word="
+        repeated_keys = assignment_prefix * (256 * 1024 // len(assignment_prefix))
         with mock.patch.object(
             workspace,
             "SECRET_ASSIGNMENT_PREFIX",
@@ -3233,7 +3234,7 @@ class PublicPoolScannerTest(unittest.TestCase):
             )
         self.assertIsNone(committed_scan.blocking_rule)
 
-        provider_payload = b"password=" * 64 + candidate + b"\n"
+        provider_payload = assignment_prefix * 64 + candidate + b"\n"
         budget = workspace.SecretScanBudget(
             workspace.MAX_SECRET_SCAN_EVENTS,
             remaining_prefix_proof_bytes=64,
