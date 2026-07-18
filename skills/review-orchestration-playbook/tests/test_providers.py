@@ -1133,6 +1133,14 @@ class ProviderPolicyTest(unittest.TestCase):
                 self.detach_calls += 1
                 return bytearray(b"must-not-detach")
 
+            def try_abandon_and_detach_pending_update(
+                self,
+                timeout: float | None,
+            ) -> tuple[bool, bytearray]:
+                del timeout
+                self.detach_calls += 1
+                return True, bytearray(b"must-not-detach")
+
         server = FixtureServer()
         abandonment_error = RuntimeError("injected abandonment latch failure")
 
@@ -1157,6 +1165,227 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn(abandonment_error, shutdown.errors)
         self.assertEqual(server.detach_calls, 0)
         self.assertEqual(server.close_publication_calls, 1)
+
+    def test_shutdown_abandonment_and_detach_respect_deadline(self) -> None:
+        class FixtureThread:
+            def join(self, timeout: float | None = None) -> None:
+                del timeout
+
+            def is_alive(self) -> bool:
+                return True
+
+        for blocked_step in ("credential-lock", "pending-lock", "abandon"):
+            with self.subTest(blocked_step=blocked_step):
+                credential = bytearray(
+                    oauth_credential_fixture(expires_in_seconds=3600)
+                )
+                pending = bytearray(
+                    oauth_credential_fixture(expires_in_seconds=7200)
+                )
+                server = providers._ClaudeKeychainCredentialServer(
+                    credential,
+                    bytes.fromhex("03" * 32),
+                    None,
+                )
+                generation = server.stage_pending_update(pending)
+                self.assertIsNotNone(generation)
+                release_abandonment = threading.Event()
+                completed = threading.Event()
+                results: list[providers._ClaudeKeychainServerShutdown] = []
+                errors: list[BaseException] = []
+                held_lock = None
+                if blocked_step == "credential-lock":
+                    held_lock = server.credential_lock
+                    held_lock.acquire()
+                elif blocked_step == "pending-lock":
+                    held_lock = server._pending_update_lock
+                    held_lock.acquire()
+
+                def abandon() -> None:
+                    if blocked_step == "abandon":
+                        self.assertTrue(
+                            release_abandonment.wait(timeout=2.0)
+                        )
+
+                def run_shutdown() -> None:
+                    try:
+                        results.append(
+                            providers._bounded_claude_keychain_server_shutdown(
+                                server,
+                                FixtureThread(),  # type: ignore[arg-type]
+                                abandon_callback=abandon,
+                            )
+                        )
+                    except BaseException as error:
+                        errors.append(error)
+                    finally:
+                        completed.set()
+
+                owner = threading.Thread(target=run_shutdown, daemon=True)
+                try:
+                    with (
+                        mock.patch.object(
+                            providers,
+                            "CLAUDE_KEYCHAIN_SERVER_SHUTDOWN_TIMEOUT_SECONDS",
+                            0.01,
+                        ),
+                        mock.patch.object(server, "shutdown", return_value=None),
+                    ):
+                        owner.start()
+                        finished_within_bound = completed.wait(timeout=0.2)
+                        publication_closed_within_bound = (
+                            server._abandoned.is_set()
+                        )
+                finally:
+                    release_abandonment.set()
+                    if held_lock is not None:
+                        held_lock.release()
+                    owner.join(timeout=2.0)
+
+                self.assertTrue(finished_within_bound)
+                self.assertTrue(publication_closed_within_bound)
+                self.assertFalse(owner.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(len(results), 1)
+                self.assertFalse(results[0].quiescent)
+                self.assertFalse(results[0].pending_update_detached)
+                detached = server.abandon_and_detach_pending_update()
+                if detached is not None:
+                    detached[:] = b"\x00" * len(detached)
+                server.server_close()
+                server.scrub_initial_credential()
+                credential[:] = b"\x00" * len(credential)
+                pending[:] = b"\x00" * len(pending)
+
+    def test_quiescence_recovery_abandonment_respects_deadline(self) -> None:
+        release_abandonment = threading.Event()
+        abandonment_finished = threading.Event()
+        recover_called = False
+        pending = bytearray(b"fixture-pending-update")
+
+        def abandon() -> None:
+            try:
+                self.assertTrue(release_abandonment.wait(timeout=2.0))
+            finally:
+                abandonment_finished.set()
+
+        def recover(_pending: bytearray | None) -> BaseException | None:
+            nonlocal recover_called
+            recover_called = True
+            return None
+
+        callbacks = providers._ClaudeKeychainQuiescenceCallbacks(
+            abandon=abandon,
+            recover=recover,
+            timeout_error=lambda: RuntimeError("unexpected timeout callback"),
+        )
+        started = time.monotonic()
+        try:
+            with mock.patch.object(
+                providers,
+                "CLAUDE_KEYCHAIN_RECOVERY_TIMEOUT_SECONDS",
+                0.01,
+            ):
+                error = providers._bounded_claude_keychain_quiescence_recovery(
+                    callbacks,
+                    pending,
+                )
+        finally:
+            release_abandonment.set()
+
+        self.assertLess(time.monotonic() - started, 0.2)
+        self.assertIsInstance(
+            error,
+            providers.ClaudeCredentialInspectionInconclusive,
+        )
+        self.assertFalse(recover_called)
+        self.assertEqual(pending, bytearray(len(pending)))
+        self.assertTrue(abandonment_finished.wait(timeout=2.0))
+
+    def test_fail_closed_scope_callback_respects_deadline(self) -> None:
+        release_callback = threading.Event()
+        callback_finished = threading.Event()
+
+        def fail_closed_error() -> BaseException:
+            try:
+                self.assertTrue(release_callback.wait(timeout=2.0))
+                return RuntimeError("fixture fail-closed scope")
+            finally:
+                callback_finished.set()
+
+        started = time.monotonic()
+        try:
+            result, error = (
+                providers._bounded_claude_keychain_fail_closed_error(
+                    fail_closed_error,
+                    0.01,
+                )
+            )
+        finally:
+            release_callback.set()
+
+        self.assertLess(time.monotonic() - started, 0.2)
+        self.assertIsNone(result)
+        self.assertIsInstance(
+            error,
+            providers.ClaudeCredentialInspectionInconclusive,
+        )
+        self.assertTrue(callback_finished.wait(timeout=2.0))
+
+    def test_recovery_timeout_callback_is_bounded_and_uses_fallback(
+        self,
+    ) -> None:
+        release_recovery = threading.Event()
+        recovery_finished = threading.Event()
+        release_timeout_callback = threading.Event()
+        timeout_callback_finished = threading.Event()
+        fallback = providers.ClaudeCredentialInspectionInconclusive(
+            "fixture precomputed recovery timeout scope"
+        )
+
+        def recover(_pending: bytearray | None) -> BaseException | None:
+            try:
+                self.assertTrue(release_recovery.wait(timeout=2.0))
+                return None
+            finally:
+                recovery_finished.set()
+
+        def timeout_error() -> BaseException:
+            try:
+                self.assertTrue(
+                    release_timeout_callback.wait(timeout=2.0)
+                )
+                return RuntimeError("fixture late timeout callback")
+            finally:
+                timeout_callback_finished.set()
+
+        callbacks = providers._ClaudeKeychainQuiescenceCallbacks(
+            abandon=lambda: None,
+            recover=recover,
+            timeout_error=timeout_error,
+            timeout_fallback_error=fallback,
+        )
+        started = time.monotonic()
+        try:
+            with mock.patch.object(
+                providers,
+                "CLAUDE_KEYCHAIN_RECOVERY_TIMEOUT_SECONDS",
+                0.01,
+            ):
+                result = (
+                    providers._bounded_claude_keychain_quiescence_recovery(
+                        callbacks,
+                        None,
+                    )
+                )
+        finally:
+            release_recovery.set()
+            release_timeout_callback.set()
+
+        self.assertLess(time.monotonic() - started, 0.2)
+        self.assertIs(result, fallback)
+        self.assertTrue(recovery_finished.wait(timeout=2.0))
+        self.assertTrue(timeout_callback_finished.wait(timeout=2.0))
 
     def test_keychain_server_rejects_obsolete_update_generation(self) -> None:
         capability = bytes.fromhex("01" * 32)
@@ -3537,6 +3766,187 @@ class ProviderPolicyTest(unittest.TestCase):
         original[:] = b"\x00" * len(original)
         refreshed[:] = b"\x00" * len(refreshed)
 
+    def test_tampered_complete_recovery_temp_is_cleanup_only(self) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
+        refreshed = bytearray(
+            oauth_credential_fixture(expires_in_seconds=7200)
+        )
+        tampered = bytearray(refreshed)
+        tampered[-1] = ord("]")
+        original_bytes = bytes(original)
+        carrier = providers._retain_claude_macos_refreshed_credential(
+            self.review,
+            original,
+        )
+        config = carrier / "config"
+        real_replace = providers.os.replace
+
+        def tamper_temporary_then_fail(
+            source: str | os.PathLike[str],
+            destination: str | os.PathLike[str],
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            if isinstance(source, str) and source.startswith(
+                providers.CLAUDE_MACOS_RECOVERY_UPDATE_PREFIX
+            ):
+                (config / source).write_bytes(tampered)
+                raise OSError("injected recovery rename failure")
+            real_replace(source, destination, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                providers.os,
+                "replace",
+                side_effect=tamper_temporary_then_fail,
+            ),
+            self.assertRaisesRegex(
+                OSError,
+                "recovery rename failure",
+            ) as raised,
+        ):
+            providers._replace_claude_macos_recovery_credential(
+                self.review,
+                carrier,
+                refreshed,
+            )
+
+        self.assertIsNone(
+            getattr(
+                raised.exception,
+                "_codex_claude_retained_credential_artifact",
+                None,
+            )
+        )
+        cleanup_value = getattr(
+            raised.exception,
+            "_codex_claude_retained_cleanup_artifact",
+            None,
+        )
+        self.assertIsInstance(cleanup_value, str)
+        cleanup_artifact = pathlib.Path(cleanup_value)
+        self.assertEqual(cleanup_artifact.read_bytes(), bytes(tampered))
+        self.assertEqual(
+            (config / providers.CLAUDE_CREDENTIAL_FILE_NAME).read_bytes(),
+            original_bytes,
+        )
+        failure = providers._failed_claude_macos_recovery_error(
+            providers.ClaudeCredentialInspectionInconclusive(
+                "fixture host writeback failure"
+            ),
+            raised.exception,
+        )
+        common.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {"authentication": {}, "phase": "runtime-cleanup"},
+        )
+        providers._record_claude_secondary_persistence_failure(
+            self.review,
+            failure,
+        )
+        report = common.read_json(
+            self.review.container_dir / "claude-runtime.json"
+        )
+        self.assertNotIn("recovery_artifact", report["authentication"])
+        self.assertEqual(
+            report["authentication"]["recovery_cleanup_artifact"],
+            str(cleanup_artifact),
+        )
+        for payload in (original, refreshed, tampered):
+            payload[:] = b"\x00" * len(payload)
+
+    def test_complete_recovery_temp_disappearing_after_readback_is_unreported(
+        self,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
+        refreshed = bytearray(
+            oauth_credential_fixture(expires_in_seconds=7200)
+        )
+        original_bytes = bytes(original)
+        carrier = providers._retain_claude_macos_refreshed_credential(
+            self.review,
+            original,
+        )
+        config = carrier / "config"
+        real_read = providers._read_claude_credential_file_from_directory
+        real_replace = providers.os.replace
+
+        def fail_temporary_replace(
+            source: str | os.PathLike[str],
+            destination: str | os.PathLike[str],
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            if isinstance(source, str) and source.startswith(
+                providers.CLAUDE_MACOS_RECOVERY_UPDATE_PREFIX
+            ):
+                raise OSError("injected recovery rename failure")
+            real_replace(source, destination, *args, **kwargs)
+
+        def read_then_remove_temporary(
+            config_descriptor: int,
+            *,
+            credential_name: str = providers.CLAUDE_CREDENTIAL_FILE_NAME,
+            expected_identity: tuple[int, ...] | None = None,
+        ) -> tuple[bytearray, tuple[int, ...]] | None:
+            result = real_read(
+                config_descriptor,
+                credential_name=credential_name,
+                expected_identity=expected_identity,
+            )
+            if credential_name.startswith(
+                providers.CLAUDE_MACOS_RECOVERY_UPDATE_PREFIX
+            ):
+                os.unlink(credential_name, dir_fd=config_descriptor)
+            return result
+
+        with (
+            mock.patch.object(
+                providers.os,
+                "replace",
+                side_effect=fail_temporary_replace,
+            ),
+            mock.patch.object(
+                providers,
+                "_read_claude_credential_file_from_directory",
+                side_effect=read_then_remove_temporary,
+            ),
+            self.assertRaisesRegex(
+                OSError,
+                "recovery rename failure",
+            ) as raised,
+        ):
+            providers._replace_claude_macos_recovery_credential(
+                self.review,
+                carrier,
+                refreshed,
+            )
+
+        self.assertIsNone(
+            getattr(
+                raised.exception,
+                "_codex_claude_retained_credential_artifact",
+                None,
+            )
+        )
+        self.assertIsNone(
+            getattr(
+                raised.exception,
+                "_codex_claude_retained_cleanup_artifact",
+                None,
+            )
+        )
+        self.assertEqual(
+            sorted(path.name for path in config.iterdir()),
+            [providers.CLAUDE_CREDENTIAL_FILE_NAME],
+        )
+        self.assertEqual(
+            (config / providers.CLAUDE_CREDENTIAL_FILE_NAME).read_bytes(),
+            original_bytes,
+        )
+        original[:] = b"\x00" * len(original)
+        refreshed[:] = b"\x00" * len(refreshed)
+
     def test_uninspectable_complete_recovery_temp_is_cleanup_only(
         self,
     ) -> None:
@@ -4823,7 +5233,7 @@ class ProviderPolicyTest(unittest.TestCase):
             ) as persist,
             self.assertRaisesRegex(
                 providers.ClaudeCredentialInspectionInconclusive,
-                "durable recovery stage could not be initialized",
+                "fail-closed recovery scope could not be initialized",
             ) as raised,
         ):
             with self.claude_keychain_runtime(
@@ -4833,7 +5243,7 @@ class ProviderPolicyTest(unittest.TestCase):
             ):
                 pass
 
-        self.assertEqual(callback_results, [False, False])
+        self.assertEqual(callback_results, [])
         self.assertEqual(recovery_root.call_count, 1)
         retain.assert_not_called()
         commit.assert_not_called()
@@ -6377,6 +6787,9 @@ class ProviderPolicyTest(unittest.TestCase):
                 yield 43211
             finally:
                 quiescence_callbacks.abandon()
+                recovery_error = quiescence_callbacks.recover(None)
+                if recovery_error is not None:
+                    raise recovery_error
 
         credential_server.side_effect = broker
         common.write_json(
@@ -6389,10 +6802,9 @@ class ProviderPolicyTest(unittest.TestCase):
                 providers.secrets,
                 "token_hex",
                 side_effect=OSError("injected random source failure"),
-            ) as token_hex,
-            self.assertRaisesRegex(
+            ),
+            self.assertRaises(
                 providers.ClaudeCredentialInspectionInconclusive,
-                "quiescence could not be proven",
             ) as raised,
         ):
             with self.claude_keychain_runtime(
@@ -6402,7 +6814,6 @@ class ProviderPolicyTest(unittest.TestCase):
             ):
                 pass
 
-        token_hex.assert_not_called()
         self.assert_macos_recovery_carrier(
             raised.exception,
             bytes(refreshed),
@@ -6889,52 +7300,10 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         commit_started = threading.Event()
         release_commit = threading.Event()
-        abandon_waiting = threading.Event()
-        allow_abandon_snapshot = threading.Event()
         callback_results: list[bool] = []
         callback_errors: list[BaseException] = []
-        abandon_errors: list[BaseException] = []
         callback_thread: threading.Thread | None = None
-        abandon_thread: threading.Thread | None = None
         real_commit = providers._commit_claude_macos_durable_stage
-        real_lock_factory = threading.Lock
-
-        class OrderedRuntimeLock:
-            def __init__(self) -> None:
-                self.lock = real_lock_factory()
-                self.block_abandon_snapshot = False
-
-            def __enter__(self) -> OrderedRuntimeLock:
-                if (
-                    self.block_abandon_snapshot
-                    and threading.current_thread().name
-                    == "fixture-abandon-snapshot"
-                ):
-                    abandon_waiting.set()
-                    if not allow_abandon_snapshot.wait(timeout=2.0):
-                        raise RuntimeError(
-                            "fixture abandonment snapshot was not released"
-                        )
-                self.lock.acquire()
-                return self
-
-            def __exit__(
-                self,
-                _exception_type: object,
-                _exception: object,
-                _traceback: object,
-            ) -> None:
-                self.lock.release()
-
-        runtime_lock = OrderedRuntimeLock()
-        lock_calls = 0
-
-        def lock_factory() -> object:
-            nonlocal lock_calls
-            lock_calls += 1
-            if lock_calls == 1:
-                return runtime_lock
-            return real_lock_factory()
 
         def blocking_commit(
             review: providers.ReviewWorkspace,
@@ -6957,7 +7326,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 providers._ClaudeKeychainQuiescenceCallbacks | None
             ) = None,
         ):
-            nonlocal callback_thread, abandon_thread
+            nonlocal callback_thread
             assert update_callback is not None
             assert quiescence_callbacks is not None
 
@@ -6967,29 +7336,15 @@ class ProviderPolicyTest(unittest.TestCase):
                 except BaseException as error:
                     callback_errors.append(error)
 
-            def run_abandonment() -> None:
-                try:
-                    quiescence_callbacks.abandon()
-                except BaseException as error:
-                    abandon_errors.append(error)
-
             callback_thread = threading.Thread(target=run_callback)
             callback_thread.start()
             self.assertTrue(commit_started.wait(timeout=2.0))
             try:
                 yield 43211
             finally:
-                runtime_lock.block_abandon_snapshot = True
-                abandon_thread = threading.Thread(
-                    target=run_abandonment,
-                    name="fixture-abandon-snapshot",
-                )
-                abandon_thread.start()
-                self.assertTrue(abandon_waiting.wait(timeout=2.0))
+                quiescence_callbacks.abandon()
                 release_commit.set()
                 callback_thread.join(timeout=2.0)
-                allow_abandon_snapshot.set()
-                abandon_thread.join(timeout=2.0)
                 recovery_error = quiescence_callbacks.recover(None)
                 failure = providers.ClaudeCredentialInspectionInconclusive(
                     "fixture handler quiescence failure"
@@ -7031,11 +7386,6 @@ class ProviderPolicyTest(unittest.TestCase):
                     "_commit_claude_macos_durable_stage",
                     side_effect=blocking_commit,
                 ),
-                mock.patch.object(
-                    providers.threading,
-                    "Lock",
-                    side_effect=lock_factory,
-                ),
                 self.assertRaises(
                     providers.ClaudeCredentialInspectionInconclusive
                 ) as raised,
@@ -7048,14 +7398,10 @@ class ProviderPolicyTest(unittest.TestCase):
                     pass
         finally:
             release_commit.set()
-            allow_abandon_snapshot.set()
             if callback_thread is not None:
                 callback_thread.join(timeout=2.0)
-            if abandon_thread is not None:
-                abandon_thread.join(timeout=2.0)
 
         self.assertEqual(callback_errors, [])
-        self.assertEqual(abandon_errors, [])
         self.assertEqual(callback_results, [False])
         persist.assert_not_called()
         reported = self.assert_macos_recovery_carrier(
@@ -7253,7 +7599,7 @@ class ProviderPolicyTest(unittest.TestCase):
         real_commit = providers._commit_claude_macos_durable_stage
         real_abandon = (
             providers._ClaudeKeychainCredentialServer
-            .abandon_and_detach_pending_update
+            .try_abandon_and_detach_pending_update
         )
 
         def blocking_commit(
@@ -7271,8 +7617,9 @@ class ProviderPolicyTest(unittest.TestCase):
 
         def abandon_then_finish_handler(
             server: providers._ClaudeKeychainCredentialServer,
-        ) -> bytearray | None:
-            pending = real_abandon(server)
+            timeout: float | None,
+        ) -> tuple[bool, bytearray | None]:
+            detached, pending = real_abandon(server, timeout)
             release_commit.set()
             if not commit_finished.wait(timeout=2.0):
                 raise RuntimeError("fixture durable commit did not finish")
@@ -7280,7 +7627,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 raise RuntimeError(
                     "fixture broker handler did not finish before runtime abandon"
                 )
-            return pending
+            return detached, pending
 
         def write_update(port: int, capability: bytes) -> None:
             try:
@@ -7332,7 +7679,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 ),
                 mock.patch.object(
                     providers._ClaudeKeychainCredentialServer,
-                    "abandon_and_detach_pending_update",
+                    "try_abandon_and_detach_pending_update",
                     new=abandon_then_finish_handler,
                 ),
                 self.assertRaises(
@@ -7423,7 +7770,7 @@ class ProviderPolicyTest(unittest.TestCase):
         real_commit = providers._commit_claude_macos_durable_stage
         real_detach = (
             providers._ClaudeKeychainCredentialServer
-            .abandon_and_detach_pending_update
+            .try_abandon_and_detach_pending_update
         )
         detach_calls = 0
 
@@ -7442,10 +7789,11 @@ class ProviderPolicyTest(unittest.TestCase):
 
         def detach_then_raise_once(
             server: providers._ClaudeKeychainCredentialServer,
-        ) -> bytearray | None:
+            timeout: float | None,
+        ) -> tuple[bool, bytearray | None]:
             nonlocal detach_calls
             detach_calls += 1
-            pending = real_detach(server)
+            detached, pending = real_detach(server, timeout)
             if detach_calls == 1:
                 release_commit.set()
                 if not commit_finished.wait(timeout=2.0):
@@ -7455,7 +7803,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 if pending is not None:
                     pending[:] = b"\x00" * len(pending)
                 raise OSError("injected post-detach failure")
-            return pending
+            return detached, pending
 
         def write_update(port: int, capability: bytes) -> None:
             response = b""
@@ -7510,7 +7858,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 ),
                 mock.patch.object(
                     providers._ClaudeKeychainCredentialServer,
-                    "abandon_and_detach_pending_update",
+                    "try_abandon_and_detach_pending_update",
                     new=detach_then_raise_once,
                 ),
                 self.assertRaises(
@@ -7578,7 +7926,7 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         refreshed[:] = b"\x00" * len(refreshed)
 
-    def test_real_server_fail_closed_after_two_abandonment_failures(
+    def test_real_server_timeout_snapshot_does_not_wait_for_runtime_lock(
         self,
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
@@ -7597,23 +7945,34 @@ class ProviderPolicyTest(unittest.TestCase):
         commit_started = threading.Event()
         release_commit = threading.Event()
         commit_finished = threading.Event()
+        release_runtime_lock_early = threading.Event()
+        runtime_lock_released = threading.Event()
         writer: threading.Thread | None = None
+        runtime_lock_release_thread: threading.Thread | None = None
+        finalization_started: float | None = None
+        finalization_elapsed: float | None = None
         writer_responses: list[bytes] = []
         real_commit = providers._commit_claude_macos_durable_stage
         real_lock_factory = threading.Lock
 
-        class FailingRuntimeLock:
+        class SnapshotContendedRuntimeLock:
             def __init__(self) -> None:
                 self.lock = real_lock_factory()
-                self.fail_entries = 0
 
-            def __enter__(self) -> FailingRuntimeLock:
-                if self.fail_entries:
-                    self.fail_entries -= 1
-                    raise RuntimeError(
-                        "injected runtime abandonment snapshot failure"
-                    )
-                self.lock.acquire()
+            def acquire(
+                self,
+                blocking: bool = True,
+                timeout: float = -1,
+            ) -> bool:
+                if timeout == -1:
+                    return self.lock.acquire(blocking)
+                return self.lock.acquire(blocking, timeout)
+
+            def release(self) -> None:
+                self.lock.release()
+
+            def __enter__(self) -> SnapshotContendedRuntimeLock:
+                self.acquire()
                 return self
 
             def __exit__(
@@ -7622,9 +7981,9 @@ class ProviderPolicyTest(unittest.TestCase):
                 _exception: object,
                 _traceback: object,
             ) -> None:
-                self.lock.release()
+                self.release()
 
-        runtime_lock = FailingRuntimeLock()
+        runtime_lock = SnapshotContendedRuntimeLock()
         lock_calls = 0
 
         def lock_factory() -> object:
@@ -7633,6 +7992,11 @@ class ProviderPolicyTest(unittest.TestCase):
             if lock_calls == 1:
                 return runtime_lock
             return real_lock_factory()
+
+        def release_runtime_lock_after_bound() -> None:
+            release_runtime_lock_early.wait(timeout=1.0)
+            runtime_lock.release()
+            runtime_lock_released.set()
 
         def blocking_commit(
             review: providers.ReviewWorkspace,
@@ -7744,16 +8108,30 @@ class ProviderPolicyTest(unittest.TestCase):
                     )
                     writer.start()
                     self.assertTrue(commit_started.wait(timeout=2.0))
-                    runtime_lock.fail_entries = 2
+                    runtime_lock.acquire()
+                    runtime_lock_release_thread = threading.Thread(
+                        target=release_runtime_lock_after_bound,
+                        daemon=True,
+                    )
+                    runtime_lock_release_thread.start()
+                    finalization_started = time.monotonic()
+            assert finalization_started is not None
+            finalization_elapsed = time.monotonic() - finalization_started
         except providers.ClaudeLoopbackUnavailable:
             self.skipTest("loopback bind is unavailable in the current sandbox")
         finally:
+            release_runtime_lock_early.set()
+            if runtime_lock_release_thread is not None:
+                runtime_lock_release_thread.join(timeout=2.0)
             release_commit.set()
             commit_finished.wait(timeout=2.0)
             if writer is not None:
                 writer.join(timeout=2.0)
 
-        self.assertEqual(runtime_lock.fail_entries, 0)
+        self.assertIsNotNone(finalization_elapsed)
+        assert finalization_elapsed is not None
+        self.assertLess(finalization_elapsed, 0.75)
+        self.assertTrue(runtime_lock_released.is_set())
         self.assertTrue(commit_finished.is_set())
         self.assertIsNotNone(writer)
         assert writer is not None
