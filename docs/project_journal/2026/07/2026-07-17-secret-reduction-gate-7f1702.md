@@ -81,13 +81,15 @@ Diagnostic and preflight evidence remain bounded audit surfaces. They use stable
 - Reviewer-visible diff and prompt artifacts are integrity-bound but are not secret-egress filters. They retain deliberately supplied reviewer input, including deleted or prompt-contained secret bytes, in original form.
 - Deleted sensitive paths are omitted from head-side changed-path findings and are allowed only when the complete materialized head remains free of sensitive paths.
 - Public changed-path evidence contains ordered SHA-256 commitments only. The helper validates those records lockstep against an owner-only private raw-path stream and checks the commitments and all other audit evidence against catalog and dynamic sensitive values. After preflight consumes the private path stream and Base64 raw-bearing dynamic-reduction manifest, it removes both through owner-, mode-, and identity-checked no-follow parent/container descriptors before publishing preflight evidence or launching a reviewer; failed preflight and later cleanup paths retry that scrub. An explicitly retained or fallback workspace therefore keeps only the frozen workspace and durable bounded evidence. Changed-blob findings identify paths by digest as well.
+- Workspace and container cleanup traverses content only through already-opened verified directory descriptors. Each ordinary file or emptied directory name is atomically moved to a fresh quarantine name in the same verified parent, and the quarantine identity must match the expected device/inode before removal. A concurrent original-name replacement is therefore preserved under quarantine and reported as a cleanup failure instead of being deleted. The two helper-private artifacts are excluded from this generic rename path: they are unlinked first at their fixed names, and any failure retains the fixed name and stops tree removal so fallback cannot lose track of sensitive state. Directory depth is explicitly bounded so an adversarial tree fails as an ordinary cleanup error while the fixed artifacts still receive their fallback scrub. As elsewhere in the local helper, malicious current-user processes are part of the host TCB; portable POSIX has no fd-only unlink/rmdir operation after the final quarantine identity check.
 - The complete prospective retained `preflight.json`, including the final `private_artifacts: removed` field, is assembled through the same shared builder used for publication and checked against every catalog and dynamic value before private-artifact removal or reviewer launch.
 - Catalog authoring and explicitly selected legacy behavior remains unchanged.
 
 ## Validation
 
 - `uv run python skills/review-orchestration-playbook/tests/test_synthetic_tokens.py`: 192 tests passed.
-- `uv run python -m unittest discover -s skills/review-orchestration-playbook/tests`: 840 tests passed, 4 skipped.
+- Python 3.10.19 `test_workspace.py`: 76 tests passed.
+- `uv run python -m unittest discover -s skills/review-orchestration-playbook/tests`: 847 tests passed, 4 skipped.
 - `ruff check` on changed runtime and test modules: passed.
 - `git diff --check`: passed.
 - Fixed-range Codex review and PR readiness evidence are recorded in the delivery thread and PR.

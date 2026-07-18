@@ -6019,17 +6019,20 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         self.assertTrue(private_manifest.exists())
 
         with mock.patch.object(
-            workspace.shutil,
-            "rmtree",
-            side_effect=PermissionError("permission denied"),
-        ) as remove_tree:
+            workspace,
+            "_remove_open_directory_contents",
+            return_value=["permission denied"],
+        ) as remove_contents:
             cleanup_error = workspace.cleanup_workspace(
                 review,
                 keep_container=True,
             )
 
         self.assertIn("permission denied", cleanup_error or "")
-        remove_tree.assert_called_once_with("workspace", dir_fd=mock.ANY)
+        remove_contents.assert_called_once_with(
+            mock.ANY,
+            excluded_entry_names=frozenset(),
+        )
         self.assertTrue(review.container_dir.exists())
         self.assertTrue(review.workspace_root.exists())
         self.assertFalse(private_paths.exists())

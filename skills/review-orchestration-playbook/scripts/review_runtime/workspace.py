@@ -281,6 +281,7 @@ MAX_SECRET_PREFIX_PROOF_TOTAL_BYTES = 64 * 1024 * 1024
 MAX_REVIEW_PROMPT_BYTES = 64 * 1024
 MAX_SYNTHETIC_EVIDENCE_BYTES = 64 * 1024
 MAX_SYNTHETIC_EVIDENCE_ENTRIES = 512
+MAX_REVIEW_CLEANUP_DEPTH = 256
 SYNTHETIC_MANIFEST_NAME = "synthetic-secret-manifest.json"
 SYNTHETIC_PRIVATE_MANIFEST_NAME = "synthetic-secret-state.json"
 SYNTHETIC_CHANGED_EVIDENCE_NAME = "synthetic-changed-evidence.json"
@@ -830,13 +831,408 @@ def _private_cleanup_identity(metadata: os.stat_result) -> tuple[int, int]:
     return metadata.st_dev, metadata.st_ino
 
 
+def _private_cleanup_directory_flags() -> int:
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+
+
+def _review_cleanup_directory_entry_error(metadata: os.stat_result) -> str | None:
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        return "review cleanup directory entry is not a real directory"
+    if metadata.st_uid != os.geteuid():
+        return "review cleanup directory entry has an unexpected owner"
+    return None
+
+
+def _quarantine_cleanup_entry(
+    parent_descriptor: int,
+    entry_name: str,
+    expected_metadata: os.stat_result,
+    *,
+    label: str,
+    missing_is_error: bool,
+) -> tuple[str | None, os.stat_result | None, list[str]]:
+    quarantine_name = f".codex-review-cleanup-{uuid.uuid4().hex}"
+    try:
+        os.rename(
+            entry_name,
+            quarantine_name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+    except FileNotFoundError:
+        if missing_is_error:
+            return None, None, [f"{label} changed before removal"]
+        return None, None, []
+    except OSError as error:
+        return None, None, [f"cannot quarantine {label}: {error}"]
+
+    try:
+        quarantined_metadata = os.stat(
+            quarantine_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return (
+            quarantine_name,
+            None,
+            [f"{label} quarantine changed before validation"],
+        )
+    except OSError as error:
+        return (
+            quarantine_name,
+            None,
+            [f"cannot inspect {label} quarantine: {error}"],
+        )
+    if _private_cleanup_identity(expected_metadata) != _private_cleanup_identity(
+        quarantined_metadata
+    ):
+        return (
+            quarantine_name,
+            quarantined_metadata,
+            [
+                f"{label} changed before removal; replacement preserved as "
+                f"{quarantine_name}"
+            ],
+        )
+    return quarantine_name, quarantined_metadata, []
+
+
+def _remove_quarantined_cleanup_entry(
+    parent_descriptor: int,
+    quarantine_name: str,
+    expected_metadata: os.stat_result,
+    *,
+    label: str,
+    is_directory: bool,
+) -> list[str]:
+    try:
+        quarantine_final = os.stat(
+            quarantine_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return [f"{label} quarantine changed before removal"]
+    except OSError as error:
+        return [f"cannot revalidate {label} quarantine: {error}"]
+    if _private_cleanup_identity(expected_metadata) != _private_cleanup_identity(
+        quarantine_final
+    ):
+        return [
+            f"{label} quarantine changed before removal; entry preserved as "
+            f"{quarantine_name}"
+        ]
+    try:
+        if is_directory:
+            os.rmdir(quarantine_name, dir_fd=parent_descriptor)
+        else:
+            os.unlink(quarantine_name, dir_fd=parent_descriptor)
+    except FileNotFoundError:
+        return [f"{label} quarantine changed before removal"]
+    except OSError as error:
+        return [f"cannot remove {label} quarantine {quarantine_name}: {error}"]
+    return []
+
+
+def _remove_open_directory_contents(
+    directory_descriptor: int,
+    *,
+    depth: int = 0,
+    excluded_entry_names: frozenset[str] = frozenset(),
+) -> list[str]:
+    if depth >= MAX_REVIEW_CLEANUP_DEPTH:
+        return ["review cleanup directory depth exceeds the safety limit"]
+    cleanup_errors: list[str] = []
+    try:
+        entry_names = os.listdir(directory_descriptor)
+    except OSError as error:
+        return [f"cannot enumerate review cleanup directory: {error}"]
+
+    for entry_name in entry_names:
+        if entry_name in excluded_entry_names:
+            continue
+        try:
+            entry_before = os.stat(
+                entry_name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            cleanup_errors.append(f"cannot inspect review cleanup entry: {error}")
+            continue
+
+        if not stat.S_ISDIR(entry_before.st_mode):
+            quarantine_name, _, quarantine_errors = _quarantine_cleanup_entry(
+                directory_descriptor,
+                entry_name,
+                entry_before,
+                label="review cleanup entry",
+                missing_is_error=False,
+            )
+            cleanup_errors.extend(quarantine_errors)
+            if quarantine_errors or quarantine_name is None:
+                continue
+            cleanup_errors.extend(
+                _remove_quarantined_cleanup_entry(
+                    directory_descriptor,
+                    quarantine_name,
+                    entry_before,
+                    label="review cleanup entry",
+                    is_directory=False,
+                )
+            )
+            continue
+
+        directory_error = _review_cleanup_directory_entry_error(entry_before)
+        if directory_error:
+            cleanup_errors.append(directory_error)
+            continue
+
+        child_descriptor: int | None = None
+        try:
+            try:
+                child_descriptor = os.open(
+                    entry_name,
+                    _private_cleanup_directory_flags(),
+                    dir_fd=directory_descriptor,
+                )
+            except FileNotFoundError:
+                continue
+            child_opened = os.fstat(child_descriptor)
+            try:
+                child_after = os.stat(
+                    entry_name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                cleanup_errors.append(
+                    "review cleanup directory entry changed while opening"
+                )
+                continue
+            for metadata in (child_opened, child_after):
+                directory_error = _review_cleanup_directory_entry_error(metadata)
+                if directory_error:
+                    cleanup_errors.append(directory_error)
+                    break
+            else:
+                if (
+                    len(
+                        {
+                            _private_cleanup_identity(entry_before),
+                            _private_cleanup_identity(child_opened),
+                            _private_cleanup_identity(child_after),
+                        }
+                    )
+                    != 1
+                ):
+                    cleanup_errors.append(
+                        "review cleanup directory entry changed while opening"
+                    )
+                    continue
+
+                child_errors = _remove_open_directory_contents(
+                    child_descriptor,
+                    depth=depth + 1,
+                )
+                cleanup_errors.extend(child_errors)
+                if child_errors:
+                    continue
+                quarantine_name, quarantined, quarantine_errors = (
+                    _quarantine_cleanup_entry(
+                        directory_descriptor,
+                        entry_name,
+                        child_opened,
+                        label="review cleanup directory entry",
+                        missing_is_error=True,
+                    )
+                )
+                cleanup_errors.extend(quarantine_errors)
+                if quarantine_errors or quarantine_name is None or quarantined is None:
+                    continue
+                directory_error = _review_cleanup_directory_entry_error(quarantined)
+                if directory_error:
+                    cleanup_errors.append(directory_error)
+                    continue
+                cleanup_errors.extend(
+                    _remove_quarantined_cleanup_entry(
+                        directory_descriptor,
+                        quarantine_name,
+                        child_opened,
+                        label="review cleanup directory entry",
+                        is_directory=True,
+                    )
+                )
+        except OSError as error:
+            cleanup_errors.append(
+                f"cannot securely open review cleanup directory entry: {error}"
+            )
+        finally:
+            if child_descriptor is not None:
+                try:
+                    os.close(child_descriptor)
+                except OSError as error:
+                    cleanup_errors.append(
+                        f"cannot close review cleanup directory entry: {error}"
+                    )
+    return cleanup_errors
+
+
+def _remove_open_directory_tree(
+    parent_descriptor: int,
+    directory_descriptor: int,
+    directory_name: str,
+    *,
+    label: str,
+    require_private_mode: bool,
+    excluded_entry_names: frozenset[str] = frozenset(),
+) -> list[str]:
+    cleanup_errors = _remove_open_directory_contents(
+        directory_descriptor,
+        excluded_entry_names=excluded_entry_names,
+    )
+    if cleanup_errors:
+        return cleanup_errors
+
+    try:
+        remaining_entry_names = os.listdir(directory_descriptor)
+    except OSError as error:
+        return [f"cannot verify empty {label}: {error}"]
+    if remaining_entry_names:
+        return [f"{label} still contains entries after cleanup"]
+
+    try:
+        directory_opened = os.fstat(directory_descriptor)
+    except OSError as error:
+        return [f"cannot revalidate {label} before removal: {error}"]
+    directory_error = _private_cleanup_directory_error(
+        directory_opened,
+        label=label,
+        require_private_mode=require_private_mode,
+    )
+    if directory_error:
+        return [directory_error]
+    quarantine_name, quarantined, quarantine_errors = _quarantine_cleanup_entry(
+        parent_descriptor,
+        directory_name,
+        directory_opened,
+        label=label,
+        missing_is_error=True,
+    )
+    if quarantine_errors or quarantine_name is None or quarantined is None:
+        return quarantine_errors
+    directory_error = _private_cleanup_directory_error(
+        quarantined,
+        label=label,
+        require_private_mode=require_private_mode,
+    )
+    if directory_error:
+        return [directory_error]
+    return _remove_quarantined_cleanup_entry(
+        parent_descriptor,
+        quarantine_name,
+        directory_opened,
+        label=label,
+        is_directory=True,
+    )
+
+
+def _remove_named_directory_tree(
+    parent_descriptor: int,
+    directory_name: str,
+    *,
+    label: str,
+    require_private_mode: bool,
+) -> list[str]:
+    try:
+        directory_before = os.stat(
+            directory_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return []
+    except OSError as error:
+        return [f"cannot inspect {label}: {error}"]
+    directory_error = _private_cleanup_directory_error(
+        directory_before,
+        label=label,
+        require_private_mode=require_private_mode,
+    )
+    if directory_error:
+        return [directory_error]
+
+    directory_descriptor: int | None = None
+    cleanup_errors: list[str] = []
+    try:
+        try:
+            directory_descriptor = os.open(
+                directory_name,
+                _private_cleanup_directory_flags(),
+                dir_fd=parent_descriptor,
+            )
+        except FileNotFoundError:
+            return []
+        directory_opened = os.fstat(directory_descriptor)
+        try:
+            directory_after = os.stat(
+                directory_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            cleanup_errors.append(f"{label} changed while opening")
+        else:
+            for metadata in (directory_opened, directory_after):
+                directory_error = _private_cleanup_directory_error(
+                    metadata,
+                    label=label,
+                    require_private_mode=require_private_mode,
+                )
+                if directory_error:
+                    cleanup_errors.append(directory_error)
+                    break
+            else:
+                if (
+                    len(
+                        {
+                            _private_cleanup_identity(directory_before),
+                            _private_cleanup_identity(directory_opened),
+                            _private_cleanup_identity(directory_after),
+                        }
+                    )
+                    != 1
+                ):
+                    cleanup_errors.append(f"{label} changed while opening")
+                else:
+                    cleanup_errors.extend(
+                        _remove_open_directory_tree(
+                            parent_descriptor,
+                            directory_descriptor,
+                            directory_name,
+                            label=label,
+                            require_private_mode=require_private_mode,
+                        )
+                    )
+    except OSError as error:
+        cleanup_errors.append(f"cannot securely open {label}: {error}")
+    finally:
+        if directory_descriptor is not None:
+            try:
+                os.close(directory_descriptor)
+            except OSError as error:
+                cleanup_errors.append(f"cannot close {label}: {error}")
+    return cleanup_errors
+
+
 def _operate_on_private_review_container(
     container: pathlib.Path,
     operation: Callable[[int, int], Iterable[str]],
 ) -> str | None:
-    directory_flags = (
-        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-    )
+    directory_flags = _private_cleanup_directory_flags()
     parent = container.parent
     try:
         parent_before = os.lstat(parent)
@@ -976,16 +1372,20 @@ def _remove_review_container_tree(container: pathlib.Path) -> str | None:
         parent_descriptor: int,
         container_descriptor: int,
     ) -> list[str]:
-        cleanup_errors: list[str] = []
-        if not shutil.rmtree.avoids_symlink_attacks:
-            cleanup_errors.append("fd-relative review cleanup is unavailable")
-        else:
-            try:
-                shutil.rmtree(container.name, dir_fd=parent_descriptor)
-            except FileNotFoundError:
-                pass
-            except OSError as error:
-                cleanup_errors.append(str(error))
+        private_cleanup_errors = _unlink_private_review_artifacts(
+            parent_descriptor,
+            container_descriptor,
+        )
+        if private_cleanup_errors:
+            return private_cleanup_errors
+        cleanup_errors = _remove_open_directory_tree(
+            parent_descriptor,
+            container_descriptor,
+            container.name,
+            label="private artifact container",
+            require_private_mode=True,
+            excluded_entry_names=frozenset(PRIVATE_HELPER_ARTIFACT_NAMES),
+        )
         cleanup_errors.extend(
             _unlink_private_review_artifacts(
                 parent_descriptor,
@@ -7842,15 +8242,14 @@ def cleanup_workspace(review: ReviewWorkspace, *, keep_container: bool) -> str |
                 container_descriptor: int,
             ) -> list[str]:
                 tree_errors: list[str] = []
-                if not shutil.rmtree.avoids_symlink_attacks:
-                    tree_errors.append("fd-relative review cleanup is unavailable")
-                else:
-                    try:
-                        shutil.rmtree("workspace", dir_fd=container_descriptor)
-                    except FileNotFoundError:
-                        pass
-                    except OSError as error:
-                        tree_errors.append(str(error))
+                tree_errors.extend(
+                    _remove_named_directory_tree(
+                        container_descriptor,
+                        "workspace",
+                        label="review workspace",
+                        require_private_mode=False,
+                    )
+                )
                 tree_errors.extend(
                     _unlink_private_review_artifacts(
                         parent_descriptor,
