@@ -147,11 +147,35 @@ explicitly configured Claude Code candidate:
 11. Launch only the one captured verified snapshot for every real model attempt
     in a fresh outer sandbox; never rediscover or fall back to the mutable source
     installation between Opus attempts. The trusted runtime may refresh only
-    inside the temporary carrier. On macOS, accept only the current broker
-    generation into helper-owned memory; an acknowledgement confirms staging,
-    not host persistence. After the broker server and every handler have fully
-    quiesced, one outer-runtime owner detaches the latest staged rotation and
-    performs guarded host writeback. Linux/WSL2 instead uses a bounded watcher
+    inside the temporary carrier. On macOS, atomically reserve attempt-scoped
+    durable-journal quota before any filesystem write for every structurally
+    valid `W` generation, then commit it to its own helper-private recovery
+    carrier. The journal is bounded to eight generations and 8 MiB of payload.
+    Every reservation consumes generation and byte quota for the rest of the
+    attempt, even if the write or publication fails. At the locked generation
+    linearization point, publish and
+    acknowledge it only if it is still current and the runtime is not
+    abandoned. Reaching either journal cap NACKs the generation, invalidates any
+    older staged host-writeback candidate, marks credential inspection
+    inconclusive, and pauses without Copilot fallback. A superseded or failed
+    generation is not acknowledged, but its carrier remains in the bounded
+    journal until post-quiescence finalization or failure recovery.
+    Acknowledgement proves file and directory synchronization plus exact
+    readback, not host persistence, so helper `SIGKILL`, fatal failure, or power
+    loss after acknowledgement still leaves the carrier. After the broker
+    server and every handler have fully quiesced, one outer-runtime owner proves
+    the newest carrier, removes older journal entries, detaches the latest
+    acknowledged rotation, performs guarded host writeback, and deletes the final
+    recovery copy only after that write is verified.
+    The latest exact-verified generation is always the canonical current carrier.
+    If quota rejection, a malformed update, or durable-stage failure leaves no
+    staged host-writeback candidate, finalization reports it as the sole current
+    recovery artifact, removes every other
+    non-authoritative complete journal entry, and reports failed stale-entry
+    cleanup separately as cleanup residue. If staged or non-staged control flow
+    leaves any stale carrier unvisited, cleanup reporting is promoted to the
+    recovery-root scope without changing the canonical current carrier.
+    Linux/WSL2 instead uses a bounded watcher
     and a synchronous final drain before cleanup. At each host commit, acquire
     the artifact-certified primary and legacy refresh locks, maintain their
     5-second heartbeat, recheck both macOS carrier snapshots or the Linux/WSL2
@@ -160,9 +184,30 @@ explicitly configured Claude Code candidate:
     staged rotation but before releasing helper-owned locks, reclaim only the
     exact empty private staged locks after both watcher join and a normal
     supervisor return prove writer quiescence, then retry the final drain once.
-    If macOS cannot prove broker-handler quiescence or complete guarded
-    post-quiescence writeback, copy the newest pending or staged payload to a
-    helper-private recovery carrier before clearing helper memory. Otherwise
+    If macOS cannot prove broker-handler quiescence, the server irreversibly
+    closes its pending-update publication/acknowledgement gate before boundedly
+    draining handlers already inside the commit critical section. Runtime
+    abandonment snapshots and pending detachment are recorded independently;
+    detachment may be retried without reopening publication or repeating a
+    successful snapshot. A terminal durable stage racing the abandonment request
+    self-registers as the quiescence stage under the runtime lock. Recovery runs
+    even for a detached `None` payload and converges that stage. The first bounded
+    snapshot failure immediately pre-reports the stable macOS recovery-root
+    cleanup scope; if both snapshots fail, preserve the snapshot failure rather
+    than misreporting recovery timeout. Whenever abandonment recovery observes
+    any durable journal entry or quiescence stage, its final error also reports
+    that root, even when it separately reports an exact current carrier. After an actual
+    bounded recovery timeout, the
+    handler/recovery state machine exclusively owns in-flight stage cleanup. Any
+    late stage or fallback is exact-cleaned by that state machine or remains
+    within the pre-reported recovery-root cleanup scope. Report a carrier as
+    current only after its exact payload is verified;
+    an unverified or incomplete file is cleanup-only.
+    Shutdown uncertainty with no `W` generation produces no current recovery
+    credential; a pre-reported recovery-root cleanup scope remains cleanup-only.
+    If guarded post-quiescence writeback
+    fails, retain the newest verified carrier or durably materialize a newer
+    pending payload before reporting its path. Otherwise
     retain and report the Linux/WSL2 private recovery carrier rather than
     deleting the only possibly
     valid refresh token. Validate structured output, effective
@@ -625,26 +670,73 @@ the access-token expiry. Access-token expiry alone is not login expiry. Select
 the candidate with the later expiry even when both access tokens are already
 expired, then load that payload into the broker. The broker serves the initial
 fixed lookup once and accepts only the exact bounded credential-store update
-forms needed for refresh into helper-owned memory. Concurrent updates receive
-monotonic generations; once a newer generation is pending, an older handler is
-rejected even if it reaches the serialization lock later. A successful broker
-acknowledgement means that the current generation was staged, not that host
-persistence already completed. A current generation that fails structural
-validation invalidates any older staged rotation instead of leaving it eligible
-for commit. It never exposes
+forms needed for refresh. Concurrent updates receive monotonic generations.
+Every structurally valid `W` generation that enters the update callback first
+atomically reserves generation and payload-byte quota before any filesystem
+write. The attempt-scoped durable journal accepts at most eight generations and
+8 MiB of payload. A reservation remains consumed for the rest of the attempt,
+including when the later filesystem write or generation publication fails. The
+generation writes a distinct private recovery carrier, synchronizes its file and containing
+directories, renames it under a synchronized parent, and reads back the exact
+payload. Only after that durable commit does the broker enter the generation
+linearization point under the current-generation lock. It publishes and
+acknowledges the generation only if it is still current and the runtime is not
+abandoned. Reaching either journal cap returns a NACK before filesystem work,
+invalidates any older staged host-writeback candidate, records
+credential-inspection-inconclusive, and pauses without Copilot fallback. A
+superseded, abandoned, or failed generation returns failure without
+acknowledgement, but its carrier remains in the bounded journal until
+post-quiescence finalization or failure recovery. A successful broker acknowledgement therefore proves durable
+recovery staging, not host persistence; helper `SIGKILL`, fatal failure, or
+power loss after acknowledgement still leaves the synchronized carrier. A
+generation that fails structural validation invalidates any older published
+host-writeback candidate while leaving the older durable carrier available for
+recovery. It never exposes
 `/usr/bin/security`, the Keychain service, the file source, or arbitrary update
 commands to Claude. The parent retains both carriers' existence, payload and
 refresh-token digests, plus the file identity, not only the selected carrier.
 Carriers with the same refresh-token digest are one logical login even when
-their access-token payloads or expiry metadata differ. Broker handlers only
-validate and stage the latest generation. After the server and every handler
-have quiesced, the outer runtime is the single host-persistence owner: it
-detaches the latest staged credential, acquires the artifact-certified primary
-`.oauth_refresh.lock` and legacy sibling lock, maintains their certified
+their access-token payloads or expiry metadata differ. After the server and
+every handler have quiesced, the outer runtime is the single host-persistence
+owner: it detaches the latest acknowledged credential, removes older durable
+generations only after the newest is proven, and then acquires the
+artifact-certified primary `.oauth_refresh.lock` and legacy sibling lock. A
+quota rejection, malformed update, or failed durable stage may leave no staged
+host-writeback candidate. In that case finalization selects and reports one exact
+verified complete journal carrier as the sole current recovery credential,
+removes every other non-authoritative complete entry, and reports a stale entry
+whose cleanup fails separately as `authentication.recovery_cleanup_artifact`. A
+control-flow interruption while removing an older generation stops immediately:
+the owner does not begin host writeback or cleanup of the latest carrier. The
+latest exact-verified generation remains the canonical current carrier. If a
+staged or non-staged control-flow stop leaves any stale carrier unvisited,
+cleanup reporting is promoted to the macOS recovery-root scope. It
+maintains the certified
 5-second heartbeat, rechecks both carriers under those locks, and performs
-guarded writeback against each carrier's own current payload. No broker handler
-can mutate host or recovery state after terminal shutdown begins. A bounded
-heartbeat join timeout marks the lease as release-started, not release-complete.
+guarded writeback against each carrier's own current payload. On unquiescent
+shutdown, the server first irreversibly closes the pending-update
+publication/acknowledgement gate, then boundedly drains handlers already inside
+the commit critical section. Runtime abandonment snapshots and pending
+detachment have independent state, so detachment may be retried without
+reopening publication or repeating a successful snapshot. A terminal durable
+stage racing the abandonment request self-registers as the quiescence stage
+under the runtime lock. Recovery executes for a detached `None` payload as well
+as a credential payload and converges that stage. The first bounded snapshot
+failure immediately pre-reports the stable macOS recovery-root cleanup scope. If
+both snapshots fail, the attempt pauses with that snapshot failure; it does not
+report recovery timeout. Whenever abandonment recovery sees any durable journal
+entry or quiescence stage, the final error also reports that root so old
+generations, a failed quiescence stage, and any fallback retain visible ownership
+even beside an exact current carrier. After an actual bounded
+recovery timeout, the handler/recovery state machine
+is the unique owner of any in-flight stage cleanup. A stage or fallback that
+completes late is exact-cleaned by that state machine or remains inside a
+pre-reported recovery-root cleanup scope. A handler that
+finishes a durable write after abandonment cannot acknowledge, mutate host
+state, or overwrite the authoritative fallback. When no `W` generation exists,
+shutdown uncertainty reports the quiescence failure without a current recovery
+credential; a pre-reported recovery-root scope remains cleanup-only. A bounded heartbeat join timeout
+marks the lease as release-started, not release-complete.
 The owning release call performs one further bounded
 cleanup attempt while preserving the first timeout as its primary diagnostic;
 if both joins time out, it reports the exact helper-owned lock paths as
@@ -675,31 +767,46 @@ unrelated external writers that bypass both locks.
 
 The same preservation boundary applies when broker-handler quiescence cannot be
 proved, a Keychain-only guarded write exhausts its bounded retry, or the first
-file-carrier write fails. The shutdown owner detaches the newest pending or
-staged structurally validated rotation and writes it to a helper-owned private
-recovery carrier below the review container before scrubbing helper memory.
+file-carrier write fails. The shutdown owner retains the newest acknowledged
+durable generation only after revalidating its carrier, or durably replaces it
+with a newer pending structurally validated rotation and verifies the resulting
+carrier before reporting it. An uncertain shutdown with no `W` generation, or a
+carrier-creation failure that left no verifiable file, carries the original
+failure without current recovery-credential metadata; a pre-reported
+recovery-root cleanup scope remains separate cleanup evidence.
 The carrier and `config` directories are `0700`; `config/.credentials.json` is
 an owner-only, single-link regular file with exact mode `0600`. It is outside
 the Claude-visible Seatbelt paths and is never passed through the child
-environment. Report only the absolute carrier path, never token contents, and
-pause as inspection-inconclusive without a login prompt or Copilot fallback.
+environment. Report only the absolute path of a carrier or artifact whose exact
+payload was verified when claiming it as current, never token contents, and
+pause as inspection-inconclusive
+without a login prompt or Copilot fallback.
+An unverified or incomplete file is cleanup-only and may be reported only as
+`authentication.recovery_cleanup_artifact`. After verified host commit, cleanup reopens the carrier through no-follow
+directory descriptors, rechecks directory and credential identity, removes the
+credential and directories in order, and synchronizes every containing
+directory. Cleanup uncertainty pauses and reports only
+`authentication.recovery_cleanup_artifact`; it never turns successful host
+persistence into a claim that the leftover copy is the current credential.
 An already-committed host file remains preserved. If recovery replacement or
 finalization fails after a complete private update file was written, retain and
 report that exact artifact instead of losing its location. A later successful,
 read-back-verified replacement removes bounded stale update artifacts. If no
-complete recovery copy can be proven, retain and report the attempted private
-path for operator inspection without claiming that its credential is complete.
-If an incomplete update cannot be removed or safely inspected, report its exact
-path only as cleanup residue; never present it as a recoverable current credential.
+complete recovery copy can be proven and no artifact actually exists, report no
+candidate or attempted path. If an actually existing incomplete update cannot
+be removed or safely inspected, report its exact path only as cleanup residue;
+never present it as a recoverable current credential.
 
 The current recovery credential and cleanup residue are separate report fields.
-Before a verified recovery commit, an exact complete uncommitted update is
+Before a verified recovery commit, an exact-readback-verified complete
+uncommitted update is
 `authentication.recovery_artifact`. After a replacement is fully fsynced and
 read-back verified, `config/.credentials.json` is the current
 `authentication.recovery_artifact`. If deleting an older temp fails, its exact
 path is `authentication.recovery_cleanup_artifact`. An incomplete update that
 cannot be removed uses the same cleanup-only field. Neither an older nor an
-incomplete artifact is ever described as the newest or current recovery value.
+unverified or incomplete artifact is ever described as the newest or current
+recovery value.
 
 The `security -i` transport-size limit applies only when the selected source is
 the Keychain or when matching refresh-token digests require a file-selected
@@ -845,9 +952,10 @@ described as an enforced final launch.
 | No automatic candidate, supported platform unavailable, or an accepted-range automatic candidate cleanly lacks a required non-security capability or secure runtime dependency | `runtime-unavailable` | Only for explicit double/triple-review consent |
 | Local/API authentication is missing, malformed, unsafe, refresh-token-less, or actually rejected as `Login expired`, HTTP 401, or refresh failure | `blocked-authentication`; request `claude auth login` for local login or unset/replace the explicit API key, then pause | No |
 | Signed artifact has no exact credential-lock protocol entry, either macOS carrier changed, lock contention/heartbeat failed, or credential inspection was unstable | `inconclusive`; report the exact coordination/inspection gate and pause without a login prompt | No |
-| The macOS broker cannot prove handler quiescence, or its latest staged rotation cannot be completely guarded-written to every required host carrier | `inconclusive`; retain the private recovery carrier or exact complete update artifact, report only its path, and pause | No |
+| The macOS attempt journal reaches eight generations or 8 MiB of reserved payload | `inconclusive`; NACK the generation before filesystem work, invalidate any older staged host-writeback candidate, and pause | No |
+| The macOS broker cannot prove handler quiescence, a runtime abandonment snapshot fails, or its latest acknowledged durable rotation cannot be completely guarded-written to every required host carrier | `inconclusive`; irreversibly close pending publication/ACK before draining entered commit sections, track runtime snapshots and retryable pending detach independently, self-register a racing terminal stage under the runtime lock, run recovery even for detached `None`, and pre-report the stable recovery-root cleanup scope at the first snapshot failure; any abandonment journal/quiescence stage keeps that root in the final error even beside an exact current carrier; after an actual recovery timeout, let only the handler/recovery state machine exact-clean a late stage/fallback or keep it within that root scope | No |
 | A verified macOS recovery replacement succeeds but deleting an older credential temp fails | `inconclusive`; report verified `config/.credentials.json` as `recovery_artifact`, report the old exact temp separately as `recovery_cleanup_artifact`, and pause | No |
-| An incomplete macOS recovery temp cannot be removed or safely inspected | `inconclusive`; keep the carrier, report the temp only as `recovery_cleanup_artifact`, and never claim it is a current credential | No |
+| An unverified or incomplete macOS recovery temp cannot be removed or safely inspected | `inconclusive`; keep the carrier, report the temp only as `recovery_cleanup_artifact`, and never claim it is a current credential | No |
 | A Linux/WSL2 staged rotation cannot be safely drained, recovered, or guarded-written to the host | `inconclusive`; retain the private recovery carrier, report its path, and pause | No |
 | Explicit override has the wrong version, platform, binary shape, capability contract, or lacks trusted GPG, probe sandbox, or trusted review tool prerequisites | `blocked` configuration error | No |
 | Wrong publisher fingerprint, invalid signature, checksum mismatch, contradictory safe-mode semantics, unsafe runtime metadata, or an isolation-boundary mismatch | `blocked` security error | No |

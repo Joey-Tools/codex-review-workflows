@@ -259,9 +259,10 @@ class RepositoryContractTest(unittest.TestCase):
             macos_runtime_source,
         )
         self.assertIn(
-            "guarded-after-broker-quiescence",
+            "durable-recovery-before-ack",
             macos_runtime_source,
         )
+        self.assertIn("commit_pending", macos_runtime_source)
         self.assertIn(
             "update_callback=stage_refreshed_credential",
             macos_runtime_source,
