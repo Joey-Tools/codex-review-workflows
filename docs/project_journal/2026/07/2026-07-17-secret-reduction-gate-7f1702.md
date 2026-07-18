@@ -29,9 +29,11 @@ head_unembedded_count <= base_unembedded_count
 
 An occurrence is unembedded only when no strictly longer candidate completely contains it. This second count prevents a change from deleting a longer secret while leaving or creating its captured substring as a standalone value.
 
+Counts alone are insufficient. Occurrence provenance (the base location from which a residual head occurrence is allowed to survive) must also prove that every raw and unembedded head occurrence existed at the same raw Git path, normalized surface kind, and absolute byte offset in the base tree. Regular blobs use one surface kind across `100644` and `100755`; symlink targets use a distinct surface kind. A new path, offset, copy, or regular-blob/symlink-target transition therefore blocks even when the global count decreases.
+
 | Range outcome | Decision |
 | --- | --- |
-| Exact raw count strictly decreases and unembedded count does not increase | Eligible after the rest of preflight passes |
+| Exact raw count strictly decreases, unembedded count does not increase, and every residual occurrence has matching base provenance | Eligible after the rest of preflight passes |
 | Residual count is equal | Block |
 | Candidate first appears at head | Block |
 | Move, rename, or copy without strict global reduction | Block |
@@ -42,7 +44,7 @@ Path findings are independent of content counts. A sensitive changed path is eli
 
 ## Trust Boundary
 
-The reviewer is a trusted processor for the scoped repository data authorized by the review request. After preflight passes, it receives the frozen tracked diff, necessary tracked context, and explicitly supplied review prompt as recorded so it can assess the security-sensitive change accurately. The prompt remains size-, identity-, and integrity-bound but is not a secret-egress filter or part of tracked-tree reduction counting. The helper does not automatically discover or collect other untracked private files, unrelated repositories, broad workspace dumps, host-local artifacts, or reviewer/runtime authentication credentials.
+The reviewer is a trusted processor for the scoped repository data authorized by the review request. After preflight passes, it receives the frozen tracked diff, necessary tracked context, and explicitly supplied review prompt as recorded so it can assess the security-sensitive change accurately. Those reviewer inputs remain size-, identity-, and integrity-bound but are intentionally not secret-scanned, redacted, or made subject to an additional prompt-secret authorization gate. The helper does not automatically discover or collect other untracked private files, unrelated repositories, broad workspace dumps, host-local artifacts, or reviewer/runtime authentication credentials. PR/master admission remains the primary secret-introduction control.
 
 Diagnostic and preflight evidence remain bounded audit surfaces. They use stable finding metadata, digests, and counts where applicable; this evidence contract does not require changing the tracked review content sent to the reviewer. Changed-head paths are published only as ordered SHA-256 commitments, while matching raw records remain helper-private and ephemeral. Changed-blob findings likewise use path digests.
 
@@ -55,7 +57,7 @@ Diagnostic and preflight evidence remain bounded audit surfaces. They use stable
 
 ## Current State
 
-- Runtime preflight exhaustively captures bounded exact candidates across complete base and head trees, performs raw and unembedded counting, and persists range-bound public metadata plus helper-private candidate bytes for stateful head recounting.
+- Runtime preflight exhaustively captures bounded exact candidates across complete base and head trees, performs raw and unembedded counting, and binds every dynamic occurrence to raw Git path, normalized blob/symlink surface, and absolute byte offset. Public manifest schema version 4 stores only fixed-size base/head provenance commitments; raw paths, offsets, occurrence identities, and candidate bytes are not published. Helper-private state retains only the exact candidate bytes needed for stateful head recounting, and materialized-head validation must reproduce the public head commitment exactly.
 - Complete PEM blocks and AWS secret values have stable candidate identities; oversized provider prefixes, oversized assignments/JWTs, incomplete PEM blocks, and other uncountable events remain fail closed. PEM end markers are indexed once by label and matched with bounded binary searches, so dense unmatched begin markers cannot amplify into overlapping 32-KiB scans.
 - Dynamic candidates that do not satisfy the reduction inequalities are rejected during preparation, before a mutable materialized head or reviewer process exists.
 - Variable-length provider candidates prove their terminating byte against the provider body alphabet, select the longest actual prefix for the 513-byte fail-closed branch, and retain provider-specific spans across stream commit boundaries.
@@ -82,7 +84,8 @@ Diagnostic and preflight evidence remain bounded audit surfaces. They use stable
 
 ## Validation
 
-- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests`: 830 tests passed, 9 skipped.
+- `uv run python skills/review-orchestration-playbook/tests/test_synthetic_tokens.py`: 189 tests passed.
+- `uv run python -m unittest discover -s skills/review-orchestration-playbook/tests`: 835 tests passed, 4 skipped.
 - `ruff check` on changed runtime and test modules: passed.
 - `git diff --check`: passed.
 - Fixed-range Codex review and PR readiness evidence are recorded in the delivery thread and PR.

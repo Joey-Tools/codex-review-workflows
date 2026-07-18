@@ -271,6 +271,7 @@ MAX_CHANGED_BLOB_SCAN_BYTES = 512 * 1024 * 1024
 MAX_SECRET_SCAN_EVENTS = 1_000_000
 MAX_SECRET_REDUCTION_CANDIDATES = 128
 MAX_SECRET_REDUCTION_CANDIDATE_BYTES = 32 * 1024
+MAX_SECRET_REDUCTION_PROVENANCE_OCCURRENCES = 512
 MAX_LEGACY_OCCURRENCE_EVENTS = 1_000_000
 MAX_LEGACY_SEARCH_BYTES = 16 * 1024 * 1024 * 1024
 MAX_LEGACY_CONTAINMENT_CHECKS = 10_000_000
@@ -283,7 +284,8 @@ MAX_SYNTHETIC_EVIDENCE_ENTRIES = 512
 SYNTHETIC_MANIFEST_NAME = "synthetic-secret-manifest.json"
 SYNTHETIC_PRIVATE_MANIFEST_NAME = "synthetic-secret-state.json"
 SYNTHETIC_CHANGED_EVIDENCE_NAME = "synthetic-changed-evidence.json"
-SYNTHETIC_MANIFEST_SCHEMA_VERSION = 3
+SYNTHETIC_MANIFEST_SCHEMA_VERSION = 4
+SECRET_REDUCTION_PROVENANCE_SCHEME = "path-surface-offset-sha256-v1"
 CONTROL_ARTIFACT_STATE_NAME = "control-artifact-state.json"
 CONTROL_ARTIFACT_SCHEMA_VERSION = 3
 CHANGED_PATH_DIGESTS_NAME = "changed-path-digests.z"
@@ -397,12 +399,29 @@ class SecretScanResult:
     blocking_candidates: dict[bytes, set[str]]
     raw_occurrence_counts: Counter[AcceptedSyntheticValue]
     unembedded_occurrence_counts: Counter[AcceptedSyntheticValue]
+    reduction_occurrence_offsets: dict[AcceptedSyntheticValue, set[int]]
+    reduction_unembedded_offsets: dict[AcceptedSyntheticValue, set[int]]
+    reduction_occurrence_identities: dict[AcceptedSyntheticValue, set[str]]
+    reduction_unembedded_identities: dict[AcceptedSyntheticValue, set[str]]
     incomplete_suffix_start: int | None
     incomplete_suffix_retention_start: int | None
 
     @classmethod
     def empty(cls) -> "SecretScanResult":
-        return cls(None, Counter(), {}, {}, Counter(), Counter(), None, None)
+        return cls(
+            None,
+            Counter(),
+            {},
+            {},
+            Counter(),
+            Counter(),
+            {},
+            {},
+            {},
+            {},
+            None,
+            None,
+        )
 
     def merge(self, other: "SecretScanResult") -> None:
         if self.blocking_rule is None:
@@ -410,6 +429,44 @@ class SecretScanResult:
         self.accepted_counts.update(other.accepted_counts)
         self.raw_occurrence_counts.update(other.raw_occurrence_counts)
         self.unembedded_occurrence_counts.update(other.unembedded_occurrence_counts)
+        for descriptor, offsets in other.reduction_occurrence_offsets.items():
+            destination = self.reduction_occurrence_offsets.setdefault(
+                descriptor,
+                set(),
+            )
+            destination.update(offsets)
+        for descriptor, offsets in other.reduction_unembedded_offsets.items():
+            destination = self.reduction_unembedded_offsets.setdefault(
+                descriptor,
+                set(),
+            )
+            destination.update(offsets)
+        for descriptor, identities in other.reduction_occurrence_identities.items():
+            destination = self.reduction_occurrence_identities.setdefault(
+                descriptor,
+                set(),
+            )
+            destination.update(identities)
+        for descriptor, identities in other.reduction_unembedded_identities.items():
+            destination = self.reduction_unembedded_identities.setdefault(
+                descriptor,
+                set(),
+            )
+            destination.update(identities)
+        if (
+            sum(map(len, self.reduction_occurrence_offsets.values()))
+            > MAX_SECRET_REDUCTION_PROVENANCE_OCCURRENCES
+            or sum(map(len, self.reduction_unembedded_offsets.values()))
+            > MAX_SECRET_REDUCTION_PROVENANCE_OCCURRENCES
+            or sum(map(len, self.reduction_occurrence_identities.values()))
+            > MAX_SECRET_REDUCTION_PROVENANCE_OCCURRENCES
+            or sum(map(len, self.reduction_unembedded_identities.values()))
+            > MAX_SECRET_REDUCTION_PROVENANCE_OCCURRENCES
+        ):
+            raise ReviewError(
+                "external review secret-reduction occurrence provenance exceeds "
+                "the entry limit"
+            )
         for accepted, values in other.accepted_candidates.items():
             self.accepted_candidates.setdefault(accepted, set()).update(values)
         for candidate, rules in other.blocking_candidates.items():
@@ -1871,6 +1928,7 @@ def _scan_batch_blob(
     raw_occurrence_values: Iterable[AcceptedSyntheticValue] = (),
     capture_accepted_candidates: bool = False,
     capture_blocking_candidates: bool = False,
+    capture_reduction_offsets: bool = False,
     reduced_secret_values: frozenset[bytes] = frozenset(),
     accepted_index: AcceptedValueIndex | None = None,
     event_budget: SecretScanBudget | None = None,
@@ -1902,6 +1960,7 @@ def _scan_batch_blob(
         raw_occurrence_values=raw_occurrence_values,
         capture_accepted_candidates=capture_accepted_candidates,
         capture_blocking_candidates=capture_blocking_candidates,
+        capture_reduction_offsets=capture_reduction_offsets,
         reduced_secret_values=reduced_secret_values,
         _accepted_index=accepted_index,
         _event_budget=event_budget,
@@ -1914,6 +1973,64 @@ def _scan_batch_blob(
     return scan, scanned_bytes + size
 
 
+def _secret_reduction_occurrence_identity(
+    *,
+    raw_path: bytes,
+    git_mode: str,
+    offset: int,
+) -> str:
+    if git_mode not in {"100644", "100755", "120000"}:
+        raise ReviewError("secret-reduction occurrence has an unsupported Git mode")
+    if not raw_path or type(offset) is not int or offset < 0:
+        raise ReviewError("secret-reduction occurrence identity is invalid")
+    digest = hashlib.sha256()
+    digest.update(b"codex-secret-reduction-occurrence-v1\0")
+    surface = b"symlink-target" if git_mode == "120000" else b"blob"
+    digest.update(surface)
+    digest.update(len(raw_path).to_bytes(8, "big"))
+    digest.update(raw_path)
+    digest.update(offset.to_bytes(8, "big"))
+    return digest.hexdigest()
+
+
+def _secret_reduction_occurrence_commitment(identities: Iterable[str]) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"codex-secret-reduction-occurrence-set-v1\0")
+    for identity in sorted(identities):
+        if re.fullmatch(r"[0-9a-f]{64}", identity) is None:
+            raise ReviewError("secret-reduction occurrence commitment is invalid")
+        digest.update(bytes.fromhex(identity))
+    return digest.hexdigest()
+
+
+def _secret_reduction_provenance_commitment(
+    raw_identities: dict[AcceptedSyntheticValue, set[str]],
+    unembedded_identities: dict[AcceptedSyntheticValue, set[str]],
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"codex-secret-reduction-provenance-v1\0")
+    descriptors = set(raw_identities) | set(unembedded_identities)
+    for descriptor in sorted(descriptors, key=lambda item: item.value_sha256):
+        if descriptor.kind != "secret-reduction":
+            raise ReviewError(
+                "secret-reduction provenance contains a non-dynamic value"
+            )
+        raw = raw_identities.get(descriptor, set())
+        unembedded = unembedded_identities.get(descriptor, set())
+        if not unembedded.issubset(raw):
+            raise ReviewError(
+                "secret-reduction unembedded provenance is not raw provenance"
+            )
+        digest.update(bytes.fromhex(descriptor.value_sha256))
+        digest.update(len(raw).to_bytes(8, "big"))
+        digest.update(bytes.fromhex(_secret_reduction_occurrence_commitment(raw)))
+        digest.update(len(unembedded).to_bytes(8, "big"))
+        digest.update(
+            bytes.fromhex(_secret_reduction_occurrence_commitment(unembedded))
+        )
+    return digest.hexdigest()
+
+
 def _scan_frozen_tree_values(
     *,
     git_view: pathlib.Path,
@@ -1923,6 +2040,7 @@ def _scan_frozen_tree_values(
     raw_occurrence_values: Iterable[AcceptedSyntheticValue] = (),
     capture_accepted_candidates: bool = False,
     capture_blocking_candidates: bool = False,
+    capture_reduction_identities: bool = False,
     reduced_secret_values: frozenset[bytes] = frozenset(),
     _continue_after_blocking: bool = False,
 ) -> SecretScanResult:
@@ -1982,6 +2100,7 @@ def _scan_frozen_tree_values(
                         "frozen Git tree scan exceeds the review entry-count limit"
                     )
                 mode, object_type, object_id, _relative = _parse_tree_record(record)
+                _metadata, raw_path = record.split(b"\t", 1)
                 if mode == "160000" and object_type == "commit":
                     continue
                 if object_type != "blob":
@@ -1997,6 +2116,7 @@ def _scan_frozen_tree_values(
                     raw_occurrence_values=raw_occurrences,
                     capture_accepted_candidates=capture_accepted_candidates,
                     capture_blocking_candidates=capture_blocking_candidates,
+                    capture_reduction_offsets=capture_reduction_identities,
                     reduced_secret_values=reduced_secret_values,
                     accepted_index=accepted_index,
                     event_budget=event_budget,
@@ -2004,6 +2124,41 @@ def _scan_frozen_tree_values(
                     occurrence_budget=occurrence_budget,
                     _continue_after_blocking=_continue_after_blocking,
                 )
+                if capture_reduction_identities:
+                    for (
+                        descriptor,
+                        offsets,
+                    ) in scan.reduction_occurrence_offsets.items():
+                        identities = scan.reduction_occurrence_identities.setdefault(
+                            descriptor,
+                            set(),
+                        )
+                        identities.update(
+                            _secret_reduction_occurrence_identity(
+                                raw_path=raw_path,
+                                git_mode=mode,
+                                offset=offset,
+                            )
+                            for offset in offsets
+                        )
+                    for (
+                        descriptor,
+                        offsets,
+                    ) in scan.reduction_unembedded_offsets.items():
+                        identities = scan.reduction_unembedded_identities.setdefault(
+                            descriptor,
+                            set(),
+                        )
+                        identities.update(
+                            _secret_reduction_occurrence_identity(
+                                raw_path=raw_path,
+                                git_mode=mode,
+                                offset=offset,
+                            )
+                            for offset in offsets
+                        )
+                    scan.reduction_occurrence_offsets.clear()
+                    scan.reduction_unembedded_offsets.clear()
                 result.merge(scan)
             _close_pipe(tree_process.stdout)
             tree_returncode = tree_process.wait()
@@ -2122,6 +2277,12 @@ def _secret_count_manifests(
             key=lambda item: (hashlib.sha256(item[0]).hexdigest(), item[0]),
         )
     )
+    _reject_secret_reduction_values_in_frozen_tree_paths(
+        git_view=git_view,
+        object_directory=object_directory,
+        commit=head_sha,
+        reduction_values=reduction_descriptors,
+    )
     count_values = legacy_accepted + reduction_descriptors
     discovered_values = frozenset(discovery.blocking_candidates)
     if count_values:
@@ -2132,6 +2293,7 @@ def _secret_count_manifests(
             accepted_values=scan_accepted,
             raw_occurrence_values=count_values,
             reduced_secret_values=discovered_values,
+            capture_reduction_identities=True,
         )
         head_scan = _scan_frozen_tree_values(
             git_view=git_view,
@@ -2140,6 +2302,7 @@ def _secret_count_manifests(
             accepted_values=scan_accepted,
             raw_occurrence_values=count_values,
             reduced_secret_values=discovered_values,
+            capture_reduction_identities=True,
         )
     else:
         base_scan = SecretScanResult.empty()
@@ -2198,6 +2361,30 @@ def _secret_count_manifests(
         head_unembedded_count = head_scan.unembedded_occurrence_counts[descriptor]
         rules = sorted(discovery.blocking_candidates[descriptor.value])
         rule_label = ", ".join(rules)
+        base_occurrences = base_scan.reduction_occurrence_identities.get(
+            descriptor,
+            set(),
+        )
+        head_occurrences = head_scan.reduction_occurrence_identities.get(
+            descriptor,
+            set(),
+        )
+        base_unembedded_occurrences = base_scan.reduction_unembedded_identities.get(
+            descriptor, set()
+        )
+        head_unembedded_occurrences = head_scan.reduction_unembedded_identities.get(
+            descriptor, set()
+        )
+        if (
+            len(base_occurrences) != base_count
+            or len(head_occurrences) != head_count
+            or len(base_unembedded_occurrences) != base_unembedded_count
+            or len(head_unembedded_occurrences) != head_unembedded_count
+        ):
+            raise ReviewError(
+                "unregistered secret occurrence provenance does not match its "
+                f"complete-tree count for scanner rules {rule_label}"
+            )
         if head_count >= base_count:
             raise ReviewError(
                 "unregistered secret count did not strictly decrease for scanner "
@@ -2208,6 +2395,19 @@ def _secret_count_manifests(
                 "unregistered secret unembedded count increased for scanner rules "
                 f"{rule_label}: base={base_unembedded_count}, "
                 f"head={head_unembedded_count}"
+            )
+        if not head_occurrences.issubset(base_occurrences):
+            raise ReviewError(
+                "unregistered secret has a head-side occurrence that was not "
+                "present at the same base path, surface kind, and byte offset for "
+                "scanner rules "
+                f"{rule_label}"
+            )
+        if not head_unembedded_occurrences.issubset(base_unembedded_occurrences):
+            raise ReviewError(
+                "unregistered secret has an unembedded head-side occurrence that "
+                "was not present at the same base path, surface kind, and byte offset "
+                f"for scanner rules {rule_label}"
             )
         allowed_reductions.append(descriptor)
         reduction_entries.append(
@@ -2231,6 +2431,17 @@ def _secret_count_manifests(
         "pool_version": catalog.pool_version,
         "schema_version": SYNTHETIC_MANIFEST_SCHEMA_VERSION,
         "secret_reductions": reduction_entries,
+        "secret_reduction_provenance": {
+            "base_sha256": _secret_reduction_provenance_commitment(
+                base_scan.reduction_occurrence_identities,
+                base_scan.reduction_unembedded_identities,
+            ),
+            "head_sha256": _secret_reduction_provenance_commitment(
+                head_scan.reduction_occurrence_identities,
+                head_scan.reduction_unembedded_identities,
+            ),
+            "scheme": SECRET_REDUCTION_PROVENANCE_SCHEME,
+        },
         "selected_exemptions": [item.identifier for item in exemptions],
     }
     private_manifest = dict(public_manifest)
@@ -2846,12 +3057,22 @@ def _load_legacy_manifest(
     list[dict[str, Any]],
     tuple[AcceptedSyntheticValue, ...],
     dict[AcceptedSyntheticValue, tuple[int, int, int, int]],
+    str,
     list[dict[str, Any]],
 ]:
     manifest_path = control_dir / SYNTHETIC_MANIFEST_NAME
     private_manifest_path = container_dir / SYNTHETIC_PRIVATE_MANIFEST_NAME
     if not manifest_path.exists() and not private_manifest_path.exists():
-        return (), (), {}, [], (), {}, []
+        return (
+            (),
+            (),
+            {},
+            [],
+            (),
+            {},
+            _secret_reduction_provenance_commitment({}, {}),
+            [],
+        )
     if not manifest_path.exists() or not private_manifest_path.exists():
         raise ReviewError("synthetic secret helper-private state is missing")
     workspace_manifest = _read_bounded_json(
@@ -2877,6 +3098,7 @@ def _load_legacy_manifest(
         "pool_version",
         "schema_version",
         "secret_reductions",
+        "secret_reduction_provenance",
         "selected_exemptions",
     }:
         raise ReviewError("synthetic secret manifest fields are invalid")
@@ -2892,6 +3114,17 @@ def _load_legacy_manifest(
         raise ReviewError(
             "synthetic secret manifest version or review range is invalid"
         )
+    provenance = manifest["secret_reduction_provenance"]
+    if (
+        not isinstance(provenance, dict)
+        or set(provenance) != {"base_sha256", "head_sha256", "scheme"}
+        or provenance.get("scheme") != SECRET_REDUCTION_PROVENANCE_SCHEME
+        or not isinstance(provenance.get("base_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", provenance["base_sha256"]) is None
+        or not isinstance(provenance.get("head_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", provenance["head_sha256"]) is None
+    ):
+        raise ReviewError("secret-reduction occurrence provenance is invalid")
     selected_ids = manifest["selected_exemptions"]
     if not isinstance(selected_ids, list) or not all(
         isinstance(item, str) for item in selected_ids
@@ -3092,6 +3325,7 @@ def _load_legacy_manifest(
         evidence,
         tuple(reduction_values),
         reduction_counts,
+        provenance["head_sha256"],
         reduction_evidence,
     )
 
@@ -3190,6 +3424,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
         legacy_evidence,
         reduction_values,
         reduction_counts,
+        expected_head_reduction_provenance,
         reduction_evidence,
     ) = _load_legacy_manifest(
         control_dir=control_dir,
@@ -3232,6 +3467,11 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     )
     frozen_head_counts: Counter[AcceptedSyntheticValue] = Counter()
     frozen_head_unembedded_counts: Counter[AcceptedSyntheticValue] = Counter()
+    frozen_head_occurrences: dict[AcceptedSyntheticValue, set[str]] = {}
+    frozen_head_unembedded_occurrences: dict[
+        AcceptedSyntheticValue,
+        set[str],
+    ] = {}
 
     def record_finding(value: str) -> None:
         nonlocal sensitive_finding_count
@@ -3245,6 +3485,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
         surface: str,
         side: str,
         path_bytes: bytes,
+        git_mode: str,
         finding_label: str,
         diagnostic_surface: str | None = None,
     ) -> None:
@@ -3252,6 +3493,39 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
             suffix = f"; {diagnostic_surface}" if diagnostic_surface is not None else ""
             record_finding(f"{finding_label} ({scan.blocking_rule}{suffix})")
         path_sha256 = hashlib.sha256(path_bytes).hexdigest()
+        for descriptor, offsets in scan.reduction_occurrence_offsets.items():
+            occurrences = frozen_head_occurrences.setdefault(descriptor, set())
+            occurrences.update(
+                _secret_reduction_occurrence_identity(
+                    raw_path=path_bytes,
+                    git_mode=git_mode,
+                    offset=offset,
+                )
+                for offset in offsets
+            )
+        for descriptor, offsets in scan.reduction_unembedded_offsets.items():
+            occurrences = frozen_head_unembedded_occurrences.setdefault(
+                descriptor,
+                set(),
+            )
+            occurrences.update(
+                _secret_reduction_occurrence_identity(
+                    raw_path=path_bytes,
+                    git_mode=git_mode,
+                    offset=offset,
+                )
+                for offset in offsets
+            )
+        if (
+            sum(map(len, frozen_head_occurrences.values()))
+            > MAX_SECRET_REDUCTION_PROVENANCE_OCCURRENCES
+            or sum(map(len, frozen_head_unembedded_occurrences.values()))
+            > MAX_SECRET_REDUCTION_PROVENANCE_OCCURRENCES
+        ):
+            raise ReviewError(
+                "frozen head secret-reduction occurrence provenance exceeds "
+                "the entry limit"
+            )
         for accepted, count in scan.accepted_counts.items():
             _record_bounded_evidence_count(
                 accepted_evidence_counts,
@@ -3467,6 +3741,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
                 accepted_values=accepted_values,
                 raw_occurrence_values=counted_values,
                 reduced_secret_values=reduced_secret_values,
+                capture_reduction_offsets=True,
                 _accepted_index=accepted_index,
                 _event_budget=event_budget,
                 _exact_index=counted_exact_index,
@@ -3477,6 +3752,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
                 surface="symlink-target",
                 side="head",
                 path_bytes=raw_relative,
+                git_mode="120000",
                 finding_label=f"{path_display} -> <redacted symlink target>",
                 diagnostic_surface="symlink-target",
             )
@@ -3487,11 +3763,14 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
             continue
         if candidate.is_dir():
             continue
+        candidate_status = os.lstat(candidate)
+        git_mode = "100755" if candidate_status.st_mode & 0o111 else "100644"
         scan = _file_secret_scan(
             candidate,
             accepted_values=accepted_values,
             raw_occurrence_values=counted_values,
             reduced_secret_values=reduced_secret_values,
+            capture_reduction_offsets=True,
             accepted_index=accepted_index,
             event_budget=event_budget,
             exact_index=counted_exact_index,
@@ -3505,6 +3784,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
             surface="frozen-head",
             side="head",
             path_bytes=raw_relative,
+            git_mode=git_mode,
             finding_label=path_display,
         )
         frozen_head_counts.update(scan.raw_occurrence_counts)
@@ -3555,6 +3835,16 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
         raise ReviewError(
             "sensitive content preflight blocked external review; remove or narrow "
             f"these paths before egress: {summary}"
+        )
+
+    actual_head_reduction_provenance = _secret_reduction_provenance_commitment(
+        frozen_head_occurrences,
+        frozen_head_unembedded_occurrences,
+    )
+    if actual_head_reduction_provenance != expected_head_reduction_provenance:
+        raise ReviewError(
+            "frozen head secret-reduction occurrence provenance changed after "
+            "preparation"
         )
 
     accepted_evidence = list(changed_accepted_evidence)
@@ -3661,6 +3951,7 @@ def _file_secret_scan(
     raw_occurrence_values: Iterable[AcceptedSyntheticValue] = (),
     capture_accepted_candidates: bool = False,
     capture_blocking_candidates: bool = False,
+    capture_reduction_offsets: bool = False,
     reduced_secret_values: frozenset[bytes] = frozenset(),
     diff_surface: bool = False,
     accepted_index: AcceptedValueIndex | None = None,
@@ -3693,6 +3984,7 @@ def _file_secret_scan(
             raw_occurrence_values=raw_occurrence_values,
             capture_accepted_candidates=capture_accepted_candidates,
             capture_blocking_candidates=capture_blocking_candidates,
+            capture_reduction_offsets=capture_reduction_offsets,
             reduced_secret_values=reduced_secret_values,
             diff_surface=diff_surface,
             _accepted_index=accepted_index,
@@ -6568,14 +6860,24 @@ def _count_exact_value_occurrences(
     minimum_start: int,
     maximum_start: int,
     event_budget: LegacyOccurrenceBudget,
+    capture_reduction_offsets: bool = False,
 ) -> tuple[
     Counter[AcceptedSyntheticValue],
     Counter[AcceptedSyntheticValue],
+    dict[AcceptedSyntheticValue, set[int]],
+    dict[AcceptedSyntheticValue, set[int]],
 ]:
     counts: Counter[AcceptedSyntheticValue] = Counter()
     unembedded_counts: Counter[AcceptedSyntheticValue] = Counter()
+    reduction_offsets: dict[AcceptedSyntheticValue, set[int]] = {}
+    reduction_unembedded_offsets: dict[AcceptedSyntheticValue, set[int]] = {}
     if not exact_index.patterns or minimum_start >= maximum_start:
-        return counts, unembedded_counts
+        return (
+            counts,
+            unembedded_counts,
+            reduction_offsets,
+            reduction_unembedded_offsets,
+        )
     event_budget.consume_search(
         len(exact_index.patterns) * max(0, len(value) - minimum_start)
     )
@@ -6587,6 +6889,17 @@ def _count_exact_value_occurrences(
                 break
             event_budget.consume()
             counts[descriptor] += 1
+            if capture_reduction_offsets and descriptor.kind == "secret-reduction":
+                offsets = reduction_offsets.setdefault(descriptor, set())
+                offsets.add(start)
+                if (
+                    sum(map(len, reduction_offsets.values()))
+                    > MAX_SECRET_REDUCTION_PROVENANCE_OCCURRENCES
+                ):
+                    raise ReviewError(
+                        "external review secret-reduction occurrence provenance "
+                        "exceeds the entry limit"
+                    )
             embedded = False
             for longer_value, offset in exact_index.containers[raw_value]:
                 event_budget.consume_containment_check()
@@ -6599,8 +6912,17 @@ def _count_exact_value_occurrences(
                     break
             if not embedded:
                 unembedded_counts[descriptor] += 1
+                if capture_reduction_offsets and descriptor.kind == "secret-reduction":
+                    reduction_unembedded_offsets.setdefault(descriptor, set()).add(
+                        start
+                    )
             next_start = start + 1
-    return counts, unembedded_counts
+    return (
+        counts,
+        unembedded_counts,
+        reduction_offsets,
+        reduction_unembedded_offsets,
+    )
 
 
 def _matching_accepted_values(
@@ -6628,6 +6950,7 @@ def _scan_secret_value(
     maximum_end: int | None = None,
     capture_accepted_candidates: bool = False,
     capture_blocking_candidates: bool = False,
+    capture_reduction_offsets: bool = False,
     reduced_secret_values: frozenset[bytes] = frozenset(),
     diff_surface: bool = False,
     prefix_context_complete: bool = True,
@@ -6656,15 +6979,23 @@ def _scan_secret_value(
     result = SecretScanResult.empty()
     exact_index = _exact_index or _index_exact_values(raw_occurrence_values)
     occurrence_budget = _occurrence_budget or LegacyOccurrenceBudget.default()
-    raw_counts, unembedded_counts = _count_exact_value_occurrences(
+    (
+        raw_counts,
+        unembedded_counts,
+        reduction_offsets,
+        reduction_unembedded_offsets,
+    ) = _count_exact_value_occurrences(
         value,
         exact_index=exact_index,
         minimum_start=0,
         maximum_start=len(value),
         event_budget=occurrence_budget,
+        capture_reduction_offsets=capture_reduction_offsets,
     )
     result.raw_occurrence_counts.update(raw_counts)
     result.unembedded_occurrence_counts.update(unembedded_counts)
+    result.reduction_occurrence_offsets.update(reduction_offsets)
+    result.reduction_unembedded_offsets.update(reduction_unembedded_offsets)
     upper = len(value) if maximum_end is None else maximum_end
     accepted_index = _accepted_index or _index_accepted_values(accepted_values)
     event_budget = _event_budget or SecretScanBudget.default()
@@ -6795,6 +7126,7 @@ def _stream_secret_scan(
     raw_occurrence_values: Iterable[AcceptedSyntheticValue] = (),
     capture_accepted_candidates: bool = False,
     capture_blocking_candidates: bool = False,
+    capture_reduction_offsets: bool = False,
     reduced_secret_values: frozenset[bytes] = frozenset(),
     diff_surface: bool = False,
     _accepted_index: AcceptedValueIndex | None = None,
@@ -6865,15 +7197,43 @@ def _stream_secret_scan(
             if at_end
             else max(0, total_read - max(0, exact_index.maximum_length - 1))
         )
-        raw_counts, unembedded_counts = _count_exact_value_occurrences(
+        (
+            raw_counts,
+            unembedded_counts,
+            reduction_offsets,
+            reduction_unembedded_offsets,
+        ) = _count_exact_value_occurrences(
             exact_pending,
             exact_index=exact_index,
             minimum_start=max(0, committed_start - exact_pending_offset),
             maximum_start=max(0, next_committed_start - exact_pending_offset),
             event_budget=occurrence_budget,
+            capture_reduction_offsets=capture_reduction_offsets,
         )
         result.raw_occurrence_counts.update(raw_counts)
         result.unembedded_occurrence_counts.update(unembedded_counts)
+        for descriptor, offsets in reduction_offsets.items():
+            destination = result.reduction_occurrence_offsets.setdefault(
+                descriptor,
+                set(),
+            )
+            destination.update(exact_pending_offset + offset for offset in offsets)
+        for descriptor, offsets in reduction_unembedded_offsets.items():
+            destination = result.reduction_unembedded_offsets.setdefault(
+                descriptor,
+                set(),
+            )
+            destination.update(exact_pending_offset + offset for offset in offsets)
+        if (
+            sum(map(len, result.reduction_occurrence_offsets.values()))
+            > MAX_SECRET_REDUCTION_PROVENANCE_OCCURRENCES
+            or sum(map(len, result.reduction_unembedded_offsets.values()))
+            > MAX_SECRET_REDUCTION_PROVENANCE_OCCURRENCES
+        ):
+            raise ReviewError(
+                "external review secret-reduction occurrence provenance exceeds "
+                "the entry limit"
+            )
         committed_start = next_committed_start
         if not at_end:
             retain_exact_from = max(
@@ -7287,12 +7647,6 @@ def prepare_workspace(
             head_sha=head_sha,
             catalog=catalog,
             exemptions=selected_exemptions,
-        )
-        _reject_secret_reduction_values_in_frozen_tree_paths(
-            git_view=git_view,
-            object_directory=object_directory,
-            commit=head_sha,
-            reduction_values=secret_reductions,
         )
         manifest_sensitive_values = evidence_sensitive_values + secret_reductions
         _materialize_frozen_tree(

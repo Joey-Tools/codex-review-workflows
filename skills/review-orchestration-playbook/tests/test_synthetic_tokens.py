@@ -701,6 +701,51 @@ class PublicPoolScannerTest(unittest.TestCase):
         self.assertEqual(scan.raw_occurrence_counts[long], 1)
         self.assertEqual(scan.unembedded_occurrence_counts[long], 1)
 
+    def test_dynamic_occurrence_offsets_are_blob_global_across_stream_chunks(
+        self,
+    ) -> None:
+        short_raw = b"RuntimeOpaque" + b"A" * 16 + b"9!"
+        long_raw = b"Prefix" + short_raw + b"Suffix"
+        short = workspace._secret_reduction_descriptor(
+            short_raw,
+            {"generic-secret-assignment"},
+        )
+        long = workspace._secret_reduction_descriptor(
+            long_raw,
+            {"generic-secret-assignment"},
+        )
+        long_start = 37
+        short_start = long_start + len(long_raw) + 41
+        payload = (
+            b"x" * long_start
+            + long_raw
+            + b"y" * (short_start - long_start - len(long_raw))
+            + short_raw
+        )
+
+        with (
+            mock.patch.object(workspace, "MAX_SECRET_PREFIX_PROOF_BYTES", 32),
+            mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", 16),
+            mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 32),
+        ):
+            scan = workspace._stream_secret_scan(
+                io.BytesIO(payload),
+                size=len(payload),
+                raw_occurrence_values=(short, long),
+                capture_reduction_offsets=True,
+            )
+
+        self.assertEqual(
+            scan.reduction_occurrence_offsets[short],
+            {long_start + len(b"Prefix"), short_start},
+        )
+        self.assertEqual(
+            scan.reduction_unembedded_offsets[short],
+            {short_start},
+        )
+        self.assertEqual(scan.reduction_occurrence_offsets[long], {long_start})
+        self.assertEqual(scan.reduction_unembedded_offsets[long], {long_start})
+
     def test_accepted_quoted_value_requires_a_complete_rhs(self) -> None:
         accepted = self.accepted[0]
         exact_assignment = assignment_bytes(b"access_token", accepted.value)
@@ -5675,7 +5720,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                         / workspace.SYNTHETIC_MANIFEST_NAME
                     )
                     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                    self.assertEqual(manifest["schema_version"], 3)
+                    self.assertEqual(manifest["schema_version"], 4)
                     self.assertEqual(len(manifest["secret_reductions"]), 1)
                     reduction = manifest["secret_reductions"][0]
                     self.assertEqual(
@@ -6348,6 +6393,101 @@ class SyntheticWorkspaceTest(unittest.TestCase):
 
                 with self.assertRaisesRegex(ReviewError, rule):
                     self.prepare(repo=repo, base=base, head=head)
+
+    def test_prepared_range_rejects_net_reduction_with_new_occurrence_provenance(
+        self,
+    ) -> None:
+        fixture = reduction_fixture("generic-secret-assignment")
+        cases = ("path", "offset", "mode")
+        for transition in cases:
+            with self.subTest(transition=transition):
+                if transition == "path":
+                    repo, base = self.new_repo(
+                        {"first.cfg": fixture, "second.cfg": fixture}
+                    )
+                    (repo / "first.cfg").unlink()
+                    (repo / "second.cfg").unlink()
+                    (repo / "relocated.cfg").write_text(fixture, encoding="utf-8")
+                elif transition == "offset":
+                    repo, base = self.new_repo(
+                        {"fixture.cfg": fixture + "# padding\n" + fixture}
+                    )
+                    (repo / "fixture.cfg").write_text(
+                        "# shifted\n" + fixture,
+                        encoding="utf-8",
+                    )
+                else:
+                    mode_value = reduction_secret("github-token").decode("ascii")
+                    repo, base = self.new_repo(
+                        {"fixture.cfg": mode_value, "extra.cfg": mode_value}
+                    )
+                    (repo / "extra.cfg").unlink()
+                    (repo / "fixture.cfg").unlink()
+                    (repo / "fixture.cfg").symlink_to(mode_value)
+                head = self.commit(repo)
+
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "head-side occurrence",
+                ):
+                    self.prepare(repo=repo, base=base, head=head)
+
+    def test_prepared_range_rejects_new_unembedded_occurrence_at_stable_offset(
+        self,
+    ) -> None:
+        short = reduction_secret("generic-secret-assignment").decode("ascii")
+        prefix = "Prefix"
+        longer = prefix + short + "Suffix"
+        assignment_prefix = "access_token = "
+        base_first = assignment_prefix + '"' + longer + '"\n'
+        head_first = assignment_prefix + " " * len(prefix) + '"' + short + '"\n'
+        self.assertEqual(base_first.index(short), head_first.index(short))
+        repo, base = self.new_repo(
+            {"fixture.cfg": base_first + assignment_text("refresh_token", short)}
+        )
+        (repo / "fixture.cfg").write_text(head_first, encoding="utf-8")
+        head = self.commit(repo)
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "unembedded head-side occurrence",
+        ):
+            self.prepare(repo=repo, base=base, head=head)
+
+    def test_dynamic_reduction_provenance_covers_binary_and_symlink_modes(
+        self,
+    ) -> None:
+        candidate = reduction_secret("github-token")
+        for surface in ("binary", "symlink", "chmod"):
+            with self.subTest(surface=surface):
+                if surface == "binary":
+                    fixture = b"\x00" + candidate + b"\x00"
+                    repo, _initial = self.new_repo({"README.md": "base\n"})
+                    (repo / "fixture.bin").write_bytes(fixture * 2)
+                    base = self.commit(repo, "Binary base")
+                    (repo / "fixture.bin").write_bytes(fixture)
+                elif surface == "symlink":
+                    repo, base = self.new_repo({"README.md": "base\n"})
+                    target = candidate.decode("ascii")
+                    (repo / "first.link").symlink_to(target)
+                    (repo / "second.link").symlink_to(target)
+                    base = self.commit(repo)
+                    (repo / "second.link").unlink()
+                else:
+                    fixture = reduction_fixture("generic-secret-assignment")
+                    repo, base = self.new_repo({"fixture.cfg": fixture * 2})
+                    (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
+                    (repo / "fixture.cfg").chmod(0o755)
+                head = self.commit(repo)
+
+                review = self.prepare(repo=repo, base=base, head=head)
+                evidence = self.validate(review)
+                reductions = evidence["synthetic_tokens"]["secret_reductions"]
+                self.assertEqual(len(reductions), 1)
+                self.assertEqual(
+                    (reductions[0]["base_count"], reductions[0]["head_count"]),
+                    (2, 1),
+                )
 
     def test_preparation_rejects_two_to_one_shared_provider_prefix_replacement(
         self,
@@ -7388,6 +7528,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             ("range", "version or review range"),
             ("digest", "helper-private entry is inconsistent"),
             ("count", "count changed after preparation"),
+            ("occurrence-commitment", "occurrence provenance changed"),
             ("private-base64", "not canonical Base64"),
         )
         for tamper, expected_message in cases:
@@ -7404,8 +7545,8 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                 )
                 public = json.loads(public_path.read_text(encoding="utf-8"))
                 private = json.loads(private_path.read_text(encoding="utf-8"))
-                self.assertEqual(public["schema_version"], 3)
-                self.assertEqual(private["schema_version"], 3)
+                self.assertEqual(public["schema_version"], 4)
+                self.assertEqual(private["schema_version"], 4)
                 self.assertEqual(len(private["secret_reduction_values"]), 1)
 
                 if tamper == "range":
@@ -7419,6 +7560,11 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                     for manifest in (public, private):
                         manifest["secret_reductions"][0]["base_count"] = 3
                         manifest["secret_reductions"][0]["head_count"] = 2
+                elif tamper == "occurrence-commitment":
+                    for manifest in (public, private):
+                        manifest["secret_reduction_provenance"]["head_sha256"] = (
+                            "0" * 64
+                        )
                 else:
                     private["secret_reduction_values"][0]["value_base64"] = "***"
 
@@ -7460,6 +7606,22 @@ class SyntheticWorkspaceTest(unittest.TestCase):
 
         (review.workspace_root / "fixture.cfg").unlink()
         with self.assertRaisesRegex(ReviewError, "count changed after preparation"):
+            self.validate(review)
+
+    def test_materialized_head_cannot_relocate_a_residual_reduced_secret(
+        self,
+    ) -> None:
+        fixture = reduction_fixture("generic-secret-assignment")
+        repo, base = self.new_repo({"fixture.cfg": fixture * 2})
+        (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
+        head = self.commit(repo)
+        review = self.prepare(repo=repo, base=base, head=head)
+
+        (review.workspace_root / "fixture.cfg").write_text(
+            "# shifted\n" + fixture,
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ReviewError, "occurrence provenance changed"):
             self.validate(review)
 
     def test_overlapping_legacy_values_are_counted_independently(self) -> None:

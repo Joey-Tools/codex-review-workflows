@@ -103,6 +103,15 @@ class ProviderPolicyTest(unittest.TestCase):
             "pool_version": catalog.pool_version,
             "schema_version": workspace_runtime.SYNTHETIC_MANIFEST_SCHEMA_VERSION,
             "secret_reductions": [],
+            "secret_reduction_provenance": {
+                "base_sha256": workspace_runtime._secret_reduction_provenance_commitment(
+                    {}, {}
+                ),
+                "head_sha256": workspace_runtime._secret_reduction_provenance_commitment(
+                    {}, {}
+                ),
+                "scheme": workspace_runtime.SECRET_REDUCTION_PROVENANCE_SCHEME,
+            },
             "selected_exemptions": [],
         }
         workspace_runtime._write_bounded_json(
