@@ -160,9 +160,10 @@ explicitly configured Claude Code candidate:
     inconclusive, and pauses without Copilot fallback. A superseded or failed
     generation is not acknowledged, but its carrier remains in the bounded
     journal until post-quiescence finalization or failure recovery.
-    Acknowledgement proves file and directory synchronization plus exact
-    readback, not host persistence, so helper `SIGKILL`, fatal failure, or power
-    loss after acknowledgement still leaves the carrier. After the broker
+    Acknowledgement proves file, carrier, review-container, and review-root
+    directory synchronization plus exact readback, not host persistence, so
+    helper `SIGKILL`, fatal failure, or power loss after acknowledgement still
+    leaves the carrier. After the broker
     server and every handler have fully quiesced, one outer-runtime owner proves
     the newest carrier, removes older journal entries, detaches the latest
     acknowledged rotation, performs guarded host writeback, and deletes the final
@@ -681,9 +682,10 @@ atomically reserves generation and payload-byte quota before any filesystem
 write. The attempt-scoped durable journal accepts at most eight generations and
 8 MiB of payload. A reservation remains consumed for the rest of the attempt,
 including when the later filesystem write or generation publication fails. The
-generation writes a distinct private recovery carrier, synchronizes its file and containing
-directories, renames it under a synchronized parent, and reads back the exact
-payload. Only after that durable commit does the broker enter the generation
+generation writes a distinct private recovery carrier, synchronizes its file,
+containing directories, review-container entry, and review-root entry, renames
+it under a synchronized parent, and reads back the exact payload. Only after
+that durable commit does the broker enter the generation
 linearization point under the current-generation lock. It publishes and
 acknowledges the generation only if it is still current and the runtime is not
 abandoned. Reaching either journal cap returns a NACK before filesystem work,
@@ -822,6 +824,26 @@ unverified or incomplete artifact is ever described as the newest or current
 recovery value. A temp that disappears before final post-failure path
 verification is neither current nor cleanup metadata.
 
+Recovery-carrier removal advances cleanup ownership only after each destructive
+syscall: from the credential file to `config`, then the carrier, then the stable
+recovery root. A current credential is republished after a cleanup failure only
+when its no-follow identity and exact payload are still proven. Cleanup metadata
+must name an existing no-follow identity-stable scope. A vanished child is not
+reported, while concurrent entry churn beneath the same directory inode does
+not invalidate that directory as the cleanup scope.
+
+Current-artifact proof is bound to the authoritative source content, not to
+whatever bytes happen to occupy the reported path later. Marker capture receives
+the digest already proven by durable staging or exact recovery writeback, rejects
+a payload mismatch, and freezes the absolute path, strong file identity, and
+complete root-to-parent no-follow ancestor chain. A same-content replacement
+before capture is harmless and becomes the marker-time identity only after the
+same owner, mode, and exact digest checks; a same-content replacement after
+capture is rejected. Reporting reopens and rechecks every directory edge plus
+the credential inode and digest. Path/proof propagation and clearing are paired,
+so a bare path, a post-capture new inode, or an ancestor replacement cannot be
+promoted to current recovery metadata.
+
 The `security -i` transport-size limit applies only when the selected source is
 the Keychain or when matching refresh-token digests require a file-selected
 rotation to update the Keychain too. A structurally valid but unselected
@@ -942,8 +964,12 @@ reached:
    OAuth refresh token. The phase carries no Copilot fallback eligibility.
    Credential-source/broker I/O races, lock contention, heartbeat failure,
    uncatalogued lock protocols, or bounded-supervision failures remain
-   inconclusive; deterministic absence of the secure broker implementation may
-   be secure-runtime unavailability, while an unsafe broker is blocked. When
+   inconclusive. For every Keychain-broker, TCP-proxy, and Unix-proxy endpoint,
+   only an explicit OS policy or socket-capability bind errno is deterministic
+   secure-runtime unavailability. Unknown, resource/capacity, or
+   address-contention bind errors, Unix-socket permissioning failure,
+   thread-start failure, and serve-start uncertainty are inconclusive, while an
+   unsafe broker is blocked. When
    refresh persistence leaves a private carrier for operator recovery,
    `authentication.recovery_carrier` records only that path and never the
    credential payload.
@@ -969,6 +995,8 @@ described as an enforced final launch.
 | Condition | Terminal classification | Copilot fallback |
 | --- | --- | --- |
 | No automatic candidate, supported platform unavailable, or an accepted-range automatic candidate cleanly lacks a required non-security capability or secure runtime dependency | `runtime-unavailable` | Only for explicit double/triple-review consent |
+| A helper-owned Keychain-broker, TCP-proxy, or Unix-proxy bind fails with an explicit OS policy or socket-capability errno | `runtime-unavailable` | Only for explicit double/triple-review consent |
+| The Keychain-broker source and compiler exist, but the compiler cannot start or the broker build returns nonzero | `inconclusive`; report the build gate and pause | No |
 | Local/API authentication is missing, malformed, unsafe, refresh-token-less, or actually rejected as `Login expired`, HTTP 401, or refresh failure | `blocked-authentication`; request `claude auth login` for local login or unset/replace the explicit API key, then pause | No |
 | Signed artifact has no exact credential-lock protocol entry, either macOS carrier changed, lock contention/heartbeat failed, or credential inspection was unstable | `inconclusive`; report the exact coordination/inspection gate and pause without a login prompt | No |
 | The macOS attempt journal reaches eight generations or 8 MiB of reserved payload | `inconclusive`; NACK the generation before filesystem work, invalidate any older staged host-writeback candidate, and pause | No |
@@ -978,7 +1006,7 @@ described as an enforced final launch.
 | A Linux/WSL2 staged rotation cannot be safely drained, recovered, or guarded-written to the host | `inconclusive`; retain the private recovery carrier, report its path, and pause | No |
 | Explicit override has the wrong version, platform, binary shape, capability contract, or lacks trusted GPG, probe sandbox, or trusted review tool prerequisites | `blocked` configuration error | No |
 | Wrong publisher fingerprint, invalid signature, checksum mismatch, contradictory safe-mode semantics, unsafe runtime metadata, or an isolation-boundary mismatch | `blocked` security error | No |
-| Manifest/probe timeout, output overflow, executable resolve/stat I/O failure, other inspection I/O failure, file race, transient network failure, capacity error, or missing trustworthy terminal artifact | `inconclusive` | No |
+| Manifest/probe timeout, output overflow, executable resolve/stat I/O failure, other inspection I/O failure, file race, transient network failure, unknown/resource/capacity/address-contention bind failure, Unix-socket permissioning failure, broker/proxy thread-start or serve-start uncertainty, or missing trustworthy terminal artifact | `inconclusive` | No |
 | Explicit model entitlement or organization-policy denial from a final review invocation after exact effective-model verification | Existing same-lane model/backend fallback policy | Only as already authorized by the lane contract |
 
 Authentication failure never becomes runtime unavailability. The helper reports

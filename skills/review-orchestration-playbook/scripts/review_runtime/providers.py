@@ -264,6 +264,9 @@ CLAUDE_PROXY_TARGETS = frozenset(
 )
 CLAUDE_PROXY_HEADER_LIMIT_BYTES = 64 * 1024
 CLAUDE_PROXY_CONNECT_TIMEOUT_SECONDS = 20.0
+CLAUDE_PROXY_SERVER_START_TIMEOUT_SECONDS = 5.0
+CLAUDE_PROXY_SERVER_POLL_INTERVAL_SECONDS = 0.05
+CLAUDE_PROXY_SERVER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 CLAUDE_REVIEW_FILE_DENY_RULES = (
     "Read(~/.aws/**)",
     "Read(~/.claude/**)",
@@ -497,6 +500,43 @@ class ClaudeLoopbackUnavailable(ReviewError):
     """The host cannot bind a loopback service required by Claude Code."""
 
 
+_CLAUDE_DETERMINISTIC_SOCKET_CAPABILITY_ERRNOS = frozenset(
+    value
+    for name in (
+        "EACCES",
+        "EPERM",
+        "EAFNOSUPPORT",
+        "EPFNOSUPPORT",
+        "EPROTONOSUPPORT",
+        "ESOCKTNOSUPPORT",
+        "EOPNOTSUPP",
+        "ENOTSUP",
+        "ENOSYS",
+    )
+    if isinstance((value := getattr(errno, name, None)), int)
+)
+_CLAUDE_DETERMINISTIC_LOOPBACK_ERRNOS = (
+    _CLAUDE_DETERMINISTIC_SOCKET_CAPABILITY_ERRNOS
+    | frozenset(
+        value
+        for name in ("EADDRNOTAVAIL",)
+        if isinstance((value := getattr(errno, name, None)), int)
+    )
+)
+
+
+def _claude_loopback_bind_is_deterministically_unavailable(
+    error: OSError,
+) -> bool:
+    return error.errno in _CLAUDE_DETERMINISTIC_LOOPBACK_ERRNOS
+
+
+def _claude_unix_bind_is_deterministically_unavailable(
+    error: OSError,
+) -> bool:
+    return error.errno in _CLAUDE_DETERMINISTIC_SOCKET_CAPABILITY_ERRNOS
+
+
 class ClaudeExecutableUnavailable(ReviewError):
     """Automatic Claude discovery found only unsupported executables."""
 
@@ -634,46 +674,27 @@ def _fsync_claude_runtime_directory(
     path: pathlib.Path,
     *,
     label: str,
+    require_current_user: bool = True,
 ) -> None:
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    descriptor: int | None = None
-    primary_error: BaseException | None = None
     try:
-        descriptor = os.open(path, flags)
-        metadata = os.fstat(descriptor)
-        if (
-            not stat.S_ISDIR(metadata.st_mode)
-            or metadata.st_uid != os.geteuid()
+        with _open_absolute_directory_chain_without_symlinks(path) as (
+            descriptor,
+            _identities,
         ):
-            raise ClaudeCredentialInspectionInconclusive(
-                f"the {label} is not a stable current-user directory"
-            )
-        os.fsync(descriptor)
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISDIR(metadata.st_mode) or (
+                require_current_user and metadata.st_uid != os.geteuid()
+            ):
+                ownership = "current-user " if require_current_user else ""
+                raise ClaudeCredentialInspectionInconclusive(
+                    f"the {label} is not a stable {ownership}directory"
+                )
+            os.fsync(descriptor)
     except OSError as error:
-        primary_error = ClaudeCredentialInspectionInconclusive(
+        failure = ClaudeCredentialInspectionInconclusive(
             f"cannot durably synchronize the {label}"
         )
-        raise primary_error from error
-    except BaseException as error:
-        primary_error = error
-        raise
-    finally:
-        cleanup_errors: list[BaseException] = []
-        if descriptor is not None:
-            try:
-                os.close(descriptor)
-            except BaseException as error:
-                cleanup_errors.append(error)
-        _raise_or_attach_claude_credential_cleanup(
-            primary_error,
-            cleanup_errors,
-            message=f"cannot close the {label} safely",
-        )
+        raise failure from error
 
 
 @dataclass(frozen=True)
@@ -914,27 +935,32 @@ def _prepare_claude_keychain_broker(
     broker.unlink(missing_ok=True)
     stdout_path = broker_dir / "build.stdout.log"
     stderr_path = broker_dir / "build.stderr.log"
-    completed = run(
-        (
-            str(compiler),
-            "-Wall",
-            "-Wextra",
-            "-Werror",
-            "-Wno-deprecated-declarations",
-            str(CLAUDE_KEYCHAIN_BROKER_SOURCE),
-            "-o",
-            str(broker),
-        ),
-        cwd=broker_dir,
-        env=child_environment(container_dir=review.container_dir),
-        stdout_path=stdout_path,
-        stderr_path=stderr_path,
-        timeout_seconds=CLAUDE_KEYCHAIN_BROKER_TIMEOUT_SECONDS,
-        output_file_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
-    )
+    try:
+        completed = run(
+            (
+                str(compiler),
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-Wno-deprecated-declarations",
+                str(CLAUDE_KEYCHAIN_BROKER_SOURCE),
+                "-o",
+                str(broker),
+            ),
+            cwd=broker_dir,
+            env=child_environment(container_dir=review.container_dir),
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            timeout_seconds=CLAUDE_KEYCHAIN_BROKER_TIMEOUT_SECONDS,
+            output_file_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
+        )
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            f"cannot build the Claude Keychain broker: {error}"
+        ) from error
     if completed.returncode != 0:
         detail = completed.stderr.decode("utf-8", errors="replace").strip()
-        raise ClaudeKeychainBrokerUnavailable(
+        raise ClaudeExecutableInspectionInconclusive(
             "failed to build the Claude Keychain broker"
             + (f": {detail}" if detail else "")
         )
@@ -1003,6 +1029,23 @@ class _ClaudeMacOSCarrierSnapshot:
     file_snapshot: _ClaudeCredentialFileSnapshot | None
     keychain_refresh_digest: bytes | None = None
     file_refresh_digest: bytes | None = None
+
+
+@dataclass(frozen=True)
+class _ClaudeRetainedCredentialProof:
+    artifact: pathlib.Path
+    digest: bytes
+    file_identity: tuple[int, ...]
+    ancestor_identities: tuple[tuple[int, ...], ...]
+
+
+@dataclass(frozen=True)
+class _ClaudeNoFollowArtifactSnapshot:
+    ancestor_identities: tuple[tuple[int, ...], ...]
+    leaf_identity: tuple[int, ...]
+    leaf_complete_identity: tuple[int, ...]
+    leaf_mode: int
+    leaf_uid: int
 
 
 @dataclass
@@ -1078,6 +1121,114 @@ def _open_absolute_directory_without_symlinks(path: pathlib.Path) -> int:
             primary_error,
             cleanup_errors,
             message="cannot close the Claude credential path safely",
+        )
+
+
+@contextlib.contextmanager
+def _open_absolute_directory_chain_without_symlinks(
+    path: pathlib.Path,
+) -> Iterator[tuple[int, tuple[tuple[int, ...], ...]]]:
+    if not path.is_absolute() or any(part in {".", ".."} for part in path.parts):
+        raise ClaudeCredentialUnsafe(
+            "Claude credential directory must be an absolute path without traversal"
+        )
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptors: list[int] = []
+    identities: list[tuple[int, ...]] = []
+    components = path.parts[1:]
+    pending_descriptor: int | None = None
+    primary_error: BaseException | None = None
+    try:
+        pending_descriptor = root_descriptor = os.open("/", flags)
+        descriptors.append(root_descriptor)
+        pending_descriptor = None
+        identities.append(
+            _claude_linux_directory_identity(os.fstat(root_descriptor))
+        )
+        for component in components:
+            parent_descriptor = descriptors[-1]
+            before_metadata = os.stat(
+                component,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            pending_descriptor = next_descriptor = os.open(
+                component,
+                flags,
+                dir_fd=parent_descriptor,
+            )
+            descriptors.append(next_descriptor)
+            pending_descriptor = None
+            opened_identity = _claude_linux_directory_identity(
+                os.fstat(next_descriptor)
+            )
+            after_identity = _claude_linux_directory_identity(
+                os.stat(
+                    component,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            )
+            if (
+                _claude_linux_directory_identity(before_metadata)
+                != opened_identity
+                or after_identity != opened_identity
+            ):
+                raise ClaudeCredentialInspectionInconclusive(
+                    "a retained Claude artifact ancestor changed while opened"
+                )
+            identities.append(opened_identity)
+        yield descriptors[-1], tuple(identities)
+        if (
+            _claude_linux_directory_identity(os.fstat(descriptors[0]))
+            != identities[0]
+        ):
+            raise ClaudeCredentialInspectionInconclusive(
+                "the retained Claude artifact root changed while inspected"
+            )
+        for index, component in enumerate(components, start=1):
+            parent_descriptor = descriptors[index - 1]
+            child_descriptor = descriptors[index]
+            dirent_identity = _claude_linux_directory_identity(
+                os.stat(
+                    component,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            )
+            opened_identity = _claude_linux_directory_identity(
+                os.fstat(child_descriptor)
+            )
+            if (
+                dirent_identity != identities[index]
+                or opened_identity != identities[index]
+            ):
+                raise ClaudeCredentialInspectionInconclusive(
+                    "a retained Claude artifact ancestor changed during inspection"
+                )
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        cleanup_errors: list[BaseException] = []
+        if (
+            pending_descriptor is not None
+            and pending_descriptor not in descriptors
+        ):
+            try:
+                os.close(pending_descriptor)
+            except BaseException as error:
+                cleanup_errors.append(error)
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except BaseException as error:
+                cleanup_errors.append(error)
+        _raise_or_attach_claude_credential_cleanup(
+            primary_error,
+            cleanup_errors,
+            message="cannot close the retained Claude artifact path safely",
         )
 
 
@@ -2124,9 +2275,46 @@ def _persist_claude_macos_refreshed_credential(
         ) from error
 
 
+def _claude_review_workspace_roots(
+    review: ReviewWorkspace,
+) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+    source_root = review.source_root
+    container_root = review.container_dir
+    if (
+        not source_root.is_absolute()
+        or not container_root.is_absolute()
+        or any(part in {".", ".."} for part in source_root.parts)
+        or any(part in {".", ".."} for part in container_root.parts)
+    ):
+        raise ClaudeCredentialInspectionInconclusive(
+            "the Claude review workspace paths are not canonical absolute paths"
+        )
+    review_root = source_root / ".codex-tmp"
+    if (
+        container_root.parent != review_root
+        or not container_root.name.startswith("isolated-review-")
+    ):
+        raise ClaudeCredentialInspectionInconclusive(
+            "the Claude review container is outside its private review root"
+        )
+    return source_root, review_root, container_root
+
+
 def _claude_macos_recovery_root(review: ReviewWorkspace) -> pathlib.Path:
+    _source_root, _review_root, container_root = (
+        _claude_review_workspace_roots(review)
+    )
+    try:
+        with _open_absolute_directory_chain_without_symlinks(container_root):
+            pass
+    except ClaudeCredentialInspectionInconclusive:
+        raise
+    except (OSError, RuntimeError, ValueError, ReviewError) as error:
+        raise ClaudeCredentialInspectionInconclusive(
+            "cannot validate the macOS Claude recovery container path"
+        ) from error
     runtime_parent = _create_or_validate_claude_runtime_directory(
-        review.container_dir.resolve(strict=True) / "claude-runtime",
+        container_root / "claude-runtime",
         private=False,
     )
     return _create_or_validate_claude_runtime_directory(
@@ -2148,13 +2336,26 @@ def _retain_claude_macos_refreshed_credential(
             credential,
             source="macOS recovery carrier",
         )
-    recovery_root = _claude_macos_recovery_root(review)
+    credential_digest = _claude_credential_digest(credential)
     if durable_directories:
-        container_root = review.container_dir.resolve(strict=True)
+        source_root, review_root, container_root = (
+            _claude_review_workspace_roots(review)
+        )
+        _fsync_claude_runtime_directory(
+            source_root,
+            label="Claude source repository root",
+            require_current_user=False,
+        )
+        _fsync_claude_runtime_directory(
+            review_root,
+            label="Claude review workspace root",
+        )
         _fsync_claude_runtime_directory(
             container_root,
             label="Claude review container",
         )
+    recovery_root = _claude_macos_recovery_root(review)
+    if durable_directories:
         _fsync_claude_runtime_directory(
             container_root / "claude-runtime",
             label="Claude runtime directory",
@@ -2180,6 +2381,7 @@ def _retain_claude_macos_refreshed_credential(
             _mark_claude_macos_recovery_update_artifact(
                 error,
                 carrier_root / "config" / CLAUDE_CREDENTIAL_FILE_NAME,
+                expected_digest=credential_digest,
             )
         else:
             _mark_claude_macos_recovery_cleanup_artifact(
@@ -2461,6 +2663,7 @@ def _read_claude_macos_recovery_credential(
         | getattr(os, "O_NOFOLLOW", 0)
     )
     config_descriptor: int | None = None
+    result: tuple[bytearray, tuple[int, ...]] | None = None
     payload: bytearray | None = None
     primary_error: BaseException | None = None
     try:
@@ -2494,8 +2697,11 @@ def _read_claude_macos_recovery_credential(
         return payload
     except BaseException as error:
         primary_error = error
-        if payload is not None:
-            payload[:] = b"\x00" * len(payload)
+        payload_to_wipe = payload
+        if payload_to_wipe is None and result is not None:
+            payload_to_wipe = result[0]
+        if payload_to_wipe is not None:
+            payload_to_wipe[:] = b"\x00" * len(payload_to_wipe)
         raise
     finally:
         cleanup_errors: list[BaseException] = []
@@ -2504,8 +2710,11 @@ def _read_claude_macos_recovery_credential(
                 os.close(config_descriptor)
             except BaseException as error:
                 cleanup_errors.append(error)
-                if payload is not None:
-                    payload[:] = b"\x00" * len(payload)
+                payload_to_wipe = payload
+                if payload_to_wipe is None and result is not None:
+                    payload_to_wipe = result[0]
+                if payload_to_wipe is not None:
+                    payload_to_wipe[:] = b"\x00" * len(payload_to_wipe)
         _raise_or_attach_claude_credential_cleanup(
             primary_error,
             cleanup_errors,
@@ -2519,6 +2728,7 @@ def _commit_claude_macos_durable_stage(
     acknowledged_carrier: pathlib.Path,
     credential: bytearray,
 ) -> pathlib.Path:
+    credential_digest = _claude_credential_digest(credential)
     recovery_root = _claude_macos_recovery_root(review)
     if (
         pending_carrier.parent != recovery_root
@@ -2554,6 +2764,7 @@ def _commit_claude_macos_durable_stage(
             _mark_claude_macos_recovery_update_artifact(
                 error,
                 carrier / "config" / CLAUDE_CREDENTIAL_FILE_NAME,
+                expected_digest=credential_digest,
             )
         else:
             _mark_claude_macos_recovery_cleanup_artifact(error, carrier)
@@ -2727,6 +2938,7 @@ def _remove_claude_macos_recovery_carrier(
     carrier_descriptor: int | None = None
     config_descriptor: int | None = None
     credential_removed = False
+    cleanup_scope = credential_path
     payload_verified = False
     primary_error: BaseException | None = None
     try:
@@ -2816,10 +3028,13 @@ def _remove_claude_macos_recovery_carrier(
             dir_fd=config_descriptor,
         )
         credential_removed = True
+        cleanup_scope = config_dir
         os.fsync(config_descriptor)
         os.rmdir("config", dir_fd=carrier_descriptor)
+        cleanup_scope = carrier_root
         os.fsync(carrier_descriptor)
         os.rmdir(carrier_root.name, dir_fd=recovery_descriptor)
+        cleanup_scope = recovery_root
         os.fsync(recovery_descriptor)
     except BaseException as error:
         primary_error = error
@@ -2848,7 +3063,36 @@ def _remove_claude_macos_recovery_carrier(
         if failure is not primary_error:
             failure.__cause__ = primary_error
         setattr(failure, "_codex_claude_refresh_persistence_failed", True)
+        retained_credential_is_current = False
         if payload_verified and not credential_removed:
+            try:
+                retained_credential_is_current = (
+                    _claude_macos_recovery_credential_matches_digest(
+                        review,
+                        carrier_root,
+                        expected_digest,
+                    )
+                )
+            except BaseException as verification_error:
+                if _is_claude_control_flow_error(failure):
+                    _attach_claude_credential_cleanup_failure(
+                        failure,
+                        verification_error,
+                    )
+                elif _is_claude_control_flow_error(verification_error):
+                    _attach_claude_credential_cleanup_failure(
+                        verification_error,
+                        failure,
+                    )
+                    failure = verification_error
+                    setattr(
+                        failure,
+                        "_codex_claude_refresh_persistence_failed",
+                        True,
+                    )
+                else:
+                    raise
+        if retained_credential_is_current:
             setattr(
                 failure,
                 "_codex_claude_retained_credential_carrier",
@@ -2857,17 +3101,70 @@ def _remove_claude_macos_recovery_carrier(
             _mark_claude_macos_recovery_update_artifact(
                 failure,
                 credential_path,
+                expected_digest=expected_digest,
             )
-        _mark_claude_macos_recovery_cleanup_artifact(
-            failure,
-            carrier_root if credential_removed else credential_path,
+        retained_cleanup_scope = (
+            _existing_claude_macos_recovery_cleanup_scope(
+                cleanup_scope,
+                recovery_root,
+            )
         )
+        if retained_cleanup_scope is not None:
+            _mark_claude_macos_recovery_cleanup_artifact(
+                failure,
+                retained_cleanup_scope,
+            )
         _raise_or_attach_claude_credential_cleanup(
             failure,
             cleanup_errors,
             message="cannot close the durable macOS Claude recovery carrier safely",
         )
         raise failure
+
+
+def _claude_macos_recovery_credential_matches_digest(
+    review: ReviewWorkspace,
+    carrier_root: pathlib.Path,
+    expected_digest: bytes,
+) -> bool:
+    payload: bytearray | None = None
+    try:
+        payload = _read_claude_macos_recovery_credential(
+            review,
+            carrier_root,
+        )
+        return hmac.compare_digest(
+            _claude_credential_digest(payload),
+            expected_digest,
+        )
+    except BaseException as error:
+        if _is_claude_control_flow_error(error):
+            raise
+        return False
+    finally:
+        if payload is not None:
+            payload[:] = b"\x00" * len(payload)
+
+
+def _existing_claude_macos_recovery_cleanup_scope(
+    candidate: pathlib.Path,
+    recovery_root: pathlib.Path,
+) -> pathlib.Path | None:
+    if candidate != recovery_root and recovery_root not in candidate.parents:
+        return None
+    current = candidate
+    while True:
+        try:
+            current.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        else:
+            return current
+        if current == recovery_root:
+            return None
+        current = current.parent
 
 
 def _claude_macos_recovery_update_artifacts(
@@ -2916,21 +3213,165 @@ def _claude_macos_recovery_update_artifacts(
     return tuple(artifacts)
 
 
-def _mark_claude_macos_recovery_update_artifact(
-    error: BaseException,
+def _capture_claude_retained_credential_proof(
     artifact: pathlib.Path,
+    *,
+    expected_digest: bytes,
+) -> _ClaudeRetainedCredentialProof:
+    if (
+        not artifact.is_absolute()
+        or not (
+            artifact.name == CLAUDE_CREDENTIAL_FILE_NAME
+            or (
+                artifact.name.startswith(
+                    CLAUDE_MACOS_RECOVERY_UPDATE_PREFIX
+                )
+                and artifact.name.endswith(
+                    CLAUDE_MACOS_RECOVERY_UPDATE_SUFFIX
+                )
+            )
+        )
+        or any(part in {".", ".."} for part in artifact.parts)
+    ):
+        raise ClaudeCredentialInspectionInconclusive(
+            "the retained macOS Claude credential artifact path is unsafe"
+        )
+    if (
+        not isinstance(expected_digest, bytes)
+        or len(expected_digest) != hashlib.sha256().digest_size
+    ):
+        raise ClaudeCredentialInspectionInconclusive(
+            "the retained macOS Claude credential source digest is invalid"
+        )
+    result: tuple[bytearray, tuple[int, ...]] | None = None
+    payload: bytearray | None = None
+    try:
+        with _open_absolute_directory_chain_without_symlinks(
+            artifact.parent
+        ) as (parent_descriptor, ancestor_identities):
+            result = _read_claude_credential_file_from_directory(
+                parent_descriptor,
+                credential_name=artifact.name,
+            )
+            if result is None:
+                raise ClaudeCredentialInspectionInconclusive(
+                    "the retained macOS Claude credential artifact is missing"
+                )
+            payload, file_identity = result
+            final_identity = _claude_credential_file_identity(
+                os.stat(
+                    artifact.name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            )
+            if (
+                final_identity != file_identity
+                or not hmac.compare_digest(
+                    _claude_credential_digest(payload),
+                    expected_digest,
+                )
+            ):
+                raise ClaudeCredentialInspectionInconclusive(
+                    "the retained macOS Claude credential does not match its "
+                    "authoritative source proof"
+                )
+            return _ClaudeRetainedCredentialProof(
+                artifact=artifact,
+                digest=expected_digest,
+                file_identity=file_identity,
+                ancestor_identities=ancestor_identities,
+            )
+    finally:
+        payload_to_wipe = payload
+        if payload_to_wipe is None and result is not None:
+            payload_to_wipe = result[0]
+        if payload_to_wipe is not None:
+            payload_to_wipe[:] = b"\x00" * len(payload_to_wipe)
+
+
+def _get_claude_retained_credential_proof(
+    error: BaseException,
+) -> _ClaudeRetainedCredentialProof | None:
+    proof = getattr(
+        error,
+        "_codex_claude_retained_credential_proof",
+        None,
+    )
+    if (
+        not isinstance(proof, _ClaudeRetainedCredentialProof)
+        or not isinstance(proof.artifact, pathlib.Path)
+        or not proof.artifact.is_absolute()
+        or any(part in {".", ".."} for part in proof.artifact.parts)
+        or not isinstance(proof.digest, bytes)
+        or len(proof.digest) != hashlib.sha256().digest_size
+    ):
+        return None
+    return proof
+
+
+def _clear_claude_retained_credential_proof(error: BaseException) -> None:
+    with contextlib.suppress(AttributeError):
+        delattr(error, "_codex_claude_retained_credential_proof")
+    with contextlib.suppress(AttributeError):
+        delattr(error, "_codex_claude_retained_credential_artifact")
+
+
+def _set_claude_retained_credential_proof(
+    error: BaseException,
+    proof: _ClaudeRetainedCredentialProof,
 ) -> None:
     setattr(
         error,
-        "_codex_claude_retained_credential_artifact",
-        str(artifact),
+        "_codex_claude_retained_credential_proof",
+        proof,
     )
-    add_note = getattr(error, "add_note", None)
-    if callable(add_note):
-        add_note(
-            "A macOS Claude recovery credential update remains at "
-            f"{artifact} for operator inspection."
+    setattr(
+        error,
+        "_codex_claude_retained_credential_artifact",
+        str(proof.artifact),
+    )
+
+
+def _copy_claude_retained_credential_proof(
+    source: BaseException,
+    target: BaseException,
+) -> bool:
+    proof = _get_claude_retained_credential_proof(source)
+    if proof is None:
+        return False
+    _set_claude_retained_credential_proof(target, proof)
+    return True
+
+
+def _mark_claude_macos_recovery_update_artifact(
+    error: BaseException,
+    artifact: pathlib.Path,
+    *,
+    expected_digest: bytes,
+) -> None:
+    try:
+        proof = _capture_claude_retained_credential_proof(
+            artifact,
+            expected_digest=expected_digest,
         )
+    except BaseException as proof_error:
+        _clear_claude_retained_credential_proof(error)
+        if _is_claude_control_flow_error(error):
+            _attach_claude_credential_cleanup_failure(error, proof_error)
+        elif _is_claude_control_flow_error(proof_error):
+            _attach_claude_credential_cleanup_failure(proof_error, error)
+            raise proof_error
+        else:
+            _attach_claude_credential_cleanup_failure(error, proof_error)
+    else:
+        _set_claude_retained_credential_proof(error, proof)
+        add_note = getattr(error, "add_note", None)
+        if callable(add_note):
+            add_note(
+                "A macOS Claude recovery credential update remains at "
+                f"{artifact} for operator inspection."
+            )
 
 
 def _mark_claude_macos_recovery_cleanup_artifact(
@@ -2959,6 +3400,7 @@ def _replace_claude_macos_recovery_credential(
         credential,
         source="macOS recovery carrier update",
     )
+    credential_digest = _claude_credential_digest(credential)
     recovery_root = _claude_macos_recovery_root(review)
     if (
         not carrier_root.is_absolute()
@@ -3011,6 +3453,7 @@ def _replace_claude_macos_recovery_credential(
     stale_update_artifacts: tuple[str, ...] = ()
     retained_update_artifact: pathlib.Path | None = None
     retained_cleanup_artifact: pathlib.Path | None = None
+    main_payload_verified = False
     primary_error: BaseException | None = None
     try:
         config_descriptor = os.open(config_dir, directory_flags)
@@ -3124,6 +3567,7 @@ def _replace_claude_macos_recovery_credential(
             raise ClaudeCredentialInspectionInconclusive(
                 "the private macOS Claude recovery carrier moved during update"
             )
+        main_payload_verified = True
         for artifact in stale_update_artifacts:
             try:
                 os.unlink(artifact, dir_fd=config_descriptor)
@@ -3131,6 +3575,7 @@ def _replace_claude_macos_recovery_credential(
                 _mark_claude_macos_recovery_update_artifact(
                     error,
                     config_dir / CLAUDE_CREDENTIAL_FILE_NAME,
+                    expected_digest=credential_digest,
                 )
                 _mark_claude_macos_recovery_cleanup_artifact(
                     error,
@@ -3243,10 +3688,16 @@ def _replace_claude_macos_recovery_credential(
                             os.fsync(config_descriptor)
                         except BaseException as error:
                             cleanup_errors.append(error)
-        if retained_update_artifact is not None and primary_error is not None:
+        current_credential_artifact = (
+            config_dir / CLAUDE_CREDENTIAL_FILE_NAME
+            if main_payload_verified
+            else retained_update_artifact
+        )
+        if current_credential_artifact is not None and primary_error is not None:
             _mark_claude_macos_recovery_update_artifact(
                 primary_error,
-                retained_update_artifact,
+                current_credential_artifact,
+                expected_digest=credential_digest,
             )
         if retained_cleanup_artifact is not None and primary_error is not None:
             _mark_claude_macos_recovery_cleanup_artifact(
@@ -3278,10 +3729,11 @@ def _replace_claude_macos_recovery_credential(
                 "_codex_claude_refresh_persistence_failed",
                 True,
             )
-            if retained_update_artifact is not None:
+            if current_credential_artifact is not None:
                 _mark_claude_macos_recovery_update_artifact(
                     cleanup_error,
-                    retained_update_artifact,
+                    current_credential_artifact,
+                    expected_digest=credential_digest,
                 )
             if retained_cleanup_artifact is not None:
                 _mark_claude_macos_recovery_cleanup_artifact(
@@ -3294,6 +3746,9 @@ def _replace_claude_macos_recovery_credential(
 def _retained_claude_macos_credential_error(
     carrier_root: pathlib.Path,
     error: BaseException,
+    *,
+    expected_digest: bytes,
+    artifact: pathlib.Path | None = None,
 ) -> ClaudeCredentialInspectionInconclusive:
     retained = ClaudeCredentialInspectionInconclusive(
         "Claude produced a structurally valid refreshed OAuth credential, but "
@@ -3308,7 +3763,10 @@ def _retained_claude_macos_credential_error(
     )
     _mark_claude_macos_recovery_update_artifact(
         retained,
-        carrier_root / "config" / CLAUDE_CREDENTIAL_FILE_NAME,
+        artifact
+        if artifact is not None
+        else carrier_root / "config" / CLAUDE_CREDENTIAL_FILE_NAME,
+        expected_digest=expected_digest,
     )
     setattr(retained, "_codex_claude_refresh_persistence_failed", True)
     retained.__cause__ = error
@@ -3330,17 +3788,15 @@ def _failed_claude_macos_recovery_error(
             "_codex_claude_retained_credential_carrier",
             None,
         )
-    retained_artifact = getattr(
-        recovery_error,
-        "_codex_claude_retained_credential_artifact",
-        None,
-    )
-    if not isinstance(retained_artifact, str):
-        retained_artifact = getattr(
-            persistence_error,
-            "_codex_claude_retained_credential_artifact",
-            None,
-        )
+    retained_proof_source: BaseException | None = None
+    retained_artifact: str | None = None
+    for proof_source in (recovery_error, persistence_error):
+        proof = _get_claude_retained_credential_proof(proof_source)
+        if proof is not None:
+            retained_proof_source = proof_source
+            retained_artifact = str(proof.artifact)
+            retained_carrier = str(proof.artifact.parent.parent)
+            break
     retained_cleanup_artifact = getattr(
         recovery_error,
         "_codex_claude_retained_cleanup_artifact",
@@ -3380,11 +3836,10 @@ def _failed_claude_macos_recovery_error(
             "_codex_claude_retained_credential_carrier",
             retained_carrier,
         )
-    if isinstance(retained_artifact, str):
-        setattr(
+    if retained_proof_source is not None:
+        _copy_claude_retained_credential_proof(
+            retained_proof_source,
             failed,
-            "_codex_claude_retained_credential_artifact",
-            retained_artifact,
         )
     if isinstance(retained_cleanup_artifact, str):
         setattr(
@@ -3638,17 +4093,10 @@ def _add_claude_persistence_note(
             "_codex_claude_retained_credential_carrier",
             retained_carrier,
         )
-    retained_artifact = getattr(
+    _copy_claude_retained_credential_proof(
         persistence_error,
-        "_codex_claude_retained_credential_artifact",
-        None,
+        error,
     )
-    if isinstance(retained_artifact, str):
-        setattr(
-            error,
-            "_codex_claude_retained_credential_artifact",
-            retained_artifact,
-        )
     retained_cleanup_artifact = getattr(
         persistence_error,
         "_codex_claude_retained_cleanup_artifact",
@@ -3690,57 +4138,169 @@ def _attach_claude_persistence_failure_preserving_control_flow(
     return primary
 
 
+def _claude_artifact_is_lexically_contained(
+    candidate: pathlib.Path,
+    container: pathlib.Path,
+) -> bool:
+    if (
+        not candidate.is_absolute()
+        or not container.is_absolute()
+        or any(part in {".", ".."} for part in candidate.parts)
+        or any(part in {".", ".."} for part in container.parts)
+    ):
+        return False
+    try:
+        candidate.relative_to(container)
+    except ValueError:
+        return False
+    return True
+
+
+def _claude_nofollow_artifact_snapshot(
+    candidate: pathlib.Path,
+) -> _ClaudeNoFollowArtifactSnapshot:
+    with _open_absolute_directory_chain_without_symlinks(
+        candidate.parent
+    ) as (parent_descriptor, ancestor_identities):
+        leaf_metadata = os.stat(
+            candidate.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        snapshot = _ClaudeNoFollowArtifactSnapshot(
+            ancestor_identities=ancestor_identities,
+            leaf_identity=_claude_cleanup_artifact_identity(leaf_metadata),
+            leaf_complete_identity=_claude_credential_file_identity(
+                leaf_metadata
+            ),
+            leaf_mode=leaf_metadata.st_mode,
+            leaf_uid=leaf_metadata.st_uid,
+        )
+        final_leaf_metadata = os.stat(
+            candidate.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            _claude_cleanup_artifact_identity(final_leaf_metadata)
+            != snapshot.leaf_identity
+            or _claude_credential_file_identity(final_leaf_metadata)
+            != snapshot.leaf_complete_identity
+        ):
+            raise ClaudeCredentialInspectionInconclusive(
+                "the retained Claude artifact changed during inspection"
+            )
+        return snapshot
+
+
+def _claude_retained_credential_artifact_matches_proof(
+    candidate: pathlib.Path,
+    proof: _ClaudeRetainedCredentialProof,
+) -> bool:
+    if candidate != proof.artifact:
+        return False
+    result: tuple[bytearray, tuple[int, ...]] | None = None
+    payload: bytearray | None = None
+    try:
+        with _open_absolute_directory_chain_without_symlinks(
+            candidate.parent
+        ) as (parent_descriptor, ancestor_identities):
+            if ancestor_identities != proof.ancestor_identities:
+                return False
+            result = _read_claude_credential_file_from_directory(
+                parent_descriptor,
+                credential_name=candidate.name,
+                expected_identity=proof.file_identity,
+            )
+            if result is None:
+                return False
+            payload, file_identity = result
+            final_identity = _claude_credential_file_identity(
+                os.stat(
+                    candidate.name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            )
+            if (
+                file_identity != proof.file_identity
+                or final_identity != proof.file_identity
+                or not hmac.compare_digest(
+                    _claude_credential_digest(payload),
+                    proof.digest,
+                )
+            ):
+                return False
+    finally:
+        payload_to_wipe = payload
+        if payload_to_wipe is None and result is not None:
+            payload_to_wipe = result[0]
+        if payload_to_wipe is not None:
+            payload_to_wipe[:] = b"\x00" * len(payload_to_wipe)
+    final_snapshot = _claude_nofollow_artifact_snapshot(candidate)
+    return (
+        final_snapshot.ancestor_identities == proof.ancestor_identities
+        and final_snapshot.leaf_complete_identity == proof.file_identity
+    )
+
+
 def _validated_claude_retained_credential_carrier(
     review: ReviewWorkspace,
     error: BaseException,
 ) -> str | None:
-    retained_carrier: str | None = None
     retained_candidate = getattr(
         error,
         "_codex_claude_retained_credential_carrier",
         None,
     )
-    if isinstance(retained_candidate, str):
-        candidate_path = pathlib.Path(retained_candidate)
-        try:
-            candidate_resolved = candidate_path.resolve(strict=False)
-            container_resolved = review.container_dir.resolve(strict=False)
-        except ForwardedSignal:
-            raise
-        except (OSError, RuntimeError, ValueError):
-            pass
-        else:
-            if candidate_path.is_absolute() and is_relative_to(
-                candidate_resolved,
-                container_resolved,
-            ):
-                retained_carrier = str(candidate_path)
-    return retained_carrier
+    if not isinstance(retained_candidate, str):
+        return None
+    candidate_path = pathlib.Path(retained_candidate)
+    if not _claude_artifact_is_lexically_contained(
+        candidate_path,
+        review.container_dir,
+    ):
+        return None
+    try:
+        initial = _claude_nofollow_artifact_snapshot(candidate_path)
+        final = _claude_nofollow_artifact_snapshot(candidate_path)
+    except ForwardedSignal:
+        raise
+    except (OSError, RuntimeError, ValueError, ReviewError):
+        return None
+    if (
+        initial.ancestor_identities != final.ancestor_identities
+        or initial.leaf_identity != final.leaf_identity
+        or not stat.S_ISDIR(final.leaf_mode)
+        or final.leaf_uid != os.geteuid()
+        or stat.S_IMODE(final.leaf_mode) != 0o700
+    ):
+        return None
+    return str(candidate_path)
 
 
 def _validated_claude_retained_credential_artifact(
     review: ReviewWorkspace,
     error: BaseException,
 ) -> str | None:
-    retained_candidate = getattr(
-        error,
-        "_codex_claude_retained_credential_artifact",
-        None,
-    )
-    if not isinstance(retained_candidate, str):
+    proof = _get_claude_retained_credential_proof(error)
+    if proof is None:
         return None
-    candidate_path = pathlib.Path(retained_candidate)
+    candidate_path = proof.artifact
+    if not _claude_artifact_is_lexically_contained(
+        candidate_path,
+        review.container_dir,
+    ):
+        return None
     try:
-        candidate_resolved = candidate_path.resolve(strict=False)
-        container_resolved = review.container_dir.resolve(strict=False)
+        if not _claude_retained_credential_artifact_matches_proof(
+            candidate_path,
+            proof,
+        ):
+            return None
     except ForwardedSignal:
         raise
-    except (OSError, RuntimeError, ValueError):
-        return None
-    if not candidate_path.is_absolute() or not is_relative_to(
-        candidate_resolved,
-        container_resolved,
-    ):
+    except (OSError, RuntimeError, ValueError, ReviewError):
         return None
     return str(candidate_path)
 
@@ -3757,19 +4317,41 @@ def _validated_claude_retained_cleanup_artifact(
     if not isinstance(retained_candidate, str):
         return None
     candidate_path = pathlib.Path(retained_candidate)
+    if not _claude_artifact_is_lexically_contained(
+        candidate_path,
+        review.container_dir,
+    ):
+        return None
     try:
-        candidate_resolved = candidate_path.resolve(strict=False)
-        container_resolved = review.container_dir.resolve(strict=False)
+        initial = _claude_nofollow_artifact_snapshot(candidate_path)
+        final = _claude_nofollow_artifact_snapshot(candidate_path)
     except ForwardedSignal:
         raise
-    except (OSError, RuntimeError, ValueError):
+    except (OSError, RuntimeError, ValueError, ReviewError):
         return None
-    if not candidate_path.is_absolute() or not is_relative_to(
-        candidate_resolved,
-        container_resolved,
+    if (
+        initial.ancestor_identities != final.ancestor_identities
+        or initial.leaf_identity != final.leaf_identity
+        or not (
+            stat.S_ISDIR(final.leaf_mode)
+            or stat.S_ISREG(final.leaf_mode)
+        )
     ):
         return None
     return str(candidate_path)
+
+
+def _claude_cleanup_artifact_identity(
+    metadata: os.stat_result,
+) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+    )
 
 
 def _record_claude_secondary_persistence_failure(
@@ -3839,10 +4421,9 @@ def _record_claude_secondary_persistence_failure(
                     retained_carrier,
                 )
             if retained_artifact is not None:
-                setattr(
+                _copy_claude_retained_credential_proof(
+                    error,
                     report_error,
-                    "_codex_claude_retained_credential_artifact",
-                    retained_artifact,
                 )
             if retained_cleanup_artifact is not None:
                 setattr(
@@ -3903,11 +4484,7 @@ def _propagate_claude_persistence_state(
             f"{retained_carrier}."
         )
     if retained_artifact is not None:
-        setattr(
-            target,
-            "_codex_claude_retained_credential_artifact",
-            retained_artifact,
-        )
+        _copy_claude_retained_credential_proof(source, target)
         diagnostic = (
             f"{diagnostic} Recovery credential artifact retained at "
             f"{retained_artifact}."
@@ -4403,6 +4980,13 @@ class _ClaudeMacOSDurableStage:
     handler_wait_expired: bool = False
 
 
+@dataclass(frozen=True)
+class _ClaudeRecoveryExpectation:
+    carrier: pathlib.Path
+    artifact: pathlib.Path
+    digest: bytes
+
+
 def _bounded_claude_keychain_abandonment(
     callback: Callable[[], None],
     timeout: float,
@@ -4747,12 +5331,23 @@ def _claude_keychain_credential_server(
             update_callback,
         )
     except OSError as error:
-        raise ClaudeLoopbackUnavailable(
+        failure_type = (
+            ClaudeLoopbackUnavailable
+            if _claude_loopback_bind_is_deterministically_unavailable(error)
+            else ClaudeCredentialInspectionInconclusive
+        )
+        raise failure_type(
             f"Claude Keychain broker cannot bind loopback: {error}"
         ) from error
+    serve_gate = threading.Event()
+    serve_cancelled = threading.Event()
+
     def serve() -> None:
         serve_error: BaseException | None = None
         try:
+            serve_gate.wait()
+            if serve_cancelled.is_set():
+                return
             server.serve_forever(
                 poll_interval=CLAUDE_KEYCHAIN_SERVER_POLL_INTERVAL_SECONDS
             )
@@ -4761,26 +5356,41 @@ def _claude_keychain_credential_server(
         finally:
             server.record_serve_stopped(serve_error)
 
-    thread = threading.Thread(
-        target=serve,
-        daemon=True,
-        name="claude-review-keychain-broker",
-    )
+    thread: threading.Thread | None = None
     thread_started = False
+    serve_admitted = False
     runtime_exposed = False
     primary_error: BaseException | None = None
     try:
         try:
+            thread = threading.Thread(
+                target=serve,
+                daemon=True,
+                name="claude-review-keychain-broker",
+            )
+        except ForwardedSignal:
+            raise
+        except Exception as error:
+            raise ClaudeCredentialInspectionInconclusive(
+                f"Claude Keychain broker cannot construct its thread: {error}"
+            ) from error
+        try:
             thread.start()
             thread_started = True
+        except ForwardedSignal:
+            thread_started = _claude_thread_may_have_started(thread)
+            raise
         except RuntimeError as error:
-            raise ClaudeLoopbackUnavailable(
+            thread_started = _claude_thread_may_have_started(thread)
+            raise ClaudeCredentialInspectionInconclusive(
                 f"Claude Keychain broker cannot start: {error}"
             ) from error
+        serve_admitted = True
+        serve_gate.set()
         if not server.wait_until_serving(
             CLAUDE_KEYCHAIN_SERVER_START_TIMEOUT_SECONDS
         ):
-            failure = ClaudeLoopbackUnavailable(
+            failure = ClaudeCredentialInspectionInconclusive(
                 "Claude Keychain broker did not enter its serve loop"
             )
             serve_error = server.serve_error()
@@ -4794,12 +5404,39 @@ def _claude_keychain_credential_server(
         raise
     finally:
         shutdown_errors: list[BaseException] = []
+        if not serve_admitted:
+            serve_cancelled.set()
+        serve_gate.set()
+        if thread is not None and not thread_started:
+            thread_started = _claude_thread_may_have_started(thread)
+        if thread_started and not serve_admitted and thread is not None:
+            try:
+                thread.join(
+                    timeout=CLAUDE_KEYCHAIN_SERVER_SHUTDOWN_TIMEOUT_SECONDS
+                )
+            except BaseException as error:
+                shutdown_errors.append(error)
+            else:
+                try:
+                    thread_alive = thread.is_alive()
+                except BaseException as error:
+                    shutdown_errors.append(error)
+                else:
+                    if thread_alive:
+                        shutdown_errors.append(
+                            ClaudeCredentialInspectionInconclusive(
+                                "Claude Keychain broker thread did not stop after "
+                                "pre-serve cancellation"
+                            )
+                        )
+                    else:
+                        thread_started = False
         shutdown = _ClaudeKeychainServerShutdown(
             quiescent=True,
             pending_update=None,
             errors=(),
         )
-        if thread_started:
+        if thread_started and thread is not None:
             shutdown = _bounded_claude_keychain_server_shutdown(
                 server,
                 thread,
@@ -5070,6 +5707,7 @@ def _claude_keychain_runtime(
     quiescence_recovery_candidate: pathlib.Path | None = None
     quiescence_recovery_replaces_existing = False
     quiescence_recovery_proven = False
+    quiescence_recovery_expectation: _ClaudeRecoveryExpectation | None = None
     quiescence_recovery_timeout_failure: BaseException | None = None
 
     def runtime_is_abandoned() -> bool:
@@ -5097,12 +5735,59 @@ def _claude_keychain_runtime(
             / f"claude-carrier-{secrets.token_hex(16)}"
         )
 
+    def recovery_expectation_from_error(
+        error: BaseException,
+        *candidate_carriers: pathlib.Path,
+    ) -> _ClaudeRecoveryExpectation | None:
+        proof = _get_claude_retained_credential_proof(error)
+        if proof is None or proof.artifact.parent.name != "config":
+            return None
+        proof_carrier = proof.artifact.parent.parent
+        if proof_carrier not in candidate_carriers:
+            return None
+        return _ClaudeRecoveryExpectation(
+            proof_carrier,
+            proof.artifact,
+            proof.digest,
+        )
+
+    def published_recovery_claim_is_current(
+        error: BaseException,
+        expectation: _ClaudeRecoveryExpectation | None = None,
+    ) -> bool:
+        retained_value = getattr(
+            error,
+            "_codex_claude_retained_credential_carrier",
+            None,
+        )
+        proof = _get_claude_retained_credential_proof(error)
+        if not isinstance(retained_value, str) or proof is None:
+            return False
+        retained_carrier = pathlib.Path(retained_value)
+        if (
+            proof.artifact.parent.name != "config"
+            or proof.artifact.parent.parent != retained_carrier
+        ):
+            return False
+        if expectation is not None and (
+            expectation.carrier != retained_carrier
+            or expectation.artifact != proof.artifact
+            or not hmac.compare_digest(expectation.digest, proof.digest)
+        ):
+            return False
+        return (
+            _validated_claude_retained_credential_artifact(
+                review,
+                error,
+            )
+            == str(proof.artifact)
+        )
+
     def cleanup_late_durable_stage(
         stage: _ClaudeMacOSDurableStage,
     ) -> None:
         with runtime_state_lock:
-            authoritative_candidate = quiescence_recovery_candidate
-            authoritative_proven = quiescence_recovery_proven
+            authoritative_expectation = quiescence_recovery_expectation
         try:
             _remove_claude_macos_recovery_carrier(
                 review,
@@ -5110,17 +5795,16 @@ def _claude_keychain_runtime(
                 stage.credential_digest,
             )
         except BaseException as cleanup_error:
-            if authoritative_candidate is not None and authoritative_proven:
+            if authoritative_expectation is not None:
                 setattr(
                     cleanup_error,
                     "_codex_claude_retained_credential_carrier",
-                    str(authoritative_candidate),
+                    str(authoritative_expectation.carrier),
                 )
                 _mark_claude_macos_recovery_update_artifact(
                     cleanup_error,
-                    authoritative_candidate
-                    / "config"
-                    / CLAUDE_CREDENTIAL_FILE_NAME,
+                    authoritative_expectation.artifact,
+                    expected_digest=authoritative_expectation.digest,
                 )
             with runtime_state_lock:
                 if _is_claude_control_flow_error(cleanup_error):
@@ -5148,6 +5832,7 @@ def _claude_keychain_runtime(
         nonlocal quiescence_recovery_candidate
         nonlocal quiescence_recovery_proven
         nonlocal quiescence_recovery_replaces_existing
+        nonlocal quiescence_recovery_expectation
         previous: bytearray | None = None
         with runtime_state_lock:
             if runtime_is_abandoned():
@@ -5166,31 +5851,39 @@ def _claude_keychain_runtime(
                 "Claude produced a malformed refreshed OAuth credential"
             )
             malformed.__cause__ = error
+            retained_entry: tuple[pathlib.Path, bytes] | None = None
+            with runtime_state_lock:
+                if not runtime_is_abandoned() and durable_stage_carriers:
+                    retained_entry = durable_stage_carriers[-1]
+            if retained_entry is not None:
+                # A superseded generation is not accepted for host writeback,
+                # but its synchronized carrier remains useful recovery evidence
+                # if the newer payload fails.
+                retained_carrier, retained_digest = retained_entry
+                setattr(
+                    malformed,
+                    "_codex_claude_retained_credential_carrier",
+                    str(retained_carrier),
+                )
+                _mark_claude_macos_recovery_update_artifact(
+                    malformed,
+                    retained_carrier
+                    / "config"
+                    / CLAUDE_CREDENTIAL_FILE_NAME,
+                    expected_digest=retained_digest,
+                )
+                setattr(
+                    malformed,
+                    "_codex_claude_refresh_persistence_failed",
+                    True,
+                )
             with runtime_state_lock:
                 if not runtime_is_abandoned():
-                    if durable_stage_carriers:
-                        # A superseded generation is not accepted for host
-                        # writeback, but its synchronized carrier remains
-                        # useful recovery evidence if the newer payload fails.
-                        retained_carrier = durable_stage_carriers[-1][0]
-                        setattr(
-                            malformed,
-                            "_codex_claude_retained_credential_carrier",
-                            str(retained_carrier),
-                        )
-                        _mark_claude_macos_recovery_update_artifact(
-                            malformed,
-                            retained_carrier
-                            / "config"
-                            / CLAUDE_CREDENTIAL_FILE_NAME,
-                        )
-                        setattr(
-                            malformed,
-                            "_codex_claude_refresh_persistence_failed",
-                            True,
-                        )
                     persistence_errors.append(malformed)
             return False
+        quota_failure: ClaudeCredentialInspectionInconclusive | None = None
+        quota_retained_entry: tuple[pathlib.Path, bytes] | None = None
+        generation: int | None = None
         with runtime_state_lock:
             if runtime_is_abandoned():
                 return False
@@ -5213,25 +5906,33 @@ def _claude_keychain_runtime(
                     True,
                 )
                 if durable_stage_carriers:
-                    retained_carrier = durable_stage_carriers[-1][0]
-                    setattr(
-                        exhausted,
-                        "_codex_claude_retained_credential_carrier",
-                        str(retained_carrier),
-                    )
-                    _mark_claude_macos_recovery_update_artifact(
-                        exhausted,
-                        retained_carrier
-                        / "config"
-                        / CLAUDE_CREDENTIAL_FILE_NAME,
-                    )
+                    quota_retained_entry = durable_stage_carriers[-1]
                 durable_stage_quota_exhausted_error = exhausted
-                persistence_errors.append(exhausted)
-                return False
-            durable_stage_reserved_generations += 1
-            durable_stage_reserved_bytes += requested_bytes
-            durable_stage_generation += 1
-            generation = durable_stage_generation
+                quota_failure = exhausted
+            else:
+                durable_stage_reserved_generations += 1
+                durable_stage_reserved_bytes += requested_bytes
+                durable_stage_generation += 1
+                generation = durable_stage_generation
+        if quota_failure is not None:
+            if quota_retained_entry is not None:
+                retained_carrier, retained_digest = quota_retained_entry
+                setattr(
+                    quota_failure,
+                    "_codex_claude_retained_credential_carrier",
+                    str(retained_carrier),
+                )
+                _mark_claude_macos_recovery_update_artifact(
+                    quota_failure,
+                    retained_carrier
+                    / "config"
+                    / CLAUDE_CREDENTIAL_FILE_NAME,
+                    expected_digest=retained_digest,
+                )
+            with runtime_state_lock:
+                persistence_errors.append(quota_failure)
+            return False
+        assert generation is not None
         try:
             recovery_root = _claude_macos_recovery_root(review)
             generation_text = str(generation).zfill(
@@ -5270,12 +5971,15 @@ def _claude_keychain_runtime(
                 True,
             )
             with runtime_state_lock:
-                previous_durable_carrier = (
-                    durable_stage_carriers[-1][0]
+                previous_durable_entry = (
+                    durable_stage_carriers[-1]
                     if durable_stage_carriers
                     else None
                 )
-            if previous_durable_carrier is not None:
+            if previous_durable_entry is not None:
+                previous_durable_carrier, previous_durable_digest = (
+                    previous_durable_entry
+                )
                 setattr(
                     setup_failure,
                     "_codex_claude_retained_credential_carrier",
@@ -5286,6 +5990,7 @@ def _claude_keychain_runtime(
                     previous_durable_carrier
                     / "config"
                     / CLAUDE_CREDENTIAL_FILE_NAME,
+                    expected_digest=previous_durable_digest,
                 )
             with runtime_state_lock:
                 persistence_errors.append(setup_failure)
@@ -5334,6 +6039,7 @@ def _claude_keychain_runtime(
                     committed_carrier
                     / "config"
                     / CLAUDE_CREDENTIAL_FILE_NAME,
+                    expected_digest=stage.credential_digest,
                 )
                 setattr(
                     error,
@@ -5427,7 +6133,6 @@ def _claude_keychain_runtime(
                     else:
                         for attribute in (
                             "_codex_claude_retained_credential_carrier",
-                            "_codex_claude_retained_credential_artifact",
                             "_codex_claude_retained_cleanup_artifact",
                         ):
                             value = getattr(error, attribute, None)
@@ -5438,10 +6143,15 @@ def _claude_keychain_runtime(
                                     cleanup_candidate
                                 )
                                 delattr(error, attribute)
+                        proof = _get_claude_retained_credential_proof(error)
+                        if proof is not None:
+                            with contextlib.suppress(ValueError):
+                                proof.artifact.relative_to(cleanup_candidate)
+                                _clear_claude_retained_credential_proof(error)
             if not isinstance(retained_candidate, str):
                 with runtime_state_lock:
-                    previous_durable_carrier = (
-                        durable_stage_carriers[-1][0]
+                    previous_durable_entry = (
+                        durable_stage_carriers[-1]
                         if durable_stage_carriers
                         else None
                     )
@@ -5450,7 +6160,10 @@ def _claude_keychain_runtime(
                     "_codex_claude_refresh_persistence_failed",
                     True,
                 )
-                if previous_durable_carrier is not None:
+                if previous_durable_entry is not None:
+                    previous_durable_carrier, previous_durable_digest = (
+                        previous_durable_entry
+                    )
                     setattr(
                         error,
                         "_codex_claude_retained_credential_carrier",
@@ -5461,6 +6174,7 @@ def _claude_keychain_runtime(
                         previous_durable_carrier
                         / "config"
                         / CLAUDE_CREDENTIAL_FILE_NAME,
+                        expected_digest=previous_durable_digest,
                     )
             with runtime_state_lock:
                 if not runtime_is_abandoned():
@@ -5498,6 +6212,7 @@ def _claude_keychain_runtime(
                             "Claude Keychain recovery could not replace a "
                             "late durable generation"
                         ),
+                        expected_digest=stage.credential_digest,
                     )
                     setattr(
                         retained,
@@ -5513,6 +6228,7 @@ def _claude_keychain_runtime(
             nonlocal quiescence_recovery_candidate
             nonlocal quiescence_recovery_proven
             nonlocal quiescence_recovery_replaces_existing
+            nonlocal quiescence_recovery_expectation
             with runtime_state_lock:
                 if runtime_is_abandoned():
                     return False
@@ -5520,6 +6236,13 @@ def _claude_keychain_runtime(
                 quiescence_recovery_candidate = committed_carrier
                 quiescence_recovery_replaces_existing = True
                 quiescence_recovery_proven = True
+                quiescence_recovery_expectation = _ClaudeRecoveryExpectation(
+                    committed_carrier,
+                    committed_carrier
+                    / "config"
+                    / CLAUDE_CREDENTIAL_FILE_NAME,
+                    stage.credential_digest,
+                )
                 if durable_stage_inflight is stage:
                     durable_stage_inflight = None
             return True
@@ -5543,6 +6266,7 @@ def _claude_keychain_runtime(
                 committed_carrier
                 / "config"
                 / CLAUDE_CREDENTIAL_FILE_NAME,
+                expected_digest=stage.credential_digest,
             )
             setattr(
                 publish_error,
@@ -5581,7 +6305,10 @@ def _claude_keychain_runtime(
         nonlocal carrier_snapshot, persisted_updates
         nonlocal quiescence_recovery_candidate
         nonlocal quiescence_recovery_replaces_existing
+        nonlocal quiescence_recovery_proven
+        nonlocal quiescence_recovery_expectation
         callback_expected_credential: bytearray | None = None
+        updated_digest = _claude_credential_digest(updated)
         try:
             try:
                 _validate_claude_local_credential(
@@ -5597,7 +6324,6 @@ def _claude_keychain_runtime(
                     if not runtime_is_abandoned():
                         persistence_errors.append(malformed)
                 return False
-
             with runtime_state_lock:
                 if runtime_is_abandoned():
                     return False
@@ -5620,6 +6346,10 @@ def _claude_keychain_runtime(
                     if isinstance(retained_candidate, str)
                     else new_recovery_candidate()
                 )
+                prior_expectation = recovery_expectation_from_error(
+                    prior_error,
+                    recovery_candidate,
+                )
                 with runtime_state_lock:
                     if runtime_is_abandoned():
                         return False
@@ -5628,6 +6358,10 @@ def _claude_keychain_runtime(
                         retained_candidate,
                         str,
                     )
+                    quiescence_recovery_proven = (
+                        prior_expectation is not None
+                    )
+                    quiescence_recovery_expectation = prior_expectation
                 try:
                     if isinstance(retained_candidate, str):
                         _replace_claude_macos_recovery_credential(
@@ -5645,6 +6379,12 @@ def _claude_keychain_runtime(
                             )
                         )
                 except BaseException as recovery_error:
+                    failed_recovery_expectation = (
+                        recovery_expectation_from_error(
+                            recovery_error,
+                            recovery_candidate,
+                        )
+                    )
                     if _is_claude_control_flow_error(prior_error):
                         replacement_error = prior_error
                         deferred_persistence_note = recovery_error
@@ -5667,6 +6407,19 @@ def _claude_keychain_runtime(
                             and persistence_errors
                             and persistence_errors[0] is prior_error
                         ):
+                            if (
+                                quiescence_recovery_candidate
+                                == recovery_candidate
+                            ):
+                                if failed_recovery_expectation is not None:
+                                    quiescence_recovery_replaces_existing = True
+                                    quiescence_recovery_proven = True
+                                    quiescence_recovery_expectation = (
+                                        failed_recovery_expectation
+                                    )
+                                else:
+                                    quiescence_recovery_proven = False
+                                    quiescence_recovery_expectation = None
                             if deferred_persistence_note is not None:
                                 _add_claude_persistence_note(
                                     prior_error,
@@ -5677,6 +6430,7 @@ def _claude_keychain_runtime(
                 retained_error = _retained_claude_macos_credential_error(
                     retained_carrier,
                     prior_error,
+                    expected_digest=updated_digest,
                 )
                 if _is_claude_control_flow_error(prior_error):
                     replacement_error = prior_error
@@ -5690,7 +6444,18 @@ def _claude_keychain_runtime(
                         and persistence_errors
                         and persistence_errors[0] is prior_error
                     ):
+                        quiescence_recovery_candidate = retained_carrier
                         quiescence_recovery_replaces_existing = True
+                        quiescence_recovery_proven = True
+                        quiescence_recovery_expectation = (
+                            _ClaudeRecoveryExpectation(
+                                retained_carrier,
+                                retained_carrier
+                                / "config"
+                                / CLAUDE_CREDENTIAL_FILE_NAME,
+                                updated_digest,
+                            )
+                        )
                         if deferred_persistence_note is not None:
                             _add_claude_persistence_note(
                                 prior_error,
@@ -5733,6 +6498,7 @@ def _claude_keychain_runtime(
                 persisted_updates += 1
                 return True
         except BaseException as error:
+            callback_recovery_candidate: pathlib.Path | None = None
             try:
                 proposed_recovery_candidate = new_recovery_candidate()
                 with runtime_state_lock:
@@ -5743,6 +6509,8 @@ def _claude_keychain_runtime(
                             proposed_recovery_candidate
                         )
                         quiescence_recovery_replaces_existing = False
+                        quiescence_recovery_proven = False
+                        quiescence_recovery_expectation = None
                     callback_recovery_candidate = (
                         quiescence_recovery_candidate
                     )
@@ -5768,6 +6536,14 @@ def _claude_keychain_runtime(
                         )
                     )
             except BaseException as recovery_error:
+                failed_recovery_expectation = (
+                    recovery_expectation_from_error(
+                        recovery_error,
+                        callback_recovery_candidate,
+                    )
+                    if callback_recovery_candidate is not None
+                    else None
+                )
                 if _is_claude_control_flow_error(error):
                     _add_claude_persistence_note(error, recovery_error)
                     persistence_error = error
@@ -5784,6 +6560,7 @@ def _claude_keychain_runtime(
                 retained_error = _retained_claude_macos_credential_error(
                     retained_carrier,
                     error,
+                    expected_digest=updated_digest,
                 )
                 if _is_claude_control_flow_error(error):
                     _add_claude_persistence_note(error, retained_error)
@@ -5795,7 +6572,32 @@ def _claude_keychain_runtime(
                 if runtime_is_abandoned():
                     return False
                 if recovered_carrier:
+                    quiescence_recovery_candidate = retained_carrier
                     quiescence_recovery_replaces_existing = True
+                    quiescence_recovery_proven = True
+                    quiescence_recovery_expectation = (
+                        _ClaudeRecoveryExpectation(
+                            retained_carrier,
+                            retained_carrier
+                            / "config"
+                            / CLAUDE_CREDENTIAL_FILE_NAME,
+                            updated_digest,
+                        )
+                    )
+                elif (
+                    callback_recovery_candidate is not None
+                    and quiescence_recovery_candidate
+                    == callback_recovery_candidate
+                ):
+                    if failed_recovery_expectation is not None:
+                        quiescence_recovery_replaces_existing = True
+                        quiescence_recovery_proven = True
+                        quiescence_recovery_expectation = (
+                            failed_recovery_expectation
+                        )
+                    else:
+                        quiescence_recovery_proven = False
+                        quiescence_recovery_expectation = None
                 if not persistence_errors:
                     persistence_errors.append(persistence_error)
                 else:
@@ -5832,6 +6634,7 @@ def _claude_keychain_runtime(
         nonlocal quiescence_recovery_candidate
         nonlocal quiescence_recovery_proven
         nonlocal quiescence_recovery_replaces_existing
+        nonlocal quiescence_recovery_expectation
         nonlocal quiescence_recovery_timeout_failure
         with runtime_state_lock:
             if (
@@ -5843,7 +6646,12 @@ def _claude_keychain_runtime(
                 durable_stage_inflight = None
             recovery_candidate = quiescence_recovery_candidate
             replace_existing = quiescence_recovery_replaces_existing
-            recovery_proven = quiescence_recovery_proven
+            recovery_expectation = quiescence_recovery_expectation
+            recovery_proven = (
+                quiescence_recovery_proven
+                and recovery_expectation is not None
+                and recovery_expectation.carrier == recovery_candidate
+            )
             inflight_stage = quiescence_durable_stage
             staged_fallback = staged_credential
             staged_credential = None
@@ -5864,7 +6672,28 @@ def _claude_keychain_runtime(
         def ensure_recovery_scope(
             error: BaseException,
         ) -> BaseException:
-            if not recovery_scope_required:
+            effective_scope_required = recovery_scope_required
+            retained_value = getattr(
+                error,
+                "_codex_claude_retained_credential_carrier",
+                None,
+            )
+            retained_proof = _get_claude_retained_credential_proof(error)
+            current_claim_present = (
+                isinstance(retained_value, str) or retained_proof is not None
+            )
+            if (
+                current_claim_present
+                and not published_recovery_claim_is_current(error)
+            ):
+                _clear_claude_retained_credential_proof(error)
+                with contextlib.suppress(AttributeError):
+                    delattr(
+                        error,
+                        "_codex_claude_retained_credential_carrier",
+                    )
+                effective_scope_required = True
+            if not effective_scope_required:
                 return error
             try:
                 recovery_root = _claude_macos_recovery_root(review)
@@ -5883,6 +6712,7 @@ def _claude_keychain_runtime(
             return error
 
         cleanup_late_stage = False
+        wait_for_inflight_stage = False
         if inflight_stage is not None:
             with runtime_state_lock:
                 if (
@@ -5895,16 +6725,85 @@ def _claude_keychain_runtime(
                     quiescence_recovery_candidate = recovery_candidate
                     quiescence_recovery_replaces_existing = True
                     quiescence_recovery_proven = True
-                elif (
-                    recovery_payload is not None
-                    and not inflight_stage.completed.is_set()
-                ):
+                    recovery_expectation = _ClaudeRecoveryExpectation(
+                        recovery_candidate,
+                        recovery_candidate
+                        / "config"
+                        / CLAUDE_CREDENTIAL_FILE_NAME,
+                        inflight_stage.credential_digest,
+                    )
+                    quiescence_recovery_expectation = recovery_expectation
+                elif not inflight_stage.completed.is_set():
                     inflight_stage.cleanup_after_completion = True
                     cleanup_late_stage = True
+                    wait_for_inflight_stage = recovery_payload is None
+        if wait_for_inflight_stage and inflight_stage is not None:
+            stage_finished = inflight_stage.completed.wait(
+                timeout=CLAUDE_KEYCHAIN_RECOVERY_TIMEOUT_SECONDS
+            )
+            if not stage_finished:
+                with runtime_state_lock:
+                    inflight_stage.fallback_proven = False
+                    timeout_failure = quiescence_recovery_timeout_failure
+                inflight_stage.recovery_decided.set()
+                setattr(
+                    quiescence_error,
+                    "_codex_claude_refresh_persistence_failed",
+                    True,
+                )
+                persistence_error = quiescence_error
+                if timeout_failure is not None:
+                    _attach_claude_credential_cleanup_failure(
+                        timeout_failure,
+                        quiescence_error,
+                    )
+                    persistence_error = timeout_failure
+                return ensure_recovery_scope(persistence_error)
+            with runtime_state_lock:
+                if inflight_stage.committed:
+                    recovery_candidate = inflight_stage.committed_carrier
+                    replace_existing = True
+                    recovery_proven = True
+                    recovery_expectation = _ClaudeRecoveryExpectation(
+                        recovery_candidate,
+                        recovery_candidate
+                        / "config"
+                        / CLAUDE_CREDENTIAL_FILE_NAME,
+                        inflight_stage.credential_digest,
+                    )
+                    quiescence_recovery_candidate = recovery_candidate
+                    quiescence_recovery_replaces_existing = True
+                    quiescence_recovery_proven = True
+                    quiescence_recovery_expectation = recovery_expectation
         if recovery_payload is None:
             inflight_error = (
                 inflight_stage.error if inflight_stage is not None else None
             )
+            inflight_expectation = (
+                recovery_expectation_from_error(
+                    inflight_error,
+                    inflight_stage.pending_carrier,
+                    inflight_stage.committed_carrier,
+                )
+                if inflight_stage is not None and inflight_error is not None
+                else None
+            )
+            if (
+                inflight_expectation is not None
+                and inflight_expectation.digest
+                != inflight_stage.credential_digest
+            ):
+                inflight_expectation = None
+            if inflight_expectation is not None:
+                with runtime_state_lock:
+                    recovery_candidate = inflight_expectation.carrier
+                    replace_existing = True
+                    recovery_expectation = inflight_expectation
+                    recovery_proven = True
+                    quiescence_recovery_candidate = recovery_candidate
+                    quiescence_recovery_replaces_existing = True
+                    quiescence_recovery_proven = True
+                    quiescence_recovery_expectation = recovery_expectation
             retained_inflight = (
                 getattr(
                     inflight_error,
@@ -5914,10 +6813,26 @@ def _claude_keychain_runtime(
                 if inflight_error is not None
                 else None
             )
-            if recovery_candidate is not None and recovery_proven:
+            if inflight_expectation is not None:
+                persistence_error = inflight_error
+                assert persistence_error is not None
+                setattr(
+                    persistence_error,
+                    "_codex_claude_retained_credential_carrier",
+                    str(inflight_expectation.carrier),
+                )
+                setattr(
+                    persistence_error,
+                    "_codex_claude_refresh_persistence_failed",
+                    True,
+                )
+            elif recovery_candidate is not None and recovery_proven:
+                assert recovery_expectation is not None
                 persistence_error = _retained_claude_macos_credential_error(
                     recovery_candidate,
                     quiescence_error,
+                    expected_digest=recovery_expectation.digest,
+                    artifact=recovery_expectation.artifact,
                 )
             elif isinstance(retained_inflight, str):
                 persistence_error = inflight_error
@@ -5962,6 +6877,31 @@ def _claude_keychain_runtime(
                 "_codex_claude_keychain_handler_quiescence_unproven",
                 True,
             )
+            if cleanup_late_stage and inflight_stage is not None:
+                with runtime_state_lock:
+                    inflight_stage.fallback_proven = False
+                inflight_stage.recovery_decided.set()
+            with runtime_state_lock:
+                timeout_failure = quiescence_recovery_timeout_failure
+                retained_proof = _get_claude_retained_credential_proof(
+                    persistence_error
+                )
+                if timeout_failure is not None and retained_proof is not None:
+                    setattr(
+                        timeout_failure,
+                        "_codex_claude_retained_credential_carrier",
+                        str(retained_proof.artifact.parent.parent),
+                    )
+                    _copy_claude_retained_credential_proof(
+                        persistence_error,
+                        timeout_failure,
+                    )
+            if timeout_failure is not None:
+                _attach_claude_credential_cleanup_failure(
+                    timeout_failure,
+                    persistence_error,
+                )
+                persistence_error = timeout_failure
             return ensure_recovery_scope(persistence_error)
         if recovery_candidate is None:
             try:
@@ -5993,13 +6933,24 @@ def _claude_keychain_runtime(
                 if quiescence_recovery_candidate is None:
                     quiescence_recovery_candidate = recovery_candidate
                     quiescence_recovery_replaces_existing = False
+                    quiescence_recovery_proven = False
+                    quiescence_recovery_expectation = None
                 else:
                     recovery_candidate = quiescence_recovery_candidate
                     replace_existing = (
                         quiescence_recovery_replaces_existing
                     )
-                    recovery_proven = quiescence_recovery_proven
+                    recovery_expectation = quiescence_recovery_expectation
+                    recovery_proven = (
+                        quiescence_recovery_proven
+                        and recovery_expectation is not None
+                        and recovery_expectation.carrier
+                        == recovery_candidate
+                    )
         recovery_succeeded = False
+        recovery_payload_digest = _claude_credential_digest(
+            recovery_payload
+        )
         try:
             if replace_existing and recovery_proven:
                 _replace_claude_macos_recovery_credential(
@@ -6033,12 +6984,16 @@ def _claude_keychain_runtime(
                     "_codex_claude_refresh_persistence_failed",
                     True,
                 )
+                assert recovery_expectation is not None
                 _mark_claude_macos_recovery_update_artifact(
                     recovery_error,
-                    recovery_candidate
-                    / "config"
-                    / CLAUDE_CREDENTIAL_FILE_NAME,
+                    recovery_expectation.artifact,
+                    expected_digest=recovery_expectation.digest,
                 )
+            failed_recovery_expectation = recovery_expectation_from_error(
+                recovery_error,
+                recovery_candidate,
+            )
             if _is_claude_control_flow_error(recovery_error):
                 _add_claude_persistence_note(
                     recovery_error,
@@ -6051,8 +7006,41 @@ def _claude_keychain_runtime(
                     recovery_error,
                 )
             with runtime_state_lock:
+                if failed_recovery_expectation is not None:
+                    recovery_candidate = (
+                        failed_recovery_expectation.carrier
+                    )
+                    replace_existing = True
+                    recovery_expectation = failed_recovery_expectation
+                    recovery_proven = True
+                    quiescence_recovery_candidate = recovery_candidate
+                    quiescence_recovery_replaces_existing = True
+                    quiescence_recovery_proven = True
+                    quiescence_recovery_expectation = recovery_expectation
+                    recovery_succeeded = hmac.compare_digest(
+                        failed_recovery_expectation.digest,
+                        recovery_payload_digest,
+                    )
+                elif quiescence_recovery_candidate == recovery_candidate:
+                    recovery_proven = False
+                    recovery_expectation = None
+                    quiescence_recovery_proven = False
+                    quiescence_recovery_expectation = None
                 timeout_failure = quiescence_recovery_timeout_failure
                 recovery_timed_out = timeout_failure is not None
+                if (
+                    timeout_failure is not None
+                    and failed_recovery_expectation is not None
+                ):
+                    setattr(
+                        timeout_failure,
+                        "_codex_claude_retained_credential_carrier",
+                        str(failed_recovery_expectation.carrier),
+                    )
+                    _copy_claude_retained_credential_proof(
+                        recovery_error,
+                        timeout_failure,
+                    )
             if recovery_timed_out and timeout_failure is not None:
                 _attach_claude_credential_cleanup_failure(
                     timeout_failure,
@@ -6060,13 +7048,44 @@ def _claude_keychain_runtime(
                 )
                 persistence_error = timeout_failure
         else:
+            successful_expectation = _ClaudeRecoveryExpectation(
+                retained_carrier,
+                retained_carrier
+                / "config"
+                / CLAUDE_CREDENTIAL_FILE_NAME,
+                recovery_payload_digest,
+            )
             with runtime_state_lock:
                 timeout_failure = quiescence_recovery_timeout_failure
                 recovery_timed_out = timeout_failure is not None
-                if not recovery_timed_out:
+                if (
+                    not recovery_timed_out
+                    or (replace_existing and recovery_proven)
+                ):
                     quiescence_recovery_candidate = retained_carrier
                     quiescence_recovery_replaces_existing = True
                     quiescence_recovery_proven = True
+                    quiescence_recovery_expectation = (
+                        successful_expectation
+                    )
+            if (
+                recovery_timed_out
+                and timeout_failure is not None
+                and replace_existing
+                and recovery_proven
+            ):
+                setattr(
+                    timeout_failure,
+                    "_codex_claude_retained_credential_carrier",
+                    str(retained_carrier),
+                )
+                _mark_claude_macos_recovery_update_artifact(
+                    timeout_failure,
+                    retained_carrier
+                    / "config"
+                    / CLAUDE_CREDENTIAL_FILE_NAME,
+                    expected_digest=recovery_payload_digest,
+                )
             if (
                 recovery_timed_out
                 and not (replace_existing and recovery_proven)
@@ -6076,7 +7095,7 @@ def _claude_keychain_runtime(
                     _remove_claude_macos_recovery_carrier(
                         review,
                         retained_carrier,
-                        _claude_credential_digest(recovery_payload),
+                        recovery_payload_digest,
                     )
                 except BaseException as error:
                     late_cleanup_error = error
@@ -6093,12 +7112,15 @@ def _claude_keychain_runtime(
                 if late_cleanup_error is not None:
                     for attribute in (
                         "_codex_claude_retained_credential_carrier",
-                        "_codex_claude_retained_credential_artifact",
                         "_codex_claude_retained_cleanup_artifact",
                     ):
                         value = getattr(late_cleanup_error, attribute, None)
                         if isinstance(value, str):
                             setattr(timeout_failure, attribute, value)
+                    _copy_claude_retained_credential_proof(
+                        late_cleanup_error,
+                        timeout_failure,
+                    )
                     _attach_claude_credential_cleanup_failure(
                         timeout_failure,
                         late_cleanup_error,
@@ -6112,6 +7134,7 @@ def _claude_keychain_runtime(
                     else _retained_claude_macos_credential_error(
                         retained_carrier,
                         quiescence_error,
+                        expected_digest=recovery_payload_digest,
                     )
                 )
         if cleanup_late_stage and inflight_stage is not None:
@@ -6210,6 +7233,7 @@ def _claude_keychain_runtime(
         failure = new_recovery_timeout_scope_failure()
         recovery_candidate: pathlib.Path | None = None
         recovery_proven = False
+        recovery_expectation: _ClaudeRecoveryExpectation | None = None
         recovery_cleanup_scope_required = True
         quiescence_recovery_timeout_failure = failure
         state_acquired = False
@@ -6217,7 +7241,12 @@ def _claude_keychain_runtime(
             state_acquired = runtime_state_lock.acquire(blocking=False)
             if state_acquired:
                 recovery_candidate = quiescence_recovery_candidate
-                recovery_proven = quiescence_recovery_proven
+                recovery_expectation = quiescence_recovery_expectation
+                recovery_proven = (
+                    quiescence_recovery_proven
+                    and recovery_expectation is not None
+                    and recovery_expectation.carrier == recovery_candidate
+                )
                 inflight_stage = quiescence_durable_stage
                 recovery_cleanup_scope_required = (
                     bool(durable_stage_carriers)
@@ -6237,6 +7266,7 @@ def _claude_keychain_runtime(
             if state_acquired:
                 runtime_state_lock.release()
         if recovery_candidate is not None and recovery_proven:
+            assert recovery_expectation is not None
             setattr(
                 failure,
                 "_codex_claude_retained_credential_carrier",
@@ -6244,9 +7274,24 @@ def _claude_keychain_runtime(
             )
             _mark_claude_macos_recovery_update_artifact(
                 failure,
-                recovery_candidate / "config" / CLAUDE_CREDENTIAL_FILE_NAME,
+                recovery_expectation.artifact,
+                expected_digest=recovery_expectation.digest,
             )
-        if recovery_proven and not recovery_cleanup_scope_required:
+        published_current = (
+            recovery_expectation is not None
+            and published_recovery_claim_is_current(
+                failure,
+                recovery_expectation,
+            )
+        )
+        if recovery_proven and not published_current:
+            _clear_claude_retained_credential_proof(failure)
+            with contextlib.suppress(AttributeError):
+                delattr(
+                    failure,
+                    "_codex_claude_retained_credential_carrier",
+                )
+        if published_current and not recovery_cleanup_scope_required:
             with contextlib.suppress(AttributeError):
                 delattr(
                     failure,
@@ -6309,6 +7354,7 @@ def _claude_keychain_runtime(
             )
         ) or runtime_is_abandoned()
         if not finalization_abandoned:
+            errors_for_latest_reproof: tuple[BaseException, ...] = ()
             with runtime_state_lock:
                 durable_carriers_for_cleanup = tuple(
                     durable_stage_carriers
@@ -6317,90 +7363,179 @@ def _claude_keychain_runtime(
                     staged_for_commit = staged_credential
                     staged_credential = None
                 if durable_carriers_for_cleanup and persistence_errors:
-                    latest_durable_carrier = (
-                        durable_carriers_for_cleanup[-1][0]
+                    errors_for_latest_reproof = tuple(persistence_errors)
+            if durable_carriers_for_cleanup and errors_for_latest_reproof:
+                latest_durable_carrier, latest_durable_digest = (
+                    durable_carriers_for_cleanup[-1]
+                )
+                latest_durable_artifact = (
+                    latest_durable_carrier
+                    / "config"
+                    / CLAUDE_CREDENTIAL_FILE_NAME
+                )
+                for existing_error in errors_for_latest_reproof:
+                    retained_value = getattr(
+                        existing_error,
+                        "_codex_claude_retained_credential_carrier",
+                        None,
                     )
-                    for existing_error in persistence_errors:
-                        retained_value = getattr(
+                    existing_proof = _get_claude_retained_credential_proof(
+                        existing_error
+                    )
+                    if (
+                        not isinstance(retained_value, str)
+                        or pathlib.Path(retained_value)
+                        != latest_durable_carrier
+                        or existing_proof is None
+                        or existing_proof.artifact != latest_durable_artifact
+                        or not hmac.compare_digest(
+                            existing_proof.digest,
+                            latest_durable_digest,
+                        )
+                    ):
+                        setattr(
                             existing_error,
                             "_codex_claude_retained_credential_carrier",
-                            None,
+                            str(latest_durable_carrier),
                         )
-                        if (
-                            not isinstance(retained_value, str)
-                            or pathlib.Path(retained_value)
-                            != latest_durable_carrier
-                        ):
-                            setattr(
-                                existing_error,
-                                "_codex_claude_retained_credential_carrier",
-                                str(latest_durable_carrier),
-                            )
-                            _mark_claude_macos_recovery_update_artifact(
-                                existing_error,
-                                latest_durable_carrier
-                                / "config"
-                                / CLAUDE_CREDENTIAL_FILE_NAME,
-                            )
+                        _mark_claude_macos_recovery_update_artifact(
+                            existing_error,
+                            latest_durable_artifact,
+                            expected_digest=latest_durable_digest,
+                        )
         if staged_for_commit is None and durable_carriers_for_cleanup:
             with runtime_state_lock:
                 if persistence_errors:
                     cleanup_primary = persistence_errors[0]
                 else:
-                    cleanup_primary = (
-                        _retained_claude_macos_credential_error(
-                            durable_carriers_for_cleanup[-1][0],
-                            ClaudeCredentialInspectionInconclusive(
-                                "Claude durable-stage finalization did not "
-                                "retain a host-writeback candidate"
-                            ),
-                        )
+                    cleanup_primary = None
+            if cleanup_primary is None:
+                created_cleanup_primary = (
+                    _retained_claude_macos_credential_error(
+                        durable_carriers_for_cleanup[-1][0],
+                        ClaudeCredentialInspectionInconclusive(
+                            "Claude durable-stage finalization did not retain "
+                            "a host-writeback candidate"
+                        ),
+                        expected_digest=durable_carriers_for_cleanup[-1][1],
                     )
-                    persistence_errors.append(cleanup_primary)
+                )
+                with runtime_state_lock:
+                    if persistence_errors:
+                        cleanup_primary = persistence_errors[0]
+                    else:
+                        cleanup_primary = created_cleanup_primary
+                        persistence_errors.append(cleanup_primary)
+            assert cleanup_primary is not None
+            latest_durable_carrier, latest_durable_digest = (
+                durable_carriers_for_cleanup[-1]
+            )
             retained_value = getattr(
                 cleanup_primary,
                 "_codex_claude_retained_credential_carrier",
                 None,
             )
             retained_path: pathlib.Path | None = None
-            if isinstance(retained_value, str):
+            retained_digest: bytes | None = None
+            retained_proof_is_current = False
+            retained_proof = _get_claude_retained_credential_proof(
+                cleanup_primary
+            )
+            if isinstance(retained_value, str) and retained_proof is not None:
                 candidate_path = pathlib.Path(retained_value)
-                try:
-                    candidate_path.lstat()
-                except OSError:
-                    for attribute in (
-                        "_codex_claude_retained_credential_carrier",
-                        "_codex_claude_retained_credential_artifact",
-                    ):
-                        with contextlib.suppress(AttributeError):
-                            delattr(cleanup_primary, attribute)
-                    retained_value = None
-                else:
+                expected_artifact = (
+                    candidate_path
+                    / "config"
+                    / CLAUDE_CREDENTIAL_FILE_NAME
+                )
+                if (
+                    retained_proof.artifact == expected_artifact
+                    and _validated_claude_retained_credential_artifact(
+                        review,
+                        cleanup_primary,
+                    )
+                    is not None
+                ):
                     retained_path = candidate_path
+                    retained_digest = retained_proof.digest
+                    retained_proof_is_current = True
             if retained_path is None:
-                retained_path = durable_carriers_for_cleanup[-1][0]
-            if not isinstance(retained_value, str):
+                _clear_claude_retained_credential_proof(cleanup_primary)
+                retained_path = latest_durable_carrier
+                retained_digest = latest_durable_digest
                 setattr(
                     cleanup_primary,
                     "_codex_claude_retained_credential_carrier",
                     str(retained_path),
                 )
+                assert retained_digest is not None
                 _mark_claude_macos_recovery_update_artifact(
                     cleanup_primary,
                     retained_path
                     / "config"
                     / CLAUDE_CREDENTIAL_FILE_NAME,
+                    expected_digest=retained_digest,
                 )
                 setattr(
                     cleanup_primary,
                     "_codex_claude_refresh_persistence_failed",
                     True,
                 )
+                retained_proof = _get_claude_retained_credential_proof(
+                    cleanup_primary
+                )
+                expected_artifact = (
+                    retained_path
+                    / "config"
+                    / CLAUDE_CREDENTIAL_FILE_NAME
+                )
+                retained_proof_is_current = (
+                    retained_proof is not None
+                    and retained_proof.artifact == expected_artifact
+                    and hmac.compare_digest(
+                        retained_proof.digest,
+                        retained_digest,
+                    )
+                    and _validated_claude_retained_credential_artifact(
+                        review,
+                        cleanup_primary,
+                    )
+                    is not None
+                )
+            if not retained_proof_is_current:
+                _clear_claude_retained_credential_proof(cleanup_primary)
+                with contextlib.suppress(AttributeError):
+                    delattr(
+                        cleanup_primary,
+                        "_codex_claude_retained_credential_carrier",
+                    )
+                try:
+                    recovery_root = _claude_macos_recovery_root(review)
+                except BaseException as root_error:
+                    preferred_primary = (
+                        _attach_claude_persistence_failure_preserving_control_flow(
+                            cleanup_primary,
+                            root_error,
+                        )
+                    )
+                    if preferred_primary is not cleanup_primary:
+                        with runtime_state_lock:
+                            persistence_errors.insert(0, preferred_primary)
+                        cleanup_primary = preferred_primary
+                else:
+                    _mark_claude_macos_recovery_cleanup_artifact(
+                        cleanup_primary,
+                        recovery_root,
+                    )
             cleanup_failures: list[BaseException] = []
-            cleanup_targets = tuple(
-                carrier
-                for carrier in durable_carriers_for_cleanup
-                if carrier[0] != retained_path
+            cleanup_targets = (
+                tuple(
+                    carrier
+                    for carrier in durable_carriers_for_cleanup
+                    if carrier[0] != retained_path
+                )
+                if retained_proof_is_current
+                else ()
             )
             cleanup_stopped_early = False
             for cleanup_index, (
@@ -6431,12 +7566,18 @@ def _claude_keychain_runtime(
                         "_codex_claude_retained_credential_carrier",
                         str(retained_path),
                     )
-                    _mark_claude_macos_recovery_update_artifact(
+                    if not _copy_claude_retained_credential_proof(
+                        cleanup_primary,
                         cleanup_error,
-                        retained_path
-                        / "config"
-                        / CLAUDE_CREDENTIAL_FILE_NAME,
-                    )
+                    ):
+                        assert retained_digest is not None
+                        _mark_claude_macos_recovery_update_artifact(
+                            cleanup_error,
+                            retained_path
+                            / "config"
+                            / CLAUDE_CREDENTIAL_FILE_NAME,
+                            expected_digest=retained_digest,
+                        )
                     cleanup_failures.append(cleanup_error)
                     if _is_claude_control_flow_error(cleanup_error):
                         cleanup_stopped_early = (
@@ -6579,18 +7720,12 @@ def _claude_keychain_runtime(
 
                 if verification_error is not None:
                     for error in (*persistence_errors, verification_error):
-                        for attribute in (
-                            (
-                                "_codex_claude_retained_"
-                                "credential_carrier"
-                            ),
-                            (
-                                "_codex_claude_retained_"
-                                "credential_artifact"
-                            ),
-                        ):
-                            with contextlib.suppress(AttributeError):
-                                delattr(error, attribute)
+                        with contextlib.suppress(AttributeError):
+                            delattr(
+                                error,
+                                "_codex_claude_retained_credential_carrier",
+                            )
+                        _clear_claude_retained_credential_proof(error)
                         setattr(
                             error,
                             "_codex_claude_refresh_persistence_failed",
@@ -6697,9 +7832,10 @@ def _claude_keychain_runtime(
                                         error,
                                         durable_carrier,
                                     )
-                                latest_carrier = (
-                                    durable_carriers_for_cleanup[-1][0]
-                                )
+                                (
+                                    latest_carrier,
+                                    latest_digest,
+                                ) = durable_carriers_for_cleanup[-1]
                                 setattr(
                                     error,
                                     (
@@ -6713,6 +7849,7 @@ def _claude_keychain_runtime(
                                     latest_carrier
                                     / "config"
                                     / CLAUDE_CREDENTIAL_FILE_NAME,
+                                    expected_digest=latest_digest,
                                 )
                                 setattr(
                                     error,
@@ -6747,18 +7884,15 @@ def _claude_keychain_runtime(
                                 durable_digest,
                             )
                         except BaseException as error:
-                            for attribute in (
-                                (
-                                    "_codex_claude_retained_"
-                                    "credential_carrier"
-                                ),
-                                (
-                                    "_codex_claude_retained_"
-                                    "credential_artifact"
-                                ),
-                            ):
-                                with contextlib.suppress(AttributeError):
-                                    delattr(error, attribute)
+                            with contextlib.suppress(AttributeError):
+                                delattr(
+                                    error,
+                                    (
+                                        "_codex_claude_retained_"
+                                        "credential_carrier"
+                                    ),
+                                )
+                            _clear_claude_retained_credential_proof(error)
                             with runtime_state_lock:
                                 if _is_claude_control_flow_error(error):
                                     persistence_errors.insert(0, error)
@@ -6769,18 +7903,14 @@ def _claude_keychain_runtime(
                                 break
                 if stale_durable_cleanup_errors:
                     for cleanup_error in stale_durable_cleanup_errors:
-                        for attribute in (
-                            (
-                                "_codex_claude_retained_"
-                                "credential_carrier"
-                            ),
-                            (
-                                "_codex_claude_retained_"
-                                "credential_artifact"
-                            ),
-                        ):
-                            with contextlib.suppress(AttributeError):
-                                delattr(cleanup_error, attribute)
+                        with contextlib.suppress(AttributeError):
+                            delattr(
+                                cleanup_error,
+                                "_codex_claude_retained_credential_carrier",
+                            )
+                        _clear_claude_retained_credential_proof(
+                            cleanup_error
+                        )
                     with runtime_state_lock:
                         persistence_errors.extend(
                             stale_durable_cleanup_errors
@@ -6862,6 +7992,7 @@ def _claude_keychain_runtime(
             final_runtime_abandoned = True
             final_recovery_candidate = None
             final_recovery_proven = False
+            final_recovery_expectation = None
             remaining_staged_credential = None
         else:
             with runtime_state_lock:
@@ -6870,7 +8001,13 @@ def _claude_keychain_runtime(
                 final_persisted_updates = persisted_updates
                 final_runtime_abandoned = runtime_is_abandoned()
                 final_recovery_candidate = quiescence_recovery_candidate
-                final_recovery_proven = quiescence_recovery_proven
+                final_recovery_expectation = quiescence_recovery_expectation
+                final_recovery_proven = (
+                    quiescence_recovery_proven
+                    and final_recovery_expectation is not None
+                    and final_recovery_expectation.carrier
+                    == final_recovery_candidate
+                )
                 remaining_staged_credential = staged_credential
                 staged_credential = None
         try:
@@ -6899,6 +8036,16 @@ def _claude_keychain_runtime(
                     for secondary in abandonment_errors:
                         if secondary is persistence_error:
                             continue
+                        if (
+                            _get_claude_retained_credential_proof(
+                                persistence_error
+                            )
+                            is None
+                        ):
+                            _copy_claude_retained_credential_proof(
+                                secondary,
+                                persistence_error,
+                            )
                         secondary_cleanup_artifact = getattr(
                             secondary,
                             (
@@ -6988,6 +8135,7 @@ def _claude_keychain_runtime(
                         final_recovery_candidate is not None
                         and final_recovery_proven
                     ):
+                        assert final_recovery_expectation is not None
                         setattr(
                             persistence_error,
                             "_codex_claude_retained_credential_carrier",
@@ -6995,9 +8143,10 @@ def _claude_keychain_runtime(
                         )
                         _mark_claude_macos_recovery_update_artifact(
                             persistence_error,
-                            final_recovery_candidate
-                            / "config"
-                            / CLAUDE_CREDENTIAL_FILE_NAME,
+                            final_recovery_expectation.artifact,
+                            expected_digest=(
+                                final_recovery_expectation.digest
+                            ),
                         )
                         setattr(
                             persistence_error,
@@ -8111,7 +9260,54 @@ class _ClaudeProxyHandler(socketserver.BaseRequestHandler):
                 upstream.close()
 
 
-class _ClaudeProxyServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+def _claude_thread_may_have_started(thread: threading.Thread) -> bool:
+    ident = thread.ident
+    return isinstance(ident, int) and not isinstance(ident, bool)
+
+
+class _ClaudeProxyServeState:
+    def _initialize_serve_state(self) -> None:
+        self._serve_condition = threading.Condition()
+        self._serving = False
+        self._serve_stopped = False
+        self._serve_error: BaseException | None = None
+
+    def service_actions(self) -> None:
+        with self._serve_condition:
+            if not self._serving:
+                self._serving = True
+                self._serve_condition.notify_all()
+
+    def record_serve_stopped(self, error: BaseException | None) -> None:
+        with self._serve_condition:
+            self._serve_stopped = True
+            self._serve_error = error
+            self._serve_condition.notify_all()
+
+    def wait_until_serving(self, timeout: float) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._serve_condition:
+            while not self._serving and not self._serve_stopped:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._serve_condition.wait(timeout=remaining)
+            return self._serving and not self._serve_stopped
+
+    def is_serving(self) -> bool:
+        with self._serve_condition:
+            return self._serving and not self._serve_stopped
+
+    def serve_error(self) -> BaseException | None:
+        with self._serve_condition:
+            return self._serve_error
+
+
+class _ClaudeProxyServer(
+    _ClaudeProxyServeState,
+    socketserver.ThreadingMixIn,
+    socketserver.TCPServer,
+):
     allow_reuse_address = False
     daemon_threads = True
 
@@ -8124,9 +9320,11 @@ class _ClaudeProxyServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self.allowed_targets = allowed_targets
         self.upstream_env = dict(upstream_env)
         super().__init__(("127.0.0.1", 0), _ClaudeProxyHandler)
+        self._initialize_serve_state()
 
 
 class _ClaudeUnixProxyServer(
+    _ClaudeProxyServeState,
     socketserver.ThreadingMixIn,
     socketserver.UnixStreamServer,
 ):
@@ -8142,6 +9340,61 @@ class _ClaudeUnixProxyServer(
         self.allowed_targets = allowed_targets
         self.upstream_env = dict(upstream_env)
         super().__init__(str(socket_path), _ClaudeProxyHandler)
+        self._initialize_serve_state()
+
+
+def _shutdown_claude_proxy_server(
+    server: _ClaudeProxyServeState,
+    thread: threading.Thread | None,
+    *,
+    thread_started: bool,
+    primary_error: BaseException | None,
+    socket_path: pathlib.Path | None = None,
+) -> None:
+    cleanup_errors: list[BaseException] = []
+    serving = False
+    if thread_started:
+        try:
+            serving = server.is_serving()
+        except BaseException as error:
+            cleanup_errors.append(error)
+    if serving:
+        try:
+            server.shutdown()  # type: ignore[attr-defined]
+        except BaseException as error:
+            cleanup_errors.append(error)
+    try:
+        server.server_close()  # type: ignore[attr-defined]
+    except BaseException as error:
+        cleanup_errors.append(error)
+    if thread_started and thread is not None:
+        try:
+            thread.join(timeout=CLAUDE_PROXY_SERVER_SHUTDOWN_TIMEOUT_SECONDS)
+        except BaseException as error:
+            cleanup_errors.append(error)
+        else:
+            try:
+                thread_alive = thread.is_alive()
+            except BaseException as error:
+                cleanup_errors.append(error)
+            else:
+                if thread_alive:
+                    cleanup_errors.append(
+                        ClaudeCredentialInspectionInconclusive(
+                            "Claude CONNECT proxy thread did not stop before the "
+                            "shutdown deadline"
+                        )
+                    )
+    if socket_path is not None:
+        try:
+            socket_path.unlink(missing_ok=True)
+        except BaseException as error:
+            cleanup_errors.append(error)
+    _raise_or_attach_claude_credential_cleanup(
+        primary_error,
+        cleanup_errors,
+        message="cannot clean up the Claude CONNECT proxy safely",
+    )
 
 
 @contextlib.contextmanager
@@ -8160,30 +9413,87 @@ def _claude_connect_proxy(
             upstream_env=env,
         )
     except OSError as error:
-        raise ClaudeLoopbackUnavailable(
+        failure_type = (
+            ClaudeLoopbackUnavailable
+            if _claude_loopback_bind_is_deterministically_unavailable(error)
+            else ClaudeCredentialInspectionInconclusive
+        )
+        raise failure_type(
             f"Claude CONNECT proxy cannot bind loopback: {error}"
         ) from error
-    thread = threading.Thread(
-        target=server.serve_forever,
-        name="claude-review-connect-proxy",
-        daemon=True,
-    )
+    thread: threading.Thread | None = None
     thread_started = False
+    serve_admitted = False
+    serve_gate = threading.Event()
+    serve_cancelled = threading.Event()
+    primary_error: BaseException | None = None
+
+    def serve() -> None:
+        serve_error: BaseException | None = None
+        try:
+            serve_gate.wait()
+            if serve_cancelled.is_set():
+                return
+            server.serve_forever(
+                poll_interval=CLAUDE_PROXY_SERVER_POLL_INTERVAL_SECONDS
+            )
+        except BaseException as error:
+            serve_error = error
+        finally:
+            server.record_serve_stopped(serve_error)
+
     try:
+        try:
+            thread = threading.Thread(
+                target=serve,
+                name="claude-review-connect-proxy",
+                daemon=True,
+            )
+        except ForwardedSignal:
+            raise
+        except Exception as error:
+            raise ClaudeCredentialInspectionInconclusive(
+                f"Claude CONNECT proxy cannot construct its thread: {error}"
+            ) from error
         try:
             thread.start()
             thread_started = True
+        except ForwardedSignal:
+            thread_started = _claude_thread_may_have_started(thread)
+            raise
         except RuntimeError as error:
-            raise ClaudeLoopbackUnavailable(
+            thread_started = _claude_thread_may_have_started(thread)
+            raise ClaudeCredentialInspectionInconclusive(
                 f"Claude CONNECT proxy cannot start: {error}"
             ) from error
+        serve_admitted = True
+        serve_gate.set()
+        if not server.wait_until_serving(
+            CLAUDE_PROXY_SERVER_START_TIMEOUT_SECONDS
+        ):
+            failure = ClaudeCredentialInspectionInconclusive(
+                "Claude CONNECT proxy did not enter its serve loop"
+            )
+            serve_error = server.serve_error()
+            if serve_error is not None:
+                failure.__cause__ = serve_error
+            raise failure
         yield int(server.server_address[1])
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        if thread_started:
-            server.shutdown()
-        server.server_close()
-        if thread_started:
-            thread.join(timeout=5.0)
+        if not serve_admitted:
+            serve_cancelled.set()
+        serve_gate.set()
+        if thread is not None and not thread_started:
+            thread_started = _claude_thread_may_have_started(thread)
+        _shutdown_claude_proxy_server(
+            server,
+            thread,
+            thread_started=thread_started,
+            primary_error=primary_error,
+        )
 
 
 @contextlib.contextmanager
@@ -8202,7 +9512,15 @@ def _claude_unix_connect_proxy(
         dir="/tmp",
     ) as raw_socket_dir:
         socket_dir = pathlib.Path(raw_socket_dir)
-        socket_dir.chmod(0o700)
+        try:
+            socket_dir.chmod(0o700)
+        except ForwardedSignal:
+            raise
+        except OSError as error:
+            raise ClaudeCredentialInspectionInconclusive(
+                "Claude CONNECT proxy cannot make its private Unix proxy "
+                f"directory safe: {error}"
+            ) from error
         socket_path = socket_dir / "p.sock"
         try:
             server = _ClaudeUnixProxyServer(
@@ -8210,33 +9528,113 @@ def _claude_unix_connect_proxy(
                 allowed_targets=allowed_targets,
                 upstream_env=env,
             )
-            socket_path.chmod(0o600)
         except OSError as error:
-            raise ClaudeLoopbackUnavailable(
+            failure_type = (
+                ClaudeLoopbackUnavailable
+                if _claude_unix_bind_is_deterministically_unavailable(error)
+                else ClaudeCredentialInspectionInconclusive
+            )
+            raise failure_type(
                 f"Claude CONNECT proxy cannot bind a private Unix socket: {error}"
             ) from error
-        thread = threading.Thread(
-            target=server.serve_forever,
-            name="claude-review-unix-connect-proxy",
-            daemon=True,
-        )
-        thread_started = False
         try:
+            socket_path.chmod(0o600)
+        except OSError as error:
+            failure = ClaudeCredentialInspectionInconclusive(
+                "Claude CONNECT proxy cannot make its Unix socket private: "
+                f"{error}"
+            )
+            failure.__cause__ = error
+            cleanup_errors: list[BaseException] = []
+            try:
+                server.server_close()
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+            try:
+                socket_path.unlink(missing_ok=True)
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+            _raise_or_attach_claude_credential_cleanup(
+                failure,
+                cleanup_errors,
+                message="cannot clean up the failed Claude Unix CONNECT proxy",
+            )
+            raise failure
+        thread: threading.Thread | None = None
+        thread_started = False
+        serve_admitted = False
+        serve_gate = threading.Event()
+        serve_cancelled = threading.Event()
+        primary_error: BaseException | None = None
+
+        def serve() -> None:
+            serve_error: BaseException | None = None
+            try:
+                serve_gate.wait()
+                if serve_cancelled.is_set():
+                    return
+                server.serve_forever(
+                    poll_interval=CLAUDE_PROXY_SERVER_POLL_INTERVAL_SECONDS
+                )
+            except BaseException as error:
+                serve_error = error
+            finally:
+                server.record_serve_stopped(serve_error)
+
+        try:
+            try:
+                thread = threading.Thread(
+                    target=serve,
+                    name="claude-review-unix-connect-proxy",
+                    daemon=True,
+                )
+            except ForwardedSignal:
+                raise
+            except Exception as error:
+                raise ClaudeCredentialInspectionInconclusive(
+                    "Claude Unix CONNECT proxy cannot construct its thread: "
+                    f"{error}"
+                ) from error
             try:
                 thread.start()
                 thread_started = True
+            except ForwardedSignal:
+                thread_started = _claude_thread_may_have_started(thread)
+                raise
             except RuntimeError as error:
-                raise ClaudeLoopbackUnavailable(
+                thread_started = _claude_thread_may_have_started(thread)
+                raise ClaudeCredentialInspectionInconclusive(
                     f"Claude Unix CONNECT proxy cannot start: {error}"
                 ) from error
+            serve_admitted = True
+            serve_gate.set()
+            if not server.wait_until_serving(
+                CLAUDE_PROXY_SERVER_START_TIMEOUT_SECONDS
+            ):
+                failure = ClaudeCredentialInspectionInconclusive(
+                    "Claude Unix CONNECT proxy did not enter its serve loop"
+                )
+                serve_error = server.serve_error()
+                if serve_error is not None:
+                    failure.__cause__ = serve_error
+                raise failure
             yield socket_path.resolve(strict=True)
+        except BaseException as error:
+            primary_error = error
+            raise
         finally:
-            if thread_started:
-                server.shutdown()
-            server.server_close()
-            if thread_started:
-                thread.join(timeout=5.0)
-            socket_path.unlink(missing_ok=True)
+            if not serve_admitted:
+                serve_cancelled.set()
+            serve_gate.set()
+            if thread is not None and not thread_started:
+                thread_started = _claude_thread_may_have_started(thread)
+            _shutdown_claude_proxy_server(
+                server,
+                thread,
+                thread_started=thread_started,
+                primary_error=primary_error,
+                socket_path=socket_path,
+            )
 
 
 def _with_claude_proxy_environment(
