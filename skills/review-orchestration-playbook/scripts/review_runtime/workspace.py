@@ -109,7 +109,13 @@ SECRET_PATTERNS = (
             rb"[A-Za-z0-9_-]{20,512}(?![A-Za-z0-9_-])|[A-Za-z0-9_-]{513})"
         ),
     ),
-    ("google-api-key", re.compile(rb"\bAIza[0-9A-Za-z_-]{35}\b")),
+    (
+        "google-api-key",
+        re.compile(
+            rb"\bAIza(?:"
+            rb"[0-9A-Za-z_-]{35,512}(?![0-9A-Za-z_-])|[0-9A-Za-z_-]{513})"
+        ),
+    ),
     ("npm-token", re.compile(rb"\bnpm_[A-Za-z0-9]{36}\b")),
     (
         "pypi-token",
@@ -4181,6 +4187,7 @@ def _provider_candidate_is_prefix_only(rule: str, candidate: bytes) -> bool:
             b"github_pat_",
         ),
         "gitlab-token": (b"glpat-",),
+        "google-api-key": (b"AIza",),
         "pypi-token": (b"pypi-",),
         "slack-token": (
             b"xoxb-",

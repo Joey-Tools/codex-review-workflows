@@ -2537,6 +2537,49 @@ class PublicPoolScannerTest(unittest.TestCase):
         self.assertEqual(len(scan.blocking_candidates), 0)
         self.assertEqual(scan.blocking_rule, "gitlab-token")
 
+    def test_google_api_key_body_continuation_keeps_complete_stream_candidate(
+        self,
+    ) -> None:
+        truncated = b"AIza" + b"A" * 34 + b"-"
+        complete = truncated + b"Z"
+        exact_scan = workspace._scan_secret_value(
+            truncated,
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+        self.assertIsNone(exact_scan.blocking_rule)
+        self.assertEqual(
+            exact_scan.blocking_candidates,
+            {truncated: {"google-api-key"}},
+        )
+        first_read = (
+            workspace.MAX_SECRET_PREFIX_PROOF_BYTES + workspace.STREAM_SCAN_OVERLAP
+        )
+        committed_end = first_read - workspace.STREAM_SCAN_OVERLAP
+        candidate_start = committed_end - len(truncated)
+        payload = (
+            b"x" * (candidate_start - 1)
+            + b"\n"
+            + complete
+            + b"!\n"
+            + b"x" * workspace.STREAM_SCAN_OVERLAP
+        )
+        self.assertGreater(len(payload), first_read)
+
+        scan = workspace._stream_secret_scan(
+            io.BytesIO(payload),
+            size=len(payload),
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+
+        self.assertIsNone(scan.blocking_rule)
+        self.assertEqual(
+            scan.blocking_candidates,
+            {complete: {"google-api-key"}},
+        )
+        self.assertNotIn(truncated, scan.blocking_candidates)
+
     def test_valid_long_provider_candidates_are_not_prefix_only_by_total_length(
         self,
     ) -> None:
@@ -2708,9 +2751,10 @@ class PublicPoolScannerTest(unittest.TestCase):
             ("github-token", b"ghp_", b"C", 4096),
             ("github-token", b"github_pat_", b"D", 513),
             ("gitlab-token", b"glpat-", b"E", 4096),
-            ("pypi-token", b"pypi-", b"F", 4096),
-            ("slack-token", b"xoxb-", b"G", 4096),
-            ("stripe-live-key", b"sk_live_", b"H", 4096),
+            ("google-api-key", b"AIza", b"F", 4096),
+            ("pypi-token", b"pypi-", b"G", 4096),
+            ("slack-token", b"xoxb-", b"H", 4096),
+            ("stripe-live-key", b"sk_live_", b"I", 4096),
         )
         for expected_rule, prefix, alphabet, body_length in cases:
             with self.subTest(rule=expected_rule):
@@ -3460,6 +3504,33 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             "unregistered secret unembedded count increased",
         ):
             self.prepare(repo=repo, base=base, head=head)
+
+    def test_google_api_key_suffix_replacement_does_not_count_as_reduction(
+        self,
+    ) -> None:
+        cases = (
+            ("hyphen-to-word", "-", ("X", "Y", "Z")),
+            ("underscore-to-hyphen", "_", ("-X", "-Y", "-Z")),
+        )
+        for label, terminal, suffixes in cases:
+            with self.subTest(case=label):
+                truncated = "AIza" + "A" * 34 + terminal
+                repo, base = self.new_repo(
+                    {
+                        "fixture.txt": (
+                            f"{truncated}{suffixes[0]}\n"
+                            f"{truncated}{suffixes[1]}\n"
+                        )
+                    }
+                )
+                (repo / "fixture.txt").write_text(
+                    f"{truncated}{suffixes[2]}\n",
+                    encoding="utf-8",
+                )
+                head = self.commit(repo)
+
+                with self.assertRaisesRegex(ReviewError, "google-api-key"):
+                    self.prepare(repo=repo, base=base, head=head)
 
     def test_prepared_range_rejects_non_decreasing_secret_transitions(self) -> None:
         cases = (
