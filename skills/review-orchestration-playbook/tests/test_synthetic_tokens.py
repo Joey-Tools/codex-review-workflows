@@ -2743,10 +2743,489 @@ class PublicPoolScannerTest(unittest.TestCase):
                     {candidate: {"github-token"}},
                 )
 
-    def test_safe_short_provider_candidate_is_counted_once(self) -> None:
+    def test_provider_prefix_keeps_complete_low_entropy_candidate(self) -> None:
+        ordinary_cases = (
+            ("aws-access-key", b"AKIA" + b"A" * 16),
+            ("anthropic-key", b"sk-" + b"ant-" + b"A" * 32),
+            ("openai-key", b"sk-" + b"A" * 32),
+            ("github-token", b"ghp_" + b"A" * 36),
+            ("github-pat", b"github_" + b"pat_" + b"A" * 20),
+            ("gitlab-token", b"glpat-" + b"A" * 20),
+            ("google-api-key", b"AI" + b"za" + b"A" * 35),
+            ("npm-token", b"npm_" + b"A" * 36),
+            ("pypi-token", b"pypi-" + b"A" * 50),
+            ("slack-token", b"xoxb-" + b"A" * 20),
+            ("stripe-live-key", b"sk_" + b"live_" + b"A" * 16),
+            (
+                "jwt",
+                b"eyJ" + b"A" * 12 + b"." + b"A" * 12 + b"." + b"A" * 12,
+            ),
+        )
+        for label, candidate in ordinary_cases:
+            with self.subTest(rule=label):
+                complete_candidate = candidate + b"+alpha"
+                scan = workspace._scan_secret_value(
+                    b"api_" + b"token = " + complete_candidate + b"\n",
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+
+                self.assertIsNone(scan.blocking_rule)
+                self.assertEqual(
+                    scan.blocking_candidates[complete_candidate],
+                    {"generic-secret-assignment"},
+                )
+
+        candidate = b"ghp_" + b"A" * 36
+        wrapped_candidate = b"wrap/" + candidate + b"+alpha"
+        wrapped_scan = workspace._scan_secret_value(
+            b"api_" + b"token = " + wrapped_candidate + b"\n",
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+        self.assertEqual(
+            wrapped_scan.blocking_candidates[wrapped_candidate],
+            {"generic-secret-assignment"},
+        )
+
+        aws_candidate = b"A" * 40
+        aws_complete_candidate = aws_candidate + b"+alpha"
+        aws_scan = workspace._scan_secret_value(
+            b"aws_" + b"secret_access_key = " + aws_complete_candidate + b"\n",
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+        self.assertEqual(
+            aws_scan.blocking_candidates[aws_complete_candidate],
+            {"generic-secret-assignment"},
+        )
+
+    def test_short_provider_candidate_keeps_incomplete_quoted_rhs_blocker(
+        self,
+    ) -> None:
+        candidate = b"ghp_" + b"A" * 36
+        assignment_prefix = b"api_" + b'token = "'
+        cases = (
+            (
+                "shell-continuation",
+                assignment_prefix + candidate + b"\\\ncontinued\"\n",
+                False,
+            ),
+            (
+                "diff-same-side-continuation",
+                b"+"
+                + assignment_prefix
+                + candidate
+                + b"\\\n+continued\"\n",
+                True,
+            ),
+            (
+                "single-quote-crlf",
+                b"api_"
+                + b"token = '"
+                + candidate
+                + b"\\\r\ncontinued'\r\n",
+                False,
+            ),
+            (
+                "raw-prefix",
+                b"api_"
+                + b'token = r"'
+                + candidate
+                + b"\\\ncontinued\"\n",
+                False,
+            ),
+            (
+                "triple-quoted",
+                b"api_"
+                + b'token = """'
+                + candidate
+                + b"\ncontinued\"\"\"\n",
+                False,
+            ),
+            (
+                "provider-on-later-line",
+                b"api_"
+                + b'token = "\\\n'
+                + candidate
+                + b"\\\ncontinued\"\n",
+                False,
+            ),
+            (
+                "unclosed-at-eof",
+                assignment_prefix + candidate,
+                False,
+            ),
+        )
+        for label, payload, diff_surface in cases:
+            with self.subTest(case=label):
+                scan = workspace._scan_secret_value(
+                    payload,
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                    diff_surface=diff_surface,
+                )
+
+                self.assertEqual(
+                    scan.blocking_rule,
+                    "generic-secret-assignment",
+                )
+                self.assertEqual(
+                    scan.blocking_candidates,
+                    {candidate: {"github-token"}},
+                )
+
+    def test_escaped_quotes_do_not_hide_nested_short_provider_candidate(
+        self,
+    ) -> None:
+        candidate = b"ghp_" + b"A" * 36
+        cases = (
+            (
+                "double-quoted",
+                b'api_token = "prefix\\"wrap/'
+                + candidate
+                + b'+alpha"\n',
+            ),
+            (
+                "single-quoted",
+                b"api_token = 'prefix\\'wrap/"
+                + candidate
+                + b"+alpha'\n",
+            ),
+            (
+                "triple-quoted",
+                b'api_token = """prefix\\"""wrap/'
+                + candidate
+                + b'+alpha"""\n',
+            ),
+        )
+        for label, payload in cases:
+            with self.subTest(case=label):
+                scan = workspace._scan_secret_value(
+                    payload,
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+
+                self.assertEqual(
+                    scan.blocking_rule,
+                    "generic-secret-assignment",
+                )
+                self.assertEqual(
+                    scan.blocking_candidates,
+                    {candidate: {"github-token"}},
+                )
+
+    def test_adjacent_quoted_rhs_keeps_nested_short_provider_blocker(
+        self,
+    ) -> None:
+        candidate = b"ghp_" + b"A" * 36
+        cases = (
+            (
+                "adjacent",
+                b'api_token = "x" "wrap/' + candidate + b'+alpha"\n',
+            ),
+            (
+                "even-backslashes",
+                b'api_token = "x\\\\" "wrap/' + candidate + b'+alpha"\n',
+            ),
+            (
+                "triple-first-literal",
+                b'api_token = """x""" "wrap/'
+                + candidate
+                + b'+alpha"\n',
+            ),
+            (
+                "operator",
+                b'api_token = "x" + "wrap/' + candidate + b'+alpha"\n',
+            ),
+        )
+        for label, payload in cases:
+            with self.subTest(case=label):
+                scan = workspace._scan_secret_value(
+                    payload,
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+
+                self.assertEqual(
+                    scan.blocking_rule,
+                    "generic-secret-assignment",
+                )
+                self.assertEqual(
+                    scan.blocking_candidates,
+                    {candidate: {"github-token"}},
+                )
+
+    def test_parenthesized_quoted_rhs_keeps_nested_short_provider_blocker(
+        self,
+    ) -> None:
+        candidate = b"ghp_" + b"A" * 36
+        cases = (
+            (
+                "single-literal",
+                b'api_token = ("wrap/' + candidate + b'+alpha")\n',
+            ),
+            (
+                "adjacent-literals",
+                b'api_token = ("x" "wrap/' + candidate + b'+alpha")\n',
+            ),
+            (
+                "multiline",
+                b'api_token = (\n    "wrap/'
+                + candidate
+                + b'+alpha"\n)\n',
+            ),
+            (
+                "nested",
+                b'api_token = [{("wrap/' + candidate + b'+alpha")}]\n',
+            ),
+            (
+                "function-call",
+                b'api_token = build("wrap/' + candidate + b'+alpha")\n',
+            ),
+            (
+                "prefix-expression",
+                b'api_token = fallback or "wrap/'
+                + candidate
+                + b'+alpha"\n',
+            ),
+            (
+                "unquoted-wrapper",
+                b"api_token = (wrap/" + candidate + b"+alpha)\n",
+            ),
+        )
+        for label, payload in cases:
+            with self.subTest(case=label):
+                scan = workspace._scan_secret_value(
+                    payload,
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+
+                self.assertEqual(
+                    scan.blocking_rule,
+                    "generic-secret-assignment",
+                )
+                self.assertEqual(
+                    scan.blocking_candidates,
+                    {candidate: {"github-token"}},
+                )
+
+    def test_diff_opposite_side_delimiter_does_not_close_quoted_rhs(self) -> None:
+        candidate = b"ghp_" + b"A" * 36
+        payload = (
+            b"@@ -1,2 +1,4 @@\n"
+            + b'+api_token = """prefix\n'
+            + b" context\n"
+            + b'-"""\n'
+            + b"+other = wrap/"
+            + candidate
+            + b"+alpha\n"
+            + b'+"""\n'
+        )
+
+        scan = workspace._scan_secret_value(
+            payload,
+            capture_blocking_candidates=True,
+            diff_surface=True,
+            _continue_after_blocking=True,
+        )
+
+        self.assertEqual(
+            scan.blocking_rule,
+            "generic-secret-assignment",
+        )
+        self.assertEqual(
+            scan.blocking_candidates,
+            {candidate: {"github-token"}},
+        )
+
+    def test_multiline_expression_keeps_nested_short_provider_blocker(self) -> None:
+        candidate = b"ghp_" + b"A" * 36
+        cases = (
+            (
+                "trailing-operator",
+                b"api_token = prefix +\n  \"wrap/"
+                + candidate
+                + b'+alpha"\n',
+                False,
+            ),
+            (
+                "leading-operator",
+                b"api_token = prefix\n  + \"wrap/"
+                + candidate
+                + b'+alpha"\n',
+                False,
+            ),
+            (
+                "ternary",
+                b"api_token = condition ?\n  \"wrap/"
+                + candidate
+                + b'+alpha" : fallback\n',
+                False,
+            ),
+            (
+                "block-comment",
+                b"api_token = prefix + /* comment\n  */ \"wrap/"
+                + candidate
+                + b'+alpha"\n',
+                False,
+            ),
+            (
+                "line-comment",
+                b"api_token = prefix + // comment\n  \"wrap/"
+                + candidate
+                + b'+alpha"\n',
+                False,
+            ),
+            (
+                "blank-line",
+                b"api_token = prefix +\n\n  \"wrap/"
+                + candidate
+                + b'+alpha"\n',
+                False,
+            ),
+            (
+                "comment-only-line",
+                b"api_token = prefix +\n  // comment\n  \"wrap/"
+                + candidate
+                + b'+alpha"\n',
+                False,
+            ),
+            (
+                "diff-same-side",
+                b"@@ -1 +1,2 @@\n"
+                + b"+api_token = prefix +\n"
+                + b'+  "wrap/'
+                + candidate
+                + b'+alpha"\n',
+                True,
+            ),
+            (
+                "diff-blank-context",
+                b"@@ -1,2 +1,3 @@\n"
+                + b"+api_token = prefix +\n"
+                + b" \n"
+                + b'+  "wrap/'
+                + candidate
+                + b'+alpha"\n',
+                True,
+            ),
+            (
+                "powershell-backtick",
+                b"$api_token = $prefix + `\r\n"
+                + b'    "wrap/'
+                + candidate
+                + b'+alpha"\r\n',
+                False,
+            ),
+            (
+                "javascript-template",
+                b"api_token = `prefix\nwrap/"
+                + candidate
+                + b"+alpha`\n",
+                False,
+            ),
+        )
+        for label, payload, diff_surface in cases:
+            with self.subTest(case=label):
+                scan = workspace._scan_secret_value(
+                    payload,
+                    capture_blocking_candidates=True,
+                    diff_surface=diff_surface,
+                    _continue_after_blocking=True,
+                )
+
+                self.assertEqual(
+                    scan.blocking_rule,
+                    "generic-secret-assignment",
+                )
+                self.assertEqual(
+                    scan.blocking_candidates,
+                    {candidate: {"github-token"}},
+                )
+
+    def test_quoted_assignment_opening_is_retained_before_provider_frontier(
+        self,
+    ) -> None:
+        candidate = b"ghp_" + b"A" * 36
+        payload = (
+            b"x" * 400
+            + b'\napi_token = """'
+            + b"y" * 180
+            + b"wrap/"
+            + candidate
+            + b'+alpha"""\n'
+        )
+        with (
+            mock.patch.object(
+                workspace,
+                "MAX_SECRET_PREFIX_PROOF_BYTES",
+                512,
+            ),
+            mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", 128),
+            mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 256),
+        ):
+            scan = workspace._stream_secret_scan(
+                io.BytesIO(payload),
+                size=len(payload),
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+
+        self.assertEqual(
+            scan.blocking_rule,
+            "generic-secret-assignment",
+        )
+        self.assertEqual(
+            scan.blocking_candidates,
+            {candidate: {"github-token"}},
+        )
+
+    def test_adjacent_quoted_rhs_is_retained_before_provider_frontier(
+        self,
+    ) -> None:
+        candidate = b"ghp_" + b"A" * 36
+        payload = (
+            b"x" * 400
+            + b'\napi_token = "x"'
+            + b" " * 180
+            + b'"wrap/'
+            + candidate
+            + b'+alpha"\n'
+        )
+        with (
+            mock.patch.object(
+                workspace,
+                "MAX_SECRET_PREFIX_PROOF_BYTES",
+                512,
+            ),
+            mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", 128),
+            mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 256),
+        ):
+            scan = workspace._stream_secret_scan(
+                io.BytesIO(payload),
+                size=len(payload),
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+
+        self.assertEqual(
+            scan.blocking_rule,
+            "generic-secret-assignment",
+        )
+        self.assertEqual(
+            scan.blocking_candidates,
+            {candidate: {"github-token"}},
+        )
+
+    def test_exact_triple_quoted_short_provider_candidate_is_counted_once(
+        self,
+    ) -> None:
         candidate = b"ghp_" + b"A" * 36
         scan = workspace._scan_secret_value(
-            b"api_" + b"token = " + candidate + b"\n",
+            b'api_token = """' + candidate + b'"""\n',
             capture_blocking_candidates=True,
             _continue_after_blocking=True,
         )
@@ -2756,6 +3235,73 @@ class PublicPoolScannerTest(unittest.TestCase):
             scan.blocking_candidates,
             {candidate: {"github-token"}},
         )
+
+    def test_exact_parenthesized_short_provider_candidate_is_counted_once(
+        self,
+    ) -> None:
+        candidate = b"ghp_" + b"A" * 36
+        scan = workspace._scan_secret_value(
+            b'api_token = ("' + candidate + b'")\n',
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+
+        self.assertIsNone(scan.blocking_rule)
+        self.assertEqual(
+            scan.blocking_candidates,
+            {candidate: {"github-token"}},
+        )
+
+    def test_exact_template_short_provider_candidate_is_counted_once(self) -> None:
+        candidate = b"ghp_" + b"A" * 36
+        scan = workspace._scan_secret_value(
+            b"api_token = `" + candidate + b"`\n",
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+
+        self.assertIsNone(scan.blocking_rule)
+        self.assertEqual(
+            scan.blocking_candidates,
+            {candidate: {"github-token"}},
+        )
+
+    def test_completed_quoted_assignment_does_not_capture_next_assignment(self) -> None:
+        candidate = b"ghp_" + b"A" * 36
+        scan = workspace._scan_secret_value(
+            b'api_token = "placeholder"\nother_token = '
+            + candidate
+            + b"\n",
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+
+        self.assertIsNone(scan.blocking_rule)
+        self.assertEqual(
+            scan.blocking_candidates,
+            {candidate: {"github-token"}},
+        )
+
+    def test_safe_short_provider_candidate_is_counted_once(self) -> None:
+        candidate = b"ghp_" + b"A" * 36
+        cases = (
+            ("unquoted", b"api_" + b"token = " + candidate + b"\n"),
+            ("quoted", b"api_" + b'token = "' + candidate + b'"\n'),
+            ("raw-quoted", b"api_" + b'token = r"' + candidate + b'"\n'),
+        )
+        for label, payload in cases:
+            with self.subTest(case=label):
+                scan = workspace._scan_secret_value(
+                    payload,
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+
+                self.assertIsNone(scan.blocking_rule)
+                self.assertEqual(
+                    scan.blocking_candidates,
+                    {candidate: {"github-token"}},
+                )
 
     def test_complete_anthropic_candidate_suppresses_openai_prefix_only_event(
         self,
@@ -2865,6 +3411,89 @@ class PublicPoolScannerTest(unittest.TestCase):
             + candidate
             + b" \\"
             + b"\ncontinued\n"
+            + b"x" * overlap
+        )
+        self.assertGreater(len(payload), proof_bytes + overlap)
+
+        with (
+            mock.patch.object(
+                workspace,
+                "MAX_SECRET_PREFIX_PROOF_BYTES",
+                proof_bytes,
+            ),
+            mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", overlap),
+            mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 256),
+        ):
+            scan = workspace._stream_secret_scan(
+                io.BytesIO(payload),
+                size=len(payload),
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+
+        self.assertEqual(scan.blocking_rule, "generic-secret-assignment")
+        self.assertEqual(
+            scan.blocking_candidates,
+            {candidate: {"github-token"}},
+        )
+
+    def test_extended_short_provider_value_crosses_stream_frontier(self) -> None:
+        candidate = b"ghp_" + b"A" * 36
+        complete_candidate = candidate + b"+alpha"
+        assignment_prefix = b"api_" + b"token = "
+        proof_bytes = 512
+        overlap = 128
+        committed_end = proof_bytes
+        candidate_start = committed_end - len(candidate)
+        line_start = candidate_start - len(assignment_prefix)
+        payload = (
+            b"x" * (line_start - 1)
+            + b"\n"
+            + assignment_prefix
+            + complete_candidate
+            + b"\nstate = ok\n"
+            + b"x" * overlap
+        )
+        self.assertGreater(len(payload), proof_bytes + overlap)
+
+        with (
+            mock.patch.object(
+                workspace,
+                "MAX_SECRET_PREFIX_PROOF_BYTES",
+                proof_bytes,
+            ),
+            mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", overlap),
+            mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 256),
+        ):
+            scan = workspace._stream_secret_scan(
+                io.BytesIO(payload),
+                size=len(payload),
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+
+        self.assertIsNone(scan.blocking_rule)
+        self.assertEqual(
+            scan.blocking_candidates[complete_candidate],
+            {"generic-secret-assignment"},
+        )
+
+    def test_incomplete_quoted_short_provider_crosses_stream_frontier_and_blocks(
+        self,
+    ) -> None:
+        candidate = b"ghp_" + b"A" * 36
+        assignment_prefix = b"api_" + b'token = "'
+        proof_bytes = 512
+        overlap = 128
+        committed_end = proof_bytes
+        candidate_start = committed_end - len(candidate)
+        line_start = candidate_start - len(assignment_prefix)
+        payload = (
+            b"x" * (line_start - 1)
+            + b"\n"
+            + assignment_prefix
+            + candidate
+            + b"\\\ncontinued\"\n"
             + b"x" * overlap
         )
         self.assertGreater(len(payload), proof_bytes + overlap)
@@ -3693,6 +4322,128 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                         manifest["secret_reductions"],
                     )
 
+    def test_changed_path_public_evidence_contains_only_digests(self) -> None:
+        fixture = reduction_fixture("generic-secret-assignment")
+        repo, base = self.new_repo({"fixture.cfg": fixture * 2})
+        (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
+        head = self.commit(repo)
+
+        review = self.prepare(repo=repo, base=base, head=head)
+        raw_path = b"fixture.cfg"
+        public_paths = (
+            review.workspace_root
+            / ".codex-review"
+            / workspace.CHANGED_PATH_DIGESTS_NAME
+        ).read_bytes()
+        private_paths = (
+            review.container_dir / workspace.PRIVATE_CHANGED_PATHS_NAME
+        ).read_bytes()
+
+        self.assertEqual(
+            public_paths,
+            hashlib.sha256(raw_path).hexdigest().encode("ascii") + b"\0",
+        )
+        self.assertNotIn(raw_path, public_paths)
+        self.assertEqual(private_paths, raw_path + b"\0")
+        self.validate(review)
+
+    def test_dynamic_secret_in_head_path_blocks_before_handoff(self) -> None:
+        raw_value = reduction_secret("generic-secret-assignment").decode("ascii")
+        fixture = assignment_text("password", raw_value)
+        cases = (
+            ("raw", raw_value),
+            (
+                "storage",
+                base64.b64encode(raw_value.encode("ascii")).decode("ascii"),
+            ),
+        )
+        for label, path_value in cases:
+            with self.subTest(case=label):
+                repo, base = self.new_repo({"fixture.cfg": fixture * 2})
+                (repo / "fixture.cfg").rename(repo / path_value)
+                (repo / path_value).write_text(fixture, encoding="utf-8")
+                head = self.commit(repo)
+
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "frozen head paths",
+                ) as caught:
+                    self.prepare(repo=repo, base=base, head=head)
+                self.assertNotIn(raw_value, str(caught.exception))
+                self.assertNotIn(path_value, str(caught.exception))
+
+    def test_materialized_head_path_cannot_add_a_reduced_dynamic_secret(self) -> None:
+        raw_value = reduction_secret("generic-secret-assignment").decode("ascii")
+        fixture = assignment_text("password", raw_value)
+        repo, base = self.new_repo({"fixture.cfg": fixture * 2})
+        (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
+        head = self.commit(repo)
+        review = self.prepare(repo=repo, base=base, head=head)
+        (review.workspace_root / "fixture.cfg").rename(
+            review.workspace_root / raw_value
+        )
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "secret-reduction-value",
+        ) as caught:
+            self.validate(review)
+        self.assertNotIn(raw_value, str(caught.exception))
+
+    def test_deleted_dynamic_secret_path_remains_reviewable_in_raw_diff(self) -> None:
+        raw_value = reduction_secret("generic-secret-assignment").decode("ascii")
+        fixture = assignment_text("password", raw_value)
+        repo, base = self.new_repo({raw_value: fixture * 2})
+        (repo / raw_value).unlink()
+        head = self.commit(repo)
+
+        review = self.prepare(repo=repo, base=base, head=head)
+        self.assertIn(raw_value.encode("ascii"), review.diff_file.read_bytes())
+        self.assertEqual(
+            (
+                review.workspace_root
+                / ".codex-review"
+                / workspace.CHANGED_PATH_DIGESTS_NAME
+            ).read_bytes(),
+            b"",
+        )
+        self.assertEqual(
+            (
+                review.container_dir / workspace.PRIVATE_CHANGED_PATHS_NAME
+            ).read_bytes(),
+            b"",
+        )
+        self.validate(review)
+
+    def test_dynamic_value_matching_changed_path_digest_fails_closed(self) -> None:
+        relative = "fixture.cfg"
+        raw_value = hashlib.sha256(relative.encode("ascii")).hexdigest()
+        fixture = assignment_text("password", raw_value)
+        repo, base = self.new_repo({relative: fixture * 2})
+        (repo / relative).write_text(fixture, encoding="utf-8")
+        head = self.commit(repo)
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "would expose a raw synthetic value",
+        ) as caught:
+            self.prepare(repo=repo, base=base, head=head)
+        self.assertNotIn(raw_value, str(caught.exception))
+
+    def test_retained_container_removes_helper_private_changed_paths(self) -> None:
+        repo, base = self.new_repo({"README.md": "base\n"})
+        (repo / "README.md").write_text("head\n", encoding="utf-8")
+        head = self.commit(repo)
+        review = self.prepare(repo=repo, base=base, head=head)
+        private_paths = review.container_dir / workspace.PRIVATE_CHANGED_PATHS_NAME
+        self.assertTrue(private_paths.exists())
+
+        self.assertIsNone(workspace.cleanup_workspace(review, keep_container=True))
+
+        self.assertTrue(review.container_dir.exists())
+        self.assertFalse(review.workspace_root.exists())
+        self.assertFalse(private_paths.exists())
+
     def test_jwt_base64url_suffix_extraction_does_not_count_as_reduction(self) -> None:
         shorter = reduction_secret("jwt").decode("ascii")
         longer = shorter + "-"
@@ -3792,6 +4543,88 @@ class SyntheticWorkspaceTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ReviewError, "generic-secret-assignment"):
             self.prepare(repo=repo, base=base, head=head)
+
+    def test_incomplete_quoted_short_provider_does_not_count_as_reduction(
+        self,
+    ) -> None:
+        candidate = b"ghp_" + b"A" * 36
+
+        def incomplete_assignment(marker: bytes) -> str:
+            return (
+                b"api_"
+                + b'token = "'
+                + candidate
+                + b"\\"
+                + b"\n"
+                + marker
+                + b'"\n'
+            ).decode("ascii")
+
+        repo, base = self.new_repo(
+            {
+                "fixture.txt": incomplete_assignment(b"continued-a")
+                + incomplete_assignment(b"continued-b")
+            }
+        )
+        (repo / "fixture.txt").write_text(
+            incomplete_assignment(b"continued-c"),
+            encoding="utf-8",
+        )
+        head = self.commit(repo)
+
+        with self.assertRaisesRegex(ReviewError, "generic-secret-assignment"):
+            self.prepare(repo=repo, base=base, head=head)
+
+    def test_extended_short_provider_value_does_not_count_as_prefix_reduction(
+        self,
+    ) -> None:
+        candidate = b"ghp_" + b"A" * 36
+
+        def assignment(suffix: bytes) -> str:
+            return (
+                b"api_" + b"token = " + candidate + suffix + b"\n"
+            ).decode("ascii")
+
+        repo, base = self.new_repo(
+            {
+                "fixture.txt": assignment(b"+alpha")
+                + assignment(b"+bravo")
+            }
+        )
+        (repo / "fixture.txt").write_text(
+            assignment(b"+charlie"),
+            encoding="utf-8",
+        )
+        head = self.commit(repo)
+
+        with self.assertRaisesRegex(ReviewError, "generic-secret-assignment"):
+            self.prepare(repo=repo, base=base, head=head)
+
+    def test_extended_short_provider_value_can_strictly_reduce_when_exact(
+        self,
+    ) -> None:
+        candidate = b"ghp_" + b"A" * 36
+        fixture = (
+            b"api_" + b"token = " + candidate + b"+alpha\n"
+        ).decode("ascii")
+        repo, base = self.new_repo({"fixture.txt": fixture * 2})
+        (repo / "fixture.txt").write_text(fixture, encoding="utf-8")
+        head = self.commit(repo)
+
+        review = self.prepare(repo=repo, base=base, head=head)
+        evidence = self.validate(review)
+        reductions = evidence["synthetic_tokens"]["secret_reductions"]
+        self.assertEqual(len(reductions), 2)
+        self.assertEqual(
+            {tuple(entry["rules"]) for entry in reductions},
+            {("generic-secret-assignment",), ("github-token",)},
+        )
+        self.assertTrue(
+            all(
+                (entry["base_count"], entry["head_count"]) == (2, 1)
+                for entry in reductions
+            )
+        )
 
     def test_prepared_range_rejects_non_decreasing_secret_transitions(self) -> None:
         cases = (
@@ -4596,7 +5429,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
 
     def test_helper_private_control_state_blocks_artifact_tampering(self) -> None:
         replacements = {
-            "changed-paths.z": b"tampered.txt\0",
+            workspace.CHANGED_PATH_DIGESTS_NAME: b"tampered.txt\0",
             "changed-blob-findings.z": (
                 b"head\0tampered.txt\0private-key\0"
             ),
@@ -4699,13 +5532,44 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         (repo / "auth.json").unlink()
         head = self.commit(repo)
         review = self.prepare(repo=repo, base=base, head=head)
-        changed_paths = review.workspace_root / ".codex-review/changed-paths.z"
+        changed_paths = (
+            review.workspace_root
+            / ".codex-review"
+            / workspace.CHANGED_PATH_DIGESTS_NAME
+        )
         changed_paths.unlink()
         os.mkfifo(changed_paths, mode=0o600)
         with self.assertRaisesRegex(
             ReviewError,
             "helper-private control state|not a regular file",
         ):
+            self.validate(review)
+
+    def test_changed_path_digests_bind_helper_private_raw_paths(self) -> None:
+        repo, base = self.new_repo({"README.md": "base\n"})
+        (repo / "README.md").write_text("head\n", encoding="utf-8")
+        head = self.commit(repo)
+        review = self.prepare(repo=repo, base=base, head=head)
+        private_paths = review.container_dir / workspace.PRIVATE_CHANGED_PATHS_NAME
+        private_paths.write_bytes(b"different.txt\0")
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "digests do not match helper-private changed paths",
+        ):
+            self.validate(review)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "requires FIFO support")
+    def test_helper_private_changed_path_fifo_fails_without_blocking(self) -> None:
+        repo, base = self.new_repo({"README.md": "base\n"})
+        (repo / "README.md").write_text("head\n", encoding="utf-8")
+        head = self.commit(repo)
+        review = self.prepare(repo=repo, base=base, head=head)
+        private_paths = review.container_dir / workspace.PRIVATE_CHANGED_PATHS_NAME
+        private_paths.unlink()
+        os.mkfifo(private_paths, mode=0o600)
+
+        with self.assertRaisesRegex(ReviewError, "not a regular file"):
             self.validate(review)
 
     def test_manifest_count_tampering_cannot_authorize_a_head_copy(self) -> None:

@@ -16,6 +16,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+from bisect import bisect_left
 from collections import Counter, deque
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -151,20 +152,35 @@ PEM_PRIVATE_KEY_BEGIN = re.compile(
     rb"(?:ENCRYPTED |RSA |EC |DSA |OPENSSH )?PRIVATE KEY)-----"
 )
 SECRET_KEY_NAME_PATTERN = (
-    rb"(?i)(?:api[_-]?(?:key|token)|access[_-]?token|auth[_-]?token|"
+    rb"(?i)(?:aws[_-]?(?:access[_-]?key[_-]?id|secret[_-]?access[_-]?key)|"
+    rb"api[_-]?(?:key|token)|access[_-]?token|auth[_-]?token|"
     rb"bearer[_-]?token|client[_-]?secret|id[_-]?token|password|passwd|"
     rb"private[_-]?token|"
     rb"refresh[_-]?token|secret[_-]?(?:key|token))['\"]?"
 )
+STRONG_SECRET_KEY_NAME_PATTERN = re.compile(
+    rb"(?i)aws[_-]?(?:access[_-]?key[_-]?id|secret[_-]?access[_-]?key)"
+)
 SECRET_KEY_PATTERN = SECRET_KEY_NAME_PATTERN + rb"\s{0,256}[:=]\s{0,256}"
+STRING_LITERAL_PREFIX_PATTERN = rb"(?:(?:br|rb|fr|rf|b|f|r|u))?"
+SECRET_ASSIGNMENT_PREFIX = re.compile(SECRET_KEY_PATTERN)
 OVERSIZED_SECRET_ASSIGNMENT_GAP = re.compile(
     SECRET_KEY_NAME_PATTERN + rb"(?:\s{257}|\s{0,256}[:=]\s{257})"
 )
 QUOTED_SECRET_ASSIGNMENT = re.compile(
-    SECRET_KEY_PATTERN + rb"(['\"])([^\r\n'\"]{16,512})\1"
+    SECRET_KEY_PATTERN
+    + STRING_LITERAL_PREFIX_PATTERN
+    + rb"(['\"])([^\r\n'\"]{16,512})\1"
+)
+QUOTED_SECRET_ASSIGNMENT_PREFIX = re.compile(
+    SECRET_KEY_PATTERN
+    + STRING_LITERAL_PREFIX_PATTERN
+    + rb"(['\"])([^\r\n'\"]{16,512})"
 )
 OVERSIZED_QUOTED_SECRET_ASSIGNMENT = re.compile(
-    SECRET_KEY_PATTERN + rb"(['\"])[^\r\n'\"]{513}"
+    SECRET_KEY_PATTERN
+    + STRING_LITERAL_PREFIX_PATTERN
+    + rb"(['\"])[^\r\n'\"]{513}"
 )
 UNQUOTED_SECRET_ASSIGNMENT = re.compile(
     SECRET_KEY_PATTERN
@@ -235,9 +251,11 @@ SYNTHETIC_PRIVATE_MANIFEST_NAME = "synthetic-secret-state.json"
 SYNTHETIC_CHANGED_EVIDENCE_NAME = "synthetic-changed-evidence.json"
 SYNTHETIC_MANIFEST_SCHEMA_VERSION = 3
 CONTROL_ARTIFACT_STATE_NAME = "control-artifact-state.json"
-CONTROL_ARTIFACT_SCHEMA_VERSION = 2
+CONTROL_ARTIFACT_SCHEMA_VERSION = 3
+CHANGED_PATH_DIGESTS_NAME = "changed-path-digests.z"
+PRIVATE_CHANGED_PATHS_NAME = "changed-paths-private.z"
 CONTROL_ARTIFACT_SPECS: dict[str, tuple[int, int | None]] = {
-    "changed-paths.z": (MAX_CHANGED_METADATA_BYTES, MAX_CHANGED_ENTRIES),
+    CHANGED_PATH_DIGESTS_NAME: (MAX_CHANGED_METADATA_BYTES, MAX_CHANGED_ENTRIES),
     "changed-blob-findings.z": (
         MAX_CHANGED_METADATA_BYTES,
         MAX_CHANGED_ENTRIES * 3,
@@ -852,20 +870,7 @@ def _parse_tree_record(record: bytes) -> tuple[str, str, str, pathlib.PurePosixP
     return mode, object_type, object_id, relative
 
 
-def _legacy_path_matcher(
-    legacy_values: Iterable[AcceptedSyntheticValue],
-) -> LegacyPathMatcher:
-    needles: dict[bytes, str] = {}
-    for descriptor in legacy_values:
-        if descriptor.kind != "legacy" or descriptor.value is None:
-            raise ReviewError(
-                "legacy path validation requires exact catalog-backed values"
-            )
-        for needle in (descriptor.value, base64.b64encode(descriptor.value)):
-            previous = needles.get(needle)
-            if previous is None or descriptor.identifier < previous:
-                needles[needle] = descriptor.identifier
-
+def _exact_path_matcher(needles: dict[bytes, str]) -> LegacyPathMatcher:
     transitions: list[dict[int, int]] = [{}]
     failures = [0]
     identifiers: list[str | None] = [None]
@@ -907,14 +912,47 @@ def _legacy_path_matcher(
     )
 
 
-def _reject_legacy_values_in_frozen_tree_paths(
+def _legacy_path_matcher(
+    legacy_values: Iterable[AcceptedSyntheticValue],
+) -> LegacyPathMatcher:
+    needles: dict[bytes, str] = {}
+    for descriptor in legacy_values:
+        if descriptor.kind != "legacy" or descriptor.value is None:
+            raise ReviewError(
+                "legacy path validation requires exact catalog-backed values"
+            )
+        for needle in (descriptor.value, base64.b64encode(descriptor.value)):
+            previous = needles.get(needle)
+            if previous is None or descriptor.identifier < previous:
+                needles[needle] = descriptor.identifier
+    return _exact_path_matcher(needles)
+
+
+def _secret_reduction_path_matcher(
+    reduction_values: Iterable[AcceptedSyntheticValue],
+) -> LegacyPathMatcher:
+    needles: dict[bytes, str] = {}
+    for descriptor in reduction_values:
+        if descriptor.kind != "secret-reduction" or descriptor.value is None:
+            raise ReviewError(
+                "secret-reduction path validation requires exact values"
+            )
+        for needle in (descriptor.value, base64.b64encode(descriptor.value)):
+            previous = needles.get(needle)
+            if previous is None or descriptor.identifier < previous:
+                needles[needle] = descriptor.identifier
+    return _exact_path_matcher(needles)
+
+
+def _reject_values_in_frozen_tree_paths(
     *,
     git_view: pathlib.Path,
     object_directory: pathlib.Path,
     commit: str,
-    legacy_values: Iterable[AcceptedSyntheticValue],
+    matcher: LegacyPathMatcher,
+    match_message: str,
+    failure_label: str,
 ) -> None:
-    matcher = _legacy_path_matcher(legacy_values)
     if len(matcher.transitions) == 1:
         return
     with tempfile.TemporaryFile() as tree_stderr:
@@ -943,11 +981,7 @@ def _reject_legacy_values_in_frozen_tree_paths(
                     raise ReviewError("malformed record from git ls-tree")
                 identifier = matcher.match(raw_path)
                 if identifier is not None:
-                    raise ReviewError(
-                        "legacy synthetic fixture values and storage encodings "
-                        "are not allowed in repository paths: "
-                        f"{identifier}"
-                    )
+                    raise ReviewError(f"{match_message}: {identifier}")
                 _parse_tree_record(record)
             _close_pipe(process.stdout)
             returncode = process.wait()
@@ -957,9 +991,49 @@ def _reject_legacy_values_in_frozen_tree_paths(
             raise
         if returncode != 0:
             raise ReviewError(
-                "cannot enumerate frozen Git paths for legacy synthetic-token "
+                f"cannot enumerate frozen Git paths for {failure_label} "
                 f"validation: {_process_stderr(tree_stderr)}"
             )
+
+
+def _reject_legacy_values_in_frozen_tree_paths(
+    *,
+    git_view: pathlib.Path,
+    object_directory: pathlib.Path,
+    commit: str,
+    legacy_values: Iterable[AcceptedSyntheticValue],
+) -> None:
+    _reject_values_in_frozen_tree_paths(
+        git_view=git_view,
+        object_directory=object_directory,
+        commit=commit,
+        matcher=_legacy_path_matcher(legacy_values),
+        match_message=(
+            "legacy synthetic fixture values and storage encodings are not "
+            "allowed in repository paths"
+        ),
+        failure_label="legacy synthetic-token",
+    )
+
+
+def _reject_secret_reduction_values_in_frozen_tree_paths(
+    *,
+    git_view: pathlib.Path,
+    object_directory: pathlib.Path,
+    commit: str,
+    reduction_values: Iterable[AcceptedSyntheticValue],
+) -> None:
+    _reject_values_in_frozen_tree_paths(
+        git_view=git_view,
+        object_directory=object_directory,
+        commit=commit,
+        matcher=_secret_reduction_path_matcher(reduction_values),
+        match_message=(
+            "unregistered secret values and storage encodings are not allowed "
+            "in the frozen head paths"
+        ),
+        failure_label="unregistered secret path",
+    )
 
 
 def _read_exact(stream: BinaryIO, size: int) -> bytes:
@@ -1374,9 +1448,12 @@ def _write_frozen_changed_paths(
     base_sha: str,
     head_sha: str,
     destination: pathlib.Path,
+    private_destination: pathlib.Path,
+    evidence_sensitive_values: Iterable[AcceptedSyntheticValue],
 ) -> None:
+    digest_evidence: list[str] = []
     with (
-        _open_new_private_binary(destination) as output,
+        _open_new_private_binary(private_destination) as output,
         tempfile.TemporaryFile() as error_output,
     ):
         _write_limited_diff_metadata(
@@ -1396,6 +1473,30 @@ def _write_frozen_changed_paths(
             label="frozen changed paths",
             record_limit=MAX_CHANGED_ENTRIES,
         )
+    with (
+        _secure_file_reader(
+            private_destination,
+            label="helper-private frozen changed paths",
+            max_bytes=MAX_CHANGED_METADATA_BYTES,
+        ) as (reader, _metadata),
+        _open_new_private_binary(destination) as output,
+    ):
+        for raw_path in _iter_nul_records(
+            reader,
+            byte_limit=MAX_CHANGED_METADATA_BYTES,
+            record_limit=MAX_CHANGED_ENTRIES,
+            label="helper-private frozen changed paths",
+        ):
+            if not raw_path:
+                raise ReviewError("frozen changed paths contain an empty path")
+            digest = hashlib.sha256(raw_path).hexdigest()
+            digest_evidence.append(digest)
+            output.write(digest.encode("ascii") + b"\0")
+    _reject_raw_values_in_evidence(
+        digest_evidence,
+        accepted_values=evidence_sensitive_values,
+        label="frozen changed path digest evidence",
+    )
 
 
 def _write_bounded_json(
@@ -1907,6 +2008,7 @@ def _write_changed_blob_findings(
     accepted_index = _index_accepted_values(accepted)
     event_budget = SecretScanBudget.default()
     accepted_evidence: Counter[tuple[AcceptedSyntheticValue, str, str]] = Counter()
+    finding_path_digests: set[str] = set()
     environment = _git_environment(object_directory=object_directory)
     with (
         tempfile.TemporaryFile() as raw_output,
@@ -1958,6 +2060,7 @@ def _write_changed_blob_findings(
                     raise ReviewError(
                         "raw Git diff is missing a changed path"
                     ) from error
+                path_sha256 = hashlib.sha256(raw_path).hexdigest()
                 for side, mode, raw_object in (
                     ("base", old_mode, old_object),
                     ("head", new_mode, new_object),
@@ -1981,15 +2084,15 @@ def _write_changed_blob_findings(
                         event_budget=event_budget,
                     )
                     if scan.blocking_rule:
+                        finding_path_digests.add(path_sha256)
                         findings_output.write(
                             side.encode("ascii")
                             + b"\0"
-                            + raw_path
+                            + path_sha256.encode("ascii")
                             + b"\0"
                             + scan.blocking_rule.encode("ascii")
                             + b"\0"
                         )
-                    path_sha256 = hashlib.sha256(raw_path).hexdigest()
                     for accepted_value, count in scan.accepted_counts.items():
                         _record_bounded_evidence_count(
                             accepted_evidence,
@@ -2012,6 +2115,11 @@ def _write_changed_blob_findings(
             raise ReviewError(
                 f"cannot scan changed Git blobs: {_process_stderr(cat_error)}"
             )
+    _reject_raw_values_in_evidence(
+        sorted(finding_path_digests),
+        accepted_values=evidence_sensitive_values,
+        label="changed-blob finding path digest evidence",
+    )
     _write_bounded_json(
         accepted_destination,
         {
@@ -2823,6 +2931,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     evidence_sensitive_values = (
         _all_catalog_sensitive_values(catalog) + reduction_values
     )
+    reduction_path_matcher = _secret_reduction_path_matcher(reduction_values)
     reduced_secret_values = frozenset(
         descriptor.value
         for descriptor in reduction_values
@@ -2882,27 +2991,56 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
                 ),
             )
 
-    changed_paths_file = review.workspace_root / ".codex-review/changed-paths.z"
+    changed_path_digests_file = (
+        review.workspace_root / ".codex-review" / CHANGED_PATH_DIGESTS_NAME
+    )
+    private_changed_paths_file = review.container_dir / PRIVATE_CHANGED_PATHS_NAME
     changed_path_count = 0
-    changed_path_artifact = control_artifacts["changed-paths.z"]
-    with _secure_file_reader(
-        changed_paths_file,
-        label="external review changed paths",
-        max_bytes=MAX_CHANGED_METADATA_BYTES,
-        expected_artifact=changed_path_artifact,
-    ) as (handle, _metadata):
-        for raw_path in _iter_nul_records(
-            handle,
+    changed_path_artifact = control_artifacts[CHANGED_PATH_DIGESTS_NAME]
+    with (
+        _secure_file_reader(
+            changed_path_digests_file,
+            label="external review changed path digests",
+            max_bytes=MAX_CHANGED_METADATA_BYTES,
+            expected_artifact=changed_path_artifact,
+        ) as (digest_handle, _digest_metadata),
+        _secure_file_reader(
+            private_changed_paths_file,
+            label="helper-private frozen changed paths",
+            max_bytes=MAX_CHANGED_METADATA_BYTES,
+        ) as (path_handle, _path_metadata),
+    ):
+        digest_records = _iter_nul_records(
+            digest_handle,
             byte_limit=MAX_CHANGED_METADATA_BYTES,
             record_limit=MAX_CHANGED_ENTRIES,
-            label="external review changed paths",
+            label="external review changed path digests",
+        )
+        for raw_path in _iter_nul_records(
+            path_handle,
+            byte_limit=MAX_CHANGED_METADATA_BYTES,
+            record_limit=MAX_CHANGED_ENTRIES,
+            label="helper-private frozen changed paths",
         ):
             changed_path_count += 1
+            expected_digest = hashlib.sha256(raw_path).hexdigest().encode("ascii")
+            if next(digest_records, None) != expected_digest:
+                raise ReviewError(
+                    "external review changed path digests do not match "
+                    "helper-private changed paths"
+                )
             legacy_path_token_id = catalog_legacy_path_matcher.match(raw_path)
+            reduction_path_token_id = reduction_path_matcher.match(raw_path)
             if legacy_path_token_id is not None:
                 record_finding(
                     "<redacted changed path> "
                     "(legacy-synthetic-value; changed-path-name)"
+                )
+                continue
+            if reduction_path_token_id is not None:
+                record_finding(
+                    "<redacted changed path> "
+                    "(secret-reduction-value; changed-path-name)"
                 )
                 continue
             path_secret_rule = _value_secret_rule(
@@ -2919,6 +3057,11 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
             if path_rule:
                 path_display = _redact_secret_path(changed_path, "changed path")
                 record_finding(f"{path_display} ({path_rule}; changed-path)")
+        if next(digest_records, None) is not None:
+            raise ReviewError(
+                "external review changed path digests do not match "
+                "helper-private changed paths"
+            )
     if changed_path_count != changed_path_artifact.record_count:
         raise ReviewError(
             "external review changed paths do not match helper-private record state"
@@ -2944,25 +3087,23 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
         )
         for raw_side in records:
             try:
-                raw_path = next(records)
+                raw_path_digest = next(records)
                 raw_rule = next(records)
                 side = raw_side.decode("ascii")
+                path_digest = raw_path_digest.decode("ascii")
                 rule = raw_rule.decode("ascii")
             except (StopIteration, UnicodeDecodeError) as error:
                 raise ReviewError(
                     "external review changed-blob findings are malformed"
                 ) from error
-            changed_blob_record_count += 3
-            legacy_path_token_id = catalog_legacy_path_matcher.match(raw_path)
-            path_display = (
-                "<redacted changed blob path>"
-                if legacy_path_token_id is not None
-                else _redact_secret_path(
-                    os.fsdecode(raw_path),
-                    "changed blob path",
+            if re.fullmatch(r"[0-9a-f]{64}", path_digest) is None:
+                raise ReviewError(
+                    "external review changed-blob findings are malformed"
                 )
+            changed_blob_record_count += 3
+            record_finding(
+                f"<redacted changed blob path> ({rule}; {side}-blob)"
             )
-            record_finding(f"{path_display} ({rule}; {side}-blob)")
     if changed_blob_record_count != changed_blob_artifact.record_count:
         raise ReviewError(
             "external review changed-blob findings do not match "
@@ -2979,9 +3120,14 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
         relative = relative_path.as_posix()
         raw_relative = os.fsencode(relative)
         legacy_path_token_id = catalog_legacy_path_matcher.match(raw_relative)
+        reduction_path_token_id = reduction_path_matcher.match(raw_relative)
         if legacy_path_token_id is not None:
             record_finding(
                 "<redacted snapshot path> (legacy-synthetic-value; path-name)"
+            )
+        if reduction_path_token_id is not None:
+            record_finding(
+                "<redacted snapshot path> (secret-reduction-value; path-name)"
             )
         path_secret_rule = _value_secret_rule(
             raw_relative,
@@ -2992,6 +3138,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
         path_display = (
             "<redacted snapshot path>"
             if legacy_path_token_id is not None
+            or reduction_path_token_id is not None
             else _redact_secret_path(relative, "snapshot path")
         )
         path_rule = _sensitive_path_rule(relative)
@@ -3871,7 +4018,7 @@ def _quoted_assignment_may_accept(
     def at_proven_end() -> bool:
         if cursor != len(value):
             return False
-        if diff_surface and crossed_line_boundary and not suffix_context_complete:
+        if not suffix_context_complete:
             raise _IncompleteSecretScanSuffix
         return True
 
@@ -4207,6 +4354,38 @@ def _provider_candidate_is_prefix_only(rule: str, candidate: bytes) -> bool:
     return actual_prefix is not None and len(candidate) - len(actual_prefix) == 513
 
 
+def _find_unescaped_delimiter(
+    value: bytes,
+    *,
+    delimiter: bytes,
+    start: int,
+    diff_side: int | None = None,
+) -> int | None:
+    search_start = start
+    while True:
+        delimiter_start = value.find(delimiter, search_start)
+        if delimiter_start < 0:
+            return None
+        if diff_side is not None:
+            line_start = (
+                max(
+                    value.rfind(b"\n", 0, delimiter_start),
+                    value.rfind(b"\r", 0, delimiter_start),
+                )
+                + 1
+            )
+            record_prefix = value[line_start : line_start + 1]
+            if record_prefix not in (b" ", bytes((diff_side,))):
+                search_start = delimiter_start + 1
+                continue
+        backslash_start = delimiter_start
+        while backslash_start > start and value[backslash_start - 1] == 0x5C:
+            backslash_start -= 1
+        if (delimiter_start - backslash_start) % 2 == 0:
+            return delimiter_start
+        search_start = delimiter_start + 1
+
+
 def _oversized_assignment_is_exact_specific_candidate(
     value: bytes,
     *,
@@ -4406,6 +4585,53 @@ def _iter_secret_events(
                 None,
                 None,
             )
+    specific_ranges = sorted(
+        {
+            (start, candidate_end)
+            for start, candidate_end, _candidate in (_specific_spans or ())
+        }
+    )
+
+    def contains_specific_candidate(start: int, candidate_end: int) -> bool:
+        index = bisect_left(specific_ranges, (start, -1))
+        while (
+            index < len(specific_ranges)
+            and specific_ranges[index][0] < candidate_end
+        ):
+            _specific_start, specific_end = specific_ranges[index]
+            if specific_end <= candidate_end:
+                return True
+            index += 1
+        return False
+
+    quoted_assignment_acceptance: dict[tuple[int, int], bool] = {}
+    for match in QUOTED_SECRET_ASSIGNMENT_PREFIX.finditer(value):
+        start, candidate_end = match.span(2)
+        if not contains_specific_candidate(start, candidate_end):
+            continue
+        if value[candidate_end : candidate_end + 1] == match.group(1):
+            continue
+        if not match_is_committable(match):
+            continue
+        event_budget.consume()
+        if candidate_end == len(value) and not suffix_context_complete:
+            yield (
+                _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE,
+                None,
+                match.end(),
+                False,
+                match.start(),
+                None,
+            )
+            continue
+        yield (
+            "generic-secret-assignment",
+            match.group(2),
+            match.end(),
+            False,
+            start,
+            candidate_end,
+        )
     for match in QUOTED_SECRET_ASSIGNMENT.finditer(value):
         if not match_is_committable(match):
             continue
@@ -4431,6 +4657,7 @@ def _iter_secret_events(
                 None,
             )
             continue
+        quoted_assignment_acceptance[(match.start(), match.end())] = may_accept
         if not may_accept or not _is_placeholder_secret(candidate.lower()):
             start, candidate_end = match.span(2)
             yield (
@@ -4441,6 +4668,438 @@ def _iter_secret_events(
                 start,
                 candidate_end,
             )
+    literal_prefixes = (b"br", b"rb", b"fr", b"rf", b"b", b"f", b"r", b"u")
+    continuation_operators = frozenset(b"+-*/%&|^!=<>?:,.`")
+    for assignment_match in SECRET_ASSIGNMENT_PREFIX.finditer(value):
+        assignment_line_start = (
+            max(
+                value.rfind(b"\n", 0, assignment_match.start()),
+                value.rfind(b"\r", 0, assignment_match.start()),
+            )
+            + 1
+        )
+        assignment_diff_side: int | None = None
+        if (
+            diff_surface
+            and assignment_line_start < len(value)
+            and value[assignment_line_start] in (0x2B, 0x2D)
+            and not value.startswith(
+                (b"+++ ", b"--- "),
+                assignment_line_start,
+            )
+        ):
+            assignment_diff_side = value[assignment_line_start]
+        cursor = assignment_match.end()
+        wrapper_prefix = False
+        wrapper_depth = 0
+        pending_expression_continuation = False
+        while cursor < len(value):
+            lowered_prefix = value[cursor : cursor + 3].lower()
+            backtick_suffix = cursor + 1
+            while backtick_suffix < len(value) and value[backtick_suffix] in (
+                0x09,
+                0x20,
+            ):
+                backtick_suffix += 1
+            backtick_continuation = (
+                value[cursor] == 0x60
+                and backtick_suffix < len(value)
+                and value[backtick_suffix] in (0x0A, 0x0D)
+            )
+            if (
+                value[cursor] in (0x22, 0x27)
+                or (value[cursor] == 0x60 and not backtick_continuation)
+                or any(
+                lowered_prefix.startswith(prefix)
+                and value[cursor + len(prefix) : cursor + len(prefix) + 1]
+                in (b"'", b'"')
+                for prefix in literal_prefixes
+                )
+            ):
+                break
+            if value[cursor] in (0x09, 0x20):
+                cursor += 1
+                continue
+            if value[cursor] in (0x28, 0x5B, 0x7B):
+                wrapper_prefix = True
+                wrapper_depth += 1
+                pending_expression_continuation = False
+                cursor += 1
+                continue
+            if value[cursor] in (0x29, 0x5D, 0x7D) and wrapper_depth:
+                wrapper_depth -= 1
+                pending_expression_continuation = False
+                cursor += 1
+                continue
+            if value.startswith(b"/*", cursor):
+                wrapper_prefix = True
+                comment_end = value.find(b"*/", cursor + 2)
+                if comment_end < 0:
+                    cursor = len(value)
+                    continue
+                cursor = comment_end + 2
+                continue
+            if value.startswith(b"//", cursor):
+                previous = cursor - 1
+                while previous >= assignment_match.end() and value[previous] in (
+                    0x09,
+                    0x20,
+                ):
+                    previous -= 1
+                pending_expression_continuation = (
+                    pending_expression_continuation
+                    or wrapper_depth > 0
+                    or (
+                        previous >= assignment_match.end()
+                        and value[previous] in continuation_operators
+                    )
+                )
+                line_end_candidates = tuple(
+                    boundary
+                    for boundary in (
+                        value.find(b"\n", cursor),
+                        value.find(b"\r", cursor),
+                    )
+                    if boundary >= 0
+                )
+                cursor = min(line_end_candidates, default=len(value))
+                continue
+            if value[cursor] in (0x0A, 0x0D):
+                previous = cursor - 1
+                while previous >= assignment_match.end() and value[previous] in (
+                    0x09,
+                    0x20,
+                ):
+                    previous -= 1
+                next_cursor = cursor + (
+                    2 if value.startswith(b"\r\n", cursor) else 1
+                )
+                if (
+                    diff_surface
+                    and next_cursor < len(value)
+                    and value[next_cursor] in (0x20, 0x2B, 0x2D)
+                ):
+                    next_cursor += 1
+                while next_cursor < len(value) and value[next_cursor] in (
+                    0x09,
+                    0x20,
+                ):
+                    next_cursor += 1
+                previous_continues = (
+                    previous >= assignment_match.end()
+                    and (
+                        value[previous] == 0x5C
+                        or value[previous] in continuation_operators
+                    )
+                )
+                next_continues = (
+                    next_cursor < len(value)
+                    and value[next_cursor] in continuation_operators
+                )
+                line_continues = (
+                    wrapper_depth > 0
+                    or pending_expression_continuation
+                    or previous_continues
+                    or next_continues
+                )
+                if wrapper_depth == 0 and (
+                    not line_continues
+                ):
+                    break
+                pending_expression_continuation = (
+                    pending_expression_continuation
+                    or previous_continues
+                    or next_continues
+                )
+                cursor += 2 if value.startswith(b"\r\n", cursor) else 1
+                continue
+            if value[cursor] == 0x23:
+                line_end_candidates = tuple(
+                    boundary
+                    for boundary in (
+                        value.find(b"\n", cursor),
+                        value.find(b"\r", cursor),
+                    )
+                    if boundary >= 0
+                )
+                line_end = min(line_end_candidates, default=len(value))
+                if wrapper_depth == 0 and not pending_expression_continuation:
+                    cursor = line_end
+                    break
+                cursor = line_end
+                continue
+            if value[cursor] == 0x3B and wrapper_depth == 0:
+                break
+            if (
+                diff_surface
+                and cursor > 0
+                and value[cursor - 1] in (0x0A, 0x0D)
+                and value[cursor] in (0x2B, 0x2D)
+            ):
+                cursor += 1
+                continue
+            wrapper_prefix = True
+            pending_expression_continuation = (
+                value[cursor] in continuation_operators
+            )
+            cursor += 1
+        lowered_suffix = value[cursor : cursor + 3].lower()
+        for prefix in literal_prefixes:
+            if lowered_suffix.startswith(prefix) and value[
+                cursor + len(prefix) : cursor + len(prefix) + 1
+            ] in (b"'", b'"'):
+                cursor += len(prefix)
+                break
+        quote = value[cursor : cursor + 1]
+        if quote not in (b"'", b'"', b"`"):
+            direct_unquoted_match = UNQUOTED_SECRET_ASSIGNMENT.match(
+                value,
+                assignment_match.start(),
+            )
+            if direct_unquoted_match is not None:
+                continue
+            range_index = bisect_left(
+                specific_ranges,
+                (assignment_match.end(), -1),
+            )
+            rhs_specific_ranges: list[tuple[int, int]] = []
+            while (
+                range_index < len(specific_ranges)
+                and specific_ranges[range_index][0] < cursor
+            ):
+                specific_start, candidate_end = specific_ranges[range_index]
+                if candidate_end <= cursor:
+                    rhs_specific_ranges.append((specific_start, candidate_end))
+                range_index += 1
+            if rhs_specific_ranges:
+                specific_start, specific_end = rhs_specific_ranges[0]
+                wrapper_prefix_bytes = value[
+                    assignment_match.end() : specific_start
+                ]
+                wrapper_suffix_bytes = value[specific_end:cursor]
+                exact_wrapped_candidate = (
+                    len(rhs_specific_ranges) == 1
+                    and all(
+                        byte in (0x09, 0x0A, 0x0D, 0x20, 0x28, 0x5B, 0x7B)
+                        for byte in wrapper_prefix_bytes
+                    )
+                    and all(
+                        byte in (0x09, 0x0A, 0x0D, 0x20, 0x29, 0x5D, 0x7D)
+                        for byte in wrapper_suffix_bytes
+                    )
+                )
+                if not exact_wrapped_candidate and end_is_committable(specific_end):
+                    event_budget.consume()
+                    yield (
+                        "generic-secret-assignment",
+                        None,
+                        specific_end,
+                        False,
+                        assignment_match.start(),
+                        None,
+                    )
+                    continue
+            proof_end = assignment_match.start() + MAX_SECRET_PREFIX_PROOF_BYTES
+            if wrapper_prefix and end_is_committable(proof_end):
+                event_budget.consume()
+                yield (
+                    "generic-secret-assignment",
+                    None,
+                    proof_end,
+                    False,
+                    assignment_match.start(),
+                    None,
+                )
+            elif (
+                wrapper_prefix
+                and not suffix_context_complete
+                and end_is_committable(assignment_match.end())
+            ):
+                event_budget.consume()
+                yield (
+                    _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE,
+                    None,
+                    assignment_match.end(),
+                    False,
+                    assignment_match.start(),
+                    None,
+                )
+            continue
+        delimiter = quote * (
+            3 if quote != b"`" and value.startswith(quote * 3, cursor) else 1
+        )
+        content_start = cursor + len(delimiter)
+        closing_start = _find_unescaped_delimiter(
+            value,
+            delimiter=delimiter,
+            start=content_start,
+            diff_side=assignment_diff_side,
+        )
+        closing_end = (
+            None if closing_start is None else closing_start + len(delimiter)
+        )
+        proof_end = assignment_match.start() + MAX_SECRET_PREFIX_PROOF_BYTES
+        if closing_start is None:
+            if end_is_committable(proof_end):
+                event_budget.consume()
+                yield (
+                    "generic-secret-assignment",
+                    None,
+                    proof_end,
+                    False,
+                    assignment_match.start(),
+                    None,
+                )
+                continue
+            range_index = bisect_left(specific_ranges, (content_start, -1))
+            specific_end = (
+                specific_ranges[range_index][1]
+                if range_index < len(specific_ranges)
+                else None
+            )
+            if not suffix_context_complete and end_is_committable(content_start):
+                event_budget.consume()
+                yield (
+                    _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE,
+                    None,
+                    content_start,
+                    False,
+                    assignment_match.start(),
+                    None,
+                )
+                continue
+            if specific_end is None or not end_is_committable(specific_end):
+                continue
+            event_budget.consume()
+            yield (
+                "generic-secret-assignment",
+                None,
+                specific_end,
+                False,
+                assignment_match.start(),
+                None,
+            )
+            continue
+
+        if closing_end is None:
+            raise ReviewError("sensitive scanner lost a quoted delimiter boundary")
+        if not end_is_committable(closing_end):
+            if end_is_committable(proof_end):
+                event_budget.consume()
+                yield (
+                    "generic-secret-assignment",
+                    None,
+                    proof_end,
+                    False,
+                    assignment_match.start(),
+                    None,
+                )
+                continue
+            if end_is_committable(content_start):
+                event_budget.consume()
+                yield (
+                    _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE,
+                    None,
+                    content_start,
+                    False,
+                    assignment_match.start(),
+                    None,
+                )
+            continue
+
+        assignment_key = (assignment_match.start(), closing_end)
+        assignment_incomplete = False
+        if assignment_key in quoted_assignment_acceptance:
+            assignment_complete = quoted_assignment_acceptance[assignment_key]
+        else:
+            try:
+                assignment_complete = _quoted_assignment_may_accept(
+                    value,
+                    assignment_start=assignment_match.start(),
+                    assignment_end=closing_end,
+                    diff_surface=diff_surface,
+                    prefix_context_complete=prefix_context_complete,
+                    suffix_context_complete=suffix_context_complete,
+                    event_budget=event_budget,
+                )
+            except _IncompleteSecretScanSuffix:
+                assignment_complete = False
+                assignment_incomplete = True
+
+        relevant_end = closing_start if assignment_complete else len(value)
+        range_index = bisect_left(specific_ranges, (content_start, -1))
+        relevant_ranges: list[tuple[int, int]] = []
+        while (
+            range_index < len(specific_ranges)
+            and specific_ranges[range_index][0] < relevant_end
+        ):
+            specific_start, candidate_end = specific_ranges[range_index]
+            if candidate_end <= relevant_end:
+                relevant_ranges.append((specific_start, candidate_end))
+            range_index += 1
+        if not relevant_ranges:
+            if (
+                not assignment_complete
+                and not suffix_context_complete
+                and end_is_committable(content_start)
+            ):
+                event_budget.consume()
+                yield (
+                    _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE,
+                    None,
+                    closing_end,
+                    False,
+                    assignment_match.start(),
+                    None,
+                )
+            continue
+
+        exact_specific_candidate = (
+            assignment_complete
+            and all(
+                specific_start == content_start
+                and candidate_end == closing_start
+                for specific_start, candidate_end in relevant_ranges
+            )
+        )
+        if exact_specific_candidate:
+            continue
+        if assignment_incomplete and all(
+            specific_start == content_start and candidate_end == closing_start
+            for specific_start, candidate_end in relevant_ranges
+        ):
+            event_budget.consume()
+            yield (
+                _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE,
+                None,
+                closing_end,
+                False,
+                assignment_match.start(),
+                None,
+            )
+            continue
+        specific_end = relevant_ranges[0][1]
+        if not end_is_committable(specific_end):
+            if end_is_committable(content_start):
+                event_budget.consume()
+                yield (
+                    _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE,
+                    None,
+                    content_start,
+                    False,
+                    assignment_match.start(),
+                    None,
+                )
+            continue
+        event_budget.consume()
+        yield (
+            "generic-secret-assignment",
+            None,
+            specific_end,
+            False,
+            assignment_match.start(),
+            None,
+        )
     for match in UNQUOTED_SECRET_ASSIGNMENT.finditer(value):
         if not match_is_committable(match):
             continue
@@ -4462,16 +5121,16 @@ def _iter_secret_events(
                 allow_inline_hash_comment=True,
             )
         start, candidate_end = match.span(1)
-        exact_specific_candidate = _specific_spans is not None and (
-            start,
-            candidate_end,
-            candidate,
-        ) in _specific_spans
+        contains_specific = contains_specific_candidate(start, candidate_end)
+        has_strong_secret_key = STRONG_SECRET_KEY_NAME_PATTERN.search(
+            value[match.start() : start]
+        ) is not None
         if (
             not placeholder
             and (
                 _looks_like_unquoted_secret(candidate)
-                or exact_specific_candidate
+                or contains_specific
+                or has_strong_secret_key
             )
         ) or (placeholder and not may_accept):
             yield (
@@ -5250,6 +5909,12 @@ def prepare_workspace(
             catalog=catalog,
             exemptions=selected_exemptions,
         )
+        _reject_secret_reduction_values_in_frozen_tree_paths(
+            git_view=git_view,
+            object_directory=object_directory,
+            commit=head_sha,
+            reduction_values=secret_reductions,
+        )
         manifest_sensitive_values = evidence_sensitive_values + secret_reductions
         _write_bounded_json(
             control_dir / SYNTHETIC_MANIFEST_NAME,
@@ -5263,13 +5928,15 @@ def prepare_workspace(
             label="synthetic secret helper-private state",
             accepted_values=evidence_sensitive_values,
         )
-        changed_paths_file = control_dir / "changed-paths.z"
+        changed_path_digests_file = control_dir / CHANGED_PATH_DIGESTS_NAME
         _write_frozen_changed_paths(
             git_view=git_view,
             object_directory=object_directory,
             base_sha=base_sha,
             head_sha=head_sha,
-            destination=changed_paths_file,
+            destination=changed_path_digests_file,
+            private_destination=container / PRIVATE_CHANGED_PATHS_NAME,
+            evidence_sensitive_values=manifest_sensitive_values,
         )
         changed_blob_findings = control_dir / "changed-blob-findings.z"
         _write_changed_blob_findings(
@@ -5280,7 +5947,7 @@ def prepare_workspace(
             destination=changed_blob_findings,
             accepted_destination=control_dir / SYNTHETIC_CHANGED_EVIDENCE_NAME,
             accepted_values=accepted_values,
-            evidence_sensitive_values=evidence_sensitive_values,
+            evidence_sensitive_values=manifest_sensitive_values,
             reduced_secret_values=frozenset(
                 descriptor.value
                 for descriptor in secret_reductions
@@ -5320,7 +5987,7 @@ def prepare_workspace(
             container / CONTROL_ARTIFACT_STATE_NAME,
             control_artifact_state,
             label="helper-private review control state",
-            accepted_values=evidence_sensitive_values,
+            accepted_values=manifest_sensitive_values,
         )
         review = ReviewWorkspace(
             source_root=source_root,
@@ -5379,7 +6046,12 @@ def cleanup_workspace(review: ReviewWorkspace, *, keep_container: bool) -> str |
     try:
         if review.workspace_root.exists():
             shutil.rmtree(review.workspace_root)
-        if not keep_container:
+        if keep_container:
+            try:
+                (review.container_dir / PRIVATE_CHANGED_PATHS_NAME).unlink()
+            except FileNotFoundError:
+                pass
+        else:
             shutil.rmtree(review.container_dir)
     except OSError as error:
         return str(error)

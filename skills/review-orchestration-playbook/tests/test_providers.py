@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import itertools
 import json
 import os
@@ -88,7 +89,8 @@ class ProviderPolicyTest(unittest.TestCase):
         control.mkdir(mode=0o700)
         diff_file = control / "review.diff"
         diff_file.write_text("diff --git a/a b/a\n", encoding="utf-8")
-        (control / "changed-paths.z").write_bytes(b"")
+        (control / workspace_runtime.CHANGED_PATH_DIGESTS_NAME).write_bytes(b"")
+        (container / workspace_runtime.PRIVATE_CHANGED_PATHS_NAME).write_bytes(b"")
         (control / "changed-blob-findings.z").write_bytes(b"")
         catalog = workspace_runtime.load_catalog()
         base_ref = "a" * 40
@@ -5471,9 +5473,15 @@ class ProviderPolicyTest(unittest.TestCase):
         self,
         resolve: mock.Mock,
     ) -> None:
-        (self.review.workspace_root / ".codex-review/changed-paths.z").write_bytes(
-            b"config/.env.production\0"
-        )
+        raw_path = b"config/.env.production"
+        (
+            self.review.workspace_root
+            / ".codex-review"
+            / workspace_runtime.CHANGED_PATH_DIGESTS_NAME
+        ).write_bytes(hashlib.sha256(raw_path).hexdigest().encode("ascii") + b"\0")
+        (
+            self.review.container_dir / workspace_runtime.PRIVATE_CHANGED_PATHS_NAME
+        ).write_bytes(raw_path + b"\0")
         self._refresh_control_artifact_state()
         outcome = providers.run_review(
             review=self.review,

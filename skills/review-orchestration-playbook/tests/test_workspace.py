@@ -310,6 +310,7 @@ class WorkspaceTest(unittest.TestCase):
                 for name in (
                     workspace_runtime.SYNTHETIC_PRIVATE_MANIFEST_NAME,
                     workspace_runtime.CONTROL_ARTIFACT_STATE_NAME,
+                    workspace_runtime.PRIVATE_CHANGED_PATHS_NAME,
                 ):
                     self.assertEqual(
                         (review.container_dir / name).stat().st_mode & 0o777,
@@ -329,7 +330,11 @@ class WorkspaceTest(unittest.TestCase):
             head_ref=self.head,
         )
         self.reviews.append(review)
-        changed_paths = review.workspace_root / ".codex-review/changed-paths.z"
+        changed_paths = (
+            review.workspace_root
+            / ".codex-review"
+            / workspace_runtime.CHANGED_PATH_DIGESTS_NAME
+        )
         changed_paths.chmod(0o660)
 
         with self.assertRaisesRegex(ReviewError, "group or other writable"):
@@ -472,7 +477,7 @@ class WorkspaceTest(unittest.TestCase):
         self.assertIn("\\udcff", diagnostic)
         diagnostic.encode("utf-8")
 
-    def test_aws_secret_key_matches_nonword_terminal_characters(self) -> None:
+    def test_aws_secret_key_rejects_extended_terminal_values(self) -> None:
         for terminal in b"/+=":
             with self.subTest(terminal=chr(terminal)):
                 value = b"A" * 39 + bytes([terminal])
@@ -480,8 +485,9 @@ class WorkspaceTest(unittest.TestCase):
                     _value_secret_rule(b"aws_secret_access_key=" + value),
                     "aws-secret-key",
                 )
-                self.assertIsNone(
-                    _value_secret_rule(b"aws_secret_access_key=" + value + b"A")
+                self.assertEqual(
+                    _value_secret_rule(b"aws_secret_access_key=" + value + b"A"),
+                    "generic-secret-assignment",
                 )
 
     def test_pgp_private_key_marker_is_rejected(self) -> None:
@@ -684,6 +690,7 @@ class WorkspaceTest(unittest.TestCase):
     def test_snapshot_rejects_oversized_changed_blob_metadata(self) -> None:
         def write_empty_changed_paths(**kwargs) -> None:
             kwargs["destination"].touch()
+            kwargs["private_destination"].touch()
 
         with (
             mock.patch.object(
@@ -707,6 +714,7 @@ class WorkspaceTest(unittest.TestCase):
     def test_snapshot_rejects_excessive_changed_blob_entries(self) -> None:
         def write_empty_changed_paths(**kwargs) -> None:
             kwargs["destination"].touch()
+            kwargs["private_destination"].touch()
 
         with (
             mock.patch.object(
