@@ -16455,6 +16455,90 @@ class ProviderPolicyTest(unittest.TestCase):
         "_resolve_validated_claude_executable",
         return_value=(pathlib.Path("/bin/claude"), {}),
     )
+    @mock.patch.object(
+        providers,
+        "resolve_reviewer_executable",
+        return_value=pathlib.Path("/bin/copilot"),
+    )
+    @mock.patch.object(providers, "_copilot_attempt")
+    @mock.patch.object(providers, "_claude_attempt")
+    def test_auth_rejection_preserves_recovery_carrier_diagnostic(
+        self,
+        claude_attempt: mock.Mock,
+        copilot_attempt: mock.Mock,
+        resolve: mock.Mock,
+        _resolve_claude: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        carrier = (
+            self.review.container_dir
+            / "claude-runtime"
+            / "linux"
+            / "claude-carrier-auth-rejection"
+        )
+        carrier.mkdir(parents=True, mode=0o700)
+        auth_error = providers.ClaudeKeychainCredentialUnavailable(
+            "the restricted runtime rejected the rotated credential"
+        )
+        setattr(
+            auth_error,
+            "_codex_claude_refresh_persistence_failed",
+            True,
+        )
+        setattr(
+            auth_error,
+            "_codex_claude_retained_credential_carrier",
+            str(carrier),
+        )
+        setattr(
+            auth_error,
+            "_codex_claude_persistence_attempt",
+            self.attempt(
+                "claude",
+                providers.CLAUDE_MODELS[0],
+                "auth",
+            ),
+        )
+        claude_attempt.side_effect = auth_error
+        providers.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {
+                "phase": "runtime-launching",
+                "authentication": {"status": "sandbox-auth-staged"},
+            },
+        )
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
+
+        self.assertEqual(outcome.returncode, 2)
+        copilot_attempt.assert_not_called()
+        resolve.assert_not_called()
+        runner_error = (self.review.container_dir / "runner-error.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("claude auth login", runner_error)
+        self.assertIn(providers.CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC, runner_error)
+        self.assertIn(str(carrier), runner_error)
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
+        self.assertEqual(
+            report["authentication"]["recovery_carrier"],
+            str(carrier),
+        )
+        self.assertEqual(
+            report["authentication"]["refresh_persistence"],
+            "failed-after-attempt",
+        )
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        return_value=(pathlib.Path("/bin/claude"), {}),
+    )
     @mock.patch.object(providers, "_copilot_attempt")
     @mock.patch.object(providers, "_claude_attempt")
     def test_credential_io_race_is_inconclusive_without_copilot_fallback(
@@ -18629,6 +18713,116 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIsInstance(attempt, providers.Attempt)
         self.assertEqual(attempt.category, "auth")
         self.assertEqual(attempt.returncode, 1)
+
+    def test_claude_linux_report_error_preserves_recovery_carrier(
+        self,
+    ) -> None:
+        executable = pathlib.Path("/verified/claude")
+        completed = Completed(
+            argv=("sandbox",),
+            returncode=0,
+            stdout=b"",
+            stderr=b"",
+        )
+        carrier = (
+            self.review.container_dir
+            / "claude-runtime"
+            / "linux"
+            / "claude-carrier-report-error"
+        )
+        carrier.mkdir(parents=True, mode=0o700)
+        inspection_error = providers.LinuxCredentialInspectionInconclusive(
+            "final credential snapshot unavailable"
+        )
+        setattr(
+            inspection_error,
+            "_codex_claude_refresh_persistence_failed",
+            True,
+        )
+        setattr(
+            inspection_error,
+            "_codex_claude_retained_credential_carrier",
+            str(carrier),
+        )
+        report_error = OSError("runtime report write failed")
+        original_update = providers._update_claude_runtime_report
+
+        def run_after_spawn(*_args: object, **kwargs: object) -> Completed:
+            on_process_started = kwargs.get("on_process_started")
+            assert callable(on_process_started)
+            on_process_started()
+            return completed
+
+        @contextlib.contextmanager
+        def failing_runtime():
+            yield mock.Mock(argv=("sandbox",), env={})
+            raise inspection_error
+
+        def fail_inconclusive_report(
+            review: ReviewWorkspace,
+            report: dict[str, object],
+        ) -> None:
+            if report.get("phase") == "authentication-inspection-inconclusive":
+                raise report_error
+            original_update(review, report)
+
+        providers.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {
+                "phase": "publisher-and-capabilities-verified",
+                "authentication": {"status": "pending"},
+            },
+        )
+        with (
+            mock.patch.object(providers, "_is_claude_linux_host", return_value=True),
+            mock.patch.object(
+                providers,
+                "_with_claude_review_tool_path",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_prepare_claude_tls_environment",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_linux_review_runtime",
+                return_value=failing_runtime(),
+            ),
+            mock.patch.object(
+                providers,
+                "_update_claude_runtime_report",
+                side_effect=fail_inconclusive_report,
+            ),
+            mock.patch.object(
+                providers,
+                "run",
+                side_effect=run_after_spawn,
+            ),
+            self.assertRaises(
+                providers.ClaudeCredentialInspectionInconclusive
+            ) as raised,
+        ):
+            providers._claude_attempt(
+                review=self.review,
+                model=providers.CLAUDE_MODELS[0],
+                index=1,
+                env={},
+                executable=executable,
+                refresh_lock_protocol=self.claude_refresh_lock_protocol,
+            )
+
+        self.assertIs(raised.exception.__cause__, report_error)
+        self.assertIn(str(carrier), str(raised.exception))
+        self.assertEqual(
+            getattr(
+                raised.exception,
+                "_codex_claude_retained_credential_carrier",
+                None,
+            ),
+            str(carrier),
+        )
 
     def test_claude_linux_supervision_failure_does_not_claim_writer_quiescence(
         self,

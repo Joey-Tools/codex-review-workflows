@@ -11867,7 +11867,7 @@ def _claude_attempt(
                 finally:
                     restore_signal_mask(quiescence_mask)
         except LinuxCredentialInspectionInconclusive as error:
-            _update_claude_runtime_report(
+            _update_claude_runtime_report_preserving_persistence(
                 review,
                 {
                     "phase": "authentication-inspection-inconclusive",
@@ -11913,6 +11913,7 @@ def _claude_attempt(
                         else None
                     ),
                 },
+                error,
             )
             if completed is not None:
                 authentication_error = (
@@ -12798,7 +12799,17 @@ def run_review(
             )
             if isinstance(persistence_attempt, Attempt):
                 attempts.append(persistence_attempt)
-            return _finish_claude_auth_required(review, attempts, str(error))
+            persistence_diagnostic = _record_claude_secondary_persistence_failure(
+                review,
+                error,
+            )
+            detail = str(error)
+            if persistence_diagnostic is not None:
+                detail = (
+                    f"{detail.rstrip('.')}; "
+                    f"{persistence_diagnostic.rstrip('.')}"
+                )
+            return _finish_claude_auth_required(review, attempts, detail)
         except (
             ClaudeKeychainBrokerUnavailable,
             ClaudeReviewToolUnavailable,

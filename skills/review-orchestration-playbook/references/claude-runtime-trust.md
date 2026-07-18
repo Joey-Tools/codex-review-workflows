@@ -1003,7 +1003,11 @@ reached:
    unsafe broker is blocked. When
    refresh persistence leaves a private carrier for operator recovery,
    `authentication.recovery_carrier` records only that path and never the
-   credential payload.
+   credential payload. A simultaneous final-runtime authentication rejection
+   remains the primary `blocked-authentication` classification, but both the
+   runtime report and operator-facing error retain the verified recovery
+   diagnostic. If writing that report fails, the replacement error inherits the
+   same validated recovery metadata instead of obscuring the carrier.
 4. Platform preparation: Linux/WSL2 reports `runtime-ready` only after the
    current attempt's credential staging and real isolation probe, with
    `outer_sandbox.status: isolation-probe-verified` and
