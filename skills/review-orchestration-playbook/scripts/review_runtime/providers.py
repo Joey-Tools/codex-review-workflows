@@ -3925,6 +3925,18 @@ def _propagate_claude_persistence_state(
     _attach_claude_persistence_signal_detail(target, diagnostic)
 
 
+def _claude_macos_runtime_io_inconclusive(
+    review: ReviewWorkspace,
+    error: OSError,
+) -> ClaudeCredentialInspectionInconclusive:
+    failure = ClaudeCredentialInspectionInconclusive(
+        "Claude macOS credential runtime I/O was inconclusive"
+    )
+    _propagate_claude_persistence_state(review, error, failure)
+    failure.__cause__ = error
+    return failure
+
+
 def _update_claude_runtime_report_preserving_persistence(
     review: ReviewWorkspace,
     report: dict[str, object],
@@ -7043,12 +7055,7 @@ def _claude_keychain_runtime(
             selected.payload[:] = b"\x00" * len(selected.payload)
         if persistence_error is not None:
             if primary_error is not None:
-                if persistence_error is primary_error:
-                    _record_claude_secondary_persistence_failure(
-                        review,
-                        primary_error,
-                    )
-                elif (
+                if (
                     not _is_claude_control_flow_error(primary_error)
                     and _is_claude_control_flow_error(persistence_error)
                 ):
@@ -7061,6 +7068,29 @@ def _claude_keychain_runtime(
                         persistence_error,
                     )
                     raise persistence_error
+                if isinstance(primary_error, OSError):
+                    active_io_error = primary_error
+                    normalized_primary = (
+                        _claude_macos_runtime_io_inconclusive(
+                            review,
+                            active_io_error,
+                        )
+                    )
+                    if persistence_error is not active_io_error:
+                        _add_claude_persistence_note(
+                            normalized_primary,
+                            persistence_error,
+                        )
+                    _record_claude_secondary_persistence_failure(
+                        review,
+                        normalized_primary,
+                    )
+                    raise normalized_primary
+                if persistence_error is primary_error:
+                    _record_claude_secondary_persistence_failure(
+                        review,
+                        primary_error,
+                    )
                 else:
                     _add_claude_persistence_note(
                         primary_error,
@@ -7071,6 +7101,11 @@ def _claude_keychain_runtime(
                         primary_error,
                     )
             else:
+                if isinstance(persistence_error, OSError):
+                    persistence_error = _claude_macos_runtime_io_inconclusive(
+                        review,
+                        persistence_error,
+                    )
                 _record_claude_secondary_persistence_failure(
                     review,
                     persistence_error,

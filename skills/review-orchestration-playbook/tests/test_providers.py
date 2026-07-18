@@ -5134,8 +5134,8 @@ class ProviderPolicyTest(unittest.TestCase):
                 "_persist_claude_macos_refreshed_credential",
             ) as persist,
             self.assertRaisesRegex(
-                OSError,
-                "first durable stage failure",
+                providers.ClaudeCredentialInspectionInconclusive,
+                "credential runtime I/O",
             ) as raised,
         ):
             with self.claude_keychain_runtime(
@@ -5148,6 +5148,11 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(retain.call_count, 2)
         commit.assert_not_called()
         persist.assert_not_called()
+        self.assertIsInstance(raised.exception.__cause__, OSError)
+        self.assertIn(
+            "first durable stage failure",
+            str(raised.exception.__cause__),
+        )
         for attribute in (
             "_codex_claude_retained_credential_carrier",
             "_codex_claude_retained_credential_artifact",
@@ -6631,8 +6636,8 @@ class ProviderPolicyTest(unittest.TestCase):
                 "_persist_claude_macos_refreshed_credential",
             ) as persist,
             self.assertRaisesRegex(
-                OSError,
-                "third durable generation commit failure",
+                providers.ClaudeCredentialInspectionInconclusive,
+                "credential runtime I/O",
             ) as raised,
         ):
             with self.claude_keychain_runtime(
@@ -6644,6 +6649,11 @@ class ProviderPolicyTest(unittest.TestCase):
 
         persist.assert_not_called()
         self.assertEqual(commit_calls, 3)
+        self.assertIsInstance(raised.exception.__cause__, OSError)
+        self.assertIn(
+            "third durable generation commit failure",
+            str(raised.exception.__cause__),
+        )
         latest_carrier = self.assert_macos_recovery_carrier(
             raised.exception,
             latest_bytes,
@@ -6819,6 +6829,83 @@ class ProviderPolicyTest(unittest.TestCase):
             bytes(refreshed),
         )
         persist_credential.assert_not_called()
+
+    def test_abandoned_primary_oserror_is_runtime_inconclusive(self) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        selected = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
+                keychain_digest=providers._claude_credential_digest(original),
+                file_digest=None,
+                file_snapshot=None,
+            ),
+        )
+        primary_error = OSError("injected runtime body I/O failure")
+
+        @contextlib.contextmanager
+        def broker(_credential, _capability, **_kwargs):
+            try:
+                yield 43211
+            except OSError as error:
+                setattr(
+                    error,
+                    "_codex_claude_refresh_persistence_failed",
+                    True,
+                )
+                setattr(
+                    error,
+                    (
+                        "_codex_claude_keychain_handler_"
+                        "quiescence_unproven"
+                    ),
+                    True,
+                )
+                raise
+
+        common.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {"authentication": {}, "phase": "runtime-launching"},
+        )
+        with (
+            mock.patch.object(
+                providers,
+                "_select_claude_macos_credential",
+                return_value=selected,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_credential_server",
+                side_effect=broker,
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeCredentialInspectionInconclusive,
+                "credential runtime I/O",
+            ) as raised,
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+            ):
+                raise primary_error
+
+        self.assertIs(raised.exception.__cause__, primary_error)
+        self.assertTrue(
+            getattr(
+                raised.exception,
+                "_codex_claude_refresh_persistence_failed",
+                False,
+            )
+        )
+        report = common.read_json(
+            self.review.container_dir / "claude-runtime.json"
+        )
+        self.assertEqual(
+            report["authentication"]["refresh_persistence"],
+            "failed-after-attempt",
+        )
 
     def test_unquiescent_recovery_reports_prior_durable_journal_scope(
         self,
