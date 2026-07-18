@@ -1733,6 +1733,13 @@ def _parse_oauth_credential(payload: bytearray) -> float:
         raise LinuxCredentialUnavailable("Claude local login lacks an access token")
     if not isinstance(refresh_token, str) or not refresh_token.strip():
         raise LinuxCredentialUnavailable("Claude local login lacks a refresh token")
+    try:
+        access_token.encode("utf-8")
+        refresh_token.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise LinuxCredentialUnsafe(
+            "Claude credential token encoding is malformed"
+        ) from error
     if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
         raise LinuxCredentialUnsafe("Claude credential expiry is malformed")
     expires_at_ms = float(expires_at)

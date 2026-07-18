@@ -5,6 +5,7 @@ import contextlib
 import errno
 import hashlib
 import hmac
+import importlib
 import itertools
 import json
 import math
@@ -670,6 +671,26 @@ def _create_or_validate_claude_runtime_directory(
     return path
 
 
+def _sync_claude_credential_descriptor(descriptor: int) -> None:
+    os.fsync(descriptor)
+    if not _is_claude_macos_host():
+        return
+    try:
+        darwin_fcntl = importlib.import_module("fcntl")
+    except ImportError as error:
+        raise OSError(
+            errno.ENOTSUP,
+            "Darwin F_FULLFSYNC is unavailable for Claude credential durability",
+        ) from error
+    fullfsync = getattr(darwin_fcntl, "F_FULLFSYNC", None)
+    if not isinstance(fullfsync, int):
+        raise OSError(
+            errno.ENOTSUP,
+            "Darwin F_FULLFSYNC is unavailable for Claude credential durability",
+        )
+    darwin_fcntl.fcntl(descriptor, fullfsync)
+
+
 def _fsync_claude_runtime_directory(
     path: pathlib.Path,
     *,
@@ -689,7 +710,7 @@ def _fsync_claude_runtime_directory(
                 raise ClaudeCredentialInspectionInconclusive(
                     f"the {label} is not a stable {ownership}directory"
                 )
-            os.fsync(descriptor)
+            _sync_claude_credential_descriptor(descriptor)
     except OSError as error:
         failure = ClaudeCredentialInspectionInconclusive(
             f"cannot durably synchronize the {label}"
@@ -1642,6 +1663,8 @@ def _validate_claude_local_credential(
             or not isinstance(expires_at, (int, float))
         ):
             raise ValueError("required OAuth fields are absent")
+        access_token.encode("utf-8")
+        refresh_token.encode("utf-8")
         expires_at_ms = float(expires_at)
         if not math.isfinite(expires_at_ms):
             raise ValueError("credential expiry is not finite")
@@ -2124,7 +2147,9 @@ def _write_claude_file_credential(
                         try:
                             os.fchmod(temporary_descriptor, 0o600)
                             _write_all_to_descriptor(temporary_descriptor, credential)
-                            os.fsync(temporary_descriptor)
+                            _sync_claude_credential_descriptor(
+                                temporary_descriptor
+                            )
                             temporary_metadata = os.fstat(temporary_descriptor)
                             if (
                                 not stat.S_ISREG(temporary_metadata.st_mode)
@@ -2176,7 +2201,7 @@ def _write_claude_file_credential(
                             dst_dir_fd=config_descriptor,
                         )
                         temporary_created = False
-                        os.fsync(config_descriptor)
+                        _sync_claude_credential_descriptor(config_descriptor)
                         persisted = _read_claude_credential_file_from_directory(
                             config_descriptor
                         )
@@ -2541,7 +2566,7 @@ def _retain_claude_macos_refreshed_credential(
         )
         os.fchmod(credential_descriptor, 0o600)
         _write_all_to_descriptor(credential_descriptor, credential)
-        os.fsync(credential_descriptor)
+        _sync_claude_credential_descriptor(credential_descriptor)
         descriptor_metadata = os.fstat(credential_descriptor)
         path_metadata = os.stat(
             CLAUDE_CREDENTIAL_FILE_NAME,
@@ -2560,7 +2585,7 @@ def _retain_claude_macos_refreshed_credential(
             raise ClaudeCredentialInspectionInconclusive(
                 "the private macOS Claude recovery carrier changed while it was written"
             )
-        os.fsync(config_descriptor)
+        _sync_claude_credential_descriptor(config_descriptor)
         recovered_result = _read_claude_credential_file_from_directory(
             config_descriptor
         )
@@ -2828,7 +2853,7 @@ def _commit_claude_macos_durable_stage(
             dst_dir_fd=recovery_descriptor,
         )
         renamed = True
-        os.fsync(recovery_descriptor)
+        _sync_claude_credential_descriptor(recovery_descriptor)
         acknowledged_metadata = os.stat(
             acknowledged_carrier.name,
             dir_fd=recovery_descriptor,
@@ -3029,13 +3054,13 @@ def _remove_claude_macos_recovery_carrier(
         )
         credential_removed = True
         cleanup_scope = config_dir
-        os.fsync(config_descriptor)
+        _sync_claude_credential_descriptor(config_descriptor)
         os.rmdir("config", dir_fd=carrier_descriptor)
         cleanup_scope = carrier_root
-        os.fsync(carrier_descriptor)
+        _sync_claude_credential_descriptor(carrier_descriptor)
         os.rmdir(carrier_root.name, dir_fd=recovery_descriptor)
         cleanup_scope = recovery_root
-        os.fsync(recovery_descriptor)
+        _sync_claude_credential_descriptor(recovery_descriptor)
     except BaseException as error:
         primary_error = error
     cleanup_errors: list[BaseException] = []
@@ -3505,7 +3530,7 @@ def _replace_claude_macos_recovery_credential(
         temporary_created = True
         os.fchmod(temporary_descriptor, 0o600)
         _write_all_to_descriptor(temporary_descriptor, credential)
-        os.fsync(temporary_descriptor)
+        _sync_claude_credential_descriptor(temporary_descriptor)
         temporary_metadata = os.fstat(temporary_descriptor)
         if (
             not stat.S_ISREG(temporary_metadata.st_mode)
@@ -3534,7 +3559,7 @@ def _replace_claude_macos_recovery_credential(
             dst_dir_fd=config_descriptor,
         )
         temporary_created = False
-        os.fsync(config_descriptor)
+        _sync_claude_credential_descriptor(config_descriptor)
         refreshed_result = _read_claude_credential_file_from_directory(
             config_descriptor
         )
@@ -3583,7 +3608,7 @@ def _replace_claude_macos_recovery_credential(
                 )
                 raise
         if stale_update_artifacts:
-            os.fsync(config_descriptor)
+            _sync_claude_credential_descriptor(config_descriptor)
     except BaseException as error:
         primary_error = error
         setattr(
@@ -3685,7 +3710,9 @@ def _replace_claude_macos_recovery_credential(
                     else:
                         temporary_created = False
                         try:
-                            os.fsync(config_descriptor)
+                            _sync_claude_credential_descriptor(
+                                config_descriptor
+                            )
                         except BaseException as error:
                             cleanup_errors.append(error)
         current_credential_artifact = (

@@ -4160,6 +4160,35 @@ class CredentialStagingTest(unittest.TestCase):
             self.assertEqual(source.read_bytes(), original_payload)
             self.assertEqual(list(helper.iterdir()), [])
 
+    def test_surrogate_staged_update_does_not_replace_source(self) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+            source = self._credential(
+                root / ".credentials.json",
+                expires_at_ms=(now - 60) * 1000,
+            )
+            original_payload = source.read_bytes()
+
+            with self.assertRaisesRegex(
+                claude_linux.LinuxCredentialUnsafe,
+                "staged credential update",
+            ):
+                with claude_linux.stage_claude_credentials(
+                    source,
+                    helper,
+                    now=now,
+                ) as staged:
+                    staged.credential_path.write_bytes(
+                        b'{"claudeAiOauth":{"accessToken":"a",'
+                        b'"refreshToken":"\\ud800","expiresAt":1}}'
+                    )
+
+            self.assertEqual(source.read_bytes(), original_payload)
+            self.assertEqual(list(helper.iterdir()), [])
+
     def test_expired_access_with_rotated_refresh_token_is_persisted(self) -> None:
         now = time.time()
         with tempfile.TemporaryDirectory() as temporary:
@@ -5167,6 +5196,32 @@ class CredentialStagingTest(unittest.TestCase):
             ):
                 with claude_linux.stage_claude_credentials(
                     nested,
+                    helper,
+                    now=now,
+                ):
+                    pass
+
+            self.assertEqual(list(helper.iterdir()), [])
+
+    def test_unpaired_surrogate_token_is_unsafe(self) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+            credential = root / "surrogate-token.json"
+            credential.write_bytes(
+                b'{"claudeAiOauth":{"accessToken":"a",'
+                b'"refreshToken":"\\ud800","expiresAt":1}}'
+            )
+            credential.chmod(0o600)
+
+            with self.assertRaisesRegex(
+                claude_linux.LinuxCredentialUnsafe,
+                "token encoding is malformed",
+            ):
+                with claude_linux.stage_claude_credentials(
+                    credential,
                     helper,
                     now=now,
                 ):

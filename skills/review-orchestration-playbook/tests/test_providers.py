@@ -2814,6 +2814,88 @@ class ProviderPolicyTest(unittest.TestCase):
                     source="fixture",
                 )
 
+    def test_credential_json_normalizes_unicode_failures_as_unsafe(self) -> None:
+        with self.assertRaises(providers.ClaudeCredentialUnsafe) as decoded:
+            providers._validate_claude_local_credential(
+                bytearray(b"\xff"),
+                source="fixture",
+            )
+        self.assertIsInstance(decoded.exception.__cause__, UnicodeDecodeError)
+
+        for field in ("accessToken", "refreshToken"):
+            values = {
+                "accessToken": "a",
+                "refreshToken": "r",
+            }
+            values[field] = "\\ud800"
+            payload = bytearray(
+                (
+                    '{"claudeAiOauth":{"accessToken":"'
+                    + values["accessToken"]
+                    + '","refreshToken":"'
+                    + values["refreshToken"]
+                    + '","expiresAt":1}}'
+                ).encode("ascii")
+            )
+            with self.subTest(field=field):
+                with self.assertRaises(
+                    providers.ClaudeCredentialUnsafe
+                ) as validated:
+                    providers._validate_claude_local_credential(
+                        payload,
+                        source="fixture",
+                    )
+                self.assertIsInstance(
+                    validated.exception.__cause__,
+                    UnicodeEncodeError,
+                )
+
+        surrogate_refresh = bytearray(
+            b'{"claudeAiOauth":{"accessToken":"a",'
+            b'"refreshToken":"\\ud800","expiresAt":1}}'
+        )
+        with self.assertRaises(providers.ClaudeCredentialUnsafe) as encoded:
+            providers._claude_credential_refresh_digest(surrogate_refresh)
+        self.assertIsInstance(encoded.exception.__cause__, UnicodeEncodeError)
+
+    def test_macos_credential_sync_fails_closed_without_fullfsync(self) -> None:
+        with (
+            mock.patch.object(providers.os, "fsync") as fsync,
+            mock.patch.object(
+                providers,
+                "_is_claude_macos_host",
+                return_value=True,
+            ),
+            mock.patch.object(
+                providers.importlib,
+                "import_module",
+                return_value=object(),
+            ) as import_module,
+            self.assertRaisesRegex(OSError, "F_FULLFSYNC"),
+        ):
+            providers._sync_claude_credential_descriptor(37)
+
+        fsync.assert_called_once_with(37)
+        import_module.assert_called_once_with("fcntl")
+
+    def test_non_macos_credential_sync_uses_fsync_only(self) -> None:
+        with (
+            mock.patch.object(providers.os, "fsync") as fsync,
+            mock.patch.object(
+                providers,
+                "_is_claude_macos_host",
+                return_value=False,
+            ),
+            mock.patch.object(
+                providers.importlib,
+                "import_module",
+            ) as import_module,
+        ):
+            providers._sync_claude_credential_descriptor(41)
+
+        fsync.assert_called_once_with(41)
+        import_module.assert_not_called()
+
     def test_file_refresh_writeback_is_atomic_0600_and_compare_guarded(self) -> None:
         original = oauth_credential_fixture(expires_in_seconds=60)
         credential_path = self.write_pwd_home_credential(original)
@@ -7166,7 +7248,7 @@ class ProviderPolicyTest(unittest.TestCase):
             [reported],
         )
 
-    def test_durable_stage_fsyncs_container_ancestors_before_publication(
+    def test_durable_stage_fullsyncs_container_ancestors_before_publication(
         self,
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
@@ -7188,6 +7270,7 @@ class ProviderPolicyTest(unittest.TestCase):
             file_digest=None,
             file_snapshot=None,
         )
+        recovery_root = providers._claude_macos_recovery_root(self.review)
         required_identities = {
             (
                 self.review.source_root.stat().st_dev,
@@ -7205,8 +7288,14 @@ class ProviderPolicyTest(unittest.TestCase):
                 (self.review.container_dir / "claude-runtime").stat().st_dev,
                 (self.review.container_dir / "claude-runtime").stat().st_ino,
             ),
+            (
+                recovery_root.stat().st_dev,
+                recovery_root.stat().st_ino,
+            ),
         }
         synchronized_directories: set[tuple[int, int]] = set()
+        full_synced_directories: set[tuple[int, int]] = set()
+        full_synced_regular_files = 0
         callback_results: list[bool] = []
         publication_checks = 0
         real_fsync = providers.os.fsync
@@ -7219,12 +7308,32 @@ class ProviderPolicyTest(unittest.TestCase):
                 )
             real_fsync(descriptor)
 
+        def track_fullfsync(descriptor: int, command: int) -> int:
+            nonlocal full_synced_regular_files
+            self.assertEqual(command, 51)
+            metadata = providers.os.fstat(descriptor)
+            if stat.S_ISDIR(metadata.st_mode):
+                full_synced_directories.add(
+                    (metadata.st_dev, metadata.st_ino)
+                )
+            elif stat.S_ISREG(metadata.st_mode):
+                full_synced_regular_files += 1
+            return 0
+
+        darwin_fcntl = mock.Mock()
+        darwin_fcntl.F_FULLFSYNC = 51
+        darwin_fcntl.fcntl.side_effect = track_fullfsync
+
         def commit_pending(publish: Callable[[], bool]) -> bool:
             nonlocal publication_checks
             publication_checks += 1
             self.assertTrue(
                 required_identities.issubset(synchronized_directories)
             )
+            self.assertTrue(
+                required_identities.issubset(full_synced_directories)
+            )
+            self.assertGreaterEqual(full_synced_regular_files, 1)
             return publish()
 
         @contextlib.contextmanager
@@ -7263,6 +7372,16 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
             mock.patch.object(
                 providers,
+                "_is_claude_macos_host",
+                return_value=True,
+            ),
+            mock.patch.object(
+                providers.importlib,
+                "import_module",
+                return_value=darwin_fcntl,
+            ),
+            mock.patch.object(
+                providers,
                 "_persist_claude_macos_refreshed_credential",
                 return_value=updated_snapshot,
             ) as persist,
@@ -7282,6 +7401,194 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(callback_results, [True])
         self.assertEqual(publication_checks, 1)
         persist.assert_called_once()
+        refreshed[:] = b"\x00" * len(refreshed)
+
+    def test_durable_stage_commit_fullsyncs_after_rename(self) -> None:
+        credential = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        recovery_root = providers._claude_macos_recovery_root(self.review)
+        recovery_metadata = recovery_root.stat()
+        recovery_identity = (
+            recovery_metadata.st_dev,
+            recovery_metadata.st_ino,
+        )
+
+        for failure_kind in ("success", "fullsync-failure"):
+            with self.subTest(failure_kind=failure_kind):
+                pending = recovery_root / (
+                    providers.CLAUDE_MACOS_DURABLE_STAGE_PENDING_PREFIX
+                    + failure_kind
+                )
+                committed = recovery_root / (
+                    providers.CLAUDE_MACOS_DURABLE_STAGE_COMMITTED_PREFIX
+                    + failure_kind
+                )
+                providers._retain_claude_macos_refreshed_credential(
+                    self.review,
+                    credential,
+                    requested_carrier_root=pending,
+                    credential_prevalidated=True,
+                    durable_directories=True,
+                )
+                events: list[str] = []
+                real_rename = providers.os.rename
+
+                def track_rename(*args: object, **kwargs: object) -> None:
+                    events.append("rename")
+                    real_rename(*args, **kwargs)
+
+                def fullsync(descriptor: int, command: int) -> int:
+                    self.assertEqual(command, 51)
+                    metadata = providers.os.fstat(descriptor)
+                    if (metadata.st_dev, metadata.st_ino) == recovery_identity:
+                        events.append("fullsync")
+                        if failure_kind == "fullsync-failure":
+                            raise OSError("injected recovery root F_FULLFSYNC failure")
+                    return 0
+
+                darwin_fcntl = mock.Mock()
+                darwin_fcntl.F_FULLFSYNC = 51
+                darwin_fcntl.fcntl.side_effect = fullsync
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(
+                        mock.patch.object(
+                            providers,
+                            "_is_claude_macos_host",
+                            return_value=True,
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            providers.importlib,
+                            "import_module",
+                            return_value=darwin_fcntl,
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            providers.os,
+                            "rename",
+                            side_effect=track_rename,
+                        )
+                    )
+                    if failure_kind == "fullsync-failure":
+                        stack.enter_context(
+                            self.assertRaisesRegex(
+                                OSError,
+                                "F_FULLFSYNC failure",
+                            )
+                        )
+                    result = providers._commit_claude_macos_durable_stage(
+                        self.review,
+                        pending,
+                        committed,
+                        credential,
+                    )
+                self.assertEqual(events[:2], ["rename", "fullsync"])
+                if failure_kind == "success":
+                    self.assertEqual(result, committed)
+
+        credential[:] = b"\x00" * len(credential)
+
+    def test_durable_stage_fullsync_failure_nacks_before_publication(
+        self,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        selected = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
+                keychain_digest=providers._claude_credential_digest(original),
+                file_digest=None,
+                file_snapshot=None,
+            ),
+        )
+        recovery_root = providers._claude_macos_recovery_root(self.review)
+        recovery_metadata = recovery_root.stat()
+        recovery_identity = (
+            recovery_metadata.st_dev,
+            recovery_metadata.st_ino,
+        )
+        recovery_fullsyncs = 0
+        callback_results: list[bool] = []
+        publication_calls = 0
+
+        def fail_commit_fullsync(descriptor: int, command: int) -> int:
+            nonlocal recovery_fullsyncs
+            self.assertEqual(command, 51)
+            metadata = providers.os.fstat(descriptor)
+            if (metadata.st_dev, metadata.st_ino) == recovery_identity:
+                recovery_fullsyncs += 1
+                if recovery_fullsyncs == 2:
+                    raise OSError("injected recovery root F_FULLFSYNC failure")
+            return 0
+
+        def commit_pending(_publish: Callable[[], bool]) -> bool:
+            nonlocal publication_calls
+            publication_calls += 1
+            return True
+
+        @contextlib.contextmanager
+        def broker(
+            _credential: bytearray,
+            _capability: bytes,
+            *,
+            update_callback: Callable[..., bool] | None = None,
+            **_kwargs: object,
+        ):
+            assert update_callback is not None
+            callback_results.append(update_callback(refreshed, commit_pending))
+            yield 43211
+
+        darwin_fcntl = mock.Mock()
+        darwin_fcntl.F_FULLFSYNC = 51
+        darwin_fcntl.fcntl.side_effect = fail_commit_fullsync
+        common.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {"authentication": {}, "phase": "runtime-launching"},
+        )
+        with (
+            mock.patch.object(
+                providers,
+                "_select_claude_macos_credential",
+                return_value=selected,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_credential_server",
+                side_effect=broker,
+            ),
+            mock.patch.object(
+                providers,
+                "_is_claude_macos_host",
+                return_value=True,
+            ),
+            mock.patch.object(
+                providers.importlib,
+                "import_module",
+                return_value=darwin_fcntl,
+            ),
+            mock.patch.object(
+                providers,
+                "_persist_claude_macos_refreshed_credential",
+            ) as persist,
+            self.assertRaisesRegex(
+                providers.ClaudeCredentialInspectionInconclusive,
+                "runtime I/O was inconclusive",
+            ),
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+            ):
+                pass
+
+        self.assertEqual(callback_results, [False])
+        self.assertEqual(publication_calls, 0)
+        self.assertGreaterEqual(recovery_fullsyncs, 2)
+        persist.assert_not_called()
         refreshed[:] = b"\x00" * len(refreshed)
 
     def test_durable_stage_rejects_swapped_or_looping_workspace_ancestor(
@@ -8102,6 +8409,14 @@ class ProviderPolicyTest(unittest.TestCase):
         def broker(_credential, _capability, *, update_callback=None, **_kwargs):
             assert update_callback is not None
             self.assertFalse(update_callback(bytearray(b"{}")))
+            self.assertFalse(
+                update_callback(
+                    bytearray(
+                        b'{"claudeAiOauth":{"accessToken":"a",'
+                        b'"refreshToken":"\\ud800","expiresAt":1}}'
+                    )
+                )
+            )
             yield 43211
 
         with (
@@ -10927,11 +11242,13 @@ class ProviderPolicyTest(unittest.TestCase):
         runtime_lock_released = threading.Event()
         writer: threading.Thread | None = None
         runtime_lock_release_thread: threading.Thread | None = None
+        recovery_threads: list[threading.Thread] = []
         finalization_started: float | None = None
         finalization_elapsed: float | None = None
         writer_responses: list[bytes] = []
         real_commit = providers._commit_claude_macos_durable_stage
         real_lock_factory = threading.Lock
+        real_thread = threading.Thread
 
         class SnapshotContendedRuntimeLock:
             def __init__(self) -> None:
@@ -10970,6 +11287,15 @@ class ProviderPolicyTest(unittest.TestCase):
             if lock_calls == 1:
                 return runtime_lock
             return real_lock_factory()
+
+        def tracking_thread(
+            *args: object,
+            **kwargs: object,
+        ) -> threading.Thread:
+            thread = real_thread(*args, **kwargs)  # type: ignore[arg-type]
+            if kwargs.get("name") == "claude-review-keychain-recovery":
+                recovery_threads.append(thread)
+            return thread
 
         def release_runtime_lock_after_bound() -> None:
             release_runtime_lock_early.wait(timeout=1.0)
@@ -11045,6 +11371,11 @@ class ProviderPolicyTest(unittest.TestCase):
                     "Lock",
                     side_effect=lock_factory,
                 ),
+                mock.patch.object(
+                    providers.threading,
+                    "Thread",
+                    side_effect=tracking_thread,
+                ),
                 self.assertRaises(
                     providers.ClaudeCredentialInspectionInconclusive
                 ) as raised,
@@ -11105,12 +11436,16 @@ class ProviderPolicyTest(unittest.TestCase):
             commit_finished.wait(timeout=2.0)
             if writer is not None:
                 writer.join(timeout=2.0)
+            for recovery_thread in recovery_threads:
+                recovery_thread.join(timeout=2.0)
 
         self.assertIsNotNone(finalization_elapsed)
         assert finalization_elapsed is not None
         self.assertLess(finalization_elapsed, 0.75)
         self.assertTrue(runtime_lock_released.is_set())
         self.assertTrue(commit_finished.is_set())
+        self.assertTrue(recovery_threads)
+        self.assertFalse(any(thread.is_alive() for thread in recovery_threads))
         self.assertIsNotNone(writer)
         assert writer is not None
         self.assertFalse(writer.is_alive())

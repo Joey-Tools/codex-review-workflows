@@ -135,7 +135,7 @@ explicitly configured Claude Code candidate:
 10. At every model-attempt boundary, prepare one platform-specific private
     credential carrier. On macOS, securely read the current-account Keychain
     item plus the empirically compatible file under the account's `pwd` home,
-    validate their structure and refresh-token presence, select the candidate
+    validate their structure, UTF-8 token encodability, and refresh-token presence, select the candidate
     with the later access-token expiry, and load it into the restricted broker.
     On Linux and WSL2, validate the host credential file and stage a private
     copy. An expired access token is accepted when a usable refresh token remains;
@@ -160,14 +160,17 @@ explicitly configured Claude Code candidate:
     inconclusive, and pauses without Copilot fallback. A superseded or failed
     generation is not acknowledged, but its carrier remains in the bounded
     journal until post-quiescence finalization or failure recovery.
-    Acknowledgement proves file, carrier, review-container, and review-root
-    directory synchronization plus exact readback, not host persistence, so
-    helper `SIGKILL`, fatal failure, or power loss after acknowledgement still
-    leaves the carrier. After the broker
+    On Darwin, every file and directory synchronization in that commit performs
+    `fsync` followed by `F_FULLFSYNC`; an unavailable or failed full sync NACKs
+    the generation. Acknowledgement therefore proves successful full-sync calls
+    plus exact readback, not host persistence or an absolute hardware guarantee.
+    This is Darwin's strongest available best-effort power-loss barrier; storage
+    hardware may still fail to honor it. After the broker
     server and every handler have fully quiesced, one outer-runtime owner proves
     the newest carrier, removes older journal entries, detaches the latest
     acknowledged rotation, performs guarded host writeback, and deletes the final
-    recovery copy only after that write is verified.
+    recovery copy only after that write and its parent directories have passed
+    the same Darwin full-sync boundary.
     The latest exact-verified generation is always the canonical current carrier.
     If quota rejection, a malformed update, or durable-stage failure leaves no
     staged host-writeback candidate, finalization reports it as the sole current
@@ -671,8 +674,9 @@ credential JSON. This macOS file source is based on observed current Claude Code
 compatibility behavior; Anthropic's public authentication documentation does
 not guarantee it as the macOS storage contract.
 
-For each structurally valid source, require a non-empty refresh token and parse
-the access-token expiry. Access-token expiry alone is not login expiry. Select
+For each structurally valid source, require non-empty access and refresh tokens
+that encode as UTF-8 without unpaired surrogates, and parse the access-token
+expiry. Access-token expiry alone is not login expiry. Select
 the candidate with the later expiry even when both access tokens are already
 expired, then load that payload into the broker. The broker serves the initial
 fixed lookup once and accepts only the exact bounded credential-store update
@@ -684,7 +688,12 @@ write. The attempt-scoped durable journal accepts at most eight generations and
 including when the later filesystem write or generation publication fails. The
 generation writes a distinct private recovery carrier, synchronizes its file,
 containing directories, review-container entry, and review-root entry, renames
-it under a synchronized parent, and reads back the exact payload. Only after
+it under a synchronized parent, and reads back the exact payload. On Darwin,
+each such synchronization runs `fsync` and then requires `F_FULLFSYNC`; the
+same barrier covers pwd-home host-file replacement before the final recovery
+carrier can be removed. A missing command or failed full sync is
+credential-inspection-inconclusive and cannot authorize acknowledgement or
+cleanup. Only after
 that durable commit does the broker enter the generation
 linearization point under the current-generation lock. It publishes and
 acknowledges the generation only if it is still current and the runtime is not
@@ -694,8 +703,9 @@ credential-inspection-inconclusive, and pauses without Copilot fallback. A
 superseded, abandoned, or failed generation returns failure without
 acknowledgement, but its carrier remains in the bounded journal until
 post-quiescence finalization or failure recovery. A successful broker acknowledgement therefore proves durable
-recovery staging, not host persistence; helper `SIGKILL`, fatal failure, or
-power loss after acknowledgement still leaves the synchronized carrier. A
+recovery staging, not host persistence or an absolute power-loss guarantee.
+`F_FULLFSYNC` is Darwin's strongest available best-effort persistence request,
+and storage hardware may still fail to honor it. A
 generation that fails structural validation invalidates any older published
 host-writeback candidate while leaving the older durable carrier available for
 recovery. It never exposes
@@ -860,7 +870,9 @@ controlled cleanup requires first confirming that no credential writer remains.
 
 On Linux and WSL2, every model attempt validates the documented Claude Code
 credential file as a non-symlink regular file owned by the current user with
-exact mode `0600`. For that attempt, copy it into a new helper-owned writable
+exact mode `0600`. Access and refresh tokens must be non-empty UTF-8-encodable
+strings without unpaired surrogates; the same parser rejects an unsafe staged
+rotation before host writeback. For that attempt, copy it into a new helper-owned writable
 `/auth` carrier root with private config at `/auth/config`; the original host
 credential is never mounted. The layout permits the primary lock under the
 config plus the legacy sibling `/auth/config.lock`. Before binding the carrier
