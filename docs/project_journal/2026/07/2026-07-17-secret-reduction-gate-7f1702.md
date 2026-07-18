@@ -67,6 +67,7 @@ Diagnostic and preflight evidence remain bounded audit surfaces. They use stable
 - A generic oversized-assignment event is suppressed only when its 513-byte prefix is proven to be the beginning of one complete provider-specific candidate that exactly fills the quoted or unquoted right-hand side, including across stream commit boundaries; any trailing generic value byte still blocks.
 - The oversized-assignment exemption reuses the ordinary quoted or unquoted logical-RHS parser, so whitespace, operators, shell continuations, quote transitions, backslashes, backticks, and unsafe diff continuations remain fail closed after a long provider candidate.
 - Exact provider-specific spans still pass through generic quoted or unquoted RHS validation when their short values fall below the generic entropy heuristic. A safe exact RHS is deduplicated only after the parser accepts it; operators, shell continuations, unsafe diff continuations, and other rejected tails remain generic-assignment blockers.
+- A quoted generic assignment is eligible only when its apparent closing quote is not escaped by an odd backslash run. An escaped quote remains a blocker and cannot supply a dynamic reduction candidate, including across complete-tree counting.
 - A complete provider-specific span nested inside a longer low-entropy unquoted assignment retains the complete generic RHS identity, including an attached suffix or nonzero offset. This prevents distinct longer values from being collapsed into one shorter reduction candidate. AWS credential assignments use the same fail-closed complete-RHS treatment.
 - Short provider-specific spans inside incomplete, multiline, prefixed, escaped, triple-quoted, adjacent-literal, wrapped, or expression-based assignments retain a generic blocker until the full logical RHS is proven to be that exact candidate. Operators and comments preserve continuation across stream boundaries and blank lines; opposite unified-diff record sides cannot supply a false closing delimiter.
 - Wrapped exact-RHS proof uses a type-aware last-in-first-out delimiter stack. Missing, crossed, mismatched, or extra delimiters block when the suffix is complete, while a structurally valid partial wrapper remains deferred at an incomplete stream frontier.
@@ -80,12 +81,13 @@ Diagnostic and preflight evidence remain bounded audit surfaces. They use stable
 - Reviewer-visible diff and prompt artifacts are integrity-bound but are not secret-egress filters. They retain deliberately supplied reviewer input, including deleted or prompt-contained secret bytes, in original form.
 - Deleted sensitive paths are omitted from head-side changed-path findings and are allowed only when the complete materialized head remains free of sensitive paths.
 - Public changed-path evidence contains ordered SHA-256 commitments only. The helper validates those records lockstep against an owner-only private raw-path stream and checks the commitments and all other audit evidence against catalog and dynamic sensitive values. After preflight consumes the private path stream and Base64 raw-bearing dynamic-reduction manifest, it removes both through owner-, mode-, and identity-checked no-follow parent/container descriptors before publishing preflight evidence or launching a reviewer; failed preflight and later cleanup paths retry that scrub. An explicitly retained or fallback workspace therefore keeps only the frozen workspace and durable bounded evidence. Changed-blob findings identify paths by digest as well.
+- The complete prospective retained `preflight.json`, including the final `private_artifacts: removed` field, is assembled through the same shared builder used for publication and checked against every catalog and dynamic value before private-artifact removal or reviewer launch.
 - Catalog authoring and explicitly selected legacy behavior remains unchanged.
 
 ## Validation
 
-- `uv run python skills/review-orchestration-playbook/tests/test_synthetic_tokens.py`: 189 tests passed.
-- `uv run python -m unittest discover -s skills/review-orchestration-playbook/tests`: 835 tests passed, 4 skipped.
+- `uv run python skills/review-orchestration-playbook/tests/test_synthetic_tokens.py`: 192 tests passed.
+- `uv run python -m unittest discover -s skills/review-orchestration-playbook/tests`: 840 tests passed, 4 skipped.
 - `ruff check` on changed runtime and test modules: passed.
 - `git diff --check`: passed.
 - Fixed-range Codex review and PR readiness evidence are recorded in the delivery thread and PR.

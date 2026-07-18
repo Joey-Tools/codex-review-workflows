@@ -746,6 +746,56 @@ class PublicPoolScannerTest(unittest.TestCase):
         self.assertEqual(scan.reduction_occurrence_offsets[long], {long_start})
         self.assertEqual(scan.reduction_unembedded_offsets[long], {long_start})
 
+    def test_escaped_quoted_closer_cannot_become_a_reduction_candidate(
+        self,
+    ) -> None:
+        candidate = reduction_secret("generic-secret-assignment") + b"\\"
+        payload = b'password = "' + candidate + b'"\n'
+        for label, candidate_payload, diff_surface in (
+            ("plain", payload, False),
+            ("diff", b"+" + payload, True),
+        ):
+            with self.subTest(case=label):
+                scan = workspace._scan_secret_value(
+                    candidate_payload,
+                    capture_blocking_candidates=True,
+                    diff_surface=diff_surface,
+                    _continue_after_blocking=True,
+                )
+
+                self.assertEqual(scan.blocking_rule, "generic-secret-assignment")
+                self.assertEqual(scan.blocking_candidates, {})
+
+        stream_payload = b"x" * 110 + payload + b"x" * 200
+        with (
+            mock.patch.object(workspace, "MAX_SECRET_PREFIX_PROOF_BYTES", 128),
+            mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", 64),
+            mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 128),
+        ):
+            stream_scan = workspace._stream_secret_scan(
+                io.BytesIO(stream_payload),
+                size=len(stream_payload),
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+        self.assertEqual(
+            stream_scan.blocking_rule,
+            "generic-secret-assignment",
+        )
+        self.assertEqual(stream_scan.blocking_candidates, {})
+
+        even_candidate = reduction_secret("generic-secret-assignment") + b"\\\\"
+        even_scan = workspace._scan_secret_value(
+            b'password = "' + even_candidate + b'"\n',
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+        self.assertIsNone(even_scan.blocking_rule)
+        self.assertEqual(
+            even_scan.blocking_candidates,
+            {even_candidate: {"generic-secret-assignment"}},
+        )
+
     def test_accepted_quoted_value_requires_a_complete_rhs(self) -> None:
         accepted = self.accepted[0]
         exact_assignment = assignment_bytes(b"access_token", accepted.value)
@@ -5734,6 +5784,47 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                         evidence["synthetic_tokens"]["secret_reductions"],
                         manifest["secret_reductions"],
                     )
+
+    def test_prepared_range_rejects_an_escaped_quoted_reduction_candidate(
+        self,
+    ) -> None:
+        candidate = reduction_secret("generic-secret-assignment") + b"\\"
+        fixture = (b'password = "' + candidate + b'"\n').decode("ascii")
+        repo, base = self.new_repo(
+            {
+                "secret-a.cfg": fixture,
+                "secret-b.cfg": fixture,
+            }
+        )
+        (repo / "secret-b.cfg").unlink()
+        head = self.commit(repo)
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "cannot extract a stable exact candidate",
+        ):
+            self.prepare(repo=repo, base=base, head=head)
+
+    def test_final_preflight_fields_cannot_reintroduce_a_reduced_value(
+        self,
+    ) -> None:
+        preflight_key = "private_" + "artifacts"
+        fixture = assignment_text("password", preflight_key)
+        repo, base = self.new_repo(
+            {
+                "secret-a.cfg": fixture,
+                "secret-b.cfg": fixture,
+            }
+        )
+        (repo / "secret-b.cfg").unlink()
+        head = self.commit(repo)
+        review = self.prepare(repo=repo, base=base, head=head)
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "preflight evidence would expose a raw synthetic value",
+        ):
+            self.validate(review)
 
     def test_changed_path_public_evidence_contains_only_digests(self) -> None:
         fixture = reduction_fixture("generic-secret-assignment")

@@ -5475,6 +5475,42 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         self.assertIn("private artifact cleanup failed", error)
 
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_preflight_builder_failure_scrubs_private_artifacts(
+        self,
+        run_model_chain: mock.Mock,
+    ) -> None:
+        with mock.patch.object(
+            providers,
+            "build_preflight_evidence",
+            side_effect=ReviewError("prospective preflight rejected"),
+        ):
+            outcome = providers.run_review(
+                review=self.review,
+                reviewer="codex",
+            )
+
+        self.assertEqual(outcome.returncode, 2)
+        run_model_chain.assert_not_called()
+        self.assertFalse((self.review.container_dir / "preflight.json").exists())
+        self.assertFalse(
+            any(
+                (self.review.container_dir / name).exists()
+                for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
+            )
+        )
+        error = (self.review.container_dir / "runner-error.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("prospective preflight rejected", error)
+
+    def test_preflight_builder_rejects_fixed_field_shadow(self) -> None:
+        with self.assertRaisesRegex(ReviewError, "shadows fixed preflight fields"):
+            providers.build_preflight_evidence(
+                self.review,
+                {"private_artifacts": "forged"},
+            )
+
     @mock.patch.object(providers, "_review_environment", return_value={})
     @mock.patch.object(providers, "_run_model_chain")
     def test_codex_preflight_evidence_precedes_model_launch(

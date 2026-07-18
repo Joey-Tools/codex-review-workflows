@@ -3885,12 +3885,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     ).encode("utf-8")
     if len(encoded_evidence) > MAX_SYNTHETIC_EVIDENCE_BYTES:
         raise ReviewError("synthetic-token preflight evidence exceeds the size limit")
-    complete_preflight_evidence = {
-        "review_range": f"{review.base_ref}..{review.head_ref}",
-        "scope": "frozen tracked workspace, diff, and review prompt",
-        "status": "secret-delta and escaping-symlink checks passed",
-    }
-    complete_preflight_evidence.update(evidence)
+    complete_preflight_evidence = build_preflight_evidence(review, evidence)
     _reject_raw_values_in_evidence(
         complete_preflight_evidence,
         accepted_values=evidence_sensitive_values,
@@ -3898,6 +3893,23 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     )
     _inspect_control_directory(control_dir, expected=control_state.directory)
     return evidence
+
+
+def build_preflight_evidence(
+    review: ReviewWorkspace,
+    synthetic_evidence: dict[str, Any],
+) -> dict[str, Any]:
+    fixed_evidence = {
+        "review_range": f"{review.base_ref}..{review.head_ref}",
+        "private_artifacts": "removed",
+        "scope": "frozen tracked workspace, diff, and review prompt",
+        "status": "secret-delta and escaping-symlink checks passed",
+    }
+    overlap = set(fixed_evidence).intersection(synthetic_evidence)
+    if overlap:
+        raise ReviewError("synthetic-token evidence shadows fixed preflight fields")
+    fixed_evidence.update(synthetic_evidence)
+    return fixed_evidence
 
 
 def _redact_secret_path(value: str, label: str) -> str:
@@ -6040,16 +6052,24 @@ def _iter_secret_events(
                     None,
                 )
             continue
+        closing_start = _find_unescaped_delimiter(
+            value,
+            delimiter=match.group(1),
+            start=match.start(2),
+            maximum_end=match.end(),
+        )
         try:
-            may_accept = _quoted_assignment_may_accept(
-                value,
-                assignment_start=match.start(),
-                assignment_end=match.end(),
-                diff_surface=diff_surface,
-                prefix_context_complete=prefix_context_complete,
-                suffix_context_complete=suffix_context_complete,
-                event_budget=event_budget,
-                maximum_end=quoted_proof_end,
+            may_accept = closing_start == match.end() - len(match.group(1)) and (
+                _quoted_assignment_may_accept(
+                    value,
+                    assignment_start=match.start(),
+                    assignment_end=match.end(),
+                    diff_surface=diff_surface,
+                    prefix_context_complete=prefix_context_complete,
+                    suffix_context_complete=suffix_context_complete,
+                    event_budget=event_budget,
+                    maximum_end=quoted_proof_end,
+                )
             )
         except _IncompleteSecretScanSuffix as incomplete:
             if quoted_proof_limit <= len(value) and end_is_committable(
@@ -6076,7 +6096,8 @@ def _iter_secret_events(
             )
             continue
         if (
-            not may_accept
+            closing_start == match.end() - len(match.group(1))
+            and not may_accept
             and _capture_only_assignment_spans is not None
             and not prefix_context_complete
             and not diff_surface
