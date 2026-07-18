@@ -559,6 +559,11 @@ class WorkspaceTest(unittest.TestCase):
 
     def test_snapshot_rejects_oversized_single_blob_before_materializing(self) -> None:
         with (
+            mock.patch.object(
+                workspace_runtime,
+                "_secret_count_manifests",
+                return_value=({}, {}, ()),
+            ),
             mock.patch.object(workspace_runtime, "MAX_SNAPSHOT_BLOB_BYTES", 1),
             self.assertRaisesRegex(ReviewError, "per-file review limit"),
         ):
@@ -613,6 +618,11 @@ class WorkspaceTest(unittest.TestCase):
                 workspace_runtime,
                 "_reject_legacy_values_in_frozen_tree_paths",
                 return_value=None,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "_secret_count_manifests",
+                return_value=({}, {}, ()),
             ),
             mock.patch.object(workspace_runtime, "MAX_TREE_METADATA_BYTES", 1),
             self.assertRaisesRegex(ReviewError, "frozen Git tree metadata exceeds"),
@@ -1262,10 +1272,17 @@ class WorkspaceTest(unittest.TestCase):
         git(self.repo, "commit", "-m", "Add escaping secret-shaped symlink")
         secret_head = git(self.repo, "rev-parse", "HEAD")
 
-        with self.assertRaisesRegex(
-            ReviewError,
-            r"artifact -> <redacted symlink target>",
-        ) as raised:
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "_secret_count_manifests",
+                return_value=({}, {}, ()),
+            ),
+            self.assertRaisesRegex(
+                ReviewError,
+                r"artifact -> <redacted symlink target>",
+            ) as raised,
+        ):
             prepare_workspace(
                 repo=self.repo,
                 base_ref=self.head,

@@ -56,7 +56,7 @@ Diagnostic and preflight evidence remain bounded audit surfaces. They use stable
 ## Current State
 
 - Runtime preflight exhaustively captures bounded exact candidates across complete base and head trees, performs raw and unembedded counting, and persists range-bound public metadata plus helper-private candidate bytes for stateful head recounting.
-- Complete PEM blocks and AWS secret values have stable candidate identities; oversized provider prefixes, oversized assignments/JWTs, incomplete PEM blocks, and other uncountable events remain fail closed.
+- Complete PEM blocks and AWS secret values have stable candidate identities; oversized provider prefixes, oversized assignments/JWTs, incomplete PEM blocks, and other uncountable events remain fail closed. PEM end markers are indexed once by label and matched with bounded binary searches, so dense unmatched begin markers cannot amplify into overlapping 32-KiB scans.
 - Dynamic candidates that do not satisfy the reduction inequalities are rejected during preparation, before a mutable materialized head or reviewer process exists.
 - Variable-length provider candidates prove their terminating byte against the provider body alphabet, select the longest actual prefix for the 513-byte fail-closed branch, and retain provider-specific spans across stream commit boundaries.
 - Fixed-length AWS access-key and npm-token candidates use provider-body termination rather than a generic word boundary. A following underscore or other non-body byte therefore preserves both the exact provider span and the complete longer RHS identity.
@@ -73,7 +73,7 @@ Diagnostic and preflight evidence remain bounded audit surfaces. They use stable
 - Incomplete stream scans carry separate commit and retention frontiers. Complete assignments before the deferred suffix are committed exactly once, while earlier diff-hunk or PEM proof bytes remain available until the deferred candidate is resolved.
 - Exhaustive provenance audit may retain assignment-local evidence for an exact catalog legacy value after an earlier stream window has already committed a blocker and external prefix context is no longer available. This capture-only evidence never suppresses that generic blocker, never applies to authoring or dynamic reduction values, and never broadens ordinary preflight.
 - Complete-catalog legacy raw values and canonical Base64 storage encodings remain forbidden in both frozen base and head paths, including when a marked base path is deleted or renamed away at head.
-- Exact dynamic reduction raw values and canonical Base64 encodings are forbidden in every frozen and materialized head path. A deleted base-only path remains reviewable through the trusted raw diff and is omitted from changed-head metadata.
+- Exact dynamic reduction raw values and canonical Base64 encodings are forbidden in every frozen and materialized head path. Candidate discovery and the frozen-head path gate run before materialization, so a case-colliding or overlong secret-bearing path cannot escape through a materialization diagnostic. A deleted base-only path remains reviewable through the trusted raw diff and is omitted from changed-head metadata.
 - Exact unembedded counting uses separate containment domains for each legacy envelope and for dynamic reductions, so a longer dynamic candidate cannot change legacy count semantics while dynamic candidates still contain one another normally.
 - Reviewer-visible diff and prompt artifacts are integrity-bound but are not secret-egress filters. They retain deliberately supplied reviewer input, including deleted or prompt-contained secret bytes, in original form.
 - Deleted sensitive paths are omitted from head-side changed-path findings and are allowed only when the complete materialized head remains free of sensitive paths.
@@ -82,7 +82,7 @@ Diagnostic and preflight evidence remain bounded audit surfaces. They use stable
 
 ## Validation
 
-- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests`: 810 tests passed, 9 skipped.
+- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests`: 812 tests passed, 9 skipped.
 - `ruff check` on changed runtime and test modules: passed.
 - `git diff --check`: passed.
 - Fixed-range Codex review and PR readiness evidence are recorded in the delivery thread and PR.

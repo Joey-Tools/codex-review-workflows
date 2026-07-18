@@ -2691,6 +2691,32 @@ class PublicPoolScannerTest(unittest.TestCase):
                 self.assertEqual(scan.blocking_rule, expected_rule)
                 self.assertFalse(scan.blocking_candidates)
 
+    def test_dense_unclosed_pem_markers_use_the_preindexed_end_markers(self) -> None:
+        class FindCountingBytes(bytes):
+            def __new__(cls, value: bytes):
+                instance = super().__new__(cls, value)
+                instance.find_calls = 0
+                return instance
+
+            def find(self, *args):
+                self.find_calls += 1
+                return super().find(*args)
+
+        marker_count = 512
+        begin_marker = b"-----BEGIN " + b"PRIVATE KEY-----"
+        payload = FindCountingBytes(b"\n".join((begin_marker,) * marker_count))
+
+        events = tuple(workspace._iter_secret_events(payload))
+
+        self.assertEqual(
+            sum(
+                rule == "private-key" and candidate is None
+                for rule, candidate, *_rest in events
+            ),
+            marker_count,
+        )
+        self.assertEqual(payload.find_calls, 0)
+
     def test_provider_body_continuation_cannot_be_captured_as_a_512_byte_prefix(
         self,
     ) -> None:
@@ -5033,6 +5059,54 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                     self.prepare(repo=repo, base=base, head=head)
                 self.assertNotIn(raw_value, str(caught.exception))
                 self.assertNotIn(path_value, str(caught.exception))
+
+    def test_overlong_dynamic_secret_path_blocks_before_materialization(self) -> None:
+        raw_value = reduction_secret("generic-secret-assignment").decode("ascii")
+        fixture = assignment_text("password", raw_value)
+        repo, base = self.new_repo(
+            {
+                "secret-a.cfg": fixture,
+                "secret-b.cfg": fixture,
+            }
+        )
+        secret_blob = git(repo, "rev-parse", f"{base}:secret-a.cfg")
+        overlong_path = raw_value + "-" + "x" * (300 - len(raw_value) - 1)
+        self.assertGreater(len(os.fsencode(overlong_path)), 255)
+        git(repo, "read-tree", base)
+        git(repo, "update-index", "--force-remove", "secret-a.cfg", "secret-b.cfg")
+        git(
+            repo,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "100644",
+            secret_blob,
+            overlong_path,
+        )
+        tree = git(repo, "write-tree")
+        head = git(repo, "commit-tree", tree, "-p", base, "-m", "Head")
+        handoffs: list[workspace.ReviewWorkspace] = []
+        materialize_frozen_tree = workspace._materialize_frozen_tree
+
+        with (
+            mock.patch.object(
+                workspace,
+                "_materialize_frozen_tree",
+                wraps=materialize_frozen_tree,
+            ) as materialize,
+            self.assertRaisesRegex(ReviewError, "frozen head paths") as caught,
+        ):
+            workspace.prepare_workspace(
+                repo=repo,
+                base_ref=base,
+                head_ref=head,
+                ownership_handoff=handoffs.append,
+            )
+
+        materialize.assert_not_called()
+        self.assertEqual(handoffs, [])
+        self.assertNotIn(raw_value, str(caught.exception))
+        self.assertNotIn(overlong_path, str(caught.exception))
 
     def test_materialized_head_path_cannot_add_a_reduced_dynamic_secret(self) -> None:
         raw_value = reduction_secret("generic-secret-assignment").decode("ascii")

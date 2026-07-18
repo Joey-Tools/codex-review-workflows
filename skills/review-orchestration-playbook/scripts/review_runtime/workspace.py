@@ -179,9 +179,14 @@ SECRET_PATTERN_MARKERS: dict[str, tuple[bytes, ...]] = {
     "stripe-live-key": (b"sk_live_",),
     "jwt": (b"eyJ",),
 }
+PEM_PRIVATE_KEY_LABEL_PATTERN = (
+    rb"PGP PRIVATE KEY BLOCK|(?:ENCRYPTED |RSA |EC |DSA |OPENSSH )?PRIVATE KEY"
+)
 PEM_PRIVATE_KEY_BEGIN = re.compile(
-    rb"-----BEGIN (?P<label>PGP PRIVATE KEY BLOCK|"
-    rb"(?:ENCRYPTED |RSA |EC |DSA |OPENSSH )?PRIVATE KEY)-----"
+    rb"-----BEGIN (?P<label>" + PEM_PRIVATE_KEY_LABEL_PATTERN + rb")-----"
+)
+PEM_PRIVATE_KEY_END = re.compile(
+    rb"-----END (?P<label>" + PEM_PRIVATE_KEY_LABEL_PATTERN + rb")-----"
 )
 SECRET_KEY_NAME_PATTERN = (
     rb"(?i)(?:aws[_-]?(?:access[_-]?key[_-]?id|secret[_-]?access[_-]?key)|"
@@ -5144,13 +5149,24 @@ def _iter_secret_events(
         return end_is_committable(match.end())
 
     long_specific_candidate_ends: dict[int, set[int]] = {}
+    pem_end_starts: dict[bytes, list[int]] = {}
+    for end_match in PEM_PRIVATE_KEY_END.finditer(value):
+        pem_end_starts.setdefault(end_match.group("label"), []).append(
+            end_match.start()
+        )
     for match in PEM_PRIVATE_KEY_BEGIN.finditer(value):
         start = match.start()
         label = match.group("label")
         rule = "pgp-private-key" if label == b"PGP PRIVATE KEY BLOCK" else "private-key"
         end_marker = b"-----END " + label + b"-----"
         search_end = min(len(value), start + MAX_PEM_SECRET_BYTES)
-        end_start = value.find(end_marker, match.end(), search_end)
+        end_starts = pem_end_starts.get(label, ())
+        end_index = bisect_left(end_starts, match.end())
+        end_start = (
+            end_starts[end_index]
+            if end_index < len(end_starts) and end_starts[end_index] < search_end
+            else -1
+        )
         if end_start >= 0:
             candidate_end = end_start + len(end_marker)
             candidate = value[start:candidate_end]
@@ -6754,6 +6770,25 @@ def prepare_workspace(
                 commit=commit,
                 legacy_values=catalog_legacy_values,
             )
+        (
+            synthetic_manifest,
+            private_synthetic_manifest,
+            secret_reductions,
+        ) = _secret_count_manifests(
+            git_view=git_view,
+            object_directory=object_directory,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            catalog=catalog,
+            exemptions=selected_exemptions,
+        )
+        _reject_secret_reduction_values_in_frozen_tree_paths(
+            git_view=git_view,
+            object_directory=object_directory,
+            commit=head_sha,
+            reduction_values=secret_reductions,
+        )
+        manifest_sensitive_values = evidence_sensitive_values + secret_reductions
         _materialize_frozen_tree(
             git_view=git_view,
             object_directory=object_directory,
@@ -6776,25 +6811,6 @@ def prepare_workspace(
             head_sha=head_sha,
             destination=diff_file,
         )
-        (
-            synthetic_manifest,
-            private_synthetic_manifest,
-            secret_reductions,
-        ) = _secret_count_manifests(
-            git_view=git_view,
-            object_directory=object_directory,
-            base_sha=base_sha,
-            head_sha=head_sha,
-            catalog=catalog,
-            exemptions=selected_exemptions,
-        )
-        _reject_secret_reduction_values_in_frozen_tree_paths(
-            git_view=git_view,
-            object_directory=object_directory,
-            commit=head_sha,
-            reduction_values=secret_reductions,
-        )
-        manifest_sensitive_values = evidence_sensitive_values + secret_reductions
         _write_bounded_json(
             control_dir / SYNTHETIC_MANIFEST_NAME,
             synthetic_manifest,
