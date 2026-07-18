@@ -1013,8 +1013,8 @@ reached:
    only an explicit OS policy or socket-capability bind errno is deterministic
    secure-runtime unavailability. Unknown, resource/capacity, or
    address-contention bind errors, Unix-socket permissioning failure,
-   thread-start failure, and serve-start uncertainty are inconclusive, while an
-   unsafe broker is blocked. When
+   thread-start failure, serve-start uncertainty, and a post-ready serve-loop
+   failure are inconclusive, while an unsafe broker is blocked. When
    refresh persistence leaves a private carrier for operator recovery,
    `authentication.recovery_carrier` records only that path and never the
    credential payload. A simultaneous final-runtime authentication rejection
@@ -1055,7 +1055,7 @@ described as an enforced final launch.
 | A Linux/WSL2 staged rotation cannot be safely drained, recovered, or guarded-written to the host | `inconclusive`; retain the private recovery carrier, report its path, and pause | No |
 | Explicit override has the wrong version, platform, binary shape, capability contract, or lacks trusted GPG, probe sandbox, or trusted review tool prerequisites | `blocked` configuration error | No |
 | Wrong publisher fingerprint, invalid signature, checksum mismatch, contradictory safe-mode semantics, unsafe runtime metadata, or an isolation-boundary mismatch | `blocked` security error | No |
-| Manifest/probe timeout, output overflow, executable resolve/stat I/O failure, other inspection I/O failure, file race, transient network failure, unknown/resource/capacity/address-contention bind failure, Unix-socket permissioning failure, broker/proxy thread-start or serve-start uncertainty, or missing trustworthy terminal artifact | `inconclusive` | No |
+| Manifest/probe timeout, output overflow, executable resolve/stat I/O failure, other inspection I/O failure, file race, transient network failure, unknown/resource/capacity/address-contention bind failure, Unix-socket permissioning failure, broker/proxy thread-start or serve-start uncertainty, post-ready serve-loop failure, or missing trustworthy terminal artifact | `inconclusive` | No |
 | Explicit model entitlement or organization-policy denial from a final review invocation after exact effective-model verification | Existing same-lane model/backend fallback policy | Only as already authorized by the lane contract |
 
 Authentication failure never becomes runtime unavailability. The helper reports

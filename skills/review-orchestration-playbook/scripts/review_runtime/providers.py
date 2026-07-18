@@ -460,6 +460,30 @@ def _attach_claude_credential_cleanup_failure(
     primary.__cause__ = diagnostic
 
 
+def _claude_visible_error_chain_contains(
+    root: BaseException | None,
+    candidate: BaseException,
+) -> bool:
+    current = root
+    seen: set[int] = set()
+    while current is not None and len(seen) < 32:
+        if current is candidate:
+            return True
+        if id(current) in seen:
+            break
+        seen.add(id(current))
+        if isinstance(current.__cause__, BaseException):
+            current = current.__cause__
+        elif (
+            not current.__suppress_context__
+            and isinstance(current.__context__, BaseException)
+        ):
+            current = current.__context__
+        else:
+            current = None
+    return False
+
+
 def _raise_or_attach_claude_credential_cleanup(
     primary: BaseException | None,
     cleanup_errors: list[BaseException],
@@ -486,7 +510,11 @@ def _raise_or_attach_claude_credential_cleanup(
         selected = ClaudeCredentialInspectionInconclusive(message)
         selected.__cause__ = cleanup_errors[0]
     for error in (primary, *cleanup_errors):
-        if error is None or error is selected:
+        if (
+            error is None
+            or error is selected
+            or _claude_visible_error_chain_contains(selected, error)
+        ):
             continue
         _attach_claude_credential_cleanup_failure(selected, error)
     if selected is not primary:
@@ -9501,6 +9529,7 @@ def _shutdown_claude_proxy_server(
     socket_path: pathlib.Path | None = None,
 ) -> None:
     cleanup_errors: list[BaseException] = []
+    post_start_serve_error = False
     serving = False
     if thread_started:
         try:
@@ -9517,6 +9546,7 @@ def _shutdown_claude_proxy_server(
     except BaseException as error:
         cleanup_errors.append(error)
     if thread_started and thread is not None:
+        thread_stopped = False
         try:
             thread.join(timeout=CLAUDE_PROXY_SERVER_SHUTDOWN_TIMEOUT_SECONDS)
         except BaseException as error:
@@ -9534,6 +9564,22 @@ def _shutdown_claude_proxy_server(
                             "shutdown deadline"
                         )
                     )
+                else:
+                    thread_stopped = True
+        if thread_stopped:
+            try:
+                serve_error = server.serve_error()
+            except BaseException as error:
+                cleanup_errors.append(error)
+            else:
+                if serve_error is not None and not (
+                    _claude_visible_error_chain_contains(
+                        primary_error,
+                        serve_error,
+                    )
+                ):
+                    cleanup_errors.insert(0, serve_error)
+                    post_start_serve_error = True
     if socket_path is not None:
         try:
             socket_path.unlink(missing_ok=True)
@@ -9542,7 +9588,11 @@ def _shutdown_claude_proxy_server(
     _raise_or_attach_claude_credential_cleanup(
         primary_error,
         cleanup_errors,
-        message="cannot clean up the Claude CONNECT proxy safely",
+        message=(
+            "Claude CONNECT proxy serve loop failed after startup"
+            if post_start_serve_error
+            else "cannot clean up the Claude CONNECT proxy safely"
+        ),
     )
 
 

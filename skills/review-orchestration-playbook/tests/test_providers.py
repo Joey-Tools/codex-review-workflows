@@ -498,6 +498,80 @@ class ProviderPolicyTest(unittest.TestCase):
                 providers.ClaudeCredentialCleanupDiagnostic,
             )
 
+    def test_cleanup_representation_uses_only_the_visible_error_chain(
+        self,
+    ) -> None:
+        explicit_cause = RuntimeError("injected explicit cause")
+        hidden_context = OSError("injected hidden context")
+        explicit_primary = providers.ClaudeCredentialInspectionInconclusive(
+            "injected explicit-cause primary"
+        )
+        explicit_primary.__cause__ = explicit_cause
+        explicit_primary.__context__ = hidden_context
+        self.assertTrue(
+            providers._claude_visible_error_chain_contains(
+                explicit_primary,
+                explicit_cause,
+            )
+        )
+        self.assertFalse(
+            providers._claude_visible_error_chain_contains(
+                explicit_primary,
+                hidden_context,
+            )
+        )
+
+        primary = providers.ClaudeCredentialInspectionInconclusive(
+            "injected credential operation failure"
+        )
+        hidden_cleanup = OSError("injected hidden cleanup failure")
+        primary.__context__ = hidden_cleanup
+        primary.__suppress_context__ = True
+        self.assertFalse(
+            providers._claude_visible_error_chain_contains(
+                primary,
+                hidden_cleanup,
+            )
+        )
+
+        implicit_primary = providers.ClaudeCredentialInspectionInconclusive(
+            "injected implicit-context primary"
+        )
+        visible_context = OSError("injected visible context")
+        implicit_primary.__context__ = visible_context
+        self.assertTrue(
+            providers._claude_visible_error_chain_contains(
+                implicit_primary,
+                visible_context,
+            )
+        )
+
+        cycle_first = RuntimeError("injected cycle first")
+        cycle_second = RuntimeError("injected cycle second")
+        cycle_first.__cause__ = cycle_second
+        cycle_second.__cause__ = cycle_first
+        self.assertFalse(
+            providers._claude_visible_error_chain_contains(
+                cycle_first,
+                OSError("injected unrelated candidate"),
+            )
+        )
+
+        providers._raise_or_attach_claude_credential_cleanup(
+            primary,
+            [hidden_cleanup],
+            message="injected cleanup failure",
+        )
+
+        notes = getattr(primary, "__notes__", ())
+        if notes:
+            self.assertTrue(any("cleanup failure" in note for note in notes))
+        else:
+            self.assertIsInstance(
+                primary.__cause__,
+                providers.ClaudeCredentialCleanupDiagnostic,
+            )
+
     def test_cleanup_diagnostic_fallback_preserves_original_cause(self) -> None:
         class LegacyInspectionError(
             providers.ClaudeCredentialInspectionInconclusive
@@ -22488,6 +22562,7 @@ class ProviderPolicyTest(unittest.TestCase):
         forwarded = providers.ForwardedSignal(signal.SIGTERM)
         server = mock.Mock()
         server.is_serving.return_value = False
+        server.serve_error.return_value = None
         thread = mock.Mock()
         thread.ident = 123
         thread.is_alive.return_value = False
@@ -22585,6 +22660,44 @@ class ProviderPolicyTest(unittest.TestCase):
         server.server_close.assert_called_once_with()
         thread.join.assert_called_once()
 
+    def test_claude_unix_proxy_post_start_serve_failure_is_inconclusive(
+        self,
+    ) -> None:
+        serve_error = RuntimeError("injected post-start serve failure")
+        server = mock.Mock()
+        server.wait_until_serving.return_value = True
+        server.is_serving.return_value = False
+        server.serve_error.return_value = serve_error
+        thread = mock.Mock()
+        thread.is_alive.return_value = False
+
+        def create_server(
+            socket_path: pathlib.Path,
+            **_kwargs: object,
+        ) -> mock.Mock:
+            socket_path.touch(mode=0o600)
+            return server
+
+        with (
+            mock.patch.object(
+                providers,
+                "_ClaudeUnixProxyServer",
+                side_effect=create_server,
+            ),
+            mock.patch.object(providers.threading, "Thread", return_value=thread),
+            self.assertRaisesRegex(
+                providers.ClaudeCredentialInspectionInconclusive,
+                "serve loop failed after startup",
+            ) as raised,
+        ):
+            with providers._claude_unix_connect_proxy(self.review, {}):
+                pass
+
+        self.assertIs(raised.exception.__cause__, serve_error)
+        server.shutdown.assert_not_called()
+        server.server_close.assert_called_once_with()
+        thread.join.assert_called_once()
+
     def test_claude_unix_proxy_cleanup_preserves_control_flow_and_continues(
         self,
     ) -> None:
@@ -22592,6 +22705,7 @@ class ProviderPolicyTest(unittest.TestCase):
         server = mock.Mock()
         server.wait_until_serving.return_value = True
         server.is_serving.return_value = True
+        server.serve_error.return_value = None
         server.shutdown.side_effect = OSError("injected shutdown failure")
         thread = mock.Mock()
         thread.is_alive.return_value = False
@@ -22813,6 +22927,7 @@ class ProviderPolicyTest(unittest.TestCase):
         forwarded = providers.ForwardedSignal(signal.SIGTERM)
         server = mock.Mock()
         server.is_serving.return_value = False
+        server.serve_error.return_value = None
         thread = mock.Mock()
         thread.ident = 123
         thread.is_alive.return_value = False
@@ -22887,6 +23002,96 @@ class ProviderPolicyTest(unittest.TestCase):
         server.server_close.assert_called_once_with()
         thread.join.assert_called_once()
 
+    def test_claude_proxy_post_start_serve_failure_is_inconclusive(self) -> None:
+        serve_error = RuntimeError("injected post-start serve failure")
+        server = mock.Mock()
+        server.server_address = ("127.0.0.1", 43210)
+        server.wait_until_serving.return_value = True
+        server.is_serving.return_value = False
+        server.serve_error.return_value = serve_error
+        thread = mock.Mock()
+        thread.is_alive.return_value = False
+
+        with (
+            mock.patch.object(
+                providers,
+                "_ClaudeProxyServer",
+                return_value=server,
+            ),
+            mock.patch.object(providers.threading, "Thread", return_value=thread),
+            self.assertRaisesRegex(
+                providers.ClaudeCredentialInspectionInconclusive,
+                "serve loop failed after startup",
+            ) as raised,
+        ):
+            with providers._claude_connect_proxy({}):
+                pass
+
+        self.assertIs(raised.exception.__cause__, serve_error)
+        server.shutdown.assert_not_called()
+        server.server_close.assert_called_once_with()
+        thread.join.assert_called_once()
+
+    def test_claude_proxy_shutdown_prioritizes_post_start_serve_failure(
+        self,
+    ) -> None:
+        serve_error = RuntimeError("injected post-start serve failure")
+        server_close_error = OSError("injected server-close failure")
+        server = mock.Mock()
+        server.is_serving.return_value = False
+        server.server_close.side_effect = server_close_error
+        server.serve_error.return_value = serve_error
+        thread = mock.Mock()
+        thread.is_alive.return_value = False
+
+        with self.assertRaisesRegex(
+            providers.ClaudeCredentialInspectionInconclusive,
+            "serve loop failed after startup",
+        ) as raised:
+            providers._shutdown_claude_proxy_server(
+                server,
+                thread,
+                thread_started=True,
+                primary_error=None,
+            )
+
+        chain: list[BaseException] = []
+        current: BaseException | None = raised.exception
+        while current is not None and len(chain) < 8:
+            chain.append(current)
+            current = current.__cause__
+        self.assertIn(serve_error, chain)
+        server.server_close.assert_called_once_with()
+        thread.join.assert_called_once()
+
+    def test_claude_proxy_shutdown_promotes_post_start_control_flow(
+        self,
+    ) -> None:
+        for serve_error in (
+            providers.ForwardedSignal(signal.SIGTERM),
+            KeyboardInterrupt("injected post-start interrupt"),
+            SystemExit("injected post-start exit"),
+        ):
+            with self.subTest(serve_error=type(serve_error).__name__):
+                server = mock.Mock()
+                server.is_serving.return_value = False
+                server.serve_error.return_value = serve_error
+                thread = mock.Mock()
+                thread.is_alive.return_value = False
+                body_error = RuntimeError("injected ordinary body failure")
+
+                with self.assertRaises(type(serve_error)) as raised:
+                    providers._shutdown_claude_proxy_server(
+                        server,
+                        thread,
+                        thread_started=True,
+                        primary_error=body_error,
+                    )
+
+                self.assertIs(raised.exception, serve_error)
+                server.server_close.assert_called_once_with()
+                thread.join.assert_called_once()
+
     def test_claude_proxy_cleanup_preserves_control_flow_and_continues(
         self,
     ) -> None:
@@ -22895,6 +23100,9 @@ class ProviderPolicyTest(unittest.TestCase):
         server.server_address = ("127.0.0.1", 43210)
         server.wait_until_serving.return_value = True
         server.is_serving.return_value = True
+        server.serve_error.return_value = RuntimeError(
+            "injected post-start serve failure"
+        )
         server.shutdown.side_effect = OSError("injected shutdown failure")
         thread = mock.Mock()
         thread.is_alive.return_value = False
