@@ -13,7 +13,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised by Python 3.10 CI
 
 
 SKILL_ROOT = pathlib.Path(__file__).resolve().parents[1]
-REPO_ROOT = SKILL_ROOT.parents[1]
+SKILL_SCOPE_ROOT = SKILL_ROOT.parents[1]
 SCRIPTS = SKILL_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
@@ -59,6 +59,35 @@ EXPECTED_CLAUDE_2_1_211_LOCK_ARTIFACTS = {
 }
 
 
+CI_FIXTURE_ROOT = SKILL_ROOT / "tests" / "fixtures" / "ci"
+CI_PROFILE_BY_SKILL_LAYOUT = {
+    pathlib.Path("skills/review-orchestration-playbook"): "canonical",
+    pathlib.Path(
+        "personal_codex/skills/review-orchestration-playbook"
+    ): "private",
+}
+
+
+def _ci_contract_context(skill_root: pathlib.Path) -> tuple[pathlib.Path, str]:
+    layouts = sorted(
+        CI_PROFILE_BY_SKILL_LAYOUT.items(),
+        key=lambda item: len(item[0].parts),
+        reverse=True,
+    )
+    for layout, profile in layouts:
+        layout_depth = len(layout.parts)
+        if skill_root.parts[-layout_depth:] != layout.parts:
+            continue
+        repo_root = skill_root.parents[layout_depth - 1]
+        if repo_root / layout != skill_root:
+            continue
+        return repo_root, profile
+    raise AssertionError(f"unsupported review skill layout: {skill_root}")
+
+
+REPO_ROOT, CI_PROFILE = _ci_contract_context(SKILL_ROOT)
+
+
 class RepositoryContractTest(unittest.TestCase):
     def test_only_canonical_review_skill_entrypoint_remains(self) -> None:
         self.assertTrue((SKILL_ROOT / "SKILL.md").is_file())
@@ -72,7 +101,7 @@ class RepositoryContractTest(unittest.TestCase):
             "skills/review-orchestration-playbook/scripts/isolated_copilot_review",
             "skills/review-orchestration-playbook/scripts/git_readonly_shim",
         ):
-            self.assertFalse((REPO_ROOT / relative).exists(), relative)
+            self.assertFalse((SKILL_SCOPE_ROOT / relative).exists(), relative)
 
     def test_healthy_bounded_wait_is_not_task_completion(self) -> None:
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
@@ -101,7 +130,7 @@ class RepositoryContractTest(unittest.TestCase):
                 candidate.read_text(encoding="utf-8"),
                 str(candidate),
             )
-        with (REPO_ROOT / "agents/reviewer.toml").open("rb") as handle:
+        with (SKILL_SCOPE_ROOT / "agents/reviewer.toml").open("rb") as handle:
             reviewer = tomllib.load(handle)
         self.assertEqual(reviewer["model"], "gpt-5.6-sol")
         self.assertEqual(reviewer["model_reasoning_effort"], "xhigh")
@@ -410,22 +439,85 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("external-review-playbook", workflow)
         self.assertNotIn("copilot-review-playbook", workflow)
 
-    def test_ci_preserves_the_required_test_status_context(self) -> None:
-        workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    def test_ci_matches_the_reviewed_repo_profile_snapshot(self) -> None:
+        actual = (REPO_ROOT / ".github/workflows/ci.yml").read_bytes()
+        expected = (CI_FIXTURE_ROOT / f"{CI_PROFILE}.yml").read_bytes()
 
-        self.assertIn("\n  platform_tests:\n", workflow)
-        self.assertIn("name: platform-tests (${{ matrix.os }})", workflow)
-        self.assertIn("\n  test:\n", workflow)
-        self.assertIn("\n    name: test\n", workflow)
-        self.assertIn("if: ${{ always() }}", workflow)
-        self.assertIn("needs: platform_tests", workflow)
+        self.assertEqual(
+            actual,
+            expected,
+            f"CI workflow differs from reviewed {CI_PROFILE} snapshot",
+        )
+
+    def test_ci_contract_context_accepts_only_supported_layouts(self) -> None:
+        cases = (
+            (
+                pathlib.Path("/repo/skills/review-orchestration-playbook"),
+                (pathlib.Path("/repo"), "canonical"),
+            ),
+            (
+                pathlib.Path(
+                    "/repo/personal_codex/skills/review-orchestration-playbook"
+                ),
+                (pathlib.Path("/repo"), "private"),
+            ),
+        )
+        for skill_root, expected in cases:
+            with self.subTest(skill_root=skill_root):
+                self.assertEqual(_ci_contract_context(skill_root), expected)
+
+        with self.assertRaisesRegex(AssertionError, "unsupported review skill layout"):
+            _ci_contract_context(pathlib.Path("/repo/custom/review-playbook"))
+
+    def test_ci_contract_carries_every_reviewed_profile_snapshot(self) -> None:
+        self.assertEqual(
+            set(CI_PROFILE_BY_SKILL_LAYOUT.values()),
+            {"canonical", "private"},
+        )
+        for profile in CI_PROFILE_BY_SKILL_LAYOUT.values():
+            with self.subTest(profile=profile):
+                self.assertTrue((CI_FIXTURE_ROOT / f"{profile}.yml").is_file())
+
+    def test_reviewed_ci_snapshots_keep_the_intended_status_guards(self) -> None:
+        canonical = (CI_FIXTURE_ROOT / "canonical.yml").read_text(encoding="utf-8")
+        private = (CI_FIXTURE_ROOT / "private.yml").read_text(encoding="utf-8")
+
         self.assertIn(
-            "PLATFORM_TESTS_RESULT: ${{ needs.platform_tests.result }}",
-            workflow,
+            """  test:
+    name: test
+    if: ${{ always() }}
+    needs: platform_tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every platform test to pass
+        env:
+          PLATFORM_TESTS_RESULT: ${{ needs.platform_tests.result }}
+        run: |
+          test "$PLATFORM_TESTS_RESULT" = "success"
+""",
+            canonical,
         )
         self.assertIn(
-            'test "$PLATFORM_TESTS_RESULT" = "success"',
-            workflow,
+            """  test:
+    name: test
+    if: ${{ always() }}
+    needs:
+      - platform_tests
+      - python-39-compatibility
+      - platform-safety
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every platform test to pass
+        env:
+          PLATFORM_TESTS_RESULT: ${{ needs.platform_tests.result }}
+          PYTHON_39_RESULT: ${{ needs.python-39-compatibility.result }}
+          PLATFORM_SAFETY_RESULT: ${{ needs.platform-safety.result }}
+        run: |
+          test "$PLATFORM_TESTS_RESULT" = "success"
+          test "$PYTHON_39_RESULT" = "success"
+          test "$PLATFORM_SAFETY_RESULT" = "success"
+""",
+            private,
         )
 
     def test_helper_declares_and_tests_its_minimum_python_runtime(self) -> None:
