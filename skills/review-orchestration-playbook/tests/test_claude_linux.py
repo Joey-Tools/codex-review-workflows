@@ -5284,6 +5284,10 @@ class SandboxCommandTest(unittest.TestCase):
             "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB",
         ):
             self.assertIn(("--setenv", key, "1"), environment_triples)
+        self.assertIn(
+            ("--setenv", "CLAUDE_CONFIG_DIR", "/auth/config"),
+            environment_triples,
+        )
         workload = (
             "/opt/codex-review/bin/claude-linux-launcher",
             "--proxy",
@@ -5316,6 +5320,65 @@ class SandboxCommandTest(unittest.TestCase):
                 ","
             ),
         )
+
+    def test_rejects_config_without_dedicated_carrier_shape(self) -> None:
+        direct_config = self.helper / "config"
+        direct_config.mkdir(mode=0o700)
+        wrong_leaf = self.config_root / "settings"
+        wrong_leaf.mkdir(mode=0o700)
+
+        for label, config_dir in (
+            ("missing-carrier-root", direct_config),
+            ("wrong-config-leaf", wrong_leaf),
+        ):
+            with self.subTest(case=label), self.assertRaisesRegex(
+                claude_linux.LinuxRuntimeError,
+                "dedicated carrier root",
+            ):
+                claude_linux.build_sandbox_command(
+                    dataclasses.replace(self.spec, config_dir=config_dir),
+                    _linux_review_arguments(),
+                )
+
+    def test_rejects_auth_carrier_overlap_with_other_writable_roles(self) -> None:
+        home_config = self.home / "config"
+        tmp_config = self.tmp / "config"
+        carrier_home = self.config_root / "nested-home"
+        carrier_tmp = self.config_root / "nested-tmp"
+        for directory in (
+            home_config,
+            tmp_config,
+            carrier_home,
+            carrier_tmp,
+        ):
+            directory.mkdir(mode=0o700)
+
+        for label, spec in (
+            (
+                "config-under-home",
+                dataclasses.replace(self.spec, config_dir=home_config),
+            ),
+            (
+                "config-under-tmp",
+                dataclasses.replace(self.spec, config_dir=tmp_config),
+            ),
+            (
+                "home-under-carrier",
+                dataclasses.replace(self.spec, helper_home=carrier_home),
+            ),
+            (
+                "tmp-under-carrier",
+                dataclasses.replace(self.spec, helper_tmp=carrier_tmp),
+            ),
+        ):
+            with self.subTest(case=label), self.assertRaisesRegex(
+                claude_linux.LinuxRuntimeError,
+                "authentication carrier must not overlap",
+            ):
+                claude_linux.build_sandbox_command(
+                    spec,
+                    _linux_review_arguments(),
+                )
 
     def test_rejects_workspace_symlinks_to_authentication_carriers(self) -> None:
         link = self.workspace / "leak"

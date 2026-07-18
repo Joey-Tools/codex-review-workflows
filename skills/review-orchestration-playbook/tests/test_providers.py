@@ -416,6 +416,53 @@ class ProviderPolicyTest(unittest.TestCase):
             result[providers.CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV] = "00" * 32
         yield result
 
+    def assert_cleanup_diagnostic_preserves_original_cause(
+        self,
+        error: BaseException,
+        original_cause: BaseException,
+    ) -> None:
+        direct_cause = error.__cause__
+        if direct_cause is original_cause:
+            return
+        self.assertIsInstance(
+            direct_cause,
+            providers.ClaudeCredentialCleanupDiagnostic,
+        )
+        self.assertIs(direct_cause.__cause__, original_cause)
+
+    def assert_persistence_diagnostic_visible(
+        self,
+        error: BaseException,
+    ) -> None:
+        pending = [error]
+        visited: set[int] = set()
+        for _ in range(16):
+            if not pending:
+                break
+            current = pending.pop(0)
+            identity = id(current)
+            if identity in visited:
+                continue
+            visited.add(identity)
+            if any(
+                providers.CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC in note
+                for note in getattr(current, "__notes__", ())
+            ):
+                return
+            if (
+                isinstance(
+                    current,
+                    providers.ClaudeCredentialPersistenceDiagnostic,
+                )
+                and providers.CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC
+                in str(current)
+            ):
+                return
+            for related in (current.__cause__, current.__context__):
+                if related is not None:
+                    pending.append(related)
+        self.fail("Claude persistence diagnostic is missing from the exception chain")
+
     def test_credential_cleanup_signal_overrides_ordinary_primary(self) -> None:
         primary = providers.ClaudeCredentialInspectionInconclusive(
             "injected credential operation failure"
@@ -449,6 +496,52 @@ class ProviderPolicyTest(unittest.TestCase):
                 forwarded.__cause__,
                 providers.ClaudeCredentialCleanupDiagnostic,
             )
+
+    def test_cleanup_diagnostic_fallback_preserves_original_cause(self) -> None:
+        class LegacyInspectionError(
+            providers.ClaudeCredentialInspectionInconclusive
+        ):
+            add_note = None
+
+        primary = LegacyInspectionError("injected legacy primary")
+        original_cause = RuntimeError("injected original cause")
+        primary.__cause__ = original_cause
+
+        providers._attach_claude_credential_cleanup_failure(
+            primary,
+            OSError("injected cleanup failure"),
+        )
+
+        self.assert_cleanup_diagnostic_preserves_original_cause(
+            primary,
+            original_cause,
+        )
+
+    def test_persistence_diagnostic_fallback_preserves_control_flow(self) -> None:
+        class LegacyKeyboardInterrupt(KeyboardInterrupt):
+            add_note = None
+
+        persistence_error = providers.ClaudeCredentialInspectionInconclusive(
+            "injected persistence failure"
+        )
+        interruption = LegacyKeyboardInterrupt("injected control flow")
+
+        selected = (
+            providers._attach_claude_persistence_failure_preserving_control_flow(
+                persistence_error,
+                interruption,
+            )
+        )
+
+        self.assertIs(selected, interruption)
+        self.assertTrue(
+            getattr(
+                interruption,
+                "_codex_claude_refresh_persistence_failed",
+                False,
+            )
+        )
+        self.assert_persistence_diagnostic_visible(interruption)
 
     def attempt(
         self,
@@ -1029,7 +1122,10 @@ class ProviderPolicyTest(unittest.TestCase):
             ):
                 self.fail("failed broker unexpectedly started")
 
-        self.assertIs(raised.exception.__cause__, serve_error)
+        self.assert_cleanup_diagnostic_preserves_original_cause(
+            raised.exception,
+            serve_error,
+        )
         server.server_close.assert_called()
         self.assertEqual(credential, bytearray(len(credential)))
 
@@ -6812,7 +6908,10 @@ class ProviderPolicyTest(unittest.TestCase):
         retain.assert_not_called()
         commit.assert_not_called()
         persist.assert_not_called()
-        self.assertIs(raised.exception.__cause__, setup_error)
+        self.assert_cleanup_diagnostic_preserves_original_cause(
+            raised.exception,
+            setup_error,
+        )
         for attribute in (
             "_codex_claude_retained_credential_carrier",
             "_codex_claude_retained_credential_artifact",
@@ -6937,7 +7036,10 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(root_failures, 1)
         self.assertEqual((retain.call_count, commit.call_count), (1, 1))
         persist.assert_not_called()
-        self.assertIs(raised.exception.__cause__, setup_error)
+        self.assert_cleanup_diagnostic_preserves_original_cause(
+            raised.exception,
+            setup_error,
+        )
         self.assert_macos_recovery_carrier(raised.exception, first_bytes)
 
     def test_post_commit_registration_failure_retains_current_carrier(
@@ -12463,15 +12565,7 @@ class ProviderPolicyTest(unittest.TestCase):
                         False,
                     )
                 )
-                notes = getattr(scope_interruption, "__notes__", ())
-                self.assertTrue(
-                    any(
-                        providers.CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC
-                        in note
-                        for note in notes
-                    ),
-                    notes,
-                )
+                self.assert_persistence_diagnostic_visible(scope_interruption)
 
         for abandoned_primary in (False, True):
             for label, interruption_factory in scope_interruption_factories:

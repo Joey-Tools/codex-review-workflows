@@ -4554,6 +4554,15 @@ def _validate_sandbox_spec(spec: SandboxSpec) -> SandboxSpec:
         raise LinuxRuntimeError(
             "Claude writable config must be nested in a dedicated carrier root"
         )
+    if any(
+        _is_relative_to(config_root, writable_role)
+        or _is_relative_to(writable_role, config_root)
+        for writable_role in private_paths[:2]
+    ):
+        raise LinuxRuntimeError(
+            "Claude authentication carrier must not overlap another helper "
+            "writable role"
+        )
     proxy_socket = _validate_private_socket(
         spec.proxy_socket,
         helper_root=helper_root,

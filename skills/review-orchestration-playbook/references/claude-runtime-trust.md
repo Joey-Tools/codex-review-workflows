@@ -863,7 +863,11 @@ credential file as a non-symlink regular file owned by the current user with
 exact mode `0600`. For that attempt, copy it into a new helper-owned writable
 `/auth` carrier root with private config at `/auth/config`; the original host
 credential is never mounted. The layout permits the primary lock under the
-config plus the legacy sibling `/auth/config.lock`. Require valid credential
+config plus the legacy sibling `/auth/config.lock`. Before binding the carrier
+root at `/auth`, require its canonical `config` child and direct-helper-root
+shape, and reject any equality or ancestor/descendant overlap with the separate
+helper home or temporary roles; one host directory must never be exposed at
+both an authentication and a general writable mount. Require valid credential
 JSON plus a usable refresh token, but do not require future access-token
 lifetime. The trusted runtime may update only the staged carrier through its
 authentication path, while the inner permission policy denies all of `/auth`

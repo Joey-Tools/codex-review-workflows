@@ -176,13 +176,30 @@ class ClaudeRefreshLockTest(unittest.TestCase):
             config = self._config_dir(pathlib.Path(temporary)).resolve()
             real_renew = claude_refresh_lock._renew_lock
             real_wait = claude_refresh_lock.threading.Event.wait
+            completed_renewals = 0
+            completed_renewals_lock = threading.Lock()
 
             def fast_wait(
                 event: object,
                 timeout: float | None = None,
             ) -> bool:
-                bounded = 0.01 if timeout is None else min(timeout, 0.01)
+                if timeout is None:
+                    return real_wait(event, None)
+                bounded = min(timeout, 0.01)
                 return real_wait(event, bounded)
+
+            def tracked_renew(
+                lock: object,
+                protocol: claude_refresh_lock.ClaudeRefreshLockProtocol,
+            ) -> None:
+                nonlocal completed_renewals
+                real_renew(lock, protocol)
+                with completed_renewals_lock:
+                    completed_renewals += 1
+
+            def renewal_count() -> int:
+                with completed_renewals_lock:
+                    return completed_renewals
 
             with (
                 mock.patch.object(
@@ -193,8 +210,8 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 mock.patch.object(
                     claude_refresh_lock,
                     "_renew_lock",
-                    wraps=real_renew,
-                ) as renew,
+                    side_effect=tracked_renew,
+                ),
             ):
                 lease = claude_refresh_lock.acquire_claude_refresh_lock(
                     config,
@@ -207,7 +224,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
 
                 deadline = time.monotonic() + 2.0
                 while time.monotonic() < deadline:
-                    if renew.call_count >= 4 and all(
+                    if renewal_count() >= 4 and all(
                         path.stat().st_mtime_ns > old_mtime_ns
                         for path in lease.paths
                     ):
@@ -216,14 +233,20 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 else:
                     self.fail("Claude refresh-lock heartbeat did not renew both locks")
 
-                calls_before_additional_wait = renew.call_count
-                time.sleep(0.05)
-                self.assertGreater(renew.call_count, calls_before_additional_wait)
+                calls_before_additional_wait = renewal_count()
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    if renewal_count() > calls_before_additional_wait:
+                        break
+                    time.sleep(0.01)
+                else:
+                    self.fail("Claude refresh-lock heartbeat stopped renewing")
 
                 lease.release()
-                calls_after_release = renew.call_count
-                time.sleep(0.04)
-                self.assertEqual(renew.call_count, calls_after_release)
+                heartbeat_thread = lease._heartbeat_thread
+                self.assertIsNotNone(heartbeat_thread)
+                assert heartbeat_thread is not None
+                self.assertFalse(heartbeat_thread.is_alive())
 
     def test_blocked_heartbeat_cannot_prevent_bounded_release(self) -> None:
         heartbeat_entered = threading.Event()
