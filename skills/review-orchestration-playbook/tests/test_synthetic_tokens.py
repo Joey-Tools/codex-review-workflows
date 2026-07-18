@@ -77,6 +77,39 @@ def reduction_fixture(rule: str, marker: bytes = b"A") -> str:
     return assignment_text("access_token", value)
 
 
+def rhs_proof_boundary_payloads() -> tuple[bytes, bytes, bytes, bytes]:
+    candidate = reduction_secret("github-token", b"C")
+    assignment_start = 200
+    prefix = b"x" * (assignment_start - 1) + b"\n"
+
+    unsafe_candidate_start = 400
+    continued = b"api_token = prefix + /*"
+    provider_prefix = b'*/ "wrap/'
+    unsafe = (
+        prefix
+        + continued
+        + b"x"
+        * (unsafe_candidate_start - len(prefix) - len(continued) - len(provider_prefix))
+        + provider_prefix
+        + candidate
+        + b'+alpha"\n'
+    )
+
+    remote_candidate_start = 500
+    safe_assignment = b'api_token = "placeholder"\nstate = "expired"\n'
+    safe_prefix = prefix + safe_assignment + b"#"
+    safe = (
+        safe_prefix
+        + b"x" * (remote_candidate_start - len(safe_prefix) - 1)
+        + b"\n"
+        + candidate
+        + b"\n"
+    )
+    ordinary_prefix = prefix + safe_assignment + b"#"
+    ordinary = ordinary_prefix + b"x" * (520 - len(ordinary_prefix) - 1) + b"\n"
+    return candidate, unsafe, safe, ordinary
+
+
 def assignment_bytes(key: bytes, value: bytes) -> bytes:
     return key + b' = "' + value + b'"'
 
@@ -1642,7 +1675,10 @@ class PublicPoolScannerTest(unittest.TestCase):
         )
 
         proof_bytes = 4096
-        long_opposite_record = b"+" + b"x" * (proof_bytes - 2) + b"\n"
+        # Leave enough of the absolute assignment proof window for the next
+        # source-side declaration that terminates this diff assignment.
+        opposite_record_bytes = proof_bytes // 2
+        long_opposite_record = b"+" + b"x" * (opposite_record_bytes - 2) + b"\n"
         long_opposite_payload = (
             b"@@ -1,3 +1,1 @@\n"
             b"-" + triple_assignment + long_opposite_record + b"-def test_fixture():\n"
@@ -3272,6 +3308,650 @@ class PublicPoolScannerTest(unittest.TestCase):
                 _continue_after_blocking=True,
                 _event_budget=budget,
             )
+
+    def test_provider_rhs_beyond_proof_frontier_is_retained_then_blocked(
+        self,
+    ) -> None:
+        proof_bytes = 256
+        overlap = 128
+        candidate = b"ghp_" + b"A" * 36
+        assignment_prefix = b"api_token = ("
+        candidate_start = proof_bytes + 16
+        wrapper_count = candidate_start - len(assignment_prefix)
+        payload = (
+            assignment_prefix
+            + b"(" * wrapper_count
+            + candidate
+            + b")" * (wrapper_count + 1)
+            + b"\n"
+        )
+        self.assertEqual(payload.index(candidate), candidate_start)
+
+        with mock.patch.object(
+            workspace,
+            "MAX_SECRET_PREFIX_PROOF_BYTES",
+            proof_bytes,
+        ):
+            incomplete = workspace._scan_secret_value(
+                payload,
+                maximum_end=proof_bytes - 1,
+                suffix_context_complete=False,
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+            frontier = workspace._scan_secret_value(
+                payload,
+                maximum_end=proof_bytes,
+                suffix_context_complete=False,
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+
+        self.assertIsNone(incomplete.blocking_rule)
+        self.assertEqual(incomplete.incomplete_suffix_start, 0)
+        self.assertEqual(incomplete.incomplete_suffix_retention_start, 0)
+        self.assertEqual(frontier.blocking_rule, "generic-secret-assignment")
+        self.assertIsNone(frontier.incomplete_suffix_start)
+
+        with (
+            mock.patch.object(
+                workspace,
+                "MAX_SECRET_PREFIX_PROOF_BYTES",
+                proof_bytes,
+            ),
+            mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", overlap),
+            mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 256),
+        ):
+            streamed = workspace._stream_secret_scan(
+                io.BytesIO(payload),
+                size=len(payload),
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+
+        self.assertEqual(streamed.blocking_rule, "generic-secret-assignment")
+        self.assertEqual(
+            streamed.blocking_candidates,
+            {candidate: {"github-token"}},
+        )
+
+    def test_open_rhs_before_delayed_provider_is_retained_and_blocked(self) -> None:
+        proof_bytes = 256
+        overlap = 32
+        candidate, unsafe, _safe, _ordinary = rhs_proof_boundary_payloads()
+        self.assertEqual(unsafe.index(b"api_token"), 200)
+        self.assertEqual(unsafe.index(candidate), 400)
+        self.assertGreater(unsafe.index(candidate), proof_bytes + overlap)
+
+        with (
+            mock.patch.object(
+                workspace,
+                "MAX_SECRET_PREFIX_PROOF_BYTES",
+                proof_bytes,
+            ),
+            mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", overlap),
+            mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 64),
+        ):
+            direct = workspace._scan_secret_value(
+                unsafe,
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+            streamed = workspace._stream_secret_scan(
+                io.BytesIO(unsafe),
+                size=len(unsafe),
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+
+        self.assertEqual(direct.blocking_rule, "generic-secret-assignment")
+        self.assertEqual(
+            direct.blocking_candidates,
+            {candidate: {"github-token"}},
+        )
+        self.assertEqual(streamed, direct)
+
+    def test_closed_rhs_releases_remote_provider_to_standalone_scan(self) -> None:
+        proof_bytes = 256
+        overlap = 32
+        candidate, _unsafe, safe, _ordinary = rhs_proof_boundary_payloads()
+        self.assertEqual(safe.index(b"api_token"), 200)
+        self.assertEqual(safe.index(candidate), 500)
+        self.assertGreater(safe.index(candidate), 200 + proof_bytes)
+
+        with (
+            mock.patch.object(
+                workspace,
+                "MAX_SECRET_PREFIX_PROOF_BYTES",
+                proof_bytes,
+            ),
+            mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", overlap),
+            mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 64),
+        ):
+            direct = workspace._scan_secret_value(
+                safe,
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+            streamed = workspace._stream_secret_scan(
+                io.BytesIO(safe),
+                size=len(safe),
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+
+        self.assertIsNone(direct.blocking_rule)
+        self.assertEqual(
+            direct.blocking_candidates,
+            {candidate: {"github-token"}},
+        )
+        self.assertEqual(streamed, direct)
+
+    def test_closed_rhs_without_provider_is_not_retained_or_overcharged(self) -> None:
+        class SliceCountingBytes(bytes):
+            def __new__(cls, value: bytes):
+                instance = super().__new__(cls, value)
+                instance.maximum_slice = 0
+                return instance
+
+            def __getitem__(self, key):
+                if isinstance(key, slice) and key.step in (None, 1):
+                    start, stop, _step = key.indices(len(self))
+                    self.maximum_slice = max(self.maximum_slice, stop - start)
+                return super().__getitem__(key)
+
+        proof_bytes = 256
+        overlap = 32
+        _candidate, _unsafe, _safe, ordinary = rhs_proof_boundary_payloads()
+        marker = b'api_token = "placeholder"'
+        recorded_values: list[bytes] = []
+        scan_secret_value = workspace._scan_secret_value
+
+        def record_scan(value: bytes, *args, **kwargs):
+            recorded_values.append(value)
+            return scan_secret_value(value, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                workspace,
+                "MAX_SECRET_PREFIX_PROOF_BYTES",
+                proof_bytes,
+            ),
+            mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", overlap),
+            mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 64),
+            mock.patch.object(
+                workspace,
+                "_scan_secret_value",
+                side_effect=record_scan,
+            ),
+        ):
+            streamed = workspace._stream_secret_scan(
+                io.BytesIO(ordinary),
+                size=len(ordinary),
+            )
+
+        self.assertEqual(streamed, workspace.SecretScanResult.empty())
+        self.assertEqual(sum(marker in value for value in recorded_values), 1)
+        self.assertTrue(recorded_values)
+        self.assertEqual(len(recorded_values[0]), proof_bytes + overlap)
+        self.assertTrue(
+            all(len(value) <= 64 + 2 * overlap for value in recorded_values[1:])
+        )
+
+        placeholder_line = marker + b"\n"
+        for repeated_line in (
+            placeholder_line,
+            b'  api_token = "placeholder"\n',
+            b'  "api_token": "placeholder"\n',
+            b'  "api_token": "placeholder"\r\n',
+            b'api_token = "placeholder"; ',
+            b'"api_token": "placeholder"; ',
+        ):
+            with self.subTest(repeated_line=repeated_line):
+                repeated = SliceCountingBytes(
+                    repeated_line * 4096 + b'state = "expired"\n'
+                )
+                budget = workspace.SecretScanBudget(
+                    workspace.MAX_SECRET_SCAN_EVENTS,
+                    remaining_prefix_proof_bytes=len(repeated),
+                )
+                repeated_scan = workspace._scan_secret_value(
+                    repeated,
+                    suffix_context_complete=False,
+                    _event_budget=budget,
+                )
+                self.assertEqual(repeated_scan, workspace.SecretScanResult.empty())
+                self.assertGreater(budget.remaining_prefix_proof_bytes, 0)
+                self.assertLess(repeated.maximum_slice, 1024)
+
+        distant = b"x" * 128 + b"\n" + placeholder_line
+        exhausted_budget = workspace.SecretScanBudget(
+            workspace.MAX_SECRET_SCAN_EVENTS,
+            remaining_prefix_proof_bytes=64,
+        )
+        with self.assertRaisesRegex(
+            workspace.ReviewError,
+            "prefix proof limit",
+        ):
+            workspace._scan_secret_value(
+                distant,
+                suffix_context_complete=False,
+                _event_budget=exhausted_budget,
+            )
+
+    def test_closed_rhs_cache_does_not_bypass_absolute_proof_cap(self) -> None:
+        proof_bytes = 128
+        overlap = 32
+        placeholder_line = b'api_token = "placeholder"\n'
+        payload = placeholder_line * 8 + b"x" * (proof_bytes + overlap)
+
+        with (
+            mock.patch.object(
+                workspace,
+                "MAX_SECRET_PREFIX_PROOF_BYTES",
+                proof_bytes,
+            ),
+            mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", overlap),
+            mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 64),
+        ):
+            direct = workspace._scan_secret_value(payload)
+            streamed = workspace._stream_secret_scan(
+                io.BytesIO(payload),
+                size=len(payload),
+            )
+
+        self.assertEqual(direct.blocking_rule, "generic-secret-assignment")
+        self.assertEqual(streamed, direct)
+
+    def test_closed_rhs_frontier_starts_after_external_wrapper(self) -> None:
+        payload = (
+            b'configure(api_token = "placeholder"\n); '
+            b'api_token = "placeholder"; state = "expired"'
+        )
+
+        scan = workspace._scan_secret_value(
+            payload,
+            suffix_context_complete=False,
+        )
+
+        self.assertEqual(scan, workspace.SecretScanResult.empty())
+
+    def test_open_rhs_without_provider_is_consistent_at_proof_cap(self) -> None:
+        proof_bytes = 64
+        overlap = 16
+        payload = b"x" * 89 + b"\napi_token: |\n" + b"x" * 100 + b"\n"
+
+        with (
+            mock.patch.object(
+                workspace,
+                "MAX_SECRET_PREFIX_PROOF_BYTES",
+                proof_bytes,
+            ),
+            mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", overlap),
+            mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 32),
+        ):
+            direct = workspace._scan_secret_value(
+                payload,
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+            streamed = workspace._stream_secret_scan(
+                io.BytesIO(payload),
+                size=len(payload),
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+
+        self.assertEqual(direct.blocking_rule, "generic-secret-assignment")
+        self.assertEqual(direct.blocking_candidates, {})
+        self.assertEqual(streamed, direct)
+
+    def test_unknown_multiline_rhs_stays_open_until_the_proof_cap(self) -> None:
+        proof_bytes = 64
+        overlap = 32
+        candidate = reduction_secret("github-token", b"C")
+        candidate_start = 100
+        prefixes = (
+            b"api_token: |\n  first\n",
+            b"api_token: >-\n  first\n",
+            b"api_token = <<EOF\nfirst\n",
+        )
+        for prefix in prefixes:
+            with self.subTest(prefix=prefix):
+                payload = (
+                    prefix
+                    + b"x" * (candidate_start - len(prefix) - 1)
+                    + b"\n"
+                    + candidate
+                    + b"\nEOF\n"
+                )
+                self.assertEqual(payload.index(candidate), candidate_start)
+                self.assertGreater(candidate_start, proof_bytes + overlap)
+                with (
+                    mock.patch.object(
+                        workspace,
+                        "MAX_SECRET_PREFIX_PROOF_BYTES",
+                        proof_bytes,
+                    ),
+                    mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", overlap),
+                    mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 64),
+                ):
+                    direct = workspace._scan_secret_value(
+                        payload,
+                        capture_blocking_candidates=True,
+                        _continue_after_blocking=True,
+                    )
+                    streamed = workspace._stream_secret_scan(
+                        io.BytesIO(payload),
+                        size=len(payload),
+                        capture_blocking_candidates=True,
+                        _continue_after_blocking=True,
+                    )
+
+                self.assertEqual(
+                    direct.blocking_rule,
+                    "generic-secret-assignment",
+                )
+                self.assertEqual(
+                    direct.blocking_candidates,
+                    {candidate: {"github-token"}},
+                )
+                self.assertEqual(streamed, direct)
+
+    def test_completed_scan_blocks_open_rhs_after_an_earlier_provider(
+        self,
+    ) -> None:
+        proof_bytes = 64
+        overlap = 32
+        candidate = reduction_secret("github-token", b"C")
+        payload = candidate + b"\napi_token: |\n  first\n" + b"x" * 90 + b"\n"
+
+        with (
+            mock.patch.object(
+                workspace,
+                "MAX_SECRET_PREFIX_PROOF_BYTES",
+                proof_bytes,
+            ),
+            mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", overlap),
+            mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 64),
+        ):
+            direct = workspace._scan_secret_value(
+                payload,
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+            streamed = workspace._stream_secret_scan(
+                io.BytesIO(payload),
+                size=len(payload),
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+
+        self.assertEqual(direct.blocking_rule, "generic-secret-assignment")
+        self.assertEqual(
+            direct.blocking_candidates,
+            {candidate: {"github-token"}},
+        )
+        self.assertEqual(streamed, direct)
+
+    def test_rhs_closure_proves_external_source_context_before_release(self) -> None:
+        proof_bytes = 64
+        overlap = 32
+        candidate_start = 100
+        candidate = reduction_secret("github-token", b"C")
+        cases = (
+            (
+                "unclosed-source-string",
+                b'payload = "\napi_token = "placeholder"\nstate = "expired"\n',
+                True,
+            ),
+            (
+                "unclosed-triple-source-string",
+                b'payload = """\napi_token = "placeholder"\nstate = "expired"\n',
+                True,
+            ),
+            (
+                "unclosed-block-comment",
+                b'/* fixture\napi_token = "placeholder"\nstate = "expired"\n',
+                True,
+            ),
+            (
+                "closed-function-wrapper",
+                b'configure(api_token = "placeholder")\nstate = "expired"\n',
+                False,
+            ),
+        )
+        provider_prefix = b"wrap/"
+        for label, prefix, should_block in cases:
+            with self.subTest(case=label):
+                payload = (
+                    prefix
+                    + b"x" * (candidate_start - len(prefix) - len(provider_prefix))
+                    + provider_prefix
+                    + candidate
+                    + b"+alpha\n"
+                )
+                self.assertEqual(payload.index(candidate), candidate_start)
+                with (
+                    mock.patch.object(
+                        workspace,
+                        "MAX_SECRET_PREFIX_PROOF_BYTES",
+                        proof_bytes,
+                    ),
+                    mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", overlap),
+                    mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 64),
+                ):
+                    direct = workspace._scan_secret_value(
+                        payload,
+                        capture_blocking_candidates=True,
+                        _continue_after_blocking=True,
+                    )
+                    streamed = workspace._stream_secret_scan(
+                        io.BytesIO(payload),
+                        size=len(payload),
+                        capture_blocking_candidates=True,
+                        _continue_after_blocking=True,
+                    )
+
+                self.assertEqual(
+                    direct.blocking_rule,
+                    "generic-secret-assignment" if should_block else None,
+                )
+                self.assertEqual(
+                    direct.blocking_candidates,
+                    {candidate: {"github-token"}},
+                )
+                self.assertEqual(streamed, direct)
+
+    def test_provider_rhs_span_and_wrapper_proof_cannot_cross_cap(self) -> None:
+        proof_bytes = 64
+        candidate = b"ghp_" + b"A" * 36
+        cases = (
+            (
+                "provider-span",
+                b"api_token = "
+                + b"(" * 37
+                + b'"'
+                + candidate
+                + b'"'
+                + b")" * 37
+                + b"\n",
+            ),
+            (
+                "direct-quoted-provider-span",
+                b"api_token = " + b" " * 20 + b'"' + candidate + b'"\n',
+            ),
+            (
+                "outer-wrappers",
+                b"api_token = "
+                + b"(" * 10
+                + b'"'
+                + candidate
+                + b'"'
+                + b")" * 10
+                + b"\n",
+            ),
+            (
+                "tail-terminator",
+                b"api_token = " + b" " * 10 + b'"' + candidate + b'";\n',
+            ),
+        )
+        for label, payload in cases:
+            with self.subTest(case=label):
+                normal_cap = workspace._scan_secret_value(
+                    payload,
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+                with mock.patch.object(
+                    workspace,
+                    "MAX_SECRET_PREFIX_PROOF_BYTES",
+                    proof_bytes,
+                ):
+                    before_frontier = workspace._scan_secret_value(
+                        payload,
+                        maximum_end=proof_bytes - 1,
+                        suffix_context_complete=False,
+                        capture_blocking_candidates=True,
+                        _continue_after_blocking=True,
+                    )
+                    at_frontier = workspace._scan_secret_value(
+                        payload,
+                        maximum_end=proof_bytes,
+                        suffix_context_complete=False,
+                        capture_blocking_candidates=True,
+                        _continue_after_blocking=True,
+                    )
+                    complete = workspace._scan_secret_value(
+                        payload,
+                        capture_blocking_candidates=True,
+                        _continue_after_blocking=True,
+                    )
+
+                self.assertIsNone(normal_cap.blocking_rule)
+                self.assertEqual(
+                    normal_cap.blocking_candidates,
+                    {candidate: {"github-token"}},
+                )
+                self.assertIsNone(before_frontier.blocking_rule)
+                self.assertEqual(before_frontier.incomplete_suffix_start, 0)
+                self.assertEqual(
+                    at_frontier.blocking_rule,
+                    "generic-secret-assignment",
+                )
+                self.assertEqual(
+                    complete.blocking_rule,
+                    "generic-secret-assignment",
+                )
+                self.assertEqual(
+                    complete.blocking_candidates,
+                    {candidate: {"github-token"}},
+                )
+
+        with mock.patch.object(
+            workspace,
+            "MAX_SECRET_PREFIX_PROOF_BYTES",
+            proof_bytes,
+        ):
+            short_incomplete = workspace._scan_secret_value(
+                b'api_token = "' + candidate + b'"',
+                suffix_context_complete=False,
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+        self.assertIsNone(short_incomplete.blocking_rule)
+        self.assertEqual(short_incomplete.incomplete_suffix_start, 0)
+
+    def test_provider_rhs_cap_does_not_copy_absolute_proof_prefix(self) -> None:
+        class SliceCountingBytes(bytes):
+            def __new__(cls, value: bytes):
+                instance = super().__new__(cls, value)
+                instance.slice_reads = []
+                return instance
+
+            def __getitem__(self, key):
+                if isinstance(key, slice) and key.step in (None, 1):
+                    start, stop, _step = key.indices(len(self))
+                    self.slice_reads.append((start, stop))
+                return super().__getitem__(key)
+
+        proof_bytes = 1024
+        assignment_start = 512
+        candidate = b"ghp_" + b"A" * 36
+        assignment_prefix = b"api_token = ("
+        candidate_start = assignment_start + proof_bytes + 16
+        wrapper_count = candidate_start - assignment_start - len(assignment_prefix)
+        payload = SliceCountingBytes(
+            b"x" * (assignment_start - 1)
+            + b"\n"
+            + assignment_prefix
+            + b"(" * wrapper_count
+            + candidate
+            + b")" * (wrapper_count + 1)
+            + b"\n"
+        )
+
+        with mock.patch.object(
+            workspace,
+            "MAX_SECRET_PREFIX_PROOF_BYTES",
+            proof_bytes,
+        ):
+            scan = workspace._scan_secret_value(
+                payload,
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+
+        self.assertEqual(scan.blocking_rule, "generic-secret-assignment")
+        self.assertEqual(
+            scan.blocking_candidates,
+            {candidate: {"github-token"}},
+        )
+        absolute_proof_end = assignment_start + proof_bytes
+        self.assertNotIn((0, absolute_proof_end), payload.slice_reads)
+        self.assertLess(
+            max((stop - start for start, stop in payload.slice_reads), default=0),
+            proof_bytes,
+        )
+
+    def test_provider_rhs_whitespace_lookahead_is_linear(self) -> None:
+        class IndexCountingBytes(bytes):
+            def __new__(cls, value: bytes):
+                instance = super().__new__(cls, value)
+                instance.integer_reads = Counter()
+                return instance
+
+            def __getitem__(self, key):
+                if isinstance(key, int) and key >= 0:
+                    self.integer_reads[key] += 1
+                return super().__getitem__(key)
+
+        whitespace_count = 512
+        candidate = b"ghp_" + b"A" * 36
+        assignment_prefix = b"api_token = ("
+        payload = IndexCountingBytes(
+            assignment_prefix + b" " * whitespace_count + candidate + b")\n"
+        )
+        scan = workspace._scan_secret_value(
+            payload,
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+
+        self.assertIsNone(scan.blocking_rule)
+        self.assertEqual(
+            scan.blocking_candidates,
+            {candidate: {"github-token"}},
+        )
+        whitespace_reads = tuple(
+            payload.integer_reads[index]
+            for index in range(
+                len(assignment_prefix),
+                len(assignment_prefix) + whitespace_count,
+            )
+        )
+        self.assertLessEqual(max(whitespace_reads), 6)
+        self.assertLessEqual(sum(whitespace_reads), whitespace_count * 6)
 
     def test_short_provider_candidate_keeps_incomplete_quoted_rhs_blocker(
         self,
@@ -5367,6 +6047,100 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         with self.assertRaisesRegex(ReviewError, "generic-secret-assignment"):
             self.prepare(repo=repo, base=base, head=head)
 
+    def test_provider_rhs_beyond_proof_cap_does_not_count_as_reduction(self) -> None:
+        proof_bytes = 256
+        candidate = b"ghp_" + b"A" * 36
+        assignment_prefix = b"api_token = ("
+        candidate_start = proof_bytes + 16
+        wrapper_count = candidate_start - len(assignment_prefix)
+        fixture = (
+            assignment_prefix
+            + b"(" * wrapper_count
+            + candidate
+            + b")" * (wrapper_count + 1)
+            + b"\n"
+        ).decode("ascii")
+        repo, base = self.new_repo({"fixture.txt": fixture * 2})
+        (repo / "fixture.txt").write_text(fixture, encoding="utf-8")
+        head = self.commit(repo)
+
+        with (
+            mock.patch.object(
+                workspace,
+                "MAX_SECRET_PREFIX_PROOF_BYTES",
+                proof_bytes,
+            ),
+            self.assertRaisesRegex(ReviewError, "generic-secret-assignment"),
+        ):
+            self.prepare(repo=repo, base=base, head=head)
+
+    def test_delayed_provider_in_open_rhs_does_not_count_as_reduction(self) -> None:
+        proof_bytes = 256
+        overlap = 32
+        _candidate, unsafe, _safe, _ordinary = rhs_proof_boundary_payloads()
+        fixture = unsafe.decode("ascii")
+        repo, base = self.new_repo({"fixture.txt": fixture * 2})
+        (repo / "fixture.txt").write_text(fixture, encoding="utf-8")
+        head = self.commit(repo)
+
+        with (
+            mock.patch.object(
+                workspace,
+                "MAX_SECRET_PREFIX_PROOF_BYTES",
+                proof_bytes,
+            ),
+            mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", overlap),
+            mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 64),
+            self.assertRaisesRegex(ReviewError, "generic-secret-assignment"),
+        ):
+            self.prepare(repo=repo, base=base, head=head)
+
+    def test_remote_provider_after_closed_rhs_keeps_reduction_semantics(
+        self,
+    ) -> None:
+        proof_bytes = 256
+        overlap = 32
+        _candidate, _unsafe, safe, _ordinary = rhs_proof_boundary_payloads()
+        fixture = safe.decode("ascii")
+        repo, base = self.new_repo(
+            {
+                "fixture-a.txt": fixture,
+                "fixture-b.txt": fixture,
+            }
+        )
+        (repo / "fixture-b.txt").unlink()
+        head = self.commit(repo)
+
+        with (
+            mock.patch.object(
+                workspace,
+                "MAX_SECRET_PREFIX_PROOF_BYTES",
+                proof_bytes,
+            ),
+            mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", overlap),
+            mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 64),
+        ):
+            review = self.prepare(repo=repo, base=base, head=head)
+            evidence = self.validate(review)
+
+        reductions = evidence["synthetic_tokens"]["secret_reductions"]
+        self.assertEqual(len(reductions), 1)
+        self.assertEqual(reductions[0]["rules"], ["github-token"])
+        self.assertEqual(
+            (
+                reductions[0]["base_count"],
+                reductions[0]["head_count"],
+            ),
+            (2, 1),
+        )
+        self.assertEqual(
+            (
+                reductions[0]["base_unembedded_count"],
+                reductions[0]["head_unembedded_count"],
+            ),
+            (2, 1),
+        )
+
     def test_incomplete_quoted_short_provider_does_not_count_as_reduction(
         self,
     ) -> None:
@@ -5908,6 +6682,47 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                 head=head,
                 catalog=catalog,
             )
+
+    def test_unselected_legacy_reduction_requires_explicit_exemption(self) -> None:
+        catalog = legacy_catalog(values=(LEGACY_A,))
+        fixture = assignment_text("access_token", LEGACY_A)
+        repo, base = self.new_repo({"fixture.cfg": fixture * 2})
+        (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
+        head = self.commit(repo)
+
+        with mock.patch.object(
+            workspace,
+            "_secret_reduction_descriptor",
+            wraps=workspace._secret_reduction_descriptor,
+        ) as descriptor:
+            with self.assertRaisesRegex(
+                ReviewError,
+                "explicitly selected synthetic secret exemption",
+            ) as raised:
+                self.prepare(
+                    repo=repo,
+                    base=base,
+                    head=head,
+                    catalog=catalog,
+                )
+        descriptor.assert_not_called()
+        self.assertNotIn(LEGACY_A, str(raised.exception))
+
+        review = self.prepare(
+            repo=repo,
+            base=base,
+            head=head,
+            catalog=catalog,
+            exemptions=("historical-fixtures",),
+        )
+        evidence = self.validate(review, catalog=catalog)
+        counts = evidence["synthetic_tokens"]["legacy_counts"]
+        self.assertEqual(len(counts), 1)
+        self.assertEqual(
+            (counts[0]["base_count"], counts[0]["head_count"]),
+            (2, 1),
+        )
+        self.assertEqual(evidence["synthetic_tokens"]["secret_reductions"], [])
 
     def test_legacy_counts_accept_authoring_values_but_not_unknown_secrets(
         self,

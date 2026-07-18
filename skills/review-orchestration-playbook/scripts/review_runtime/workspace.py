@@ -2085,6 +2085,33 @@ def _secret_count_manifests(
             "secret-reduction proof cannot extract a stable exact candidate for "
             f"scanner rule {discovery.blocking_rule}"
         )
+    selected_exemption_ids = frozenset(exemption.identifier for exemption in exemptions)
+    unselected_legacy_values = {
+        token.value: exemption.identifier
+        for exemption in catalog.legacy_exemptions
+        if exemption.identifier not in selected_exemption_ids
+        for token in exemption.values
+    }
+    unselected_legacy_candidates = {
+        candidate: rules
+        for candidate, rules in discovery.blocking_candidates.items()
+        if candidate in unselected_legacy_values
+    }
+    if unselected_legacy_candidates:
+        exemption_ids = sorted(
+            {
+                unselected_legacy_values[candidate]
+                for candidate in unselected_legacy_candidates
+            }
+        )
+        scanner_rules = sorted(
+            rule for rules in unselected_legacy_candidates.values() for rule in rules
+        )
+        raise ReviewError(
+            "unselected catalog legacy value requires an explicitly selected "
+            "synthetic secret exemption: "
+            f"{', '.join(exemption_ids)}; scanner rules: {', '.join(scanner_rules)}"
+        )
     reduction_descriptors = tuple(
         _secret_reduction_descriptor(candidate, rules)
         for candidate, rules in sorted(
@@ -3788,12 +3815,321 @@ def _assignment_proof_retention_start(
     return lower_bound
 
 
-def _wrapper_segments_are_balanced(
-    prefix: bytes,
-    suffix: bytes,
+def _secret_assignment_rhs_is_closed(
+    value: bytes,
     *,
+    prefix_proof_start: int = 0,
+    assignment_start: int,
+    assignment_end: int,
+    assignment_line_start: int,
+    proof_end: int,
+    diff_surface: bool,
+    prefix_context_complete: bool,
+    suffix_context_complete: bool,
+    event_budget: SecretScanBudget,
+    closure_recorder: Callable[[int], None] | None = None,
+) -> bool:
+    if not (
+        0
+        <= prefix_proof_start
+        <= assignment_start
+        <= assignment_end
+        <= proof_end
+        <= len(value)
+        and 0 <= assignment_line_start <= assignment_start
+    ):
+        raise ReviewError("sensitive scanner produced an invalid RHS proof range")
+    proof_suffix_context_complete = suffix_context_complete and proof_end == len(value)
+    cursor = assignment_end
+    inspected_end = cursor
+    wrapper_closers: list[int] = []
+    wrapper_mismatch = False
+    pending_expression_continuation = False
+    rhs_prefix_is_wrapper_only = True
+    literal_prefixes = (b"br", b"rb", b"fr", b"rf", b"b", b"f", b"r", b"u")
+    continuation_operators = frozenset(b"+-*/%&|^!=<>?:,.`")
+
+    assignment_diff_side: int | None = None
+    if (
+        diff_surface
+        and assignment_line_start < proof_end
+        and value[assignment_line_start] in (0x2B, 0x2D)
+        and not value.startswith(
+            (b"+++ ", b"--- "),
+            assignment_line_start,
+            proof_end,
+        )
+    ):
+        assignment_diff_side = value[assignment_line_start]
+
+    def record_inspected(end: int) -> None:
+        nonlocal inspected_end
+        inspected_end = max(inspected_end, min(end, proof_end))
+
+    def finish(closed: bool) -> bool:
+        proof_bytes = max(0, inspected_end - assignment_end)
+        if not event_budget.consume_prefix_proof(proof_bytes):
+            raise ReviewError("sensitive scanner exceeded one RHS proof window")
+        if closed and closure_recorder is not None:
+            closure_recorder(inspected_end)
+        return closed
+
+    def tail_is_proven(
+        *,
+        rhs_end: int,
+        required_closers: tuple[int, ...],
+    ) -> bool:
+        def record_tail_inspected(byte_count: int) -> None:
+            record_inspected(rhs_end + byte_count)
+
+        try:
+            return _quoted_assignment_may_accept(
+                value,
+                assignment_start=assignment_start,
+                assignment_end=rhs_end,
+                prefix_proof_start=prefix_proof_start,
+                required_closers=required_closers,
+                diff_surface=diff_surface,
+                prefix_context_complete=prefix_context_complete,
+                suffix_context_complete=proof_suffix_context_complete,
+                event_budget=event_budget,
+                maximum_end=proof_end,
+                inspection_recorder=record_tail_inspected,
+            )
+        except _IncompleteSecretScanSuffix:
+            return False
+
+    direct_unquoted_match = UNQUOTED_SECRET_ASSIGNMENT.match(
+        value,
+        assignment_start,
+        proof_end,
+    )
+    if direct_unquoted_match is not None:
+        unquoted_end = direct_unquoted_match.end()
+        record_inspected(unquoted_end)
+        return finish(
+            tail_is_proven(
+                rhs_end=unquoted_end,
+                required_closers=(),
+            )
+        )
+
+    def next_line_content_start(position: int) -> int:
+        nonlocal inspected_end
+        while position < proof_end:
+            record_prefix = value[position]
+            if not diff_surface or record_prefix not in (0x20, 0x2B, 0x2D):
+                break
+            if (
+                assignment_diff_side is not None
+                and record_prefix in (0x2B, 0x2D)
+                and record_prefix != assignment_diff_side
+            ):
+                boundaries = tuple(
+                    boundary
+                    for boundary in (
+                        value.find(b"\n", position, proof_end),
+                        value.find(b"\r", position, proof_end),
+                    )
+                    if boundary >= 0
+                )
+                if not boundaries:
+                    record_inspected(proof_end)
+                    return proof_end
+                boundary = min(boundaries)
+                position = boundary + (
+                    2 if value.startswith(b"\r\n", boundary, proof_end) else 1
+                )
+                record_inspected(position)
+                continue
+            position += 1
+            break
+        while position < proof_end and value[position] in (0x09, 0x20):
+            position += 1
+        record_inspected(position)
+        return position
+
+    while cursor < proof_end:
+        record_inspected(cursor + 1)
+        byte = value[cursor]
+        if rhs_prefix_is_wrapper_only:
+            placeholder_match = PLACEHOLDER_SECRET_PATTERN.match(
+                value,
+                cursor,
+                proof_end,
+            )
+            if placeholder_match is not None:
+                placeholder_end = placeholder_match.end()
+                if placeholder_end == proof_end or value[placeholder_end] in (
+                    0x09,
+                    0x0A,
+                    0x0D,
+                    0x20,
+                    0x29,
+                    0x3B,
+                    0x5D,
+                    0x7D,
+                ):
+                    cursor = placeholder_end
+                    record_inspected(cursor)
+                    return finish(
+                        tail_is_proven(
+                            rhs_end=placeholder_end,
+                            required_closers=tuple(reversed(wrapper_closers)),
+                        )
+                    )
+        lowered_prefix = value[cursor : min(cursor + 3, proof_end)].lower()
+        literal_prefix_length = 0
+        quote = b""
+        if byte in (0x22, 0x27):
+            quote = value[cursor : cursor + 1]
+        elif byte == 0x60:
+            continuation_end = cursor + 1
+            while continuation_end < proof_end and value[continuation_end] in (
+                0x09,
+                0x20,
+            ):
+                continuation_end += 1
+            record_inspected(continuation_end)
+            if continuation_end >= proof_end or value[continuation_end] not in (
+                0x0A,
+                0x0D,
+            ):
+                quote = b"`"
+        else:
+            for prefix in literal_prefixes:
+                if lowered_prefix.startswith(prefix) and value[
+                    cursor + len(prefix) : min(cursor + len(prefix) + 1, proof_end)
+                ] in (b"'", b'"'):
+                    literal_prefix_length = len(prefix)
+                    quote = value[
+                        cursor + literal_prefix_length : cursor
+                        + literal_prefix_length
+                        + 1
+                    ]
+                    break
+        if quote:
+            delimiter_start = cursor + literal_prefix_length
+            delimiter = quote * (
+                3
+                if quote != b"`"
+                and value.startswith(quote * 3, delimiter_start, proof_end)
+                else 1
+            )
+            content_start = delimiter_start + len(delimiter)
+            closing_start = _find_unescaped_delimiter(
+                value,
+                delimiter=delimiter,
+                start=content_start,
+                diff_side=assignment_diff_side,
+                maximum_end=proof_end,
+            )
+            if closing_start is None:
+                record_inspected(proof_end)
+                return finish(False)
+            closing_end = closing_start + len(delimiter)
+            record_inspected(closing_end)
+            if not rhs_prefix_is_wrapper_only:
+                return finish(False)
+            return finish(
+                tail_is_proven(
+                    rhs_end=closing_end,
+                    required_closers=tuple(reversed(wrapper_closers)),
+                )
+            )
+        if byte in (0x09, 0x20):
+            cursor += 1
+            continue
+        if byte in (0x28, 0x5B, 0x7B):
+            wrapper_closers.append({0x28: 0x29, 0x5B: 0x5D, 0x7B: 0x7D}[byte])
+            pending_expression_continuation = False
+            cursor += 1
+            continue
+        if byte in (0x29, 0x5D, 0x7D):
+            if wrapper_closers:
+                if byte == wrapper_closers[-1]:
+                    wrapper_closers.pop()
+                else:
+                    wrapper_mismatch = True
+            pending_expression_continuation = False
+            cursor += 1
+            continue
+        if value.startswith(b"/*", cursor, proof_end):
+            comment_end = value.find(b"*/", cursor + 2, proof_end)
+            if comment_end < 0:
+                record_inspected(proof_end)
+                return finish(False)
+            cursor = comment_end + 2
+            record_inspected(cursor)
+            continue
+        if value.startswith(b"//", cursor, proof_end) or byte == 0x23:
+            boundaries = tuple(
+                boundary
+                for boundary in (
+                    value.find(b"\n", cursor, proof_end),
+                    value.find(b"\r", cursor, proof_end),
+                )
+                if boundary >= 0
+            )
+            if not boundaries:
+                record_inspected(proof_end)
+                return finish(False)
+            cursor = min(boundaries)
+            record_inspected(cursor)
+            continue
+        if byte in (0x0A, 0x0D):
+            previous = cursor - 1
+            while previous >= assignment_end and value[previous] in (0x09, 0x20):
+                previous -= 1
+            next_cursor = cursor + (
+                2 if value.startswith(b"\r\n", cursor, proof_end) else 1
+            )
+            logical_next = next_line_content_start(next_cursor)
+            previous_continues = previous >= assignment_end and (
+                value[previous] == 0x5C or value[previous] in continuation_operators
+            )
+            next_continues = (
+                logical_next < proof_end
+                and value[logical_next] in continuation_operators
+            )
+            line_continues = (
+                bool(wrapper_closers)
+                or wrapper_mismatch
+                or pending_expression_continuation
+                or previous_continues
+                or next_continues
+            )
+            if not line_continues:
+                record_inspected(next_cursor)
+                return finish(False)
+            pending_expression_continuation = (
+                pending_expression_continuation or previous_continues or next_continues
+            )
+            cursor = logical_next
+            continue
+        if byte == 0x3B and not wrapper_closers and not wrapper_mismatch:
+            return finish(False)
+        rhs_prefix_is_wrapper_only = False
+        pending_expression_continuation = byte in continuation_operators
+        cursor += 1
+
+    record_inspected(proof_end)
+    return finish(False)
+
+
+def _wrapper_ranges_are_balanced(
+    value: bytes,
+    *,
+    prefix_start: int,
+    prefix_end: int,
+    suffix_start: int,
+    suffix_end: int,
     require_complete: bool = True,
 ) -> bool:
+    if not (
+        0 <= prefix_start <= prefix_end <= suffix_start <= suffix_end <= len(value)
+    ):
+        raise ReviewError("sensitive scanner produced invalid wrapper proof ranges")
     expected_closers: list[int] = []
     closer_by_opener = {
         0x28: 0x29,
@@ -3801,14 +4137,16 @@ def _wrapper_segments_are_balanced(
         0x7B: 0x7D,
     }
     trivia = frozenset((0x09, 0x0A, 0x0D, 0x20))
-    for byte in prefix:
+    for index in range(prefix_start, prefix_end):
+        byte = value[index]
         if byte in trivia:
             continue
         closer = closer_by_opener.get(byte)
         if closer is None:
             return False
         expected_closers.append(closer)
-    for byte in suffix:
+    for index in range(suffix_start, suffix_end):
+        byte = value[index]
         if byte in trivia:
             continue
         if not expected_closers or byte != expected_closers.pop():
@@ -3819,6 +4157,7 @@ def _wrapper_segments_are_balanced(
 def _quoted_assignment_may_accept(
     value: bytes,
     *,
+    prefix_proof_start: int = 0,
     assignment_start: int,
     assignment_end: int,
     required_closers: tuple[int, ...] = (),
@@ -3826,7 +4165,17 @@ def _quoted_assignment_may_accept(
     prefix_context_complete: bool = True,
     suffix_context_complete: bool = True,
     event_budget: SecretScanBudget,
+    maximum_end: int | None = None,
+    inspection_recorder: Callable[[int], None] | None = None,
 ) -> bool:
+    logical_end = len(value) if maximum_end is None else min(len(value), maximum_end)
+    if not (
+        0 <= prefix_proof_start <= assignment_start <= assignment_end <= logical_end
+    ):
+        raise ReviewError(
+            "sensitive scanner produced an invalid assignment proof range"
+        )
+    suffix_context_complete = suffix_context_complete and logical_end == len(value)
     cursor = assignment_end
     inspected = 0
     crossed_line_boundary = False
@@ -3846,6 +4195,12 @@ def _quoted_assignment_may_accept(
         prefix_context_complete=prefix_context_complete,
     )
 
+    def logical_startswith(prefix: bytes | tuple[bytes, ...], start: int) -> bool:
+        return value.startswith(prefix, start, logical_end)
+
+    def logical_find(needle: bytes, start: int) -> int:
+        return value.find(needle, start, logical_end)
+
     def triple_prefix_is_hunk_content() -> bool:
         hunk_context, lower_bound = _bounded_diff_hunk_context_before(
             value,
@@ -3859,11 +4214,11 @@ def _quoted_assignment_may_accept(
     match_diff_side: int | None = None
     if (
         diff_surface
-        and match_line_start < len(value)
+        and match_line_start < logical_end
         and value[match_line_start] in (0x2B, 0x2D)
     ):
         if (
-            value.startswith(
+            logical_startswith(
                 (b"+++ ", b"--- "),
                 match_line_start,
             )
@@ -3876,74 +4231,80 @@ def _quoted_assignment_may_accept(
         nonlocal crossed_line_boundary, cursor, inspected
         if inspected + count > MAX_SECRET_ASSIGNMENT_TRAILING_BYTES:
             return False
+        if cursor + count > logical_end:
+            if not suffix_context_complete:
+                raise _IncompleteSecretScanSuffix(proof_retention_start)
+            return False
         if (
             b"\n" in value[cursor : cursor + count]
             or b"\r" in value[cursor : cursor + count]
         ):
             crossed_line_boundary = True
         inspected += count
+        if inspection_recorder is not None:
+            inspection_recorder(inspected)
         cursor += count
         return True
 
     def trim_space() -> bool:
-        while cursor < len(value) and value[cursor] in (0x20, 0x09):
+        while cursor < logical_end and value[cursor] in (0x20, 0x09):
             if not advance(1):
                 return False
         return True
 
     def trim_continuation_trivia() -> bool:
-        while cursor < len(value):
+        while cursor < logical_end:
             if not trim_space():
                 return False
-            if value.startswith(b"\r\n", cursor):
+            if logical_startswith(b"\r\n", cursor):
                 if not advance(2):
                     return False
-            elif value.startswith((b"\r", b"\n"), cursor):
+            elif logical_startswith((b"\r", b"\n"), cursor):
                 if not advance(1):
                     return False
-            elif value.startswith(b"#", cursor):
+            elif logical_startswith(b"#", cursor):
                 if not advance(1):
                     return False
-                while cursor < len(value) and value[cursor] not in (0x0A, 0x0D):
+                while cursor < logical_end and value[cursor] not in (0x0A, 0x0D):
                     if not advance(1):
                         return False
-            elif value.startswith(b"/*", cursor):
+            elif logical_startswith(b"/*", cursor):
                 if not advance(2):
                     return False
-                while cursor < len(value) and not value.startswith(b"*/", cursor):
+                while cursor < logical_end and not logical_startswith(b"*/", cursor):
                     if not advance(1):
                         return False
-                if cursor < len(value) and not advance(2):
+                if cursor < logical_end and not advance(2):
                     return False
             else:
                 return True
         return True
 
     def starts_trivia() -> bool:
-        return value.startswith((b"\r", b"\n", b"#", b"/*"), cursor)
+        return logical_startswith((b"\r", b"\n", b"#", b"/*"), cursor)
 
     def starts_literal() -> bool:
-        return _starts_quoted_literal(value[cursor : cursor + 16])
+        return _starts_quoted_literal(value[cursor : min(cursor + 16, logical_end)])
 
     def skip_opposite_diff_records() -> tuple[bool, bool]:
         nonlocal crossed_line_boundary, cursor, skipped_diff_bytes
         skipped = False
         while (
             match_diff_side is not None
-            and cursor < len(value)
+            and cursor < logical_end
             and cursor > 0
             and value[cursor - 1] == 0x0A
             and value[cursor] in (0x2B, 0x2D)
             and value[cursor] != match_diff_side
         ):
-            line_end = value.find(b"\n", cursor)
-            record_end = len(value) if line_end < 0 else line_end + 1
+            line_end = logical_find(b"\n", cursor)
+            record_end = logical_end if line_end < 0 else line_end + 1
             record_size = record_end - cursor
             if skipped_diff_bytes + record_size > MAX_SECRET_PREFIX_PROOF_BYTES:
                 return False, skipped
             if not event_budget.consume_prefix_proof(record_size):
                 return False, skipped
-            if record_end == len(value) and not suffix_context_complete:
+            if record_end == logical_end and not suffix_context_complete:
                 raise _IncompleteSecretScanSuffix(proof_retention_start)
             skipped_diff_bytes += record_size
             cursor = record_end
@@ -3959,7 +4320,7 @@ def _quoted_assignment_may_accept(
             return False
         if (
             diff_surface
-            and cursor < len(value)
+            and cursor < logical_end
             and value[cursor] in (0x2B, 0x2D)
             and cursor > 0
             and value[cursor - 1] == 0x0A
@@ -3979,13 +4340,13 @@ def _quoted_assignment_may_accept(
         )
         return any(
             inspected + len(marker) <= MAX_SECRET_ASSIGNMENT_TRAILING_BYTES
-            and value.startswith(marker, cursor)
+            and logical_startswith(marker, cursor)
             for marker in markers
         )
 
     def starts_named_assignment() -> bool:
         limit = min(
-            len(value),
+            logical_end,
             cursor + MAX_SECRET_ASSIGNMENT_TRAILING_BYTES - inspected + 1,
         )
         index = cursor
@@ -4061,13 +4422,13 @@ def _quoted_assignment_may_accept(
             index = skip_space(index)
         if index >= limit or value[index] not in (0x3A, 0x3D):
             return False
-        if index + 1 < len(value) and value[index + 1] in (0x3A, 0x3D, 0x3E):
+        if index + 1 < limit and value[index + 1] in (0x3A, 0x3D, 0x3E):
             return False
         return True
 
     def starts_python_call_statement() -> bool:
         limit = min(
-            len(value),
+            logical_end,
             cursor + MAX_SECRET_ASSIGNMENT_TRAILING_BYTES - inspected + 1,
         )
         index = cursor
@@ -4137,7 +4498,7 @@ def _quoted_assignment_may_accept(
             return False
 
         limit = min(
-            len(value),
+            logical_end,
             cursor + MAX_SECRET_ASSIGNMENT_TRAILING_BYTES - inspected + 1,
         )
         index = cursor
@@ -4168,7 +4529,7 @@ def _quoted_assignment_may_accept(
             end = position + len(keyword)
             if (
                 end >= limit
-                or not value.startswith(keyword, position)
+                or not value.startswith(keyword, position, limit)
                 or value[end] not in (0x20, 0x09)
             ):
                 return None
@@ -4177,7 +4538,7 @@ def _quoted_assignment_may_accept(
         async_end = consume_keyword(index, b"async")
         if async_end is not None:
             index = async_end
-        declaration = b"def" if value.startswith(b"def", index) else b"class"
+        declaration = b"def" if value.startswith(b"def", index, limit) else b"class"
         if async_end is not None and declaration != b"def":
             return False
         declaration_end = consume_keyword(index, declaration)
@@ -4205,9 +4566,8 @@ def _quoted_assignment_may_accept(
         else:
             hunk_start = hunk_context.source_start
         prefix_end = cursor if end is None else end
-        raw_prefix = value[hunk_start:prefix_end]
         skipped_bytes = skipped_diff_bytes if end is None else 0
-        source_proof_bytes = len(raw_prefix) - skipped_bytes
+        source_proof_bytes = prefix_end - hunk_start - skipped_bytes
         if not 0 <= source_proof_bytes <= MAX_SECRET_PREFIX_PROOF_BYTES:
             return None
         newly_proved_bytes = source_proof_bytes - diff_source_proof_bytes
@@ -4219,6 +4579,7 @@ def _quoted_assignment_may_accept(
             diff_source_proof_bytes,
             source_proof_bytes,
         )
+        raw_prefix = value[hunk_start:prefix_end]
         source_side = match_diff_side if match_diff_side is not None else 0x2B
         source_lines: list[bytes] = []
         for line in raw_prefix.splitlines(keepends=True):
@@ -4244,9 +4605,11 @@ def _quoted_assignment_may_accept(
         else:
             if not prefix_context_complete:
                 return None
-            prefix = value[:assignment_start]
-            if not event_budget.consume_prefix_proof(len(prefix)):
+            if not event_budget.consume_prefix_proof(
+                assignment_start - prefix_proof_start
+            ):
                 return None
+            prefix = value[prefix_proof_start:assignment_start]
 
         closer_by_opener = {
             0x28: 0x29,
@@ -4270,13 +4633,19 @@ def _quoted_assignment_may_accept(
                 delimiter=delimiter,
                 start=assignment_start,
                 diff_side=match_diff_side,
+                maximum_end=assignment_end,
             )
             if key_quote_end is None or key_quote_end >= assignment_end:
                 return False
             key_separator = key_quote_end + len(delimiter)
-            while value[key_separator : key_separator + 1] in (b" ", b"\t"):
+            while key_separator < assignment_end and value[
+                key_separator : key_separator + 1
+            ] in (b" ", b"\t"):
                 key_separator += 1
-            return value[key_separator : key_separator + 1] == b":"
+            return (
+                key_separator < assignment_end
+                and value[key_separator : key_separator + 1] == b":"
+            )
 
         def logical_wrapper_closers(prefix_value: bytes) -> tuple[int, ...] | None:
             logical_closers: list[int] = []
@@ -4418,9 +4787,9 @@ def _quoted_assignment_may_accept(
         else:
             if not prefix_context_complete:
                 return False
-            prefix = value[:cursor]
-            if not event_budget.consume_prefix_proof(len(prefix)):
+            if not event_budget.consume_prefix_proof(cursor - prefix_proof_start):
                 return False
+            prefix = value[prefix_proof_start:cursor]
         try:
             compile(
                 prefix,
@@ -4471,7 +4840,7 @@ def _quoted_assignment_may_accept(
         )
 
     def at_proven_end() -> bool:
-        if cursor != len(value):
+        if cursor != logical_end:
             return False
         if not suffix_context_complete:
             raise _IncompleteSecretScanSuffix(proof_retention_start)
@@ -4480,7 +4849,7 @@ def _quoted_assignment_may_accept(
     def consume_external_wrapper_closers() -> bool:
         if source_wrapper_closers or outer_quote_pending:
             return True
-        while value.startswith((b")", b"]", b"}"), cursor):
+        while logical_startswith((b")", b"]", b"}"), cursor):
             if not load_external_wrapper_context():
                 return False
             if (
@@ -4496,7 +4865,7 @@ def _quoted_assignment_may_accept(
         nonlocal outer_quote_pending, source_literal_wrapper
         if not load_external_wrapper_context():
             return False
-        while source_wrapper_closers and value.startswith((b")", b"]", b"}"), cursor):
+        while source_wrapper_closers and logical_startswith((b")", b"]", b"}"), cursor):
             if value[cursor] != source_wrapper_closers.pop():
                 return False
             if not advance(1) or not trim_space():
@@ -4506,7 +4875,7 @@ def _quoted_assignment_may_accept(
         if (
             outer_quote_pending
             and outer_delimiter is not None
-            and value.startswith(outer_delimiter, cursor)
+            and logical_startswith(outer_delimiter, cursor)
         ):
             if not advance(len(outer_delimiter)) or not trim_space():
                 return False
@@ -4515,14 +4884,14 @@ def _quoted_assignment_may_accept(
         return True
 
     def consume_nested_literal() -> bool:
-        quote = value[cursor : cursor + 1]
+        quote = value[cursor : min(cursor + 1, logical_end)]
         delimiter = quote * (
-            3 if quote != b"`" and value.startswith(quote * 3, cursor) else 1
+            3 if quote != b"`" and logical_startswith(quote * 3, cursor) else 1
         )
         if not advance(len(delimiter)):
             return False
         while True:
-            if cursor == len(value):
+            if cursor == logical_end:
                 if not suffix_context_complete:
                     raise _IncompleteSecretScanSuffix(proof_retention_start)
                 return False
@@ -4535,10 +4904,10 @@ def _quoted_assignment_may_accept(
                 and not trim_diff_record_prefix()
             ):
                 return False
-            if value.startswith(delimiter, cursor):
+            if logical_startswith(delimiter, cursor):
                 return advance(len(delimiter))
             if value[cursor] == 0x5C:
-                if cursor + 1 == len(value):
+                if cursor + 1 == logical_end:
                     if not suffix_context_complete:
                         raise _IncompleteSecretScanSuffix(proof_retention_start)
                     return False
@@ -4551,8 +4920,8 @@ def _quoted_assignment_may_accept(
     def consume_block_comment() -> bool:
         if not advance(2):
             return False
-        while not value.startswith(b"*/", cursor):
-            if cursor == len(value):
+        while not logical_startswith(b"*/", cursor):
+            if cursor == logical_end:
                 if not suffix_context_complete:
                     raise _IncompleteSecretScanSuffix(proof_retention_start)
                 return False
@@ -4563,7 +4932,7 @@ def _quoted_assignment_may_accept(
     def consume_line_comment(prefix_size: int) -> bool:
         if not advance(prefix_size):
             return False
-        while cursor < len(value) and value[cursor] not in (0x0A, 0x0D):
+        while cursor < logical_end and value[cursor] not in (0x0A, 0x0D):
             if not advance(1):
                 return False
         return True
@@ -4578,7 +4947,7 @@ def _quoted_assignment_may_accept(
             0x7B: 0x7D,
         }
         while source_wrapper_closers or outer_quote_pending or external_wrapper_closers:
-            if cursor == len(value):
+            if cursor == logical_end:
                 if not suffix_context_complete:
                     raise _IncompleteSecretScanSuffix(proof_retention_start)
                 return False
@@ -4593,7 +4962,7 @@ def _quoted_assignment_may_accept(
                 return False
             if not trim_space():
                 return False
-            if cursor == len(value):
+            if cursor == logical_end:
                 if not suffix_context_complete:
                     raise _IncompleteSecretScanSuffix(proof_retention_start)
                 return False
@@ -4603,9 +4972,8 @@ def _quoted_assignment_may_accept(
                 continue
 
             if not source_wrapper_closers and outer_quote_pending:
-                if outer_delimiter is None or not value.startswith(
-                    outer_delimiter,
-                    cursor,
+                if outer_delimiter is None or not logical_startswith(
+                    outer_delimiter, cursor
                 ):
                     return False
                 if not advance(len(outer_delimiter)):
@@ -4619,11 +4987,11 @@ def _quoted_assignment_may_accept(
                 if source_wrapper_closers
                 else external_wrapper_closers
             )
-            if value.startswith(b"/*", cursor):
+            if logical_startswith(b"/*", cursor):
                 if not consume_block_comment():
                     return False
                 continue
-            if value.startswith(b"//", cursor):
+            if logical_startswith(b"//", cursor):
                 if not consume_line_comment(2):
                     return False
                 continue
@@ -4665,7 +5033,7 @@ def _quoted_assignment_may_accept(
             return True
         if starts_diff_metadata_boundary():
             return True
-        if value.startswith(b";", cursor):
+        if logical_startswith(b";", cursor):
             if not advance(1) or not trim_space():
                 return False
             while starts_trivia():
@@ -4683,7 +5051,7 @@ def _quoted_assignment_may_accept(
 
     while required_closer_index < len(required_closers):
         expected_closer = required_closers[required_closer_index]
-        if cursor < len(value) and value[cursor] == expected_closer:
+        if cursor < logical_end and value[cursor] == expected_closer:
             if not advance(1):
                 return False
             required_closer_index += 1
@@ -4697,7 +5065,7 @@ def _quoted_assignment_may_accept(
             if not trim_diff_record_prefix():
                 return False
             continue
-        if cursor == len(value) and not suffix_context_complete:
+        if cursor == logical_end and not suffix_context_complete:
             raise _IncompleteSecretScanSuffix(proof_retention_start)
         return False
     if not consume_direct_source_context():
@@ -4718,7 +5086,7 @@ def _quoted_assignment_may_accept(
         break
     if at_proven_end():
         return True
-    if value.startswith(b";", cursor):
+    if logical_startswith(b";", cursor):
         if not advance(1) or not trim_space():
             return False
         if starts_trivia():
@@ -4731,7 +5099,7 @@ def _quoted_assignment_may_accept(
             or starts_named_assignment()
             or starts_proven_python_declaration()
         )
-    if value.startswith(b",", cursor):
+    if logical_startswith(b",", cursor):
         if not advance(1) or not trim_space():
             return False
         while True:
@@ -4745,7 +5113,7 @@ def _quoted_assignment_may_accept(
                 if not trim_diff_record_prefix():
                     return False
                 continue
-            if value.startswith(b",", cursor):
+            if logical_startswith(b",", cursor):
                 if not advance(1) or not trim_space():
                     return False
                 continue
@@ -4754,7 +5122,7 @@ def _quoted_assignment_may_accept(
             return True
         if starts_diff_metadata_boundary():
             return external_wrappers_are_closed()
-        if value.startswith(b";", cursor):
+        if logical_startswith(b";", cursor):
             if not advance(1) or not trim_space():
                 return False
             if starts_trivia() and not trim_continuation_trivia():
@@ -5051,10 +5419,14 @@ def _find_unescaped_delimiter(
     delimiter: bytes,
     start: int,
     diff_side: int | None = None,
+    maximum_end: int | None = None,
 ) -> int | None:
+    logical_end = len(value) if maximum_end is None else min(len(value), maximum_end)
+    if not 0 <= start <= logical_end:
+        raise ReviewError("sensitive scanner produced an invalid delimiter proof range")
     search_start = start
     while True:
-        delimiter_start = value.find(delimiter, search_start)
+        delimiter_start = value.find(delimiter, search_start, logical_end)
         if delimiter_start < 0:
             return None
         if diff_side is not None:
@@ -5360,6 +5732,19 @@ def _iter_secret_events(
             continue
         event_budget.consume()
         candidate = match.group(2)
+        quoted_proof_limit = match.start() + MAX_SECRET_PREFIX_PROOF_BYTES
+        quoted_proof_end = min(len(value), quoted_proof_limit)
+        if match.end() > quoted_proof_end:
+            if end_is_committable(quoted_proof_limit):
+                yield (
+                    "generic-secret-assignment",
+                    None,
+                    quoted_proof_limit,
+                    False,
+                    match.start(),
+                    None,
+                )
+            continue
         try:
             may_accept = _quoted_assignment_may_accept(
                 value,
@@ -5369,8 +5754,21 @@ def _iter_secret_events(
                 prefix_context_complete=prefix_context_complete,
                 suffix_context_complete=suffix_context_complete,
                 event_budget=event_budget,
+                maximum_end=quoted_proof_end,
             )
         except _IncompleteSecretScanSuffix as incomplete:
+            if quoted_proof_limit <= len(value) and end_is_committable(
+                quoted_proof_limit
+            ):
+                yield (
+                    "generic-secret-assignment",
+                    None,
+                    quoted_proof_limit,
+                    False,
+                    match.start(),
+                    None,
+                )
+                continue
             yield (
                 _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE,
                 None,
@@ -5423,11 +5821,14 @@ def _iter_secret_events(
     literal_prefixes = (b"br", b"rb", b"fr", b"rf", b"b", b"f", b"r", b"u")
     continuation_operators = frozenset(b"+-*/%&|^!=<>?:,.`")
     assignment_matches: Iterable[re.Match[bytes]] = (
-        SECRET_ASSIGNMENT_PREFIX.finditer(value) if pending_specific_ranges else ()
+        SECRET_ASSIGNMENT_PREFIX.finditer(value) if minimum_end < len(value) else ()
     )
     assignment_line_search_start = 0
     assignment_line_start = 0
     pending_specific_cursor = 0
+    closed_assignment_proof_frontier: int | None = (
+        0 if prefix_context_complete and not diff_surface else None
+    )
     for assignment_match in assignment_matches:
         line_break = max(
             value.rfind(
@@ -5451,14 +5852,88 @@ def _iter_secret_events(
             < assignment_match.end()
         ):
             pending_specific_cursor += 1
-        proof_limit_end = assignment_match.start() + MAX_SECRET_PREFIX_PROOF_BYTES
-        proof_end = min(len(value), proof_limit_end)
         if (
-            pending_specific_cursor >= len(pending_specific_ranges)
-            or pending_specific_ranges[pending_specific_cursor][0] >= proof_end
+            closed_assignment_proof_frontier is not None
+            and assignment_match.start() < closed_assignment_proof_frontier
         ):
             continue
         if maximum_end is not None and assignment_match.start() >= maximum_end:
+            continue
+        proof_limit_end = assignment_match.start() + MAX_SECRET_PREFIX_PROOF_BYTES
+        if (
+            pending_specific_cursor >= len(pending_specific_ranges)
+            and suffix_context_complete
+            and proof_limit_end > len(value)
+        ):
+            continue
+        proof_end = min(len(value), proof_limit_end)
+        proof_limit_visible = proof_limit_end <= len(value)
+        proof_suffix_context_complete = suffix_context_complete and proof_end == len(
+            value
+        )
+        pending_specific_within_proof = (
+            pending_specific_cursor < len(pending_specific_ranges)
+            and pending_specific_ranges[pending_specific_cursor][0] < proof_end
+            and pending_specific_ranges[pending_specific_cursor][1] <= proof_end
+        )
+        if not pending_specific_within_proof:
+            prefix_proof_start = 0
+            if (
+                closed_assignment_proof_frontier is not None
+                and closed_assignment_proof_frontier > 0
+                and closed_assignment_proof_frontier <= assignment_match.start()
+                and assignment_match.start() <= MAX_SECRET_PREFIX_PROOF_BYTES
+            ):
+                prefix_proof_start = closed_assignment_proof_frontier
+            recorded_closure_frontiers: list[int] = []
+            assignment_closed = _secret_assignment_rhs_is_closed(
+                value,
+                prefix_proof_start=prefix_proof_start,
+                assignment_start=assignment_match.start(),
+                assignment_end=assignment_match.end(),
+                assignment_line_start=assignment_line_start,
+                proof_end=proof_end,
+                diff_surface=diff_surface,
+                prefix_context_complete=prefix_context_complete,
+                suffix_context_complete=suffix_context_complete,
+                event_budget=event_budget,
+                closure_recorder=recorded_closure_frontiers.append,
+            )
+            if assignment_closed:
+                if (
+                    closed_assignment_proof_frontier is not None
+                    and recorded_closure_frontiers
+                ):
+                    closed_assignment_proof_frontier = max(
+                        closed_assignment_proof_frontier,
+                        recorded_closure_frontiers[-1],
+                    )
+                continue
+            if proof_limit_visible and end_is_committable(proof_limit_end):
+                event_budget.consume()
+                yield (
+                    "generic-secret-assignment",
+                    None,
+                    proof_limit_end,
+                    False,
+                    assignment_match.start(),
+                    None,
+                )
+            elif end_is_committable(assignment_match.end()):
+                event_budget.consume()
+                yield (
+                    _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE,
+                    None,
+                    assignment_match.end(),
+                    False,
+                    assignment_match.start(),
+                    _assignment_proof_retention_start(
+                        value,
+                        assignment_start=assignment_match.start(),
+                        diff_surface=diff_surface,
+                        prefix_context_complete=prefix_context_complete,
+                    ),
+                )
             continue
         if (
             maximum_end is not None
@@ -5508,11 +5983,12 @@ def _iter_secret_events(
         assignment_diff_side: int | None = None
         if (
             diff_surface
-            and assignment_line_start < len(value)
+            and assignment_line_start < proof_end
             and value[assignment_line_start] in (0x2B, 0x2D)
             and not value.startswith(
                 (b"+++ ", b"--- "),
                 assignment_line_start,
+                proof_end,
             )
         ):
             assignment_diff_side = value[assignment_line_start]
@@ -5522,25 +5998,27 @@ def _iter_secret_events(
         wrapper_mismatch = False
         quoted_prefix_wrapper_only = True
         pending_expression_continuation = False
-        while cursor < len(value):
-            lowered_prefix = value[cursor : cursor + 3].lower()
-            backtick_suffix = cursor + 1
-            while backtick_suffix < len(value) and value[backtick_suffix] in (
-                0x09,
-                0x20,
-            ):
-                backtick_suffix += 1
-            backtick_continuation = (
-                value[cursor] == 0x60
-                and backtick_suffix < len(value)
-                and value[backtick_suffix] in (0x0A, 0x0D)
-            )
+        while cursor < proof_end:
+            lowered_prefix = value[cursor : min(cursor + 3, proof_end)].lower()
+            backtick_continuation = False
+            if value[cursor] == 0x60:
+                backtick_suffix = cursor + 1
+                while backtick_suffix < proof_end and value[backtick_suffix] in (
+                    0x09,
+                    0x20,
+                ):
+                    backtick_suffix += 1
+                backtick_continuation = backtick_suffix < proof_end and value[
+                    backtick_suffix
+                ] in (0x0A, 0x0D)
             if (
                 value[cursor] in (0x22, 0x27)
                 or (value[cursor] == 0x60 and not backtick_continuation)
                 or any(
                     lowered_prefix.startswith(prefix)
-                    and value[cursor + len(prefix) : cursor + len(prefix) + 1]
+                    and value[
+                        cursor + len(prefix) : min(cursor + len(prefix) + 1, proof_end)
+                    ]
                     in (b"'", b'"')
                     for prefix in literal_prefixes
                 )
@@ -5571,16 +6049,16 @@ def _iter_secret_events(
                 pending_expression_continuation = False
                 cursor += 1
                 continue
-            if value.startswith(b"/*", cursor):
+            if value.startswith(b"/*", cursor, proof_end):
                 wrapper_prefix = True
                 quoted_prefix_wrapper_only = False
-                comment_end = value.find(b"*/", cursor + 2)
+                comment_end = value.find(b"*/", cursor + 2, proof_end)
                 if comment_end < 0:
-                    cursor = len(value)
+                    cursor = proof_end
                     continue
                 cursor = comment_end + 2
                 continue
-            if value.startswith(b"//", cursor):
+            if value.startswith(b"//", cursor, proof_end):
                 quoted_prefix_wrapper_only = False
                 previous = cursor - 1
                 while previous >= assignment_match.end() and value[previous] in (
@@ -5599,12 +6077,12 @@ def _iter_secret_events(
                 line_end_candidates = tuple(
                     boundary
                     for boundary in (
-                        value.find(b"\n", cursor),
-                        value.find(b"\r", cursor),
+                        value.find(b"\n", cursor, proof_end),
+                        value.find(b"\r", cursor, proof_end),
                     )
                     if boundary >= 0
                 )
-                cursor = min(line_end_candidates, default=len(value))
+                cursor = min(line_end_candidates, default=proof_end)
                 continue
             if value[cursor] in (0x0A, 0x0D):
                 previous = cursor - 1
@@ -5613,14 +6091,16 @@ def _iter_secret_events(
                     0x20,
                 ):
                     previous -= 1
-                next_cursor = cursor + (2 if value.startswith(b"\r\n", cursor) else 1)
+                next_cursor = cursor + (
+                    2 if value.startswith(b"\r\n", cursor, proof_end) else 1
+                )
                 if (
                     diff_surface
-                    and next_cursor < len(value)
+                    and next_cursor < proof_end
                     and value[next_cursor] in (0x20, 0x2B, 0x2D)
                 ):
                     next_cursor += 1
-                while next_cursor < len(value) and value[next_cursor] in (
+                while next_cursor < proof_end and value[next_cursor] in (
                     0x09,
                     0x20,
                 ):
@@ -5629,7 +6109,7 @@ def _iter_secret_events(
                     value[previous] == 0x5C or value[previous] in continuation_operators
                 )
                 next_continues = (
-                    next_cursor < len(value)
+                    next_cursor < proof_end
                     and value[next_cursor] in continuation_operators
                 )
                 line_continues = (
@@ -5645,19 +6125,19 @@ def _iter_secret_events(
                     or previous_continues
                     or next_continues
                 )
-                cursor += 2 if value.startswith(b"\r\n", cursor) else 1
+                cursor += 2 if value.startswith(b"\r\n", cursor, proof_end) else 1
                 continue
             if value[cursor] == 0x23:
                 quoted_prefix_wrapper_only = False
                 line_end_candidates = tuple(
                     boundary
                     for boundary in (
-                        value.find(b"\n", cursor),
-                        value.find(b"\r", cursor),
+                        value.find(b"\n", cursor, proof_end),
+                        value.find(b"\r", cursor, proof_end),
                     )
                     if boundary >= 0
                 )
-                line_end = min(line_end_candidates, default=len(value))
+                line_end = min(line_end_candidates, default=proof_end)
                 if not wrapper_closers and not pending_expression_continuation:
                     cursor = line_end
                     break
@@ -5677,18 +6157,19 @@ def _iter_secret_events(
             quoted_prefix_wrapper_only = False
             pending_expression_continuation = value[cursor] in continuation_operators
             cursor += 1
-        lowered_suffix = value[cursor : cursor + 3].lower()
+        lowered_suffix = value[cursor : min(cursor + 3, proof_end)].lower()
         for prefix in literal_prefixes:
             if lowered_suffix.startswith(prefix) and value[
-                cursor + len(prefix) : cursor + len(prefix) + 1
+                cursor + len(prefix) : min(cursor + len(prefix) + 1, proof_end)
             ] in (b"'", b'"'):
                 cursor += len(prefix)
                 break
-        quote = value[cursor : cursor + 1]
+        quote = value[cursor : min(cursor + 1, proof_end)]
         if quote not in (b"'", b'"', b"`"):
             direct_unquoted_match = UNQUOTED_SECRET_ASSIGNMENT.match(
                 value,
                 assignment_match.start(),
+                proof_end,
             )
             if direct_unquoted_match is not None:
                 continue
@@ -5707,27 +6188,31 @@ def _iter_secret_events(
                 range_index += 1
             if rhs_specific_ranges:
                 specific_start, specific_end = rhs_specific_ranges[0]
-                wrapper_prefix_bytes = value[assignment_match.end() : specific_start]
-                wrapper_suffix_bytes = value[specific_end:cursor]
                 exact_wrapped_candidate = len(
                     rhs_specific_ranges
-                ) == 1 and _wrapper_segments_are_balanced(
-                    wrapper_prefix_bytes,
-                    wrapper_suffix_bytes,
+                ) == 1 and _wrapper_ranges_are_balanced(
+                    value,
+                    prefix_start=assignment_match.end(),
+                    prefix_end=specific_start,
+                    suffix_start=specific_end,
+                    suffix_end=cursor,
                 )
                 wrapper_may_complete = len(
                     rhs_specific_ranges
-                ) == 1 and _wrapper_segments_are_balanced(
-                    wrapper_prefix_bytes,
-                    wrapper_suffix_bytes,
+                ) == 1 and _wrapper_ranges_are_balanced(
+                    value,
+                    prefix_start=assignment_match.end(),
+                    prefix_end=specific_start,
+                    suffix_start=specific_end,
+                    suffix_end=cursor,
                     require_complete=False,
                 )
                 if (
                     not exact_wrapped_candidate
                     and end_is_committable(specific_end)
                     and not (
-                        not suffix_context_complete
-                        and cursor == len(value)
+                        not proof_suffix_context_complete
+                        and cursor == proof_end
                         and wrapper_may_complete
                     )
                 ):
@@ -5743,7 +6228,7 @@ def _iter_secret_events(
                     continue
             if (
                 wrapper_prefix
-                and proof_limit_end <= len(value)
+                and proof_limit_visible
                 and end_is_committable(proof_limit_end)
             ):
                 event_budget.consume()
@@ -5757,7 +6242,7 @@ def _iter_secret_events(
                 )
             elif (
                 wrapper_prefix
-                and not suffix_context_complete
+                and not proof_suffix_context_complete
                 and end_is_committable(assignment_match.end())
             ):
                 event_budget.consume()
@@ -5771,7 +6256,7 @@ def _iter_secret_events(
                 )
             continue
         delimiter = quote * (
-            3 if quote != b"`" and value.startswith(quote * 3, cursor) else 1
+            3 if quote != b"`" and value.startswith(quote * 3, cursor, proof_end) else 1
         )
         content_start = cursor + len(delimiter)
         closing_start = _find_unescaped_delimiter(
@@ -5779,10 +6264,11 @@ def _iter_secret_events(
             delimiter=delimiter,
             start=content_start,
             diff_side=assignment_diff_side,
+            maximum_end=proof_end,
         )
         closing_end = None if closing_start is None else closing_start + len(delimiter)
         if closing_start is None:
-            if proof_limit_end <= len(value) and end_is_committable(proof_limit_end):
+            if proof_limit_visible and end_is_committable(proof_limit_end):
                 event_budget.consume()
                 yield (
                     "generic-secret-assignment",
@@ -5799,7 +6285,7 @@ def _iter_secret_events(
                 if range_index < len(specific_ranges)
                 else None
             )
-            if not suffix_context_complete and end_is_committable(content_start):
+            if not proof_suffix_context_complete and end_is_committable(content_start):
                 event_budget.consume()
                 yield (
                     _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE,
@@ -5826,7 +6312,7 @@ def _iter_secret_events(
         if closing_end is None:
             raise ReviewError("sensitive scanner lost a quoted delimiter boundary")
         if maximum_end is not None and closing_end > maximum_end:
-            if proof_limit_end <= len(value) and end_is_committable(proof_limit_end):
+            if proof_limit_visible and end_is_committable(proof_limit_end):
                 event_budget.consume()
                 yield (
                     "generic-secret-assignment",
@@ -5854,7 +6340,7 @@ def _iter_secret_events(
         assignment_incomplete_start = assignment_retention_start
         if wrapper_mismatch:
             assignment_complete = False
-        elif assignment_key in quoted_assignment_acceptance:
+        elif proof_end == len(value) and assignment_key in quoted_assignment_acceptance:
             assignment_complete = quoted_assignment_acceptance[assignment_key]
         else:
             try:
@@ -5865,8 +6351,9 @@ def _iter_secret_events(
                     required_closers=tuple(reversed(wrapper_closers)),
                     diff_surface=diff_surface,
                     prefix_context_complete=prefix_context_complete,
-                    suffix_context_complete=suffix_context_complete,
+                    suffix_context_complete=proof_suffix_context_complete,
                     event_budget=event_budget,
+                    maximum_end=proof_end,
                 )
             except _IncompleteSecretScanSuffix as incomplete:
                 assignment_complete = False
@@ -5874,7 +6361,23 @@ def _iter_secret_events(
                 if incomplete.retention_start is not None:
                     assignment_incomplete_start = incomplete.retention_start
 
-        relevant_end = closing_start if assignment_complete else len(value)
+        if (
+            assignment_incomplete
+            and proof_limit_visible
+            and end_is_committable(proof_limit_end)
+        ):
+            event_budget.consume()
+            yield (
+                "generic-secret-assignment",
+                None,
+                proof_limit_end,
+                False,
+                assignment_match.start(),
+                None,
+            )
+            continue
+
+        relevant_end = closing_start if assignment_complete else proof_end
         range_index = bisect_left(specific_ranges, (content_start, -1))
         relevant_ranges: list[tuple[int, int]] = []
         while (
@@ -5888,7 +6391,7 @@ def _iter_secret_events(
         if not relevant_ranges:
             if (
                 not assignment_complete
-                and not suffix_context_complete
+                and not proof_suffix_context_complete
                 and end_is_committable(content_start)
             ):
                 event_budget.consume()

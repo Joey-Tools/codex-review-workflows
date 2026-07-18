@@ -50,7 +50,7 @@ Diagnostic and preflight evidence remain bounded audit surfaces. They use stable
 
 - Authoring entries keep their exact catalog-declared scanner-rule acceptance behavior.
 - Explicit legacy envelopes keep the existing non-increasing raw and unembedded count policy, including equal-count moves between safe paths when all other legacy checks pass.
-- Dynamic reduction does not create catalog entries, select a legacy envelope, weaken catalog validation, or relax sensitive-path checks.
+- Dynamic reduction does not create catalog entries, select a legacy envelope, weaken catalog validation, or relax sensitive-path checks. A value already registered in an unselected legacy envelope must use explicit legacy selection and cannot be reclassified as an unregistered dynamic deletion.
 - New fixtures must still use the authoring pool, and master-proven historical fixtures must still use explicit legacy selection.
 
 ## Current State
@@ -69,7 +69,7 @@ Diagnostic and preflight evidence remain bounded audit surfaces. They use stable
 - Short provider-specific spans inside incomplete, multiline, prefixed, escaped, triple-quoted, adjacent-literal, wrapped, or expression-based assignments retain a generic blocker until the full logical RHS is proven to be that exact candidate. Operators and comments preserve continuation across stream boundaries and blank lines; opposite unified-diff record sides cannot supply a false closing delimiter.
 - Wrapped exact-RHS proof uses a type-aware last-in-first-out delimiter stack. Missing, crossed, mismatched, or extra delimiters block when the suffix is complete, while a structurally valid partial wrapper remains deferred at an incomplete stream frontier.
 - Exact quoted-RHS proof also validates containers opened before the assignment. A missing external function, array, or object closer blocks at EOF or before a new unseparated statement; comma-delimited sibling assignments remain valid. Mapping-key quotes nested inside a source literal are recognized only when their same-side, unescaped closer is followed by horizontal whitespace and `:` before the assignment value.
-- Provider-backed exhaustive assignment discovery skips the secondary RHS walk when no provider span exists, advances line context incrementally, and reserves bounded prefix-proof budget before inspecting a candidate-bearing RHS. Diff-source proof uses a monotonic watermark to avoid charging the same bytes twice while retaining the absolute per-assignment proof cap. Repeated secret-key prefixes therefore remain linear or fail closed within the scanner budget.
+- Secondary RHS discovery retains OPEN (not yet proven complete) and unknown assignments across stream windows even before a provider span is visible, and releases only a CLOSED (proven complete) RHS. The absolute per-assignment proof cap includes the candidate, delimiters, trailing bytes, wrapper state, and external source context inspected for that decision. Line starts and diff-source context advance monotonically, so repeated secret-key prefixes remain linear or fail closed within the scanner budget.
 - Incomplete stream scans carry separate commit and retention frontiers. Complete assignments before the deferred suffix are committed exactly once, while earlier diff-hunk or PEM proof bytes remain available until the deferred candidate is resolved.
 - Exhaustive provenance audit may retain assignment-local evidence for an exact catalog legacy value after an earlier stream window has already committed a blocker and external prefix context is no longer available. This capture-only evidence never suppresses that generic blocker, never applies to authoring or dynamic reduction values, and never broadens ordinary preflight.
 - Complete-catalog legacy raw values and canonical Base64 storage encodings remain forbidden in both frozen base and head paths, including when a marked base path is deleted or renamed away at head.
@@ -82,7 +82,7 @@ Diagnostic and preflight evidence remain bounded audit surfaces. They use stable
 
 ## Validation
 
-- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests`: 812 tests passed, 9 skipped.
+- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests`: 829 tests passed, 9 skipped.
 - `ruff check` on changed runtime and test modules: passed.
 - `git diff --check`: passed.
 - Fixed-range Codex review and PR readiness evidence are recorded in the delivery thread and PR.
