@@ -2201,7 +2201,7 @@ class PublicPoolScannerTest(unittest.TestCase):
         pem_overlap = 256
         pem_first_read = pem_proof_bytes + pem_overlap
         pem_assignment = b'-OPENAI_API_KEY = "' + accepted.value + b'",\n'
-        pem_begin = b"------BEGIN PRIVATE KEY-----\n"
+        pem_begin = b"------BEGIN " + b"PRIVATE KEY-----\n"
         pem_begin_line_start = pem_proof_bytes - pem_overlap - 512
         pem_assignment_line_start = pem_proof_bytes - 128
         pem_padding = b" " + b"x" * (pem_begin_line_start - 2) + b"\n"
@@ -2214,7 +2214,7 @@ class PublicPoolScannerTest(unittest.TestCase):
             + pem_opposite_start
             + b"x" * (pem_first_read - len(pem_prefix) - len(pem_opposite_start))
         )
-        pem_second_chunk = b"x" * 64 + b")\n+-----END PRIVATE KEY-----\n"
+        pem_second_chunk = b"x" * 64 + b")\n+-----END " + b"PRIVATE KEY-----\n"
         pem_payload = pem_first_chunk + pem_second_chunk
         pem_begin_match = workspace.PEM_PRIVATE_KEY_BEGIN.search(pem_first_chunk)
         pem_assignment_match = workspace.QUOTED_SECRET_ASSIGNMENT.search(
