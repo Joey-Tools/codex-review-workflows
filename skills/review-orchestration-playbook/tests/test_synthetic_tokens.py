@@ -1049,6 +1049,23 @@ class PublicPoolScannerTest(unittest.TestCase):
         self.assertIsNone(source_wrapper.blocking_rule)
         self.assertEqual(source_wrapper.accepted_counts[accepted], 1)
 
+        provider_candidate = b"ghp_" + b"A" * 36
+        provider_accepted = accepted_legacy_value(
+            provider_candidate.decode("ascii"),
+            rule="github-token",
+        )
+        parenthesized_source_wrapper = workspace._scan_secret_value(
+            b"payload = b'access_token = (\""
+            + provider_candidate
+            + b"\")'\nstate = 1\n",
+            accepted_values=(provider_accepted,),
+        )
+        self.assertIsNone(parenthesized_source_wrapper.blocking_rule)
+        self.assertEqual(
+            parenthesized_source_wrapper.accepted_counts[provider_accepted],
+            1,
+        )
+
         plain_source_wrapper = workspace._scan_secret_value(
             b"payload = '" + exact_assignment + b"'\nstate = 1\n",
             accepted_values=self.accepted,
@@ -2800,6 +2817,126 @@ class PublicPoolScannerTest(unittest.TestCase):
             {"generic-secret-assignment"},
         )
 
+    def test_fixed_length_provider_suffix_keeps_complete_rhs_identity(
+        self,
+    ) -> None:
+        cases = (
+            ("aws-access-key", b"AKIA" + b"A" * 16),
+            ("npm-token", b"npm_" + b"A" * 36),
+        )
+        for rule, candidate in cases:
+            with self.subTest(rule=rule):
+                complete_candidate = candidate + b"_suffix"
+                scan = workspace._scan_secret_value(
+                    b"api_" + b"token = " + complete_candidate + b"\n",
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+
+                self.assertIsNone(scan.blocking_rule)
+                self.assertEqual(
+                    scan.blocking_candidates[candidate],
+                    {rule},
+                )
+                self.assertEqual(
+                    scan.blocking_candidates[complete_candidate],
+                    {"generic-secret-assignment"},
+                )
+
+                body_continuation = workspace._scan_secret_value(
+                    b"api_" + b"token = " + candidate + b"A\n",
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+                self.assertNotIn(candidate, body_continuation.blocking_candidates)
+
+    def test_unclosed_or_mismatched_rhs_wrapper_keeps_generic_blocker(
+        self,
+    ) -> None:
+        candidate = b"ghp_" + b"A" * 36
+        cases = (
+            ("unclosed-unquoted", b"api_token = (" + candidate + b"\n"),
+            ("wrong-type-unquoted", b"api_token = (" + candidate + b"]\n"),
+            (
+                "crossed-unquoted",
+                b"api_token = ([" + candidate + b")]\n",
+            ),
+            ("mismatched-unquoted", b"api_token = ([" + candidate + b")\n"),
+            ("extra-unquoted", b"api_token = (" + candidate + b"))\n"),
+            ("unclosed-quoted", b'api_token = ("' + candidate + b'"\n'),
+            (
+                "mismatched-quoted",
+                b'api_token = (["' + candidate + b'")\n',
+            ),
+            (
+                "crossed-quoted",
+                b'api_token = (["' + candidate + b'")]\n',
+            ),
+            (
+                "expression-before-quote",
+                b'api_token = fallback or "' + candidate + b'"\n',
+            ),
+            (
+                "closed-wrapper-before-quote",
+                b'api_token = ()"' + candidate + b'"\n',
+            ),
+            (
+                "external-function-mismatch",
+                b'configure(api_token = "' + candidate + b'"]\n',
+            ),
+            (
+                "external-json-mismatch",
+                b'[{"api_token": "' + candidate + b'")]\n',
+            ),
+            (
+                "diff-external-function-mismatch",
+                b"@@ -1 +1 @@\n"
+                + b'+configure(api_token = "'
+                + candidate
+                + b'"]\n',
+            ),
+            (
+                "diff-external-json-mismatch",
+                b"@@ -1 +1 @@\n"
+                + b'+[{"api_token": "'
+                + candidate
+                + b'")]\n',
+            ),
+        )
+        for label, payload in cases:
+            with self.subTest(case=label):
+                scan = workspace._scan_secret_value(
+                    payload,
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                    diff_surface=label.startswith("diff-"),
+                )
+
+                self.assertEqual(
+                    scan.blocking_rule,
+                    "generic-secret-assignment",
+                )
+                self.assertEqual(
+                    scan.blocking_candidates,
+                    {candidate: {"github-token"}},
+                )
+
+    def test_unclosed_rhs_wrapper_preserves_incomplete_suffix_state(self) -> None:
+        candidate = b"ghp_" + b"A" * 36
+        scan = workspace._scan_secret_value(
+            b"api_token = (" + candidate,
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+            suffix_context_complete=False,
+        )
+
+        self.assertIsNone(scan.blocking_rule)
+        self.assertIsNotNone(scan.incomplete_suffix_start)
+        self.assertEqual(
+            scan.blocking_candidates,
+            {candidate: {"github-token"}},
+        )
+
     def test_short_provider_candidate_keeps_incomplete_quoted_rhs_blocker(
         self,
     ) -> None:
@@ -3240,17 +3377,41 @@ class PublicPoolScannerTest(unittest.TestCase):
         self,
     ) -> None:
         candidate = b"ghp_" + b"A" * 36
-        scan = workspace._scan_secret_value(
-            b'api_token = ("' + candidate + b'")\n',
-            capture_blocking_candidates=True,
-            _continue_after_blocking=True,
+        cases = (
+            (b'api_token = ("' + candidate + b'")\n', False),
+            (b"api_token = ([{" + candidate + b"}])\n", False),
+            (b'api_token = ([{"' + candidate + b'"}])\n', False),
+            (b'configure(api_token = "' + candidate + b'")\n', False),
+            (b'[{"api_token": "' + candidate + b'"}]\n', False),
+            (
+                b"@@ -1 +1 @@\n"
+                + b'+configure(api_token = "'
+                + candidate
+                + b'")\n',
+                True,
+            ),
+            (
+                b"@@ -1 +1 @@\n"
+                + b'+[{"api_token": "'
+                + candidate
+                + b'"}]\n',
+                True,
+            ),
         )
+        for payload, diff_surface in cases:
+            with self.subTest(payload=payload):
+                scan = workspace._scan_secret_value(
+                    payload,
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                    diff_surface=diff_surface,
+                )
 
-        self.assertIsNone(scan.blocking_rule)
-        self.assertEqual(
-            scan.blocking_candidates,
-            {candidate: {"github-token"}},
-        )
+                self.assertIsNone(scan.blocking_rule)
+                self.assertEqual(
+                    scan.blocking_candidates,
+                    {candidate: {"github-token"}},
+                )
 
     def test_exact_template_short_provider_candidate_is_counted_once(self) -> None:
         candidate = b"ghp_" + b"A" * 36
@@ -4444,6 +4605,32 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         self.assertFalse(review.workspace_root.exists())
         self.assertFalse(private_paths.exists())
 
+    def test_retained_container_removes_private_paths_when_cleanup_fails(
+        self,
+    ) -> None:
+        repo, base = self.new_repo({"README.md": "base\n"})
+        (repo / "README.md").write_text("head\n", encoding="utf-8")
+        head = self.commit(repo)
+        review = self.prepare(repo=repo, base=base, head=head)
+        private_paths = review.container_dir / workspace.PRIVATE_CHANGED_PATHS_NAME
+        self.assertTrue(private_paths.exists())
+
+        with mock.patch.object(
+            workspace.shutil,
+            "rmtree",
+            side_effect=PermissionError("permission denied"),
+        ) as remove_tree:
+            cleanup_error = workspace.cleanup_workspace(
+                review,
+                keep_container=True,
+            )
+
+        self.assertIn("permission denied", cleanup_error or "")
+        remove_tree.assert_called_once_with(review.workspace_root)
+        self.assertTrue(review.container_dir.exists())
+        self.assertTrue(review.workspace_root.exists())
+        self.assertFalse(private_paths.exists())
+
     def test_jwt_base64url_suffix_extraction_does_not_count_as_reduction(self) -> None:
         shorter = reduction_secret("jwt").decode("ascii")
         longer = shorter + "-"
@@ -4575,6 +4762,34 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         with self.assertRaisesRegex(ReviewError, "generic-secret-assignment"):
             self.prepare(repo=repo, base=base, head=head)
 
+    def test_incomplete_rhs_wrapper_does_not_count_as_reduction(self) -> None:
+        candidate = b"ghp_" + b"A" * 36
+        cases = (
+            ("unclosed-unquoted", b"api_token = (" + candidate + b"\n"),
+            ("mismatched-unquoted", b"api_token = ([" + candidate + b")\n"),
+            ("unclosed-quoted", b'api_token = ("' + candidate + b'"\n'),
+            (
+                "external-function-mismatch",
+                b'configure(api_token = "' + candidate + b'"]\n',
+            ),
+            (
+                "external-json-mismatch",
+                b'[{"api_token": "' + candidate + b'")]\n',
+            ),
+        )
+        for label, raw_fixture in cases:
+            with self.subTest(case=label):
+                fixture = raw_fixture.decode("ascii")
+                repo, base = self.new_repo({"fixture.txt": fixture * 2})
+                (repo / "fixture.txt").write_text(fixture, encoding="utf-8")
+                head = self.commit(repo)
+
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "generic-secret-assignment",
+                ):
+                    self.prepare(repo=repo, base=base, head=head)
+
     def test_extended_short_provider_value_does_not_count_as_prefix_reduction(
         self,
     ) -> None:
@@ -4625,6 +4840,70 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                 for entry in reductions
             )
         )
+
+    def test_fixed_length_provider_suffix_does_not_count_as_prefix_reduction(
+        self,
+    ) -> None:
+        cases = (
+            ("aws-access-key", b"AKIA" + b"A" * 16),
+            ("npm-token", b"npm_" + b"A" * 36),
+        )
+        for rule, candidate in cases:
+            with self.subTest(rule=rule):
+
+                def assignment(suffix: bytes) -> str:
+                    return (
+                        b"api_" + b"token = " + candidate + suffix + b"\n"
+                    ).decode("ascii")
+
+                repo, base = self.new_repo(
+                    {
+                        "fixture.txt": assignment(b"_alpha")
+                        + assignment(b"_bravo")
+                    }
+                )
+                (repo / "fixture.txt").write_text(
+                    assignment(b"_charlie"),
+                    encoding="utf-8",
+                )
+                head = self.commit(repo)
+
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "generic-secret-assignment",
+                ):
+                    self.prepare(repo=repo, base=base, head=head)
+
+    def test_fixed_length_provider_suffix_can_strictly_reduce_when_exact(
+        self,
+    ) -> None:
+        cases = (
+            ("aws-access-key", b"AKIA" + b"A" * 16),
+            ("npm-token", b"npm_" + b"A" * 36),
+        )
+        for rule, candidate in cases:
+            with self.subTest(rule=rule):
+                fixture = (
+                    b"api_" + b"token = " + candidate + b"_suffix\n"
+                ).decode("ascii")
+                repo, base = self.new_repo({"fixture.txt": fixture * 2})
+                (repo / "fixture.txt").write_text(fixture, encoding="utf-8")
+                head = self.commit(repo)
+
+                review = self.prepare(repo=repo, base=base, head=head)
+                evidence = self.validate(review)
+                reductions = evidence["synthetic_tokens"]["secret_reductions"]
+                self.assertEqual(len(reductions), 2)
+                self.assertEqual(
+                    {tuple(entry["rules"]) for entry in reductions},
+                    {("generic-secret-assignment",), (rule,)},
+                )
+                self.assertTrue(
+                    all(
+                        (entry["base_count"], entry["head_count"]) == (2, 1)
+                        for entry in reductions
+                    )
+                )
 
     def test_prepared_range_rejects_non_decreasing_secret_transitions(self) -> None:
         cases = (

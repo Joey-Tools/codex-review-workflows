@@ -73,7 +73,10 @@ OVERSIZED_JWT_PATTERN = re.compile(
 )
 # Complete shared-prefix rules must precede broader overlapping sentinel rules.
 SECRET_PATTERNS = (
-    ("aws-access-key", re.compile(rb"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    (
+        "aws-access-key",
+        re.compile(rb"\b(?:AKIA|ASIA)[0-9A-Z]{16}(?![0-9A-Z])"),
+    ),
     (
         "aws-secret-key",
         AWS_SECRET_KEY_PATTERN,
@@ -117,7 +120,10 @@ SECRET_PATTERNS = (
             rb"[0-9A-Za-z_-]{35,512}(?![0-9A-Za-z_-])|[0-9A-Za-z_-]{513})"
         ),
     ),
-    ("npm-token", re.compile(rb"\bnpm_[A-Za-z0-9]{36}\b")),
+    (
+        "npm-token",
+        re.compile(rb"\bnpm_[A-Za-z0-9]{36}(?![A-Za-z0-9])"),
+    ),
     (
         "pypi-token",
         re.compile(
@@ -3530,11 +3536,40 @@ def _bounded_diff_hunk_context_before(
     )
 
 
+def _wrapper_segments_are_balanced(
+    prefix: bytes,
+    suffix: bytes,
+    *,
+    require_complete: bool = True,
+) -> bool:
+    expected_closers: list[int] = []
+    closer_by_opener = {
+        0x28: 0x29,
+        0x5B: 0x5D,
+        0x7B: 0x7D,
+    }
+    trivia = frozenset((0x09, 0x0A, 0x0D, 0x20))
+    for byte in prefix:
+        if byte in trivia:
+            continue
+        closer = closer_by_opener.get(byte)
+        if closer is None:
+            return False
+        expected_closers.append(closer)
+    for byte in suffix:
+        if byte in trivia:
+            continue
+        if not expected_closers or byte != expected_closers.pop():
+            return False
+    return not expected_closers or not require_complete
+
+
 def _quoted_assignment_may_accept(
     value: bytes,
     *,
     assignment_start: int,
     assignment_end: int,
+    required_closers: tuple[int, ...] = (),
     diff_surface: bool = False,
     prefix_context_complete: bool = True,
     suffix_context_complete: bool = True,
@@ -3945,7 +3980,7 @@ def _quoted_assignment_may_accept(
             return index < limit and value[index] == 0x28
         return index < limit and value[index] in (0x28, 0x3A)
 
-    def diff_source_prefix() -> bytes | None:
+    def diff_source_prefix(*, end: int | None = None) -> bytes | None:
         hunk_context, lower_bound = _bounded_diff_hunk_context_before(
             value,
             match_line_start,
@@ -3957,8 +3992,10 @@ def _quoted_assignment_may_accept(
             return None
         else:
             hunk_start = hunk_context.source_start
-        raw_prefix = value[hunk_start:cursor]
-        source_proof_bytes = len(raw_prefix) - skipped_diff_bytes
+        prefix_end = cursor if end is None else end
+        raw_prefix = value[hunk_start:prefix_end]
+        skipped_bytes = skipped_diff_bytes if end is None else 0
+        source_proof_bytes = len(raw_prefix) - skipped_bytes
         if source_proof_bytes < 0 or not event_budget.consume_prefix_proof(
             source_proof_bytes
         ):
@@ -3977,6 +4014,72 @@ def _quoted_assignment_may_accept(
             elif line:
                 return None
         return b"".join(source_lines)
+
+    def wrapper_closers_before_assignment() -> tuple[int, ...] | None:
+        if diff_surface:
+            prefix = diff_source_prefix(end=assignment_start)
+            if prefix is None:
+                return None
+        else:
+            if not prefix_context_complete:
+                return None
+            prefix = value[:assignment_start]
+            if not event_budget.consume_prefix_proof(len(prefix)):
+                return None
+
+        closer_by_opener = {
+            0x28: 0x29,
+            0x5B: 0x5D,
+            0x7B: 0x7D,
+        }
+        closers: list[int] = []
+        index = 0
+        while index < len(prefix):
+            if prefix.startswith(b"/*", index):
+                comment_end = prefix.find(b"*/", index + 2)
+                if comment_end < 0:
+                    return None
+                index = comment_end + 2
+                continue
+            if prefix.startswith(b"//", index) or prefix[index] == 0x23:
+                line_end_candidates = tuple(
+                    boundary
+                    for boundary in (
+                        prefix.find(b"\n", index),
+                        prefix.find(b"\r", index),
+                    )
+                    if boundary >= 0
+                )
+                if not line_end_candidates:
+                    return None
+                index = min(line_end_candidates)
+                continue
+            if prefix[index] in (0x22, 0x27, 0x60):
+                quote = prefix[index : index + 1]
+                delimiter = quote * (
+                    3
+                    if quote != b"`" and prefix.startswith(quote * 3, index)
+                    else 1
+                )
+                closing_start = _find_unescaped_delimiter(
+                    prefix,
+                    delimiter=delimiter,
+                    start=index + len(delimiter),
+                )
+                if closing_start is None:
+                    return tuple(closers)
+                index = closing_start + len(delimiter)
+                continue
+            closer = closer_by_opener.get(prefix[index])
+            if closer is not None:
+                closers.append(closer)
+                index += 1
+                continue
+            if prefix[index] in (0x29, 0x5D, 0x7D):
+                if not closers or prefix[index] != closers.pop():
+                    return None
+            index += 1
+        return tuple(closers)
 
     def python_prefix_is_complete() -> bool:
         if diff_surface:
@@ -4005,12 +4108,10 @@ def _quoted_assignment_may_accept(
         return False
     source_literal_wrapper = False
     outer_quote = source_literal_quote()
-    if outer_quote is not None:
-        if cursor < len(value) and value[cursor] == outer_quote:
-            if not advance(1) or not trim_space():
-                return False
-            source_literal_wrapper = True
     crossed_boundary = False
+    required_closer_index = 0
+    external_wrapper_closers: list[int] | None = None
+    external_wrapper_context_loaded = False
 
     def starts_proven_python_declaration() -> bool:
         return starts_top_level_python_declaration() and python_prefix_is_complete()
@@ -4022,12 +4123,52 @@ def _quoted_assignment_may_accept(
             raise _IncompleteSecretScanSuffix
         return True
 
-    while True:
+    def consume_external_wrapper_closers() -> bool:
+        nonlocal external_wrapper_closers, external_wrapper_context_loaded
         while value.startswith((b")", b"]", b"}"), cursor):
+            if not external_wrapper_context_loaded:
+                external_wrapper_context = wrapper_closers_before_assignment()
+                if external_wrapper_context is None:
+                    return False
+                external_wrapper_closers = list(external_wrapper_context)
+                external_wrapper_context_loaded = True
+            if (
+                not external_wrapper_closers
+                or value[cursor] != external_wrapper_closers.pop()
+            ):
+                return False
+            if not advance(1) or not trim_space():
+                return False
+        return True
+
+    while required_closer_index < len(required_closers):
+        expected_closer = required_closers[required_closer_index]
+        if cursor < len(value) and value[cursor] == expected_closer:
             if not advance(1):
                 return False
+            required_closer_index += 1
             if not trim_space():
                 return False
+            continue
+        if starts_trivia():
+            crossed_boundary = True
+            if not trim_continuation_trivia():
+                return False
+            if not trim_diff_record_prefix():
+                return False
+            continue
+        if cursor == len(value) and not suffix_context_complete:
+            raise _IncompleteSecretScanSuffix
+        return False
+    if outer_quote is not None:
+        if cursor < len(value) and value[cursor] == outer_quote:
+            if not advance(1) or not trim_space():
+                return False
+            source_literal_wrapper = True
+
+    while True:
+        if not consume_external_wrapper_closers():
+            return False
         if starts_trivia():
             crossed_boundary = True
             if not trim_continuation_trivia():
@@ -4054,9 +4195,8 @@ def _quoted_assignment_may_accept(
         if not advance(1) or not trim_space():
             return False
         while True:
-            while value.startswith((b")", b"]", b"}"), cursor):
-                if not advance(1) or not trim_space():
-                    return False
+            if not consume_external_wrapper_closers():
+                return False
             if starts_trivia():
                 if not trim_continuation_trivia():
                     return False
@@ -4691,7 +4831,9 @@ def _iter_secret_events(
             assignment_diff_side = value[assignment_line_start]
         cursor = assignment_match.end()
         wrapper_prefix = False
-        wrapper_depth = 0
+        wrapper_closers: list[int] = []
+        wrapper_mismatch = False
+        quoted_prefix_wrapper_only = True
         pending_expression_continuation = False
         while cursor < len(value):
             lowered_prefix = value[cursor : cursor + 3].lower()
@@ -4722,17 +4864,29 @@ def _iter_secret_events(
                 continue
             if value[cursor] in (0x28, 0x5B, 0x7B):
                 wrapper_prefix = True
-                wrapper_depth += 1
+                wrapper_closers.append(
+                    {
+                        0x28: 0x29,
+                        0x5B: 0x5D,
+                        0x7B: 0x7D,
+                    }[value[cursor]]
+                )
                 pending_expression_continuation = False
                 cursor += 1
                 continue
-            if value[cursor] in (0x29, 0x5D, 0x7D) and wrapper_depth:
-                wrapper_depth -= 1
+            if value[cursor] in (0x29, 0x5D, 0x7D):
+                wrapper_prefix = True
+                quoted_prefix_wrapper_only = False
+                if wrapper_closers and value[cursor] == wrapper_closers[-1]:
+                    wrapper_closers.pop()
+                else:
+                    wrapper_mismatch = True
                 pending_expression_continuation = False
                 cursor += 1
                 continue
             if value.startswith(b"/*", cursor):
                 wrapper_prefix = True
+                quoted_prefix_wrapper_only = False
                 comment_end = value.find(b"*/", cursor + 2)
                 if comment_end < 0:
                     cursor = len(value)
@@ -4740,6 +4894,7 @@ def _iter_secret_events(
                 cursor = comment_end + 2
                 continue
             if value.startswith(b"//", cursor):
+                quoted_prefix_wrapper_only = False
                 previous = cursor - 1
                 while previous >= assignment_match.end() and value[previous] in (
                     0x09,
@@ -4748,7 +4903,7 @@ def _iter_secret_events(
                     previous -= 1
                 pending_expression_continuation = (
                     pending_expression_continuation
-                    or wrapper_depth > 0
+                    or bool(wrapper_closers)
                     or (
                         previous >= assignment_match.end()
                         and value[previous] in continuation_operators
@@ -4797,12 +4952,12 @@ def _iter_secret_events(
                     and value[next_cursor] in continuation_operators
                 )
                 line_continues = (
-                    wrapper_depth > 0
+                    bool(wrapper_closers)
                     or pending_expression_continuation
                     or previous_continues
                     or next_continues
                 )
-                if wrapper_depth == 0 and (
+                if not wrapper_closers and (
                     not line_continues
                 ):
                     break
@@ -4814,6 +4969,7 @@ def _iter_secret_events(
                 cursor += 2 if value.startswith(b"\r\n", cursor) else 1
                 continue
             if value[cursor] == 0x23:
+                quoted_prefix_wrapper_only = False
                 line_end_candidates = tuple(
                     boundary
                     for boundary in (
@@ -4823,12 +4979,12 @@ def _iter_secret_events(
                     if boundary >= 0
                 )
                 line_end = min(line_end_candidates, default=len(value))
-                if wrapper_depth == 0 and not pending_expression_continuation:
+                if not wrapper_closers and not pending_expression_continuation:
                     cursor = line_end
                     break
                 cursor = line_end
                 continue
-            if value[cursor] == 0x3B and wrapper_depth == 0:
+            if value[cursor] == 0x3B and not wrapper_closers:
                 break
             if (
                 diff_surface
@@ -4839,6 +4995,7 @@ def _iter_secret_events(
                 cursor += 1
                 continue
             wrapper_prefix = True
+            quoted_prefix_wrapper_only = False
             pending_expression_continuation = (
                 value[cursor] in continuation_operators
             )
@@ -4879,16 +5036,28 @@ def _iter_secret_events(
                 wrapper_suffix_bytes = value[specific_end:cursor]
                 exact_wrapped_candidate = (
                     len(rhs_specific_ranges) == 1
-                    and all(
-                        byte in (0x09, 0x0A, 0x0D, 0x20, 0x28, 0x5B, 0x7B)
-                        for byte in wrapper_prefix_bytes
-                    )
-                    and all(
-                        byte in (0x09, 0x0A, 0x0D, 0x20, 0x29, 0x5D, 0x7D)
-                        for byte in wrapper_suffix_bytes
+                    and _wrapper_segments_are_balanced(
+                        wrapper_prefix_bytes,
+                        wrapper_suffix_bytes,
                     )
                 )
-                if not exact_wrapped_candidate and end_is_committable(specific_end):
+                wrapper_may_complete = (
+                    len(rhs_specific_ranges) == 1
+                    and _wrapper_segments_are_balanced(
+                        wrapper_prefix_bytes,
+                        wrapper_suffix_bytes,
+                        require_complete=False,
+                    )
+                )
+                if (
+                    not exact_wrapped_candidate
+                    and end_is_committable(specific_end)
+                    and not (
+                        not suffix_context_complete
+                        and cursor == len(value)
+                        and wrapper_may_complete
+                    )
+                ):
                     event_budget.consume()
                     yield (
                         "generic-secret-assignment",
@@ -5009,7 +5178,9 @@ def _iter_secret_events(
 
         assignment_key = (assignment_match.start(), closing_end)
         assignment_incomplete = False
-        if assignment_key in quoted_assignment_acceptance:
+        if wrapper_mismatch:
+            assignment_complete = False
+        elif assignment_key in quoted_assignment_acceptance:
             assignment_complete = quoted_assignment_acceptance[assignment_key]
         else:
             try:
@@ -5017,6 +5188,7 @@ def _iter_secret_events(
                     value,
                     assignment_start=assignment_match.start(),
                     assignment_end=closing_end,
+                    required_closers=tuple(reversed(wrapper_closers)),
                     diff_surface=diff_surface,
                     prefix_context_complete=prefix_context_complete,
                     suffix_context_complete=suffix_context_complete,
@@ -5056,6 +5228,7 @@ def _iter_secret_events(
 
         exact_specific_candidate = (
             assignment_complete
+            and quoted_prefix_wrapper_only
             and all(
                 specific_start == content_start
                 and candidate_end == closing_start
@@ -6043,16 +6216,19 @@ def prepare_workspace(
 
 def cleanup_workspace(review: ReviewWorkspace, *, keep_container: bool) -> str | None:
     validate_workspace_layout(review)
+    cleanup_errors: list[str] = []
     try:
         if review.workspace_root.exists():
             shutil.rmtree(review.workspace_root)
-        if keep_container:
-            try:
-                (review.container_dir / PRIVATE_CHANGED_PATHS_NAME).unlink()
-            except FileNotFoundError:
-                pass
-        else:
+        if not keep_container:
             shutil.rmtree(review.container_dir)
     except OSError as error:
-        return str(error)
-    return None
+        cleanup_errors.append(str(error))
+    finally:
+        try:
+            (review.container_dir / PRIVATE_CHANGED_PATHS_NAME).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            cleanup_errors.append(str(error))
+    return "; ".join(cleanup_errors) or None

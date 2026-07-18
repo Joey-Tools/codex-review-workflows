@@ -59,23 +59,25 @@ Diagnostic and preflight evidence remain bounded audit surfaces. They use stable
 - Complete PEM blocks and AWS secret values have stable candidate identities; oversized provider prefixes, oversized assignments/JWTs, incomplete PEM blocks, and other uncountable events remain fail closed.
 - Dynamic candidates that do not satisfy the reduction inequalities are rejected during preparation, before a mutable materialized head or reviewer process exists.
 - Variable-length provider candidates prove their terminating byte against the provider body alphabet, select the longest actual prefix for the 513-byte fail-closed branch, and retain provider-specific spans across stream commit boundaries.
+- Fixed-length AWS access-key and npm-token candidates use provider-body termination rather than a generic word boundary. A following underscore or other non-body byte therefore preserves both the exact provider span and the complete longer RHS identity.
 - Google API-key candidates capture the complete 35-to-512-byte provider body; a 513-byte prefix remains fail closed, so Base64url punctuation cannot truncate distinct longer values into one reduction candidate.
 - A generic oversized-assignment event is suppressed only when its 513-byte prefix is proven to be the beginning of one complete provider-specific candidate that exactly fills the quoted or unquoted right-hand side, including across stream commit boundaries; any trailing generic value byte still blocks.
 - The oversized-assignment exemption reuses the ordinary quoted or unquoted logical-RHS parser, so whitespace, operators, shell continuations, quote transitions, backslashes, backticks, and unsafe diff continuations remain fail closed after a long provider candidate.
 - Exact provider-specific spans still pass through generic quoted or unquoted RHS validation when their short values fall below the generic entropy heuristic. A safe exact RHS is deduplicated only after the parser accepts it; operators, shell continuations, unsafe diff continuations, and other rejected tails remain generic-assignment blockers.
 - A complete provider-specific span nested inside a longer low-entropy unquoted assignment retains the complete generic RHS identity, including an attached suffix or nonzero offset. This prevents distinct longer values from being collapsed into one shorter reduction candidate. AWS credential assignments use the same fail-closed complete-RHS treatment.
 - Short provider-specific spans inside incomplete, multiline, prefixed, escaped, triple-quoted, adjacent-literal, wrapped, or expression-based assignments retain a generic blocker until the full logical RHS is proven to be that exact candidate. Operators and comments preserve continuation across stream boundaries and blank lines; opposite unified-diff record sides cannot supply a false closing delimiter.
+- Wrapped exact-RHS proof uses a type-aware last-in-first-out delimiter stack. Missing, crossed, mismatched, or extra delimiters block when the suffix is complete, while a structurally valid partial wrapper remains deferred at an incomplete stream frontier.
 - Complete-catalog legacy raw values and canonical Base64 storage encodings remain forbidden in both frozen base and head paths, including when a marked base path is deleted or renamed away at head.
 - Exact dynamic reduction raw values and canonical Base64 encodings are forbidden in every frozen and materialized head path. A deleted base-only path remains reviewable through the trusted raw diff and is omitted from changed-head metadata.
 - Exact unembedded counting uses separate containment domains for each legacy envelope and for dynamic reductions, so a longer dynamic candidate cannot change legacy count semantics while dynamic candidates still contain one another normally.
 - Reviewer-visible diff and prompt artifacts are integrity-bound. Text diffs are not secret-egress filters and retain deleted secret bytes in their original form; prompts remain independently secret-scanned and accept only exact authoring-catalog values.
 - Deleted sensitive paths are omitted from head-side changed-path findings and are allowed only when the complete materialized head remains free of sensitive paths.
-- Public changed-path evidence contains ordered SHA-256 commitments only. The helper validates those records lockstep against an owner-only private raw-path stream, checks the commitments and all other audit evidence against catalog and dynamic sensitive values, and removes the private stream whenever the reviewer workspace is cleaned. Changed-blob findings identify paths by digest as well.
+- Public changed-path evidence contains ordered SHA-256 commitments only. The helper validates those records lockstep against an owner-only private raw-path stream, checks the commitments and all other audit evidence against catalog and dynamic sensitive values, and removes the private stream whenever workspace cleanup is attempted, including after a workspace-tree removal error. Changed-blob findings identify paths by digest as well.
 - Catalog authoring and explicitly selected legacy behavior remains unchanged.
 
 ## Validation
 
-- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests`: 786 tests passed, 9 skipped.
+- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests`: 793 tests passed, 9 skipped.
 - `ruff check` on changed runtime and test modules: passed.
 - `git diff --check`: passed.
 - Fixed-range Codex review and PR readiness evidence are recorded in the delivery thread and PR.
