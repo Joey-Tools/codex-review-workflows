@@ -1511,7 +1511,7 @@ class PublicPoolScannerTest(unittest.TestCase):
         for expected_rule, candidate in cases:
             for quoted, payload in (
                 (True, assignment_bytes(b"api_token", candidate)),
-                (False, b"api_token = " + candidate + b"\n"),
+                (False, b"api_" + b"token = " + candidate + b"\n"),
             ):
                 with self.subTest(rule=expected_rule, quoted=quoted):
                     scan = workspace._scan_secret_value(
@@ -1529,7 +1529,7 @@ class PublicPoolScannerTest(unittest.TestCase):
                         (
                             assignment_bytes(b"api_token", candidate + b"!")
                             if quoted
-                            else b"api_token = " + candidate + b"!\n"
+                            else b"api_" + b"token = " + candidate + b"!\n"
                         ),
                         capture_blocking_candidates=True,
                         _continue_after_blocking=True,
@@ -1559,7 +1559,7 @@ class PublicPoolScannerTest(unittest.TestCase):
         self,
     ) -> None:
         candidate = b"sk-proj-" + b"B" * 508
-        assignment_prefix = b'api_token = "'
+        assignment_prefix = b"api_" + b'token = "'
         first_read = (
             workspace.MAX_SECRET_PREFIX_PROOF_BYTES + workspace.STREAM_SCAN_OVERLAP
         )
