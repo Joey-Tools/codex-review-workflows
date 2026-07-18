@@ -2092,20 +2092,23 @@ def _secret_count_manifests(
         if exemption.identifier not in selected_exemption_ids
         for token in exemption.values
     }
+    unselected_legacy_matcher = _exact_path_matcher(unselected_legacy_values)
     unselected_legacy_candidates = {
-        candidate: rules
+        candidate: (rules, exemption_id)
         for candidate, rules in discovery.blocking_candidates.items()
-        if candidate in unselected_legacy_values
+        if (exemption_id := unselected_legacy_matcher.match(candidate)) is not None
     }
     if unselected_legacy_candidates:
         exemption_ids = sorted(
             {
-                unselected_legacy_values[candidate]
-                for candidate in unselected_legacy_candidates
+                exemption_id
+                for _rules, exemption_id in unselected_legacy_candidates.values()
             }
         )
         scanner_rules = sorted(
-            rule for rules in unselected_legacy_candidates.values() for rule in rules
+            rule
+            for rules, _exemption_id in unselected_legacy_candidates.values()
+            for rule in rules
         )
         raise ReviewError(
             "unselected catalog legacy value requires an explicitly selected "

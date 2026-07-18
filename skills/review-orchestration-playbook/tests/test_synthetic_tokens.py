@@ -6724,6 +6724,56 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         )
         self.assertEqual(evidence["synthetic_tokens"]["secret_reductions"], [])
 
+    def test_unselected_legacy_substring_reduction_requires_explicit_exemption(
+        self,
+    ) -> None:
+        catalog = legacy_catalog(values=(LEGACY_A,))
+        embedded_value = "Prefix" + LEGACY_A + "Suffix"
+        fixture = assignment_text("access_token", embedded_value)
+        repo, base = self.new_repo({"fixture.cfg": fixture * 2})
+        (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
+        head = self.commit(repo)
+
+        with mock.patch.object(
+            workspace,
+            "_secret_reduction_descriptor",
+            wraps=workspace._secret_reduction_descriptor,
+        ) as descriptor:
+            with self.assertRaisesRegex(
+                ReviewError,
+                "explicitly selected synthetic secret exemption",
+            ) as raised:
+                self.prepare(
+                    repo=repo,
+                    base=base,
+                    head=head,
+                    catalog=catalog,
+                )
+        descriptor.assert_not_called()
+        self.assertNotIn(LEGACY_A, str(raised.exception))
+        self.assertNotIn(embedded_value, str(raised.exception))
+
+        review = self.prepare(
+            repo=repo,
+            base=base,
+            head=head,
+            catalog=catalog,
+            exemptions=("historical-fixtures",),
+        )
+        evidence = self.validate(review, catalog=catalog)
+        counts = evidence["synthetic_tokens"]["legacy_counts"]
+        reductions = evidence["synthetic_tokens"]["secret_reductions"]
+        self.assertEqual(len(counts), 1)
+        self.assertEqual(
+            (counts[0]["base_count"], counts[0]["head_count"]),
+            (2, 1),
+        )
+        self.assertEqual(len(reductions), 1)
+        self.assertEqual(
+            (reductions[0]["base_count"], reductions[0]["head_count"]),
+            (2, 1),
+        )
+
     def test_legacy_counts_accept_authoring_values_but_not_unknown_secrets(
         self,
     ) -> None:

@@ -50,7 +50,7 @@ Diagnostic and preflight evidence remain bounded audit surfaces. They use stable
 
 - Authoring entries keep their exact catalog-declared scanner-rule acceptance behavior.
 - Explicit legacy envelopes keep the existing non-increasing raw and unembedded count policy, including equal-count moves between safe paths when all other legacy checks pass.
-- Dynamic reduction does not create catalog entries, select a legacy envelope, weaken catalog validation, or relax sensitive-path checks. A value already registered in an unselected legacy envelope must use explicit legacy selection and cannot be reclassified as an unregistered dynamic deletion.
+- Dynamic reduction does not create catalog entries, select a legacy envelope, weaken catalog validation, or relax sensitive-path checks. A dynamic candidate that equals or contains a value registered in an unselected legacy envelope must use explicit legacy selection and cannot reclassify that catalog value as part of an unregistered deletion.
 - New fixtures must still use the authoring pool, and master-proven historical fixtures must still use explicit legacy selection.
 
 ## Current State
@@ -82,7 +82,7 @@ Diagnostic and preflight evidence remain bounded audit surfaces. They use stable
 
 ## Validation
 
-- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests`: 829 tests passed, 9 skipped.
+- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests`: 830 tests passed, 9 skipped.
 - `ruff check` on changed runtime and test modules: passed.
 - `git diff --check`: passed.
 - Fixed-range Codex review and PR readiness evidence are recorded in the delivery thread and PR.
