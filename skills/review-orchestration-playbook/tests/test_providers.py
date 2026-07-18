@@ -131,6 +131,10 @@ class ProviderPolicyTest(unittest.TestCase):
             diff_file=diff_file,
             prompt_file=prompt_file,
         )
+        self.private_review_artifacts = {
+            name: (container / name).read_bytes()
+            for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
+        }
         self._refresh_control_artifact_state()
         self.claude_broker = (
             container / "claude-runtime" / "keychain-broker" / "security"
@@ -236,6 +240,10 @@ class ProviderPolicyTest(unittest.TestCase):
             state,
             label="helper-private review control state",
         )
+
+    def _restore_private_review_artifacts(self) -> None:
+        for name, payload in self.private_review_artifacts.items():
+            (self.review.container_dir / name).write_bytes(payload)
 
     def tearDown(self) -> None:
         self.warmup_patcher.stop()
@@ -3547,6 +3555,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
         for error_type, failure_class in cases:
             with self.subTest(failure_class=failure_class):
+                self._restore_private_review_artifacts()
                 diagnostic = f"private diagnostic for {failure_class}"
                 providers.write_json(
                     self.review.container_dir / "claude-runtime.json",
@@ -4154,6 +4163,7 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         for error in cases:
             with self.subTest(error_type=type(error).__name__):
+                self._restore_private_review_artifacts()
                 self.warmup.reset_mock()
                 copilot_attempt.reset_mock()
                 resolve.reset_mock()
@@ -4595,6 +4605,7 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         for error in errors:
             with self.subTest(error_type=type(error).__name__):
+                self._restore_private_review_artifacts()
                 claude_attempt.reset_mock()
                 copilot_attempt.reset_mock()
                 resolve.reset_mock()
@@ -4657,6 +4668,7 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         for error in errors:
             with self.subTest(error_type=type(error).__name__):
+                self._restore_private_review_artifacts()
                 claude_attempt.reset_mock()
                 copilot_attempt.reset_mock()
                 resolve.reset_mock()
@@ -5354,6 +5366,12 @@ class ProviderPolicyTest(unittest.TestCase):
         resolve.assert_not_called()
         self.assertFalse((self.review.container_dir / "egress.json").exists())
         self.assertFalse((self.review.container_dir / "preflight.json").exists())
+        self.assertFalse(
+            any(
+                (self.review.container_dir / name).exists()
+                for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
+            )
+        )
         error = (self.review.container_dir / "runner-error.txt").read_text(
             encoding="utf-8"
         )
@@ -5415,6 +5433,38 @@ class ProviderPolicyTest(unittest.TestCase):
             secret,
             self.review.prompt_file.read_text(encoding="utf-8"),
         )
+        self.assertFalse(
+            any(
+                (self.review.container_dir / name).exists()
+                for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
+            )
+        )
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_private_artifact_cleanup_failure_blocks_codex_launch(
+        self,
+        run_model_chain: mock.Mock,
+        environment: mock.Mock,
+    ) -> None:
+        with mock.patch.object(
+            providers,
+            "remove_private_review_artifacts",
+            return_value="unlink denied",
+        ):
+            outcome = providers.run_review(
+                review=self.review,
+                reviewer="codex",
+            )
+
+        self.assertEqual(outcome.returncode, 2)
+        run_model_chain.assert_not_called()
+        environment.assert_not_called()
+        self.assertFalse((self.review.container_dir / "preflight.json").exists())
+        error = (self.review.container_dir / "runner-error.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("private artifact cleanup failed", error)
 
     @mock.patch.object(providers, "_review_environment", return_value={})
     @mock.patch.object(providers, "_run_model_chain")
@@ -5432,6 +5482,13 @@ class ProviderPolicyTest(unittest.TestCase):
             self.assertEqual(
                 evidence["review_range"],
                 f"{self.review.base_ref}..{self.review.head_ref}",
+            )
+            self.assertEqual(evidence["private_artifacts"], "removed")
+            self.assertFalse(
+                any(
+                    (self.review.container_dir / name).exists()
+                    for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
+                )
             )
             return "success", "No findings."
 

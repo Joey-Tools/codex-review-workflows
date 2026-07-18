@@ -93,6 +93,7 @@ from .common import (
 from .workspace import (
     MAX_REVIEW_PROMPT_BYTES,
     ReviewWorkspace,
+    remove_private_review_artifacts,
     validate_external_workspace,
 )
 
@@ -4789,13 +4790,31 @@ def run_review(
     try:
         synthetic_evidence = validate_external_workspace(review) or {}
     except ReviewError as error:
+        private_cleanup_error = remove_private_review_artifacts(
+            review.container_dir
+        )
+        cleanup_suffix = (
+            f"; private artifact cleanup failed: {private_cleanup_error}"
+            if private_cleanup_error
+            else ""
+        )
         write_text_atomic(
             review.container_dir / "runner-error.txt",
-            f"review egress workspace preflight failed: {error}\n",
+            f"review egress workspace preflight failed: {error}{cleanup_suffix}\n",
+        )
+        return Outcome(2, None, tuple())
+
+    private_cleanup_error = remove_private_review_artifacts(review.container_dir)
+    if private_cleanup_error:
+        write_text_atomic(
+            review.container_dir / "runner-error.txt",
+            "review egress private artifact cleanup failed: "
+            f"{private_cleanup_error}\n",
         )
         return Outcome(2, None, tuple())
 
     preflight_evidence = {
+        "private_artifacts": "removed",
         "review_range": f"{review.base_ref}..{review.head_ref}",
         "scope": "frozen tracked workspace, diff, and review prompt",
         "status": "secret-delta and escaping-symlink checks passed",

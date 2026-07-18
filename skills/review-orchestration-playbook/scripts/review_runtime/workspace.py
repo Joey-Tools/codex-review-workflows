@@ -271,6 +271,10 @@ CONTROL_ARTIFACT_STATE_NAME = "control-artifact-state.json"
 CONTROL_ARTIFACT_SCHEMA_VERSION = 3
 CHANGED_PATH_DIGESTS_NAME = "changed-path-digests.z"
 PRIVATE_CHANGED_PATHS_NAME = "changed-paths-private.z"
+PRIVATE_HELPER_ARTIFACT_NAMES = (
+    SYNTHETIC_PRIVATE_MANIFEST_NAME,
+    PRIVATE_CHANGED_PATHS_NAME,
+)
 CONTROL_ARTIFACT_SPECS: dict[str, tuple[int, int | None]] = {
     CHANGED_PATH_DIGESTS_NAME: (MAX_CHANGED_METADATA_BYTES, MAX_CHANGED_ENTRIES),
     "changed-blob-findings.z": (
@@ -730,43 +734,207 @@ def _require_ancestor_range(
     )
 
 
-def _remove_private_changed_paths(container: pathlib.Path) -> str | None:
-    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+def _private_cleanup_directory_error(
+    metadata: os.stat_result,
+    *,
+    label: str,
+    require_private_mode: bool,
+) -> str | None:
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        return f"{label} is not a real directory"
+    if metadata.st_uid != os.geteuid():
+        return f"{label} has an unexpected owner"
+    mode = stat.S_IMODE(metadata.st_mode)
+    if require_private_mode and mode != 0o700:
+        return f"{label} must have mode 0700"
+    if not require_private_mode and mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return f"{label} must not be group or other writable"
+    return None
+
+
+def _private_cleanup_identity(metadata: os.stat_result) -> tuple[int, int]:
+    return metadata.st_dev, metadata.st_ino
+
+
+def _operate_on_private_review_container(
+    container: pathlib.Path,
+    operation: Callable[[int, int], Iterable[str]],
+) -> str | None:
+    directory_flags = (
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    )
+    parent = container.parent
     try:
-        directory_descriptor = os.open(container, directory_flags)
+        parent_before = os.lstat(parent)
     except FileNotFoundError:
-        return None
+        return "private artifact parent is missing"
     except OSError as error:
-        return str(error)
-    cleanup_errors: list[str] = []
+        return f"cannot inspect private artifact parent: {error.strerror or error}"
+    parent_error = _private_cleanup_directory_error(
+        parent_before,
+        label="private artifact parent",
+        require_private_mode=False,
+    )
+    if parent_error:
+        return parent_error
+
     try:
+        parent_descriptor = os.open(parent, directory_flags)
+    except FileNotFoundError:
+        return "private artifact parent changed while opening"
+    except OSError as error:
+        return f"cannot securely open private artifact parent: {error}"
+
+    cleanup_errors: list[str] = []
+    container_descriptor: int | None = None
+    try:
+        parent_opened = os.fstat(parent_descriptor)
+        parent_after = os.lstat(parent)
+        for metadata in (parent_opened, parent_after):
+            parent_error = _private_cleanup_directory_error(
+                metadata,
+                label="private artifact parent",
+                require_private_mode=False,
+            )
+            if parent_error:
+                raise ReviewError(parent_error)
+        if (
+            len(
+                {
+                    _private_cleanup_identity(parent_before),
+                    _private_cleanup_identity(parent_opened),
+                    _private_cleanup_identity(parent_after),
+                }
+            )
+            != 1
+        ):
+            raise ReviewError("private artifact parent changed while opening")
+
         try:
-            os.unlink(PRIVATE_CHANGED_PATHS_NAME, dir_fd=directory_descriptor)
+            container_before = os.stat(
+                container.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            container_before = None
+        if container_before is not None:
+            container_error = _private_cleanup_directory_error(
+                container_before,
+                label="private artifact container",
+                require_private_mode=True,
+            )
+            if container_error:
+                raise ReviewError(container_error)
+            container_descriptor = os.open(
+                container.name,
+                directory_flags,
+                dir_fd=parent_descriptor,
+            )
+            container_opened = os.fstat(container_descriptor)
+            container_after = os.stat(
+                container.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            for metadata in (container_opened, container_after):
+                container_error = _private_cleanup_directory_error(
+                    metadata,
+                    label="private artifact container",
+                    require_private_mode=True,
+                )
+                if container_error:
+                    raise ReviewError(container_error)
+            if (
+                len(
+                    {
+                        _private_cleanup_identity(container_before),
+                        _private_cleanup_identity(container_opened),
+                        _private_cleanup_identity(container_after),
+                    }
+                )
+                != 1
+            ):
+                raise ReviewError("private artifact container changed while opening")
+
+        if container_descriptor is not None:
+            cleanup_errors.extend(operation(parent_descriptor, container_descriptor))
+    except (OSError, ReviewError) as error:
+        cleanup_errors.append(str(error))
+    finally:
+        for label, descriptor in (
+            ("private artifact container", container_descriptor),
+            ("private artifact parent", parent_descriptor),
+        ):
+            if descriptor is None:
+                continue
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                cleanup_errors.append(f"cannot close {label}: {error}")
+    return "; ".join(cleanup_errors) or None
+
+
+def _unlink_private_review_artifacts(
+    _parent_descriptor: int,
+    container_descriptor: int,
+) -> list[str]:
+    cleanup_errors: list[str] = []
+    for artifact_name in PRIVATE_HELPER_ARTIFACT_NAMES:
+        try:
+            os.unlink(artifact_name, dir_fd=container_descriptor)
         except FileNotFoundError:
             pass
         except OSError as error:
-            cleanup_errors.append(str(error))
-    finally:
-        try:
-            os.close(directory_descriptor)
-        except OSError as error:
-            cleanup_errors.append(str(error))
-    return "; ".join(cleanup_errors) or None
+            cleanup_errors.append(f"{artifact_name}: {error}")
+    return cleanup_errors
+
+
+def remove_private_review_artifacts(container: pathlib.Path) -> str | None:
+    return _operate_on_private_review_container(
+        container,
+        _unlink_private_review_artifacts,
+    )
+
+
+def _remove_review_container_tree(container: pathlib.Path) -> str | None:
+    def remove_tree(
+        parent_descriptor: int,
+        container_descriptor: int,
+    ) -> list[str]:
+        cleanup_errors: list[str] = []
+        if not shutil.rmtree.avoids_symlink_attacks:
+            cleanup_errors.append("fd-relative review cleanup is unavailable")
+        else:
+            try:
+                shutil.rmtree(container.name, dir_fd=parent_descriptor)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                cleanup_errors.append(str(error))
+        cleanup_errors.extend(
+            _unlink_private_review_artifacts(
+                parent_descriptor,
+                container_descriptor,
+            )
+        )
+        return cleanup_errors
+
+    return _operate_on_private_review_container(container, remove_tree)
 
 
 def _remove_partial_container(container: pathlib.Path) -> str | None:
-    cleanup_errors: list[str] = []
-    try:
-        shutil.rmtree(container)
-    except FileNotFoundError:
-        pass
-    except OSError as error:
-        cleanup_errors.append(str(error))
-    finally:
-        private_cleanup_error = _remove_private_changed_paths(container)
-        if private_cleanup_error:
-            cleanup_errors.append(private_cleanup_error)
-    return "; ".join(cleanup_errors) or None
+    return _remove_review_container_tree(container)
+
+
+def _bound_private_cleanup_target(review: ReviewWorkspace) -> pathlib.Path | None:
+    source_root = review.source_root.expanduser().absolute()
+    container = review.container_dir.expanduser().absolute()
+    if container.parent != source_root / ".codex-tmp" or not container.name.startswith(
+        "isolated-review-"
+    ):
+        return None
+    return container
 
 
 def _retained_container_detail(container: pathlib.Path, cleanup_error: str) -> str:
@@ -2195,8 +2363,16 @@ def _write_changed_blob_findings(
 
 
 def validate_workspace_layout(review: ReviewWorkspace) -> None:
-    source_root = review.source_root.resolve(strict=False)
-    container_dir = review.container_dir.resolve(strict=False)
+    def canonical_path(path: pathlib.Path, *, label: str) -> pathlib.Path:
+        absolute = path.expanduser().absolute()
+        normalized = pathlib.Path(os.path.normpath(os.fspath(absolute)))
+        resolved = path.expanduser().resolve(strict=False)
+        if absolute != normalized:
+            raise ReviewError(f"review {label} path is not canonical: {absolute}")
+        return resolved
+
+    source_root = canonical_path(review.source_root, label="source root")
+    container_dir = canonical_path(review.container_dir, label="container")
     expected_parent = (source_root / ".codex-tmp").resolve(strict=False)
     if container_dir.parent != expected_parent or not container_dir.name.startswith(
         "isolated-review-"
@@ -2205,16 +2381,19 @@ def validate_workspace_layout(review: ReviewWorkspace) -> None:
             f"review container is outside the source repository review root: {container_dir}"
         )
     expected_workspace = container_dir / "workspace"
-    if review.workspace_root.resolve(strict=False) != expected_workspace:
+    if canonical_path(review.workspace_root, label="workspace") != expected_workspace:
         raise ReviewError(
             f"review workspace escapes its container: {review.workspace_root}"
         )
     control_dir = expected_workspace / ".codex-review"
-    if review.diff_file.resolve(strict=False) != control_dir / "review.diff":
+    if canonical_path(review.diff_file, label="diff") != control_dir / "review.diff":
         raise ReviewError(
             f"review diff escapes its control directory: {review.diff_file}"
         )
-    if review.prompt_file.resolve(strict=False) != control_dir / "review.prompt":
+    if (
+        canonical_path(review.prompt_file, label="prompt")
+        != control_dir / "review.prompt"
+    ):
         raise ReviewError(
             f"review prompt escapes its control directory: {review.prompt_file}"
         )
@@ -6720,24 +6899,59 @@ def prepare_workspace(
 def cleanup_workspace(review: ReviewWorkspace, *, keep_container: bool) -> str | None:
     cleanup_errors: list[str] = []
     validation_error: ReviewError | None = None
+    private_cleanup_target = _bound_private_cleanup_target(review)
     try:
         validate_workspace_layout(review)
-        if review.workspace_root.exists():
-            shutil.rmtree(review.workspace_root)
-        if not keep_container:
-            shutil.rmtree(review.container_dir)
     except ReviewError as error:
         validation_error = error
-    except OSError as error:
-        cleanup_errors.append(str(error))
-    finally:
-        private_cleanup_error = _remove_private_changed_paths(review.container_dir)
+    if validation_error is None and private_cleanup_target is None:
+        validation_error = ReviewError(
+            "review container is not lexically bound to its source-root review directory"
+        )
+
+    if private_cleanup_target is not None:
+        if validation_error is not None:
+            private_cleanup_error = remove_private_review_artifacts(
+                private_cleanup_target
+            )
+        elif keep_container:
+
+            def remove_workspace(
+                parent_descriptor: int,
+                container_descriptor: int,
+            ) -> list[str]:
+                tree_errors: list[str] = []
+                if not shutil.rmtree.avoids_symlink_attacks:
+                    tree_errors.append("fd-relative review cleanup is unavailable")
+                else:
+                    try:
+                        shutil.rmtree("workspace", dir_fd=container_descriptor)
+                    except FileNotFoundError:
+                        pass
+                    except OSError as error:
+                        tree_errors.append(str(error))
+                tree_errors.extend(
+                    _unlink_private_review_artifacts(
+                        parent_descriptor,
+                        container_descriptor,
+                    )
+                )
+                return tree_errors
+
+            private_cleanup_error = _operate_on_private_review_container(
+                private_cleanup_target,
+                remove_workspace,
+            )
+        else:
+            private_cleanup_error = _remove_review_container_tree(
+                private_cleanup_target
+            )
         if private_cleanup_error:
             cleanup_errors.append(private_cleanup_error)
     if validation_error is not None:
         if cleanup_errors:
             raise ReviewError(
-                f"{validation_error}; private path cleanup failed: "
+                f"{validation_error}; private artifact cleanup failed: "
                 + "; ".join(cleanup_errors)
             ) from validation_error
         raise validation_error

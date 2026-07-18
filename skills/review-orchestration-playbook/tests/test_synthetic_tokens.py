@@ -5021,19 +5021,29 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             self.prepare(repo=repo, base=base, head=head)
         self.assertNotIn(raw_value, str(caught.exception))
 
-    def test_retained_container_removes_helper_private_changed_paths(self) -> None:
-        repo, base = self.new_repo({"README.md": "base\n"})
-        (repo / "README.md").write_text("head\n", encoding="utf-8")
+    def test_retained_container_removes_helper_private_artifacts(self) -> None:
+        fixture = reduction_fixture("generic-secret-assignment")
+        secret = reduction_secret("generic-secret-assignment")
+        repo, base = self.new_repo({"fixture.cfg": fixture * 2})
+        (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
         head = self.commit(repo)
         review = self.prepare(repo=repo, base=base, head=head)
         private_paths = review.container_dir / workspace.PRIVATE_CHANGED_PATHS_NAME
+        private_manifest = (
+            review.container_dir / workspace.SYNTHETIC_PRIVATE_MANIFEST_NAME
+        )
         self.assertTrue(private_paths.exists())
+        self.assertIn(
+            base64.b64encode(secret),
+            private_manifest.read_bytes(),
+        )
 
         self.assertIsNone(workspace.cleanup_workspace(review, keep_container=True))
 
         self.assertTrue(review.container_dir.exists())
         self.assertFalse(review.workspace_root.exists())
         self.assertFalse(private_paths.exists())
+        self.assertFalse(private_manifest.exists())
 
     def test_retained_container_removes_private_paths_when_cleanup_fails(
         self,
@@ -5043,7 +5053,11 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         head = self.commit(repo)
         review = self.prepare(repo=repo, base=base, head=head)
         private_paths = review.container_dir / workspace.PRIVATE_CHANGED_PATHS_NAME
+        private_manifest = (
+            review.container_dir / workspace.SYNTHETIC_PRIVATE_MANIFEST_NAME
+        )
         self.assertTrue(private_paths.exists())
+        self.assertTrue(private_manifest.exists())
 
         with mock.patch.object(
             workspace.shutil,
@@ -5056,18 +5070,23 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             )
 
         self.assertIn("permission denied", cleanup_error or "")
-        remove_tree.assert_called_once_with(review.workspace_root)
+        remove_tree.assert_called_once_with("workspace", dir_fd=mock.ANY)
         self.assertTrue(review.container_dir.exists())
         self.assertTrue(review.workspace_root.exists())
         self.assertFalse(private_paths.exists())
+        self.assertFalse(private_manifest.exists())
 
-    def test_cleanup_validation_failure_removes_helper_private_paths(self) -> None:
+    def test_cleanup_validation_failure_removes_helper_private_artifacts(self) -> None:
         repo, base = self.new_repo({"README.md": "base\n"})
         (repo / "README.md").write_text("head\n", encoding="utf-8")
         head = self.commit(repo)
         review = self.prepare(repo=repo, base=base, head=head)
         private_paths = review.container_dir / workspace.PRIVATE_CHANGED_PATHS_NAME
+        private_manifest = (
+            review.container_dir / workspace.SYNTHETIC_PRIVATE_MANIFEST_NAME
+        )
         self.assertTrue(private_paths.exists())
+        self.assertTrue(private_manifest.exists())
 
         with (
             mock.patch.object(
@@ -5082,6 +5101,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         self.assertTrue(review.container_dir.exists())
         self.assertTrue(review.workspace_root.exists())
         self.assertFalse(private_paths.exists())
+        self.assertFalse(private_manifest.exists())
 
         with (
             mock.patch.object(
@@ -5091,12 +5111,12 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             ),
             mock.patch.object(
                 workspace,
-                "_remove_private_changed_paths",
+                "remove_private_review_artifacts",
                 return_value="unlink denied",
             ),
             self.assertRaisesRegex(
                 ReviewError,
-                "layout invalid; private path cleanup failed: unlink denied",
+                "layout invalid; private artifact cleanup failed: unlink denied",
             ),
         ):
             workspace.cleanup_workspace(review, keep_container=True)

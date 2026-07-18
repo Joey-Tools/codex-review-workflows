@@ -28,6 +28,7 @@ from .workspace import (
     ReviewWorkspace,
     cleanup_workspace,
     prepare_workspace,
+    remove_private_review_artifacts,
     validate_authoring_catalog_scanner_contract,
 )
 
@@ -207,8 +208,7 @@ def _run_foreground(args: argparse.Namespace) -> int:
         raise ForwardedSignal(signum)
 
     previous_handlers = {
-        signum: signal.signal(signum, forward_signal)
-        for signum in forwarded_signals()
+        signum: signal.signal(signum, forward_signal) for signum in forwarded_signals()
     }
 
     def accept_workspace(prepared: ReviewWorkspace) -> None:
@@ -256,6 +256,9 @@ def _run_foreground(args: argparse.Namespace) -> int:
         try:
             if review is not None:
                 if args.keep_workspace:
+                    cleanup_error = remove_private_review_artifacts(
+                        review.container_dir
+                    )
                     print(
                         f"kept review workspace: {review.container_dir}",
                         file=sys.stderr,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import pathlib
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,8 @@ sys.path.insert(0, str(SCRIPTS))
 from review_runtime import cleanup_worker, providers, state  # noqa: E402
 from review_runtime.common import ReviewError, write_json  # noqa: E402
 from review_runtime.workspace import (  # noqa: E402
+    PRIVATE_CHANGED_PATHS_NAME,
+    SYNTHETIC_PRIVATE_MANIFEST_NAME,
     cleanup_workspace,
     prepare_workspace as _prepare_workspace,
 )
@@ -110,6 +113,11 @@ class StatefulLifecycleTest(unittest.TestCase):
 
     def test_final_returns_artifact_and_cleans_detached_workspace(self) -> None:
         self.write_completed_state()
+        private_artifacts = (
+            self.review.container_dir / PRIVATE_CHANGED_PATHS_NAME,
+            self.review.container_dir / SYNTHETIC_PRIVATE_MANIFEST_NAME,
+        )
+        self.assertTrue(all(path.exists() for path in private_artifacts))
         summary = state.status(self.review.container_dir)
         self.assertFalse(summary["running"])
         self.assertEqual(summary["exit_code"], 0)
@@ -121,9 +129,39 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.assertEqual(text, "No findings.")
         self.assertFalse(self.review.workspace_root.exists())
         self.assertTrue(self.review.container_dir.exists())
+        self.assertFalse(any(path.exists() for path in private_artifacts))
+
+    def test_final_keep_workspace_scrubs_private_artifacts(self) -> None:
+        self.write_completed_state()
+        current = state.load_state(self.review.container_dir)
+        current["keep_workspace"] = True
+        write_json(self.review.container_dir / state.STATE_FILE, current)
+        private_artifacts = (
+            self.review.container_dir / PRIVATE_CHANGED_PATHS_NAME,
+            self.review.container_dir / SYNTHETIC_PRIVATE_MANIFEST_NAME,
+        )
+
+        exit_code, text = state.final(self.review.container_dir)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(text, "No findings.")
+        self.assertTrue(self.review.workspace_root.exists())
+        self.assertFalse(any(path.exists() for path in private_artifacts))
+        self.assertEqual(
+            state.cleanup(
+                self.review.container_dir,
+                timeout_seconds=state.FINAL_CLEANUP_TIMEOUT_SECONDS,
+            ),
+            0,
+        )
+        self.assertFalse(self.review.workspace_root.exists())
 
     def test_codex_unavailable_retains_preflight_workspace_until_cleanup(self) -> None:
         self.write_completed_state()
+        private_artifacts = (
+            self.review.container_dir / PRIVATE_CHANGED_PATHS_NAME,
+            self.review.container_dir / SYNTHETIC_PRIVATE_MANIFEST_NAME,
+        )
         current = state.load_state(self.review.container_dir)
         current["reviewer"] = "codex"
         current["egress_consent"] = None
@@ -140,6 +178,7 @@ class StatefulLifecycleTest(unittest.TestCase):
         write_json(
             self.review.container_dir / "preflight.json",
             {
+                "private_artifacts": "removed",
                 "review_range": f"{self.base}..{self.head}",
                 "status": "secret-delta and escaping-symlink checks passed",
             },
@@ -150,6 +189,7 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.assertEqual(exit_code, 127)
         self.assertIn("retained for clean-context fallback", text)
         self.assertTrue(self.review.workspace_root.exists())
+        self.assertFalse(any(path.exists() for path in private_artifacts))
         summary = state.status(self.review.container_dir)
         self.assertTrue(summary["fallback_workspace_retained"])
         self.assertEqual(
@@ -165,6 +205,7 @@ class StatefulLifecycleTest(unittest.TestCase):
             0,
         )
         self.assertFalse(self.review.workspace_root.exists())
+        self.assertFalse(any(path.exists() for path in private_artifacts))
         self.assertFalse(
             state.status(self.review.container_dir)["fallback_workspace_retained"]
         )
@@ -188,6 +229,36 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.assertEqual(exit_code, 127)
         self.assertFalse(self.review.workspace_root.exists())
 
+    def test_codex_unavailable_without_private_cleanup_proof_does_not_retain_workspace(
+        self,
+    ) -> None:
+        self.write_completed_state()
+        current = state.load_state(self.review.container_dir)
+        current["reviewer"] = "codex"
+        current["egress_consent"] = None
+        write_json(self.review.container_dir / state.STATE_FILE, current)
+        (self.review.container_dir / state.EXIT_FILE).write_text(
+            "127\n",
+            encoding="utf-8",
+        )
+        (self.review.container_dir / "final.txt").unlink()
+        write_json(
+            self.review.container_dir / "preflight.json",
+            {
+                "review_range": f"{self.base}..{self.head}",
+                "status": "secret-delta and escaping-symlink checks passed",
+            },
+        )
+
+        exit_code, text = state.final(self.review.container_dir)
+
+        self.assertEqual(exit_code, 127)
+        self.assertNotIn("retained for clean-context fallback", text)
+        self.assertFalse(self.review.workspace_root.exists())
+        self.assertFalse(
+            state.status(self.review.container_dir)["fallback_workspace_retained"]
+        )
+
     def test_status_redacts_legacy_attempt_final_text(self) -> None:
         self.write_completed_state()
         artifact = "legacy terminal artifact"
@@ -205,8 +276,12 @@ class StatefulLifecycleTest(unittest.TestCase):
     def test_concurrent_wait_serializes_workspace_cleanup(self) -> None:
         self.write_completed_state()
         with ThreadPoolExecutor(max_workers=2) as executor:
-            first = executor.submit(state.wait, self.review.container_dir, timeout_seconds=2)
-            second = executor.submit(state.wait, self.review.container_dir, timeout_seconds=2)
+            first = executor.submit(
+                state.wait, self.review.container_dir, timeout_seconds=2
+            )
+            second = executor.submit(
+                state.wait, self.review.container_dir, timeout_seconds=2
+            )
             self.assertEqual(first.result(timeout=2), 0)
             self.assertEqual(second.result(timeout=2), 0)
 
@@ -216,10 +291,20 @@ class StatefulLifecycleTest(unittest.TestCase):
     def test_wait_clears_stale_cleanup_error_after_successful_retry(self) -> None:
         self.write_completed_state()
         cleanup_error_path = self.review.container_dir / "cleanup-error.txt"
+        private_artifacts = (
+            self.review.container_dir / PRIVATE_CHANGED_PATHS_NAME,
+            self.review.container_dir / SYNTHETIC_PRIVATE_MANIFEST_NAME,
+        )
+
+        def fail_after_workspace_removal(review, *, keep_container: bool) -> str:
+            self.assertTrue(keep_container)
+            shutil.rmtree(review.workspace_root)
+            return "cannot remove private artifacts"
+
         with mock.patch.object(
             state,
             "cleanup_workspace",
-            return_value="cannot remove workspace",
+            side_effect=fail_after_workspace_removal,
         ):
             self.assertEqual(
                 state.wait(self.review.container_dir, timeout_seconds=None),
@@ -227,11 +312,26 @@ class StatefulLifecycleTest(unittest.TestCase):
             )
 
         self.assertTrue(cleanup_error_path.is_file())
+        self.assertFalse(self.review.workspace_root.exists())
+        self.assertTrue(all(path.exists() for path in private_artifacts))
+        with mock.patch.object(
+            state,
+            "cleanup_workspace",
+            return_value="cannot remove private artifacts",
+        ) as retry_cleanup:
+            self.assertEqual(
+                state.wait(self.review.container_dir, timeout_seconds=None),
+                1,
+            )
+        retry_cleanup.assert_called_once_with(self.review, keep_container=True)
+        self.assertTrue(cleanup_error_path.is_file())
+        self.assertTrue(all(path.exists() for path in private_artifacts))
         self.assertEqual(
             state.wait(self.review.container_dir, timeout_seconds=None),
             0,
         )
         self.assertFalse(self.review.workspace_root.exists())
+        self.assertFalse(any(path.exists() for path in private_artifacts))
         self.assertFalse(cleanup_error_path.exists())
 
     def test_cleanup_worker_clears_stale_error_after_success(self) -> None:
@@ -338,6 +438,10 @@ class StatefulLifecycleTest(unittest.TestCase):
 
     def test_forged_workspace_escape_is_rejected_before_cleanup(self) -> None:
         self.write_completed_state()
+        private_artifacts = (
+            self.review.container_dir / PRIVATE_CHANGED_PATHS_NAME,
+            self.review.container_dir / SYNTHETIC_PRIVATE_MANIFEST_NAME,
+        )
         value = self.review.to_json()
         value["workspace_root"] = str(self.repo)
         current = state.load_state(self.review.container_dir)
@@ -346,8 +450,115 @@ class StatefulLifecycleTest(unittest.TestCase):
 
         with self.assertRaises(ReviewError):
             state.load_review_state(self.review.container_dir)
+        with self.assertRaises(ReviewError):
+            state.cleanup(
+                self.review.container_dir,
+                timeout_seconds=state.FINAL_CLEANUP_TIMEOUT_SECONDS,
+            )
         self.assertTrue(self.repo.exists())
         self.assertTrue(self.review.workspace_root.exists())
+        self.assertFalse(any(path.exists() for path in private_artifacts))
+
+    def test_explicit_cleanup_scrubs_private_artifacts_after_corrupt_state(
+        self,
+    ) -> None:
+        self.write_completed_state()
+        private_artifacts = (
+            self.review.container_dir / PRIVATE_CHANGED_PATHS_NAME,
+            self.review.container_dir / SYNTHETIC_PRIVATE_MANIFEST_NAME,
+        )
+        (self.review.container_dir / state.STATE_FILE).write_text(
+            "{\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(ReviewError):
+            state.cleanup(
+                self.review.container_dir,
+                timeout_seconds=state.FINAL_CLEANUP_TIMEOUT_SECONDS,
+            )
+
+        self.assertTrue(self.review.workspace_root.exists())
+        self.assertFalse(any(path.exists() for path in private_artifacts))
+
+    def test_explicit_cleanup_scrubs_noncanonical_resolving_state(self) -> None:
+        self.write_completed_state()
+        private_artifacts = (
+            self.review.container_dir / PRIVATE_CHANGED_PATHS_NAME,
+            self.review.container_dir / SYNTHETIC_PRIVATE_MANIFEST_NAME,
+        )
+        current = state.load_state(self.review.container_dir)
+        workspace = self.review.to_json()
+        container = (
+            self.review.container_dir.parent
+            / "nonexistent"
+            / ".."
+            / self.review.container_dir.name
+        )
+        workspace_root = container / "workspace"
+        control = workspace_root / ".codex-review"
+        workspace.update(
+            {
+                "container_dir": str(container),
+                "workspace_root": str(workspace_root),
+                "diff_file": str(control / "review.diff"),
+                "prompt_file": str(control / "review.prompt"),
+            }
+        )
+        current["workspace"] = workspace
+        write_json(self.review.container_dir / state.STATE_FILE, current)
+
+        with self.assertRaisesRegex(ReviewError, "not canonical"):
+            state.cleanup(
+                self.review.container_dir,
+                timeout_seconds=state.FINAL_CLEANUP_TIMEOUT_SECONDS,
+            )
+
+        self.assertTrue(self.review.workspace_root.exists())
+        self.assertFalse(any(path.exists() for path in private_artifacts))
+
+    def test_invalid_state_cleanup_aggregates_private_scrub_failure(self) -> None:
+        self.write_completed_state()
+        (self.review.container_dir / state.STATE_FILE).write_text(
+            "{\n",
+            encoding="utf-8",
+        )
+
+        with (
+            mock.patch.object(
+                state,
+                "remove_private_review_artifacts",
+                return_value="unlink denied",
+            ) as remove_private,
+            self.assertRaisesRegex(
+                ReviewError,
+                "private artifact cleanup failed: unlink denied",
+            ),
+        ):
+            state.cleanup(
+                self.review.container_dir,
+                timeout_seconds=state.FINAL_CLEANUP_TIMEOUT_SECONDS,
+            )
+
+        remove_private.assert_called_once_with(self.review.container_dir)
+
+    def test_explicit_cleanup_does_not_scrub_while_runner_lock_is_held(self) -> None:
+        self.write_completed_state()
+
+        with (
+            mock.patch.object(state, "_runner_lock_held", return_value=True),
+            mock.patch.object(
+                state,
+                "remove_private_review_artifacts",
+            ) as remove_private,
+        ):
+            exit_code = state.cleanup(
+                self.review.container_dir,
+                timeout_seconds=state.FINAL_CLEANUP_TIMEOUT_SECONDS,
+            )
+
+        self.assertEqual(exit_code, 3)
+        remove_private.assert_not_called()
 
     def test_start_wait_final_runs_in_a_pollable_background_process(self) -> None:
         fake_runner = pathlib.Path(self.temporary.name) / "fake_runner.py"
@@ -419,12 +630,21 @@ time.sleep(0.2)
             encoding="utf-8",
         )
         original_workspace = self.review.to_json()
+        private_artifacts = {
+            path: path.read_bytes()
+            for path in (
+                state_dir / PRIVATE_CHANGED_PATHS_NAME,
+                state_dir / SYNTHETIC_PRIVATE_MANIFEST_NAME,
+            )
+        }
 
         for field, forged_ref in (
             ("base_ref", "c" * 40),
             ("head_ref", "d" * 40),
         ):
             with self.subTest(field=field):
+                for path, payload in private_artifacts.items():
+                    path.write_bytes(payload)
                 forged_workspace = dict(original_workspace)
                 forged_workspace[field] = forged_ref
                 write_json(
@@ -448,9 +668,7 @@ time.sleep(0.2)
                 launch.assert_not_called()
                 resolve.assert_not_called()
                 self.assertFalse((state_dir / "preflight.json").exists())
-                error = (state_dir / "runner-error.txt").read_text(
-                    encoding="utf-8"
-                )
+                error = (state_dir / "runner-error.txt").read_text(encoding="utf-8")
                 self.assertIn(
                     "synthetic secret manifest version or review range is invalid",
                     error,
@@ -735,9 +953,7 @@ time.sleep(0.2)
             ),
             mock.patch.object(state.subprocess, "Popen", return_value=process),
             mock.patch.object(state, "terminate_process_group") as terminate,
-            mock.patch.object(
-                state, "cleanup_workspace", return_value=None
-            ) as cleanup,
+            mock.patch.object(state, "cleanup_workspace", return_value=None) as cleanup,
         ):
             with self.assertRaises(BrokenPipeError):
                 state.start(
@@ -824,9 +1040,7 @@ time.sleep(0.2)
                 "terminate_process_group",
                 side_effect=signal_during_cleanup,
             ) as terminate,
-            mock.patch.object(
-                state, "cleanup_workspace", return_value=None
-            ) as cleanup,
+            mock.patch.object(state, "cleanup_workspace", return_value=None) as cleanup,
         ):
             with self.assertRaises(state.ForwardedSignal) as raised:
                 state.start(

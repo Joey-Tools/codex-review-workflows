@@ -76,12 +76,12 @@ Diagnostic and preflight evidence remain bounded audit surfaces. They use stable
 - Exact unembedded counting uses separate containment domains for each legacy envelope and for dynamic reductions, so a longer dynamic candidate cannot change legacy count semantics while dynamic candidates still contain one another normally.
 - Reviewer-visible diff and prompt artifacts are integrity-bound but are not secret-egress filters. They retain deliberately supplied reviewer input, including deleted or prompt-contained secret bytes, in original form.
 - Deleted sensitive paths are omitted from head-side changed-path findings and are allowed only when the complete materialized head remains free of sensitive paths.
-- Public changed-path evidence contains ordered SHA-256 commitments only. The helper validates those records lockstep against an owner-only private raw-path stream, checks the commitments and all other audit evidence against catalog and dynamic sensitive values, and removes the private stream through a no-follow container descriptor whenever cleanup is attempted, including partial preparation cleanup, layout-validation failure, and workspace-tree removal error. Changed-blob findings identify paths by digest as well.
+- Public changed-path evidence contains ordered SHA-256 commitments only. The helper validates those records lockstep against an owner-only private raw-path stream and checks the commitments and all other audit evidence against catalog and dynamic sensitive values. After preflight consumes the private path stream and Base64 raw-bearing dynamic-reduction manifest, it removes both through owner-, mode-, and identity-checked no-follow parent/container descriptors before publishing preflight evidence or launching a reviewer; failed preflight and later cleanup paths retry that scrub. An explicitly retained or fallback workspace therefore keeps only the frozen workspace and durable bounded evidence. Changed-blob findings identify paths by digest as well.
 - Catalog authoring and explicitly selected legacy behavior remains unchanged.
 
 ## Validation
 
-- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests`: 798 tests passed, 9 skipped.
+- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests`: 807 tests passed, 9 skipped.
 - `ruff check` on changed runtime and test modules: passed.
 - `git diff --check`: passed.
 - Fixed-range Codex review and PR readiness evidence are recorded in the delivery thread and PR.

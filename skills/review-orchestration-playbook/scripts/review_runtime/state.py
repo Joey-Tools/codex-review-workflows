@@ -33,6 +33,7 @@ from .workspace import (
     ReviewWorkspace,
     cleanup_workspace,
     prepare_workspace,
+    remove_private_review_artifacts,
     validate_workspace_layout,
 )
 
@@ -410,14 +411,11 @@ def status(state_dir: pathlib.Path) -> dict[str, Any]:
             state_dir / "runner-error.txt",
             "review runner exited without recording a terminal result\n",
         )
-    fallback_workspace_retained = (
-        not running
-        and _should_retain_fallback_workspace(
-            state_dir=state_dir,
-            state=state,
-            review=review,
-            exit_code=exit_code,
-        )
+    fallback_workspace_retained = not running and _should_retain_fallback_workspace(
+        state_dir=state_dir,
+        state=state,
+        review=review,
+        exit_code=exit_code,
     )
     attempts: list[Any] = []
     attempts_path = state_dir / "attempts.json"
@@ -474,8 +472,8 @@ def _should_retain_fallback_workspace(
         return False
     return (
         preflight.get("review_range") == f"{review.base_ref}..{review.head_ref}"
-        and preflight.get("status")
-        == "secret-delta and escaping-symlink checks passed"
+        and preflight.get("private_artifacts") == "removed"
+        and preflight.get("status") == "secret-delta and escaping-symlink checks passed"
     )
 
 
@@ -517,7 +515,8 @@ def wait(
 def cleanup(state_dir: pathlib.Path, *, timeout_seconds: float | None) -> int:
     _validate_timeout(timeout_seconds)
     state_dir = state_dir.expanduser().resolve()
-    if status(state_dir)["running"]:
+    _state_path(state_dir)
+    if _runner_lock_held(state_dir / LOCK_FILE):
         return 3
     deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
     return _cleanup_terminal_workspace(state_dir, deadline=deadline, force=True)
@@ -541,7 +540,20 @@ def _cleanup_terminal_workspace(
             cleanup_lock_transferred = True
 
         try:
-            state, review = load_review_state(state_dir)
+            if force and _runner_lock_held(state_dir / LOCK_FILE):
+                return 3
+            try:
+                state, review = load_review_state(state_dir)
+            except ReviewError as state_error:
+                if not force or not (state_dir / STATE_MARKER).is_file():
+                    raise
+                private_cleanup_error = remove_private_review_artifacts(state_dir)
+                if private_cleanup_error:
+                    raise ReviewError(
+                        f"{state_error}; private artifact cleanup failed: "
+                        f"{private_cleanup_error}"
+                    ) from state_error
+                raise
             keep_workspace = bool(state.get("keep_workspace"))
             exit_code = _read_exit_code(state_dir)
             retain_for_fallback = _should_retain_fallback_workspace(
@@ -551,26 +563,27 @@ def _cleanup_terminal_workspace(
                 exit_code=exit_code,
             )
             should_keep = not force and (keep_workspace or retain_for_fallback)
-            if review.workspace_root.exists() and not should_keep:
+            if should_keep:
+                cleanup_error = remove_private_review_artifacts(review.container_dir)
+                cleanup_completed = True
+            else:
                 cleanup_completed, cleanup_error = _cleanup_before_deadline(
                     review,
                     deadline=deadline,
                     cleanup_lock_fd=cleanup_lock.fileno(),
                     lock_handoff=transfer_cleanup_lock,
                 )
-                if not cleanup_completed:
-                    return 124
-                if cleanup_error:
-                    write_text_atomic(cleanup_error_path, cleanup_error + "\n")
-                    return 1
-            if not should_keep and not review.workspace_root.exists():
-                try:
-                    cleanup_error_path.unlink(missing_ok=True)
-                except OSError as error:
-                    raise ReviewError(
-                        f"cannot clear resolved cleanup error {cleanup_error_path}: "
-                        f"{error}"
-                    ) from error
+            if not cleanup_completed:
+                return 124
+            if cleanup_error:
+                write_text_atomic(cleanup_error_path, cleanup_error + "\n")
+                return 1
+            try:
+                cleanup_error_path.unlink(missing_ok=True)
+            except OSError as error:
+                raise ReviewError(
+                    f"cannot clear resolved cleanup error {cleanup_error_path}: {error}"
+                ) from error
             if cleanup_error_path.is_file():
                 return 1
             return 0

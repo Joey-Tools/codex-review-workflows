@@ -884,11 +884,13 @@ class WorkspaceTest(unittest.TestCase):
         review_root = self.repo / ".codex-tmp"
         self.assertEqual(len(list(review_root.glob("isolated-review-*"))), 1)
 
-    def test_partial_cleanup_removes_private_paths_when_rmtree_fails(self) -> None:
+    def test_partial_cleanup_removes_private_artifacts_when_rmtree_fails(self) -> None:
         container = pathlib.Path(self.temporary.name) / "partial-container"
-        container.mkdir()
+        container.mkdir(mode=0o700)
         private_paths = container / workspace_runtime.PRIVATE_CHANGED_PATHS_NAME
+        private_manifest = container / workspace_runtime.SYNTHETIC_PRIVATE_MANIFEST_NAME
         private_paths.write_bytes(b"private-path\x00")
+        private_manifest.write_bytes(b"private-manifest")
 
         with mock.patch.object(
             workspace_runtime.shutil,
@@ -898,9 +900,10 @@ class WorkspaceTest(unittest.TestCase):
             cleanup_error = workspace_runtime._remove_partial_container(container)
 
         self.assertIn("permission denied", cleanup_error or "")
-        remove_tree.assert_called_once_with(container)
+        remove_tree.assert_called_once_with(container.name, dir_fd=mock.ANY)
         self.assertTrue(container.exists())
         self.assertFalse(private_paths.exists())
+        self.assertFalse(private_manifest.exists())
 
         symlink_target = pathlib.Path(self.temporary.name) / "symlink-target"
         symlink_target.mkdir()
@@ -908,15 +911,159 @@ class WorkspaceTest(unittest.TestCase):
             symlink_target / workspace_runtime.PRIVATE_CHANGED_PATHS_NAME
         )
         target_private_paths.write_bytes(b"outside\x00")
+        target_private_manifest = (
+            symlink_target / workspace_runtime.SYNTHETIC_PRIVATE_MANIFEST_NAME
+        )
+        target_private_manifest.write_bytes(b"outside-manifest")
         symlink_container = pathlib.Path(self.temporary.name) / "container-link"
         symlink_container.symlink_to(symlink_target, target_is_directory=True)
 
-        symlink_error = workspace_runtime._remove_private_changed_paths(
+        symlink_error = workspace_runtime.remove_private_review_artifacts(
             symlink_container
         )
 
         self.assertIsNotNone(symlink_error)
         self.assertTrue(target_private_paths.exists())
+        self.assertTrue(target_private_manifest.exists())
+
+        private_paths.write_bytes(b"private-path\x00")
+        private_manifest.write_bytes(b"private-manifest")
+        real_unlink = os.unlink
+
+        def fail_first_unlink(path, *args, **kwargs):
+            if path == workspace_runtime.SYNTHETIC_PRIVATE_MANIFEST_NAME:
+                raise PermissionError("manifest unlink denied")
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(
+            workspace_runtime.os,
+            "unlink",
+            side_effect=fail_first_unlink,
+        ):
+            first_unlink_error = workspace_runtime.remove_private_review_artifacts(
+                container
+            )
+
+        self.assertIn("manifest unlink denied", first_unlink_error or "")
+        self.assertTrue(private_manifest.exists())
+        self.assertFalse(private_paths.exists())
+
+        private_manifest.unlink()
+        private_manifest.mkdir()
+        nested_private = private_manifest / "nested.txt"
+        nested_private.write_text("do not recurse\n", encoding="utf-8")
+        private_paths.write_bytes(b"private-path\x00")
+
+        directory_artifact_error = workspace_runtime.remove_private_review_artifacts(
+            container
+        )
+
+        self.assertIsNotNone(directory_artifact_error)
+        self.assertTrue(nested_private.exists())
+        self.assertFalse(private_paths.exists())
+
+        missing_parent_error = workspace_runtime.remove_private_review_artifacts(
+            pathlib.Path(self.temporary.name) / "missing-parent/isolated-review-missing"
+        )
+        self.assertIn("parent is missing", missing_parent_error or "")
+
+        source_root = pathlib.Path(self.temporary.name) / "symlink-source"
+        source_root.mkdir()
+        review_root = source_root / ".codex-tmp"
+        review_root.mkdir(mode=0o700)
+        original_container = review_root / "isolated-review-original"
+        original_container.mkdir(mode=0o700)
+        original_private = (
+            original_container / workspace_runtime.SYNTHETIC_PRIVATE_MANIFEST_NAME
+        )
+        original_private.write_bytes(b"original")
+        moved_review_root = source_root / ".codex-tmp-original"
+        review_root.rename(moved_review_root)
+        outside_root = pathlib.Path(self.temporary.name) / "outside-review-root"
+        outside_root.mkdir(mode=0o700)
+        outside_container = outside_root / original_container.name
+        outside_container.mkdir(mode=0o700)
+        outside_workspace = outside_container / "workspace"
+        outside_workspace.mkdir(mode=0o700)
+        outside_victim = outside_workspace / "victim.txt"
+        outside_victim.write_text("outside\n", encoding="utf-8")
+        outside_private = (
+            outside_container / workspace_runtime.SYNTHETIC_PRIVATE_MANIFEST_NAME
+        )
+        outside_private.write_bytes(b"outside")
+        review_root.symlink_to(outside_root, target_is_directory=True)
+
+        swapped_parent_error = workspace_runtime.remove_private_review_artifacts(
+            original_container
+        )
+
+        self.assertIsNotNone(swapped_parent_error)
+        self.assertTrue(outside_private.exists())
+        self.assertTrue(
+            (
+                moved_review_root
+                / original_container.name
+                / workspace_runtime.SYNTHETIC_PRIVATE_MANIFEST_NAME
+            ).exists()
+        )
+
+        swapped_review = workspace_runtime.ReviewWorkspace(
+            source_root=source_root,
+            container_dir=original_container,
+            workspace_root=original_container / "workspace",
+            base_ref=self.base,
+            head_ref=self.head,
+            diff_file=original_container / "workspace/.codex-review/review.diff",
+            prompt_file=original_container / "workspace/.codex-review/review.prompt",
+        )
+        swapped_cleanup_error = workspace_runtime.cleanup_workspace(
+            swapped_review,
+            keep_container=False,
+        )
+        partial_cleanup_error = workspace_runtime._remove_partial_container(
+            original_container
+        )
+
+        self.assertIsNotNone(swapped_cleanup_error)
+        self.assertIsNotNone(partial_cleanup_error)
+        self.assertTrue(outside_victim.exists())
+        self.assertTrue(outside_private.exists())
+
+    def test_cleanup_does_not_scrub_forged_external_container(self) -> None:
+        external_container = pathlib.Path(self.temporary.name) / "external-container"
+        external_container.mkdir(mode=0o700)
+        private_artifacts = tuple(
+            external_container / name
+            for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
+        )
+        for path in private_artifacts:
+            path.write_bytes(b"outside")
+        forged = workspace_runtime.ReviewWorkspace(
+            source_root=self.repo,
+            container_dir=external_container,
+            workspace_root=external_container / "workspace",
+            base_ref=self.base,
+            head_ref=self.head,
+            diff_file=external_container / "review.diff",
+            prompt_file=external_container / "review.prompt",
+        )
+
+        with self.assertRaises(ReviewError):
+            workspace_runtime.cleanup_workspace(forged, keep_container=True)
+
+        self.assertTrue(all(path.exists() for path in private_artifacts))
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "validate_workspace_layout",
+                return_value=None,
+            ),
+            self.assertRaisesRegex(ReviewError, "not lexically bound"),
+        ):
+            workspace_runtime.cleanup_workspace(forged, keep_container=True)
+
+        self.assertTrue(all(path.exists() for path in private_artifacts))
 
     def test_container_handoff_signal_cleans_private_snapshot(self) -> None:
         restore_calls = 0

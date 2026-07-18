@@ -70,9 +70,7 @@ class ForegroundCleanupTest(unittest.TestCase):
             ),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = cli.main(
-                ["--base-ref", "a" * 40, "--head-ref", "b" * 40]
-            )
+            returncode = cli.main(["--base-ref", "a" * 40, "--head-ref", "b" * 40])
 
         self.assertEqual(returncode, 128 + signal.SIGTERM)
         self.assertIn("evidence retained at /tmp/review", stderr.getvalue())
@@ -213,6 +211,55 @@ class ForegroundCleanupTest(unittest.TestCase):
         self.assertEqual(returncode, 1)
         self.assertIn("cleanup failed", stderr.getvalue())
         self.assertIn("isolated-review-test", stderr.getvalue())
+
+    def test_keep_workspace_retries_private_artifact_cleanup(self) -> None:
+        root = pathlib.Path("/tmp/review-keep")
+        review = ReviewWorkspace(
+            source_root=root,
+            container_dir=root / ".codex-tmp/isolated-review-test",
+            workspace_root=root / ".codex-tmp/isolated-review-test/workspace",
+            base_ref="a" * 40,
+            head_ref="b" * 40,
+            diff_file=root
+            / ".codex-tmp/isolated-review-test/workspace/.codex-review/review.diff",
+            prompt_file=root
+            / ".codex-tmp/isolated-review-test/workspace/.codex-review/review.prompt",
+        )
+        args = argparse.Namespace(
+            repo=str(root),
+            reviewer="codex",
+            base_ref=review.base_ref,
+            head_ref=review.head_ref,
+            prompt_file=None,
+            keep_workspace=True,
+            egress_consent=None,
+        )
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                cli,
+                "prepare_workspace",
+                side_effect=prepared_workspace(review),
+            ),
+            mock.patch.object(
+                cli,
+                "run_review",
+                return_value=providers.Outcome(0, "No findings.", tuple()),
+            ),
+            mock.patch.object(
+                cli,
+                "remove_private_review_artifacts",
+                return_value="unlink denied",
+            ) as remove_private,
+            contextlib.redirect_stderr(stderr),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            returncode = cli._run_foreground(args)
+
+        self.assertEqual(returncode, 1)
+        remove_private.assert_called_once_with(review.container_dir)
+        self.assertIn("cleanup failed", stderr.getvalue())
+        self.assertIn("kept review workspace", stderr.getvalue())
 
 
 if __name__ == "__main__":
