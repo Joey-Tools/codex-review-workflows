@@ -28544,9 +28544,9 @@ class ProviderPolicyTest(unittest.TestCase):
 
         with (
             mock.patch.object(
-                providers,
-                "_is_claude_macos_host",
-                return_value=False,
+                providers.sys,
+                "platform",
+                "linux",
             ),
             mock.patch.object(
                 providers.ssl,
@@ -28582,9 +28582,9 @@ class ProviderPolicyTest(unittest.TestCase):
 
         with (
             mock.patch.object(
-                providers,
-                "_is_claude_macos_host",
-                return_value=True,
+                providers.sys,
+                "platform",
+                "darwin",
             ),
             mock.patch.object(
                 providers,

@@ -12697,7 +12697,7 @@ def _proxy_ssl_context(
                 cadata=b"".join(materials).decode("ascii")
             )
         else:
-            if _is_claude_macos_host():
+            if sys.platform == "darwin":
                 default_cafile = CLAUDE_SYSTEM_CA_FILE
             else:
                 defaults = ssl.get_default_verify_paths()
