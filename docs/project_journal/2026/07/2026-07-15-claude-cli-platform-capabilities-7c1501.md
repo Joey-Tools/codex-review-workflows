@@ -3,11 +3,11 @@ id: 20260715-7c1501
 title: Claude CLI Platform Capabilities
 status: completed
 created: 2026-07-15
-updated: 2026-07-16
+updated: 2026-07-17
 branch: codex/claude-cli-trust-followup
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/46
 supersedes: []
-superseded_by:
+superseded_by: 20260717-c17a11
 ---
 
 # Claude CLI Platform Capabilities

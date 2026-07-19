@@ -18,8 +18,11 @@ is supported only when every applicable gate below passes.
 
 ## Policy Summary
 
-- Accept installed Claude Code release versions `>=2.1.187,<3.0.0` after all
+- Accept installed Claude Code release versions `>=2.1.211,<3.0.0` after all
   provenance, platform, capability, credential, and isolation checks pass.
+  Local-login refresh writeback additionally requires an exact
+  version/platform/SHA-256 entry from the signed artifact in the credential-lock
+  protocol catalog. An explicit API key does not require that internal protocol.
 - Do not pin the helper to `latest`, `stable`, or one current patch release. The
   helper never upgrades Claude Code and reviews the installed release it finds.
 - The former exact patch pin was a compact trust-and-compatibility shortcut for
@@ -29,6 +32,12 @@ is supported only when every applicable gate below passes.
   Anthropic publisher provenance and capability probes bound the CLI contract.
 - Reject prerelease, development, unparseable, and future-major versions unless
   this contract is deliberately revised.
+- The `2.1.211` floor deliberately trusts the current CLI's refresh behavior and
+  explicit login-expiry signals. The helper no longer compensates for older
+  authentication bugs with a custom OAuth freshness warmup. Internal
+  credential-lock coordination is separately artifact-certified: the initial
+  catalog covers `2.1.211` Darwin arm64/x64 and Linux glibc/musl arm64/x64, with
+  WSL2 reusing the matching Linux artifact.
 - Treat the fixed Anthropic release-signing key fingerprint and the signed
   per-version manifest as publisher provenance. A version string, executable
   bit, native file format, install path, or self-reported identity is not
@@ -89,7 +98,7 @@ explicitly configured Claude Code candidate:
    helper-owned home/temp paths, a fixed system-only `PATH`, a deterministic C
    locale, and `NO_COLOR`; do not inherit proxy, CA, authentication, review, or
    other caller state. Bound time and both output streams.
-4. Parse exactly one release version and require `>=2.1.187,<3.0.0`.
+4. Parse exactly one release version and require `>=2.1.211,<3.0.0`.
 5. Fetch the manifest and detached signature for that exact version through the
    parent helper. Resolve GPG only from the fixed host paths, validate the source
    path, retain a stable source descriptor, and copy from that descriptor into a
@@ -123,26 +132,104 @@ explicitly configured Claude Code candidate:
    mentions, and deny every non-workspace synthetic-root mount with absolute
    double-slash rules. Command construction must fail closed when a mount lacks
    coverage or appears below `/workspace`.
-10. At every model-attempt boundary, prepare the platform-specific private
-    credential carrier for only that attempt's 30-minute timeout plus the
-    2-minute safety margin. On macOS, first check freshness; only when the
-    current window is insufficient, run the fixed no-tools, no-workspace-read
-    warmup with the current attempt's model, then re-read and validate the
-    Keychain item. Linux and WSL2 never warm or refresh credentials; each
-    attempt independently validates and stages a new private copy. An explicit
-    API key skips local-login warmup and staging. If the warmup returns an
-    explicit entitlement or organization-policy denial in a strict top-level
-    error result, with structured-error classification and exact effective-model
-    verification, persist that fallback evidence and end the current model
-    boundary without starting the final broker or review sandbox, even when
-    credential freshness remains insufficient. Successful structured output
-    plus entitlement-shaped stderr never authorizes fallback.
+10. At every model-attempt boundary, prepare one platform-specific private
+    credential carrier. On macOS, securely read the current-account Keychain
+    item plus the empirically compatible file under the account's `pwd` home,
+    validate their structure, UTF-8 token encodability, and refresh-token presence, select the candidate
+    with the later access-token expiry, and load it into the restricted broker.
+    On Linux and WSL2, validate the host credential file and stage a private
+    copy. An expired access token is accepted when a usable refresh token remains;
+    there is no warmup or attempt-duration freshness gate. An explicit API key
+    skips local credential selection, staging, and the internal lock-protocol
+    gate. Before local-login preparation, require the captured signed artifact
+    to resolve to one exact certified lock protocol; an unknown artifact is
+    inspection-inconclusive before credentials or review data are exposed.
 11. Launch only the one captured verified snapshot for every real model attempt
     in a fresh outer sandbox; never rediscover or fall back to the mutable source
-    installation between Opus attempts. If entitlement selects a later Opus
-    model, repeat step 10 before that attempt. Validate structured output,
-    effective model, and terminal status before accepting text as review
-    evidence. The requested effort remains explicit in every real command.
+    installation between Opus attempts. The trusted runtime may refresh only
+    inside the temporary carrier. On macOS, atomically reserve attempt-scoped
+    durable-journal quota before any filesystem write for every generation
+    admitted to durable staging, then commit it to its own helper-private recovery
+    carrier. The journal is bounded to eight generations and 8 MiB of payload.
+    The last generation and 1 MiB are reserved for one terminal recovery
+    generation, and every reservation consumes generation and byte quota for
+    the rest of the attempt even if the write or publication fails. At the
+    locked generation linearization point, publish and
+    acknowledge it only if it is still current and the runtime is not
+    abandoned. When an update would consume the terminal reserve, the broker
+    atomically proves that it is still the current pending generation, closes
+    later `W` admission, commits that exact payload to the final journal slot,
+    and NACKs without publication or host writeback. Later `W` requests receive
+    an explicit NACK before their callback or filesystem work. The terminal
+    generation invalidates any older staged host-writeback candidate, marks
+    credential inspection inconclusive, and pauses without Copilot fallback.
+    A superseded or failed
+    generation is not acknowledged, but its carrier remains in the bounded
+    journal until post-quiescence finalization or failure recovery.
+    On Darwin, every file and directory synchronization in that commit performs
+    `fsync` followed by `F_FULLFSYNC`; an unavailable or failed full sync NACKs
+    the generation. Acknowledgement therefore proves successful full-sync calls
+    plus exact readback, not host persistence or an absolute hardware guarantee.
+    This is Darwin's strongest available best-effort power-loss barrier; storage
+    hardware may still fail to honor it. After the broker
+    server and every handler have fully quiesced, one outer-runtime owner proves
+    the newest carrier, removes older journal entries, detaches the latest
+    acknowledged rotation, performs guarded host writeback, and deletes the final
+    recovery copy only after that write and its parent directories have passed
+    the same Darwin full-sync boundary.
+    The latest exact-verified generation is always the canonical current carrier.
+    If quota rejection, a malformed update, or durable-stage failure leaves no
+    staged host-writeback candidate, finalization reports it as the sole current
+    recovery artifact, removes every other
+    non-authoritative complete journal entry, and reports failed stale-entry
+    cleanup separately as cleanup residue. If staged or non-staged control flow
+    leaves any stale carrier unvisited, cleanup reporting is promoted to the
+    recovery-root scope without changing the canonical current carrier.
+    Linux/WSL2 instead uses a bounded watcher
+    and a synchronous final drain before cleanup. At each host commit, acquire
+    the artifact-certified primary and legacy refresh locks, maintain their
+    5-second heartbeat, recheck both macOS carrier snapshots or the Linux/WSL2
+    host file, and write only if the complete observed state still matches the
+    current baseline. If Linux/WSL2 Claude exits after a
+    staged rotation but before releasing helper-owned locks, reclaim only the
+    exact empty private staged locks after both watcher join and a normal
+    supervisor return prove writer quiescence, then retry the final drain once.
+    Before exposing the macOS broker, prevalidate its stable recovery-root
+    cleanup scope. If macOS cannot prove broker-handler quiescence, the server irreversibly
+    closes its pending-update publication/acknowledgement gate before boundedly
+    draining handlers already inside the commit critical section. Runtime
+    abandonment latching and pending detachment are recorded independently, and
+    detachment may be retried without reopening publication. The event-only
+    abandonment callback and timed detach are bounded; detach timeout leaves
+    payload ownership with the server. A terminal durable stage racing the event
+    either self-registers or is transferred by the bounded recovery worker under
+    the runtime lock. Recovery runs even for a detached `None` payload and
+    converges that stage. Timeout reporting takes only a nonblocking runtime-state
+    snapshot and otherwise reports the stable recovery-root cleanup scope without
+    claiming a current carrier. Once quiescence is unproven, outer finalization
+    does not wait for or consume runtime state still owned by a late handler or
+    recovery worker. Whenever abandonment recovery observes
+    any durable journal entry or quiescence stage, its final error also reports
+    that root, even when it separately reports an exact current carrier. After an actual
+    bounded recovery timeout, the
+    handler/recovery state machine exclusively owns in-flight stage cleanup. Any
+    late stage or fallback is exact-cleaned by that state machine or remains
+    within the pre-reported recovery-root cleanup scope. Report a carrier as
+    current only after its no-follow path identity and exact payload are verified;
+    an unverified or incomplete existing file is cleanup-only, and a vanished
+    temp is unreported.
+    Shutdown uncertainty with no `W` generation produces no current recovery
+    credential; a pre-reported recovery-root cleanup scope remains cleanup-only.
+    If guarded post-quiescence writeback
+    fails, retain the newest verified carrier or durably materialize a newer
+    pending payload before reporting its path. Otherwise
+    retain and report the Linux/WSL2 private recovery carrier rather than
+    deleting the only possibly
+    valid refresh token. Validate structured output, effective
+    model, and terminal status before accepting text as review evidence. A strict
+    entitlement result may select the later Opus model; an authentication result
+    instead stops as `blocked-authentication`. The requested effort remains
+    explicit in every real command.
 
 ## Publisher Provenance
 
@@ -317,8 +404,8 @@ customization, policy, runtime, and environment claims are still validated
 separately. This default-deny self-reference rule avoids treating an
 ever-growing list of negative auxiliaries as a semantic parser.
 
-Require every public option used by the macOS authentication warmup or final
-review command to appear exactly once in the bounded `--help` output from the
+Require every public option used by the final review command to appear exactly
+once in the bounded `--help` output from the
 verified executable snapshot. This includes print mode, model and effort
 selection, structured output, session non-persistence, safe mode, permission
 mode, settings and MCP isolation, browser and slash-command disablement, and
@@ -521,7 +608,7 @@ material remain outside the contract.
 Linux and WSL2 fix cwd at `/workspace`, use `dontAsk`, expose only `Read`, and
 pre-approve only `Read(./**)`. Every other top-level path mounted into the
 synthetic root is denied both at the root and recursively with absolute
-double-slash rules, for example `Read(//config)`, `Read(//config/**)`,
+double-slash rules, for example `Read(//auth)`, `Read(//auth/**)`,
 `Read(//proc)`, and `Read(//proc/**)`. A single leading slash would be relative
 to the settings source rather than the filesystem root and is not accepted.
 The command builder derives top-level roots from the actual mount set and fails
@@ -549,76 +636,338 @@ components would return to it. The pre-egress workspace scan still validates the
 completed link graph. Linux and WSL2 additionally repeat a bounded no-follow
 link/identity scan immediately before every isolation-probe or final sandbox
 command is serialized. Stable relative links whose complete chains remain
-inside `/workspace` continue to work; `/config`, `/proc` magic links, absolute
+inside `/workspace` continue to work; `/auth`, `/proc` magic links, absolute
 links, transient or final escapes, loops, link races, and inspection I/O failures
 all fail closed before the authenticated workload starts. As with the final
 path-to-mount handoff, this does not claim protection from a malicious same-euid
 host process after the last identity check.
 
-The supported range continues to start at `2.1.187` instead of forcing an
-upgrade to `2.1.208`. Anthropic documents reliable propagation of `Read` rules
-to `Grep`, `Glob`, LSP, and prompt file mentions only from `2.1.208`. Therefore
-Linux and WSL2 do not expose those search tools and reject ASCII `@` file-mention
-syntax in the complete review prompt before launch. The frozen diff remains
-available through the workspace-only `Read` tool. macOS keeps its existing
-`Read`/`Grep`/`Glob` contract because Seatbelt does not expose the Linux
-credential shape.
+The supported range starts at `2.1.211`, after Anthropic's documented `2.1.208`
+boundary for reliable propagation of `Read` rules to `Grep`, `Glob`, LSP, and
+prompt file mentions. Linux and WSL2 nevertheless retain the narrower defense-
+in-depth contract: they do not expose those search tools and reject ASCII `@`
+file-mention syntax in the complete review prompt before launch. The frozen diff
+remains available through the workspace-only `Read` tool. macOS keeps its
+existing `Read`/`Grep`/`Glob` contract because Seatbelt supplies the outer
+filesystem boundary.
 
 ## Credentials
 
 An explicitly supplied `ANTHROPIC_API_KEY` remains an optional override and does
-not require local-login credential access. Never pass Claude and Copilot
-credentials into the same child environment.
+not require local-login credential access or an internal credential-lock
+protocol entry. Never pass Claude and Copilot credentials into the same child
+environment.
 
-On macOS, retain the capability-authenticated, one-shot Keychain broker. Before
-each model attempt, after trusted executable, review-tool, and TLS preparation,
-the parent reads and validates the current Claude Code item with Apple's trusted
-client. The token needs to cover only the current bounded attempt plus its
-safety margin, currently `1800 + 120 = 1920` seconds. A sufficiently fresh token
-is not refreshed. Otherwise the helper runs the fixed-input safe-mode warmup
-with the current attempt's model, no tools, and no workspace read, then re-reads
-and validates the item. The final broker performs another read and fail-closed
-single-attempt validation before its one-shot handoff. The final Claude process
-cannot execute `/usr/bin/security`, access Keychain services directly, update
-the host item, or refresh OAuth credentials during the review. Every later
-model attempt repeats this refresh-if-needed and validation sequence. A
-strictly structured, exact-model-verified entitlement denial from the warmup is
-recorded only as model-chain fallback evidence with no final text; it skips the
-final broker and repository-review launch, and the next model still starts from
-its own freshness boundary. Its bounded complete stdout/stderr capture is copied
-to the formal attempt logs after the temporary warmup output directory closes.
-An explicit authentication failure remains unavailable even when the refreshed
-Keychain item is structurally fresh enough for a later attempt.
+Before local-login credential access on any platform, bind the verified
+executable, release version, manifest platform key, and signed SHA-256 from
+`claude-runtime.json` to the exact credential-lock protocol catalog. The initial
+catalog contains the six supported Darwin and Linux artifacts for `2.1.211`;
+WSL2 uses its matching Linux artifact. Unknown versions, platforms, checksums,
+or mismatched executable evidence are inspection-inconclusive before credentials
+or review data are exposed. They are not authentication failures, runtime
+unavailability, or Copilot fallback reasons.
+
+On macOS, retain the capability-authenticated temporary Keychain broker but
+allow it to coordinate the current CLI's normal refresh behavior without giving
+the final Claude process direct host credential access. Before each model
+attempt, after trusted executable, review-tool, and TLS preparation, the parent
+reads the current-account `Claude Code-credentials` item with Apple's trusted
+client. It also resolves the current account through `pwd.getpwuid(os.getuid())`
+and safely inspects `<pwd-home>/.claude/.credentials.json`; caller-controlled
+`HOME` never selects this source. The file must be a stable no-follow regular
+file owned by the current user with exact mode `0600`, bounded size, and valid
+credential JSON. This macOS file source is based on observed current Claude Code
+compatibility behavior; Anthropic's public authentication documentation does
+not guarantee it as the macOS storage contract.
+
+For each structurally valid source, require non-empty access and refresh tokens
+that encode as UTF-8 without unpaired surrogates, and parse the access-token
+expiry. Access-token expiry alone is not login expiry. Select
+the candidate with the later expiry even when both access tokens are already
+expired, then load that payload into the broker. The broker serves the initial
+fixed lookup once and accepts only the exact bounded credential-store update
+forms needed for refresh. Concurrent updates receive monotonic generations.
+Every `W` generation admitted to durable staging first atomically reserves
+generation and payload-byte quota before any filesystem
+write. The attempt-scoped durable journal accepts at most eight generations and
+8 MiB of payload. A reservation remains consumed for the rest of the attempt,
+including when the later filesystem write or generation publication fails. The
+generation writes a distinct private recovery carrier, synchronizes its file,
+containing directories, review-container entry, and review-root entry, renames
+it under a synchronized parent, and reads back the exact payload. On Darwin,
+each such synchronization runs `fsync` and then requires `F_FULLFSYNC`; the
+same barrier covers pwd-home host-file replacement before the final recovery
+carrier can be removed. A missing command or failed full sync is
+credential-inspection-inconclusive and cannot authorize acknowledgement or
+cleanup. If the final carrier rename completed before a full-sync or identity
+check failed, only an exact re-proof of the acknowledged path and payload digest
+may retain it as recovery-only evidence; it is never published for host
+writeback. Only after that durable commit does the broker enter the generation
+linearization point under the current-generation lock. It publishes and
+acknowledges the generation only if it is still current and the runtime is not
+abandoned. The eighth generation and final 1 MiB are reserved for terminal
+recovery. When an update would enter that reserve, the server atomically closes
+later update admission only if that update is still the current pending
+generation, commits the exact payload into the terminal slot, and returns a
+NACK without calling the publication linearization point. A superseded
+candidate consumes no quota or filesystem work; later `W` requests are
+explicitly NACKed before their callback. The terminal generation invalidates
+any older staged host-writeback candidate, records
+credential-inspection-inconclusive, and pauses without Copilot fallback. A
+superseded, abandoned, or failed generation returns failure without
+acknowledgement, but its carrier remains in the bounded journal until
+post-quiescence finalization or failure recovery. A successful broker acknowledgement therefore proves durable
+recovery staging, not host persistence or an absolute power-loss guarantee.
+`F_FULLFSYNC` is Darwin's strongest available best-effort persistence request,
+and storage hardware may still fail to honor it. A
+generation that fails structural validation invalidates any older published
+host-writeback candidate while leaving the older durable carrier available for
+recovery. It never exposes
+`/usr/bin/security`, the Keychain service, the file source, or arbitrary update
+commands to Claude. The parent retains both carriers' existence, payload and
+refresh-token digests, plus the file identity, not only the selected carrier.
+Carriers with the same refresh-token digest are one logical login even when
+their access-token payloads or expiry metadata differ. After the server and
+every handler have quiesced, the outer runtime is the single host-persistence
+owner: it detaches the latest acknowledged credential, removes older durable
+generations only after the newest is proven, and then acquires the
+artifact-certified primary `.oauth_refresh.lock` and legacy sibling lock. A
+quota rejection, malformed update, or failed durable stage may leave no staged
+host-writeback candidate. In that case finalization selects and reports one exact
+verified complete journal carrier as the sole current recovery credential,
+removes every other non-authoritative complete entry, and reports a stale entry
+whose cleanup fails separately as `authentication.recovery_cleanup_artifact`. A
+control-flow interruption while removing an older generation stops immediately:
+the owner does not begin host writeback or cleanup of the latest carrier. The
+latest exact-verified generation remains the canonical current carrier. If a
+staged or non-staged control-flow stop leaves any stale carrier unvisited,
+cleanup reporting is promoted to the macOS recovery-root scope. It
+maintains the certified
+5-second heartbeat, rechecks both carriers under those locks, and performs
+guarded writeback against each carrier's own current payload. The helper
+prevalidates the stable macOS recovery-root cleanup scope before broker exposure.
+On unquiescent shutdown, the server first irreversibly closes the pending-update
+publication/acknowledgement gate, then boundedly drains handlers already inside
+the commit critical section. Runtime abandonment latching and pending detachment
+have independent state, so detachment may be retried without reopening
+publication. The abandonment callback only sets an event and is itself bounded;
+it never waits for the runtime-state lock. Timed detachment uses one deadline
+across both credential locks and transfers no payload on timeout. A terminal
+durable stage racing the abandonment event either self-registers or is
+transferred to the quiescence stage by the bounded recovery worker under the
+runtime lock. Recovery executes for a detached `None` payload as well as a
+credential payload and converges that stage. Recovery-timeout reporting takes
+only a nonblocking runtime-state snapshot. If the lock is contended, it reports
+the stable macOS recovery-root cleanup scope without claiming a current carrier.
+Once quiescence is unproven, outer finalization does not wait for or consume
+runtime state still owned by a late handler or recovery worker.
+Whenever abandonment recovery sees any durable journal entry or quiescence
+stage, the final error also reports that root so old generations, a failed
+quiescence stage, and any fallback retain visible ownership even beside an exact
+current carrier. After an actual bounded recovery timeout, the handler/recovery state machine
+is the unique owner of any in-flight stage cleanup. A stage or fallback that
+completes late is exact-cleaned by that state machine or remains inside a
+pre-reported recovery-root cleanup scope. A handler that
+finishes a durable write after abandonment cannot acknowledge, mutate host
+state, or overwrite the authoritative fallback. When no `W` generation exists,
+shutdown uncertainty reports the quiescence failure without a current recovery
+credential; a pre-reported recovery-root scope remains cleanup-only. A bounded heartbeat join timeout
+marks the lease as release-started, not release-complete.
+The owning release call performs one further bounded
+cleanup attempt while preserving the first timeout as its primary diagnostic;
+if both joins time out, it reports the exact helper-owned lock paths as
+cleanup-inconclusive and pauses for controlled operator cleanup after confirming
+that no credential writer remains. The lease then remains terminal, so queued or
+later release calls repeat the same diagnostic instead of deleting the paths.
+An interruption after descriptor or lock removal starts has the same terminal
+policy. Exact recovery paths remain visible even when an earlier credential
+operation stays primary, and a forwarded signal carries them in its detail. It
+never silently labels a potentially orphaned lock as completed cleanup. Every
+successful post-quiescence write advances the full baseline, including the new
+file identity, for final verification and subsequent model attempts. Supported
+Claude Code login/refresh writers therefore serialize with the commit window; observed
+concurrent changes win and successful refresh-token rotation is normally
+retained. The Keychain and POSIX file do not share one transaction. After the
+file commit, a failed Keychain command therefore triggers locked readback: an
+already-complete update is accepted, an exact file-new/Keychain-old state gets
+one bounded Keychain retry against the original Keychain payload, and any other
+state pauses without overwriting it. For a Keychain-only refresh, the same
+readback requires an unrelated file carrier to remain unchanged or absent rather
+than incorrectly requiring it to contain the refreshed Keychain value. If the
+retry remains partial, preserve the
+new file credential because token rotation may already have invalidated the old
+refresh token, report the synchronization failure as inspection-inconclusive,
+and pause without a login prompt or Copilot fallback. This dual-lock
+compare-before-write guard is not an atomic compare-and-swap guarantee against
+unrelated external writers that bypass both locks.
+
+The same preservation boundary has two ownership domains. When broker-handler
+quiescence cannot be proved, only the handler/recovery state machine retains the
+newest acknowledged durable generation or materializes a newer pending
+structurally validated rotation; outer finalization does not inspect that runtime
+state. After proven quiescence, an outer shutdown owner handles a Keychain-only
+guarded write that exhausts its bounded retry or a first file-carrier write that
+fails. That owner retains the newest acknowledged durable generation only after
+revalidating its carrier, or durably replaces it with a newer pending rotation
+and verifies the resulting carrier before reporting it. An uncertain shutdown with no `W` generation, or a
+carrier-creation failure that left no verifiable file, carries the original
+failure without current recovery-credential metadata; a pre-reported
+recovery-root cleanup scope remains separate cleanup evidence.
+The carrier and `config` directories are `0700`; `config/.credentials.json` is
+an owner-only, single-link regular file with exact mode `0600`. It is outside
+the Claude-visible Seatbelt paths and is never passed through the child
+environment. Report only the absolute path of a carrier or artifact whose exact
+payload was verified when claiming it as current, never token contents, and
+pause as inspection-inconclusive
+without a login prompt or Copilot fallback.
+An unverified or incomplete file is cleanup-only and may be reported only as
+`authentication.recovery_cleanup_artifact`. After verified host commit, cleanup reopens the carrier through no-follow
+directory descriptors, rechecks directory and credential identity, removes the
+credential and directories in order, and synchronizes every containing
+directory. Cleanup uncertainty pauses and reports only
+`authentication.recovery_cleanup_artifact`; it never turns successful host
+persistence into a claim that the leftover copy is the current credential.
+An already-committed host file remains preserved. If recovery replacement or
+finalization fails after a complete private update file was written, retain and
+report that exact artifact instead of losing its location. A later successful,
+read-back-verified replacement removes bounded stale update artifacts. If no
+complete recovery copy can be proven and no artifact actually exists, report no
+candidate or attempted path. If an actually existing incomplete update cannot
+be removed or safely inspected, report its exact path only as cleanup residue;
+never present it as a recoverable current credential.
+
+The current recovery credential and cleanup residue are separate report fields.
+Before a verified recovery commit, a complete uncommitted update whose no-follow
+path identity and exact payload are reverified after the triggering failure is
+`authentication.recovery_artifact`. After a replacement is fully fsynced and
+read-back verified, `config/.credentials.json` is the current
+`authentication.recovery_artifact`. If deleting an older temp fails, its exact
+path is `authentication.recovery_cleanup_artifact`. An incomplete update that
+cannot be removed uses the same cleanup-only field. Neither an older nor an
+unverified or incomplete artifact is ever described as the newest or current
+recovery value. A temp that disappears before final post-failure path
+verification is neither current nor cleanup metadata.
+
+Recovery-carrier removal advances cleanup ownership only after each destructive
+syscall: from the credential file to `config`, then the carrier, then the stable
+recovery root. A current credential is republished after a cleanup failure only
+when its no-follow identity and exact payload are still proven. Cleanup metadata
+must name an existing no-follow identity-stable scope. A vanished child is not
+reported, while concurrent entry churn beneath the same directory inode does
+not invalidate that directory as the cleanup scope.
+
+Current-artifact proof is bound to the authoritative source content, not to
+whatever bytes happen to occupy the reported path later. Marker capture receives
+the digest already proven by durable staging or exact recovery writeback, rejects
+a payload mismatch, and freezes the absolute path, strong file identity, and
+complete root-to-parent no-follow ancestor chain. A same-content replacement
+before capture is harmless and becomes the marker-time identity only after the
+same owner, mode, and exact digest checks; a same-content replacement after
+capture is rejected. Reporting reopens and rechecks every directory edge plus
+the credential inode and digest. Path/proof propagation and clearing are paired,
+so a bare path, a post-capture new inode, or an ancestor replacement cannot be
+promoted to current recovery metadata.
+
+The `security -i` transport-size limit applies only when the selected source is
+the Keychain or when matching refresh-token digests require a file-selected
+rotation to update the Keychain too. A structurally valid but unselected
+Keychain credential from a distinct logical login remains part of the observed
+snapshot, but its encoded update size does not block an independently usable
+file credential that will never write that Keychain item.
+
+Helper-lock or Claude-lock contention, heartbeat/lease compromise, a stale
+shared lock, a change to either macOS carrier, and credential inspection I/O uncertainty are
+inspection-inconclusive. They pause the lane without a `claude auth login`
+instruction and without Copilot fallback because they do not prove that the
+login is invalid. The helper never automatically deletes a stale shared lock;
+controlled cleanup requires first confirming that no credential writer remains.
 
 On Linux and WSL2, every model attempt validates the documented Claude Code
 credential file as a non-symlink regular file owned by the current user with
-exact mode `0600`. For that attempt, copy it into a new helper-owned `0700`
-directory as a private `0600` file and expose only that staged copy's config
-directory through a read-only mount at `/config`; the original host credential
-is never mounted. Parse the OAuth expiry and require the same single-attempt
-`1920`-second window before launch. Linux and WSL2 perform no pre-chain staging,
-warmup, refresh, or host-credential write; a missing or insufficiently fresh
-credential is unavailable unless an explicit `ANTHROPIC_API_KEY` is supplied.
-Reject unsafe ownership, mode, symlink, path-race, size, or JSON structure, and
-never persist or print credential contents in review state. The source
-descriptor must close successfully before a validated payload is returned;
-close failure zeroes the in-memory copy, preserves any earlier
-validation/control-flow error, and fails closed without retrying the same
-numeric descriptor.
+exact mode `0600`. Access and refresh tokens must be non-empty UTF-8-encodable
+strings without unpaired surrogates; the same parser rejects an unsafe staged
+rotation before host writeback. Before the first credential read, the helper
+opens every absolute directory component from the filesystem root through the
+credential parent with `O_DIRECTORY|O_NOFOLLOW`, retains that complete
+descriptor chain for the attempt, and rejects a symlink at any ancestor or the
+credential leaf. Reads, directory locking, refresh-lock mutation, replacement,
+and parent-directory sync stay relative to those retained descriptors; the
+helper revalidates every path edge before commit and after sync, so retargeting
+an earlier ancestor cannot redirect a read or write into a replacement tree.
+The refresh-lock helper's borrowed anchors are descriptor-only; the credential
+anchor owns complete edge revalidation. If cleanup of a descriptor-bound lock
+fails after path movement, the helper publishes no lexical cleanup path because
+that pathname is no longer authoritative; it pauses with an identity-only
+recovery warning instead of directing cleanup at a replacement tree. On watcher timeout, an explicit
+cleanup-reached handoff makes either the parent or the exiting worker close the
+descriptor chain, whichever completes the ownership transition last, without
+waiting behind filesystem inspection. For that attempt, copy it into a new helper-owned writable
+`/auth` carrier root with private config at `/auth/config`; the original host
+credential is never mounted. The layout permits the primary lock under the
+config plus the legacy sibling `/auth/config.lock`. Before binding the carrier
+root at `/auth`, require its canonical `config` child and direct-helper-root
+shape, and reject any equality or ancestor/descendant overlap with the separate
+helper home or temporary roles; one host directory must never be exposed at
+both an authentication and a general writable mount. Require valid credential
+JSON plus a usable refresh token, but do not require future access-token
+lifetime. The trusted runtime may update only the staged carrier through its
+authentication path, while the inner permission policy denies all of `/auth`
+from model-visible `Read`. A 50-ms metadata watcher takes staged locks only after
+a possible change, releases them before taking host locks, validates the stable
+payload, and guarded-writes every rotation while advancing its payload and file-
+identity baseline. After an ordinary watcher stop, a bounded synchronous final
+drain rechecks the staged and host states before cleanup. A normal supervisor
+return, including a nonzero Claude exit, proves that the supervised `bubblewrap`
+process group is quiescent. If exact helper-owned staged primary or legacy locks
+remain at that point, first preflight both paths as unchanged, empty,
+current-user-owned `0700` directories, remove them in reverse acquisition order,
+and retry the final drain once. Freshness is irrelevant for this narrowly scoped
+recovery because process quiescence is the safety proof. Never apply it to the
+host credential directory or a shared lock. If the supervisor times out or
+reports a process leak, lock recovery is unsafe, the retry fails, or guarded host
+writeback remains unproven while a staged update may be newer, retain the private
+carrier under the review container and record its recovery path without token
+contents. Stop first linearizes closure of new background-writeback admission,
+so a candidate whose last blocking read completes after closure cannot begin
+host writeback. If the initial bounded watcher join itself times out, classify
+the attempt as inspection-inconclusive, retain the carrier immediately, and
+skip concurrent final drain, payload scrubbing, and carrier cleanup. If a
+background writeback was admitted before stop and remains in flight, report
+host state as ambiguous because that already-started commit may still complete;
+do not claim an exclusive recovery handoff. The watcher is a daemon only so
+such an uninterruptible operation cannot keep the helper alive after the
+bounded failure report; normal paths still join it and the recovery copy is
+never silently deleted. A control-flow signal is re-raised only after the
+retained path has been attached to its visible diagnostic. The parent uses the
+same artifact-certified primary and legacy host locks with heartbeat and rejects
+any external host change instead of adopting it. This
+closes the commit race with supported Claude Code login/refresh writers but
+cannot atomically close it for unrelated writers that bypass both locks. Reject
+unsafe ownership,
+mode, symlink, path-race, size, or JSON structure, and never persist or print
+credential contents in review state. Every retained source descriptor must close
+successfully before a validated payload is returned; close failure zeroes the
+in-memory copy, preserves any earlier validation/control-flow error, and fails
+closed without retrying the same numeric descriptor.
 
 Credential staging owns cleanup from the first successful create through the
-final close. Scrub, close, unlink, and directory removal are attempted in a
-bounded order even when the body exits through cancellation or generator
-closure. A cleanup-time `KeyboardInterrupt`, `SystemExit`, or other
+final close. Ordinary successful and non-recoverable cleanup scrubs, closes,
+unlinks, and removes directories in a bounded order even when the body exits
+through cancellation or generator closure. The intentional exception is an
+unpersisted, still-usable staged credential: if writer quiescence or guarded
+writeback cannot be proved, leave its exact-mode-`0600` file inside the
+exact-mode-`0700` carrier, retain the review container, and expose only the
+carrier path as recovery metadata. A cleanup-time `KeyboardInterrupt`, `SystemExit`, or other
 `BaseException` control-flow signal is never converted into an ordinary
 credential error; an already-active body exception remains primary and receives
 the cleanup diagnostic. Python 3.10 records that diagnostic in the preserved
 exception chain through a dedicated diagnostic cause because
 `BaseException.add_note()` is available only from Python 3.11.
 
-A read-only mount prevents mutation but does not hide a secret from the Claude
-process that must authenticate with it. The Linux/WSL2 inner permission policy
-therefore denies `/config` from model-visible `Read`. In API-key mode, it also
+A private staged carrier prevents direct host-file mutation but does not hide a
+secret from the Claude process that must authenticate with it. The Linux/WSL2
+inner permission policy therefore denies `/auth` from model-visible `Read`.
+In API-key mode, it also
 denies `/proc` and `/dev` so `Read(//proc/self/environ)` and file-descriptor
 aliases cannot expose `ANTHROPIC_API_KEY`. This boundary trusts the
 publisher-verified Claude runtime to enforce its own tool permissions against
@@ -644,35 +993,35 @@ reached:
 1. `publisher-and-capabilities-verified`: the signed release, private snapshot,
    and safe-mode/help capability contract passed. `outer_sandbox.status` remains
    `pending-runtime-launch` and `authentication.status` remains `pending`.
-2. macOS `authentication-preflight-complete`: after review-tool and TLS
-   preparation for the current attempt, API-key configuration or local-login
-   refresh/validation passed. Authentication status becomes `configured` or
-   `freshness-verified`; `authentication.model` and `validated_for_model` both
-   identify the current model whose attempt window was checked. When this
-   outcome is published for a later Opus attempt, it clears the previous
-   attempt subtree, restores the outer-sandbox
-   status to pending, and is not a whole-chain freshness guarantee.
-3. macOS authentication preparation failure before a model launch is explicit.
-   `authentication-preflight-inconclusive` records the current model and stable
-   warmup failure class without inventing a formal review attempt. This includes
-   supervision failures from the credential freshness read immediately before
-   or after the warmup.
-   `authentication-preflight-unavailable` also covers an attempt-local failure
-   of the restricted Keychain broker, with the same consent-gated fallback
-   policy as an unavailable credential.
-   A structured transient warmup remains inconclusive when the post-warmup read
-   also finds that broker unavailable. During final staging, credential-read
-   supervision failures use failure class `credential-read` with no model
-   attempt, while broker failure or a warmup/final-staging loopback failure
-   resets the phase to unavailable before the Claude CLI launch.
-   `authentication-preflight-entitlement` records a strict, exact-model-verified
-   warmup entitlement attempt while keeping `outer_sandbox.status` at
-   `pending-runtime-launch` and `validated_for_model` unset. This is fallback
-   evidence with no final text, not a final review launch or clean artifact.
-   `authentication-preflight-unavailable` records an explicitly unavailable
-   current-attempt Keychain credential. Linux/WSL2 credential unavailability
-   prevents `runtime-ready` from being published and is retained through the
-   ordinary unavailable error artifact instead of a macOS preflight phase.
+2. Authentication preparation records only the selected carrier kind and
+   readiness state; it never persists credential contents, refresh tokens, or
+   bearer-capable expiry metadata. Artifact lock-protocol certification happens
+   before either local-login carrier is read. macOS reaches `sandbox-auth-staged`
+   only after both carrier snapshots are captured and the selected source is
+   loaded into the restricted broker. Linux/WSL2 reaches it only after the
+   private staged carrier and real isolation probe are ready. Access-token expiry
+   alone does not create an error phase.
+3. Authentication failure is explicit. Missing, malformed, unsafe, or
+   refresh-token-less local credentials, plus a final-runtime `Login expired`,
+   HTTP 401, or refresh failure, write `blocked-authentication` and the operator
+   action `claude auth login`. A rejected explicit API key instead instructs the
+   operator to unset or replace `ANTHROPIC_API_KEY`; it is not evaluated for an
+   OAuth refresh token. The phase carries no Copilot fallback eligibility.
+   Credential-source/broker I/O races, lock contention, heartbeat failure,
+   uncatalogued lock protocols, or bounded-supervision failures remain
+   inconclusive. For every Keychain-broker, TCP-proxy, and Unix-proxy endpoint,
+   only an explicit OS policy or socket-capability bind errno is deterministic
+   secure-runtime unavailability. Unknown, resource/capacity, or
+   address-contention bind errors, Unix-socket permissioning failure,
+   thread-start failure, serve-start uncertainty, and a post-ready serve-loop
+   failure are inconclusive, while an unsafe broker is blocked. When
+   refresh persistence leaves a private carrier for operator recovery,
+   `authentication.recovery_carrier` records only that path and never the
+   credential payload. A simultaneous final-runtime authentication rejection
+   remains the primary `blocked-authentication` classification, but both the
+   runtime report and operator-facing error retain the verified recovery
+   diagnostic. If writing that report fails, the replacement error inherits the
+   same validated recovery metadata instead of obscuring the carrier.
 4. Platform preparation: Linux/WSL2 reports `runtime-ready` only after the
    current attempt's credential staging and real isolation probe, with
    `outer_sandbox.status: isolation-probe-verified` and
@@ -694,27 +1043,41 @@ described as an enforced final launch.
 
 | Condition | Terminal classification | Copilot fallback |
 | --- | --- | --- |
-| No automatic candidate, supported platform unavailable, accepted-range candidate lacks a required non-security capability, or usable local/API authentication is absent at the current attempt boundary | `runtime-unavailable` or `auth-unavailable` | Only for explicit double/triple-review consent |
+| No automatic candidate, supported platform unavailable, or an accepted-range automatic candidate cleanly lacks a required non-security capability or secure runtime dependency | `runtime-unavailable` | Only for explicit double/triple-review consent |
+| A helper-owned Keychain-broker, TCP-proxy, or Unix-proxy bind fails with an explicit OS policy or socket-capability errno | `runtime-unavailable` | Only for explicit double/triple-review consent |
+| The Keychain-broker source and compiler exist, but the compiler cannot start or the broker build returns nonzero | `inconclusive`; report the build gate and pause | No |
+| Local/API authentication is missing, malformed, unsafe, refresh-token-less, or actually rejected as `Login expired`, HTTP 401, or refresh failure | `blocked-authentication`; request `claude auth login` for local login or unset/replace the explicit API key, then pause | No |
+| Signed artifact has no exact credential-lock protocol entry, either macOS carrier changed, lock contention/heartbeat failed, or credential inspection was unstable | `inconclusive`; report the exact coordination/inspection gate and pause without a login prompt | No |
+| The current macOS update would consume the reserved eighth generation or final 1 MiB | `inconclusive`; atomically close later `W` admission, durably stage that current update in the terminal recovery slot, invalidate any older staged host-writeback candidate, and NACK without publication or host writeback; NACK later requests before their callbacks or filesystem work | No |
+| The macOS broker cannot prove handler quiescence, bounded abandonment or detach is inconclusive, or its latest acknowledged durable rotation cannot be completely guarded-written to every required host carrier | `inconclusive`; irreversibly close pending publication/ACK before draining entered commit sections, use an event-only bounded abandonment latch and timed retryable detach, transfer no payload on timeout, converge a racing terminal stage through bounded recovery even for detached `None`, and use only a nonblocking timeout snapshot; any abandonment journal/quiescence stage keeps the recovery-root cleanup scope in the final error even beside an exact current carrier; after an actual recovery timeout, let only the handler/recovery state machine exact-clean a late stage/fallback or keep it within that root scope | No |
+| A verified macOS recovery replacement succeeds but deleting an older credential temp fails | `inconclusive`; report verified `config/.credentials.json` as `recovery_artifact`, report the old exact temp separately as `recovery_cleanup_artifact`, and pause | No |
+| An unverified or incomplete macOS recovery temp cannot be removed or safely inspected | `inconclusive`; keep the carrier, report the temp only as `recovery_cleanup_artifact`, and never claim it is a current credential | No |
+| A Linux/WSL2 staged rotation cannot be safely drained, recovered, or guarded-written to the host | `inconclusive`; retain the private recovery carrier, report its path, and pause | No |
 | Explicit override has the wrong version, platform, binary shape, capability contract, or lacks trusted GPG, probe sandbox, or trusted review tool prerequisites | `blocked` configuration error | No |
-| Wrong publisher fingerprint, invalid signature, checksum mismatch, contradictory safe-mode semantics, unsafe credential metadata, or an isolation-boundary mismatch | `blocked` security error | No |
-| Manifest/probe timeout, output overflow, executable resolve/stat I/O failure, other inspection I/O failure, file race, transient network failure, capacity error, or missing trustworthy terminal artifact | `inconclusive` | No |
-| Explicit model entitlement or organization-policy denial from a final review invocation, or from a fixed-input warmup after exact effective-model verification | Existing same-lane model/backend fallback policy | Only as already authorized by the lane contract |
+| Wrong publisher fingerprint, invalid signature, checksum mismatch, contradictory safe-mode semantics, unsafe runtime metadata, or an isolation-boundary mismatch | `blocked` security error | No |
+| Manifest/probe timeout, output overflow, executable resolve/stat I/O failure, other inspection I/O failure, file race, transient network failure, unknown/resource/capacity/address-contention bind failure, Unix-socket permissioning failure, broker/proxy thread-start or serve-start uncertainty, post-ready serve-loop failure, or missing trustworthy terminal artifact | `inconclusive` | No |
+| Explicit model entitlement or organization-policy denial from a final review invocation after exact effective-model verification | Existing same-lane model/backend fallback policy | Only as already authorized by the lane contract |
 
-A transient, timed-out, output-limited, drain-failed, or process-leaking macOS
-warmup is `inconclusive` and returns exit `75`; it never authorizes Copilot. If
-an earlier Opus attempt completed with entitlement metadata, that evidence stays
-persisted while the model whose inconclusive authentication gate failed is not
-recorded as a launched attempt. A verified warmup entitlement is recorded as an
-attempt with no final text, but missing or mismatched model metadata stops the
-lane as `runtime-unverified` or `model-mismatch` and never authorizes fallback.
-Transient and authentication classifications retain their existing precedence.
-Every later Opus model independently repeats the freshness/warmup boundary. A
-credential that is explicitly unavailable at a later model boundary follows
-only the existing double/triple-review consent gate; `explicit-claude-review`
-remains Anthropic-only.
+Authentication failure never becomes runtime unavailability. The helper reports
+`blocked-authentication`, tells the operator to run `claude auth login` for local
+login or unset/replace an explicit `ANTHROPIC_API_KEY`, and pauses for an explicit
+retry. Access-token expiry alone is not this state: the current CLI may refresh
+inside the temporary carrier, and the parent uses validated guarded writeback to
+retain a rotation when the observed host source still matches.
+Only stderr and structured primary error fields are failure-classification
+evidence. Primary authentication evidence wins over mixed transient or
+entitlement words, while repository-controlled partial result text is never
+classified and cannot authorize an authentication, model, or Copilot fallback.
+Only a strict entitlement result from a launched final review can advance to the
+later Opus model or, after the complete Claude chain is entitlement-blocked, to
+an already-consented Copilot backend. Missing or mismatched model metadata stops
+the lane as `runtime-unverified` or `model-mismatch` and never authorizes
+fallback. `explicit-claude-review` remains Anthropic-only.
 
 An unsupported future patch inside the version range may be treated as automatic
-runtime unavailability only when it cleanly lacks a required capability. Evidence
+runtime unavailability only when it cleanly lacks a required public capability.
+An uncatalogued internal credential-lock protocol is instead inconclusive for
+local login and remains usable with an explicit API key. Evidence
 of tampering, contradictory claims, or boundary failure is blocked, not converted
 into availability fallback. Capacity, rate limits, timeouts, and 5xx errors never
 authorize a model or backend switch. On WSL2, a path positively covered by a
@@ -729,8 +1092,10 @@ A verifier dependency is `runtime-unavailable` only when its fixed source is
 deterministically absent or the supported platform/capability is not present.
 A present but non-native, untrusted-owner, writable, set-id, non-executable, or
 otherwise unsafe GPG/`otool`/glibc-loader candidate is a blocked security error.
-A resolve, stat, open, copy, launch, or refresh I/O failure is inconclusive. The
-generic provenance-operation exception therefore never authorizes Copilot
+A resolve, stat, open, copy, launch, or non-authentication I/O failure is
+inconclusive. A final-runtime credential refresh failure is instead
+`blocked-authentication`. The generic provenance-operation exception therefore
+never authorizes Copilot
 fallback; only its dedicated deterministic-dependency subtype may do so.
 
 Persist the detected runtime version, platform and architecture, source and
@@ -751,6 +1116,9 @@ metadata that can act as a bearer secret, or unbounded probe output.
   on macOS, `bubblewrap` plus `socat` on Linux and WSL2, and the WSL1 limitation.
 - [Claude Code authentication](https://code.claude.com/docs/en/authentication):
   macOS Keychain storage and the Linux `0600` credential file.
+- The additional macOS `pwd`-home credential-file source is an empirically
+  verified compatibility source for current Claude Code releases, not a storage
+  location guaranteed by the official authentication documentation above.
 - [Claude Code corporate network configuration](https://code.claude.com/docs/en/corporate-proxy):
   the supported enterprise custom-CA entrypoint for Claude Code.
 - [Node.js `NODE_EXTRA_CA_CERTS`](https://nodejs.org/api/cli.html#node_extra_ca_certsfile):

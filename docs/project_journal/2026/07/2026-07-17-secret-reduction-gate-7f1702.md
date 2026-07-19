@@ -3,7 +3,7 @@ id: 20260717-7f1702
 title: Permit Review of Verified Secret-Reduction Ranges
 status: completed
 created: 2026-07-17
-updated: 2026-07-18
+updated: 2026-07-19
 branch: codex/secret-reduction-review
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/60
 supersedes: []
@@ -88,9 +88,11 @@ Diagnostic and preflight evidence remain bounded audit surfaces. They use stable
 ## Validation
 
 - Focused complete-path, catalog-reload, side-binding, quarantine-before-recursion, and failure-regression runs: 15 tests and 9 tests passed.
-- Python 3.13 full suite: 868 tests passed, 9 skipped.
-- Python 3.10.19 full suite: 868 tests passed, 9 skipped.
-- `ruff check` on all changed Python modules and `ruff format --check` on the changed workspace runtime, workspace tests, and synthetic-token tests: passed.
+- Latest `master` (`6dc2050`) was merged without rewriting history. Its Claude authentication, recovery-carrier, and refresh-lock fail-closed policies remain intact; authentication failure is not a Copilot fallback reason.
+- Conflict-focused state tests: 50 passed. Provider tests: 457 passed, 3 platform-conditional skips.
+- Python 3.13 full suite: 1163 tests passed, 4 skipped.
+- Python 3.10.19 full suite: 1163 tests passed, 4 skipped.
+- `ruff check` and `ruff format --check` on all 10 Python files changed from the refreshed `master`: passed.
 - `git diff --check`: passed.
 - Fixed-range Codex review and PR readiness evidence are recorded in the delivery thread and PR.
 

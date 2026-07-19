@@ -3,11 +3,11 @@ id: 20260716-662f2c
 title: Claude OAuth Per-Model-Attempt Freshness
 status: completed
 created: 2026-07-16
-updated: 2026-07-16
+updated: 2026-07-17
 branch: wip/claude-oauth-per-attempt-freshness
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/49
 supersedes: []
-superseded_by:
+superseded_by: 20260717-c17a11
 ---
 
 # Claude OAuth Per-Model-Attempt Freshness
