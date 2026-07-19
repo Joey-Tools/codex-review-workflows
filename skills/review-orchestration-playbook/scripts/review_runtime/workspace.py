@@ -5756,6 +5756,8 @@ def _secret_assignment_rhs_is_closed(
     inspected_end = cursor
     wrapper_closers: list[int] = []
     wrapper_mismatch = False
+    wrapper_token_seen = False
+    wrapper_closed_before_literal = False
     pending_expression_continuation = False
     rhs_prefix_is_wrapper_only = True
     literal_prefixes = (b"br", b"rb", b"fr", b"rf", b"b", b"f", b"r", b"u")
@@ -5921,6 +5923,9 @@ def _secret_assignment_rhs_is_closed(
                     ]
                     break
         if quote:
+            literal_prefix_is_valid = not wrapper_closed_before_literal and (
+                not wrapper_token_seen or bool(wrapper_closers)
+            )
             delimiter_start = cursor + literal_prefix_length
             delimiter = quote * (
                 3
@@ -5938,11 +5943,7 @@ def _secret_assignment_rhs_is_closed(
             )
             if closing_start is None:
                 record_inspected(proof_end)
-                if (
-                    rhs_prefix_is_wrapper_only
-                    and literal_rhs_recorder is not None
-                    and (delimiter == b"`" or len(delimiter) == 3 or wrapper_closers)
-                ):
+                if literal_rhs_recorder is not None:
                     literal_rhs_recorder(
                         content_start,
                         None,
@@ -5959,13 +5960,7 @@ def _secret_assignment_rhs_is_closed(
                 rhs_end=closing_end,
                 required_closers=tuple(reversed(wrapper_closers)),
             )
-            if literal_rhs_recorder is not None and (
-                delimiter == b"`"
-                or len(delimiter) == 3
-                or bool(wrapper_closers)
-                or b"\r" in value[content_start:closing_start]
-                or b"\n" in value[content_start:closing_start]
-            ):
+            if literal_rhs_recorder is not None:
                 literal_rhs_recorder(
                     content_start,
                     closing_start,
@@ -5973,21 +5968,28 @@ def _secret_assignment_rhs_is_closed(
                     value[cursor:delimiter_start],
                     assignment_diff_side,
                 )
-            return finish(tail_closed)
+            return finish(
+                tail_closed and literal_prefix_is_valid and not wrapper_mismatch
+            )
         if byte in (0x09, 0x20):
             cursor += 1
             continue
         if byte in (0x28, 0x5B, 0x7B):
+            wrapper_token_seen = True
             wrapper_closers.append({0x28: 0x29, 0x5B: 0x5D, 0x7B: 0x7D}[byte])
             pending_expression_continuation = False
             cursor += 1
             continue
         if byte in (0x29, 0x5D, 0x7D):
+            wrapper_token_seen = True
+            wrapper_closed_before_literal = True
             if wrapper_closers:
                 if byte == wrapper_closers[-1]:
                     wrapper_closers.pop()
                 else:
                     wrapper_mismatch = True
+            else:
+                wrapper_mismatch = True
             pending_expression_continuation = False
             cursor += 1
             continue
@@ -7697,7 +7699,7 @@ def _iter_secret_events(
         start, candidate_end = match.span(2)
         if not contains_specific_candidate(start, candidate_end):
             continue
-        if value[candidate_end : candidate_end + 1] == match.group(1):
+        if value[candidate_end : candidate_end + 1] in (b"'", b'"'):
             continue
         if not match_is_committable(match):
             continue

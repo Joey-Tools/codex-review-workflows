@@ -3336,6 +3336,180 @@ class PublicPoolScannerTest(unittest.TestCase):
                     {candidate: {"github-token"}},
                 )
 
+    def test_unmatched_rhs_closers_never_create_reduction_candidates(
+        self,
+    ) -> None:
+        candidate = reduction_secret("generic-secret-assignment")
+        cases = (
+            ("unmatched", b'password = ) "' + candidate + b'"\n', False),
+            (
+                "mismatched-active-wrapper",
+                b'password = (] "' + candidate + b'")\n',
+                False,
+            ),
+            (
+                "crossed-then-balanced",
+                b'password = ([)] ) "' + candidate + b'"\n',
+                False,
+            ),
+            (
+                "closed-wrapper-before-literal",
+                b'password = () "' + candidate + b'"\n',
+                False,
+            ),
+            (
+                "diff-unmatched",
+                b'@@ -1 +1 @@\n+password = ) "' + candidate + b'"\n',
+                True,
+            ),
+        )
+        for label, payload, diff_surface in cases:
+            with self.subTest(case=label):
+                scan = workspace._scan_secret_value(
+                    payload,
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                    diff_surface=diff_surface,
+                )
+
+                self.assertEqual(
+                    scan.blocking_rule,
+                    "generic-secret-assignment",
+                )
+                self.assertEqual(scan.blocking_candidates, {})
+
+        boundary = 128
+        prefix = b"#" + b"x" * (boundary - 2) + b"\n"
+        payload = prefix + b'password = ([)] ) "' + candidate + b'"\n' + b"x" * 200
+        with (
+            mock.patch.object(workspace, "MAX_SECRET_PREFIX_PROOF_BYTES", 128),
+            mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", 64),
+            mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 96),
+        ):
+            direct = workspace._scan_secret_value(
+                payload,
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+            streamed = workspace._stream_secret_scan(
+                io.BytesIO(payload),
+                size=len(payload),
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+
+        self.assertEqual(streamed, direct)
+        self.assertEqual(direct.blocking_rule, "generic-secret-assignment")
+        self.assertEqual(direct.blocking_candidates, {})
+
+    def test_closed_wrapper_before_literal_stays_invalid_after_fresh_openers(
+        self,
+    ) -> None:
+        candidate = reduction_secret("generic-secret-assignment", b"K")
+        accepted = accepted_legacy_value(
+            candidate.decode("ascii"),
+            rule="generic-secret-assignment",
+        )
+        invalid_cases = (
+            (
+                "closed-then-fresh-wrapper",
+                b'password = () ("' + candidate + b'")\n',
+            ),
+            (
+                "inner-wrapper-closed",
+                b'password = ([] "' + candidate + b'")\n',
+            ),
+            (
+                "closed-then-fresh-nested-wrapper",
+                b'password = ([] ("' + candidate + b'"))\n',
+            ),
+        )
+        safe_cases = (
+            (
+                "nested-opens",
+                b'password = (("' + candidate + b'"))\n',
+            ),
+            (
+                "heterogeneous-nested-opens",
+                b'password = ([{"' + candidate + b'"}])\n',
+            ),
+        )
+
+        for label, payload in invalid_cases:
+            with self.subTest(case=label):
+                framed_payload = (
+                    b"x" * 49 + b"\n" + payload + b"state = 1\n" + b"x" * 160
+                )
+                with (
+                    mock.patch.object(
+                        workspace,
+                        "MAX_SECRET_PREFIX_PROOF_BYTES",
+                        96,
+                    ),
+                    mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", 32),
+                    mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 32),
+                ):
+                    direct = workspace._scan_secret_value(
+                        framed_payload,
+                        accepted_values=(accepted,),
+                        capture_accepted_candidates=True,
+                        capture_blocking_candidates=True,
+                        _continue_after_blocking=True,
+                    )
+                    streamed = workspace._stream_secret_scan(
+                        io.BytesIO(framed_payload),
+                        size=len(framed_payload),
+                        accepted_values=(accepted,),
+                        capture_accepted_candidates=True,
+                        capture_blocking_candidates=True,
+                        _continue_after_blocking=True,
+                    )
+
+                self.assertEqual(streamed, direct)
+                self.assertEqual(
+                    direct.blocking_rule,
+                    "generic-secret-assignment",
+                )
+                self.assertEqual(direct.accepted_counts, Counter())
+                self.assertEqual(direct.accepted_candidates, {})
+                self.assertEqual(direct.blocking_candidates, {})
+
+        for label, payload in safe_cases:
+            with self.subTest(case=label):
+                framed_payload = b"x" * 49 + b"\n" + payload
+                with (
+                    mock.patch.object(
+                        workspace,
+                        "MAX_SECRET_PREFIX_PROOF_BYTES",
+                        96,
+                    ),
+                    mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", 32),
+                    mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 32),
+                ):
+                    direct = workspace._scan_secret_value(
+                        framed_payload,
+                        accepted_values=(accepted,),
+                        capture_accepted_candidates=True,
+                        capture_blocking_candidates=True,
+                        _continue_after_blocking=True,
+                    )
+                    streamed = workspace._stream_secret_scan(
+                        io.BytesIO(framed_payload),
+                        size=len(framed_payload),
+                        accepted_values=(accepted,),
+                        capture_accepted_candidates=True,
+                        capture_blocking_candidates=True,
+                        _continue_after_blocking=True,
+                    )
+
+                self.assertEqual(streamed, direct)
+                self.assertIsNone(direct.blocking_rule)
+                self.assertEqual(direct.accepted_counts, Counter({accepted: 1}))
+                self.assertEqual(
+                    direct.accepted_candidates,
+                    {accepted: {candidate}},
+                )
+
     def test_unclosed_rhs_wrapper_preserves_incomplete_suffix_state(self) -> None:
         candidate = b"ghp_" + b"A" * 36
         cases = (
@@ -3612,6 +3786,90 @@ class PublicPoolScannerTest(unittest.TestCase):
                 )
                 self.assertEqual(streamed, direct)
 
+    def test_opposite_quote_literal_rhs_is_an_exact_reduction_candidate(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "outer-double",
+                reduction_secret("generic-secret-assignment", b"H") + b"'segment",
+                lambda candidate: b'password = "' + candidate + b'"\n',
+            ),
+            (
+                "outer-single",
+                reduction_secret("generic-secret-assignment", b"I") + b'"segment',
+                lambda candidate: b"password = '" + candidate + b"'\n",
+            ),
+        )
+        for label, candidate, literal in cases:
+            for surface, payload, diff_surface in (
+                ("plain", literal(candidate), False),
+                (
+                    "diff",
+                    b"@@ -1 +1 @@\n+" + literal(candidate),
+                    True,
+                ),
+            ):
+                with self.subTest(case=label, surface=surface):
+                    scan = workspace._scan_secret_value(
+                        payload,
+                        capture_blocking_candidates=True,
+                        _continue_after_blocking=True,
+                        diff_surface=diff_surface,
+                    )
+
+                    self.assertIsNone(scan.blocking_rule)
+                    self.assertEqual(
+                        scan.blocking_candidates,
+                        {candidate: {"generic-secret-assignment"}},
+                    )
+
+            unclosed_payload = literal(candidate)[:-2]
+            unclosed_direct = workspace._scan_secret_value(
+                unclosed_payload,
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+            unclosed_streamed = workspace._stream_secret_scan(
+                io.BytesIO(unclosed_payload),
+                size=len(unclosed_payload),
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+            self.assertEqual(unclosed_streamed, unclosed_direct)
+            self.assertEqual(
+                unclosed_direct.blocking_rule,
+                "generic-secret-assignment",
+            )
+            self.assertEqual(unclosed_direct.blocking_candidates, {})
+
+            framed_payload = (
+                b"x" * 49 + b"\n" + literal(candidate) + b"state = 1\n" + b"x" * 160
+            )
+            with (
+                mock.patch.object(workspace, "MAX_SECRET_PREFIX_PROOF_BYTES", 64),
+                mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", 32),
+                mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 32),
+            ):
+                direct = workspace._scan_secret_value(
+                    framed_payload,
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+                streamed = workspace._stream_secret_scan(
+                    io.BytesIO(framed_payload),
+                    size=len(framed_payload),
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+
+            self.assertEqual(streamed, direct)
+            self.assertIsNone(direct.blocking_rule)
+            self.assertEqual(
+                direct.blocking_candidates,
+                {candidate: {"generic-secret-assignment"}},
+            )
+
     def test_closed_literal_proof_in_overlap_retains_assignment(self) -> None:
         candidate = reduction_secret("generic-secret-assignment", b"F")
         assignment_start = 20
@@ -3711,6 +3969,104 @@ class PublicPoolScannerTest(unittest.TestCase):
                 self.assertIsNone(direct.blocking_rule)
                 self.assertEqual(direct.blocking_candidates, expected_candidates)
                 self.assertEqual(streamed, direct)
+
+    def test_opposite_quote_provider_literal_keeps_full_generic_candidate(
+        self,
+    ) -> None:
+        provider = reduction_secret("github-token", b"J")
+        cases = (
+            (
+                "outer-double",
+                b"wrap/" + provider + b"'segment",
+                lambda candidate: b'api_token = "' + candidate + b'"\n',
+            ),
+            (
+                "outer-single",
+                b"wrap/" + provider + b'"segment',
+                lambda candidate: b"api_token = '" + candidate + b"'\n",
+            ),
+        )
+        for label, full_candidate, literal in cases:
+            expected_candidates = {
+                provider: {"github-token"},
+                full_candidate: {"generic-secret-assignment"},
+            }
+            payload = literal(full_candidate)
+            direct = workspace._scan_secret_value(
+                payload,
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+            self.assertIsNone(direct.blocking_rule)
+            self.assertEqual(direct.blocking_candidates, expected_candidates)
+
+            framed_payload = b"x" * 49 + b"\n" + payload + b"state = 1\n" + b"x" * 160
+            with (
+                mock.patch.object(workspace, "MAX_SECRET_PREFIX_PROOF_BYTES", 96),
+                mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", 32),
+                mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 32),
+            ):
+                framed_direct = workspace._scan_secret_value(
+                    framed_payload,
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+                streamed = workspace._stream_secret_scan(
+                    io.BytesIO(framed_payload),
+                    size=len(framed_payload),
+                    capture_blocking_candidates=True,
+                    _continue_after_blocking=True,
+                )
+            self.assertEqual(streamed, framed_direct)
+            self.assertIsNone(framed_direct.blocking_rule)
+            self.assertEqual(
+                framed_direct.blocking_candidates,
+                expected_candidates,
+            )
+
+            for malformed, malformed_payload in (
+                ("unclosed", payload[:-2]),
+                (
+                    "escaped",
+                    literal(full_candidate + b"\\n"),
+                ),
+            ):
+                with self.subTest(case=label, malformed=malformed):
+                    scan = workspace._scan_secret_value(
+                        malformed_payload,
+                        capture_blocking_candidates=True,
+                        _continue_after_blocking=True,
+                    )
+                    self.assertEqual(
+                        scan.blocking_rule,
+                        "generic-secret-assignment",
+                    )
+                    self.assertEqual(
+                        scan.blocking_candidates,
+                        {provider: {"github-token"}},
+                    )
+
+        mixed_diff = (
+            b"@@ -1,2 +1,2 @@\n"
+            + b'+api_token = "wrap/'
+            + provider
+            + b"'segment\n"
+            + b'-"\n'
+        )
+        mixed_scan = workspace._scan_secret_value(
+            mixed_diff,
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+            diff_surface=True,
+        )
+        self.assertEqual(
+            mixed_scan.blocking_rule,
+            "generic-secret-assignment",
+        )
+        self.assertEqual(
+            mixed_scan.blocking_candidates,
+            {provider: {"github-token"}},
+        )
 
     def test_ambiguous_provider_literal_has_no_full_stream_candidate(self) -> None:
         provider = reduction_secret("github-token", b"G")
@@ -6149,6 +6505,217 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                         evidence["synthetic_tokens"]["secret_reductions"],
                         manifest["secret_reductions"],
                     )
+
+    def test_malformed_literal_rhs_cannot_enter_or_justify_a_reduction(
+        self,
+    ) -> None:
+        candidate = reduction_secret("generic-secret-assignment")
+
+        unmatched = (b'password = ) "' + candidate + b'"\n').decode("ascii")
+        addition_repo, addition_base = self.new_repo({"README.md": "base\n"})
+        (addition_repo / "fixture.cfg").write_text(unmatched, encoding="utf-8")
+        addition_head = self.commit(addition_repo)
+        with self.assertRaisesRegex(ReviewError, "generic-secret-assignment"):
+            self.prepare(
+                repo=addition_repo,
+                base=addition_base,
+                head=addition_head,
+            )
+
+        mismatched = (b'password = (] "' + candidate + b'")\n').decode("ascii")
+        reduction_repo, reduction_base = self.new_repo({"fixture.cfg": mismatched * 2})
+        (reduction_repo / "fixture.cfg").write_text(
+            mismatched,
+            encoding="utf-8",
+        )
+        reduction_head = self.commit(reduction_repo)
+        with self.assertRaisesRegex(ReviewError, "generic-secret-assignment"):
+            self.prepare(
+                repo=reduction_repo,
+                base=reduction_base,
+                head=reduction_head,
+            )
+
+        wrapped = (b'password = ("' + candidate + b'")\n').decode("ascii")
+        safe_repo, safe_base = self.new_repo({"fixture.cfg": wrapped * 2})
+        (safe_repo / "fixture.cfg").write_text(wrapped, encoding="utf-8")
+        safe_head = self.commit(safe_repo)
+
+        review = self.prepare(repo=safe_repo, base=safe_base, head=safe_head)
+        evidence = self.validate(review)
+        reductions = evidence["synthetic_tokens"]["secret_reductions"]
+        self.assertEqual(len(reductions), 1)
+        self.assertEqual(reductions[0]["rules"], ["generic-secret-assignment"])
+        self.assertEqual(
+            (reductions[0]["base_count"], reductions[0]["head_count"]),
+            (2, 1),
+        )
+
+    def test_closed_wrapper_before_literal_cannot_justify_a_reduction(
+        self,
+    ) -> None:
+        candidate = reduction_secret("generic-secret-assignment", b"K")
+        invalid_cases = (
+            (
+                "closed-then-fresh-wrapper",
+                b'password = () ("' + candidate + b'")\n',
+            ),
+            (
+                "inner-wrapper-closed",
+                b'password = ([] "' + candidate + b'")\n',
+            ),
+            (
+                "closed-then-fresh-nested-wrapper",
+                b'password = ([] ("' + candidate + b'"))\n',
+            ),
+        )
+        for label, raw_fixture in invalid_cases:
+            with self.subTest(case=label):
+                fixture = raw_fixture.decode("ascii")
+                repo, base = self.new_repo({"fixture.cfg": fixture * 2})
+                (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
+                head = self.commit(repo)
+
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "generic-secret-assignment",
+                ):
+                    self.prepare(repo=repo, base=base, head=head)
+
+        safe_cases = (
+            (
+                "nested-opens",
+                b'password = (("' + candidate + b'"))\n',
+            ),
+            (
+                "heterogeneous-nested-opens",
+                b'password = ([{"' + candidate + b'"}])\n',
+            ),
+        )
+        for label, raw_fixture in safe_cases:
+            with self.subTest(case=label):
+                fixture = raw_fixture.decode("ascii")
+                repo, base = self.new_repo({"fixture.cfg": fixture * 2})
+                (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
+                head = self.commit(repo)
+
+                review = self.prepare(repo=repo, base=base, head=head)
+                evidence = self.validate(review)
+                reductions = evidence["synthetic_tokens"]["secret_reductions"]
+                self.assertEqual(len(reductions), 1)
+                self.assertEqual(
+                    reductions[0]["rules"],
+                    ["generic-secret-assignment"],
+                )
+                self.assertEqual(
+                    (reductions[0]["base_count"], reductions[0]["head_count"]),
+                    (2, 1),
+                )
+
+    def test_opposite_quote_literal_only_allows_strict_reductions(self) -> None:
+        cases = (
+            (
+                "outer-double",
+                reduction_secret("generic-secret-assignment", b"H") + b"'segment",
+                lambda candidate: b'password = "' + candidate + b'"\n',
+            ),
+            (
+                "outer-single",
+                reduction_secret("generic-secret-assignment", b"I") + b'"segment',
+                lambda candidate: b"password = '" + candidate + b"'\n",
+            ),
+        )
+        for label, candidate, literal in cases:
+            with self.subTest(case=label, transition="addition"):
+                fixture = literal(candidate).decode("ascii")
+                repo, base = self.new_repo({"README.md": "base\n"})
+                (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
+                head = self.commit(repo)
+
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "generic-secret-assignment",
+                ):
+                    self.prepare(repo=repo, base=base, head=head)
+
+            with self.subTest(case=label, transition="reduction"):
+                repo, base = self.new_repo({"fixture.cfg": fixture * 2})
+                (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
+                head = self.commit(repo)
+
+                review = self.prepare(repo=repo, base=base, head=head)
+                evidence = self.validate(review)
+                reductions = evidence["synthetic_tokens"]["secret_reductions"]
+                self.assertEqual(len(reductions), 1)
+                self.assertEqual(
+                    reductions[0]["rules"],
+                    ["generic-secret-assignment"],
+                )
+                self.assertEqual(
+                    (reductions[0]["base_count"], reductions[0]["head_count"]),
+                    (2, 1),
+                )
+
+    def test_opposite_quote_provider_literal_allows_only_strict_reductions(
+        self,
+    ) -> None:
+        provider = reduction_secret("github-token", b"J")
+        cases = (
+            (
+                "outer-double",
+                b"wrap/" + provider + b"'segment",
+                lambda candidate: b'api_token = "' + candidate + b'"\n',
+            ),
+            (
+                "outer-single",
+                b"wrap/" + provider + b'"segment',
+                lambda candidate: b"api_token = '" + candidate + b"'\n",
+            ),
+        )
+        for label, full_candidate, literal in cases:
+            fixture = literal(full_candidate).decode("ascii")
+            with self.subTest(case=label, transition="addition"):
+                repo, base = self.new_repo({"README.md": "base\n"})
+                (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
+                head = self.commit(repo)
+
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "generic-secret-assignment",
+                ):
+                    self.prepare(repo=repo, base=base, head=head)
+
+            with self.subTest(case=label, transition="reduction"):
+                repo, base = self.new_repo({"fixture.cfg": fixture * 2})
+                (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
+                head = self.commit(repo)
+
+                review = self.prepare(repo=repo, base=base, head=head)
+                manifest_path = (
+                    review.workspace_root
+                    / ".codex-review"
+                    / workspace.SYNTHETIC_MANIFEST_NAME
+                )
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                reductions = manifest["secret_reductions"]
+                self.assertEqual(
+                    {tuple(entry["rules"]) for entry in reductions},
+                    {
+                        ("generic-secret-assignment",),
+                        ("github-token",),
+                    },
+                )
+                self.assertTrue(
+                    all(
+                        (entry["base_count"], entry["head_count"]) == (2, 1)
+                        for entry in reductions
+                    )
+                )
+                evidence = self.validate(review)
+                self.assertEqual(
+                    evidence["synthetic_tokens"]["secret_reductions"],
+                    reductions,
+                )
 
     def test_prepared_range_rejects_an_escaped_quoted_reduction_candidate(
         self,
