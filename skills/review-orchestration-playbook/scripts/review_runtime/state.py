@@ -5,12 +5,14 @@ import json
 import math
 import os
 import pathlib
+import re
 import signal
+import stat
 import subprocess
 import sys
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, BinaryIO, Callable
 
 from .common import (
     PROCESS_GROUP_TERM_GRACE_SECONDS,
@@ -30,7 +32,11 @@ from .common import (
 )
 from .providers import run_review
 from .workspace import (
+    MAX_PREFLIGHT_JSON_BYTES,
     ReviewWorkspace,
+    _inspect_control_directory,
+    _load_control_artifact_state,
+    _read_bounded_json,
     cleanup_workspace,
     prepare_workspace,
     validate_workspace_layout,
@@ -44,7 +50,151 @@ LOCK_FILE = "runner.lock"
 CLEANUP_LOCK_FILE = "cleanup.lock"
 FINAL_CLEANUP_TIMEOUT_SECONDS = 30.0
 RUNNER_SHUTDOWN_GRACE_SECONDS = PROCESS_GROUP_TERM_GRACE_SECONDS * 4
+PRIMARY_DIFF_RELATIVE_PATH = ".codex-review/review.diff"
+SAFE_LEGACY_LOCK_MODES = frozenset({0o600, 0o604, 0o640, 0o644})
 _STARTED_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
+
+
+def _regular_file_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _validate_regular_file_path_identity(
+    path: pathlib.Path,
+    descriptor: int,
+    *,
+    label: str,
+    expected_mode: int | None = None,
+    expected_size: int | None = None,
+) -> os.stat_result:
+    try:
+        descriptor_before = os.fstat(descriptor)
+        path_before = os.stat(path, follow_symlinks=False)
+        descriptor_after = os.fstat(descriptor)
+        path_after = os.stat(path, follow_symlinks=False)
+    except OSError as error:
+        raise ReviewError(f"cannot validate {label}: {error}") from error
+
+    descriptor_identity = _regular_file_identity(descriptor_before)
+    if descriptor_identity != _regular_file_identity(descriptor_after):
+        raise ReviewError(f"{label} changed while its identity was validated")
+    path_identity = _regular_file_identity(path_before)
+    if path_identity != _regular_file_identity(path_after):
+        raise ReviewError(f"{label} path changed while its identity was validated")
+    if descriptor_identity != path_identity:
+        raise ReviewError(f"{label} path does not match its open file descriptor")
+    if not stat.S_ISREG(descriptor_after.st_mode):
+        raise ReviewError(f"{label} is not a regular file")
+    if descriptor_after.st_uid != os.getuid():
+        raise ReviewError(f"{label} is not owned by the current user")
+    if descriptor_after.st_nlink != 1:
+        raise ReviewError(f"{label} must have exactly one hard link")
+    if expected_mode is not None:
+        if stat.S_IMODE(descriptor_after.st_mode) != expected_mode:
+            raise ReviewError(f"{label} mode must be exactly {expected_mode:04o}")
+    elif descriptor_after.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise ReviewError(f"{label} must not be group or other writable")
+    if expected_size is not None and descriptor_after.st_size != expected_size:
+        raise ReviewError(f"{label} has an unexpected size")
+    return descriptor_after
+
+
+def validate_private_lock_file(
+    path: pathlib.Path,
+    handle: BinaryIO,
+    *,
+    label: str,
+) -> None:
+    _validate_regular_file_path_identity(
+        path,
+        handle.fileno(),
+        label=label,
+        expected_mode=0o600,
+    )
+
+
+def validate_safe_legacy_lock_file(
+    path: pathlib.Path,
+    handle: BinaryIO,
+    *,
+    label: str,
+) -> os.stat_result:
+    metadata = _validate_regular_file_path_identity(
+        path,
+        handle.fileno(),
+        label=label,
+    )
+    if stat.S_IMODE(metadata.st_mode) not in SAFE_LEGACY_LOCK_MODES:
+        raise ReviewError(f"{label} has an unsafe legacy mode")
+    return metadata
+
+
+def open_private_lock_file(
+    path: pathlib.Path,
+    *,
+    label: str,
+    allow_legacy_read_mode: bool = False,
+) -> BinaryIO:
+    existing_flags = (
+        os.O_RDWR
+        | os.O_CLOEXEC
+        | os.O_NOFOLLOW
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    descriptor: int | None = None
+    created = False
+    try:
+        try:
+            descriptor = os.open(
+                path,
+                existing_flags | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            created = True
+        except FileExistsError:
+            existing_metadata = os.stat(path, follow_symlinks=False)
+            existing_identity = (
+                existing_metadata.st_dev,
+                existing_metadata.st_ino,
+            )
+            descriptor = os.open(path, existing_flags)
+            opened_metadata = os.fstat(descriptor)
+            if existing_identity != (
+                opened_metadata.st_dev,
+                opened_metadata.st_ino,
+            ):
+                raise ReviewError(f"{label} changed before it could be opened safely")
+        if created:
+            os.fchmod(descriptor, 0o600)
+        handle = os.fdopen(descriptor, "r+b", buffering=0)
+        descriptor = None
+        try:
+            if allow_legacy_read_mode:
+                validate_safe_legacy_lock_file(
+                    path,
+                    handle,
+                    label=label,
+                )
+            else:
+                validate_private_lock_file(path, handle, label=label)
+        except BaseException:
+            handle.close()
+            raise
+        return handle
+    except OSError as error:
+        raise ReviewError(f"cannot open {label} safely: {error}") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _state_path(state_dir: pathlib.Path) -> pathlib.Path:
@@ -478,14 +628,70 @@ def _should_retain_fallback_workspace(
     ):
         return False
     try:
-        preflight = read_json(state_dir / "preflight.json")
+        preflight = _read_bounded_json(
+            state_dir / "preflight.json",
+            label="retained fallback preflight evidence",
+            max_bytes=MAX_PREFLIGHT_JSON_BYTES,
+        )
+        if (
+            preflight.get("review_range")
+            != f"{review.base_ref}..{review.head_ref}"
+            or preflight.get("status")
+            != "sensitive-content and escaping-symlink checks passed"
+        ):
+            return False
+        primary_diff = preflight.get("primary_diff")
+        if (
+            not isinstance(primary_diff, dict)
+            or set(primary_diff) != {"path", "sha256", "size"}
+            or primary_diff.get("path") != PRIMARY_DIFF_RELATIVE_PATH
+            or type(primary_diff.get("size")) is not int
+            or primary_diff["size"] < 0
+            or not isinstance(primary_diff.get("sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", primary_diff["sha256"]) is None
+        ):
+            return False
+
+        expected_diff_path = review.workspace_root / PRIMARY_DIFF_RELATIVE_PATH
+        if review.diff_file != expected_diff_path:
+            return False
+        control_state = _load_control_artifact_state(container_dir=state_dir)
+        expected_diff = control_state.artifacts["review.diff"]
+        if (
+            primary_diff["size"] != expected_diff.size
+            or primary_diff["sha256"] != expected_diff.sha256
+        ):
+            return False
+        control_dir = review.workspace_root / ".codex-review"
+        _inspect_control_directory(control_dir, expected=control_state.directory)
+        flags = (
+            os.O_RDONLY
+            | os.O_CLOEXEC
+            | os.O_NOFOLLOW
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        try:
+            descriptor = os.open(expected_diff_path, flags)
+        except OSError as error:
+            raise ReviewError(
+                f"cannot open retained fallback primary diff safely: {error}"
+            ) from error
+        try:
+            _validate_regular_file_path_identity(
+                expected_diff_path,
+                descriptor,
+                label="retained fallback primary diff",
+                expected_size=expected_diff.size,
+            )
+        finally:
+            os.close(descriptor)
+        _inspect_control_directory(control_dir, expected=control_state.directory)
     except ReviewError:
         return False
-    return (
-        preflight.get("review_range") == f"{review.base_ref}..{review.head_ref}"
-        and preflight.get("status")
-        == "sensitive-content and escaping-symlink checks passed"
-    )
+    # This synchronous status path intentionally validates only bounded metadata.
+    # The actual fallback consumer must supervise a complete read and verify the
+    # primary diff SHA-256 against both attestations before using any diff bytes.
+    return True
 
 
 def _validate_timeout(timeout_seconds: float | None) -> None:
@@ -540,7 +746,11 @@ def _cleanup_terminal_workspace(
 ) -> int:
     cleanup_lock_path = state_dir / CLEANUP_LOCK_FILE
     cleanup_error_path = state_dir / "cleanup-error.txt"
-    with cleanup_lock_path.open("a+b") as cleanup_lock:
+    with open_private_lock_file(
+        cleanup_lock_path,
+        label="review cleanup lock",
+        allow_legacy_read_mode=True,
+    ) as cleanup_lock:
         if not _acquire_cleanup_lock(cleanup_lock, deadline=deadline):
             return 124
         cleanup_lock_transferred = False
@@ -550,6 +760,19 @@ def _cleanup_terminal_workspace(
             cleanup_lock_transferred = True
 
         try:
+            locked_metadata = validate_safe_legacy_lock_file(
+                cleanup_lock_path,
+                cleanup_lock,
+                label="review cleanup lock",
+            )
+            if stat.S_IMODE(locked_metadata.st_mode) != 0o600:
+                os.fchmod(cleanup_lock.fileno(), 0o600)
+                os.fsync(cleanup_lock.fileno())
+            validate_private_lock_file(
+                cleanup_lock_path,
+                cleanup_lock,
+                label="review cleanup lock",
+            )
             state, review = load_review_state(state_dir)
             keep_workspace = bool(state.get("keep_workspace"))
             exit_code = _read_exit_code(state_dir)

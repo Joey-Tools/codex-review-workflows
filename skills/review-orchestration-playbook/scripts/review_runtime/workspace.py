@@ -199,6 +199,7 @@ MAX_SECRET_PREFIX_PROOF_TOTAL_BYTES = 64 * 1024 * 1024
 MAX_REVIEW_PROMPT_BYTES = 64 * 1024
 MAX_SYNTHETIC_EVIDENCE_BYTES = 64 * 1024
 MAX_SYNTHETIC_EVIDENCE_ENTRIES = 512
+MAX_PREFLIGHT_JSON_BYTES = 128 * 1024
 SYNTHETIC_MANIFEST_NAME = "synthetic-secret-manifest.json"
 SYNTHETIC_PRIVATE_MANIFEST_NAME = "synthetic-secret-state.json"
 SYNTHETIC_CHANGED_EVIDENCE_NAME = "synthetic-changed-evidence.json"
@@ -2019,27 +2020,57 @@ def _read_bounded_json(
     *,
     label: str,
     expected_artifact: ControlArtifactEvidence | None = None,
+    max_bytes: int = MAX_SYNTHETIC_EVIDENCE_BYTES,
 ) -> dict[str, Any]:
     chunks: list[bytes] = []
     with _secure_file_reader(
         path,
         label=label,
-        max_bytes=MAX_SYNTHETIC_EVIDENCE_BYTES,
+        max_bytes=max_bytes,
         expected_artifact=expected_artifact,
     ) as (reader, _metadata):
-        while chunk := reader.read(64 * 1024):
+        remaining = max_bytes
+        while chunk := reader.read(min(64 * 1024, remaining + 1)):
+            if len(chunk) > remaining:
+                raise ReviewError(f"{label} exceeds its review size limit")
             chunks.append(chunk)
+            remaining -= len(chunk)
     encoded = b"".join(chunks)
     try:
         value = json.loads(
             encoded.decode("utf-8"),
             object_pairs_hook=_reject_duplicate_json_object,
         )
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        OverflowError,
+        ValueError,
+    ) as error:
         raise ReviewError(f"{label} is not valid JSON") from error
     if not isinstance(value, dict):
         raise ReviewError(f"{label} must be a JSON object")
     return value
+
+
+def encode_preflight_json(value: dict[str, Any]) -> str:
+    encoded = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    if len(encoded) > MAX_PREFLIGHT_JSON_BYTES:
+        raise ReviewError("serialized preflight evidence exceeds the size limit")
+    return encoded.decode("utf-8")
+
+
+def _encode_synthetic_evidence_json(value: dict[str, Any]) -> bytes:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    if len(encoded) > MAX_SYNTHETIC_EVIDENCE_BYTES:
+        raise ReviewError("synthetic-token preflight evidence exceeds the size limit")
+    return encoded
 
 
 def _control_entry_names_sha256(names: Iterable[str]) -> str:
@@ -2801,6 +2832,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
                 f"actual={actual_head_unembedded_count}"
             )
 
+    primary_diff_artifact = control_artifacts["review.diff"]
     diff_scan = _file_secret_scan(
         review.diff_file,
         accepted_values=accepted_values,
@@ -2808,7 +2840,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
         accepted_index=accepted_index,
         event_budget=event_budget,
         max_bytes=MAX_DIFF_BYTES,
-        expected_artifact=control_artifacts["review.diff"],
+        expected_artifact=primary_diff_artifact,
     )
     record_scan(
         diff_scan,
@@ -2863,6 +2895,11 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     if len(accepted_evidence) > MAX_SYNTHETIC_EVIDENCE_ENTRIES:
         raise ReviewError("accepted synthetic-token evidence has too many entries")
     evidence = {
+        "primary_diff": {
+            "path": ".codex-review/review.diff",
+            "sha256": primary_diff_artifact.sha256,
+            "size": primary_diff_artifact.size,
+        },
         "synthetic_tokens": {
             "accepted": accepted_evidence,
             "catalog_schema_version": catalog.schema_version,
@@ -2870,20 +2907,14 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
             "pool_version": catalog.pool_version,
         }
     }
-    encoded_evidence = json.dumps(
-        evidence,
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    if len(encoded_evidence) > MAX_SYNTHETIC_EVIDENCE_BYTES:
-        raise ReviewError("synthetic-token preflight evidence exceeds the size limit")
+    _encode_synthetic_evidence_json(evidence)
     complete_preflight_evidence = {
         "review_range": f"{review.base_ref}..{review.head_ref}",
         "scope": "frozen tracked workspace, diff, and review prompt",
         "status": "sensitive-content and escaping-symlink checks passed",
     }
     complete_preflight_evidence.update(evidence)
+    encode_preflight_json(complete_preflight_evidence)
     _reject_raw_values_in_evidence(
         complete_preflight_evidence,
         accepted_values=evidence_sensitive_values,
