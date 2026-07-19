@@ -1493,6 +1493,22 @@ class ProviderPolicyTest(unittest.TestCase):
                 "SSL_CERT_FILE": "/helper/merged-claude-ca.pem",
             }
 
+        proxy_ssl_context = mock.Mock(spec=ssl.SSLContext)
+
+        def prepare_proxy_tls(
+            _review: ReviewWorkspace,
+            env: dict[str, str],
+        ) -> tuple[dict[str, str], ssl.SSLContext]:
+            events.append("proxy-tls")
+            return (
+                {
+                    **env,
+                    "NODE_EXTRA_CA_CERTS": "/helper/proxy-node-extra-ca.pem",
+                    "SSL_CERT_FILE": "/helper/proxy-parent-ca.pem",
+                },
+                proxy_ssl_context,
+            )
+
         def warmup(
             _review: ReviewWorkspace,
             _executable: pathlib.Path,
@@ -1527,11 +1543,13 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         self.warmup.side_effect = warmup
         providers._claude_keychain_runtime.side_effect = broker_runtime
+        trust_state = providers.ClaudeTrustSessionState()
 
         def runner(**kwargs) -> providers.Attempt:
             return providers._claude_attempt(
                 executable=executable,
                 executable_evidence=self.claude_executable_evidence,
+                trust_state=trust_state,
                 **kwargs,
             )
 
@@ -1545,6 +1563,11 @@ class ProviderPolicyTest(unittest.TestCase):
                 providers,
                 "_prepare_claude_tls_environment",
                 side_effect=prepare_tls,
+            ),
+            mock.patch.object(
+                providers,
+                "_prepare_claude_proxy_tls_environment",
+                side_effect=prepare_proxy_tls,
             ),
             mock.patch.object(
                 providers,
@@ -1590,6 +1613,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(
             events,
             [
+                "proxy-tls",
                 "tool",
                 "tls",
                 "warmup",
@@ -1608,20 +1632,28 @@ class ProviderPolicyTest(unittest.TestCase):
         for call in self.warmup.call_args_list:
             self.assertEqual(
                 call.kwargs["proxy_env"]["SSL_CERT_FILE"],
-                "/caller/parent-proxy-ca.pem",
+                "/helper/proxy-parent-ca.pem",
             )
             self.assertEqual(
                 call.kwargs["proxy_env"]["NODE_EXTRA_CA_CERTS"],
-                "/caller/node-extra-ca.pem",
+                "/helper/proxy-node-extra-ca.pem",
+            )
+            self.assertIs(
+                call.kwargs["proxy_ssl_context"],
+                proxy_ssl_context,
             )
         for call in connect_proxy.call_args_list:
             self.assertEqual(
                 call.args[0]["SSL_CERT_FILE"],
-                "/caller/parent-proxy-ca.pem",
+                "/helper/proxy-parent-ca.pem",
             )
             self.assertEqual(
                 call.args[0]["NODE_EXTRA_CA_CERTS"],
-                "/caller/node-extra-ca.pem",
+                "/helper/proxy-node-extra-ca.pem",
+            )
+            self.assertIs(
+                call.kwargs["upstream_ssl_context"],
+                proxy_ssl_context,
             )
         self.assertEqual(
             providers._claude_keychain_runtime.call_count,
@@ -3034,6 +3066,31 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertEqual(providers._parse_claude_output(stdout), (None, None))
 
+    def test_claude_success_requires_supported_result_metadata(self) -> None:
+        base = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "No findings.",
+            "modelUsage": {"claude-opus-4-8": {}},
+        }
+        cases = (
+            {**base, "telemetry": None},
+            {**base, "permission_denials": ["tool denied"]},
+            {**base, "usage": {"input_tokens": -1}},
+            {**base, "message": "authentication failed"},
+            {**base, "code": "unexpected_success_code"},
+            {**base, "detail": "contradictory success detail"},
+            {**base, "reason": "contradictory success reason"},
+        )
+
+        for payload in cases:
+            with self.subTest(keys=sorted(payload)):
+                self.assertEqual(
+                    providers._parse_claude_output(json.dumps(payload).encode()),
+                    (None, "claude-opus-4-8"),
+                )
+
     def test_claude_rejects_success_with_nonempty_errors(self) -> None:
         stdout = json.dumps(
             {
@@ -3049,6 +3106,31 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(
             providers._parse_claude_output(stdout),
             (None, "claude-opus-4-8"),
+        )
+
+    def test_claude_accepts_success_with_explicitly_empty_error_metadata(
+        self,
+    ) -> None:
+        stdout = json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": "No findings.",
+                "modelUsage": {"claude-opus-4-8": {}},
+                "api_error_status": " ",
+                "code": "",
+                "detail": None,
+                "error": {},
+                "errors": [],
+                "message": " ",
+                "reason": None,
+            }
+        ).encode()
+
+        self.assertEqual(
+            providers._parse_claude_output(stdout),
+            ("No findings.", "claude-opus-4-8"),
         )
 
     def test_claude_rejects_unknown_or_malformed_error_payloads(self) -> None:
@@ -3608,7 +3690,7 @@ class ProviderPolicyTest(unittest.TestCase):
             mock.patch.object(
                 providers,
                 "_claude_connect_proxy",
-                side_effect=lambda _env: contextlib.nullcontext(43210),
+                side_effect=lambda _env, **_kwargs: contextlib.nullcontext(43210),
             ),
             mock.patch.object(
                 providers,
@@ -3675,6 +3757,260 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(wrong.category, "model-mismatch")
         self.assertEqual(wrong.reason, "effective-model-mismatch")
         self.assertEqual(matching.category, "entitlement")
+
+    def test_model_entitlement_accepts_closed_grammar_variants(self) -> None:
+        model = providers.CLAUDE_MODELS[0]
+        for index, message in enumerate(
+            (
+                "Model is not included in your plan",
+                "This model is not supported with your ChatGPT account",
+            ),
+            start=153,
+        ):
+            payload = {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "error": {"message": message},
+                "modelUsage": {model: {}},
+            }
+
+            with self.subTest(message=message):
+                attempt = self.record_claude_result(
+                    json.dumps(payload).encode(),
+                    index=index,
+                )
+                self.assertEqual(attempt.category, "entitlement")
+
+    def test_explicit_model_code_accepts_only_neutral_metadata(self) -> None:
+        model = providers.CLAUDE_MODELS[0]
+        errors = (
+            {"code": "model_not_enabled"},
+            {
+                "type": "error",
+                "code": "model_not_enabled",
+                "message": "request rejected",
+            },
+            {"code": "model_not_enabled", "message": ""},
+        )
+        for index, error in enumerate(errors, start=175):
+            payload = {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "error": error,
+                "modelUsage": {model: {}},
+            }
+
+            with self.subTest(error=error):
+                attempt = self.record_claude_result(
+                    json.dumps(payload).encode(),
+                    index=index,
+                )
+                self.assertEqual(attempt.category, "entitlement")
+
+    def test_explicit_model_code_rejects_non_neutral_result_and_multiline_text(
+        self,
+    ) -> None:
+        model = providers.CLAUDE_MODELS[0]
+        cases = (
+            {
+                "result": "Web search is denied for this account",
+                "error": {"code": "model_not_enabled"},
+            },
+            {
+                "result": "request rejected\n",
+                "error": {"code": "model_not_enabled"},
+            },
+            {
+                "result": "request rejected",
+                "error": {
+                    "code": "model_not_enabled",
+                    "message": "Model\nis not available for your account",
+                },
+            },
+            {
+                "result": "request rejected",
+                "error": {
+                    "type": "\nerror",
+                    "code": "model_not_enabled",
+                },
+            },
+            {
+                "result": "request rejected",
+                "error": {"code": "model_not_enabled\n"},
+            },
+            {
+                "result": "request rejected",
+                "code": "\rmodel_not_enabled",
+            },
+        )
+        for index, fields in enumerate(cases, start=178):
+            payload = {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                **fields,
+                "modelUsage": {model: {}},
+            }
+
+            with self.subTest(fields=fields):
+                self.assertIsNone(
+                    providers._claude_supported_failure_category(
+                        json.dumps(payload).encode(),
+                        requested_model=model,
+                    )
+                )
+                attempt = self.record_claude_result(
+                    json.dumps(payload).encode(),
+                    index=index,
+                )
+                self.assertEqual(attempt.category, "inconclusive")
+                self.assertEqual(
+                    attempt.reason,
+                    "unverified-entitlement-failure-envelope",
+                )
+
+    def test_non_model_feature_entitlement_cannot_authorize_fallback(self) -> None:
+        model = providers.CLAUDE_MODELS[0]
+        cases = (
+            (
+                "feature_not_enabled",
+                "Web search is not available for your account",
+            ),
+            (
+                "model_not_found",
+                "Web search is not available for your account",
+            ),
+            (
+                "feature_not_enabled",
+                "Web search is not available for your account; this model "
+                "request cannot use that feature",
+            ),
+            (
+                "model_not_found",
+                "Web search is not available for your account because this "
+                "model is not supported by web search",
+            ),
+            (
+                "feature_not_enabled",
+                "Model is not available for your account",
+            ),
+        )
+        for index, (code, message) in enumerate(
+            cases,
+            start=155,
+        ):
+            payload = {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "error": {
+                    "code": code,
+                    "message": message,
+                },
+                "modelUsage": {model: {}},
+            }
+            encoded = json.dumps(payload).encode()
+
+            with self.subTest(code=code, message=message):
+                self.assertIsNone(
+                    providers._claude_supported_failure_category(
+                        encoded,
+                        requested_model=model,
+                    )
+                )
+                attempt = self.record_claude_result(encoded, index=index)
+                self.assertEqual(attempt.category, "inconclusive")
+                self.assertEqual(
+                    attempt.reason,
+                    "unverified-entitlement-failure-envelope",
+                )
+                self.assertIsNone(attempt.final_text)
+
+    def test_mixed_model_and_feature_entitlement_fields_cannot_fallback(
+        self,
+    ) -> None:
+        model = providers.CLAUDE_MODELS[0]
+        payload = {
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": True,
+            "error": {
+                "code": "model_not_enabled",
+                "message": "Model is not available for your account",
+                "detail": "Web search is not available for your account",
+            },
+            "modelUsage": {model: {}},
+        }
+        encoded = json.dumps(payload).encode()
+
+        self.assertIsNone(
+            providers._claude_supported_failure_category(
+                encoded,
+                requested_model=model,
+            )
+        )
+        attempt = self.record_claude_result(encoded, index=159)
+        self.assertEqual(attempt.category, "inconclusive")
+        self.assertEqual(
+            attempt.reason,
+            "unverified-entitlement-failure-envelope",
+        )
+        self.assertIsNone(attempt.final_text)
+
+    def test_explicit_model_code_cannot_hide_feature_denial_variants(
+        self,
+    ) -> None:
+        model = providers.CLAUDE_MODELS[0]
+        for index, detail in enumerate(
+            (
+                "Web search is denied for this account",
+                "Web search is unavailable for this account",
+                "Tool use is unsupported for this plan",
+                "Feature access denied",
+                "Web search\nis denied for this account",
+                {"type": "tool_permission_denied"},
+                {"status": "denied"},
+                {"subtype": "feature-not-enabled"},
+                "Tool permission is forbidden",
+                "Feature access is restricted",
+                "Web search is not permitted for this account",
+                {"type": "toolPermissionDenied"},
+                {"type": "MCPPermissionDenied"},
+                {"type": "toolPermissionBlocked"},
+                {"type": "MCPPermissionBlocked"},
+                {"type": "futureFeatureBlocked"},
+            ),
+            start=160,
+        ):
+            payload = {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "error": {
+                    "code": "model_not_enabled",
+                    "message": "Model is not available for your account",
+                    "detail": detail,
+                },
+                "modelUsage": {model: {}},
+            }
+            encoded = json.dumps(payload).encode()
+
+            with self.subTest(detail=detail):
+                self.assertIsNone(
+                    providers._claude_supported_failure_category(
+                        encoded,
+                        requested_model=model,
+                    )
+                )
+                attempt = self.record_claude_result(encoded, index=index)
+                self.assertEqual(attempt.category, "inconclusive")
+                self.assertEqual(
+                    attempt.reason,
+                    "unverified-entitlement-failure-envelope",
+                )
+                self.assertIsNone(attempt.final_text)
 
     def test_claude_fallback_envelope_uses_exact_recursive_allowlists(self) -> None:
         model = providers.CLAUDE_MODELS[0]
@@ -7963,6 +8299,20 @@ class ProviderPolicyTest(unittest.TestCase):
             stdout=b"{}",
             stderr=b"",
         )
+        proxy_tls_env = {
+            "SSL_CERT_FILE": "/helper/proxy-ca.pem",
+        }
+        proxy_ssl_context = mock.Mock(spec=ssl.SSLContext)
+        tls_inputs: list[dict[str, str]] = []
+
+        def prepare_tls(
+            _review: ReviewWorkspace,
+            env: dict[str, str],
+            **_kwargs: object,
+        ) -> dict[str, str]:
+            tls_inputs.append(dict(env))
+            return dict(env)
+
         self.assertEqual(
             providers.CLAUDE_ATTEMPT_CREDENTIAL_VALIDITY_SECONDS,
             32 * 60.0,
@@ -8048,7 +8398,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     ),
                 )
             )
-            stack.enter_context(
+            connect_proxy = stack.enter_context(
                 mock.patch.object(
                     providers,
                     "_claude_unix_connect_proxy",
@@ -8079,7 +8429,14 @@ class ProviderPolicyTest(unittest.TestCase):
                 mock.patch.object(
                     providers,
                     "_prepare_claude_tls_environment",
-                    side_effect=lambda _review, env, **_kwargs: dict(env),
+                    side_effect=prepare_tls,
+                )
+            )
+            prepare_proxy_tls = stack.enter_context(
+                mock.patch.object(
+                    providers,
+                    "_prepare_claude_proxy_tls_environment",
+                    return_value=(proxy_tls_env, proxy_ssl_context),
                 )
             )
             stack.enter_context(
@@ -8100,11 +8457,13 @@ class ProviderPolicyTest(unittest.TestCase):
                 )
             )
             recorded_attempts: list[providers.Attempt] = []
+            trust_state = providers.ClaudeTrustSessionState()
 
             def runner(**kwargs) -> providers.Attempt:
                 return providers._claude_attempt(
                     executable=executable,
                     executable_evidence=self.claude_executable_evidence,
+                    trust_state=trust_state,
                     **kwargs,
                 )
 
@@ -8114,7 +8473,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 runner=runner,
                 runtime="claude",
                 requested_effort=providers.CLAUDE_REASONING_EFFORT,
-                env={},
+                env={"SSL_CERT_FILE": "/caller/original-ca.pem"},
                 attempts=recorded_attempts,
             )
 
@@ -8122,6 +8481,20 @@ class ProviderPolicyTest(unittest.TestCase):
             self.assertEqual(final_text, "No findings.")
             self.assertEqual(recorded_attempts, list(attempts))
             self.warmup.assert_not_called()
+            prepare_proxy_tls.assert_called_once()
+            self.assertEqual(len(tls_inputs), len(providers.CLAUDE_MODELS))
+            self.assertTrue(
+                all(
+                    item["SSL_CERT_FILE"] == "/helper/proxy-ca.pem"
+                    for item in tls_inputs
+                )
+            )
+            for call in connect_proxy.call_args_list[: len(providers.CLAUDE_MODELS)]:
+                self.assertEqual(call.args[1], proxy_tls_env)
+                self.assertIs(
+                    call.kwargs["upstream_ssl_context"],
+                    proxy_ssl_context,
+                )
 
             self.assertEqual(
                 stage_credentials.call_count,
@@ -8169,6 +8542,22 @@ class ProviderPolicyTest(unittest.TestCase):
                 build_sandbox.call_args.kwargs["auth_env"],
                 {"ANTHROPIC_API_KEY": "test-only"},
             )
+
+    def test_claude_linux_runtime_rejects_proxy_env_without_tls_context(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(
+            providers.ClaudeExecutableInspectionInconclusive,
+            "proxy TLS context is unavailable",
+        ):
+            with providers._claude_linux_review_runtime(
+                self.review,
+                pathlib.Path("/verified/claude"),
+                {},
+                (),
+                proxy_env={"SSL_CERT_FILE": "/helper/proxy-ca.pem"},
+            ):
+                self.fail("Linux runtime accepted proxy state without its TLS context")
 
     def test_claude_linux_final_workspace_inspection_is_inconclusive(self) -> None:
         host = mock.Mock()
@@ -9887,7 +10276,7 @@ class ProviderPolicyTest(unittest.TestCase):
             mock.patch.object(
                 providers,
                 "_claude_connect_proxy",
-                side_effect=lambda _env: contextlib.nullcontext(43210),
+                side_effect=lambda _env, **_kwargs: contextlib.nullcontext(43210),
             ),
             mock.patch.object(
                 providers,
@@ -9980,7 +10369,7 @@ class ProviderPolicyTest(unittest.TestCase):
             mock.patch.object(
                 providers,
                 "_claude_connect_proxy",
-                side_effect=lambda _env: contextlib.nullcontext(43210),
+                side_effect=lambda _env, **_kwargs: contextlib.nullcontext(43210),
             ),
             mock.patch.object(
                 providers,
@@ -11212,6 +11601,33 @@ class ProviderPolicyTest(unittest.TestCase):
                     domain="user",
                     options=(),
                 )
+
+    def test_trust_domain_signal_exit_cannot_report_no_settings(self) -> None:
+        completed = common.BoundedCapture(
+            argv=("security",),
+            returncode=-signal.SIGTERM,
+            stdout=bytearray(),
+            stderr=bytearray(providers.CLAUDE_TRUST_NO_SETTINGS[0].encode()),
+        )
+
+        with (
+            mock.patch.object(
+                providers,
+                "run_bounded_capture",
+                return_value=completed,
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "failed inconclusively",
+            ),
+        ):
+            providers._read_claude_trust_domain(
+                pathlib.Path("/usr/bin/security"),
+                {},
+                self.review.container_dir,
+                domain="user",
+                options=(),
+            )
 
     def test_trust_export_cleanup_preserves_existing_policy_error(self) -> None:
         path = types.SimpleNamespace(
@@ -13166,6 +13582,33 @@ class ProviderPolicyTest(unittest.TestCase):
                 trust_state=state,
             )
 
+    def test_proxy_ca_source_is_snapshotted_once_per_review(self) -> None:
+        certificate = self.sample_ca_certificate()
+        source = self.review.source_root / "proxy-ca.pem"
+        self.write_private_source(source, certificate)
+        state = providers.ClaudeTrustSessionState()
+
+        first, first_context = providers._claude_proxy_tls_environment(
+            self.review,
+            {"SSL_CERT_FILE": str(source)},
+            trust_state=state,
+        )
+        snapshot = pathlib.Path(first["SSL_CERT_FILE"])
+        self.assertEqual(snapshot.read_bytes(), certificate)
+        source.write_bytes(b"replacement must not become trusted")
+        snapshot.write_bytes(b"same-uid replacement must not become trusted")
+        first["SSL_CERT_FILE"] = str(source)
+        second, second_context = providers._claude_proxy_tls_environment(
+            self.review,
+            {"SSL_CERT_FILE": str(source)},
+            trust_state=state,
+        )
+
+        self.assertNotEqual(snapshot, source)
+        self.assertEqual(snapshot.parent.name, "claude-proxy-ca")
+        self.assertEqual(second["SSL_CERT_FILE"], str(snapshot))
+        self.assertIs(second_context, first_context)
+
     def test_caller_ca_material_is_certificate_only(self) -> None:
         certificate = self.sample_ca_certificate()
         source = self.review.source_root / "caller-ca-with-key.pem"
@@ -14355,51 +14798,320 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(bundle, destination_dir / "bundle.pem")
         self.assertTrue(providers.CLAUDE_CERTIFICATE_BLOCK.search(bundle.read_bytes()))
 
-    @mock.patch.object(providers.ssl, "create_default_context")
+    @mock.patch.object(providers.ssl, "SSLContext")
     def test_proxy_ssl_context_honors_git_ca_bundle(
         self,
-        create_context: mock.Mock,
+        context_type: mock.Mock,
     ) -> None:
-        context = create_context.return_value
+        context = context_type.return_value
 
         result = providers._proxy_ssl_context(
-            {"GIT_SSL_CAINFO": "/isolated/git-ca.pem"}
+            {"GIT_SSL_CAINFO": "/isolated/git-ca.pem"},
+            snapshot_material={"/isolated/git-ca.pem": b"git-ca"},
         )
 
         self.assertIs(result, context)
-        create_context.assert_called_once_with(cafile="/isolated/git-ca.pem")
+        context_type.assert_called_once_with(ssl.PROTOCOL_TLS_CLIENT)
+        context.load_verify_locations.assert_called_once_with(cadata="git-ca")
 
-    @mock.patch.object(providers.ssl, "create_default_context")
-    def test_proxy_ssl_context_ignores_node_extra_ca_certs(
+    @mock.patch.object(providers.ssl, "SSLContext")
+    def test_proxy_ssl_context_uses_captured_fixed_system_ca_file(
         self,
-        create_context: mock.Mock,
+        context_type: mock.Mock,
     ) -> None:
-        context = create_context.return_value
+        context = context_type.return_value
+        default_file = self.review.container_dir / "system-ca.pem"
+        default_file.write_bytes(b"fixture")
 
-        result = providers._proxy_ssl_context(
-            {"NODE_EXTRA_CA_CERTS": "/isolated/node-extra-ca.pem"}
-        )
+        with (
+            mock.patch.object(
+                providers.ssl,
+                "get_default_verify_paths",
+                return_value=mock.Mock(openssl_cafile=str(default_file)),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_proxy_system_ca_source",
+                return_value=b"system-ca",
+            ) as read_default,
+        ):
+            result = providers._proxy_ssl_context(
+                {"NODE_EXTRA_CA_CERTS": "/isolated/node-extra-ca.pem"},
+                snapshot_material={},
+            )
 
         self.assertIs(result, context)
-        create_context.assert_called_once_with(cafile=None)
+        read_default.assert_called_once_with(
+            default_file.resolve(),
+        )
+        context_type.assert_called_once_with(ssl.PROTOCOL_TLS_CLIENT)
+        context.load_verify_locations.assert_called_once_with(cadata="system-ca")
 
-    @mock.patch.object(providers.ssl, "create_default_context")
-    def test_proxy_ssl_context_loads_each_ca_directory(
+    def test_proxy_system_ca_reader_accepts_public_read_only_bundle(self) -> None:
+        default_file = self.review.container_dir / "system-ca.pem"
+        certificate = self.sample_ca_certificate()
+        default_file.write_bytes(certificate)
+        default_file.chmod(0o644)
+
+        result = providers._read_proxy_system_ca_source(default_file)
+
+        self.assertEqual(result, certificate)
+
+    def test_proxy_ca_subject_hashes_uses_fixed_openssl(self) -> None:
+        hashes, certificate_count = providers._proxy_ca_subject_hashes(
+            self.sample_ca_certificate(),
+            deadline=time.monotonic()
+            + providers.CLAUDE_PROXY_CA_HASH_TIMEOUT_SECONDS,
+            certificate_limit=providers.CLAUDE_PROXY_CA_HASH_CERTIFICATE_LIMIT,
+        )
+
+        self.assertEqual(len(hashes), 1)
+        self.assertRegex(next(iter(hashes)), r"^[0-9a-f]{8}$")
+        self.assertEqual(certificate_count, 1)
+
+    def test_proxy_ca_subject_hashes_rejects_expired_deadline_before_launch(
         self,
-        create_context: mock.Mock,
     ) -> None:
-        context = create_context.return_value
+        with (
+            mock.patch.object(providers.time, "monotonic", return_value=10.0),
+            mock.patch.object(providers, "run_bounded_capture") as run_hash,
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "deadline expired",
+            ),
+        ):
+            providers._proxy_ca_subject_hashes(
+                self.sample_ca_certificate(),
+                deadline=10.0,
+                certificate_limit=1,
+            )
 
-        result = providers._proxy_ssl_context(
-            {"SSL_CERT_DIR": os.pathsep.join(("/first", "/second"))}
+        run_hash.assert_not_called()
+
+    def test_proxy_ca_subject_hashes_rejects_certificate_limit_before_launch(
+        self,
+    ) -> None:
+        with (
+            mock.patch.object(providers, "run_bounded_capture") as run_hash,
+            self.assertRaisesRegex(ReviewError, "certificate limit exceeded"),
+        ):
+            providers._proxy_ca_subject_hashes(
+                self.sample_ca_certificate() * 2,
+                deadline=time.monotonic()
+                + providers.CLAUDE_PROXY_CA_HASH_TIMEOUT_SECONDS,
+                certificate_limit=1,
+            )
+
+        run_hash.assert_not_called()
+
+    def test_proxy_ca_subject_hashes_rejects_call_that_crosses_deadline(
+        self,
+    ) -> None:
+        completed = common.BoundedCapture(
+            argv=(),
+            returncode=0,
+            stdout=bytearray(b"01234567\n"),
+            stderr=bytearray(),
+        )
+        with (
+            mock.patch.object(
+                providers.time,
+                "monotonic",
+                side_effect=(9.0, 11.0),
+            ),
+            mock.patch.object(
+                providers,
+                "run_bounded_capture",
+                return_value=completed,
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "deadline expired",
+            ),
+        ):
+            providers._proxy_ca_subject_hashes(
+                self.sample_ca_certificate(),
+                deadline=10.0,
+                certificate_limit=1,
+            )
+
+        self.assertEqual(completed.stdout, bytearray(len(completed.stdout)))
+
+    def test_new_proxy_ssl_context_preserves_hardened_verification_flags(
+        self,
+    ) -> None:
+        context = providers._new_proxy_ssl_context()
+
+        self.assertEqual(
+            context.verify_flags & providers.CLAUDE_PROXY_TLS_VERIFY_FLAGS,
+            providers.CLAUDE_PROXY_TLS_VERIFY_FLAGS,
         )
 
+    @mock.patch.object(providers.ssl, "SSLContext")
+    def test_proxy_ssl_context_loads_only_indexed_ca_directory_entries(
+        self,
+        context_type: mock.Mock,
+    ) -> None:
+        context = context_type.return_value
+
+        hashes = {
+            b"first-ca": frozenset({"01234567"}),
+            b"first-next-ca": frozenset({"01234567"}),
+            b"second-ca": frozenset({"89abcdef"}),
+            b"wrong-hash-ca": frozenset({"cafebabe"}),
+        }
+        def calculate_hashes(
+            material: bytes,
+            *,
+            deadline: float,
+            certificate_limit: int,
+        ) -> tuple[frozenset[str], int]:
+            del deadline, certificate_limit
+            return hashes[material], 1
+
+        with (
+            mock.patch.object(providers.time, "monotonic", return_value=100.0),
+            mock.patch.object(
+                providers,
+                "_proxy_ca_subject_hashes",
+                side_effect=calculate_hashes,
+            ) as subject_hashes,
+        ):
+            result = providers._proxy_ssl_context(
+                {"SSL_CERT_DIR": os.pathsep.join(("/first", "/second"))},
+                snapshot_material={
+                    "/first/01234567.0": b"first-ca",
+                    "/first/01234567.00": b"noncanonical-ca",
+                    "/first/01234567.1": b"first-next-ca",
+                    "/first/01234567.3": b"gap-ca",
+                    "/first/ABCDEF01.0": b"uppercase-ca",
+                    "/first/dormant.pem": b"dormant-ca",
+                    "/second/89abcdef.0": b"second-ca",
+                    "/second/76543210.0": b"first-ca",
+                    "/second/cafebabe.1": b"orphan-ca",
+                    "/second/deadbeef.0": b"wrong-hash-ca",
+                    "/second/also-dormant.crt": b"also-dormant-ca",
+                },
+            )
+
         self.assertIs(result, context)
-        create_context.assert_called_once_with(cafile=None)
+        self.assertCountEqual(
+            [call.args[0] for call in subject_hashes.call_args_list],
+            [b"first-ca", b"first-next-ca", b"second-ca", b"wrong-hash-ca"],
+        )
+        self.assertEqual(
+            [call.kwargs["deadline"] for call in subject_hashes.call_args_list],
+            [120.0] * 4,
+        )
+        self.assertEqual(
+            [
+                call.kwargs["certificate_limit"]
+                for call in subject_hashes.call_args_list
+            ],
+            [512, 511, 510, 509],
+        )
+        context_type.assert_called_once_with(ssl.PROTOCOL_TLS_CLIENT)
         self.assertEqual(
             context.load_verify_locations.call_args_list,
-            [mock.call(capath="/first"), mock.call(capath="/second")],
+            [mock.call(cadata="first-cafirst-next-casecond-ca")],
         )
+
+    @mock.patch.object(providers.ssl, "SSLContext")
+    def test_proxy_ssl_context_rejects_unindexed_ca_directory(
+        self,
+        context_type: mock.Mock,
+    ) -> None:
+        with self.assertRaisesRegex(
+            ReviewError,
+            "contains no indexed certificates",
+        ):
+            providers._proxy_ssl_context(
+                {"SSL_CERT_DIR": "/isolated"},
+                snapshot_material={"/isolated/dormant.pem": b"dormant-ca"},
+            )
+
+        context_type.assert_not_called()
+
+    @mock.patch.object(providers.ssl, "SSLContext")
+    def test_proxy_ssl_context_rejects_hash_work_that_crosses_shared_deadline(
+        self,
+        context_type: mock.Mock,
+    ) -> None:
+        with (
+            mock.patch.object(
+                providers.time,
+                "monotonic",
+                side_effect=(100.0, 110.0, 121.0),
+            ),
+            mock.patch.object(
+                providers,
+                "_proxy_ca_subject_hashes",
+                return_value=(frozenset({"01234567"}), 1),
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "deadline expired",
+            ),
+        ):
+            providers._proxy_ssl_context(
+                {"SSL_CERT_DIR": "/isolated"},
+                snapshot_material={"/isolated/01234567.0": b"indexed-ca"},
+            )
+
+        context_type.assert_not_called()
+
+    @mock.patch.object(providers.ssl, "SSLContext")
+    def test_proxy_ssl_context_rejects_deadline_crossed_during_context_load(
+        self,
+        context_type: mock.Mock,
+    ) -> None:
+        context = context_type.return_value
+        with (
+            mock.patch.object(
+                providers.time,
+                "monotonic",
+                side_effect=(100.0, 110.0, 110.0, 121.0),
+            ),
+            mock.patch.object(
+                providers,
+                "_proxy_ca_subject_hashes",
+                return_value=(frozenset({"01234567"}), 1),
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "deadline expired",
+            ),
+        ):
+            providers._proxy_ssl_context(
+                {"SSL_CERT_DIR": "/isolated"},
+                snapshot_material={"/isolated/01234567.0": b"indexed-ca"},
+            )
+
+        context_type.assert_called_once_with(ssl.PROTOCOL_TLS_CLIENT)
+        context.load_verify_locations.assert_called_once_with(cadata="indexed-ca")
+
+    @mock.patch.object(providers.ssl, "SSLContext")
+    def test_proxy_ssl_context_rejects_wrong_subject_hash_directory(
+        self,
+        context_type: mock.Mock,
+    ) -> None:
+        with (
+            mock.patch.object(
+                providers,
+                "_proxy_ca_subject_hashes",
+                return_value=(frozenset({"cafebabe"}), 1),
+            ),
+            self.assertRaisesRegex(
+                ReviewError,
+                "contains no indexed certificates",
+            ),
+        ):
+            providers._proxy_ssl_context(
+                {"SSL_CERT_DIR": "/isolated"},
+                snapshot_material={"/isolated/deadbeef.0": b"wrong-hash-ca"},
+            )
+
+        context_type.assert_not_called()
 
     def test_claude_connect_proxy_allows_only_configured_target(self) -> None:
         class EchoHandler(socketserver.BaseRequestHandler):
@@ -14418,6 +15130,7 @@ class ProviderPolicyTest(unittest.TestCase):
         try:
             with providers._claude_connect_proxy(
                 {},
+                upstream_ssl_context=mock.Mock(spec=ssl.SSLContext),
                 allowed_targets=frozenset({("127.0.0.1", target_port)}),
             ) as proxy_port:
                 with socket.create_connection(("127.0.0.1", proxy_port)) as client:
@@ -14450,6 +15163,7 @@ class ProviderPolicyTest(unittest.TestCase):
             context = providers._claude_unix_connect_proxy(
                 self.review,
                 {},
+                upstream_ssl_context=mock.Mock(spec=ssl.SSLContext),
                 allowed_targets=frozenset({("api.anthropic.com", 443)}),
             )
             with context as socket_path:
@@ -14538,6 +15252,49 @@ class ProviderPolicyTest(unittest.TestCase):
             "http://corporate-proxy:8080",
         )
 
+    def test_https_upstream_proxy_uses_preloaded_ssl_context(self) -> None:
+        raw_socket = mock.Mock(spec=socket.socket)
+        tls_socket = mock.Mock(spec=socket.socket)
+        tls_socket.recv.return_value = b"HTTP/1.1 200 OK\r\n\r\n"
+        upstream_ssl_context = mock.Mock(spec=ssl.SSLContext)
+        upstream_ssl_context.wrap_socket.return_value = tls_socket
+
+        with (
+            mock.patch.object(
+                providers.socket,
+                "create_connection",
+                return_value=raw_socket,
+            ) as create_connection,
+            mock.patch.object(
+                providers,
+                "_proxy_ssl_context",
+                side_effect=AssertionError("snapshot paths must not be reopened"),
+            ),
+        ):
+            result = providers._open_proxy_target(
+                "api.anthropic.com",
+                443,
+                env={
+                    "https_proxy": "https://proxy.example:8443",
+                    "SSL_CERT_FILE": "/replaced/proxy-ca.pem",
+                },
+                upstream_ssl_context=upstream_ssl_context,
+            )
+
+        self.assertIs(result, tls_socket)
+        create_connection.assert_called_once_with(
+            ("proxy.example", 8443),
+            timeout=providers.CLAUDE_PROXY_CONNECT_TIMEOUT_SECONDS,
+        )
+        upstream_ssl_context.wrap_socket.assert_called_once_with(
+            raw_socket,
+            server_hostname="proxy.example",
+        )
+        tls_socket.sendall.assert_called_once_with(
+            b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n"
+            b"Host: api.anthropic.com:443\r\n\r\n"
+        )
+
     def test_claude_upstream_proxy_prefers_lowercase_override(self) -> None:
         self.assertEqual(
             providers._upstream_proxy_url(
@@ -14581,7 +15338,10 @@ class ProviderPolicyTest(unittest.TestCase):
                     "upstream proxy .* invalid",
                 ),
             ):
-                with providers._claude_connect_proxy({"https_proxy": value}):
+                with providers._claude_connect_proxy(
+                    {"https_proxy": value},
+                    upstream_ssl_context=mock.Mock(spec=ssl.SSLContext),
+                ):
                     self.fail("invalid upstream proxy unexpectedly started")
 
     @mock.patch.object(
@@ -14597,7 +15357,10 @@ class ProviderPolicyTest(unittest.TestCase):
             providers.ClaudeLoopbackUnavailable,
             "CONNECT proxy cannot bind loopback",
         ):
-            with providers._claude_connect_proxy({}):
+            with providers._claude_connect_proxy(
+                {},
+                upstream_ssl_context=mock.Mock(spec=ssl.SSLContext),
+            ):
                 self.fail("unavailable proxy unexpectedly started")
 
     def test_claude_proxy_thread_failure_closes_server(self) -> None:
@@ -14617,7 +15380,10 @@ class ProviderPolicyTest(unittest.TestCase):
                 "CONNECT proxy cannot start",
             ),
         ):
-            with providers._claude_connect_proxy({}):
+            with providers._claude_connect_proxy(
+                {},
+                upstream_ssl_context=mock.Mock(spec=ssl.SSLContext),
+            ):
                 self.fail("unavailable proxy unexpectedly started")
 
         server.shutdown.assert_not_called()

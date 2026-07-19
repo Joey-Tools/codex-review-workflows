@@ -529,7 +529,9 @@ On macOS, caller CA inputs use owner-only, single-link regular-file reads with
 no symlinks, FIFOs, extended ACL entries, or identity/growth races. The helper
 snapshots only bounded certificate material once and revalidates its digest for
 the model chain. Before every attempt it re-exports user, admin, and system
-trust settings into bounded helper files. Explicit deny wins even when another
+trust settings into bounded helper files. The exact no-settings response is
+accepted only with `security` status `1`; signal and other abnormal exits remain
+inconclusive. Explicit deny wins even when another
 domain or sibling entry is malformed. Constrained, missing, expired, non-root,
 or otherwise invalid additional certificates are excluded from the complete
 merged bundle, regardless of which input also contains them. The exact embedded
@@ -537,6 +539,24 @@ root set is evidence derived from the publisher-verified snapshot; if a host
 policy excludes a root still reachable through Claude's bundled store, the lane
 blocks rather than weakening signed provenance. Every trust preparation writes
 a sanitized terminal `claude-trust-policy.json` record.
+
+Upstream HTTPS proxy trust is prepared separately from Claude runtime trust.
+Caller CA files and directories are copied once into a dedicated helper-owned
+snapshot for the complete model chain, preserving proxy CA precedence while
+excluding publisher-bundled and host-added Claude roots. The helper initializes
+one in-memory TLS context from the captured bytes and reuses it for every
+upstream proxy connection. Replacement directories contribute only canonical
+OpenSSL hash-index entries whose suffix sequence and certificate subject hash
+are verified with the fixed OpenSSL client under one shared 20-second deadline
+and a 512-certificate budget for the complete snapshot and replacement-context
+initialization. The deadline is rechecked after each subprocess and before
+acceptance; duplicate material is verified once. The in-memory context enables
+strict X.509 verification and partial-chain trust anchors without loading
+ambient roots. Default trust uses explicit compiled-in OpenSSL
+CA-file material captured through the same stable descriptor reader rather than
+caller-controlled environment lookup or a lazy CA directory. Neither original
+nor helper snapshot paths are reopened, so later path replacement cannot change
+the proxy's trust set.
 An unconstrained `TrustRoot` entry must be a strict currently valid self-signed
 CA root. An unconstrained `TrustAsRoot` entry may instead be a non-self-issued
 CA or intermediate certificate: it must retain strict CA and certificate-signing
@@ -833,6 +853,14 @@ and mixed authentication and entitlement/transient semantics remain
 inconclusive regardless of which stream or priority branch supplied them.
 Every supported authentication, entitlement, or transient category additionally
 requires a valid `modelUsage` entry matching the exact requested model.
+Entitlement also requires an explicit model-entitlement code or entitlement
+text that names a model or the requested model; account-level denial of an
+unrelated feature or tool remains inconclusive even with matching model usage.
+Every other non-empty recursive error-payload string and the top-level failure
+`result` must match the closed neutral grammar (`error` or `request rejected`).
+Raw code and text values reject CR/LF before normalization. Unknown identifiers,
+future denial variants, and mixed feature evidence therefore remain inconclusive
+even when an explicit model code is present.
 Transient classification follows the same exact failure-envelope allowlist;
 stderr-only or structurally ambiguous network text remains inconclusive.
 Missing, malformed, or wrong-model `modelUsage` never authorizes model or

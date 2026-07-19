@@ -220,6 +220,14 @@ CLAUDE_CA_DIR_LIMIT_BYTES = 64 * 1024 * 1024
 CLAUDE_CA_DIR_ENTRY_LIMIT = 4096
 CLAUDE_CA_SYMLINK_LIMIT = 32
 CLAUDE_CA_PATH_COMPONENT_LIMIT = 256
+CLAUDE_PROXY_CA_HASH_TIMEOUT_SECONDS = 20.0
+CLAUDE_PROXY_CA_HASH_CERTIFICATE_LIMIT = 512
+CLAUDE_PROXY_TLS_VERIFY_FLAGS = (
+    ssl.VERIFY_X509_STRICT | ssl.VERIFY_X509_PARTIAL_CHAIN
+)
+CLAUDE_OPENSSL_CA_HASH_ENTRY_RE = re.compile(
+    r"^([0-9a-f]{8})\.(0|[1-9][0-9]*)$"
+)
 CLAUDE_EXECUTABLE_HASH_CHUNK_BYTES = 1024 * 1024
 CLAUDE_BUNDLED_CERTIFICATE_LIMIT_BYTES = 128 * 1024
 CLAUDE_BUNDLED_ROOT_LIMIT = 512
@@ -426,6 +434,53 @@ STRUCTURED_ENTITLEMENT_CODES = (
     "model_permission_denied",
 )
 STRUCTURED_AMBIGUOUS_MODEL_CODES = ("model_not_found", "not_found_error")
+CLAUDE_MODEL_ENTITLEMENT_TEXT_PATTERNS = (
+    re.compile(
+        r"\s*(?:error:\s*)?(?:(?:this|the|requested)\s+)?model\s+"
+        r"(?:is|was)\s+not\s+"
+        r"(?:available|enabled|allowed|included|supported|entitled)"
+        r"(?:\s+(?:for|to|on|in|with|by)\s+"
+        r"(?:(?:your|this|the)\s+)?"
+        r"(?:(?:chatgpt\s+)?account(?:\s+plan)?|user|organization|organisation|plan|"
+        r"current\s+plan|current\s+subscription))?\s*[.!]?\s*",
+        re.I,
+    ),
+    re.compile(
+        r"\s*(?:error:\s*)?(?:does not|do not|don't)\s+have access to\s+"
+        r"(?:(?:this|the|requested)\s+)?model\s*[.!]?\s*",
+        re.I,
+    ),
+    re.compile(
+        r"\s*(?:error:\s*)?(?:account|user|organization|organisation)\s+"
+        r"has no access to\s+(?:(?:this|the|requested)\s+)?model\s*[.!]?\s*",
+        re.I,
+    ),
+    re.compile(
+        r"\s*(?:error:\s*)?model access\s+"
+        r"(?:(?:is|has been)\s+)?(?:denied|disabled)\s*[.!]?\s*",
+        re.I,
+    ),
+    re.compile(
+        r"\s*(?:error:\s*)?model\s+is\s+"
+        r"(?:disabled|not allowed|not enabled)\s+(?:by|for)\s+"
+        r"(?:your|this)\s+(?:organization|organisation)\s*[.!]?\s*",
+        re.I,
+    ),
+    re.compile(
+        r"\s*(?:error:\s*)?not in\s+(?:your|this)\s+"
+        r"(?:organization|organisation)'s\s+allowed models\s*[.!]?\s*",
+        re.I,
+    ),
+    re.compile(
+        r"\s*(?:error:\s*)?unsupported model for\s+"
+        r"(?:this|your|the) account\s*[.!]?\s*",
+        re.I,
+    ),
+)
+CLAUDE_ENTITLEMENT_NEUTRAL_TEXT_PATTERN = re.compile(
+    r"\s*(?:error|request rejected)\s*",
+    re.I,
+)
 
 AUTH_FAILURE_FRAGMENTS = (
     "authentication failed",
@@ -839,6 +894,8 @@ class ClaudeTrustMaterial:
 @dataclass
 class ClaudeTrustSessionState:
     caller_ca_snapshot_sha256: str | None = None
+    proxy_tls_env: dict[str, str] | None = None
+    proxy_ssl_context: ssl.SSLContext | None = None
 
 
 class _DuplicatePlistKey(ValueError):
@@ -3122,6 +3179,70 @@ def _read_ca_source(path: pathlib.Path, *, source: str) -> bytes:
     return material
 
 
+def _read_proxy_system_ca_source(path: pathlib.Path) -> bytes:
+    source = "Claude proxy system CA bundle"
+    try:
+        descriptor = os.open(path, _ca_nofollow_flags(directory=False))
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            f"cannot open a stable {source}"
+        ) from error
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid not in {0, os.geteuid()}
+            or before.st_nlink != 1
+            or before.st_mode & 0o022
+        ):
+            raise ReviewError(f"{source} has unsafe metadata")
+        _require_no_extended_acl(descriptor, label=source)
+        payload = bytearray()
+        while True:
+            chunk = os.read(
+                descriptor,
+                min(64 * 1024, CLAUDE_CA_FILE_LIMIT_BYTES + 1 - len(payload)),
+            )
+            if not chunk:
+                break
+            payload.extend(chunk)
+            if len(payload) > CLAUDE_CA_FILE_LIMIT_BYTES:
+                raise ReviewError(f"{source} exceeds the size limit")
+        after = os.fstat(descriptor)
+    except OSError as error:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        raise ClaudeExecutableInspectionInconclusive(
+            f"cannot read a stable {source}"
+        ) from error
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        raise
+    else:
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot close a stable {source}"
+            ) from error
+    try:
+        path_after = path.lstat()
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            f"{source} changed while being read"
+        ) from error
+    if (
+        _ca_source_metadata(before) != _ca_source_metadata(after)
+        or _ca_source_metadata(after) != _ca_source_metadata(path_after)
+        or len(payload) != before.st_size
+    ):
+        raise ClaudeExecutableInspectionInconclusive(
+            f"{source} changed while being read"
+        )
+    return _extract_ca_certificates(bytes(payload), source=source)
+
+
 def _open_ca_directory_at(
     directory_descriptor: int,
     name: str,
@@ -3823,7 +3944,7 @@ def _read_claude_trust_domain(
                 .strip()
             )
             if completed.returncode != 0:
-                if _is_no_trust_settings(detail):
+                if completed.returncode == 1 and _is_no_trust_settings(detail):
                     return None
                 raise ClaudeExecutableInspectionInconclusive(
                     f"Claude {domain} trust export failed inconclusively"
@@ -4249,12 +4370,14 @@ def _read_claude_trust_certificates_impl(
             completed.stderr[:] = b"\x00" * len(completed.stderr)
 
 
-def _prepare_claude_generic_tls_environment(
+def _snapshot_claude_tls_environment(
     review: ReviewWorkspace,
     env: dict[str, str],
-) -> dict[str, str]:
+    *,
+    ca_root: pathlib.Path,
+) -> tuple[dict[str, str], dict[str, bytes]]:
     result = dict(env)
-    ca_root = review.container_dir / "claude-ca"
+    snapshots: dict[str, bytes] = {}
     _require_private_claude_ca_root(ca_root)
     for key in CLAUDE_TLS_FILE_ENV_KEYS:
         raw = result.get(key)
@@ -4264,12 +4387,11 @@ def _prepare_claude_generic_tls_environment(
         if not source_path.is_absolute():
             raise ReviewError(f"Claude review requires valid absolute {key}")
         destination = ca_root / f"{key.lower()}.pem"
-        _write_private_ca_file(
-            destination,
-            _read_ca_source(source_path, source=key),
-        )
+        material = _read_ca_source(source_path, source=key)
+        _write_private_ca_file(destination, material)
         _validate_ca_file(destination)
         result[key] = str(destination)
+        snapshots[str(destination)] = material
 
     for key in CLAUDE_TLS_DIR_ENV_KEYS:
         raw_entries = [
@@ -4347,6 +4469,7 @@ def _prepare_claude_generic_tls_environment(
                         destination = destination_dir / source_name
                         _write_private_ca_file(destination, material)
                         _validate_ca_file(destination)
+                        snapshots[str(destination)] = material
                         copied = True
                     directory_after = os.fstat(source_directory)
                     if _ca_source_metadata(directory_before) != _ca_source_metadata(
@@ -4382,6 +4505,65 @@ def _prepare_claude_generic_tls_environment(
         if not prepared_dirs:
             raise ReviewError("Claude review CA directory contains no PEM certificates")
         result[key] = os.pathsep.join(str(path) for path in prepared_dirs)
+    return result, snapshots
+
+
+def _prepare_claude_generic_tls_environment(
+    review: ReviewWorkspace,
+    env: dict[str, str],
+) -> dict[str, str]:
+    result, _snapshots = _snapshot_claude_tls_environment(
+        review,
+        env,
+        ca_root=review.container_dir / "claude-ca",
+    )
+    return result
+
+
+def _prepare_claude_proxy_tls_environment(
+    review: ReviewWorkspace,
+    env: dict[str, str],
+) -> tuple[dict[str, str], ssl.SSLContext]:
+    result, snapshots = _snapshot_claude_tls_environment(
+        review,
+        env,
+        ca_root=review.container_dir / "claude-proxy-ca",
+    )
+    return result, _proxy_ssl_context(result, snapshot_material=snapshots)
+
+
+def _claude_proxy_tls_environment(
+    review: ReviewWorkspace,
+    env: dict[str, str],
+    *,
+    trust_state: ClaudeTrustSessionState,
+) -> tuple[dict[str, str], ssl.SSLContext]:
+    if trust_state.proxy_tls_env is None:
+        (
+            trust_state.proxy_tls_env,
+            trust_state.proxy_ssl_context,
+        ) = _prepare_claude_proxy_tls_environment(
+            review,
+            env,
+        )
+    if trust_state.proxy_ssl_context is None:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude proxy TLS context is unavailable"
+        )
+    return dict(trust_state.proxy_tls_env), trust_state.proxy_ssl_context
+
+
+def _with_claude_tls_snapshot_inputs(
+    env: dict[str, str],
+    snapshot_env: dict[str, str],
+) -> dict[str, str]:
+    result = dict(env)
+    for key in (*CLAUDE_TLS_FILE_ENV_KEYS, *CLAUDE_TLS_DIR_ENV_KEYS):
+        value = snapshot_env.get(key)
+        if value:
+            result[key] = value
+        else:
+            result.pop(key, None)
     return result
 
 
@@ -4898,7 +5080,99 @@ def _upstream_proxy_url(
     return None
 
 
-def _proxy_ssl_context(env: dict[str, str]) -> ssl.SSLContext:
+def _proxy_ca_subject_hashes(
+    material: bytes,
+    *,
+    deadline: float,
+    certificate_limit: int,
+) -> tuple[frozenset[str], int]:
+    try:
+        openssl_metadata = CLAUDE_OPENSSL_CLIENT.lstat()
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude proxy CA hash tooling is unavailable"
+        ) from error
+    if (
+        not stat.S_ISREG(openssl_metadata.st_mode)
+        or openssl_metadata.st_uid != 0
+        or openssl_metadata.st_nlink != 1
+        or openssl_metadata.st_mode & 0o6022
+        or not os.access(CLAUDE_OPENSSL_CLIENT, os.X_OK)
+    ):
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude proxy CA hash tooling has unsafe metadata"
+        )
+    normalized = _extract_ca_certificates(
+        material,
+        source="Claude proxy CA hash entry",
+    )
+    blocks = CLAUDE_CERTIFICATE_BLOCK.findall(normalized)
+    if len(blocks) > certificate_limit:
+        raise ReviewError("Claude proxy CA hash certificate limit exceeded")
+    hashes: set[str] = set()
+    for block in blocks:
+        remaining_seconds = deadline - time.monotonic()
+        if remaining_seconds <= 0:
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude proxy CA hash deadline expired"
+            )
+        try:
+            completed = run_bounded_capture(
+                (
+                    str(CLAUDE_OPENSSL_CLIENT),
+                    "x509",
+                    "-subject_hash",
+                    "-noout",
+                ),
+                env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+                stdin=block,
+                timeout_seconds=min(
+                    CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS,
+                    remaining_seconds,
+                ),
+                stdout_limit_bytes=4096,
+                stderr_limit_bytes=4096,
+            )
+        except ReviewTimeoutError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude proxy CA subject hash timed out"
+            ) from error
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude proxy CA hash tooling could not be launched"
+            ) from error
+        try:
+            if time.monotonic() >= deadline:
+                raise ClaudeExecutableInspectionInconclusive(
+                    "Claude proxy CA hash deadline expired"
+                )
+            match = re.fullmatch(rb"([0-9a-f]{8})\r?\n", bytes(completed.stdout))
+            if completed.returncode != 0 or completed.stderr or match is None:
+                raise ClaudeExecutableInspectionInconclusive(
+                    "Claude proxy CA subject hash is inconclusive"
+                )
+            hashes.add(match.group(1).decode("ascii"))
+        finally:
+            completed.stdout[:] = b"\x00" * len(completed.stdout)
+            completed.stderr[:] = b"\x00" * len(completed.stderr)
+    if not hashes:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude proxy CA hash entry contains no certificate"
+        )
+    return frozenset(hashes), len(blocks)
+
+
+def _new_proxy_ssl_context() -> ssl.SSLContext:
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.verify_flags |= CLAUDE_PROXY_TLS_VERIFY_FLAGS
+    return context
+
+
+def _proxy_ssl_context(
+    env: dict[str, str],
+    *,
+    snapshot_material: dict[str, bytes],
+) -> ssl.SSLContext:
     cafile = next(
         (
             env[key]
@@ -4912,10 +5186,99 @@ def _proxy_ssl_context(env: dict[str, str]) -> ssl.SSLContext:
         ),
         None,
     )
-    context = ssl.create_default_context(cafile=cafile)
-    for raw in env.get("SSL_CERT_DIR", "").split(os.pathsep):
-        if raw:
-            context.load_verify_locations(capath=raw)
+    configured_directories = [
+        pathlib.Path(raw)
+        for raw in env.get("SSL_CERT_DIR", "").split(os.pathsep)
+        if raw
+    ]
+    directory_material: list[bytes] = []
+    subject_hash_cache: dict[bytes, frozenset[str]] = {}
+    subject_hash_deadline = time.monotonic() + CLAUDE_PROXY_CA_HASH_TIMEOUT_SECONDS
+    remaining_hash_certificates = CLAUDE_PROXY_CA_HASH_CERTIFICATE_LIMIT
+    for directory in configured_directories:
+        indexed: dict[str, dict[int, bytes]] = {}
+        for path, material in snapshot_material.items():
+            snapshot_path = pathlib.Path(path)
+            if snapshot_path.parent != directory:
+                continue
+            match = CLAUDE_OPENSSL_CA_HASH_ENTRY_RE.fullmatch(snapshot_path.name)
+            if match is None:
+                continue
+            indexed.setdefault(match.group(1), {})[int(match.group(2))] = material
+        for subject_hash in sorted(indexed):
+            entries = indexed[subject_hash]
+            index = 0
+            while index in entries:
+                if time.monotonic() >= subject_hash_deadline:
+                    raise ClaudeExecutableInspectionInconclusive(
+                        "Claude proxy CA hash deadline expired"
+                    )
+                material = entries[index]
+                digest = hashlib.sha256(material).digest()
+                material_hashes = subject_hash_cache.get(digest)
+                if material_hashes is None:
+                    material_hashes, consumed_certificates = _proxy_ca_subject_hashes(
+                        material,
+                        deadline=subject_hash_deadline,
+                        certificate_limit=remaining_hash_certificates,
+                    )
+                    remaining_hash_certificates -= consumed_certificates
+                    subject_hash_cache[digest] = material_hashes
+                if material_hashes == {subject_hash}:
+                    directory_material.append(material)
+                index += 1
+    if configured_directories and time.monotonic() >= subject_hash_deadline:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude proxy CA hash deadline expired"
+        )
+    try:
+        replacement_configured = cafile is not None or bool(configured_directories)
+        if replacement_configured:
+            materials: list[bytes] = []
+            if cafile is not None:
+                file_material = snapshot_material.get(cafile)
+                if file_material is None:
+                    raise ClaudeExecutableInspectionInconclusive(
+                        "Claude proxy CA file snapshot is incomplete"
+                    )
+                materials.append(file_material)
+            materials.extend(directory_material)
+            if not materials:
+                raise ReviewError(
+                    "Claude proxy CA replacement contains no indexed certificates"
+                )
+            context = _new_proxy_ssl_context()
+            context.load_verify_locations(
+                cadata=b"".join(materials).decode("ascii")
+            )
+        else:
+            defaults = ssl.get_default_verify_paths()
+            if not defaults.openssl_cafile:
+                raise ClaudeExecutableInspectionInconclusive(
+                    "Claude proxy system CA file is unavailable"
+                )
+            default_cafile = pathlib.Path(defaults.openssl_cafile)
+            if not default_cafile.is_absolute():
+                raise ClaudeExecutableInspectionInconclusive(
+                    "Claude proxy system CA file is not absolute"
+                )
+            try:
+                resolved_default_cafile = default_cafile.resolve(strict=True)
+            except OSError as error:
+                raise ClaudeExecutableInspectionInconclusive(
+                    "Claude proxy system CA file is unavailable"
+                ) from error
+            default_material = _read_proxy_system_ca_source(resolved_default_cafile)
+            context = _new_proxy_ssl_context()
+            context.load_verify_locations(cadata=default_material.decode("ascii"))
+    except (OSError, UnicodeDecodeError, ValueError, ssl.SSLError) as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude proxy CA snapshot could not be loaded"
+        ) from error
+    if configured_directories and time.monotonic() >= subject_hash_deadline:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude proxy CA hash deadline expired"
+        )
     return context
 
 
@@ -4945,6 +5308,7 @@ def _open_proxy_target(
     port: int,
     *,
     env: dict[str, str],
+    upstream_ssl_context: ssl.SSLContext,
 ) -> socket.socket:
     upstream_url = _upstream_proxy_url(env, host=host, port=port)
     if upstream_url is None:
@@ -4958,7 +5322,7 @@ def _open_proxy_target(
         timeout=CLAUDE_PROXY_CONNECT_TIMEOUT_SECONDS,
     )
     if parsed.scheme == "https":
-        connection = _proxy_ssl_context(env).wrap_socket(
+        connection = upstream_ssl_context.wrap_socket(
             connection,
             server_hostname=parsed.hostname,
         )
@@ -5034,7 +5398,11 @@ class _ClaudeProxyHandler(socketserver.BaseRequestHandler):
             if target not in server.allowed_targets:
                 client.sendall(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
                 return
-            upstream = _open_proxy_target(*target, env=server.upstream_env)
+            upstream = _open_proxy_target(
+                *target,
+                env=server.upstream_env,
+                upstream_ssl_context=server.upstream_ssl_context,
+            )
             client.sendall(
                 b"HTTP/1.1 200 Connection Established\r\nConnection: close\r\n\r\n"
             )
@@ -5056,9 +5424,11 @@ class _ClaudeProxyServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         *,
         allowed_targets: frozenset[tuple[str, int]],
         upstream_env: dict[str, str],
+        upstream_ssl_context: ssl.SSLContext,
     ) -> None:
         self.allowed_targets = allowed_targets
         self.upstream_env = dict(upstream_env)
+        self.upstream_ssl_context = upstream_ssl_context
         super().__init__(("127.0.0.1", 0), _ClaudeProxyHandler)
 
 
@@ -5074,9 +5444,11 @@ class _ClaudeUnixProxyServer(
         *,
         allowed_targets: frozenset[tuple[str, int]],
         upstream_env: dict[str, str],
+        upstream_ssl_context: ssl.SSLContext,
     ) -> None:
         self.allowed_targets = allowed_targets
         self.upstream_env = dict(upstream_env)
+        self.upstream_ssl_context = upstream_ssl_context
         super().__init__(str(socket_path), _ClaudeProxyHandler)
 
 
@@ -5084,6 +5456,7 @@ class _ClaudeUnixProxyServer(
 def _claude_connect_proxy(
     env: dict[str, str],
     *,
+    upstream_ssl_context: ssl.SSLContext,
     allowed_targets: frozenset[tuple[str, int]] = CLAUDE_PROXY_TARGETS,
 ) -> Iterator[int]:
     for host, port in allowed_targets:
@@ -5094,6 +5467,7 @@ def _claude_connect_proxy(
         server = _ClaudeProxyServer(
             allowed_targets=allowed_targets,
             upstream_env=env,
+            upstream_ssl_context=upstream_ssl_context,
         )
     except OSError as error:
         raise ClaudeLoopbackUnavailable(
@@ -5127,6 +5501,7 @@ def _claude_unix_connect_proxy(
     _review: ReviewWorkspace,
     env: dict[str, str],
     *,
+    upstream_ssl_context: ssl.SSLContext,
     allowed_targets: frozenset[tuple[str, int]] = CLAUDE_PROXY_TARGETS,
 ) -> Iterator[pathlib.Path]:
     for host, port in allowed_targets:
@@ -5145,6 +5520,7 @@ def _claude_unix_connect_proxy(
                 socket_path,
                 allowed_targets=allowed_targets,
                 upstream_env=env,
+                upstream_ssl_context=upstream_ssl_context,
             )
             socket_path.chmod(0o600)
         except OSError as error:
@@ -5202,6 +5578,7 @@ def _run_claude_auth_warmup(
     model: str,
     *,
     proxy_env: dict[str, str] | None = None,
+    proxy_ssl_context: ssl.SSLContext | None = None,
 ) -> Completed:
     rg = _trusted_claude_ripgrep()
     if rg is None:
@@ -5214,9 +5591,15 @@ def _run_claude_auth_warmup(
         {"disableAllHooks": True},
         separators=(",", ":"),
     )
+    if proxy_env is not None and proxy_ssl_context is None:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude proxy TLS context is unavailable"
+        )
+    effective_proxy_context = proxy_ssl_context or ssl.create_default_context()
     with (
         _claude_connect_proxy(
             warmup_env if proxy_env is None else proxy_env,
+            upstream_ssl_context=effective_proxy_context,
             allowed_targets=CLAUDE_AUTH_PROXY_TARGETS,
         ) as proxy_port,
         tempfile.TemporaryDirectory(
@@ -5283,6 +5666,7 @@ def _warm_claude_local_login(
     model: str,
     *,
     proxy_env: dict[str, str] | None = None,
+    proxy_ssl_context: ssl.SSLContext | None = None,
 ) -> None:
     try:
         _require_fresh_claude_keychain_credential_for_auth_preflight(review)
@@ -5290,7 +5674,14 @@ def _warm_claude_local_login(
     except ClaudeKeychainCredentialUnavailable:
         pass
     try:
-        proxy_options = {} if proxy_env is None else {"proxy_env": proxy_env}
+        proxy_options = (
+            {}
+            if proxy_env is None
+            else {
+                "proxy_env": proxy_env,
+                "proxy_ssl_context": proxy_ssl_context,
+            }
+        )
         warmup = _run_claude_auth_warmup(
             review,
             executable,
@@ -5524,6 +5915,7 @@ def _claude_failure_metadata_is_supported(result: dict[str, Any]) -> bool:
     api_error_status = result.get("api_error_status")
     if "api_error_status" in result and not (
         api_error_status is None
+        or (isinstance(api_error_status, str) and not api_error_status.strip())
         or (type(api_error_status) is int and 100 <= api_error_status <= 599)
     ):
         return False
@@ -5603,6 +5995,8 @@ def _claude_auth_warmup_output_shape(stdout: bytes) -> dict[str, object]:
             if "api_error_status" not in result
             else "null"
             if api_error_status is None
+            else "empty"
+            if isinstance(api_error_status, str) and not api_error_status.strip()
             else "status"
             if safe_api_error_status is not None
             else "invalid"
@@ -6498,6 +6892,85 @@ def _claude_nonzero_failure_reason(stdout: bytes) -> str:
     return "nonzero-contradictory-result-envelope"
 
 
+def _claude_entitlement_evidence_is_model_specific(
+    result: dict[str, Any],
+    *,
+    requested_model: str,
+) -> bool:
+    values: list[str] = []
+    codes: set[str] = set()
+    malformed_code = False
+
+    def collect(value: Any) -> None:
+        nonlocal malformed_code
+        if isinstance(value, str):
+            values.append(value)
+            return
+        if isinstance(value, list):
+            for item in value:
+                collect(item)
+            return
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key == "code" and isinstance(item, str):
+                    if "\r" in item or "\n" in item:
+                        malformed_code = True
+                        continue
+                    codes.add(item.strip().lower())
+                    continue
+                collect(item)
+
+    for key in CLAUDE_AUTH_WARMUP_ERROR_FIELDS - {"api_error_status"}:
+        if key in result:
+            if key == "code" and isinstance(result[key], str):
+                if "\r" in result[key] or "\n" in result[key]:
+                    malformed_code = True
+                    continue
+                codes.add(result[key].strip().lower())
+                continue
+            collect(result[key])
+    if "result" in result:
+        collect(result["result"])
+    if malformed_code:
+        return False
+
+    explicit_codes = set(STRUCTURED_ENTITLEMENT_CODES)
+    ambiguous_codes = set(STRUCTURED_AMBIGUOUS_MODEL_CODES)
+    if codes - explicit_codes - ambiguous_codes:
+        return False
+    explicit_model_code = bool(codes & explicit_codes)
+
+    requested_literal = requested_model.lower()
+    requested_rejection = re.compile(
+        r"\s*(?:error:\s*)?(?:"
+        rf"{re.escape(requested_literal)}\s+(?:is|was)\s+not\s+"
+        r"(?:available|enabled|allowed|included|supported|entitled)"
+        r"(?:\s+(?:for|to|on|in|with|by)\s+"
+        r"(?:(?:your|this|the)\s+)?"
+        r"(?:(?:chatgpt\s+)?account(?:\s+plan)?|user|organization|organisation|plan|"
+        r"current\s+plan|current\s+subscription))?|"
+        r"(?:no access to|access (?:is )?denied for)\s+"
+        rf"{re.escape(requested_literal)})\s*[.!]?\s*",
+        re.I,
+    )
+    matched_model_rejection = False
+    for value in values:
+        if "\r" in value or "\n" in value:
+            return False
+        model_rejection = any(
+            pattern.fullmatch(value)
+            for pattern in CLAUDE_MODEL_ENTITLEMENT_TEXT_PATTERNS
+        ) or requested_rejection.fullmatch(value)
+        if model_rejection:
+            matched_model_rejection = True
+            continue
+        if value.strip() and CLAUDE_ENTITLEMENT_NEUTRAL_TEXT_PATTERN.fullmatch(
+            value
+        ) is None:
+            return False
+    return explicit_model_code or matched_model_rejection
+
+
 def _claude_supported_failure_category(
     stdout: bytes,
     *,
@@ -6541,6 +7014,11 @@ def _claude_supported_failure_category(
     elif category in {"entitlement", "transient"} and result_signal_categories not in (
         [],
         [category],
+    ):
+        return None
+    if category == "entitlement" and not _claude_entitlement_evidence_is_model_specific(
+        result,
+        requested_model=requested_model,
     ):
         return None
     if category in {"entitlement", "transient"}:
@@ -6737,7 +7215,9 @@ def _parse_claude_output_evidence(
     )
     if result.get("subtype") != "success" or result.get("is_error") is not False:
         return None, effective_model, model_evidence_consistent
-    for key in ("error", "errors"):
+    if not _claude_failure_metadata_is_supported(result):
+        return None, effective_model, model_evidence_consistent
+    for key in CLAUDE_AUTH_WARMUP_ERROR_FIELDS:
         if key not in result:
             continue
         value = result[key]
@@ -6747,10 +7227,6 @@ def _parse_claude_output_evidence(
             or (isinstance(value, (list, dict)) and not value)
         )
         if not explicitly_empty:
-            return None, effective_model, model_evidence_consistent
-    if "api_error_status" in result:
-        value = result["api_error_status"]
-        if value is not None and not (isinstance(value, str) and not value.strip()):
             return None, effective_model, model_evidence_consistent
     final_text = result.get("result")
     if (
@@ -7637,7 +8113,14 @@ def _claude_linux_review_runtime(
     executable: pathlib.Path,
     env: dict[str, str],
     arguments: tuple[str, ...],
+    *,
+    proxy_env: dict[str, str] | None = None,
+    proxy_ssl_context: ssl.SSLContext | None = None,
 ) -> Iterator[Any]:
+    if proxy_env is not None and proxy_ssl_context is None:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude proxy TLS context is unavailable"
+        )
     try:
         host = _claude_linux_host()
         claude_info = validate_claude_linux_executable(executable, host)
@@ -7695,7 +8178,13 @@ def _claude_linux_review_runtime(
                     f"Claude Linux local-login credential is unsafe: {error}"
                 ) from error
             config_dir = staged.config_dir
-        proxy_socket = stack.enter_context(_claude_unix_connect_proxy(review, env))
+        proxy_socket = stack.enter_context(
+            _claude_unix_connect_proxy(
+                review,
+                env if proxy_env is None else proxy_env,
+                upstream_ssl_context=proxy_ssl_context or ssl.create_default_context(),
+            )
+        )
         spec = SandboxSpec(
             host=host,
             toolchain=toolchain,
@@ -7963,6 +8452,11 @@ def _claude_attempt(
         settings=settings,
         linux=linux_host,
     )
+    proxy_env, proxy_ssl_context = _claude_proxy_tls_environment(
+        review,
+        env,
+        trust_state=trust_state,
+    )
     completed: Completed | None = None
     for credential_round in range(2):
         _require_matching_claude_executable_snapshot(
@@ -7971,7 +8465,11 @@ def _claude_attempt(
             container_dir=review.container_dir,
         )
         attempt_env = _with_claude_review_tool_path(review, env)
-        proxy_env = dict(attempt_env)
+        if linux_host:
+            attempt_env = _with_claude_tls_snapshot_inputs(
+                attempt_env,
+                proxy_env,
+            )
         attempt_env = _prepare_claude_tls_environment(
             review,
             attempt_env,
@@ -7994,6 +8492,7 @@ def _claude_attempt(
                         attempt_env,
                         model,
                         proxy_env=proxy_env,
+                        proxy_ssl_context=proxy_ssl_context,
                     )
                 except ClaudeAuthWarmupEntitlement as error:
                     (
@@ -8104,6 +8603,8 @@ def _claude_attempt(
                 executable,
                 attempt_env,
                 arguments,
+                proxy_env=proxy_env,
+                proxy_ssl_context=proxy_ssl_context,
             ) as sandbox_command:
                 _require_matching_claude_executable_snapshot(
                     executable,
@@ -8136,7 +8637,12 @@ def _claude_attempt(
                     raise ClaudeAuthWarmupInconclusive(
                         f"Claude final credential check was inconclusive: {error}"
                     ) from error
-                proxy_port = stack.enter_context(_claude_connect_proxy(proxy_env))
+                proxy_port = stack.enter_context(
+                    _claude_connect_proxy(
+                        proxy_env,
+                        upstream_ssl_context=proxy_ssl_context,
+                    )
+                )
                 review_env = _with_claude_proxy_environment(
                     runtime_env,
                     proxy_port,
