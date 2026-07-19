@@ -33,6 +33,7 @@ from .common import (
 from .providers import run_review
 from .workspace import (
     PRIVATE_HELPER_ARTIFACT_NAMES,
+    BoundReviewLock,
     CleanupIdentity,
     LegacyReviewWorkspace,
     PrivateCleanupEvidence,
@@ -43,10 +44,13 @@ from .workspace import (
     parse_partial_private_cleanup_evidence,
     parse_private_cleanup_evidence,
     prepare_workspace,
+    remove_bound_review_text,
     remove_legacy_private_review_artifacts,
     remove_partial_review_container,
     remove_private_review_artifacts,
+    open_bound_review_lock,
     validate_workspace_layout,
+    write_bound_review_text,
 )
 
 
@@ -78,6 +82,46 @@ CLEANUP_LOCK_FILE = "cleanup.lock"
 FINAL_CLEANUP_TIMEOUT_SECONDS = 30.0
 RUNNER_SHUTDOWN_GRACE_SECONDS = PROCESS_GROUP_TERM_GRACE_SECONDS * 4
 _STARTED_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
+
+
+def _write_loaded_review_text(
+    state_dir: pathlib.Path,
+    review: ReviewWorkspace | LegacyReviewWorkspace,
+    *,
+    name: str,
+    text: str,
+) -> str | None:
+    if isinstance(review, LegacyReviewWorkspace):
+        try:
+            write_text_atomic(state_dir / name, text)
+        except Exception as error:
+            return str(error)
+        return None
+    return write_bound_review_text(
+        state_dir,
+        expected=review.private_cleanup,
+        name=name,
+        text=text,
+    )
+
+
+def _remove_loaded_review_text(
+    state_dir: pathlib.Path,
+    review: ReviewWorkspace | LegacyReviewWorkspace,
+    *,
+    name: str,
+) -> str | None:
+    if isinstance(review, LegacyReviewWorkspace):
+        try:
+            (state_dir / name).unlink(missing_ok=True)
+        except OSError as error:
+            return str(error)
+        return None
+    return remove_bound_review_text(
+        state_dir,
+        expected=review.private_cleanup,
+        name=name,
+    )
 
 
 @dataclass(frozen=True)
@@ -768,6 +812,7 @@ def run_state(
     pending_signal: signal.Signals | None = None
     suppress_signal_raise = False
     state_loaded = False
+    review: ReviewWorkspace | LegacyReviewWorkspace | None = None
 
     def record_signal(signum: int, _frame: object) -> None:
         nonlocal pending_signal
@@ -802,20 +847,38 @@ def run_state(
         exit_code = outcome.returncode
     except ForwardedSignal as error:
         exit_code = 128 + int(error.signum)
-        if state_loaded and error.detail:
-            try:
-                write_text_atomic(
-                    state_dir / "runner-error.txt",
-                    "review orchestration interrupted by signal "
-                    f"{int(error.signum)}: {error.detail}\n",
-                )
-            except Exception:
-                pass
-    except Exception as error:
-        if state_loaded:
-            write_text_atomic(
-                state_dir / "runner-error.txt", f"{type(error).__name__}: {error}\n"
+        if state_loaded and review is not None and error.detail:
+            diagnostic = (
+                "review orchestration interrupted by signal "
+                f"{int(error.signum)}: {error.detail}\n"
             )
+            diagnostic_error = _write_loaded_review_text(
+                state_dir,
+                review,
+                name="runner-error.txt",
+                text=diagnostic,
+            )
+            if diagnostic_error:
+                print(
+                    diagnostic.rstrip("\n")
+                    + f"; runner diagnostic was not persisted: {diagnostic_error}",
+                    file=sys.stderr,
+                )
+    except Exception as error:
+        if state_loaded and review is not None:
+            diagnostic = f"{type(error).__name__}: {error}\n"
+            diagnostic_error = _write_loaded_review_text(
+                state_dir,
+                review,
+                name="runner-error.txt",
+                text=diagnostic,
+            )
+            if diagnostic_error:
+                print(
+                    diagnostic.rstrip("\n")
+                    + f"; runner diagnostic was not persisted: {diagnostic_error}",
+                    file=sys.stderr,
+                )
         exit_code = 1
     finally:
         suppress_signal_raise = True
@@ -831,8 +894,18 @@ def run_state(
                     pending_signal = masked_signal
                 if pending_signal is not None:
                     exit_code = 128 + int(pending_signal)
-                if state_loaded:
-                    write_text_atomic(state_dir / EXIT_FILE, f"{exit_code}\n")
+                if state_loaded and review is not None:
+                    exit_error = _write_loaded_review_text(
+                        state_dir,
+                        review,
+                        name=EXIT_FILE,
+                        text=f"{exit_code}\n",
+                    )
+                    if exit_error:
+                        print(
+                            f"review runner exit code was not persisted: {exit_error}",
+                            file=sys.stderr,
+                        )
                 if previous_mask is None:
                     break
                 pending_signal = consume_pending_forwarded_signal()
@@ -862,11 +935,23 @@ def status(state_dir: pathlib.Path) -> dict[str, Any]:
             _reap_started_process(pid)
     if exit_code is None and not running:
         exit_code = 1
-        write_text_atomic(state_dir / EXIT_FILE, "1\n")
-        write_text_atomic(
-            state_dir / "runner-error.txt",
-            "review runner exited without recording a terminal result\n",
+        exit_error = _write_loaded_review_text(
+            state_dir,
+            review,
+            name=EXIT_FILE,
+            text="1\n",
         )
+        diagnostic_error = _write_loaded_review_text(
+            state_dir,
+            review,
+            name="runner-error.txt",
+            text="review runner exited without recording a terminal result\n",
+        )
+        if exit_error or diagnostic_error:
+            raise ReviewError(
+                "cannot persist missing runner terminal state: "
+                + "; ".join(error for error in (exit_error, diagnostic_error) if error)
+            )
     fallback_workspace_retained = not running and _should_retain_fallback_workspace(
         state_dir=state_dir,
         state=state,
@@ -1000,9 +1085,21 @@ def _cleanup_terminal_workspace(
     deadline: float | None,
     force: bool,
 ) -> int:
-    cleanup_lock_path = state_dir / CLEANUP_LOCK_FILE
-    cleanup_error_path = state_dir / "cleanup-error.txt"
-    with cleanup_lock_path.open("a+b") as cleanup_lock:
+    marker = _load_state_marker(state_dir)
+    if marker.private_cleanup is not None:
+        cleanup_lock, lock_error = open_bound_review_lock(
+            state_dir,
+            expected=marker.private_cleanup,
+            name=CLEANUP_LOCK_FILE,
+        )
+        if lock_error or cleanup_lock is None:
+            raise ReviewError(
+                "cannot open preparation-bound cleanup lock: "
+                f"{lock_error or 'lock handle is unavailable'}"
+            )
+    else:
+        cleanup_lock = (state_dir / CLEANUP_LOCK_FILE).open("a+b")
+    with cleanup_lock:
         if not _acquire_cleanup_lock(cleanup_lock, deadline=deadline):
             return 124
         cleanup_lock_transferred = False
@@ -1081,32 +1178,80 @@ def _cleanup_terminal_workspace(
                 cleanup_completed, cleanup_error = _cleanup_before_deadline(
                     review,
                     deadline=deadline,
-                    cleanup_lock_fd=cleanup_lock.fileno(),
+                    cleanup_lock_fds=_cleanup_lock_fds(cleanup_lock),
                     lock_handoff=transfer_cleanup_lock,
                 )
             if not cleanup_completed:
                 return 124
             if cleanup_error:
-                write_text_atomic(cleanup_error_path, cleanup_error + "\n")
+                diagnostic_error = _write_loaded_review_text(
+                    state_dir,
+                    review,
+                    name="cleanup-error.txt",
+                    text=cleanup_error + "\n",
+                )
+                if diagnostic_error:
+                    raise ReviewError(
+                        "cleanup failed and its diagnostic was not persisted: "
+                        f"{cleanup_error}; {diagnostic_error}"
+                    )
                 return 1
-            try:
-                cleanup_error_path.unlink(missing_ok=True)
-            except OSError as error:
+            diagnostic_error = _remove_loaded_review_text(
+                state_dir,
+                review,
+                name="cleanup-error.txt",
+            )
+            if diagnostic_error:
                 raise ReviewError(
-                    f"cannot clear resolved cleanup error {cleanup_error_path}: {error}"
-                ) from error
-            if cleanup_error_path.is_file():
-                return 1
+                    f"cannot clear resolved cleanup error: {diagnostic_error}"
+                )
             return 0
         finally:
             if not cleanup_lock_transferred:
-                fcntl.flock(cleanup_lock.fileno(), fcntl.LOCK_UN)
+                for descriptor in reversed(_cleanup_lock_fds(cleanup_lock)):
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+
+def _cleanup_lock_fds(handle) -> tuple[int, ...]:
+    if isinstance(handle, BoundReviewLock):
+        return handle.filenos()
+    return (handle.fileno(),)
 
 
 def _acquire_cleanup_lock(handle, *, deadline: float | None) -> bool:
+    primary_descriptor = handle.fileno()
+    if not _acquire_cleanup_lock_descriptor(primary_descriptor, deadline=deadline):
+        return False
+    acquired = [primary_descriptor]
+    if isinstance(handle, BoundReviewLock):
+        compatibility_error = handle.open_compatibility_lock(CLEANUP_LOCK_FILE)
+        if compatibility_error:
+            fcntl.flock(primary_descriptor, fcntl.LOCK_UN)
+            raise ReviewError(
+                "cannot open preparation-bound cleanup compatibility lock: "
+                f"{compatibility_error}"
+            )
+        descriptors = list(handle.filenos()[1:])
+    else:
+        descriptors = []
+    for descriptor in descriptors:
+        if _acquire_cleanup_lock_descriptor(descriptor, deadline=deadline):
+            acquired.append(descriptor)
+            continue
+        for acquired_descriptor in reversed(acquired):
+            fcntl.flock(acquired_descriptor, fcntl.LOCK_UN)
+        return False
+    return True
+
+
+def _acquire_cleanup_lock_descriptor(
+    descriptor: int,
+    *,
+    deadline: float | None,
+) -> bool:
     while True:
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return True
         except BlockingIOError:
             if deadline is not None and time.monotonic() >= deadline:
@@ -1129,7 +1274,7 @@ def _cleanup_before_deadline(
     review: ReviewWorkspace | LegacyReviewWorkspace,
     *,
     deadline: float | None,
-    cleanup_lock_fd: int,
+    cleanup_lock_fds: tuple[int, ...],
     lock_handoff: Callable[[], None],
 ) -> tuple[bool, str | None]:
     if deadline is None:
@@ -1146,10 +1291,10 @@ def _cleanup_before_deadline(
                     sys.executable,
                     str(worker_path),
                     str(review.container_dir),
-                    str(cleanup_lock_fd),
+                    *(str(descriptor) for descriptor in cleanup_lock_fds),
                 ),
                 close_fds=True,
-                pass_fds=(cleanup_lock_fd,),
+                pass_fds=cleanup_lock_fds,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,

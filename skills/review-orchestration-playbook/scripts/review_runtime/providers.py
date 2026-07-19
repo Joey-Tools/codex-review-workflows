@@ -112,6 +112,7 @@ from .workspace import (
     build_preflight_evidence,
     remove_private_review_artifacts,
     validate_external_workspace,
+    write_bound_runner_error,
 )
 
 
@@ -12218,6 +12219,40 @@ def _finish(
     return Outcome(1, None, tuple(attempts))
 
 
+def _persist_runner_error(review: ReviewWorkspace, text: str) -> str | None:
+    """Persist a runner diagnostic without following a replaced container path."""
+
+    diagnostic_error = write_bound_runner_error(
+        review.container_dir,
+        expected=review.private_cleanup,
+        text=text,
+    )
+    if diagnostic_error:
+        print(
+            text.rstrip("\n")
+            + f"; runner diagnostic was not persisted: {diagnostic_error}",
+            file=sys.stderr,
+        )
+    return diagnostic_error
+
+
+def _persist_failure_artifacts(
+    review: ReviewWorkspace,
+    text: str,
+    attempts: Iterable[Attempt],
+) -> bool:
+    """Persist failure artifacts only while the review container remains bound."""
+
+    if _persist_runner_error(review, text):
+        return False
+    try:
+        _write_attempts(review, attempts)
+    except ReviewError as error:
+        print(f"review attempts were not persisted: {error}", file=sys.stderr)
+        return False
+    return True
+
+
 def _finish_claude_auth_required(
     review: ReviewWorkspace,
     attempts: list[Attempt],
@@ -12253,11 +12288,11 @@ def _finish_claude_auth_required(
             },
         },
     )
-    write_text_atomic(
-        review.container_dir / "runner-error.txt",
+    _persist_failure_artifacts(
+        review,
         f"Claude Code authentication requires user action: {detail}. {action}\n",
+        attempts,
     )
-    _write_attempts(review, attempts)
     return Outcome(2, None, tuple(attempts))
 
 
@@ -12323,21 +12358,19 @@ def run_review(
     egress_consent: str | None = None,
 ) -> Outcome:
     if reviewer not in ("codex", "claude"):
-        write_text_atomic(
-            review.container_dir / "runner-error.txt", f"unknown reviewer: {reviewer}\n"
-        )
+        _persist_runner_error(review, f"unknown reviewer: {reviewer}\n")
         return Outcome(2, None, tuple())
 
     if reviewer == "claude":
         if egress_consent not in CLAUDE_EGRESS_CONSENTS:
-            write_text_atomic(
-                review.container_dir / "runner-error.txt",
+            _persist_runner_error(
+                review,
                 "Claude-family review requires an explicit egress-consent reason.\n",
             )
             return Outcome(2, None, tuple())
     elif egress_consent is not None:
-        write_text_atomic(
-            review.container_dir / "runner-error.txt",
+        _persist_runner_error(
+            review,
             "egress-consent is valid only for the Claude-family reviewer.\n",
         )
         return Outcome(2, None, tuple())
@@ -12355,10 +12388,10 @@ def run_review(
             if private_cleanup_error
             else ""
         )
-        write_text_atomic(
-            review.container_dir / "runner-error.txt",
-            f"review egress workspace preflight failed: {error}{cleanup_suffix}\n",
+        diagnostic = (
+            f"review egress workspace preflight failed: {error}{cleanup_suffix}\n"
         )
+        _persist_runner_error(review, diagnostic)
         return Outcome(2, None, tuple())
 
     private_cleanup_error = remove_private_review_artifacts(
@@ -12366,10 +12399,10 @@ def run_review(
         expected=review.private_cleanup,
     )
     if private_cleanup_error:
-        write_text_atomic(
-            review.container_dir / "runner-error.txt",
-            f"review egress private artifact cleanup failed: {private_cleanup_error}\n",
+        diagnostic = (
+            f"review egress private artifact cleanup failed: {private_cleanup_error}\n"
         )
+        _persist_runner_error(review, diagnostic)
         return Outcome(2, None, tuple())
 
     write_json(review.container_dir / "preflight.json", preflight_evidence)
@@ -12413,7 +12446,7 @@ def run_review(
                 attempts=attempts,
             )
         except FileNotFoundError as error:
-            write_text_atomic(review.container_dir / "runner-error.txt", f"{error}\n")
+            _persist_runner_error(review, f"{error}\n")
             return Outcome(127, None, tuple())
         except (
             ReviewTimeoutError,
@@ -12421,11 +12454,11 @@ def run_review(
             ReviewOutputLimitError,
             ReviewProcessLeakError,
         ) as error:
-            write_text_atomic(
-                review.container_dir / "runner-error.txt",
+            _persist_failure_artifacts(
+                review,
                 f"Codex review was inconclusive: {error}\n",
+                attempts,
             )
-            _write_attempts(review, attempts)
             return Outcome(75, None, tuple(attempts))
         return _finish(review, attempts, final_text)
 
@@ -12483,13 +12516,13 @@ def run_review(
                 ClaudeProvenanceVerifierUnavailable,
             ),
         ):
-            write_text_atomic(
-                review.container_dir / "runner-error.txt",
+            _persist_failure_artifacts(
+                review,
                 "Explicit CODEX_REVIEW_CLAUDE_PATH lacks a required secure "
                 "runtime prerequisite; refusing Copilot fallback: "
                 f"{error}\n",
+                attempts,
             )
-            _write_attempts(review, attempts)
             return Outcome(2, None, tuple(attempts))
         claude_available = False
         write_text_atomic(
@@ -12505,19 +12538,19 @@ def run_review(
         ReviewOutputLimitError,
         ReviewProcessLeakError,
     ) as error:
-        write_text_atomic(
-            review.container_dir / "runner-error.txt",
+        _persist_failure_artifacts(
+            review,
             f"Claude Code validation was inconclusive: {error}\n",
+            [],
         )
-        write_json(review.container_dir / "attempts.json", [])
         return Outcome(75, None, tuple(attempts))
     except ReviewError as error:
-        write_text_atomic(
-            review.container_dir / "runner-error.txt",
+        _persist_failure_artifacts(
+            review,
             "Claude Code executable validation failed; refusing Copilot fallback: "
             f"{error}\n",
+            [],
         )
-        write_json(review.container_dir / "attempts.json", [])
         return Outcome(2, None, tuple(attempts))
     if claude_available and claude_executable is not None:
 
@@ -12555,6 +12588,9 @@ def run_review(
             ReviewOutputLimitError,
             ReviewProcessLeakError,
         ) as error:
+            initial_diagnostic = f"Claude Code validation was inconclusive: {error}\n"
+            if _persist_runner_error(review, initial_diagnostic):
+                return Outcome(75, None, tuple(attempts))
             persistence_attempt = getattr(
                 error,
                 "_codex_claude_persistence_attempt",
@@ -12585,16 +12621,16 @@ def run_review(
                         },
                     },
                 )
-            write_text_atomic(
-                review.container_dir / "runner-error.txt",
-                f"Claude Code validation was inconclusive: {error}\n"
+            _persist_failure_artifacts(
+                review,
+                initial_diagnostic
                 + (
                     f"{persistence_diagnostic}\n"
                     if persistence_diagnostic is not None
                     else ""
                 ),
+                attempts,
             )
-            _write_attempts(review, attempts)
             return Outcome(75, None, tuple(attempts))
         except ClaudeKeychainCredentialUnavailable as error:
             persistence_attempt = getattr(
@@ -12629,13 +12665,13 @@ def run_review(
                     ClaudeProvenanceVerifierUnavailable,
                 ),
             ):
-                write_text_atomic(
-                    review.container_dir / "runner-error.txt",
+                _persist_failure_artifacts(
+                    review,
                     "Explicit CODEX_REVIEW_CLAUDE_PATH lacks a required secure "
                     "runtime prerequisite; refusing Copilot fallback: "
                     f"{error}\n",
+                    attempts,
                 )
-                _write_attempts(review, attempts)
                 return Outcome(2, None, tuple(attempts))
             category = "unavailable"
             final_text = None
@@ -12648,8 +12684,8 @@ def run_review(
                 review,
                 error,
             )
-            write_text_atomic(
-                review.container_dir / "runner-error.txt",
+            _persist_failure_artifacts(
+                review,
                 "Claude Code failed executable validation; "
                 f"refusing Copilot fallback: {error}\n"
                 + (
@@ -12657,8 +12693,8 @@ def run_review(
                     if persistence_diagnostic is not None
                     else ""
                 ),
+                attempts,
             )
-            _write_attempts(review, attempts)
             return Outcome(2, None, tuple(attempts))
         if final_text:
             return _finish(review, attempts, final_text)
@@ -12677,29 +12713,31 @@ def run_review(
             return _finish(review, attempts, None)
 
     if egress_consent not in COPILOT_EGRESS_CONSENTS:
-        write_text_atomic(
-            review.container_dir / "runner-error.txt",
+        _persist_failure_artifacts(
+            review,
             "Claude Code was unavailable or lacked model entitlement, but "
             "explicit-claude-review does not authorize GitHub Copilot fallback.\n",
+            attempts,
         )
-        _write_attempts(review, attempts)
         return Outcome(2, None, tuple(attempts))
 
     try:
         copilot_available = resolve_reviewer_executable("copilot") is not None
     except ReviewError as error:
-        write_text_atomic(
-            review.container_dir / "runner-error.txt",
+        _persist_failure_artifacts(
+            review,
             f"Copilot CLI executable validation failed: {error}\n",
+            attempts,
         )
-        _write_attempts(review, attempts)
         return Outcome(2, None, tuple(attempts))
     if not copilot_available:
-        write_text_atomic(
-            review.container_dir / "runner-error.txt",
+        diagnostic_error = _persist_runner_error(
+            review,
             "Claude Code was unavailable or lacked model entitlement, and "
             "Copilot CLI is unavailable.\n",
         )
+        if diagnostic_error:
+            return Outcome(1, None, tuple(attempts))
         return _finish(review, attempts, None)
     copilot_env = _review_environment(
         review=review,
@@ -12721,17 +12759,17 @@ def run_review(
         ReviewOutputLimitError,
         ReviewProcessLeakError,
     ) as error:
-        write_text_atomic(
-            review.container_dir / "runner-error.txt",
+        _persist_failure_artifacts(
+            review,
             f"Copilot review was inconclusive: {error}\n",
+            attempts,
         )
-        _write_attempts(review, attempts)
         return Outcome(75, None, tuple(attempts))
     except (FileNotFoundError, ReviewError) as error:
-        write_text_atomic(
-            review.container_dir / "runner-error.txt",
+        _persist_failure_artifacts(
+            review,
             f"Copilot CLI became unavailable or failed executable validation: {error}\n",
+            attempts,
         )
-        _write_attempts(review, attempts)
         return Outcome(2, None, tuple(attempts))
     return _finish(review, attempts, final_text)

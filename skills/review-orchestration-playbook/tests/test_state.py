@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import pathlib
 import signal
@@ -239,7 +241,7 @@ class StatefulLifecycleTest(unittest.TestCase):
         victim = self.review.workspace_root / "victim.txt"
         victim.write_text("retain\n", encoding="utf-8")
 
-        with self.assertRaisesRegex(ReviewError, "partial container cleanup failed"):
+        with self.assertRaisesRegex(ReviewError, "preparation-bound cleanup lock"):
             state.cleanup(
                 self.review.container_dir,
                 timeout_seconds=state.FINAL_CLEANUP_TIMEOUT_SECONDS,
@@ -746,11 +748,16 @@ class StatefulLifecycleTest(unittest.TestCase):
         with lock_path.open("a+b") as cleanup_lock:
             state.fcntl.flock(cleanup_lock.fileno(), state.fcntl.LOCK_EX)
             started = time.monotonic()
-            exit_code = state.wait(self.review.container_dir, timeout_seconds=0.05)
+            with mock.patch.object(state, "_cleanup_before_deadline") as cleanup:
+                exit_code = state.wait(
+                    self.review.container_dir,
+                    timeout_seconds=0.05,
+                )
             elapsed = time.monotonic() - started
 
         self.assertEqual(exit_code, 124)
         self.assertLess(elapsed, 0.5)
+        cleanup.assert_not_called()
 
     def test_wait_rejects_negative_and_non_finite_timeouts(self) -> None:
         for timeout in (-0.1, float("nan"), float("inf"), float("-inf")):
@@ -1089,6 +1096,50 @@ time.sleep(0.2)
         unblock.assert_called_once_with()
         self.assertEqual((state_dir / state.EXIT_FILE).read_text().strip(), "0")
 
+    def test_runner_does_not_publish_exit_to_replaced_container(self) -> None:
+        state_dir = self.review.container_dir
+        moved_state_dir = state_dir.with_name(f"{state_dir.name}-moved")
+        state._write_state_marker(self.review)
+        write_json(
+            state_dir / state.STATE_FILE,
+            {
+                "version": state.STATE_SCHEMA_VERSION,
+                "reviewer": "codex",
+                "workspace": self.review.to_json(),
+            },
+        )
+        stderr = io.StringIO()
+
+        def replace_container(**_kwargs):
+            state_dir.rename(moved_state_dir)
+            state_dir.mkdir(mode=0o700)
+            (state_dir / "sentinel").write_text("keep me\n", encoding="utf-8")
+            return mock.Mock(returncode=2)
+
+        try:
+            with (
+                mock.patch.object(state, "run_review", side_effect=replace_container),
+                contextlib.redirect_stderr(stderr),
+            ):
+                exit_code = state.run_state(state_dir=state_dir)
+
+            self.assertEqual(exit_code, 2)
+            self.assertEqual(
+                (state_dir / "sentinel").read_text(encoding="utf-8"),
+                "keep me\n",
+            )
+            self.assertFalse((state_dir / state.EXIT_FILE).exists())
+            self.assertFalse((state_dir / "runner-error.txt").exists())
+            self.assertFalse((moved_state_dir / state.EXIT_FILE).exists())
+            self.assertFalse((moved_state_dir / "runner-error.txt").exists())
+            self.assertIn("exit code was not persisted", stderr.getvalue())
+        finally:
+            if state_dir.is_dir():
+                (state_dir / "sentinel").unlink(missing_ok=True)
+                state_dir.rmdir()
+            if moved_state_dir.is_dir():
+                moved_state_dir.rename(state_dir)
+
     def test_runner_rejects_tampered_state_range_before_provider_launch(
         self,
     ) -> None:
@@ -1181,13 +1232,25 @@ time.sleep(0.2)
             },
         )
         runner_error_path = state_dir / "runner-error.txt"
-        original_write_text_atomic = state.write_text_atomic
+        original_write_bound_review_text = state.write_bound_review_text
 
-        def fail_runner_error_write(path: pathlib.Path, text: str) -> None:
-            if path == runner_error_path:
-                raise RuntimeError("runner error diagnostic unavailable")
-            original_write_text_atomic(path, text)
+        def fail_runner_error_write(
+            container: pathlib.Path,
+            *,
+            expected: PrivateCleanupEvidence,
+            name: str,
+            text: str,
+        ) -> str | None:
+            if name == "runner-error.txt":
+                return "runner error diagnostic unavailable"
+            return original_write_bound_review_text(
+                container,
+                expected=expected,
+                name=name,
+                text=text,
+            )
 
+        stderr = io.StringIO()
         with (
             mock.patch.object(
                 state,
@@ -1199,9 +1262,10 @@ time.sleep(0.2)
             ),
             mock.patch.object(
                 state,
-                "write_text_atomic",
+                "write_bound_review_text",
                 side_effect=fail_runner_error_write,
             ),
+            contextlib.redirect_stderr(stderr),
         ):
             exit_code = state.run_state(state_dir=state_dir)
 
@@ -1211,6 +1275,75 @@ time.sleep(0.2)
             str(128 + signal.SIGTERM),
         )
         self.assertFalse(runner_error_path.exists())
+        self.assertIn("runner diagnostic was not persisted", stderr.getvalue())
+
+    def test_cleanup_worker_identity_failure_does_not_write_replacement(self) -> None:
+        self.write_completed_state()
+        state_dir = self.review.container_dir
+        moved_state_dir = state_dir.with_name(f"{state_dir.name}-moved")
+        state_dir.rename(moved_state_dir)
+        state_dir.mkdir(mode=0o700)
+        sentinel = state_dir / "sentinel"
+        sentinel.write_text("keep me\n", encoding="utf-8")
+        shutil.copy2(
+            moved_state_dir / state.STATE_MARKER, state_dir / state.STATE_MARKER
+        )
+        shutil.copy2(moved_state_dir / state.STATE_FILE, state_dir / state.STATE_FILE)
+        stderr = io.StringIO()
+        lock_path = moved_state_dir / "handoff.lock"
+        try:
+            with (
+                lock_path.open("a+b") as cleanup_lock,
+                contextlib.redirect_stderr(stderr),
+            ):
+                exit_code = cleanup_worker.main(
+                    [str(state_dir), str(cleanup_lock.fileno())]
+                )
+
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep me\n")
+            self.assertFalse((state_dir / "cleanup-error.txt").exists())
+            self.assertFalse((moved_state_dir / "cleanup-error.txt").exists())
+            self.assertIn("cleanup worker failed", stderr.getvalue())
+            self.assertIn(
+                "container does not match preparation identity", stderr.getvalue()
+            )
+        finally:
+            sentinel.unlink(missing_ok=True)
+            (state_dir / state.STATE_MARKER).unlink(missing_ok=True)
+            (state_dir / state.STATE_FILE).unlink(missing_ok=True)
+            state_dir.rmdir()
+            moved_state_dir.rename(state_dir)
+
+    def test_cleanup_identity_failure_does_not_create_replacement_lock(self) -> None:
+        self.write_completed_state()
+        state_dir = self.review.container_dir
+        moved_state_dir = state_dir.with_name(f"{state_dir.name}-moved")
+        state_dir.rename(moved_state_dir)
+        state_dir.mkdir(mode=0o700)
+        shutil.copy2(
+            moved_state_dir / state.STATE_MARKER, state_dir / state.STATE_MARKER
+        )
+        shutil.copy2(moved_state_dir / state.STATE_FILE, state_dir / state.STATE_FILE)
+        try:
+            with self.assertRaisesRegex(
+                ReviewError,
+                "preparation-bound cleanup lock",
+            ):
+                state.cleanup(
+                    state_dir,
+                    timeout_seconds=state.FINAL_CLEANUP_TIMEOUT_SECONDS,
+                )
+
+            self.assertFalse((state_dir / state.CLEANUP_LOCK_FILE).exists())
+            self.assertFalse((state_dir / "cleanup-error.txt").exists())
+            self.assertFalse((moved_state_dir / state.CLEANUP_LOCK_FILE).exists())
+            self.assertFalse((moved_state_dir / "cleanup-error.txt").exists())
+        finally:
+            (state_dir / state.STATE_MARKER).unlink(missing_ok=True)
+            (state_dir / state.STATE_FILE).unlink(missing_ok=True)
+            state_dir.rmdir()
+            moved_state_dir.rename(state_dir)
 
     def test_runner_installs_signal_handler_before_unblocking_inherited_mask(
         self,

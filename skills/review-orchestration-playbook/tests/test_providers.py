@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import errno
+import io
 import itertools
 import json
 import multiprocessing
@@ -17791,6 +17792,128 @@ class ProviderPolicyTest(unittest.TestCase):
 
     @mock.patch.object(providers, "_review_environment", return_value={})
     @mock.patch.object(providers, "_run_model_chain")
+    def test_cleanup_failure_after_container_replacement_uses_stderr(
+        self,
+        run_model_chain: mock.Mock,
+        environment: mock.Mock,
+    ) -> None:
+        container = self.review.container_dir
+        moved_container = container.with_name(f"{container.name}-moved")
+        stderr = io.StringIO()
+
+        def replace_container(*_args, **_kwargs):
+            container.rename(moved_container)
+            container.mkdir(mode=0o700)
+            (container / "sentinel").write_text("keep me\n", encoding="utf-8")
+            return "forced cleanup failure"
+
+        try:
+            with (
+                mock.patch.object(
+                    providers,
+                    "remove_private_review_artifacts",
+                    side_effect=replace_container,
+                ),
+                contextlib.redirect_stderr(stderr),
+            ):
+                outcome = providers.run_review(
+                    review=self.review,
+                    reviewer="codex",
+                )
+
+            self.assertEqual(outcome.returncode, 2)
+            run_model_chain.assert_not_called()
+            environment.assert_not_called()
+            self.assertEqual(
+                (container / "sentinel").read_text(encoding="utf-8"),
+                "keep me\n",
+            )
+            self.assertFalse((container / "runner-error.txt").exists())
+            self.assertFalse((moved_container / "runner-error.txt").exists())
+            self.assertIn(
+                "review egress private artifact cleanup failed", stderr.getvalue()
+            )
+            self.assertIn("runner diagnostic was not persisted", stderr.getvalue())
+        finally:
+            if container.is_dir():
+                (container / "sentinel").unlink(missing_ok=True)
+                (container / "runner-error.txt").unlink(missing_ok=True)
+                container.rmdir()
+            if moved_container.is_dir():
+                moved_container.rename(container)
+
+    def test_unknown_reviewer_does_not_write_replaced_container(self) -> None:
+        container = self.review.container_dir
+        moved_container = container.with_name(f"{container.name}-moved")
+        stderr = io.StringIO()
+        container.rename(moved_container)
+        container.mkdir(mode=0o700)
+        sentinel = container / "sentinel"
+        sentinel.write_text("keep me\n", encoding="utf-8")
+        try:
+            with contextlib.redirect_stderr(stderr):
+                outcome = providers.run_review(
+                    review=self.review,
+                    reviewer="unknown",
+                )
+
+            self.assertEqual(outcome.returncode, 2)
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep me\n")
+            self.assertFalse((container / "runner-error.txt").exists())
+            self.assertFalse((moved_container / "runner-error.txt").exists())
+            self.assertIn("unknown reviewer", stderr.getvalue())
+            self.assertIn("runner diagnostic was not persisted", stderr.getvalue())
+        finally:
+            sentinel.unlink(missing_ok=True)
+            (container / "runner-error.txt").unlink(missing_ok=True)
+            container.rmdir()
+            moved_container.rename(container)
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_post_preflight_failure_does_not_write_replaced_container(
+        self,
+        run_model_chain: mock.Mock,
+        environment: mock.Mock,
+    ) -> None:
+        container = self.review.container_dir
+        moved_container = container.with_name(f"{container.name}-moved")
+        stderr = io.StringIO()
+
+        def replace_container(**_kwargs):
+            container.rename(moved_container)
+            container.mkdir(mode=0o700)
+            (container / "sentinel").write_text("keep me\n", encoding="utf-8")
+            raise FileNotFoundError("reviewer disappeared")
+
+        run_model_chain.side_effect = replace_container
+        try:
+            with contextlib.redirect_stderr(stderr):
+                outcome = providers.run_review(
+                    review=self.review,
+                    reviewer="codex",
+                )
+
+            self.assertEqual(outcome.returncode, 127)
+            environment.assert_called_once()
+            self.assertEqual(
+                (container / "sentinel").read_text(encoding="utf-8"),
+                "keep me\n",
+            )
+            self.assertFalse((container / "runner-error.txt").exists())
+            self.assertFalse((moved_container / "runner-error.txt").exists())
+            self.assertIn("reviewer disappeared", stderr.getvalue())
+            self.assertIn("runner diagnostic was not persisted", stderr.getvalue())
+        finally:
+            if container.is_dir():
+                (container / "sentinel").unlink(missing_ok=True)
+                (container / "runner-error.txt").unlink(missing_ok=True)
+                container.rmdir()
+            if moved_container.is_dir():
+                moved_container.rename(container)
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(providers, "_run_model_chain")
     def test_private_artifact_replacement_blocks_codex_before_launch(
         self,
         run_model_chain: mock.Mock,
@@ -17842,10 +17965,12 @@ class ProviderPolicyTest(unittest.TestCase):
         victim = container / "replacement-victim"
         victim.write_text("keep me\n", encoding="utf-8")
 
-        outcome = providers.run_review(
-            review=self.review,
-            reviewer="codex",
-        )
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            outcome = providers.run_review(
+                review=self.review,
+                reviewer="codex",
+            )
 
         self.assertEqual(outcome.returncode, 2)
         run_model_chain.assert_not_called()
@@ -17859,8 +17984,84 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         self.assertFalse((container / "preflight.json").exists())
         self.assertFalse((moved_container / "preflight.json").exists())
-        error = (container / "runner-error.txt").read_text(encoding="utf-8")
-        self.assertIn("container does not match preparation identity", error)
+        self.assertFalse((container / "runner-error.txt").exists())
+        self.assertFalse((moved_container / "runner-error.txt").exists())
+        self.assertIn("review egress workspace preflight failed", stderr.getvalue())
+        self.assertIn(
+            "container does not match preparation identity", stderr.getvalue()
+        )
+        self.assertIn("runner diagnostic was not persisted", stderr.getvalue())
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_private_container_symlink_is_not_used_for_diagnostic(
+        self,
+        run_model_chain: mock.Mock,
+        environment: mock.Mock,
+    ) -> None:
+        container = self.review.container_dir
+        moved_container = container.with_name(f"{container.name}-moved")
+        victim = container.with_name(f"{container.name}-victim")
+        container.rename(moved_container)
+        victim.mkdir(mode=0o700)
+        sentinel = victim / "sentinel"
+        sentinel.write_text("keep me\n", encoding="utf-8")
+        container.symlink_to(victim, target_is_directory=True)
+        stderr = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(stderr):
+                outcome = providers.run_review(
+                    review=self.review,
+                    reviewer="codex",
+                )
+
+            self.assertEqual(outcome.returncode, 2)
+            run_model_chain.assert_not_called()
+            environment.assert_not_called()
+            self.assertTrue(container.is_symlink())
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep me\n")
+            self.assertFalse((victim / "runner-error.txt").exists())
+            self.assertFalse((moved_container / "runner-error.txt").exists())
+            self.assertFalse((victim / "preflight.json").exists())
+            self.assertFalse((moved_container / "preflight.json").exists())
+            self.assertIn("review egress workspace preflight failed", stderr.getvalue())
+            self.assertIn("runner diagnostic was not persisted", stderr.getvalue())
+        finally:
+            container.unlink(missing_ok=True)
+            moved_container.rename(container)
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_missing_private_container_is_not_recreated_for_diagnostic(
+        self,
+        run_model_chain: mock.Mock,
+        environment: mock.Mock,
+    ) -> None:
+        container = self.review.container_dir
+        moved_container = container.with_name(f"{container.name}-moved")
+        container.rename(moved_container)
+        stderr = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(stderr):
+                outcome = providers.run_review(
+                    review=self.review,
+                    reviewer="codex",
+                )
+
+            self.assertEqual(outcome.returncode, 2)
+            run_model_chain.assert_not_called()
+            environment.assert_not_called()
+            self.assertFalse(container.exists())
+            self.assertFalse((moved_container / "runner-error.txt").exists())
+            self.assertIn("review egress workspace preflight failed", stderr.getvalue())
+            self.assertIn("private artifact container is missing", stderr.getvalue())
+            self.assertIn("runner diagnostic was not persisted", stderr.getvalue())
+        finally:
+            if container.is_dir():
+                (container / "runner-error.txt").unlink(missing_ok=True)
+                container.rmdir()
+            if moved_container.is_dir():
+                moved_container.rename(container)
 
     @mock.patch.object(providers, "_run_model_chain")
     def test_preflight_builder_failure_scrubs_private_artifacts(

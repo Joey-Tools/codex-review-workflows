@@ -367,6 +367,88 @@ class PrivateCleanupEvidence:
         }
 
 
+class BoundReviewLock:
+    """Own modern and compatibility cleanup-lock descriptors."""
+
+    def __init__(self, descriptor: int) -> None:
+        self._descriptor: int | None = descriptor
+        self._compatibility_descriptor: int | None = None
+
+    def fileno(self) -> int:
+        if self._descriptor is None:
+            raise ValueError("I/O operation on closed review lock")
+        return self._descriptor
+
+    def filenos(self) -> tuple[int, ...]:
+        descriptors = [self.fileno()]
+        if self._compatibility_descriptor is not None:
+            descriptors.append(self._compatibility_descriptor)
+        return tuple(descriptors)
+
+    def open_compatibility_lock(self, name: str) -> str | None:
+        if name != "cleanup.lock":
+            return "review runtime compatibility lock name is not allowed"
+        if self._compatibility_descriptor is not None:
+            return None
+
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(name, flags, 0o600, dir_fd=self.fileno())
+            opened = os.fstat(descriptor)
+            current = os.stat(
+                name,
+                dir_fd=self.fileno(),
+                follow_symlinks=False,
+            )
+            for metadata in (opened, current):
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    return "review runtime compatibility lock is not a regular file"
+                if metadata.st_uid != os.geteuid():
+                    return "review runtime compatibility lock has an unexpected owner"
+                if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                    return (
+                        "review runtime compatibility lock must not be group or "
+                        "other writable"
+                    )
+            if _private_cleanup_identity(opened) != _private_cleanup_identity(current):
+                return "review runtime compatibility lock changed while opening"
+            self._compatibility_descriptor = descriptor
+            descriptor = None
+        except OSError as error:
+            return f"cannot securely open review runtime compatibility lock: {error}"
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        return None
+
+    def close(self) -> None:
+        first_error: OSError | None = None
+        for attribute in ("_compatibility_descriptor", "_descriptor"):
+            descriptor = getattr(self, attribute)
+            if descriptor is None:
+                continue
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                if first_error is None:
+                    first_error = error
+            setattr(self, attribute, None)
+        if first_error is not None:
+            raise first_error
+
+    def __enter__(self) -> BoundReviewLock:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+
 @dataclass(frozen=True)
 class ReviewWorkspace:
     source_root: pathlib.Path
@@ -1953,6 +2035,180 @@ def remove_private_review_artifacts(
         container,
         unlink_bound_artifacts,
     )
+
+
+def write_bound_review_text(
+    container: pathlib.Path,
+    *,
+    expected: PrivateCleanupEvidence,
+    name: str,
+    text: str,
+) -> str | None:
+    """Persist one runtime text artifact inside the preparation-bound container."""
+
+    if name not in {"cleanup-error.txt", "exit-code", "runner-error.txt"}:
+        return "review runtime text artifact name is not allowed"
+
+    try:
+        encoded = text.encode("utf-8")
+    except UnicodeEncodeError as error:
+        return f"cannot encode runner diagnostic: {error}"
+
+    def persist_text(
+        _parent_descriptor: int,
+        container_descriptor: int,
+    ) -> list[str]:
+        if (
+            _cleanup_identity_evidence(os.fstat(container_descriptor))
+            != expected.container
+        ):
+            return ["private artifact container does not match preparation identity"]
+
+        target_name = name
+        temporary_name = f".{target_name}.{uuid.uuid4().hex}"
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor: int | None = None
+        handle: BinaryIO | None = None
+        try:
+            descriptor = os.open(
+                temporary_name,
+                flags,
+                0o600,
+                dir_fd=container_descriptor,
+            )
+            handle = os.fdopen(descriptor, "wb")
+            descriptor = None
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+            handle.close()
+            handle = None
+            os.replace(
+                temporary_name,
+                target_name,
+                src_dir_fd=container_descriptor,
+                dst_dir_fd=container_descriptor,
+            )
+            os.fsync(container_descriptor)
+        except OSError as error:
+            return [f"cannot persist review runtime text artifact: {error}"]
+        finally:
+            if handle is not None:
+                handle.close()
+            elif descriptor is not None:
+                os.close(descriptor)
+            try:
+                os.unlink(temporary_name, dir_fd=container_descriptor)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+        return []
+
+    return _operate_on_private_review_container(container, persist_text)
+
+
+def write_bound_runner_error(
+    container: pathlib.Path,
+    *,
+    expected: PrivateCleanupEvidence,
+    text: str,
+) -> str | None:
+    return write_bound_review_text(
+        container,
+        expected=expected,
+        name="runner-error.txt",
+        text=text,
+    )
+
+
+def remove_bound_review_text(
+    container: pathlib.Path,
+    *,
+    expected: PrivateCleanupEvidence,
+    name: str,
+) -> str | None:
+    """Remove one runtime text artifact from the preparation-bound container."""
+
+    if name not in {"cleanup-error.txt", "exit-code", "runner-error.txt"}:
+        return "review runtime text artifact name is not allowed"
+
+    def remove_text(
+        _parent_descriptor: int,
+        container_descriptor: int,
+    ) -> list[str]:
+        if (
+            _cleanup_identity_evidence(os.fstat(container_descriptor))
+            != expected.container
+        ):
+            return ["private artifact container does not match preparation identity"]
+        try:
+            os.unlink(name, dir_fd=container_descriptor)
+        except FileNotFoundError:
+            return []
+        except OSError as error:
+            return [f"cannot remove review runtime text artifact: {error}"]
+        try:
+            os.fsync(container_descriptor)
+        except OSError as error:
+            return [f"cannot sync removed review runtime text artifact: {error}"]
+        return []
+
+    return _operate_on_private_review_container(container, remove_text)
+
+
+def open_bound_review_lock(
+    container: pathlib.Path,
+    *,
+    expected: PrivateCleanupEvidence,
+    name: str,
+) -> tuple[BoundReviewLock | None, str | None]:
+    """Duplicate the preparation-bound container descriptor for cleanup locking."""
+
+    if name != "cleanup.lock":
+        return None, "review runtime lock name is not allowed"
+
+    handle: BoundReviewLock | None = None
+
+    def open_lock(
+        _parent_descriptor: int,
+        container_descriptor: int,
+    ) -> list[str]:
+        nonlocal handle
+        if (
+            _cleanup_identity_evidence(os.fstat(container_descriptor))
+            != expected.container
+        ):
+            return ["private artifact container does not match preparation identity"]
+
+        duplicate: int | None = None
+        try:
+            duplicate = os.dup(container_descriptor)
+            duplicate_identity = _cleanup_identity_evidence(os.fstat(duplicate))
+        except OSError as error:
+            if duplicate is not None:
+                os.close(duplicate)
+            return [f"cannot duplicate review runtime lock descriptor: {error}"]
+        if duplicate_identity != expected.container:
+            os.close(duplicate)
+            return ["duplicated review runtime lock changed identity"]
+        handle = BoundReviewLock(duplicate)
+        return []
+
+    lock_error = _operate_on_private_review_container(container, open_lock)
+    if lock_error:
+        if handle is not None:
+            handle.close()
+        return None, lock_error
+    if handle is None:
+        return None, "review runtime lock was not opened"
+    return handle, None
 
 
 def _remove_review_container_tree(

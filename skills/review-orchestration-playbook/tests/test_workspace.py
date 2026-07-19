@@ -1213,6 +1213,79 @@ class WorkspaceTest(unittest.TestCase):
             )
         )
 
+    def test_bound_cleanup_lock_rejects_compatibility_symlink_leaf(self) -> None:
+        review = self.prepare_range(self.base, self.head)
+        victim = review.container_dir / "lock-victim"
+        victim.write_text("keep me\n", encoding="utf-8")
+        lock_path = review.container_dir / "cleanup.lock"
+        lock_path.unlink(missing_ok=True)
+        lock_path.symlink_to(victim.name)
+
+        handle, lock_error = workspace_runtime.open_bound_review_lock(
+            review.container_dir,
+            expected=review.private_cleanup,
+            name="cleanup.lock",
+        )
+
+        self.assertIsNone(lock_error)
+        self.assertIsNotNone(handle)
+        if handle is not None:
+            compatibility_error = handle.open_compatibility_lock("cleanup.lock")
+            self.assertIn(
+                "cannot securely open review runtime compatibility lock",
+                compatibility_error or "",
+            )
+            handle.close()
+        self.assertTrue(lock_path.is_symlink())
+        self.assertEqual(victim.read_text(encoding="utf-8"), "keep me\n")
+
+    def test_bound_cleanup_lock_uses_open_container_after_path_swap(self) -> None:
+        review = self.prepare_range(self.base, self.head)
+        container = review.container_dir
+        moved_container = container.with_name(f"{container.name}-moved-lock-open")
+        sentinel = container / "replacement"
+        real_dup = workspace_runtime.os.dup
+        swapped = False
+
+        def swap_before_lock_dup(descriptor: int) -> int:
+            nonlocal swapped
+            if not swapped:
+                container.rename(moved_container)
+                container.mkdir(mode=0o700)
+                sentinel.write_text("keep me\n", encoding="utf-8")
+                swapped = True
+            return real_dup(descriptor)
+
+        handle = None
+        try:
+            with mock.patch.object(
+                workspace_runtime.os,
+                "dup",
+                side_effect=swap_before_lock_dup,
+            ):
+                handle, lock_error = workspace_runtime.open_bound_review_lock(
+                    container,
+                    expected=review.private_cleanup,
+                    name="cleanup.lock",
+                )
+
+            self.assertIsNone(lock_error)
+            self.assertIsNotNone(handle)
+            if handle is not None:
+                self.assertIsNone(handle.open_compatibility_lock("cleanup.lock"))
+            self.assertTrue(swapped)
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep me\n")
+            self.assertFalse((container / "cleanup.lock").exists())
+            self.assertTrue((moved_container / "cleanup.lock").is_file())
+        finally:
+            if handle is not None:
+                handle.close()
+            if container.is_dir():
+                sentinel.unlink(missing_ok=True)
+                container.rmdir()
+            if moved_container.is_dir():
+                moved_container.rename(container)
+
     def test_private_cleanup_rejects_container_moved_before_cleanup(self) -> None:
         review = self.prepare_range(self.base, self.head)
         container = review.container_dir
