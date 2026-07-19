@@ -92,11 +92,12 @@ Diagnostic and preflight evidence remain bounded audit surfaces. They use stable
 ## Validation
 
 - Post-integration frozen-range review found and fixed scope/scanner gaps: initialized submodule content can no longer enter `review.diff`; wrapped/triple/multiline and opposite-quote generic literals now participate in exact reduction proof; malformed closer prefixes remain blockers instead of disappearing or producing a reduction candidate; provider-specific and PEM events are charged exactly once regardless of later accepted/blocking classification; unselected legacy overlap covers raw and canonical Base64 representations during preparation and runtime catalog reload. `PublicPoolScannerTest`: 96 passed. Synthetic-token module: 217 passed.
-- Focused complete-path, catalog-reload, side-binding, quarantine-before-recursion, and failure-regression runs passed. The final lifecycle gate additionally passed 66 state-module tests, 31 cleanup/handoff/durability tests, 12 state-start tests, and the missing-to-concurrent-create durability race regressions.
+- Focused complete-path, catalog-reload, side-binding, quarantine-before-recursion, cleanup/handoff/durability, state-start, and missing-to-concurrent-create race regressions passed.
+- Independent frozen-range review exposed and fixed a retained-workspace cleanup retry gap: an unknown top-level cleanup quarantine now fails closed and preserves the cleanup error for manual recovery instead of treating a missing `workspace` name as success. An explicit rename integration test also confirms that `--no-renames` records the base source as `B` and the head destination as `H`; the existing runtime catalog-reload test proves the base-only renamed path remains enforced.
 - Latest `master` (`6dc2050`) was merged without rewriting history. Its Claude authentication, recovery-carrier, and refresh-lock fail-closed policies remain intact; authentication failure is not a Copilot fallback reason.
 - Provider module: 462 tests run, 3 skipped.
-- Python 3.13 full suite: 1221 tests run, 4 skipped.
-- Python 3.10.19 full suite: 1221 tests run, 4 skipped.
+- Python 3.13 full suite: 1224 tests run, 4 skipped.
+- Python 3.10.19 full suite: 1224 tests run, 4 skipped.
 - `ruff check` and `ruff format --check` on all 11 Python files changed from the refreshed `master`: passed.
 - `git diff --check`: passed.
 - Fixed-range Codex review and PR readiness evidence are recorded in the delivery thread and PR.

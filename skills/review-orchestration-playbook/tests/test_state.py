@@ -22,6 +22,7 @@ from review_runtime import cleanup_worker, providers, state  # noqa: E402
 from review_runtime.common import ReviewError, write_json  # noqa: E402
 from review_runtime.workspace import (  # noqa: E402
     PRIVATE_CHANGED_PATHS_NAME,
+    REVIEW_CLEANUP_QUARANTINE_PREFIX,
     SYNTHETIC_PRIVATE_MANIFEST_NAME,
     CleanupIdentity,
     PrivateCleanupEvidence,
@@ -727,6 +728,37 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.assertFalse(self.review.workspace_root.exists())
         self.assertFalse(any(path.exists() for path in private_artifacts))
         self.assertFalse(cleanup_error_path.exists())
+
+    def test_wait_preserves_cleanup_error_for_workspace_quarantine(self) -> None:
+        self.write_completed_state()
+        cleanup_error_path = self.review.container_dir / "cleanup-error.txt"
+
+        with mock.patch(
+            "review_runtime.workspace._remove_open_directory_contents",
+            return_value=["permission denied"],
+        ):
+            self.assertEqual(
+                state.wait(self.review.container_dir, timeout_seconds=None),
+                1,
+            )
+
+        quarantines = list(
+            self.review.container_dir.glob(f"{REVIEW_CLEANUP_QUARANTINE_PREFIX}*")
+        )
+        self.assertEqual(len(quarantines), 1)
+        self.assertTrue(cleanup_error_path.is_file())
+        self.assertFalse(self.review.workspace_root.exists())
+
+        self.assertEqual(
+            state.wait(self.review.container_dir, timeout_seconds=None),
+            1,
+        )
+        self.assertTrue(cleanup_error_path.is_file())
+        self.assertIn(
+            "pre-existing review cleanup quarantine requires manual recovery",
+            cleanup_error_path.read_text(encoding="utf-8"),
+        )
+        self.assertTrue(quarantines[0].exists())
 
     def test_cleanup_worker_clears_stale_error_after_success(self) -> None:
         self.write_completed_state()

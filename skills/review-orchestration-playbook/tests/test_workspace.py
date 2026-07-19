@@ -307,6 +307,27 @@ class WorkspaceTest(unittest.TestCase):
         cleanup_workspace(review, keep_container=False)
         self.assertFalse(review.container_dir.exists())
 
+    def test_changed_path_proof_preserves_both_sides_of_rename(self) -> None:
+        git(self.repo, "mv", "example.txt", "renamed.txt")
+        git(self.repo, "commit", "-m", "Rename example")
+        renamed_head = git(self.repo, "rev-parse", "HEAD")
+
+        review = self.prepare_range(self.head, renamed_head)
+        private_records = (
+            (review.container_dir / workspace_runtime.PRIVATE_CHANGED_PATHS_NAME)
+            .read_bytes()
+            .split(b"\0")
+        )
+
+        self.assertIn(
+            workspace_runtime.CHANGED_PATH_BASE_ONLY_TAG + b"example.txt",
+            private_records,
+        )
+        self.assertIn(
+            workspace_runtime.CHANGED_PATH_HEAD_TAG + b"renamed.txt",
+            private_records,
+        )
+
     def test_prepare_uses_private_control_modes_under_permissive_umask(self) -> None:
         for mask in (0o002, 0o000):
             with self.subTest(mask=oct(mask)):
@@ -930,6 +951,34 @@ class WorkspaceTest(unittest.TestCase):
 
         review_root = self.repo / ".codex-tmp"
         self.assertEqual(len(list(review_root.glob("isolated-review-*"))), 1)
+
+    def test_keep_container_cleanup_retry_rejects_workspace_quarantine(self) -> None:
+        review = self.prepare_range(self.base, self.head)
+
+        with mock.patch.object(
+            workspace_runtime,
+            "_remove_open_directory_contents",
+            return_value=["permission denied"],
+        ):
+            first_error = cleanup_workspace(review, keep_container=True)
+
+        self.assertIn("permission denied", first_error or "")
+        quarantines = list(
+            review.container_dir.glob(
+                f"{workspace_runtime.REVIEW_CLEANUP_QUARANTINE_PREFIX}*"
+            )
+        )
+        self.assertEqual(len(quarantines), 1)
+        self.assertTrue(quarantines[0].is_dir())
+        self.assertFalse(review.workspace_root.exists())
+
+        retry_error = cleanup_workspace(review, keep_container=True)
+
+        self.assertIn(
+            "pre-existing review cleanup quarantine requires manual recovery",
+            retry_error or "",
+        )
+        self.assertTrue(quarantines[0].exists())
 
     def test_partial_cleanup_removes_private_artifacts_when_rmtree_fails(self) -> None:
         container = pathlib.Path(self.temporary.name) / "partial-container"

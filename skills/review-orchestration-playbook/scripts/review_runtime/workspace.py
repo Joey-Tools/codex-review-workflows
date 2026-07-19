@@ -1553,6 +1553,21 @@ def _remove_named_directory_tree(
     label: str,
     require_private_mode: bool,
 ) -> list[str]:
+    def preexisting_quarantine_errors() -> list[str]:
+        try:
+            entry_names = os.listdir(parent_descriptor)
+        except OSError as error:
+            return [f"cannot enumerate {label} parent before cleanup: {error}"]
+        if any(
+            entry_name.startswith(REVIEW_CLEANUP_QUARANTINE_PREFIX)
+            for entry_name in entry_names
+        ):
+            return ["pre-existing review cleanup quarantine requires manual recovery"]
+        return []
+
+    quarantine_errors = preexisting_quarantine_errors()
+    if quarantine_errors:
+        return quarantine_errors
     try:
         directory_before = os.stat(
             directory_name,
@@ -1560,7 +1575,7 @@ def _remove_named_directory_tree(
             follow_symlinks=False,
         )
     except FileNotFoundError:
-        return []
+        return preexisting_quarantine_errors()
     except OSError as error:
         return [f"cannot inspect {label}: {error}"]
     directory_error = _private_cleanup_directory_error(
@@ -3227,6 +3242,7 @@ def _write_frozen_changed_paths(
                 "diff",
                 "--name-status",
                 "-z",
+                # Classify paths by side: renames become D/A and copies remain A.
                 "--no-renames",
                 "--diff-filter=ADMTUXB",
                 base_sha,
