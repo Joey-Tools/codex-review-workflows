@@ -89,22 +89,21 @@ def _ci_contract_context(skill_root: pathlib.Path) -> tuple[pathlib.Path, str]:
 REPO_ROOT, CI_PROFILE = _ci_contract_context(SKILL_ROOT)
 
 
-def _repository_policy_files(
+def _claude_auth_repository_policy_files(
     repo_root: pathlib.Path,
     profile: str,
 ) -> dict[str, str]:
-    policy_paths = {"README.md": repo_root / "README.md"}
+    policy_paths: dict[str, pathlib.Path] = {}
     if profile == "canonical":
-        policy_paths.update(
-            {
-                "AGENTS.md": repo_root / "AGENTS.md",
-                "project journal": (
-                    repo_root
-                    / "docs/project_journal/2026/07/"
-                    / "2026-07-17-claude-auth-carriers-c17a11.md"
-                ),
-            }
-        )
+        policy_paths = {
+            "AGENTS.md": repo_root / "AGENTS.md",
+            "README.md": repo_root / "README.md",
+            "project journal": (
+                repo_root
+                / "docs/project_journal/2026/07/"
+                / "2026-07-17-claude-auth-carriers-c17a11.md"
+            ),
+        }
     elif profile != "private":
         raise AssertionError(f"unsupported repository policy profile: {profile}")
     return {
@@ -199,13 +198,10 @@ class RepositoryContractTest(unittest.TestCase):
         egress_consent = (
             SKILL_ROOT / "references/egress-consent.md"
         ).read_text(encoding="utf-8")
-        repository_policy_files = _repository_policy_files(REPO_ROOT, CI_PROFILE)
-        readme = repository_policy_files["README.md"]
-        canonical_only_policy_files = {
-            name: policy
-            for name, policy in repository_policy_files.items()
-            if name != "README.md"
-        }
+        repository_policy_files = _claude_auth_repository_policy_files(
+            REPO_ROOT,
+            CI_PROFILE,
+        )
 
         self.assertEqual(claude_capabilities.CLAUDE_MINIMUM_VERSION, (2, 1, 211))
         self.assertEqual(claude_linux.DEFAULT_CREDENTIAL_VALIDITY_SECONDS, 0.0)
@@ -330,13 +326,13 @@ class RepositoryContractTest(unittest.TestCase):
         )
 
         carrier_policy_files = {
-            "README.md": readme,
             "SKILL.md": skill,
             "helper-contract.md": helper_contract,
             "claude-runtime-trust.md": runtime_trust,
         }
-        if journal := canonical_only_policy_files.get("project journal"):
-            carrier_policy_files["project journal"] = journal
+        for name in ("README.md", "project journal"):
+            if policy := repository_policy_files.get(name):
+                carrier_policy_files[name] = policy
         for name, policy in carrier_policy_files.items():
             with self.subTest(policy=name):
                 normalized = policy.lower()
@@ -352,7 +348,7 @@ class RepositoryContractTest(unittest.TestCase):
             "helper-contract.md": helper_contract,
             "claude-runtime-trust.md": runtime_trust,
         }
-        if journal := canonical_only_policy_files.get("project journal"):
+        if journal := repository_policy_files.get("project journal"):
             macos_recovery_policy_files["project journal"] = journal
         for name, policy in macos_recovery_policy_files.items():
             with self.subTest(macos_recovery_policy=name):
@@ -362,11 +358,10 @@ class RepositoryContractTest(unittest.TestCase):
                 self.assertIn("copilot fallback", normalized)
 
         macos_quiescence_policy_files = {
-            "README.md": readme,
             "SKILL.md": skill,
             "helper-contract.md": helper_contract,
             "claude-runtime-trust.md": runtime_trust,
-            **canonical_only_policy_files,
+            **repository_policy_files,
         }
         for name, policy in macos_quiescence_policy_files.items():
             with self.subTest(macos_quiescence_policy=name):
@@ -382,11 +377,10 @@ class RepositoryContractTest(unittest.TestCase):
                 )
 
         macos_terminal_reserve_policy_files = {
-            "README.md": readme,
             "SKILL.md": skill,
             "helper-contract.md": helper_contract,
             "claude-runtime-trust.md": runtime_trust,
-            **canonical_only_policy_files,
+            **repository_policy_files,
         }
         for name, policy in macos_terminal_reserve_policy_files.items():
             with self.subTest(macos_terminal_reserve_policy=name):
@@ -455,7 +449,7 @@ class RepositoryContractTest(unittest.TestCase):
                 helper_contract,
                 runtime_trust,
                 egress_consent,
-                canonical_only_policy_files.get("AGENTS.md", ""),
+                repository_policy_files.get("AGENTS.md", ""),
             )
         )
         self.assertIn(">=2.1.211,<3.0.0", current_policy)
@@ -557,22 +551,22 @@ class RepositoryContractTest(unittest.TestCase):
             with self.subTest(profile=profile):
                 self.assertTrue((CI_FIXTURE_ROOT / f"{profile}.yml").is_file())
 
-    def test_repository_policy_files_match_distribution_profile(self) -> None:
+    def test_claude_auth_policy_files_match_distribution_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_root = pathlib.Path(temp_dir)
-            (repo_root / "README.md").write_text("private\n", encoding="utf-8")
+            (repo_root / "README.md").write_text("unrelated\n", encoding="utf-8")
 
             self.assertEqual(
-                _repository_policy_files(repo_root, "private"),
-                {"README.md": "private\n"},
+                _claude_auth_repository_policy_files(repo_root, "private"),
+                {},
             )
             with self.assertRaises(FileNotFoundError):
-                _repository_policy_files(repo_root, "canonical")
+                _claude_auth_repository_policy_files(repo_root, "canonical")
             with self.assertRaisesRegex(
                 AssertionError,
                 "unsupported repository policy profile",
             ):
-                _repository_policy_files(repo_root, "unknown")
+                _claude_auth_repository_policy_files(repo_root, "unknown")
 
     def test_reviewed_ci_snapshots_keep_the_intended_status_guards(self) -> None:
         canonical = (CI_FIXTURE_ROOT / "canonical.yml").read_text(encoding="utf-8")
