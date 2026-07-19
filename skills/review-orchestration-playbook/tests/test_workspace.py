@@ -1702,6 +1702,31 @@ class WorkspaceTest(unittest.TestCase):
                 head_ref=clean_head,
             )
 
+    def test_head_cleanup_quarantine_namespace_is_rejected(self) -> None:
+        marker = "private-marker"
+        reserved_path = f"nested/.codex-review-cleanup-{marker}/tracked.txt"
+        reserved_head = self.commit_bytes(
+            reserved_path,
+            b"tracked\n",
+            "Add reserved cleanup quarantine path",
+        )
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "frozen head uses a reserved review cleanup quarantine path component",
+        ) as raised:
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.head,
+                head_ref=reserved_head,
+            )
+        self.assertNotIn(marker, str(raised.exception))
+        self.assertNotIn(reserved_path, str(raised.exception))
+        self.assertEqual(
+            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            [],
+        )
+
     def test_protected_review_path_symlink_is_rejected(self) -> None:
         (self.repo / ".agents").symlink_to(".codex-review")
         git(self.repo, "add", ".agents")
@@ -1731,6 +1756,24 @@ class WorkspaceTest(unittest.TestCase):
         (review.workspace_root / "escape").symlink_to(self.repo / "example.txt")
         with self.assertRaises(ReviewError):
             validate_external_workspace(review)
+
+    def test_external_workspace_rejects_injected_cleanup_quarantine_path(
+        self,
+    ) -> None:
+        review = self.prepare_range(self.base, self.head)
+        marker = "post-prepare-marker"
+        injected = review.workspace_root / f".codex-review-cleanup-{marker}"
+        injected.write_text("injected\n", encoding="utf-8")
+        try:
+            with self.assertRaisesRegex(
+                ReviewError,
+                "external review snapshot uses a reserved review cleanup "
+                "quarantine path component",
+            ) as raised:
+                validate_external_workspace(review)
+            self.assertNotIn(marker, str(raised.exception))
+        finally:
+            injected.unlink()
 
     def test_frozen_tree_rejects_sandbox_authentication_symlink(self) -> None:
         (self.repo / "leak").symlink_to("/config/.credentials.json")
@@ -2138,6 +2181,25 @@ class WorkspaceTest(unittest.TestCase):
         review = self.prepare_range(credential_base, clean_head)
         validate_external_workspace(review)
         self.assertIn(b"fixtures/.netrc", review.diff_file.read_bytes())
+
+    def test_base_only_cleanup_quarantine_path_is_allowed(self) -> None:
+        deleted_path = "nested/.codex-review-cleanup-deleted-marker/tracked.txt"
+        reserved_base = self.commit_bytes(
+            deleted_path,
+            b"tracked\n",
+            "Add cleanup quarantine path for deletion",
+        )
+        clean_head = self.remove_and_commit(
+            deleted_path,
+            "Delete cleanup quarantine path",
+        )
+
+        review = self.prepare_range(reserved_base, clean_head)
+        validate_external_workspace(review)
+        self.assertFalse(
+            (review.workspace_root / deleted_path).exists(),
+        )
+        self.assertIn(os.fsencode(deleted_path), review.diff_file.read_bytes())
 
     def test_new_and_retained_credential_paths_are_blocked(self) -> None:
         added_head = self.commit_bytes(

@@ -2111,6 +2111,14 @@ def _parse_tree_record(record: bytes) -> tuple[str, str, str, pathlib.PurePosixP
     return mode, object_type, object_id, relative
 
 
+def _uses_review_cleanup_quarantine_namespace(
+    relative: pathlib.PurePosixPath,
+) -> bool:
+    return any(
+        part.startswith(REVIEW_CLEANUP_QUARANTINE_PREFIX) for part in relative.parts
+    )
+
+
 def _exact_path_matcher(needles: dict[bytes, str]) -> LegacyPathMatcher:
     transitions: list[dict[int, int]] = [{}]
     failures = [0]
@@ -2512,6 +2520,11 @@ def _materialize_frozen_tree(
                         "frozen Git tree exceeds the review entry-count limit"
                     )
                 mode, object_type, object_id, relative = _parse_tree_record(record)
+                if _uses_review_cleanup_quarantine_namespace(relative):
+                    raise ReviewError(
+                        "the frozen head uses a reserved review cleanup "
+                        "quarantine path component"
+                    )
                 destination = workspace_root.joinpath(*relative.parts)
                 path_display = _redact_secret_path(
                     os.fspath(relative),
@@ -3222,6 +3235,42 @@ def _secret_reduction_descriptor(
     )
 
 
+def _reject_unselected_legacy_reduction_candidates(
+    *,
+    catalog: SyntheticTokenCatalog,
+    exemptions: Iterable[LegacyExemption],
+    candidates: Mapping[bytes, Iterable[str]],
+) -> None:
+    selected_exemption_ids = frozenset(exemption.identifier for exemption in exemptions)
+    unselected_legacy_values = {
+        token.value: exemption.identifier
+        for exemption in catalog.legacy_exemptions
+        if exemption.identifier not in selected_exemption_ids
+        for token in exemption.values
+    }
+    unselected_legacy_matcher = _exact_path_matcher(unselected_legacy_values)
+    unselected_legacy_candidates = {
+        candidate: (tuple(rules), exemption_id)
+        for candidate, rules in candidates.items()
+        if (exemption_id := unselected_legacy_matcher.match(candidate)) is not None
+    }
+    if not unselected_legacy_candidates:
+        return
+    exemption_ids = sorted(
+        {exemption_id for _rules, exemption_id in unselected_legacy_candidates.values()}
+    )
+    scanner_rules = sorted(
+        rule
+        for rules, _exemption_id in unselected_legacy_candidates.values()
+        for rule in rules
+    )
+    raise ReviewError(
+        "unselected catalog legacy value requires an explicitly selected "
+        "synthetic secret exemption: "
+        f"{', '.join(exemption_ids)}; scanner rules: {', '.join(scanner_rules)}"
+    )
+
+
 def _secret_count_manifests(
     *,
     git_view: pathlib.Path,
@@ -3261,36 +3310,11 @@ def _secret_count_manifests(
             "secret-reduction proof cannot extract a stable exact candidate for "
             f"scanner rule {discovery.blocking_rule}"
         )
-    selected_exemption_ids = frozenset(exemption.identifier for exemption in exemptions)
-    unselected_legacy_values = {
-        token.value: exemption.identifier
-        for exemption in catalog.legacy_exemptions
-        if exemption.identifier not in selected_exemption_ids
-        for token in exemption.values
-    }
-    unselected_legacy_matcher = _exact_path_matcher(unselected_legacy_values)
-    unselected_legacy_candidates = {
-        candidate: (rules, exemption_id)
-        for candidate, rules in discovery.blocking_candidates.items()
-        if (exemption_id := unselected_legacy_matcher.match(candidate)) is not None
-    }
-    if unselected_legacy_candidates:
-        exemption_ids = sorted(
-            {
-                exemption_id
-                for _rules, exemption_id in unselected_legacy_candidates.values()
-            }
-        )
-        scanner_rules = sorted(
-            rule
-            for rules, _exemption_id in unselected_legacy_candidates.values()
-            for rule in rules
-        )
-        raise ReviewError(
-            "unselected catalog legacy value requires an explicitly selected "
-            "synthetic secret exemption: "
-            f"{', '.join(exemption_ids)}; scanner rules: {', '.join(scanner_rules)}"
-        )
+    _reject_unselected_legacy_reduction_candidates(
+        catalog=catalog,
+        exemptions=exemptions,
+        candidates=discovery.blocking_candidates,
+    )
     reduction_descriptors = tuple(
         _secret_reduction_descriptor(candidate, rules)
         for candidate, rules in sorted(
@@ -4691,7 +4715,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     _inspect_control_directory(control_dir, expected=control_state.directory)
     control_artifacts = control_state.artifacts
     (
-        _exemptions,
+        exemptions,
         legacy_values,
         legacy_counts,
         legacy_evidence,
@@ -4709,6 +4733,19 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
         ],
         expected_base_ref=review.base_ref,
         expected_head_ref=review.head_ref,
+    )
+    _reject_unselected_legacy_reduction_candidates(
+        catalog=catalog,
+        exemptions=exemptions,
+        candidates={
+            descriptor.value: evidence["rules"]
+            for descriptor, evidence in zip(
+                reduction_values,
+                reduction_evidence,
+                strict=True,
+            )
+            if descriptor.value is not None
+        },
     )
     authoring_values = accepted_authoring_values(catalog)
     accepted_values = authoring_values + legacy_values
@@ -4933,6 +4970,11 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     snapshot_entries = 0
     for candidate in review.workspace_root.rglob("*"):
         relative_path = candidate.relative_to(review.workspace_root)
+        if _uses_review_cleanup_quarantine_namespace(relative_path):
+            raise ReviewError(
+                "external review snapshot uses a reserved review cleanup "
+                "quarantine path component"
+            )
         if relative_path.parts and relative_path.parts[0] == ".codex-review":
             continue
         snapshot_entries += 1

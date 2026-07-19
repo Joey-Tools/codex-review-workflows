@@ -7062,6 +7062,34 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             (2, 1),
         )
 
+    def test_runtime_catalog_rechecks_unselected_legacy_reduction_overlap(
+        self,
+    ) -> None:
+        catalog = synthetic_tokens.load_catalog()
+        candidate = reduction_secret("generic-secret-assignment")
+        legacy_substring = candidate[4:-4].decode("ascii")
+        fixture = reduction_fixture("generic-secret-assignment")
+        repo, base = self.new_repo({"fixture.cfg": fixture * 2})
+        (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
+        head = self.commit(repo)
+        review = self.prepare(
+            repo=repo,
+            base=base,
+            head=head,
+            catalog=catalog,
+        )
+        mutated_catalog = legacy_catalog(values=(legacy_substring,))
+        self.assertEqual(mutated_catalog.schema_version, catalog.schema_version)
+        self.assertEqual(mutated_catalog.pool_version, catalog.pool_version)
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "explicitly selected synthetic secret exemption",
+        ) as raised:
+            self.validate(review, catalog=mutated_catalog)
+        self.assertNotIn(candidate.decode("ascii"), str(raised.exception))
+        self.assertNotIn(legacy_substring, str(raised.exception))
+
     def test_legacy_counts_accept_authoring_values_but_not_unknown_secrets(
         self,
     ) -> None:
