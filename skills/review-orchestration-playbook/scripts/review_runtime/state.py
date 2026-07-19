@@ -49,9 +49,17 @@ CLEANUP_LOCK_FILE = "cleanup.lock"
 FINAL_CLEANUP_TIMEOUT_SECONDS = 30.0
 RUNNER_SHUTDOWN_GRACE_SECONDS = PROCESS_GROUP_TERM_GRACE_SECONDS * 4
 _STARTED_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
-_EXPLICIT_CLAUDE_CREDENTIAL_ENV_KEYS = (
+_CLAUDE_REDACTION_ENV_KEYS = (
     "ANTHROPIC_API_KEY",
     "CLAUDE_CODE_OAUTH_TOKEN",
+    "ALL_PROXY",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "NO_PROXY",
+    "all_proxy",
+    "https_proxy",
+    "http_proxy",
+    "no_proxy",
 )
 _STATE_OWNED_TEXT_ARTIFACTS = (
     STATE_MARKER,
@@ -86,9 +94,6 @@ def _state_owned_write_filter(
     def includes(path: pathlib.Path) -> bool:
         candidate = path.expanduser()
         try:
-            # Resolve only the parent. Atomic replacement must classify the
-            # destination name without following an attacker-controlled leaf
-            # symlink that the writer will replace rather than dereference.
             parent = candidate.parent.resolve(strict=True)
         except (OSError, RuntimeError) as error:
             raise ReviewError(
@@ -99,14 +104,12 @@ def _state_owned_write_filter(
     return includes
 
 
-def _freeze_explicit_claude_redactions(
+def _freeze_claude_redactions(
     environment: Mapping[str, str] | None = None,
 ) -> tuple[str, ...]:
     source = os.environ if environment is None else environment
     values = {
-        value
-        for key in _EXPLICIT_CLAUDE_CREDENTIAL_ENV_KEYS
-        if (value := source.get(key, ""))
+        value for key in _CLAUDE_REDACTION_ENV_KEYS if (value := source.get(key, ""))
     }
     return tuple(sorted(values, key=lambda value: (-len(value), value)))
 
@@ -263,9 +266,10 @@ def start(
     keep_workspace: bool,
     egress_consent: str | None,
     synthetic_secret_exemptions: tuple[str, ...] = (),
+    include_source_wip: bool = False,
     publisher: Callable[[pathlib.Path], None] | None = None,
 ) -> pathlib.Path:
-    redact_values = _freeze_explicit_claude_redactions()
+    redact_values = _freeze_claude_redactions()
     _redact_claude_text("", redact_values)
     process: subprocess.Popen[bytes] | None = None
     review: ReviewWorkspace | None = None
@@ -309,6 +313,7 @@ def start(
             ownership_handoff=accept_workspace,
             synthetic_secret_exemptions=synthetic_secret_exemptions,
             prompt_override=prompt_file,
+            include_source_wip=include_source_wip,
         )
         if review is None:
             raise ReviewError("workspace ownership handoff did not complete")
@@ -329,6 +334,7 @@ def start(
             "keep_workspace": keep_workspace,
             "egress_consent": egress_consent,
             "synthetic_secret_exemptions": list(synthetic_secret_exemptions),
+            "include_source_wip": include_source_wip,
             "stdout_path": str(stdout_path),
             "stderr_path": str(stderr_path),
             "final_path": str(state_dir / "final.txt"),
@@ -362,9 +368,6 @@ def start(
                     ),
                     cwd=review.workspace_root,
                     stdin=subprocess.DEVNULL,
-                    # The detached parent cannot stream-redact these descriptors.
-                    # Explicit-auth diagnostics are recorded through sanitized
-                    # state artifacts instead of process stdio.
                     stdout=(subprocess.DEVNULL if redact_values else stdout_handle),
                     stderr=(subprocess.DEVNULL if redact_values else stderr_handle),
                     start_new_session=True,
@@ -479,7 +482,7 @@ def run_state(
     state_dir: pathlib.Path,
     terminal_process: bool = False,
 ) -> int:
-    redact_values = _freeze_explicit_claude_redactions()
+    redact_values = _freeze_claude_redactions()
     _redact_claude_text("", redact_values)
     exit_code = 1
     pending_signal: signal.Signals | None = None
@@ -576,7 +579,7 @@ def run_state(
 
 
 def status(state_dir: pathlib.Path) -> dict[str, Any]:
-    redact_values = _freeze_explicit_claude_redactions()
+    redact_values = _freeze_claude_redactions()
     state_dir = state_dir.expanduser().resolve()
     state, review = load_review_state(state_dir)
     pid_value = state.get("pid")
@@ -622,6 +625,9 @@ def status(state_dir: pathlib.Path) -> dict[str, Any]:
         "state_dir": str(state_dir),
         "reviewer": state.get("reviewer"),
         "egress_consent": state.get("egress_consent"),
+        "content_variant": review.content_variant,
+        "snapshot_tree_sha": review.snapshot_tree_sha,
+        "scope_identity": review.scope_identity,
         "pid": pid or None,
         "runner_lock_held": process_running,
         "running": running,
@@ -636,8 +642,6 @@ def status(state_dir: pathlib.Path) -> dict[str, Any]:
         "runner_error": tail_text(state_dir / "runner-error.txt"),
         "cleanup_error": tail_text(state_dir / "cleanup-error.txt"),
     }
-    # These keys are the public status schema. Redacting a key can make wait()
-    # and final() lose fields such as "running" when a credential matches it.
     return {
         key: _redact_claude_value(item, redact_values) for key, item in summary.items()
     }
@@ -654,6 +658,8 @@ def _should_retain_fallback_workspace(
         state.get("reviewer") != "codex"
         or exit_code != 127
         or not review.workspace_root.is_dir()
+        or not (review.git_dir or review.container_dir / "review.git").is_dir()
+        or not review.has_complete_scope_identity()
     ):
         return False
     try:
@@ -662,6 +668,9 @@ def _should_retain_fallback_workspace(
         return False
     return (
         preflight.get("review_range") == f"{review.base_ref}..{review.head_ref}"
+        and preflight.get("content_variant") == review.content_variant
+        and preflight.get("snapshot_tree_sha") == review.snapshot_tree_sha
+        and preflight.get("scope_identity") == review.scope_identity
         and preflight.get("status")
         == "sensitive-content and escaping-symlink checks passed"
     )
@@ -717,7 +726,6 @@ def _cleanup_terminal_workspace(
     deadline: float | None,
     force: bool,
 ) -> int:
-    redact_values = _freeze_explicit_claude_redactions()
     cleanup_lock_path = state_dir / CLEANUP_LOCK_FILE
     cleanup_error_path = state_dir / "cleanup-error.txt"
     with cleanup_lock_path.open("a+b") as cleanup_lock:
@@ -750,10 +758,7 @@ def _cleanup_terminal_workspace(
                 if not cleanup_completed:
                     return 124
                 if cleanup_error:
-                    write_text_atomic(
-                        cleanup_error_path,
-                        _redact_claude_text(cleanup_error, redact_values) + "\n",
-                    )
+                    write_text_atomic(cleanup_error_path, cleanup_error + "\n")
                     return 1
             if not should_keep and not review.workspace_root.exists():
                 try:
@@ -838,7 +843,6 @@ def _cleanup_before_deadline(
 
 
 def final(state_dir: pathlib.Path) -> tuple[int, str]:
-    redact_values = _freeze_explicit_claude_redactions()
     summary = status(state_dir)
     if summary["running"]:
         return 3, "review is still running"
@@ -847,17 +851,14 @@ def final(state_dir: pathlib.Path) -> tuple[int, str]:
         return 3, "review completed but workspace cleanup did not finish before timeout"
     cleanup_error = tail_text(state_dir.expanduser().resolve() / "cleanup-error.txt")
     if cleanup_error:
-        return 1, (
-            "review completed but workspace cleanup failed: "
-            f"{_redact_claude_text(cleanup_error, redact_values)}"
-        )
+        return 1, f"review completed but workspace cleanup failed: {cleanup_error}"
     summary = status(state_dir)
     exit_code = summary["exit_code"]
     final_path = state_dir.expanduser().resolve() / "final.txt"
     if exit_code == 0 and final_path.is_file():
         text = final_path.read_text(encoding="utf-8", errors="replace").strip()
         if text:
-            return 0, _redact_claude_text(text, redact_values)
+            return 0, text
     details = (
         summary.get("runner_error")
         or summary.get("stderr_tail")
@@ -868,7 +869,4 @@ def final(state_dir: pathlib.Path) -> tuple[int, str]:
             f"{details}\nfrozen workspace retained for clean-context fallback: "
             f"{summary['fallback_workspace']}"
         )
-    return int(wait_code or exit_code or 1), _redact_claude_text(
-        str(details),
-        redact_values,
-    )
+    return int(wait_code or exit_code or 1), str(details)

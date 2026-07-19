@@ -52,6 +52,15 @@ def _add_review_arguments(parser: argparse.ArgumentParser) -> None:
         help="Keep the detached review workspace after completion.",
     )
     parser.add_argument(
+        "--include-source-wip",
+        action="store_true",
+        help=(
+            "Review a helper-private snapshot of source HEAD plus staged, "
+            "unstaged, and nonignored untracked content. Review-only; not "
+            "formal PR-readiness or merge-ready evidence."
+        ),
+    )
+    parser.add_argument(
         "--egress-consent",
         choices=CLAUDE_EGRESS_CONSENTS,
         help=(
@@ -83,8 +92,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="isolated_review",
         description=(
-            "Run a pinned Codex or Claude-family reviewer against one frozen Git range "
-            "inside a detached read-only review workspace."
+            "Run a pinned Codex or Claude-family reviewer against one clean frozen "
+            "Git range or explicitly authorized digest-bound WIP snapshot inside a "
+            "detached read-only review workspace."
         ),
     )
     _add_review_arguments(parser)
@@ -207,8 +217,7 @@ def _run_foreground(args: argparse.Namespace) -> int:
         raise ForwardedSignal(signum)
 
     previous_handlers = {
-        signum: signal.signal(signum, forward_signal)
-        for signum in forwarded_signals()
+        signum: signal.signal(signum, forward_signal) for signum in forwarded_signals()
     }
 
     def accept_workspace(prepared: ReviewWorkspace) -> None:
@@ -227,6 +236,7 @@ def _run_foreground(args: argparse.Namespace) -> int:
             prompt_override=(
                 pathlib.Path(args.prompt_file) if args.prompt_file else None
             ),
+            include_source_wip=bool(getattr(args, "include_source_wip", False)),
         )
         if review is None:
             raise ReviewError("workspace ownership handoff did not complete")
@@ -297,6 +307,7 @@ def _run_stateful(argv: list[str], *, script_path: pathlib.Path) -> int:
             synthetic_secret_exemptions=tuple(
                 getattr(args, "synthetic_secret_exemption", ())
             ),
+            include_source_wip=bool(getattr(args, "include_source_wip", False)),
             publisher=lambda created: print(created, flush=True),
         )
         return 0

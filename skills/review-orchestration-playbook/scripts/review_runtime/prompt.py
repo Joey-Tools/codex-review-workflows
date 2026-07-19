@@ -9,16 +9,33 @@ def build_review_prompt(
     diff_file: pathlib.Path,
     base_ref: str,
     head_ref: str,
+    content_variant: str = "head",
+    snapshot_tree_sha: str = "",
+    scope_identity: str = "",
 ) -> str:
     relative_diff = diff_file.relative_to(workspace).as_posix()
+    if content_variant == "source-wip":
+        scope_lines = f"""- Committed anchor range: {base_ref}..{head_ref}
+- Content variant: source-wip (a helper-private composite of source HEAD plus staged, unstaged, and nonignored untracked content).
+- Snapshot tree: {snapshot_tree_sha}
+- Scope identity: {scope_identity}
+- This is WIP review evidence, not an exact committed range or merge-readiness evidence."""
+        discipline_scope = "Review only the supplied WIP snapshot"
+    else:
+        scope_lines = f"""- Frozen review range: {base_ref}..{head_ref}
+- Content variant: head
+- Snapshot tree: {snapshot_tree_sha}
+- Scope identity: {scope_identity}"""
+        discipline_scope = "Review only the frozen range"
     return f"""Persistent isolated code-review contract:
 - Workspace: .
 - Primary diff file: {relative_diff}
-- Frozen review range: {base_ref}..{head_ref}
+{scope_lines}
 - The `.codex-review/` directory is helper-owned review evidence, not part of the change.
+- The private Git database contains the scanned base/head endpoint commits and tree/blob closures, plus this WIP snapshot tree/blob closure when applicable. Intermediate commit history and history-only objects are intentionally unavailable.
 
 Review discipline:
-- Review only the frozen range. Use the supplied diff as the primary review surface and read nearby repository files only when needed to verify a concrete concern.
+- {discipline_scope}. Use the supplied diff as the primary review surface and read nearby repository files only when needed to verify a concrete concern.
 - Do not read outside the detached workspace or inspect its parent directories, the source checkout, unrelated repositories, home-directory content, credentials, or untracked private files.
 - Use only the tools exposed by the reviewer. If `Read` is the only file tool, read the primary diff and any necessary nearby file in bounded offset/limit windows; do not request unavailable search, shell, Git, or LSP tools.
 - When count, search, or read-only Git tools are available, start with count-only probes, diff headers, --stat/--numstat, rg -l, rg --count, or exact symbol windows before printing changed-file lists or large hunks.

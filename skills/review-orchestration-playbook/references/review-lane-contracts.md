@@ -4,7 +4,8 @@ Use this contract for helper-backed review, a clean-context `reviewer` fallback,
 
 ## Scope And Evidence Budget
 
-- Bind the review to one frozen `base_sha..head_sha` range or an explicit diff artifact.
+- Bind the review to one clean frozen `base_sha..head_sha` detached-worktree artifact or an explicitly authorized digest-bound WIP artifact.
+- Record the workspace content mode. `--include-source-wip` evidence includes staged, unstaged, and non-ignored untracked files after sensitive-content scanning, but it is review-only and never satisfies formal PR-readiness or merge-ready gates.
 - Use the supplied diff as the primary surface; read nearby tracked files only to validate a concrete concern.
 - Count before printing changed-file lists, diff headers, `--stat` / `--numstat`, or large search results; cap first-stage samples.
 - Treat line-producing `rg -n`, including `rg -n -C`, as a second-stage read against one exact file, hunk, or symbol window after `rg -l` / `rg --count`.
@@ -32,13 +33,13 @@ Use this contract for helper-backed review, a clean-context `reviewer` fallback,
 
 ## Clean-Context Codex Fallback
 
-If the helper-backed Codex reviewer runtime is deterministically unavailable after the helper has written a matching successful `preflight.json`, `stateful final` retains the immutable frozen workspace and reports it through `fallback_workspace_retained`. Use only that retained scope with the `reviewer` agent and the complete diff/evidence and output contracts, then run `stateful cleanup --state-dir <dir>`. If the helper cannot complete that preflight, stop instead of bypassing it. The fallback's pinned configuration is `gpt-5.6-sol` with `xhigh`. Do not use an inherited-context/default coding agent. A `gpt-5.5` fallback is allowed only after explicit model entitlement/policy denial.
+If the helper-backed Codex reviewer runtime is deterministically unavailable after the helper has written a matching successful `preflight.json`, `stateful final` retains the immutable detached worktree and reports it through `fallback_workspace_retained`. Use only that retained scope with the `reviewer` agent and the complete diff/evidence and output contracts, then run `stateful cleanup --state-dir <dir>`. Require the retained mode and exact head/tree or WIP digest to match the requested artifact. If the helper cannot complete that preflight, stop instead of bypassing it. The fallback's pinned configuration is `gpt-5.6-sol` with `xhigh`. Do not use an inherited-context/default coding agent. A `gpt-5.5` fallback is allowed only after explicit model entitlement/policy denial.
 
 ## PR Readiness Codex Gates
 
 `independent-codex-pr-review` is a fresh Codex CLI review-only session, separate from the helper. Launch it only after the offline helper has retained successful preflight evidence for the same frozen range. Its prompt must identify the parent PR readiness workflow, bind the exact PR and frozen range, include every rule in **Scope And Evidence Budget** and **Parent-Process Output Budget**, disable project-instruction injection, and forbid PR actions, fixes, other reviewers, and CI waiting. Only its final `LGTM` or no-findings artifact is evidence.
 
-`offline-frozen-diff-review` is the first stateful helper-backed pinned Codex lane over the same range. Its retained preflight evidence gates the later independent Codex session. Its terminal artifact, or the **Clean-Context Codex Fallback** artifact when only the helper-backed reviewer runtime is deterministically unavailable after preflight, is separate required evidence. GitHub Codex cannot replace either local PR-readiness gate.
+`offline-frozen-diff-review` is the first stateful helper-backed pinned Codex lane over the same clean exact-commit range. Its retained preflight evidence gates the later independent Codex session. Its terminal artifact, or the **Clean-Context Codex Fallback** artifact when only the helper-backed reviewer runtime is deterministically unavailable after preflight, is separate required evidence. GitHub Codex cannot replace either local PR-readiness gate. A WIP artifact cannot be substituted for this clean gate.
 
 These two gates apply to full PR readiness / merge-ready workflows. They do not add lanes to a standalone request whose only requested shape is double review or triple review.
 

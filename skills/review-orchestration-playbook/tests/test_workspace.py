@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import os
 import pathlib
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+import zlib
 from unittest import mock
 
 
@@ -29,10 +32,34 @@ from review_runtime.workspace import (  # noqa: E402
 )
 
 
+def test_git_environment() -> dict[str, str]:
+    environment = dict(os.environ)
+    for name in (
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_NO_LAZY_FETCH",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_WORK_TREE",
+    ):
+        environment.pop(name, None)
+    environment.update(
+        {
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "LC_ALL": "C",
+        }
+    )
+    return environment
+
+
 def git(repo: pathlib.Path, *args: str) -> str:
     completed = subprocess.run(
         ("git", "-C", str(repo), *args),
         check=True,
+        env=test_git_environment(),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -86,6 +113,27 @@ class WorkspaceTest(unittest.TestCase):
             if review.workspace_root.exists():
                 cleanup_workspace(review, keep_container=False)
         self.temporary.cleanup()
+
+    def install_raw_commit(self, raw_commit: bytes, *, previous: str) -> str:
+        created = subprocess.run(
+            (
+                "git",
+                "-C",
+                str(self.repo),
+                "hash-object",
+                "-t",
+                "commit",
+                "-w",
+                "--stdin",
+            ),
+            input=raw_commit,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        commit = created.stdout.decode("ascii").strip()
+        git(self.repo, "update-ref", "refs/heads/master", commit, previous)
+        return commit
 
     def test_git_environment_disables_lazy_fetch_and_prompts(self) -> None:
         environment = workspace_runtime._git_environment()
@@ -145,11 +193,12 @@ class WorkspaceTest(unittest.TestCase):
         self.assertTrue(marker.exists())
         marker.unlink()
 
-        with self.assertRaisesRegex(ReviewError, "unexpected git cat-file"):
+        with self.assertRaisesRegex(ReviewError, "private review Git objects"):
             prepare_workspace(
                 repo=partial,
                 base_ref=self.base,
                 head_ref=self.head,
+                include_source_wip=True,
             )
 
         self.assertFalse(marker.exists())
@@ -177,7 +226,12 @@ class WorkspaceTest(unittest.TestCase):
         self.assertIn("If `Read` is the only file tool", prompt)
         self.assertNotIn(str(review.workspace_root), prompt)
         self.assertNotIn("Source repository:", prompt)
-        self.assertFalse((review.workspace_root / ".git").exists())
+        self.assertTrue((review.workspace_root / ".git").is_file())
+        self.assertEqual(review.content_variant, "head")
+        self.assertRegex(review.snapshot_tree_sha, r"^[0-9a-f]{40,64}$")
+        self.assertRegex(review.scope_identity, r"^[0-9a-f]{64}$")
+        self.assertEqual(git(review.workspace_root, "status", "--porcelain"), "")
+        self.assertEqual(git(review.workspace_root, "rev-parse", "HEAD"), self.head)
         self.assertEqual(review.container_dir.stat().st_mode & 0o777, 0o700)
         self.assertEqual(
             (review.workspace_root / "example.txt").read_text(encoding="utf-8"),
@@ -186,6 +240,1220 @@ class WorkspaceTest(unittest.TestCase):
 
         cleanup_workspace(review, keep_container=False)
         self.assertFalse(review.container_dir.exists())
+
+    def test_default_rejects_dirty_source_before_creating_container(self) -> None:
+        (self.repo / "example.txt").write_text("dirty\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(ReviewError, "include-source-wip"):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+
+        self.assertEqual(
+            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            [],
+        )
+
+    def test_wip_snapshot_includes_final_tracked_deleted_and_untracked_content(
+        self,
+    ) -> None:
+        (self.repo / "example.txt").write_text("staged\n", encoding="utf-8")
+        git(self.repo, "add", "example.txt")
+        (self.repo / "example.txt").write_text("staged\nunstaged\n", encoding="utf-8")
+        (self.repo / ".gitattributes").unlink()
+        (self.repo / "new.txt").write_text("untracked\n", encoding="utf-8")
+
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+            include_source_wip=True,
+        )
+        self.reviews.append(review)
+
+        self.assertEqual(review.content_variant, "source-wip")
+        self.assertEqual(
+            (review.workspace_root / "example.txt").read_text(encoding="utf-8"),
+            "staged\nunstaged\n",
+        )
+        self.assertFalse((review.workspace_root / ".gitattributes").exists())
+        self.assertEqual(
+            (review.workspace_root / "new.txt").read_text(encoding="utf-8"),
+            "untracked\n",
+        )
+        diff = review.diff_file.read_text(encoding="utf-8")
+        self.assertIn("+unstaged", diff)
+        self.assertIn("new.txt", diff)
+        prompt = review.prompt_file.read_text(encoding="utf-8")
+        self.assertIn("Content variant: source-wip", prompt)
+        self.assertIn("not an exact committed range", prompt)
+
+    def test_wip_requires_source_head_to_match_review_head(self) -> None:
+        (self.repo / "example.txt").write_text("dirty\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(ReviewError, "source HEAD"):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.base,
+                include_source_wip=True,
+            )
+
+        self.assertEqual(
+            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            [],
+        )
+
+    def test_wip_symlink_to_directory_transition_preserves_aliased_content(
+        self,
+    ) -> None:
+        target = self.repo / "target"
+        target.mkdir()
+        (target / "child.txt").write_text("tracked target\n", encoding="utf-8")
+        (self.repo / "alias").symlink_to("target", target_is_directory=True)
+        git(self.repo, "add", "target/child.txt", "alias")
+        git(self.repo, "commit", "-m", "Add tracked alias")
+        head = git(self.repo, "rev-parse", "HEAD")
+
+        (self.repo / "alias").unlink()
+        (self.repo / "alias").mkdir()
+        (self.repo / "alias/child.txt").write_text("reviewed WIP\n", encoding="utf-8")
+
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.head,
+            head_ref=head,
+            include_source_wip=True,
+        )
+        self.reviews.append(review)
+
+        self.assertEqual(
+            (review.workspace_root / "target/child.txt").read_text(encoding="utf-8"),
+            "tracked target\n",
+        )
+        self.assertEqual(
+            (review.workspace_root / "alias/child.txt").read_text(encoding="utf-8"),
+            "reviewed WIP\n",
+        )
+        self.assertEqual(
+            git(review.workspace_root, "write-tree"), review.snapshot_tree_sha
+        )
+        validate_external_workspace(review)
+
+    def test_wip_directory_to_file_transition_matches_snapshot_tree(self) -> None:
+        (self.repo / "node").mkdir()
+        (self.repo / "node/child.txt").write_text("tracked child\n", encoding="utf-8")
+        git(self.repo, "add", "node/child.txt")
+        git(self.repo, "commit", "-m", "Add tracked directory")
+        head = git(self.repo, "rev-parse", "HEAD")
+
+        (self.repo / "node/child.txt").unlink()
+        (self.repo / "node").rmdir()
+        (self.repo / "node").write_text("replacement file\n", encoding="utf-8")
+
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.head,
+            head_ref=head,
+            include_source_wip=True,
+        )
+        self.reviews.append(review)
+
+        self.assertTrue((review.workspace_root / "node").is_file())
+        self.assertEqual(
+            (review.workspace_root / "node").read_text(encoding="utf-8"),
+            "replacement file\n",
+        )
+        self.assertEqual(
+            git(review.workspace_root, "write-tree"), review.snapshot_tree_sha
+        )
+        validate_external_workspace(review)
+
+    def test_wip_directory_to_external_symlink_never_reads_external_bytes(
+        self,
+    ) -> None:
+        (self.repo / "node").mkdir()
+        (self.repo / "node/child.txt").write_text("tracked child\n", encoding="utf-8")
+        git(self.repo, "add", "node/child.txt")
+        git(self.repo, "commit", "-m", "Add tracked directory")
+        head = git(self.repo, "rev-parse", "HEAD")
+        outside = pathlib.Path(self.temporary.name) / "outside-wip"
+        outside.mkdir()
+        marker = b"MUST_NOT_ENTER_REVIEW_SNAPSHOT\n"
+        (outside / "child.txt").write_bytes(marker)
+
+        (self.repo / "node/child.txt").unlink()
+        (self.repo / "node").rmdir()
+        (self.repo / "node").symlink_to(outside, target_is_directory=True)
+
+        with self.assertRaisesRegex(ReviewError, "symlink escapes") as raised:
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.head,
+                head_ref=head,
+                include_source_wip=True,
+            )
+
+        self.assertNotIn(marker.decode().strip(), str(raised.exception))
+        self.assertEqual(list((self.repo / ".codex-tmp").glob("isolated-review-*")), [])
+
+    def test_external_preflight_rejects_post_prepare_workspace_mutation(self) -> None:
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(review)
+        (review.workspace_root / "example.txt").write_text(
+            "post-prepare mutation\n", encoding="utf-8"
+        )
+
+        with self.assertRaisesRegex(ReviewError, "does not match snapshot"):
+            validate_external_workspace(review)
+
+    def test_external_preflight_rejects_forged_scope_identity(self) -> None:
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(review)
+        forged = review.to_json()
+        forged["scope_identity"] = "0" * 64
+
+        with self.assertRaisesRegex(ReviewError, "scope identity"):
+            validate_external_workspace(
+                workspace_runtime.ReviewWorkspace.from_json(forged)
+            )
+
+    def test_external_preflight_rejects_detached_head_retargeting(self) -> None:
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(review)
+        pointer = (review.workspace_root / ".git").read_text(encoding="utf-8")
+        worktree_admin = pathlib.Path(pointer.removeprefix("gitdir: ").strip())
+        (worktree_admin / "HEAD").write_text(
+            f"{review.base_ref}\n",
+            encoding="ascii",
+        )
+
+        with self.assertRaisesRegex(ReviewError, "HEAD no longer matches"):
+            validate_external_workspace(review)
+
+    def test_external_preflight_rejects_attached_head_at_expected_commit(self) -> None:
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(review)
+        pointer = (review.workspace_root / ".git").read_text(encoding="utf-8")
+        worktree_admin = pathlib.Path(pointer.removeprefix("gitdir: ").strip())
+        (worktree_admin / "HEAD").write_text(
+            "ref: refs/heads/reviewer-mutation\n",
+            encoding="ascii",
+        )
+
+        with self.assertRaisesRegex(ReviewError, "no longer detached"):
+            validate_external_workspace(review)
+
+    def test_external_preflight_rejects_private_shallow_endpoint_mutation(
+        self,
+    ) -> None:
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(review)
+        shallow = review.git_dir / "shallow"
+        shallow.write_text(f"{review.head_ref}\n", encoding="ascii")
+
+        with self.assertRaisesRegex(ReviewError, "shallow endpoints"):
+            validate_external_workspace(review)
+
+    def test_external_preflight_bounds_head_before_running_git(self) -> None:
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(review)
+        pointer = (review.workspace_root / ".git").read_text(encoding="utf-8")
+        worktree_admin = pathlib.Path(pointer.removeprefix("gitdir: ").strip())
+        (worktree_admin / "HEAD").write_bytes(b"0" * 4097)
+
+        with (
+            mock.patch.object(workspace_runtime, "_run_worktree_git") as worktree_git,
+            mock.patch.object(workspace_runtime, "_run_private_git") as private_git,
+            self.assertRaisesRegex(ReviewError, "HEAD exceeds its review size limit"),
+        ):
+            validate_external_workspace(review)
+
+        worktree_git.assert_not_called()
+        private_git.assert_not_called()
+
+    def test_external_preflight_bounds_shallow_before_running_git(self) -> None:
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(review)
+        (review.git_dir / "shallow").write_bytes(b"0" * (2 * 65 + 1))
+
+        with (
+            mock.patch.object(workspace_runtime, "_run_worktree_git") as worktree_git,
+            mock.patch.object(workspace_runtime, "_run_private_git") as private_git,
+            self.assertRaisesRegex(ReviewError, "shallow.*review size limit"),
+        ):
+            validate_external_workspace(review)
+
+        worktree_git.assert_not_called()
+        private_git.assert_not_called()
+
+    def test_external_preflight_rejects_worktree_commondir_retargeting(self) -> None:
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(review)
+        pointer = (review.workspace_root / ".git").read_text(encoding="utf-8")
+        worktree_admin = pathlib.Path(pointer.removeprefix("gitdir: ").strip())
+        (worktree_admin / "commondir").write_text(
+            f"{self.repo / '.git'}\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ReviewError, "commondir"):
+            validate_external_workspace(review)
+
+    def test_external_preflight_rejects_private_object_alternates(self) -> None:
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(review)
+        alternates = review.git_dir / "objects/info/alternates"
+        alternates.write_text(f"{self.repo / '.git/objects'}\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(ReviewError, "object alternates"):
+            validate_external_workspace(review)
+
+    def test_external_preflight_rejects_private_config_comment(self) -> None:
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(review)
+        with (review.git_dir / "config").open("ab") as handle:
+            handle.write(b"# unexpected private comment\n")
+
+        with self.assertRaisesRegex(ReviewError, "config"):
+            validate_external_workspace(review)
+
+    def test_external_preflight_rejects_private_locked_payload(self) -> None:
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(review)
+        pointer = (review.workspace_root / ".git").read_text(encoding="utf-8")
+        worktree_admin = pathlib.Path(pointer.removeprefix("gitdir: ").strip())
+        (worktree_admin / "locked").write_bytes(b"unexpected private data\n")
+
+        with self.assertRaisesRegex(ReviewError, "locked"):
+            validate_external_workspace(review)
+
+    def test_external_preflight_rejects_unexpected_private_root_file(self) -> None:
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(review)
+        (review.git_dir / "note").write_bytes(b"unexpected private data\n")
+
+        with self.assertRaisesRegex(ReviewError, "root inventory"):
+            validate_external_workspace(review)
+
+    def test_external_preflight_rejects_unexpected_private_object(self) -> None:
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(review)
+        subprocess.run(
+            (
+                "git",
+                f"--git-dir={review.git_dir}",
+                "hash-object",
+                "-w",
+                "--stdin",
+            ),
+            input=b"unexpected private object\n",
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        with self.assertRaisesRegex(ReviewError, "object set"):
+            validate_external_workspace(review)
+
+    def test_wip_private_object_limit_includes_snapshot_closure(self) -> None:
+        (self.repo / "fresh-wip.txt").write_text("fresh WIP blob\n", encoding="utf-8")
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+            include_source_wip=True,
+        )
+        self.reviews.append(review)
+        object_id_length = len(review.head_ref)
+        endpoint_objects = workspace_runtime._private_object_id_set(
+            git_dir=review.git_dir,
+            args=(
+                "rev-list",
+                "--objects",
+                "--no-object-names",
+                f"{review.base_ref}^{{tree}}",
+                f"{review.head_ref}^{{tree}}",
+            ),
+            label="scaled endpoint objects",
+            object_id_length=object_id_length,
+        )
+        snapshot_objects = workspace_runtime._private_object_id_set(
+            git_dir=review.git_dir,
+            args=(
+                "rev-list",
+                "--objects",
+                "--no-object-names",
+                review.snapshot_tree_sha,
+            ),
+            label="scaled WIP snapshot objects",
+            object_id_length=object_id_length,
+        )
+        self.assertGreaterEqual(len(snapshot_objects - endpoint_objects), 2)
+        actual_objects = workspace_runtime._private_object_id_set(
+            git_dir=review.git_dir,
+            args=(
+                "cat-file",
+                "--batch-check=%(objectname)",
+                "--batch-all-objects",
+            ),
+            label="scaled actual objects",
+            object_id_length=object_id_length,
+        )
+        self.assertEqual(
+            workspace_runtime.MAX_PRIVATE_OBJECT_ENTRIES,
+            6 * workspace_runtime.MAX_SNAPSHOT_ENTRIES + 16,
+        )
+        scaled_limit = len(actual_objects)
+        with mock.patch.object(
+            workspace_runtime,
+            "MAX_PRIVATE_OBJECT_ENTRIES",
+            scaled_limit,
+        ):
+            validate_external_workspace(review)
+
+        subprocess.run(
+            (
+                "git",
+                f"--git-dir={review.git_dir}",
+                "hash-object",
+                "-w",
+                "--stdin",
+            ),
+            input=b"unexpected scaled private object\n",
+            check=True,
+            env=test_git_environment(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_PRIVATE_OBJECT_ENTRIES",
+                scaled_limit,
+            ),
+            self.assertRaisesRegex(ReviewError, "actual objects exceeds"),
+        ):
+            validate_external_workspace(review)
+
+    def test_external_preflight_rejects_unexpected_private_ref(self) -> None:
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(review)
+        subprocess.run(
+            (
+                "git",
+                f"--git-dir={review.git_dir}",
+                "update-ref",
+                "refs/heads/injected",
+                review.head_ref,
+            ),
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        with self.assertRaisesRegex(ReviewError, "unexpected ref"):
+            validate_external_workspace(review)
+
+    def test_external_preflight_rejects_corrupt_loose_object_shadow(self) -> None:
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(review)
+        blob = git(review.workspace_root, "rev-parse", "HEAD:example.txt")
+        loose = review.git_dir / "objects" / blob[:2] / blob[2:]
+        loose.parent.mkdir(exist_ok=True)
+        loose.write_bytes(zlib.compress(b"blob 7\0mutated"))
+
+        with self.assertRaisesRegex(ReviewError, "integrity check"):
+            validate_external_workspace(review)
+
+    def test_external_preflight_rejects_oversized_private_pack(self) -> None:
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(review)
+        pack_path = next((review.git_dir / "objects/pack").glob("*.pack"))
+        pack_path.chmod(0o600)
+        with pack_path.open("r+b") as handle:
+            handle.truncate(workspace_runtime.MAX_PRIVATE_PACK_BYTES + 1)
+
+        with self.assertRaisesRegex(ReviewError, "size limit"):
+            validate_external_workspace(review)
+
+    def test_external_preflight_rejects_index_stat_cache_payload(self) -> None:
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(review)
+        pointer = (review.workspace_root / ".git").read_text(encoding="utf-8")
+        worktree_admin = pathlib.Path(pointer.removeprefix("gitdir: ").strip())
+        index_path = worktree_admin / "index"
+        encoded = bytearray(index_path.read_bytes())
+        token = ("AKIA" + "A" * 16).encode("ascii")
+        encoded[12 : 12 + len(token)] = token
+        encoded[-20:] = hashlib.sha1(encoded[:-20]).digest()
+        index_path.write_bytes(encoded)
+        self.assertEqual(
+            git(review.workspace_root, "write-tree"),
+            review.snapshot_tree_sha,
+        )
+
+        with self.assertRaisesRegex(ReviewError, "noncanonical metadata"):
+            validate_external_workspace(review)
+
+    def test_external_preflight_rejects_gitlink_replaced_by_file(self) -> None:
+        git(
+            self.repo,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{self.head},module",
+        )
+        git(self.repo, "commit", "-m", "Add gitlink fixture")
+        head = git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "module").mkdir()
+
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.head,
+            head_ref=head,
+        )
+        self.reviews.append(review)
+        (review.workspace_root / "module").rmdir()
+        (review.workspace_root / "module").write_text(
+            "not a gitlink\n", encoding="utf-8"
+        )
+
+        with self.assertRaisesRegex(ReviewError, "gitlink"):
+            validate_external_workspace(review)
+
+    def test_private_git_database_excludes_intermediate_reverted_objects(self) -> None:
+        base = self.head
+        marker = b"INTERMEDIATE_ONLY_PRIVATE_OBJECT\n"
+        (self.repo / "intermediate.txt").write_bytes(marker)
+        git(self.repo, "add", "intermediate.txt")
+        git(self.repo, "commit", "-m", "Intermediate content")
+        intermediate = git(self.repo, "rev-parse", "HEAD")
+        intermediate_blob = git(self.repo, "rev-parse", "HEAD:intermediate.txt")
+        (self.repo / "intermediate.txt").unlink()
+        git(self.repo, "add", "-u")
+        git(self.repo, "commit", "-m", "Revert intermediate content")
+        head = git(self.repo, "rev-parse", "HEAD")
+
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=base,
+            head_ref=head,
+        )
+        self.reviews.append(review)
+
+        for object_id in (intermediate, intermediate_blob):
+            unavailable = subprocess.run(
+                ("git", "-C", str(review.workspace_root), "cat-file", "-e", object_id),
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(unavailable.returncode, 0)
+        self.assertEqual(git(review.workspace_root, "rev-parse", "HEAD"), head)
+        self.assertEqual(
+            git(review.workspace_root, "rev-parse", "--is-shallow-repository"),
+            "true",
+        )
+        self.assertEqual(git(review.workspace_root, "rev-list", "HEAD"), head)
+        self.assertEqual(
+            git(review.workspace_root, "diff", "--exit-code", base, head), ""
+        )
+        self.assertNotIn(marker, review.diff_file.read_bytes())
+
+    def test_endpoint_commit_message_with_secret_is_rejected(self) -> None:
+        message = json.dumps({"refresh_token": oauth_refresh_credential()})
+        git(self.repo, "commit", "--allow-empty", "-m", message)
+        head = git(self.repo, "rev-parse", "HEAD")
+
+        with self.assertRaisesRegex(ReviewError, "endpoint commit object"):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.head,
+                head_ref=head,
+            )
+
+        self.assertEqual(list((self.repo / ".codex-tmp").glob("isolated-review-*")), [])
+
+    def test_endpoint_commit_signature_block_is_not_scanned_as_human_metadata(
+        self,
+    ) -> None:
+        tree = git(self.repo, "rev-parse", "HEAD^{tree}")
+        raw_commit = (
+            f"tree {tree}\n"
+            f"parent {self.head}\n"
+            "author Review Test <review@example.com> 1700000000 +0000\n"
+            "committer Review Test <review@example.com> 1700000000 +0000\n"
+            "gpgsig -----BEGIN PGP SIGNATURE-----\n"
+            " QUJD\n"
+            " =AAAA\n"
+            " -----END PGP SIGNATURE-----\n"
+            "\n"
+            "Signed endpoint fixture\n"
+        ).encode("utf-8")
+        created = subprocess.run(
+            (
+                "git",
+                "-C",
+                str(self.repo),
+                "hash-object",
+                "-t",
+                "commit",
+                "-w",
+                "--stdin",
+            ),
+            input=raw_commit,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        head = created.stdout.decode("ascii").strip()
+        git(self.repo, "update-ref", "refs/heads/master", head, self.head)
+
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.head,
+            head_ref=head,
+        )
+        self.reviews.append(review)
+        validate_external_workspace(review)
+
+    def test_endpoint_commit_accepts_real_wrapped_ssh_signature_armor(self) -> None:
+        tree = git(self.repo, "rev-parse", "HEAD^{tree}")
+        # Generated once with `ssh-keygen -Y sign`; preserve 70/70/70/22 wrapping.
+        raw_commit = (
+            f"tree {tree}\n"
+            f"parent {self.head}\n"
+            "author Review Test <review@example.com> 1700000000 +0000\n"
+            "committer Review Test <review@example.com> 1700000000 +0000\n"
+            "gpgsig -----BEGIN SSH SIGNATURE-----\n"
+            " U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg62o+hpYZCWU2AhVqtlt3CSqisN\n"
+            " cS4G3tNI/RO0pKfRYAAAAEZmlsZQAAAAAAAAAGc2hhNTEyAAAAUwAAAAtzc2gtZWQyNTUx\n"
+            " OQAAAEDNCoSaeGCiFs0XiXJYiHX6JRXRBMdy+ZKMy3SsQQtzETgnNrBz3f+Wqt929WJ73C\n"
+            " pG/h6O5BSY3TPrdHKKxTMA\n"
+            " -----END SSH SIGNATURE-----\n"
+            "\n"
+            "SSH-signed endpoint fixture\n"
+        ).encode("utf-8")
+        head = self.install_raw_commit(raw_commit, previous=self.head)
+
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.head,
+            head_ref=head,
+        )
+        self.reviews.append(review)
+        validate_external_workspace(review)
+
+    def test_endpoint_commit_malformed_signature_header_fails_closed(self) -> None:
+        tree = git(self.repo, "rev-parse", "HEAD^{tree}")
+        raw_commit = (
+            f"tree {tree}\n"
+            f"parent {self.head}\n"
+            "author Review Test <review@example.com> 1700000000 +0000\n"
+            "committer Review Test <review@example.com> 1700000000 +0000\n"
+            f"gpgsig refresh_token={oauth_refresh_credential()}\n"
+            "\n"
+            "Malformed signature fixture\n"
+        ).encode("utf-8")
+        head = self.install_raw_commit(raw_commit, previous=self.head)
+
+        with self.assertRaisesRegex(ReviewError, "malformed signature"):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.head,
+                head_ref=head,
+            )
+
+    def test_endpoint_commit_noncanonical_signature_key_is_scanned(self) -> None:
+        tree = git(self.repo, "rev-parse", "HEAD^{tree}")
+        access_key = "AKIA" + "A" * 16
+        raw_commit = (
+            f"tree {tree}\n"
+            f"parent {self.head}\n"
+            "author Review Test <review@example.com> 1700000000 +0000\n"
+            "committer Review Test <review@example.com> 1700000000 +0000\n"
+            "GPGSIG -----BEGIN PGP SIGNATURE-----\n"
+            f" {access_key}\n"
+            " -----END PGP SIGNATURE-----\n"
+            "\n"
+            "Noncanonical signature key fixture\n"
+        ).encode("utf-8")
+        head = self.install_raw_commit(raw_commit, previous=self.head)
+
+        with self.assertRaisesRegex(ReviewError, "endpoint commit object"):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.head,
+                head_ref=head,
+            )
+
+    def test_endpoint_commit_malformed_parent_metadata_fails_closed(self) -> None:
+        tree = git(self.repo, "rev-parse", "HEAD^{tree}")
+        raw_commit = (
+            f"tree {tree}\n"
+            f"parent refresh_token={oauth_refresh_credential()}\n"
+            "author Review Test <review@example.com> 1700000000 +0000\n"
+            "committer Review Test <review@example.com> 1700000000 +0000\n"
+            "\n"
+            "Malformed parent fixture\n"
+        ).encode("utf-8")
+
+        with self.assertRaisesRegex(ReviewError, "malformed parent"):
+            workspace_runtime._human_commit_metadata(
+                raw_commit,
+                object_id_length=len(self.head),
+            )
+
+    def test_endpoint_commit_accepts_uppercase_structural_object_ids(self) -> None:
+        tree = git(self.repo, "rev-parse", "HEAD^{tree}")
+        raw_commit = (
+            f"tree {tree.upper()}\n"
+            f"parent {self.head.upper()}\n"
+            "author Review Test <review@example.com> 1700000000 +0000\n"
+            "committer Review Test <review@example.com> 1700000000 +0000\n"
+            "\n"
+            "Uppercase object fixture\n"
+        ).encode("utf-8")
+        head = self.install_raw_commit(raw_commit, previous=self.head)
+
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.head,
+            head_ref=head,
+        )
+        self.reviews.append(review)
+        validate_external_workspace(review)
+
+    def test_endpoint_commit_mergetag_object_must_be_an_object_id(self) -> None:
+        tree = git(self.repo, "rev-parse", "HEAD^{tree}")
+        raw_commit = (
+            f"tree {tree}\n"
+            f"parent {self.head}\n"
+            "author Review Test <review@example.com> 1700000000 +0000\n"
+            "committer Review Test <review@example.com> 1700000000 +0000\n"
+            f"mergetag object refresh_token={oauth_refresh_credential()}\n"
+            " type commit\n"
+            " tag fixture\n"
+            " tagger Review Test <review@example.com> 1700000000 +0000\n"
+            " \n"
+            " Mergetag fixture\n"
+            "\n"
+            "Endpoint fixture\n"
+        ).encode("utf-8")
+        head = self.install_raw_commit(raw_commit, previous=self.head)
+
+        with self.assertRaisesRegex(ReviewError, "malformed mergetag object"):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.head,
+                head_ref=head,
+            )
+
+    def test_endpoint_commit_custom_header_containing_sig_is_scanned(self) -> None:
+        tree = git(self.repo, "rev-parse", "HEAD^{tree}")
+        raw_commit = (
+            f"tree {tree}\n"
+            f"parent {self.head}\n"
+            "author Review Test <review@example.com> 1700000000 +0000\n"
+            "committer Review Test <review@example.com> 1700000000 +0000\n"
+            f"design-note refresh_token={oauth_refresh_credential()}\n"
+            "\n"
+            "Custom metadata fixture\n"
+        ).encode("utf-8")
+        created = subprocess.run(
+            (
+                "git",
+                "-C",
+                str(self.repo),
+                "hash-object",
+                "-t",
+                "commit",
+                "-w",
+                "--stdin",
+            ),
+            input=raw_commit,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        head = created.stdout.decode("ascii").strip()
+        git(self.repo, "update-ref", "refs/heads/master", head, self.head)
+
+        with self.assertRaisesRegex(ReviewError, "endpoint commit object"):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.head,
+                head_ref=head,
+            )
+
+    def test_endpoint_commit_malformed_mergetag_fails_closed(self) -> None:
+        tree = git(self.repo, "rev-parse", "HEAD^{tree}")
+        raw_commit = (
+            f"tree {tree}\n"
+            f"parent {self.head}\n"
+            "author Review Test <review@example.com> 1700000000 +0000\n"
+            "committer Review Test <review@example.com> 1700000000 +0000\n"
+            "mergetag malformed-without-tag-headers-or-message\n"
+            "\n"
+            "Malformed mergetag fixture\n"
+        ).encode("utf-8")
+        created = subprocess.run(
+            (
+                "git",
+                "-C",
+                str(self.repo),
+                "hash-object",
+                "-t",
+                "commit",
+                "-w",
+                "--stdin",
+            ),
+            input=raw_commit,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        head = created.stdout.decode("ascii").strip()
+        git(self.repo, "update-ref", "refs/heads/master", head, self.head)
+
+        with self.assertRaisesRegex(ReviewError, "malformed mergetag"):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.head,
+                head_ref=head,
+            )
+
+    def test_endpoint_commit_mergetag_human_message_is_scanned(self) -> None:
+        tree = git(self.repo, "rev-parse", "HEAD^{tree}")
+        raw_commit = (
+            f"tree {tree}\n"
+            f"parent {self.head}\n"
+            "author Review Test <review@example.com> 1700000000 +0000\n"
+            "committer Review Test <review@example.com> 1700000000 +0000\n"
+            f"mergetag object {self.head}\n"
+            " type commit\n"
+            " tag fixture\n"
+            " tagger Review Test <review@example.com> 1700000000 +0000\n"
+            " \n"
+            f" refresh_token={oauth_refresh_credential()}\n"
+            "\n"
+            "Mergetag metadata fixture\n"
+        ).encode("utf-8")
+        created = subprocess.run(
+            (
+                "git",
+                "-C",
+                str(self.repo),
+                "hash-object",
+                "-t",
+                "commit",
+                "-w",
+                "--stdin",
+            ),
+            input=raw_commit,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        head = created.stdout.decode("ascii").strip()
+        git(self.repo, "update-ref", "refs/heads/master", head, self.head)
+
+        with self.assertRaisesRegex(ReviewError, "endpoint commit object"):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.head,
+                head_ref=head,
+            )
+
+    def test_wip_revalidates_content_even_when_porcelain_status_is_unchanged(
+        self,
+    ) -> None:
+        (self.repo / "example.txt").write_text("first dirty value\n", encoding="utf-8")
+        original_run_worktree_git = workspace_runtime._run_worktree_git
+        mutated = False
+
+        def mutate_after_snapshot(workspace_root, *args, **kwargs):
+            nonlocal mutated
+            result = original_run_worktree_git(workspace_root, *args, **kwargs)
+            if args == ("write-tree",) and not mutated:
+                mutated = True
+                (self.repo / "example.txt").write_text(
+                    "second dirty value\n", encoding="utf-8"
+                )
+            return result
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "_run_worktree_git",
+                side_effect=mutate_after_snapshot,
+            ),
+            self.assertRaisesRegex(ReviewError, "content changed"),
+        ):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+                include_source_wip=True,
+            )
+
+    def test_source_status_output_is_byte_bounded(self) -> None:
+        (self.repo / "example.txt").write_text("dirty\n", encoding="utf-8")
+
+        with (
+            mock.patch.object(workspace_runtime, "MAX_SOURCE_STATUS_BYTES", 1),
+            self.assertRaisesRegex(ReviewError, "source WIP status metadata exceeds"),
+        ):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+                include_source_wip=True,
+            )
+
+    def test_source_wip_tracked_paths_are_record_bounded(self) -> None:
+        (self.repo / "example.txt").write_text("dirty\n", encoding="utf-8")
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SOURCE_TRACKED_PATH_RECORDS",
+                0,
+            ),
+            self.assertRaisesRegex(ReviewError, "source WIP tracked paths exceeds"),
+        ):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+                include_source_wip=True,
+            )
+
+    def test_source_index_flag_enumeration_is_record_bounded(self) -> None:
+        with (
+            mock.patch.object(workspace_runtime, "MAX_SOURCE_INDEX_RECORDS", 0),
+            self.assertRaisesRegex(ReviewError, "source index-flag metadata exceeds"),
+        ):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+
+    def test_source_status_timeout_terminates_git_process(self) -> None:
+        fake_git = pathlib.Path(self.temporary.name) / "bounded-git"
+        fake_git.write_text(
+            "#!/bin/sh\nexec /bin/sleep 30\n",
+            encoding="utf-8",
+        )
+        fake_git.chmod(0o755)
+        stop_process = workspace_runtime._stop_source_git_process
+
+        with (
+            mock.patch.object(workspace_runtime, "resolve_git", return_value=fake_git),
+            mock.patch.object(
+                workspace_runtime,
+                "SOURCE_GIT_TIMEOUT_SECONDS",
+                0.25,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "_stop_source_git_process",
+                wraps=stop_process,
+            ) as stopped,
+            self.assertRaisesRegex(ReviewError, "source Git time limit"),
+        ):
+            workspace_runtime._source_status(self.repo)
+
+        stopped.assert_called_once()
+        process = stopped.call_args.args[0]
+        self.assertIsNotNone(process.returncode)
+        self.assertLess(process.returncode, 0)
+
+    def test_source_git_query_timeout_terminates_process(self) -> None:
+        fake_git = pathlib.Path(self.temporary.name) / "bounded-query-git"
+        fake_git.write_text(
+            "#!/bin/sh\nexec /bin/sleep 30\n",
+            encoding="utf-8",
+        )
+        fake_git.chmod(0o755)
+        stop_process = workspace_runtime._stop_bounded_process
+
+        with (
+            mock.patch.object(workspace_runtime, "resolve_git", return_value=fake_git),
+            mock.patch.object(
+                workspace_runtime,
+                "SOURCE_GIT_TIMEOUT_SECONDS",
+                0.25,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "_stop_bounded_process",
+                wraps=stop_process,
+            ) as stopped,
+            self.assertRaisesRegex(ReviewError, "source Git time limit"),
+        ):
+            workspace_runtime.resolve_commit(self.repo, "HEAD", label="query head")
+
+        stopped.assert_called_once()
+        process = stopped.call_args.args[0]
+        self.assertIsNotNone(process.returncode)
+        self.assertLess(process.returncode, 0)
+
+    def test_private_git_preparation_timeout_terminates_process(self) -> None:
+        fake_git = pathlib.Path(self.temporary.name) / "bounded-private-git"
+        fake_git.write_text(
+            "#!/bin/sh\nexec /bin/sleep 30\n",
+            encoding="utf-8",
+        )
+        fake_git.chmod(0o755)
+        frozen_command = workspace_runtime._frozen_command
+        stop_process = workspace_runtime._stop_bounded_process
+
+        def stall_object_enumeration(*, git_view, args):
+            if args[:1] == ("rev-list",):
+                return (str(fake_git),)
+            return frozen_command(git_view=git_view, args=args)
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "_frozen_command",
+                side_effect=stall_object_enumeration,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "PRIVATE_GIT_TIMEOUT_SECONDS",
+                0.25,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "_stop_bounded_process",
+                wraps=stop_process,
+            ) as stopped,
+            self.assertRaisesRegex(ReviewError, "private Git time limit"),
+        ):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+
+        stopped.assert_called_once()
+        process = stopped.call_args.args[0]
+        self.assertIsNotNone(process.returncode)
+        self.assertLess(process.returncode, 0)
+        self.assertEqual(
+            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            [],
+        )
+
+    def test_clean_and_wip_reject_assume_unchanged_index_entries(self) -> None:
+        git(self.repo, "update-index", "--assume-unchanged", "example.txt")
+        (self.repo / "example.txt").write_text("hidden dirty value\n", encoding="utf-8")
+
+        for include_source_wip in (False, True):
+            with (
+                self.subTest(include_source_wip=include_source_wip),
+                self.assertRaisesRegex(ReviewError, "hidden index flags"),
+            ):
+                prepare_workspace(
+                    repo=self.repo,
+                    base_ref=self.base,
+                    head_ref=self.head,
+                    include_source_wip=include_source_wip,
+                )
+
+    def test_clean_and_wip_reject_skip_worktree_index_entries(self) -> None:
+        git(self.repo, "update-index", "--skip-worktree", "example.txt")
+        (self.repo / "example.txt").write_text("hidden dirty value\n", encoding="utf-8")
+
+        for include_source_wip in (False, True):
+            with (
+                self.subTest(include_source_wip=include_source_wip),
+                self.assertRaisesRegex(ReviewError, "hidden index flags"),
+            ):
+                prepare_workspace(
+                    repo=self.repo,
+                    base_ref=self.base,
+                    head_ref=self.head,
+                    include_source_wip=include_source_wip,
+                )
+
+    def test_core_filemode_false_cannot_hide_mode_only_wip(self) -> None:
+        git(self.repo, "config", "core.filemode", "false")
+        (self.repo / "example.txt").chmod(0o755)
+
+        with self.assertRaisesRegex(ReviewError, "source repository has"):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+            include_source_wip=True,
+        )
+        self.reviews.append(review)
+        self.assertEqual(
+            stat.S_IMODE((review.workspace_root / "example.txt").stat().st_mode),
+            0o755,
+        )
+
+    def test_wip_rejects_collapsed_untracked_nested_repository(self) -> None:
+        nested = self.repo / "nested"
+        subprocess.run(
+            ("git", "init", "-b", "master", str(nested)),
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        (nested / "private.txt").write_text("nested content\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(ReviewError, "nested repositories"):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+                include_source_wip=True,
+            )
+
+    def test_cleanup_keeps_state_artifacts_but_removes_private_git_database(
+        self,
+    ) -> None:
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        marker = review.container_dir / "state-marker"
+        marker.write_text("retain\n", encoding="utf-8")
+
+        self.assertIsNone(cleanup_workspace(review, keep_container=True))
+        self.assertTrue(review.container_dir.is_dir())
+        self.assertTrue(marker.is_file())
+        self.assertFalse(review.workspace_root.exists())
+        self.assertFalse(
+            (review.git_dir or review.container_dir / "review.git").exists()
+        )
+        self.assertIsNone(cleanup_workspace(review, keep_container=False))
+
+    def test_clean_and_wip_prepare_without_codex_tmp_ignore(self) -> None:
+        plain = pathlib.Path(self.temporary.name) / "plain"
+        plain.mkdir()
+        subprocess.run(
+            ("git", "init", "-b", "master", str(plain)),
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        git(plain, "config", "user.name", "Review Test")
+        git(plain, "config", "user.email", "review@example.com")
+        git(plain, "config", "commit.gpgsign", "false")
+        (plain / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+        git(plain, "add", "tracked.txt")
+        git(plain, "commit", "-m", "Initial")
+        head = git(plain, "rev-parse", "HEAD")
+
+        clean_review = prepare_workspace(repo=plain, base_ref=head, head_ref=head)
+        self.assertIsNone(cleanup_workspace(clean_review, keep_container=False))
+
+        (plain / "wip.txt").write_text("WIP\n", encoding="utf-8")
+        wip_review = prepare_workspace(
+            repo=plain,
+            base_ref=head,
+            head_ref=head,
+            include_source_wip=True,
+        )
+        self.assertEqual(
+            (wip_review.workspace_root / "wip.txt").read_text(encoding="utf-8"),
+            "WIP\n",
+        )
+        self.assertIsNone(cleanup_workspace(wip_review, keep_container=False))
+
+    def test_cleanup_of_detached_worktree_is_idempotent(self) -> None:
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+
+        self.assertIsNone(cleanup_workspace(review, keep_container=False))
+        self.assertIsNone(cleanup_workspace(review, keep_container=False))
 
     def test_prepare_uses_private_control_modes_under_permissive_umask(self) -> None:
         for mask in (0o002, 0o000):
@@ -864,7 +2132,7 @@ class WorkspaceTest(unittest.TestCase):
         outside.mkdir()
         (self.repo / ".codex-tmp").symlink_to(outside, target_is_directory=True)
 
-        with self.assertRaisesRegex(ReviewError, "not a symlink"):
+        with self.assertRaisesRegex(ReviewError, "source repository has"):
             prepare_workspace(
                 repo=self.repo,
                 base_ref=self.base,

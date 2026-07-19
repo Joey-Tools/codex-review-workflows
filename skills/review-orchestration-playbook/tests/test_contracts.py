@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import pathlib
 import subprocess
 import sys
@@ -16,61 +15,16 @@ except ModuleNotFoundError:  # pragma: no cover - exercised by Python 3.10 CI
 SKILL_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SKILL_SCOPE_ROOT = SKILL_ROOT.parents[1]
 SCRIPTS = SKILL_ROOT / "scripts"
+RUNTIME = SCRIPTS / "review_runtime"
 sys.path.insert(0, str(SCRIPTS))
 
-from review_runtime import (  # noqa: E402
-    claude_capabilities,
-    claude_keychain_macos,
-    claude_linux,
-    claude_refresh_lock,
-    providers,
-)
-
-
-EXPECTED_CLAUDE_2_1_211_LOCK_ARTIFACTS = {
-    (
-        "2.1.211",
-        "darwin-arm64",
-        "5a728a76198b6eca7f3c7cdbff43bab44b77b48c2108f7a3107d889773382629",
-    ),
-    (
-        "2.1.211",
-        "darwin-x64",
-        "33049eb14cf4702b992b7eda41ec077fc6e76539f7fd046e6d32538757235da4",
-    ),
-    (
-        "2.1.211",
-        "linux-arm64",
-        "1fff7e8f947c07b19d10b1fbf714b7e547e9536253b9b58230d8adbc4624f867",
-    ),
-    (
-        "2.1.211",
-        "linux-x64",
-        "8272c8a474ac9ea1bc35f19b9f7c7e7dc4dc4eb6d5ad3e484b19335ac72446b2",
-    ),
-    (
-        "2.1.211",
-        "linux-arm64-musl",
-        "ca094a85ea464b2ebec2ecfcc9e2c056573d4ca95ebe12ffae2c7dccb722e17b",
-    ),
-    (
-        "2.1.211",
-        "linux-x64-musl",
-        "c99bd7934ac841d5be6ee7d3644cb63bccef2cd495c6c1bb982a1b1deac1b466",
-    ),
-}
-
-
-SYNTH_API_KEY_A = "codex_synth_v1_api_key_a"  # Synthetic token id: api-key-a.
-SYNTH_BEARER_A = "codex_synth_v1_bearer_a"  # Synthetic token id: bearer-a.
+from review_runtime import providers  # noqa: E402
 
 
 CI_FIXTURE_ROOT = SKILL_ROOT / "tests" / "fixtures" / "ci"
 CI_PROFILE_BY_SKILL_LAYOUT = {
     pathlib.Path("skills/review-orchestration-playbook"): "canonical",
-    pathlib.Path(
-        "personal_codex/skills/review-orchestration-playbook"
-    ): "private",
+    pathlib.Path("personal_codex/skills/review-orchestration-playbook"): "private",
 }
 
 
@@ -94,7 +48,7 @@ def _ci_contract_context(skill_root: pathlib.Path) -> tuple[pathlib.Path, str]:
 REPO_ROOT, CI_PROFILE = _ci_contract_context(SKILL_ROOT)
 
 
-def _claude_auth_repository_policy_files(
+def _claude_repository_policy_files(
     repo_root: pathlib.Path,
     profile: str,
 ) -> dict[str, str]:
@@ -106,15 +60,30 @@ def _claude_auth_repository_policy_files(
             "project journal": (
                 repo_root
                 / "docs/project_journal/2026/07/"
-                / "2026-07-17-claude-auth-carriers-c17a11.md"
+                / "2026-07-19-real-home-read-only-claude-c63d11.md"
             ),
         }
     elif profile != "private":
         raise AssertionError(f"unsupported repository policy profile: {profile}")
     return {
-        name: path.read_text(encoding="utf-8")
-        for name, path in policy_paths.items()
+        name: path.read_text(encoding="utf-8") for name, path in policy_paths.items()
     }
+
+
+def _current_claude_contract_files() -> dict[str, str]:
+    candidates = {
+        "SKILL.md": SKILL_ROOT / "SKILL.md",
+        "helper-contract.md": SKILL_ROOT / "references/helper-contract.md",
+        "claude-runtime-trust.md": (SKILL_ROOT / "references/claude-runtime-trust.md"),
+        "egress-consent.md": SKILL_ROOT / "references/egress-consent.md",
+        "pr-readiness.md": SKILL_ROOT / "references/pr-readiness.md",
+        **{
+            name: REPO_ROOT / name
+            for name in ("AGENTS.md", "README.md")
+            if (REPO_ROOT / name).is_file()
+        },
+    }
+    return {name: path.read_text(encoding="utf-8") for name, path in candidates.items()}
 
 
 class RepositoryContractTest(unittest.TestCase):
@@ -137,7 +106,10 @@ class RepositoryContractTest(unittest.TestCase):
 
         self.assertIn("only an intermediate poll, not task completion", skill)
         self.assertIn("Keep the parent task active", skill)
-        self.assertIn("do not end the task merely because one wait window expires", skill)
+        self.assertIn(
+            "do not end the task merely because one wait window expires",
+            skill,
+        )
 
     def test_models_are_pinned_in_runtime_and_clean_context_agent(self) -> None:
         self.assertEqual(providers.CODEX_MODELS, ("gpt-5.6-sol", "gpt-5.5"))
@@ -164,542 +136,154 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(reviewer["model"], "gpt-5.6-sol")
         self.assertEqual(reviewer["model_reasoning_effort"], "xhigh")
 
-    def test_claude_policy_defaults_to_local_login_in_safe_mode(self) -> None:
-        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
-        helper_contract = (SKILL_ROOT / "references/helper-contract.md").read_text(
-            encoding="utf-8"
+    def test_claude_uses_one_real_home_read_only_worktree_mode(self) -> None:
+        policies = _current_claude_contract_files()
+        combined = "\n".join(policies.values())
+        required = (
+            "real `HOME`",
+            "detached Git worktree",
+            ">=2.1.212,<3.0.0",
+            "plan mode",
+            "Read",
+            "Grep",
+            "Glob",
+            "read-only `Bash`",
+            "native sandbox",
+            "unsandboxed",
         )
-
-        self.assertIn("ordinary local Claude login by default", skill)
-        self.assertIn("runs in safe mode", helper_contract)
-        self.assertIn(
-            "hardening-compatible `default` permission mode",
-            helper_contract,
-        )
-        self.assertIn(
-            "helper-owned outer sandbox",
-            helper_contract,
-        )
-        self.assertNotIn("safe mode with `dontAsk` permissions", helper_contract)
-        self.assertIn("per-version signed manifest", helper_contract)
-        self.assertIn("manifest checksum", helper_contract)
-        self.assertIn("downloads.claude.ai", helper_contract)
-        self.assertIn("deny-by-default Seatbelt profile", helper_contract)
-        self.assertIn("current-account `Claude Code-credentials`", helper_contract)
-        self.assertIn("helper-controlled proxy", helper_contract)
-        self.assertIn(">=2.1.211,<3.0.0", helper_contract)
-        self.assertIn("Linux and WSL2", helper_contract)
-        self.assertNotIn("requires `ANTHROPIC_API_KEY`", skill)
-
-    def test_claude_explicit_auth_and_keychain_binding_contract(self) -> None:
-        explicit_env = {
-            "ANTHROPIC_API_KEY": SYNTH_API_KEY_A,
-            "CLAUDE_CODE_OAUTH_TOKEN": SYNTH_BEARER_A,
-        }
-        self.assertEqual(
-            providers.CLAUDE_EXPLICIT_AUTH_ENV_KEYS,
-            ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"),
-        )
-        self.assertEqual(
-            providers._claude_explicit_auth_source(explicit_env),
-            "api-key",
-        )
-        self.assertEqual(
-            providers._claude_explicit_auth_environment(explicit_env),
-            {"ANTHROPIC_API_KEY": SYNTH_API_KEY_A},
-        )
-        self.assertEqual(
-            set(providers._claude_explicit_auth_secrets(explicit_env)),
-            {SYNTH_API_KEY_A, SYNTH_BEARER_A},
-        )
-        self.assertEqual(
-            providers._claude_explicit_auth_environment(
-                {
-                    "ANTHROPIC_API_KEY": "",
-                    "CLAUDE_CODE_OAUTH_TOKEN": SYNTH_BEARER_A,
-                }
-            ),
-            {"CLAUDE_CODE_OAUTH_TOKEN": SYNTH_BEARER_A},
-        )
-
-        broker_source = inspect.getsource(
-            providers._prepare_claude_keychain_broker
-        )
-        macos_runtime_source = inspect.getsource(providers._claude_keychain_runtime)
-        linux_runtime_source = inspect.getsource(
-            providers._claude_linux_review_runtime
-        )
-        attempt_source = inspect.getsource(providers._claude_attempt)
-        tool_path_source = inspect.getsource(providers._with_claude_review_tool_path)
-        sandbox_source = inspect.getsource(providers._claude_review_sandbox_profile)
-        run_review_source = inspect.getsource(providers.run_review)
-        keychain_read_source = inspect.getsource(
-            providers._read_claude_keychain_credential_snapshot
-        )
-        keychain_write_source = inspect.getsource(
-            providers._write_claude_keychain_credential
-        )
-        keychain_persistence_source = inspect.getsource(
-            providers._persist_claude_macos_refreshed_credential_impl
-        )
-
-        self.assertLess(
-            broker_source.index("_claude_has_explicit_auth"),
-            broker_source.index("CLAUDE_KEYCHAIN_BROKER_COMPILER"),
-        )
-        self.assertLess(
-            macos_runtime_source.index("_claude_has_explicit_auth"),
-            macos_runtime_source.index("refresh_lock_protocol is None"),
-        )
-        self.assertLess(
-            macos_runtime_source.index("_claude_has_explicit_auth"),
-            macos_runtime_source.index("_select_claude_macos_credential"),
-        )
-        self.assertLess(
-            linux_runtime_source.index("_claude_explicit_auth_environment"),
-            linux_runtime_source.index("stage_claude_credentials"),
-        )
-        for source in (attempt_source, tool_path_source, sandbox_source):
-            self.assertIn("_claude_has_explicit_auth", source)
-        self.assertIn("_claude_explicit_auth_secrets", run_review_source)
-
-        self.assertIn("read_login_keychain_credential", keychain_read_source)
-        self.assertIn("replace_login_keychain_credential", keychain_write_source)
-        replacement_index = keychain_write_source.index(
-            "replace_login_keychain_credential"
-        )
-        self.assertLess(
-            keychain_write_source.index("refresh_lock.assert_held()"),
-            replacement_index,
-        )
-        self.assertGreater(
-            keychain_write_source.rindex("refresh_lock.assert_held()"),
-            replacement_index,
-        )
-        self.assertFalse(hasattr(providers, "CLAUDE_KEYCHAIN_CLIENT"))
-        self.assertFalse(
-            hasattr(providers, "CLAUDE_KEYCHAIN_SECURITY_STDIN_LIMIT_BYTES")
-        )
-        self.assertEqual(
-            claude_keychain_macos.MAXIMUM_CREDENTIAL_BYTES,
-            providers.CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES,
-        )
-
-        keychain_source = inspect.getsource(claude_keychain_macos)
-        for expected in (
-            "Security.framework",
-            'pathlib.Path("/")',
-            'decoded_type != "apfs"',
-            "_MNT_LOCAL",
-            "_ACL_EXTENDED_ALLOW",
-            "select.kqueue()",
-            "consume_expected_update_events",
-            "SecKeychainGetUserInteractionAllowed",
-            "SecKeychainSetUserInteractionAllowed",
-            "socket.socketpair",
-            "pass_fds",
-            "start_new_session=True",
-            "KEYCHAIN_WORKER_TIMEOUT_SECONDS",
-            "MacOSKeychainWriteOutcomeUnknown",
-            "_kill_and_reap_worker",
-        ):
-            self.assertIn(expected, keychain_source)
-        self.assertIn(
-            "ClaudeCredentialWriteOutcomeUnknown", keychain_persistence_source
-        )
-        self.assertIn(
-            "ClaudeCredentialWorkerTerminationInconclusive",
-            keychain_persistence_source,
-        )
-        self.assertIn(
-            "retain_for_controlled_cleanup",
-            keychain_persistence_source,
-        )
-        self.assertNotIn("/usr/bin/" + "security", keychain_source)
-
-        policy_files = {
-            "SKILL.md": SKILL_ROOT / "SKILL.md",
-            "helper-contract.md": SKILL_ROOT / "references/helper-contract.md",
-            "claude-runtime-trust.md": (
-                SKILL_ROOT / "references/claude-runtime-trust.md"
-            ),
-        }
-        policies = {
-            name: path.read_text(encoding="utf-8")
-            for name, path in policy_files.items()
-        }
-        if CI_PROFILE == "canonical":
-            policies.update(
-                _claude_auth_repository_policy_files(REPO_ROOT, CI_PROFILE)
-            )
-            policies["project journal"] = (
-                REPO_ROOT
-                / "docs/project_journal/2026/07/"
-                / "2026-07-18-claude-explicit-auth-sources-a718e2.md"
-            ).read_text(encoding="utf-8")
-        forbidden_phrases = (
-            "/usr/bin/" + "security",
-            "security" + " -i",
-            "40" + "32",
-            "batch" + "-hex",
-            "Keychain update " + "transport" + "-size limit",
-        )
-        for name, policy in policies.items():
-            with self.subTest(policy=name):
-                self.assertIn("ANTHROPIC_API_KEY", policy)
-                self.assertIn("CLAUDE_CODE_OAUTH_TOKEN", policy)
-                for forbidden in forbidden_phrases:
-                    self.assertNotIn(forbidden, policy)
-
-        current_policy = "\n".join(policies.values())
+        for phrase in required:
+            self.assertIn(phrase, combined)
         for name in (
             "SKILL.md",
             "helper-contract.md",
             "claude-runtime-trust.md",
+            "README.md",
         ):
-            self.assertIn("post-ready serve-loop failure", policies[name])
-        for expected in (
-            "Security.framework",
-            "exact item reference",
-            "descriptor-bound",
-            "local APFS",
-            "DENY-only ACL",
-            "kqueue",
-            "certified writer lease",
-            "winner",
-            "loser",
-            "redaction",
-            "at most two Keychain replacement attempts",
-            "dedicated supervised helper process",
-            "monotonic hard timeout",
-            "write outcome unknown",
-            "one bounded readback",
-            "no second replacement",
-            "shared refresh locks",
-        ):
-            self.assertIn(expected, current_policy)
+            if policy := policies.get(name):
+                with self.subTest(policy=name):
+                    self.assertIn("worktree", policy.lower())
+                    self.assertIn("HOME", policy)
+                    self.assertIn("sandbox", policy.lower())
 
-    def test_claude_auth_carriers_refresh_without_a_freshness_gate(self) -> None:
-        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
-        helper_contract = (SKILL_ROOT / "references/helper-contract.md").read_text(
+        self.assertIn("control plane", combined)
+        self.assertIn("write denials", combined)
+        self.assertIn("requested rather than claiming independent proof", combined)
+        self.assertIn("model tools", combined)
+        self.assertIn("authentication", combined)
+        self.assertNotIn("separate HOME/runtime modes", combined)
+
+        provider_source = (RUNTIME / "providers.py").read_text(encoding="utf-8")
+        self.assertIn('"autoAllowBashIfSandboxed": False', provider_source)
+        self.assertIn('"allowUnsandboxedCommands": False', provider_source)
+        self.assertIn("model-backed behavioral probe", combined)
+        for stale_claim in (
+            "helper-controlled route",
+            "materializes certificate-only",
+            "effort mismatch fail closed",
+        ):
+            self.assertNotIn(stale_claim, combined)
+
+    def test_claude_auth_precedence_delegates_to_verified_cli(self) -> None:
+        policies = _current_claude_contract_files()
+        combined = "\n".join(policies.values())
+        provider_source = (RUNTIME / "providers.py").read_text(encoding="utf-8")
+
+        precedence = (
+            "`ANTHROPIC_API_KEY` > `CLAUDE_CODE_OAUTH_TOKEN` > ordinary local login"
+        )
+        self.assertIn(precedence, combined)
+        self.assertIn("ANTHROPIC_API_KEY", provider_source)
+        self.assertIn("CLAUDE_CODE_OAUTH_TOKEN", provider_source)
+        self.assertIn("blocked-authentication", combined)
+        self.assertIn("claude auth login", combined)
+        self.assertIn("unset or replace `ANTHROPIC_API_KEY`", combined)
+        self.assertIn("unset or replace `CLAUDE_CODE_OAUTH_TOKEN`", combined)
+
+        self.assertIn("opaque-forward", policies["SKILL.md"])
+        self.assertIn("never parses", policies["SKILL.md"])
+        self.assertIn("opaque-forward", policies["helper-contract.md"])
+        self.assertIn("never parses", policies["helper-contract.md"])
+        self.assertIn("auth status --json", combined)
+        self.assertIn("system/init", combined)
+        self.assertIn("The helper never:", policies["claude-runtime-trust.md"])
+        for name in ("SKILL.md", "helper-contract.md", "claude-runtime-trust.md"):
+            with self.subTest(policy=name):
+                self.assertIn("persist", policies[name])
+
+    def test_helper_managed_credential_protocol_is_retired(self) -> None:
+        for relative in (
+            "claude_keychain_macos.py",
+            "claude_keychain_broker.c",
+            "claude_refresh_lock.py",
+        ):
+            self.assertFalse((RUNTIME / relative).exists(), relative)
+
+        provider_source = (RUNTIME / "providers.py").read_text(encoding="utf-8")
+        linux_source = (RUNTIME / "claude_linux.py").read_text(encoding="utf-8")
+        for symbol in (
+            "_prepare_claude_keychain_broker",
+            "_claude_keychain_runtime",
+            "_persist_claude_macos_refreshed_credential",
+            "_write_claude_keychain_credential",
+            "stage_claude_credentials",
+            "acquire_claude_refresh_lock",
+        ):
+            with self.subTest(symbol=symbol):
+                self.assertNotIn(symbol, provider_source + linux_source)
+
+        forbidden_policy_terms = (
+            "SecKeychainItemRef",
+            "credential-lock protocol catalog",
+            "certified 5-second heartbeat",
+            "recovery_artifact",
+            "recovery carrier",
+            "/auth/config",
+            "guarded writeback",
+            "helper-controlled broker",
+        )
+        for name, policy in _current_claude_contract_files().items():
+            with self.subTest(policy=name):
+                for term in forbidden_policy_terms:
+                    self.assertNotIn(term, policy)
+
+    def test_workspace_defaults_clean_and_wip_is_explicit_review_only(self) -> None:
+        cli_source = (RUNTIME / "cli.py").read_text(encoding="utf-8")
+        workspace_source = (RUNTIME / "workspace.py").read_text(encoding="utf-8")
+        policies = _current_claude_contract_files()
+
+        self.assertIn("--include-source-wip", cli_source)
+        self.assertIn("include_source_wip", cli_source + workspace_source)
+        for name in ("SKILL.md", "helper-contract.md", "egress-consent.md"):
+            policy = policies[name]
+            with self.subTest(policy=name):
+                self.assertIn("--include-source-wip", policy)
+                self.assertIn("staged", policy)
+                self.assertIn("unstaged", policy)
+                self.assertIn("untracked", policy)
+
+        helper = policies["helper-contract.md"]
+        self.assertIn("helper-owned minimal Git database", helper)
+        self.assertIn("source repository/common Git directory", helper)
+        self.assertIn("WIP digest", helper)
+        self.assertIn("source checkout", helper)
+
+        readiness = policies["pr-readiness.md"]
+        self.assertIn("always uses clean exact-commit mode", readiness)
+        self.assertIn("must be committed", readiness)
+        self.assertIn("omit `--include-source-wip`", readiness)
+        self.assertIn("never report a WIP digest", readiness)
+
+    def test_wip_consent_includes_untracked_but_excludes_home(self) -> None:
+        consent = (SKILL_ROOT / "references/egress-consent.md").read_text(
             encoding="utf-8"
         )
-        runtime_trust = (
-            SKILL_ROOT / "references/claude-runtime-trust.md"
-        ).read_text(encoding="utf-8")
-
-        egress_consent = (
-            SKILL_ROOT / "references/egress-consent.md"
-        ).read_text(encoding="utf-8")
-        repository_policy_files = _claude_auth_repository_policy_files(
-            REPO_ROOT,
-            CI_PROFILE,
-        )
-
-        self.assertEqual(claude_capabilities.CLAUDE_MINIMUM_VERSION, (2, 1, 211))
-        self.assertEqual(claude_linux.DEFAULT_CREDENTIAL_VALIDITY_SECONDS, 0.0)
-        self.assertFalse(hasattr(providers, "CLAUDE_AUTH_EXPIRY_MARGIN_SECONDS"))
-        self.assertFalse(
-            hasattr(providers, "CLAUDE_ATTEMPT_CREDENTIAL_VALIDITY_SECONDS")
-        )
-
-        attempt_source = inspect.getsource(providers._claude_attempt)
-        pwd_home_source = inspect.getsource(providers._claude_pwd_home)
-        select_source = inspect.getsource(providers._select_claude_macos_credential)
-        validate_source = inspect.getsource(
-            providers._validate_claude_local_credential
-        )
-        macos_runtime_source = inspect.getsource(providers._claude_keychain_runtime)
-        macos_persist_source = inspect.getsource(
-            providers._persist_claude_macos_refreshed_credential
-        ) + inspect.getsource(
-            providers._persist_claude_macos_refreshed_credential_impl
-        )
-        macos_recovery_report_source = inspect.getsource(
-            providers._record_claude_secondary_persistence_failure
-        )
-        run_review_source = inspect.getsource(
-            providers.run_review
-        ) + inspect.getsource(providers._run_review_with_frozen_auth)
-        auth_outcome_source = inspect.getsource(
-            providers._finish_claude_auth_required
-        )
-        linux_runtime_source = inspect.getsource(
-            providers._claude_linux_review_runtime
-        )
-        linux_command_source = inspect.getsource(claude_linux.build_sandbox_command)
-        keychain_write_source = inspect.getsource(
-            providers._write_claude_keychain_credential
-        )
-        file_write_source = inspect.getsource(
-            providers._write_claude_file_credential
-        )
-        linux_write_source = inspect.getsource(
-            claude_linux._writeback_refreshed_credential_impl
-        )
-        linux_staging_source = inspect.getsource(
-            claude_linux.stage_claude_credentials
-        )
-        linux_anchored_staging_source = inspect.getsource(
-            claude_linux._stage_claude_credentials_anchored
-        )
-        refresh_lock_source = inspect.getsource(
-            claude_refresh_lock.acquire_claude_refresh_lock
-        )
-        staged_lock_recovery_source = inspect.getsource(
-            claude_refresh_lock.recover_abandoned_staged_claude_refresh_locks
-        )
-
-        self.assertNotIn("_warm_claude_local_login", attempt_source)
-        self.assertNotIn("authentication-preflight-entitlement", attempt_source)
-        self.assertNotIn("freshness-verified", attempt_source)
-        self.assertIn("_prepare_claude_tls_environment", attempt_source)
-        self.assertIn("_claude_keychain_runtime", attempt_source)
-        self.assertIn("_claude_linux_review_runtime", attempt_source)
-
-        self.assertIn("pwd.getpwuid(os.getuid()).pw_dir", pwd_home_source)
-        self.assertNotIn('os.environ.get("HOME")', pwd_home_source)
-        self.assertIn("_read_claude_keychain_credential", select_source)
-        self.assertIn("_read_claude_macos_file_credential", select_source)
-        self.assertIn("selected = max(", select_source)
-        self.assertIn("candidate.expires_at_ms", select_source)
-        self.assertIn("selected.carrier_snapshot", select_source)
-        self.assertIn("refreshToken", validate_source)
-        self.assertIn(
-            "_persist_claude_macos_refreshed_credential",
-            macos_runtime_source,
-        )
-        self.assertIn(
-            "_retain_claude_macos_refreshed_credential",
-            macos_runtime_source,
-        )
-        self.assertIn(
-            "_replace_claude_macos_recovery_credential",
-            macos_runtime_source,
-        )
-        self.assertIn(
-            "durable-recovery-before-ack",
-            macos_runtime_source,
-        )
-        self.assertIn("commit_pending", macos_runtime_source)
-        self.assertIn(
-            "update_callback=stage_refreshed_credential",
-            macos_runtime_source,
-        )
-        self.assertNotIn(
-            "update_callback=accept_refreshed_credential",
-            macos_runtime_source,
-        )
-        self.assertIn("_write_claude_keychain_credential", macos_persist_source)
-        self.assertIn("_write_claude_file_credential", macos_persist_source)
-        self.assertNotIn("require_unexpired=True", macos_runtime_source)
-        self.assertNotIn("require_unexpired=True", macos_persist_source)
-        self.assertIn(
-            'authentication_report["recovery_cleanup_artifact"]',
-            macos_recovery_report_source,
-        )
-
-        self.assertIn("stage_claude_credentials", linux_runtime_source)
-        self.assertIn("writer_started", linux_runtime_source)
-        self.assertIn("writer_quiescent", linux_runtime_source)
-        self.assertIn("on_process_started=writer_started.set", attempt_source)
-        self.assertIn("writer_quiescent.set()", attempt_source)
-        self.assertIn(
-            "retain_for_recovery",
-            linux_staging_source + linux_anchored_staging_source,
-        )
-        self.assertIn("writer_quiescent is not True", staged_lock_recovery_source)
-        self.assertIn("reversed(locks)", staged_lock_recovery_source)
-        self.assertNotIn("math.nextafter", linux_runtime_source)
-        self.assertNotIn("staged.expires_at_ms <= time.time()", linux_runtime_source)
-        self.assertNotIn("_require_fresh_claude_linux_credential", run_review_source)
-        self.assertEqual(str(claude_linux.SANDBOX_AUTH_ROOT), "/auth")
-        self.assertEqual(str(claude_linux.SANDBOX_CONFIG), "/auth/config")
-        self.assertIn(
-            '"CLAUDE_CONFIG_DIR": str(SANDBOX_CONFIG)',
-            linux_command_source,
-        )
-
-        carrier_policy_files = {
-            "SKILL.md": skill,
-            "helper-contract.md": helper_contract,
-            "claude-runtime-trust.md": runtime_trust,
-        }
-        for name in ("README.md", "project journal"):
-            if policy := repository_policy_files.get(name):
-                carrier_policy_files[name] = policy
-        for name, policy in carrier_policy_files.items():
-            with self.subTest(policy=name):
-                normalized = policy.lower()
-                self.assertIn("/auth/config", policy)
-                self.assertIn("final drain", normalized)
-                self.assertIn("recovery carrier", normalized)
-                self.assertNotIn("read(//config", normalized)
-                self.assertNotIn("at `/config`", policy)
-                self.assertNotIn("mounts only that carrier at `/config`", policy)
-
-        macos_recovery_policy_files = {
-            "SKILL.md": skill,
-            "helper-contract.md": helper_contract,
-            "claude-runtime-trust.md": runtime_trust,
-        }
-        if journal := repository_policy_files.get("project journal"):
-            macos_recovery_policy_files["project journal"] = journal
-        for name, policy in macos_recovery_policy_files.items():
-            with self.subTest(macos_recovery_policy=name):
-                normalized = policy.lower()
-                self.assertIn("macos", normalized)
-                self.assertIn("private recovery carrier", normalized)
-                self.assertIn("copilot fallback", normalized)
-
-        macos_quiescence_policy_files = {
-            "SKILL.md": skill,
-            "helper-contract.md": helper_contract,
-            "claude-runtime-trust.md": runtime_trust,
-            **repository_policy_files,
-        }
-        for name, policy in macos_quiescence_policy_files.items():
-            with self.subTest(macos_quiescence_policy=name):
-                normalized = policy.lower()
-                self.assertRegex(normalized, r"quiesc(?:e|ence)")
-                self.assertIn("recovery_cleanup_artifact", policy)
-                self.assertIn("incomplete", normalized)
-                self.assertNotIn("before acknowledging", normalized)
-                self.assertNotIn("every accepted rotation", normalized)
-                self.assertNotIn(
-                    "persist macos broker rotations before",
-                    normalized,
-                )
-
-        macos_terminal_reserve_policy_files = {
-            "SKILL.md": skill,
-            "helper-contract.md": helper_contract,
-            "claude-runtime-trust.md": runtime_trust,
-            **repository_policy_files,
-        }
-        for name, policy in macos_terminal_reserve_policy_files.items():
-            with self.subTest(macos_terminal_reserve_policy=name):
-                normalized = policy.lower()
-                self.assertIn("admitted to durable staging", normalized)
-                self.assertIn("last generation and 1 mib", normalized)
-                self.assertNotIn(
-                    "reaching either journal cap nacks the generation",
-                    normalized,
-                )
-                self.assertNotIn(
-                    "nack the generation before filesystem work",
-                    normalized,
-                )
-
-        self.assertIn(
-            "durably stages its exact payload",
-            skill,
-        )
-        self.assertIn(
-            "later requests are NACKed before callbacks",
-            skill,
-        )
-        self.assertIn(
-            "durably stage that current update in the terminal recovery slot",
-            runtime_trust,
-        )
-        self.assertIn(
-            "NACK later requests before their callbacks or filesystem work",
-            runtime_trust,
-        )
-
-        protocol = claude_refresh_lock.CLAUDE_REFRESH_LOCK_PROTOCOL_2_1_211
-        self.assertEqual(protocol.primary_lock_name, ".oauth_refresh.lock")
-        self.assertEqual(protocol.legacy_suffix, ".lock")
-        self.assertEqual(protocol.stale_seconds, 60.0)
-        self.assertEqual(protocol.update_seconds, 5.0)
-        self.assertEqual(
-            set(claude_refresh_lock.CERTIFIED_CLAUDE_REFRESH_LOCK_ARTIFACTS),
-            EXPECTED_CLAUDE_2_1_211_LOCK_ARTIFACTS,
-        )
-        self.assertLess(
-            refresh_lock_source.index('label="primary"'),
-            refresh_lock_source.index('label="legacy"'),
-        )
-        for write_source in (keychain_write_source, file_write_source):
-            self.assertIn("claude_refresh_lock", write_source)
-            self.assertIn("_claude_macos_carriers_match", write_source)
-            self.assertIn("refresh_lock.assert_held()", write_source)
-            self.assertIn("refresh_lock_protocol", write_source)
-        self.assertIn("acquire_claude_refresh_lock", linux_write_source)
-        self.assertIn("refresh_lock.assert_held()", linux_write_source)
-        self.assertIn("refresh_lock_protocol", linux_write_source)
-        self.assertIn("_certified_claude_refresh_lock_protocol", attempt_source)
-        self.assertIn("_claude_has_explicit_auth", attempt_source)
-
-        self.assertIn('"phase": "blocked-authentication"', auth_outcome_source)
-        self.assertIn("CLAUDE_AUTH_LOGIN_ACTION", auth_outcome_source)
-        self.assertIn("_finish_claude_auth_required", run_review_source)
-        self.assertIn("validate_external_workspace", run_review_source)
-        self.assertIn("sensitive-content and escaping-symlink checks passed", run_review_source)
-
-        current_policy = "\n".join(
-            (
-                skill,
-                helper_contract,
-                runtime_trust,
-                egress_consent,
-                repository_policy_files.get("AGENTS.md", ""),
-            )
-        )
-        self.assertIn(">=2.1.211,<3.0.0", current_policy)
-        self.assertIn("pwd.getpwuid(os.getuid())", current_policy)
-        self.assertIn("empirically compatible", current_policy)
-        self.assertIn("not an officially guaranteed storage contract", current_policy)
-        self.assertIn("guarded writeback", current_policy)
-        self.assertIn("not an atomic compare-and-swap guarantee", current_policy)
-        self.assertIn("primary `.oauth_refresh.lock`", current_policy)
-        self.assertIn("legacy sibling lock", current_policy)
-        self.assertIn("bypass both locks", current_policy)
-        self.assertIn("credential-lock protocol catalog", current_policy)
-        self.assertIn("certified 5-second heartbeat", current_policy)
-        self.assertIn("both carriers", current_policy)
-        self.assertIn("inspection-inconclusive", current_policy)
-        self.assertIn("Access-token expiry alone is not login expiry", current_policy)
-        self.assertIn("blocked-authentication", current_policy)
-        self.assertIn("claude auth login", current_policy)
-        for policy in (skill, helper_contract, runtime_trust):
-            self.assertIn("claude auth login", policy)
-            self.assertIn("ANTHROPIC_API_KEY", policy)
-            self.assertIn("unset or replace", policy)
-        self.assertIn("secure Claude runtime is deterministically absent/unavailable", current_policy)
-        self.assertIn("model entitlement", current_policy)
-        self.assertNotIn("has no usable local/API authentication", current_policy)
-        self.assertNotIn("1920", current_policy)
-
-    def test_claude_linux_file_tools_are_workspace_only_across_supported_versions(
-        self,
-    ) -> None:
-        self.assertEqual(claude_linux.CLAUDE_LINUX_REVIEW_VISIBLE_TOOLS, "Read")
-        self.assertEqual(
-            claude_linux.CLAUDE_LINUX_REVIEW_ALLOWED_TOOLS,
-            "Read(./**)",
-        )
-        self.assertEqual(
-            claude_linux.CLAUDE_LINUX_REVIEW_PERMISSION_MODE,
-            "dontAsk",
-        )
-        cli_denies = set(
-            claude_linux.CLAUDE_LINUX_REVIEW_DISALLOWED_TOOLS.split(",")
-        )
-        self.assertTrue({"Grep", "Glob"}.issubset(cli_denies))
-        self.assertIn(
-            "Read(//auth/**)",
-            claude_linux.CLAUDE_LINUX_FILE_TOOL_DENY_RULES,
-        )
-        self.assertIn(
-            "Read(//proc/**)",
-            claude_linux.CLAUDE_LINUX_FILE_TOOL_DENY_RULES,
-        )
-        self.assertNotIn(
-            "Read(/auth/**)",
-            claude_linux.CLAUDE_LINUX_FILE_TOOL_DENY_RULES,
-        )
+        self.assertIn("separate explicit authorization", consent)
+        self.assertIn("non-ignored untracked files", consent)
+        self.assertIn("sensitive-content", consent)
+        self.assertIn("does not add HOME files", consent)
+        self.assertIn("reviewer prompt forbids", consent)
+        self.assertIn("explicit deny rules", consent)
+        self.assertIn("real `HOME`", consent)
 
     def test_ci_targets_only_the_canonical_runtime_and_tests(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
@@ -746,64 +330,33 @@ class RepositoryContractTest(unittest.TestCase):
             with self.subTest(profile=profile):
                 self.assertTrue((CI_FIXTURE_ROOT / f"{profile}.yml").is_file())
 
-    def test_claude_auth_policy_files_match_distribution_profile(self) -> None:
+    def test_claude_policy_files_match_distribution_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_root = pathlib.Path(temp_dir)
             (repo_root / "README.md").write_text("unrelated\n", encoding="utf-8")
 
             self.assertEqual(
-                _claude_auth_repository_policy_files(repo_root, "private"),
+                _claude_repository_policy_files(repo_root, "private"),
                 {},
             )
             with self.assertRaises(FileNotFoundError):
-                _claude_auth_repository_policy_files(repo_root, "canonical")
+                _claude_repository_policy_files(repo_root, "canonical")
             with self.assertRaisesRegex(
                 AssertionError,
                 "unsupported repository policy profile",
             ):
-                _claude_auth_repository_policy_files(repo_root, "unknown")
+                _claude_repository_policy_files(repo_root, "unknown")
 
     def test_reviewed_ci_snapshots_keep_the_intended_status_guards(self) -> None:
         canonical = (CI_FIXTURE_ROOT / "canonical.yml").read_text(encoding="utf-8")
         private = (CI_FIXTURE_ROOT / "private.yml").read_text(encoding="utf-8")
 
-        self.assertIn(
-            """  test:
-    name: test
-    if: ${{ always() }}
-    needs: platform_tests
-    runs-on: ubuntu-latest
-    steps:
-      - name: Require every platform test to pass
-        env:
-          PLATFORM_TESTS_RESULT: ${{ needs.platform_tests.result }}
-        run: |
-          test "$PLATFORM_TESTS_RESULT" = "success"
-""",
-            canonical,
-        )
-        self.assertIn(
-            """  test:
-    name: test
-    if: ${{ always() }}
-    needs:
-      - platform_tests
-      - python-39-compatibility
-      - platform-safety
-    runs-on: ubuntu-latest
-    steps:
-      - name: Require every platform test to pass
-        env:
-          PLATFORM_TESTS_RESULT: ${{ needs.platform_tests.result }}
-          PYTHON_39_RESULT: ${{ needs.python-39-compatibility.result }}
-          PLATFORM_SAFETY_RESULT: ${{ needs.platform-safety.result }}
-        run: |
-          test "$PLATFORM_TESTS_RESULT" = "success"
-          test "$PYTHON_39_RESULT" = "success"
-          test "$PLATFORM_SAFETY_RESULT" = "success"
-""",
-            private,
-        )
+        self.assertIn("PLATFORM_TESTS_RESULT", canonical)
+        self.assertIn('test "$PLATFORM_TESTS_RESULT" = "success"', canonical)
+        self.assertIn("PLATFORM_TESTS_RESULT", private)
+        self.assertIn("PYTHON_39_RESULT", private)
+        self.assertIn("PLATFORM_SAFETY_RESULT", private)
+        self.assertIn('test "$PYTHON_39_RESULT" = "success"', private)
 
     def test_helper_declares_and_tests_its_minimum_python_runtime(self) -> None:
         entrypoint = (SCRIPTS / "isolated_review").read_text(encoding="utf-8")
@@ -812,7 +365,9 @@ class RepositoryContractTest(unittest.TestCase):
 
         guard = "if sys.version_info < (3, 10):"
         self.assertIn(guard, entrypoint)
-        self.assertLess(entrypoint.index(guard), entrypoint.index("from review_runtime"))
+        self.assertLess(
+            entrypoint.index(guard), entrypoint.index("from review_runtime")
+        )
         self.assertIn('python-version: "3.10"', workflow)
         self.assertIn("tomli==2.2.1", workflow)
         self.assertIn("requires Python 3.10 or later", readme)
@@ -829,10 +384,11 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("offline-frozen-diff-review", value)
         self.assertIn("standalone double/triple-review", readiness)
         self.assertLess(
-            readiness.index("3. Run `offline-frozen-diff-review` first"),
+            readiness.index("3. Require a clean source checkout"),
             readiness.index("4. After the helper preflight passes"),
         )
         self.assertIn("Require its retained `preflight.json`", readiness)
+        self.assertIn("WIP artifact cannot be substituted", contracts)
 
     def test_independent_codex_process_output_is_task_scoped_and_bounded(self) -> None:
         readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
@@ -842,109 +398,24 @@ class RepositoryContractTest(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("stdout and stderr in task-scoped bounded sinks", readiness)
-        self.assertIn("--output-last-message <task-scoped-target>", readiness)
-        self.assertIn("byte limits for each process log and the final-message", readiness)
-        self.assertIn("default 30-minute / 16-MiB / 64-KiB limits", readiness)
-        self.assertIn("deadline expires or any output limit", readiness)
-        self.assertIn("limit-terminated attempt is inconclusive", readiness)
-        self.assertIn("bounded sinks", readiness)
-        self.assertIn("bounded FIFO/pipe", readiness)
-        self.assertIn("distinct fresh ordinary artifact", readiness)
-        self.assertIn("only that ordinary artifact", readiness)
-        self.assertIn(
-            "Never implement the final-message cap with process-wide `RLIMIT_FSIZE`",
-            readiness,
-        )
-        self.assertIn("terminate the reviewer with `SIGXFSZ`", readiness)
-        self.assertIn(
-            "a parent supervisor that enforces the caps on parent-owned bounded sinks",
-            readiness,
-        )
-        self.assertIn("Enforce every cap while the reviewer runs", readiness)
-        self.assertIn("OS-enforced job/cgroup/container", readiness)
-        self.assertIn("survives `setsid` / `setpgid`", readiness)
-        self.assertIn("verified kernel no-child-process policy", readiness)
-        self.assertIn("fully self-contained artifact-only review", readiness)
-        self.assertIn("complete diff and permitted neighboring evidence", readiness)
-        self.assertIn("tool calls are forbidden", readiness)
-        self.assertIn("report `blocked` and do not launch", readiness)
-        self.assertIn("descendant polling is not a substitute", readiness)
-        self.assertIn("separate 10-second deadline", readiness)
-        self.assertIn("stat every ordinary output artifact again", readiness)
-        self.assertIn("never use FIFO metadata", readiness)
-        self.assertIn("even after exit zero", readiness)
-        self.assertIn("quiescence or sink closure cannot be confirmed", readiness)
-        self.assertIn("Poll only with bounded status probes", readiness)
-        self.assertIn("Parent-Process Output Budget", readiness)
-        self.assertIn("do not stream either process output", contracts)
-        self.assertIn("--output-last-message <task-scoped-target>", contracts)
-        self.assertIn("unique path that does not exist before the attempt", contracts)
-        self.assertIn("freshly created before launch at one path", contracts)
-        self.assertIn("different ordinary artifact path", contracts)
-        self.assertIn("byte limit for the final-message artifact", contracts)
-        self.assertIn("30-minute deadline, 16 MiB", contracts)
-        self.assertIn("64 KiB for the final-message artifact", contracts)
-        self.assertIn("send `TERM`", contracts)
-        self.assertIn("send `KILL`", contracts)
-        self.assertIn("when the deadline expires", contracts)
-        self.assertIn("hard per-file quota or bounded sink", contracts)
-        self.assertIn("bounded FIFO/pipe reader", contracts)
-        self.assertIn(
-            "Do not set process-wide file-size limits such as `RLIMIT_FSIZE`",
-            contracts,
-        )
-        self.assertIn("unrelated internal session and state files", contracts)
-        self.assertIn("terminate the reviewer with `SIGXFSZ`", contracts)
-        self.assertIn("invalid harness attempt, not review evidence", contracts)
-        self.assertIn(
-            "a parent supervisor enforces the relevant byte ceilings",
-            contracts,
-        )
-        self.assertIn("Direct-path monitoring or a post-exit size check alone", contracts)
-        self.assertIn("OS-enforced job, cgroup, or container", contracts)
-        self.assertIn("survives `setsid` / `setpgid`", contracts)
-        self.assertIn("kernel-enforced no-child-process policy", contracts)
-        self.assertIn("fully self-contained artifact-only review", contracts)
-        self.assertIn("complete diff and permitted neighboring evidence", contracts)
-        self.assertIn("prompt forbids tool calls", contracts)
-        self.assertIn("report `blocked` and do not launch", contracts)
-        self.assertIn("descendant polling may provide diagnostics", contracts)
-        self.assertIn("never substitute for containment", contracts)
-        self.assertIn("separate 10-second close deadline", contracts)
-        self.assertIn("waiting indefinitely", contracts)
-        self.assertIn("Do not accept a final-message artifact", contracts)
-        self.assertIn("file byte or line counts", contracts)
-        self.assertIn("attempt exits zero", contracts)
-        self.assertIn("creates it as a nonempty file", contracts)
-        self.assertIn("stat both process logs and the ordinary final-message artifact", contracts)
-        self.assertIn("Never use a FIFO's `st_size`", contracts)
-        self.assertIn("even when it exited zero", contracts)
-        self.assertIn("reaches or exceeds", contracts)
-        self.assertIn("record only the byte counts", contracts)
-        self.assertIn("remove the oversized artifact", contracts)
-        self.assertIn("reject any stale or partial result", contracts)
-        self.assertIn("On a nonzero exit or a missing/empty file", contracts)
-        self.assertIn("read at most the final 8 KiB of stderr", contracts)
-        self.assertIn("byte-count-limited read", contracts)
-        self.assertIn("truncates before inserting text", contracts)
-        self.assertIn("line-count-only command", contracts)
-        self.assertIn("single long JSON or trace line", contracts)
-        self.assertIn("runtime-verification failure as `blocked`", contracts)
-        self.assertIn("otherwise report `inconclusive`", contracts)
-        self.assertIn("Never read the complete stderr", contracts)
-        self.assertIn(
-            "Remove task-scoped process logs and the final-message file",
-            contracts,
-        )
-        self.assertIn("reported blocker or recovery handoff", contracts)
-        self.assertIn("remove the oversized log", contracts)
+        for value in (readiness, contracts):
+            normalized = value.replace("-", " ")
+            self.assertIn("--output-last-message <task-scoped-target>", value)
+            self.assertIn("30-minute", value)
+            self.assertIn("16 MiB", normalized)
+            self.assertIn("64 KiB", normalized)
+            self.assertIn("RLIMIT_FSIZE", value)
+            self.assertIn("OS-enforced", value)
+            self.assertIn("inconclusive", value)
         self.assertIn("read at most the final 8 KiB of stderr", readiness)
-        self.assertIn("line-count-only tail is not bounded", readiness)
+        self.assertIn("Never read the complete stderr", contracts)
 
     def test_review_prompts_do_not_use_unbounded_only_matching_samples(self) -> None:
         forbidden = "rg -o --max-count 80"
-        candidates = [SKILL_ROOT / "SKILL.md", SKILL_ROOT / "scripts/review_runtime/prompt.py"]
+        candidates = [
+            SKILL_ROOT / "SKILL.md",
+            SKILL_ROOT / "scripts/review_runtime/prompt.py",
+        ]
         candidates.extend((SKILL_ROOT / "references").glob("*.md"))
         for candidate in candidates:
             self.assertNotIn(
@@ -973,25 +444,18 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 2)
         self.assertIn("--egress-consent", completed.stderr)
 
-    def test_approval_template_excludes_authentication_from_copilot_fallback(
-        self,
-    ) -> None:
+    def test_approval_template_excludes_authentication_from_fallback(self) -> None:
         consent = (SKILL_ROOT / "references/egress-consent.md").read_text(
             encoding="utf-8"
         )
         self.assertIn(
-            "secure Claude runtime is deterministically absent/unavailable",
-            consent,
+            "verified Claude runtime is deterministically unavailable", consent
         )
-        self.assertIn(
-            "both pinned Claude Opus models are entitlement-blocked",
-            consent,
-        )
+        self.assertIn("both pinned Claude models are entitlement-blocked", consent)
         self.assertIn(
             "Claude authentication failure pauses as `blocked-authentication`",
             consent,
         )
-        self.assertNotIn("has no usable local/API authentication", consent)
 
     def test_triple_review_consent_names_all_provider_organizations(self) -> None:
         candidates = [

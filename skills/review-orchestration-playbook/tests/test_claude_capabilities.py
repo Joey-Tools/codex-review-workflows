@@ -33,7 +33,7 @@ def supported_help(*, safe_mode: str | None = None) -> str:
 
 class ClaudeCapabilitiesTest(unittest.TestCase):
     def test_version_range_floats_within_major_two(self) -> None:
-        for version in ("2.1.211", "2.1.212", "2.99.999"):
+        for version in ("2.1.212", "2.1.213", "2.99.999"):
             with self.subTest(version=version):
                 parsed = capabilities.parse_claude_version(
                     f"{version} (Claude Code)\n"
@@ -42,10 +42,10 @@ class ClaudeCapabilitiesTest(unittest.TestCase):
 
     def test_version_range_rejects_old_next_major_and_prerelease(self) -> None:
         for output in (
-            "2.1.210 (Claude Code)\n",
+            "2.1.211 (Claude Code)\n",
             "3.0.0 (Claude Code)\n",
-            "2.1.211-beta.1 (Claude Code)\n",
-            "2.1.211 (Claude Code)\nextra\n",
+            "2.1.212-beta.1 (Claude Code)\n",
+            "2.1.212 (Claude Code)\nextra\n",
         ):
             with self.subTest(output=output):
                 with self.assertRaises(capabilities.ClaudeCapabilityError):
@@ -96,12 +96,12 @@ class ClaudeCapabilitiesTest(unittest.TestCase):
         ):
             capabilities.validate_claude_help(help_text)
 
-    def test_help_requires_dont_ask_permission_mode_before_credentials(self) -> None:
-        help_text = supported_help().replace("dontAsk, ", "")
+    def test_help_requires_plan_permission_mode(self) -> None:
+        help_text = supported_help().replace(", plan", "")
 
         with self.assertRaisesRegex(
             capabilities.ClaudeCapabilityUnavailable,
-            "required dontAsk choice",
+            "required plan choice",
         ):
             capabilities.validate_claude_help(help_text)
 

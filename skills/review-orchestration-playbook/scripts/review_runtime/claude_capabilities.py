@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 
 
-CLAUDE_MINIMUM_VERSION = (2, 1, 211)
+CLAUDE_MINIMUM_VERSION = (2, 1, 212)
 CLAUDE_NEXT_MAJOR_VERSION = (3, 0, 0)
 CLAUDE_VERSION_COMPONENT_MAX_DIGITS = 9
 _CLAUDE_VERSION_COMPONENT = (
@@ -26,7 +26,7 @@ CLAUDE_HELP_OPTION_DECLARATION = re.compile(
 CLAUDE_HELP_OPTION_TOKEN = re.compile(
     r"(?<![A-Za-z0-9-])--[A-Za-z0-9][A-Za-z0-9-]*"
 )
-CLAUDE_DONT_ASK_CHOICE = re.compile(r"(?<![a-z0-9])dontask(?![a-z0-9])")
+CLAUDE_PLAN_CHOICE = re.compile(r"(?<![a-z0-9])plan(?![a-z0-9])")
 # These are the exact public options used by the helper's authenticated Claude
 # commands. Help text is not treated as an ABI: option descriptions may change,
 # but removal of an option that the helper invokes must fail closed.
@@ -451,7 +451,7 @@ def parse_claude_version(output: str) -> ClaudeVersion:
     typed_parts = (parts[0], parts[1], parts[2])
     if not CLAUDE_MINIMUM_VERSION <= typed_parts < CLAUDE_NEXT_MAJOR_VERSION:
         raise ClaudeCapabilityError(
-            "Claude Code version is outside the supported >=2.1.211,<3 range"
+            "Claude Code version is outside the supported >=2.1.212,<3 range"
         )
     return ClaudeVersion(".".join(str(part) for part in typed_parts), typed_parts)
 
@@ -740,11 +740,11 @@ def validate_claude_help(help_text: str) -> tuple[tuple[str, ...], str]:
         )
 
     permission_mode_blocks = _help_option_blocks(help_text, "--permission-mode")
-    if len(permission_mode_blocks) != 1 or CLAUDE_DONT_ASK_CHOICE.search(
+    if len(permission_mode_blocks) != 1 or CLAUDE_PLAN_CHOICE.search(
         permission_mode_blocks[0]
     ) is None:
         raise ClaudeCapabilityUnavailable(
-            "Claude Code --permission-mode does not advertise the required dontAsk "
+            "Claude Code --permission-mode does not advertise the required plan "
             "choice"
         )
 

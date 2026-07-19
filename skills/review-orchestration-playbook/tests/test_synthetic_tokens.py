@@ -3177,14 +3177,39 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                 frozen_link = review.workspace_root / "artifact"
                 frozen_link.unlink()
                 frozen_link.symlink_to("../../../../" + sensitive_target)
-                with self.assertRaisesRegex(
-                    ReviewError,
-                    "<redacted symlink target>",
-                ) as caught:
+                with self.assertRaises(ReviewError) as snapshot_caught:
                     self.validate(review, catalog=catalog)
-                message = str(caught.exception)
-                self.assertNotIn(LEGACY_A, message)
-                self.assertNotIn(legacy_value_base64(LEGACY_A), message)
+                snapshot_message = str(snapshot_caught.exception)
+                self.assertEqual(
+                    snapshot_message,
+                    "source WIP symlink escapes review workspace: artifact",
+                )
+                self.assertNotIn(LEGACY_A, snapshot_message)
+                self.assertNotIn(
+                    legacy_value_base64(LEGACY_A),
+                    snapshot_message,
+                )
+
+                with (
+                    mock.patch.object(
+                        workspace,
+                        "_verify_materialized_snapshot",
+                    ) as verify_snapshot,
+                    self.assertRaises(ReviewError) as redaction_caught,
+                ):
+                    self.validate(review, catalog=catalog)
+                verify_snapshot.assert_called_once()
+                redaction_message = str(redaction_caught.exception)
+                self.assertEqual(
+                    redaction_message,
+                    "external review symlink escapes the frozen workspace: "
+                    "artifact -> <redacted symlink target>",
+                )
+                self.assertNotIn(LEGACY_A, redaction_message)
+                self.assertNotIn(
+                    legacy_value_base64(LEGACY_A),
+                    redaction_message,
+                )
 
     def test_evidence_cannot_expose_legacy_storage_encoding(self) -> None:
         raw_value = "jgajgajgajgajgajga"
@@ -3671,9 +3696,20 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(
             ReviewError,
-            "count changed after preparation",
+            "topology does not match snapshot tree",
+        ) as snapshot_caught:
+            self.validate(review, catalog=catalog)
+        self.assertNotIn(LEGACY_A, str(snapshot_caught.exception))
+
+        with (
+            mock.patch.object(workspace, "_verify_materialized_snapshot"),
+            self.assertRaisesRegex(
+                ReviewError,
+                "count changed after preparation",
+            ) as count_caught,
         ):
             self.validate(review, catalog=catalog)
+        self.assertNotIn(LEGACY_A, str(count_caught.exception))
 
     def test_snapshot_path_rename_to_legacy_value_fails_revalidation(self) -> None:
         catalog = legacy_catalog(values=(LEGACY_A,))
@@ -3692,53 +3728,66 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             catalog=catalog,
             exemptions=("historical-fixtures",),
         )
-        (review.workspace_root / "safe.txt").rename(
-            review.workspace_root / f"moved-{LEGACY_A}.txt"
-        )
+        moved_path = review.workspace_root / f"moved-{LEGACY_A}.txt"
+        (review.workspace_root / "safe.txt").rename(moved_path)
 
         with self.assertRaisesRegex(
             ReviewError,
-            "legacy-synthetic-value",
-        ) as caught:
+            "missing a snapshot blob",
+        ) as snapshot_caught:
             self.validate(review, catalog=catalog)
-        self.assertNotIn(LEGACY_A, str(caught.exception))
+        self.assertNotIn(LEGACY_A, str(snapshot_caught.exception))
+
+        with (
+            mock.patch.object(workspace, "_verify_materialized_snapshot"),
+            self.assertRaisesRegex(
+                ReviewError,
+                "legacy-synthetic-value",
+            ) as path_caught,
+        ):
+            self.validate(review, catalog=catalog)
+        path_message = str(path_caught.exception)
+        self.assertIn("<redacted snapshot path>", path_message)
+        self.assertNotIn(LEGACY_A, path_message)
 
     def test_catalog_legacy_paths_stay_redacted_in_file_reader_errors(self) -> None:
         raw_value = "archived_" + "fixture_0001"
         catalog = legacy_catalog(values=(raw_value,))
         representations = (raw_value, legacy_value_base64(raw_value))
-        variants = ["hardlink", "open-error", "writable"]
+        matcher = workspace._legacy_path_matcher(
+            synthetic_tokens.accepted_legacy_values(
+                catalog,
+                catalog.legacy_exemptions,
+            )
+        )
+        variants = {
+            "hardlink": "not a regular file with one link",
+            "open-error": (
+                "cannot open external review content <redacted snapshot path>"
+            ),
+            "writable": "must not be group or other writable",
+        }
         if hasattr(os, "mkfifo"):
-            variants.append("fifo")
+            variants["fifo"] = "not a regular file with one link"
 
-        for representation in representations:
-            for variant in variants:
+        for representation_index, representation in enumerate(representations):
+            for variant, expected_error in variants.items():
                 with self.subTest(representation=representation, variant=variant):
-                    repo, base = self.new_repo(
-                        {
-                            "fixture.cfg": assignment_text(
-                                "access_token",
-                                raw_value,
-                            ),
-                            "safe.txt": "safe\n",
-                        }
+                    case_root = self.root / (
+                        f"file-reader-{representation_index}-{variant}"
                     )
-                    (repo / "README.md").write_text("head\n", encoding="utf-8")
-                    head = self.commit(repo)
-                    review = self.prepare(
-                        repo=repo,
-                        base=base,
-                        head=head,
-                        catalog=catalog,
-                        exemptions=("historical-fixtures",),
+                    case_root.mkdir()
+                    target = case_root / f"moved-{representation}.txt"
+                    target.write_text("safe\n", encoding="utf-8")
+                    self.assertEqual(
+                        matcher.match(os.fsencode(target.name)),
+                        "historical-1",
                     )
-                    target = review.workspace_root / f"moved-{representation}.txt"
-                    (review.workspace_root / "safe.txt").rename(target)
                     patch_open = contextlib.nullcontext()
                     if variant == "hardlink":
                         os.link(
                             target,
-                            review.workspace_root / f"peer-{representation}.txt",
+                            case_root / f"peer-{representation}.txt",
                         )
                     elif variant == "open-error":
                         real_open = os.open
@@ -3762,8 +3811,17 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                         target.unlink()
                         os.mkfifo(target, mode=0o600)
 
-                    with patch_open, self.assertRaises(ReviewError) as caught:
-                        self.validate(review, catalog=catalog)
+                    with (
+                        patch_open,
+                        self.assertRaisesRegex(
+                            ReviewError,
+                            re.escape(expected_error),
+                        ) as caught,
+                    ):
+                        workspace._file_secret_scan(
+                            target,
+                            diagnostic_path="<redacted snapshot path>",
+                        )
                     message = str(caught.exception)
                     self.assertIn("<redacted snapshot path>", message)
                     self.assertNotIn(raw_value, message)
@@ -3804,8 +3862,13 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         frozen_file = review.workspace_root / "README.md"
         frozen_file.unlink()
         os.mkfifo(frozen_file, mode=0o600)
-        with self.assertRaisesRegex(ReviewError, "not a regular file"):
+        with self.assertRaisesRegex(
+            ReviewError,
+            r"unsupported special file in source WIP: README\.md",
+        ):
             self.validate(review)
+        with self.assertRaisesRegex(ReviewError, "not a regular file"):
+            workspace._file_secret_scan(frozen_file)
 
     def test_helper_private_control_state_blocks_artifact_tampering(self) -> None:
         replacements = {
@@ -3950,9 +4013,18 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         self.assertNotIn(legacy_value_base64(LEGACY_A), private_contents)
         with self.assertRaisesRegex(
             ReviewError,
-            "does not match helper-private control state",
-        ):
+            "topology does not match snapshot tree",
+        ) as snapshot_caught:
             self.validate(review, catalog=catalog)
+        self.assertNotIn(LEGACY_A, str(snapshot_caught.exception))
+
+        (review.workspace_root / "copied.txt").unlink()
+        with self.assertRaisesRegex(
+            ReviewError,
+            "does not match helper-private control state",
+        ) as manifest_caught:
+            self.validate(review, catalog=catalog)
+        self.assertNotIn(LEGACY_A, str(manifest_caught.exception))
 
     def test_overlapping_legacy_values_are_counted_independently(self) -> None:
         longer = LEGACY_A + "Suffix"

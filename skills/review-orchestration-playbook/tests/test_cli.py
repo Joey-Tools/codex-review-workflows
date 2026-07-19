@@ -27,6 +27,33 @@ def prepared_workspace(review):
 
 
 class ForegroundCleanupTest(unittest.TestCase):
+    def test_help_distinguishes_clean_range_from_review_only_wip(self) -> None:
+        help_text = " ".join(cli._build_parser().format_help().split())
+
+        self.assertIn("one clean frozen Git range", help_text)
+        self.assertIn("digest-bound WIP snapshot", help_text)
+        self.assertIn("Review-only", help_text)
+        self.assertIn("not formal PR-readiness", help_text)
+
+    def test_stateful_start_passes_include_source_wip(self) -> None:
+        with mock.patch.object(
+            cli, "start", return_value=pathlib.Path("/tmp/state")
+        ) as start:
+            returncode = cli.main(
+                [
+                    "stateful",
+                    "start",
+                    "--base-ref",
+                    "a" * 40,
+                    "--head-ref",
+                    "b" * 40,
+                    "--include-source-wip",
+                ]
+            )
+
+        self.assertEqual(returncode, 0)
+        self.assertTrue(start.call_args.kwargs["include_source_wip"])
+
     def test_stateful_cleanup_dispatches_bounded_cleanup(self) -> None:
         state_dir = pathlib.Path("/tmp/isolated-review-state")
         with mock.patch.object(cli, "cleanup_state", return_value=0) as cleanup:
@@ -70,9 +97,7 @@ class ForegroundCleanupTest(unittest.TestCase):
             ),
             contextlib.redirect_stderr(stderr),
         ):
-            returncode = cli.main(
-                ["--base-ref", "a" * 40, "--head-ref", "b" * 40]
-            )
+            returncode = cli.main(["--base-ref", "a" * 40, "--head-ref", "b" * 40])
 
         self.assertEqual(returncode, 128 + signal.SIGTERM)
         self.assertIn("evidence retained at /tmp/review", stderr.getvalue())
