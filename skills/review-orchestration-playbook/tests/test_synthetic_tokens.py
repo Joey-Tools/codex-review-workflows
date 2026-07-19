@@ -5845,10 +5845,21 @@ class SyntheticWorkspaceTest(unittest.TestCase):
 
         self.assertEqual(
             public_paths,
-            hashlib.sha256(raw_path).hexdigest().encode("ascii") + b"\0",
+            hashlib.sha256(
+                workspace.CHANGED_PATH_DIGEST_DOMAIN
+                + workspace.CHANGED_PATH_HEAD_TAG
+                + b"\0"
+                + raw_path
+            )
+            .hexdigest()
+            .encode("ascii")
+            + b"\0",
         )
         self.assertNotIn(raw_path, public_paths)
-        self.assertEqual(private_paths, raw_path + b"\0")
+        self.assertEqual(
+            private_paths,
+            workspace.CHANGED_PATH_HEAD_TAG + raw_path + b"\0",
+        )
         self.validate(review)
 
     def test_dynamic_secret_in_head_path_blocks_before_handoff(self) -> None:
@@ -5957,17 +5968,30 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                 / ".codex-review"
                 / workspace.CHANGED_PATH_DIGESTS_NAME
             ).read_bytes(),
-            b"",
+            hashlib.sha256(
+                workspace.CHANGED_PATH_DIGEST_DOMAIN
+                + workspace.CHANGED_PATH_BASE_ONLY_TAG
+                + b"\0"
+                + raw_value.encode("ascii")
+            )
+            .hexdigest()
+            .encode("ascii")
+            + b"\0",
         )
         self.assertEqual(
             (review.container_dir / workspace.PRIVATE_CHANGED_PATHS_NAME).read_bytes(),
-            b"",
+            workspace.CHANGED_PATH_BASE_ONLY_TAG + raw_value.encode("ascii") + b"\0",
         )
         self.validate(review)
 
     def test_dynamic_value_matching_changed_path_digest_fails_closed(self) -> None:
         relative = "fixture.cfg"
-        raw_value = hashlib.sha256(relative.encode("ascii")).hexdigest()
+        raw_value = hashlib.sha256(
+            workspace.CHANGED_PATH_DIGEST_DOMAIN
+            + workspace.CHANGED_PATH_HEAD_TAG
+            + b"\0"
+            + relative.encode("ascii")
+        ).hexdigest()
         fixture = assignment_text("password", raw_value)
         repo, base = self.new_repo({relative: fixture * 2})
         (repo / relative).write_text(fixture, encoding="utf-8")
@@ -6008,7 +6032,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        self.assertEqual(state["schema_version"], 4)
+        self.assertEqual(state["schema_version"], 5)
         self.assertEqual(
             state["private_cleanup"],
             {
@@ -6045,10 +6069,23 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         self.assertIn("permission denied", cleanup_error or "")
         remove_contents.assert_called_once_with(
             mock.ANY,
+            depth=0,
             excluded_entry_names=frozenset(),
         )
         self.assertTrue(review.container_dir.exists())
-        self.assertTrue(review.workspace_root.exists())
+        self.assertFalse(review.workspace_root.exists())
+        retained_workspaces = [
+            path
+            for path in review.container_dir.glob(".codex-review-cleanup-*")
+            if path.is_dir()
+        ]
+        self.assertEqual(len(retained_workspaces), 1)
+        self.assertTrue(
+            (
+                retained_workspaces[0]
+                / review.diff_file.relative_to(review.workspace_root)
+            ).exists()
+        )
         self.assertFalse(private_paths.exists())
         self.assertFalse(private_manifest.exists())
 
@@ -6627,7 +6664,12 @@ class SyntheticWorkspaceTest(unittest.TestCase):
 
     def test_dynamic_path_digest_cannot_expose_an_authoring_value(self) -> None:
         relative = "fixture.cfg"
-        raw_value = hashlib.sha256(relative.encode("ascii")).hexdigest()[:24]
+        raw_value = hashlib.sha256(
+            workspace.CHANGED_PATH_DIGEST_DOMAIN
+            + workspace.CHANGED_PATH_HEAD_TAG
+            + b"\0"
+            + relative.encode("ascii")
+        ).hexdigest()[:24]
         payload = catalog_payload()
         payload["authoring_pool"]["tokens"][0]["value"] = raw_value
         catalog = synthetic_tokens.parse_catalog_bytes(
@@ -7089,6 +7131,44 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             self.validate(review, catalog=mutated_catalog)
         self.assertNotIn(candidate.decode("ascii"), str(raised.exception))
         self.assertNotIn(legacy_substring, str(raised.exception))
+
+    def test_runtime_catalog_rechecks_base_only_legacy_paths(self) -> None:
+        catalog = synthetic_tokens.load_catalog()
+        raw_value = "RuntimeCatalogLegacyPathA9Z8Y7"
+        mutated_catalog = legacy_catalog(values=(raw_value,))
+        self.assertEqual(mutated_catalog.schema_version, catalog.schema_version)
+        self.assertEqual(mutated_catalog.pool_version, catalog.pool_version)
+        cases = {
+            "deleted-raw": (raw_value, None),
+            "renamed-storage": (
+                legacy_value_base64(raw_value),
+                "safe-destination.txt",
+            ),
+        }
+
+        for label, (path_value, destination) in cases.items():
+            with self.subTest(case=label):
+                source = f"fixture-{path_value}.txt"
+                repo, base = self.new_repo({source: "base\n"})
+                if destination is None:
+                    (repo / source).unlink()
+                else:
+                    (repo / source).rename(repo / destination)
+                head = self.commit(repo)
+                review = self.prepare(
+                    repo=repo,
+                    base=base,
+                    head=head,
+                    catalog=catalog,
+                )
+
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "legacy-synthetic-value",
+                ) as raised:
+                    self.validate(review, catalog=mutated_catalog)
+                self.assertNotIn(raw_value, str(raised.exception))
+                self.assertNotIn(path_value, str(raised.exception))
 
     def test_legacy_counts_accept_authoring_values_but_not_unknown_secrets(
         self,
@@ -7602,7 +7682,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         review = self.prepare(repo=repo, base=base, head=head)
         state_path = review.container_dir / workspace.CONTROL_ARTIFACT_STATE_NAME
         payload = json.loads(state_path.read_text(encoding="utf-8"))
-        self.assertEqual(payload["schema_version"], 4)
+        self.assertEqual(payload["schema_version"], 5)
         self.assertEqual(
             payload["private_cleanup"],
             {
@@ -7652,13 +7732,53 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         head = self.commit(repo)
         review = self.prepare(repo=repo, base=base, head=head)
         private_paths = review.container_dir / workspace.PRIVATE_CHANGED_PATHS_NAME
-        private_paths.write_bytes(b"different.txt\0")
+        private_paths.write_bytes(workspace.CHANGED_PATH_HEAD_TAG + b"different.txt\0")
 
         with self.assertRaisesRegex(
             ReviewError,
             "digests do not match helper-private changed paths",
         ):
             self.validate(review)
+
+    def test_changed_path_digests_bind_the_path_side(self) -> None:
+        repo, base = self.new_repo({"README.md": "base\n"})
+        (repo / "README.md").write_text("head\n", encoding="utf-8")
+        head = self.commit(repo)
+        review = self.prepare(repo=repo, base=base, head=head)
+        private_paths = review.container_dir / workspace.PRIVATE_CHANGED_PATHS_NAME
+        self.assertEqual(
+            private_paths.read_bytes(),
+            workspace.CHANGED_PATH_HEAD_TAG + b"README.md\0",
+        )
+        private_paths.write_bytes(workspace.CHANGED_PATH_BASE_ONLY_TAG + b"README.md\0")
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "digests do not match helper-private changed paths",
+        ):
+            self.validate(review)
+
+    def test_unknown_changed_path_side_fails_closed(self) -> None:
+        repo, base = self.new_repo({"README.md": "base\n"})
+        (repo / "README.md").write_text("head\n", encoding="utf-8")
+        head = self.commit(repo)
+        review = self.prepare(repo=repo, base=base, head=head)
+        private_paths = review.container_dir / workspace.PRIVATE_CHANGED_PATHS_NAME
+        private_paths.write_bytes(b"ZREADME.md\0")
+
+        with self.assertRaisesRegex(ReviewError, "unknown side"):
+            self.validate(review)
+
+    def test_deleted_path_counts_toward_changed_path_budget(self) -> None:
+        repo, base = self.new_repo({"README.md": "base\n"})
+        (repo / "README.md").unlink()
+        head = self.commit(repo)
+
+        with (
+            mock.patch.object(workspace, "MAX_CHANGED_ENTRIES", 0),
+            self.assertRaisesRegex(ReviewError, "entry review limit"),
+        ):
+            self.prepare(repo=repo, base=base, head=head)
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "requires FIFO support")
     def test_helper_private_changed_path_fifo_fails_without_blocking(self) -> None:

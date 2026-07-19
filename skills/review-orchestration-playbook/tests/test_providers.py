@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
-import hashlib
 import itertools
 import json
 import os
@@ -5664,7 +5663,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertNotIn(token, error)
 
     @mock.patch.object(providers, "resolve_reviewer_executable")
-    def test_unproven_deleted_sensitive_path_record_blocks_external_reviewer(
+    def test_head_side_sensitive_path_record_blocks_external_reviewer(
         self,
         resolve: mock.Mock,
     ) -> None:
@@ -5673,10 +5672,16 @@ class ProviderPolicyTest(unittest.TestCase):
             self.review.workspace_root
             / ".codex-review"
             / workspace_runtime.CHANGED_PATH_DIGESTS_NAME
-        ).write_bytes(hashlib.sha256(raw_path).hexdigest().encode("ascii") + b"\0")
+        ).write_bytes(
+            workspace_runtime._changed_path_digest(
+                workspace_runtime.CHANGED_PATH_HEAD_TAG,
+                raw_path,
+            )
+            + b"\0"
+        )
         (
             self.review.container_dir / workspace_runtime.PRIVATE_CHANGED_PATHS_NAME
-        ).write_bytes(raw_path + b"\0")
+        ).write_bytes(workspace_runtime.CHANGED_PATH_HEAD_TAG + raw_path + b"\0")
         self._refresh_control_artifact_state()
         outcome = providers.run_review(
             review=self.review,

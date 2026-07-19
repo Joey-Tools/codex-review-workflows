@@ -952,6 +952,7 @@ class WorkspaceTest(unittest.TestCase):
         self.assertIn("permission denied", cleanup_error or "")
         remove_contents.assert_called_once_with(
             mock.ANY,
+            depth=0,
             excluded_entry_names=frozenset(
                 workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
             ),
@@ -1450,7 +1451,10 @@ class WorkspaceTest(unittest.TestCase):
             cleanup_error or "",
         )
         self.assertTrue(swapped)
-        self.assertEqual(list(moved_nested.iterdir()), [])
+        self.assertEqual(
+            (moved_nested / "original.txt").read_text(encoding="utf-8"),
+            "original\n",
+        )
         quarantines = list(container.glob(".codex-review-cleanup-*/victim.txt"))
         self.assertEqual(len(quarantines), 1)
         self.assertEqual(quarantines[0].read_text(encoding="utf-8"), "replacement\n")
@@ -1466,6 +1470,38 @@ class WorkspaceTest(unittest.TestCase):
         )
         self.assertTrue(quarantines[0].exists())
         self.assertEqual(quarantines[0].read_text(encoding="utf-8"), "replacement\n")
+
+    def test_partial_cleanup_does_not_enter_a_mountpoint_like_directory(self) -> None:
+        container = pathlib.Path(self.temporary.name) / "mount-boundary-container"
+        container.mkdir(mode=0o700)
+        nested = container / "nested"
+        nested.mkdir()
+        victim = nested / "victim.txt"
+        victim.write_text("retained\n", encoding="utf-8")
+        expected_cleanup = cleanup_evidence(container)
+        real_rename = os.rename
+
+        def reject_mountpoint_rename(source, destination, *args, **kwargs):
+            if source == nested.name:
+                raise OSError(errno.EBUSY, "Device or resource busy")
+            return real_rename(source, destination, *args, **kwargs)
+
+        with mock.patch.object(
+            workspace_runtime.os,
+            "rename",
+            side_effect=reject_mountpoint_rename,
+        ):
+            cleanup_error = workspace_runtime._remove_partial_container(
+                container,
+                expected=expected_cleanup,
+            )
+
+        self.assertIn(
+            "cannot quarantine review cleanup directory entry",
+            cleanup_error or "",
+        )
+        self.assertEqual(victim.read_text(encoding="utf-8"), "retained\n")
+        self.assertEqual(list(container.glob(".codex-review-cleanup-*")), [])
 
     def test_partial_cleanup_bounds_depth_and_still_scrubs_private_files(
         self,
@@ -1497,7 +1533,13 @@ class WorkspaceTest(unittest.TestCase):
 
         self.assertIn("directory depth exceeds the safety limit", cleanup_error or "")
         self.assertTrue(container.exists())
-        self.assertTrue(deep_victim.exists())
+        self.assertFalse(deep_victim.exists())
+        retained_victims = list(container.rglob("victim.txt"))
+        self.assertEqual(len(retained_victims), 1)
+        self.assertEqual(
+            retained_victims[0].read_text(encoding="utf-8"),
+            "retained\n",
+        )
         self.assertTrue(all(not path.exists() for path in private_artifacts))
 
     def test_partial_cleanup_unlinks_nested_symlink_without_following_it(self) -> None:
@@ -1561,7 +1603,11 @@ class WorkspaceTest(unittest.TestCase):
         self.assertIn("review workspace changed before removal", cleanup_error or "")
         self.assertTrue(swapped)
         self.assertTrue(moved_workspace.exists())
-        self.assertEqual(list(moved_workspace.iterdir()), [])
+        self.assertTrue(
+            (
+                moved_workspace / review.diff_file.relative_to(review.workspace_root)
+            ).exists()
+        )
         quarantines = list(
             review.container_dir.glob(".codex-review-cleanup-*/victim.txt")
         )

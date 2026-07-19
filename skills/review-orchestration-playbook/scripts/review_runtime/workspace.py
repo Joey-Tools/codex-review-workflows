@@ -290,9 +290,12 @@ SYNTHETIC_CHANGED_EVIDENCE_NAME = "synthetic-changed-evidence.json"
 SYNTHETIC_MANIFEST_SCHEMA_VERSION = 4
 SECRET_REDUCTION_PROVENANCE_SCHEME = "path-surface-offset-sha256-v1"
 CONTROL_ARTIFACT_STATE_NAME = "control-artifact-state.json"
-CONTROL_ARTIFACT_SCHEMA_VERSION = 4
+CONTROL_ARTIFACT_SCHEMA_VERSION = 5
 CHANGED_PATH_DIGESTS_NAME = "changed-path-digests.z"
 PRIVATE_CHANGED_PATHS_NAME = "changed-paths-private.z"
+CHANGED_PATH_DIGEST_DOMAIN = b"codex-review-changed-path-v2\0"
+CHANGED_PATH_HEAD_TAG = b"H"
+CHANGED_PATH_BASE_ONLY_TAG = b"B"
 PRIVATE_HELPER_ARTIFACT_NAMES = (
     SYNTHETIC_PRIVATE_MANIFEST_NAME,
     PRIVATE_CHANGED_PATHS_NAME,
@@ -1231,36 +1234,15 @@ def _remove_open_directory_contents(
                     )
                     continue
 
-                child_errors = _remove_open_directory_contents(
-                    child_descriptor,
-                    depth=depth + 1,
-                )
-                cleanup_errors.extend(child_errors)
-                if child_errors:
-                    continue
-                quarantine_name, quarantined, quarantine_errors = (
-                    _quarantine_cleanup_entry(
-                        directory_descriptor,
-                        entry_name,
-                        child_opened,
-                        label="review cleanup directory entry",
-                        missing_is_error=True,
-                    )
-                )
-                cleanup_errors.extend(quarantine_errors)
-                if quarantine_errors or quarantine_name is None or quarantined is None:
-                    continue
-                directory_error = _review_cleanup_directory_entry_error(quarantined)
-                if directory_error:
-                    cleanup_errors.append(directory_error)
-                    continue
                 cleanup_errors.extend(
-                    _remove_quarantined_cleanup_entry(
+                    _remove_open_directory_tree(
                         directory_descriptor,
-                        quarantine_name,
-                        child_opened,
+                        child_descriptor,
+                        entry_name,
                         label="review cleanup directory entry",
-                        is_directory=True,
+                        require_private_mode=False,
+                        depth=depth + 1,
+                        quarantine_before_recursion=True,
                     )
                 )
         except OSError as error:
@@ -1287,9 +1269,57 @@ def _remove_open_directory_tree(
     require_private_mode: bool,
     excluded_entry_names: frozenset[str] = frozenset(),
     final_entry_names: frozenset[str] = frozenset(),
+    depth: int = 0,
+    quarantine_before_recursion: bool = False,
 ) -> list[str]:
+    try:
+        directory_opened = os.fstat(directory_descriptor)
+    except OSError as error:
+        return [f"cannot inspect {label} before quarantine: {error}"]
+    directory_error = _private_cleanup_directory_error(
+        directory_opened,
+        label=label,
+        require_private_mode=require_private_mode,
+    )
+    if directory_error:
+        return [directory_error]
+
+    directory_quarantine_name: str | None = None
+    if quarantine_before_recursion:
+        try:
+            parent_opened = os.fstat(parent_descriptor)
+        except OSError as error:
+            return [f"cannot inspect {label} parent before quarantine: {error}"]
+        if directory_opened.st_dev != parent_opened.st_dev:
+            return [f"{label} crosses a filesystem boundary"]
+        (
+            directory_quarantine_name,
+            quarantined,
+            quarantine_errors,
+        ) = _quarantine_cleanup_entry(
+            parent_descriptor,
+            directory_name,
+            directory_opened,
+            label=label,
+            missing_is_error=True,
+        )
+        if (
+            quarantine_errors
+            or directory_quarantine_name is None
+            or quarantined is None
+        ):
+            return quarantine_errors
+        directory_error = _private_cleanup_directory_error(
+            quarantined,
+            label=label,
+            require_private_mode=require_private_mode,
+        )
+        if directory_error:
+            return [directory_error]
+
     cleanup_errors = _remove_open_directory_contents(
         directory_descriptor,
+        depth=depth,
         excluded_entry_names=excluded_entry_names | final_entry_names,
     )
     if cleanup_errors:
@@ -1308,19 +1338,19 @@ def _remove_open_directory_tree(
             return [f"cannot inspect final review cleanup entry: {error}"]
         if stat.S_ISDIR(final_entry_metadata.st_mode):
             return ["final review cleanup entry is unexpectedly a directory"]
-        quarantine_name, _, quarantine_errors = _quarantine_cleanup_entry(
+        final_quarantine_name, _, quarantine_errors = _quarantine_cleanup_entry(
             directory_descriptor,
             final_entry_name,
             final_entry_metadata,
             label="final review cleanup entry",
             missing_is_error=True,
         )
-        if quarantine_errors or quarantine_name is None:
+        if quarantine_errors or final_quarantine_name is None:
             return quarantine_errors
         cleanup_errors.extend(
             _remove_quarantined_cleanup_entry(
                 directory_descriptor,
-                quarantine_name,
+                final_quarantine_name,
                 final_entry_metadata,
                 label="final review cleanup entry",
                 is_directory=False,
@@ -1337,35 +1367,51 @@ def _remove_open_directory_tree(
         return [f"{label} still contains entries after cleanup"]
 
     try:
-        directory_opened = os.fstat(directory_descriptor)
+        directory_final = os.fstat(directory_descriptor)
     except OSError as error:
         return [f"cannot revalidate {label} before removal: {error}"]
     directory_error = _private_cleanup_directory_error(
-        directory_opened,
+        directory_final,
         label=label,
         require_private_mode=require_private_mode,
     )
     if directory_error:
         return [directory_error]
-    quarantine_name, quarantined, quarantine_errors = _quarantine_cleanup_entry(
-        parent_descriptor,
-        directory_name,
-        directory_opened,
-        label=label,
-        missing_is_error=True,
-    )
-    if quarantine_errors or quarantine_name is None or quarantined is None:
-        return quarantine_errors
-    directory_error = _private_cleanup_directory_error(
-        quarantined,
-        label=label,
-        require_private_mode=require_private_mode,
-    )
-    if directory_error:
-        return [directory_error]
+    if _private_cleanup_identity(directory_final) != _private_cleanup_identity(
+        directory_opened
+    ):
+        suffix = (
+            "; quarantine preserved" if directory_quarantine_name is not None else ""
+        )
+        return [f"{label} changed during cleanup{suffix}"]
+    if directory_quarantine_name is None:
+        (
+            directory_quarantine_name,
+            quarantined,
+            quarantine_errors,
+        ) = _quarantine_cleanup_entry(
+            parent_descriptor,
+            directory_name,
+            directory_final,
+            label=label,
+            missing_is_error=True,
+        )
+        if (
+            quarantine_errors
+            or directory_quarantine_name is None
+            or quarantined is None
+        ):
+            return quarantine_errors
+        directory_error = _private_cleanup_directory_error(
+            quarantined,
+            label=label,
+            require_private_mode=require_private_mode,
+        )
+        if directory_error:
+            return [directory_error]
     return _remove_quarantined_cleanup_entry(
         parent_descriptor,
-        quarantine_name,
+        directory_quarantine_name,
         directory_opened,
         label=label,
         is_directory=True,
@@ -1447,6 +1493,7 @@ def _remove_named_directory_tree(
                             directory_name,
                             label=label,
                             require_private_mode=require_private_mode,
+                            quarantine_before_recursion=True,
                         )
                     )
     except OSError as error:
@@ -2721,6 +2768,14 @@ def _write_limited_diff_metadata(
         raise ReviewError(f"cannot generate {label}: {_process_stderr(error_output)}")
 
 
+def _changed_path_digest(side_tag: bytes, raw_path: bytes) -> bytes:
+    return (
+        hashlib.sha256(CHANGED_PATH_DIGEST_DOMAIN + side_tag + b"\0" + raw_path)
+        .hexdigest()
+        .encode("ascii")
+    )
+
+
 def _write_frozen_changed_paths(
     *,
     git_view: pathlib.Path,
@@ -2735,11 +2790,7 @@ def _write_frozen_changed_paths(
 ) -> None:
     digest_evidence: list[str] = []
     with (
-        _open_new_private_binary(
-            private_destination,
-            identity_handoff=private_identity_handoff,
-            parent_descriptor=private_parent_descriptor,
-        ) as output,
+        tempfile.TemporaryFile() as raw_metadata,
         tempfile.TemporaryFile() as error_output,
     ):
         _write_limited_diff_metadata(
@@ -2747,37 +2798,66 @@ def _write_frozen_changed_paths(
             object_directory=object_directory,
             args=(
                 "diff",
-                "--name-only",
+                "--name-status",
                 "-z",
                 "--no-renames",
-                "--diff-filter=ACMRTUXB",
+                "--diff-filter=ADMTUXB",
                 base_sha,
                 head_sha,
             ),
-            output=output,
+            output=raw_metadata,
             error_output=error_output,
             label="frozen changed paths",
-            record_limit=MAX_CHANGED_ENTRIES,
+            record_limit=MAX_CHANGED_ENTRIES * 2,
         )
-    with (
-        _secure_file_reader(
-            private_destination,
-            label="helper-private frozen changed paths",
-            max_bytes=MAX_CHANGED_METADATA_BYTES,
-        ) as (reader, _metadata),
-        _open_new_private_binary(destination) as output,
-    ):
-        for raw_path in _iter_nul_records(
-            reader,
+        raw_metadata.seek(0)
+        metadata_records = _iter_nul_records(
+            raw_metadata,
             byte_limit=MAX_CHANGED_METADATA_BYTES,
-            record_limit=MAX_CHANGED_ENTRIES,
-            label="helper-private frozen changed paths",
+            record_limit=MAX_CHANGED_ENTRIES * 2,
+            label="frozen changed paths",
+        )
+        logical_record_count = 0
+        private_bytes = 0
+        with (
+            _open_new_private_binary(
+                private_destination,
+                identity_handoff=private_identity_handoff,
+                parent_descriptor=private_parent_descriptor,
+            ) as private_output,
+            _open_new_private_binary(destination) as public_output,
         ):
-            if not raw_path:
-                raise ReviewError("frozen changed paths contain an empty path")
-            digest = hashlib.sha256(raw_path).hexdigest()
-            digest_evidence.append(digest)
-            output.write(digest.encode("ascii") + b"\0")
+            while (status := next(metadata_records, None)) is not None:
+                raw_path = next(metadata_records, None)
+                if raw_path is None:
+                    raise ReviewError(
+                        "frozen changed path metadata is missing a path record"
+                    )
+                if status == b"D":
+                    side_tag = CHANGED_PATH_BASE_ONLY_TAG
+                elif status in {b"A", b"M", b"T", b"U", b"X", b"B"}:
+                    side_tag = CHANGED_PATH_HEAD_TAG
+                else:
+                    raise ReviewError(
+                        "frozen changed path metadata contains an unknown status"
+                    )
+                if not raw_path:
+                    raise ReviewError("frozen changed paths contain an empty path")
+                logical_record_count += 1
+                if logical_record_count > MAX_CHANGED_ENTRIES:
+                    raise ReviewError(
+                        "frozen changed paths exceed the review entry-count limit"
+                    )
+                private_record = side_tag + raw_path
+                private_bytes += len(private_record) + 1
+                if private_bytes > MAX_CHANGED_METADATA_BYTES:
+                    raise ReviewError(
+                        "frozen changed paths exceed the review byte limit"
+                    )
+                digest = _changed_path_digest(side_tag, raw_path)
+                digest_evidence.append(digest.decode("ascii"))
+                private_output.write(private_record + b"\0")
+                public_output.write(digest + b"\0")
     _reject_raw_values_in_evidence(
         digest_evidence,
         accepted_values=evidence_sensitive_values,
@@ -4888,27 +4968,39 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
             record_limit=MAX_CHANGED_ENTRIES,
             label="external review changed path digests",
         )
-        for raw_path in _iter_nul_records(
+        for private_record in _iter_nul_records(
             path_handle,
             byte_limit=MAX_CHANGED_METADATA_BYTES,
             record_limit=MAX_CHANGED_ENTRIES,
             label="helper-private frozen changed paths",
         ):
             changed_path_count += 1
-            expected_digest = hashlib.sha256(raw_path).hexdigest().encode("ascii")
+            if len(private_record) < 2:
+                raise ReviewError(
+                    "helper-private frozen changed path record is malformed"
+                )
+            side_tag = private_record[:1]
+            raw_path = private_record[1:]
+            if side_tag not in {CHANGED_PATH_HEAD_TAG, CHANGED_PATH_BASE_ONLY_TAG}:
+                raise ReviewError(
+                    "helper-private frozen changed path record has an unknown side"
+                )
+            expected_digest = _changed_path_digest(side_tag, raw_path)
             if next(digest_records, None) != expected_digest:
                 raise ReviewError(
                     "external review changed path digests do not match "
                     "helper-private changed paths"
                 )
             legacy_path_token_id = catalog_legacy_path_matcher.match(raw_path)
-            reduction_path_token_id = reduction_path_matcher.match(raw_path)
             if legacy_path_token_id is not None:
                 record_finding(
                     "<redacted changed path> "
                     "(legacy-synthetic-value; changed-path-name)"
                 )
                 continue
+            if side_tag == CHANGED_PATH_BASE_ONLY_TAG:
+                continue
+            reduction_path_token_id = reduction_path_matcher.match(raw_path)
             if reduction_path_token_id is not None:
                 record_finding(
                     "<redacted changed path> "
