@@ -317,6 +317,7 @@ def run(
     capture_limit_bytes: int = 4 * 1024 * 1024,
     timeout_seconds: float | None = None,
     output_file_limit_bytes: int | None = None,
+    on_process_started: Callable[[], None] | None = None,
 ) -> Completed:
     command = tuple(str(item) for item in argv)
     if (stdout_path is None) != (stderr_path is None):
@@ -329,6 +330,10 @@ def run(
         raise ReviewError("output_file_limit_bytes requires timeout_seconds")
     if timeout_seconds is not None and (stdout_path is None or stderr_path is None):
         raise ReviewError("timeout_seconds requires logged output paths")
+    if on_process_started is not None and (
+        stdout_path is None or stderr_path is None
+    ):
+        raise ReviewError("on_process_started requires logged output paths")
     if output_file_limit_bytes is not None and output_file_limit_bytes <= 0:
         raise ReviewError("output_file_limit_bytes must be positive")
     try:
@@ -362,6 +367,7 @@ def run(
                     timeout_seconds=timeout_seconds,
                     stdout_file_limit_bytes=output_file_limit_bytes,
                     stderr_file_limit_bytes=output_file_limit_bytes,
+                    on_process_started=on_process_started,
                 )
             result = Completed(
                 command,
@@ -388,7 +394,7 @@ def run_bounded_capture(
     *,
     cwd: pathlib.Path | None = None,
     env: dict[str, str] | None = None,
-    stdin: bytes | None = None,
+    stdin: bytes | bytearray | None = None,
     timeout_seconds: float,
     stdout_limit_bytes: int,
     stderr_limit_bytes: int,
@@ -613,7 +619,7 @@ def _run_logged_process(
     *,
     cwd: pathlib.Path | None,
     env: dict[str, str] | None,
-    stdin: bytes | None,
+    stdin: bytes | bytearray | None,
     stdout_handle: BinaryIO,
     stderr_handle: BinaryIO,
     timeout_seconds: float | None = None,
@@ -621,9 +627,12 @@ def _run_logged_process(
     stderr_file_limit_bytes: int | None = None,
     regular_file_limit_bytes: int | None = None,
     regular_file_limit_path: pathlib.Path | None = None,
+    on_process_started: Callable[[], None] | None = None,
 ) -> int:
     process: subprocess.Popen[bytes] | None = None
     pending_signal: signal.Signals | None = None
+    forwarded_signal_sent = False
+    spawn_handoff_complete = False
     io_threads: list[threading.Thread] = []
     stop_io = threading.Event()
     regular_file_overflow = threading.Event()
@@ -633,12 +642,13 @@ def _run_logged_process(
     deadline: float | None = None
 
     def forward_signal(signum: int, _frame: object) -> None:
-        nonlocal pending_signal
+        nonlocal forwarded_signal_sent, pending_signal
         forwarded = signal.Signals(signum)
         pending_signal = forwarded
-        if process is None:
+        if process is None or not spawn_handoff_complete:
             return
         signal_process_group(process, forwarded)
+        forwarded_signal_sent = True
         raise ForwardedSignal(forwarded)
 
     previous_handlers: dict[signal.Signals, object] = {}
@@ -737,8 +747,12 @@ def _run_logged_process(
                     )
                 errno_value = int(exec_status)
                 raise OSError(errno_value, os.strerror(errno_value), command[0])
+        if on_process_started is not None:
+            on_process_started()
+        spawn_handoff_complete = True
         if pending_signal is not None:
             signal_process_group(process, pending_signal)
+            forwarded_signal_sent = True
             raise ForwardedSignal(pending_signal)
         if stdout_file_limit_bytes is None or stderr_file_limit_bytes is None:
             if timeout_seconds is None:
@@ -815,7 +829,11 @@ def _run_logged_process(
                 drain_errors.append(error)
                 signal_process_group(process, signal.SIGTERM)
 
-        def write_stdin_bounded(stream: BinaryIO, payload: bytes) -> None:
+        def write_stdin_bounded(
+            stream: BinaryIO,
+            payload: bytes | bytearray,
+        ) -> None:
+            view = memoryview(payload)
             try:
                 descriptor = stream.fileno()
                 os.set_blocking(descriptor, False)
@@ -827,7 +845,7 @@ def _run_logged_process(
                     if not writable:
                         continue
                     try:
-                        written = os.write(descriptor, payload[offset:])
+                        written = os.write(descriptor, view[offset:])
                     except BlockingIOError:
                         continue
                     offset += written
@@ -838,6 +856,8 @@ def _run_logged_process(
             except Exception as error:
                 drain_errors.append(error)
                 signal_process_group(process, signal.SIGTERM)
+            finally:
+                view.release()
 
         thread_start_mask = block_forwarded_signals()
         try:
@@ -952,7 +972,7 @@ def _run_logged_process(
                 terminate_process_group(
                     process,
                     initial_signal=cleanup_signal,
-                    signal_already_sent=pending_signal is not None,
+                    signal_already_sent=forwarded_signal_sent,
                 )
             stop_io.set()
             for thread in io_threads:

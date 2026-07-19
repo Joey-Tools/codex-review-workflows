@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 
 
-CLAUDE_MINIMUM_VERSION = (2, 1, 187)
+CLAUDE_MINIMUM_VERSION = (2, 1, 211)
 CLAUDE_NEXT_MAJOR_VERSION = (3, 0, 0)
 CLAUDE_VERSION_COMPONENT_MAX_DIGITS = 9
 _CLAUDE_VERSION_COMPONENT = (
@@ -451,7 +451,7 @@ def parse_claude_version(output: str) -> ClaudeVersion:
     typed_parts = (parts[0], parts[1], parts[2])
     if not CLAUDE_MINIMUM_VERSION <= typed_parts < CLAUDE_NEXT_MAJOR_VERSION:
         raise ClaudeCapabilityError(
-            "Claude Code version is outside the supported >=2.1.187,<3 range"
+            "Claude Code version is outside the supported >=2.1.211,<3 range"
         )
     return ClaudeVersion(".".join(str(part) for part in typed_parts), typed_parts)
 
