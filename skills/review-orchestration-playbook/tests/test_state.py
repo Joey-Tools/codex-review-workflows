@@ -259,7 +259,7 @@ class StatefulLifecycleTest(unittest.TestCase):
 
         with self.assertRaisesRegex(
             ReviewError,
-            "retained fallback preflight evidence is not valid JSON",
+            "retained fallback preflight evidence exceeds the JSON nesting depth limit",
         ):
             state._read_bounded_json(
                 preflight_path,
@@ -446,12 +446,12 @@ class StatefulLifecycleTest(unittest.TestCase):
         original_open = os.open
         open_count = 0
 
-        def delete_before_existing_open(path, flags, mode=0o777):
+        def delete_before_existing_open(path, flags, mode=0o777, *, dir_fd=None):
             nonlocal open_count
             open_count += 1
             if open_count == 2:
                 lock_path.unlink()
-            return original_open(path, flags, mode)
+            return original_open(path, flags, mode, dir_fd=dir_fd)
 
         with (
             mock.patch.object(
@@ -478,12 +478,12 @@ class StatefulLifecycleTest(unittest.TestCase):
         original_open = os.open
         open_count = 0
 
-        def replace_before_existing_open(path, flags, mode=0o777):
+        def replace_before_existing_open(path, flags, mode=0o777, *, dir_fd=None):
             nonlocal open_count
             open_count += 1
             if open_count == 2:
                 os.replace(replacement_path, lock_path)
-            return original_open(path, flags, mode)
+            return original_open(path, flags, mode, dir_fd=dir_fd)
 
         with (
             mock.patch.object(
@@ -526,6 +526,20 @@ class StatefulLifecycleTest(unittest.TestCase):
                     pass
                 self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), mode)
 
+    def test_general_legacy_lock_open_rejects_cleanup_only_0664_mode(self) -> None:
+        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+        lock_path.write_bytes(b"")
+        lock_path.chmod(0o664)
+
+        with self.assertRaisesRegex(ReviewError, "unsafe legacy mode"):
+            state.open_private_lock_file(
+                lock_path,
+                label="test cleanup lock",
+                allow_legacy_read_mode=True,
+            )
+
+        self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o664)
+
     def test_cleanup_migrates_safe_legacy_lock_mode_after_flock(self) -> None:
         self.write_completed_state()
         lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
@@ -539,6 +553,91 @@ class StatefulLifecycleTest(unittest.TestCase):
 
         self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o600)
         self.assertFalse(self.review.workspace_root.exists())
+
+    def test_cleanup_migrates_private_empty_legacy_0664_lock(self) -> None:
+        self.write_completed_state()
+        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+        previous_umask = os.umask(0o002)
+        try:
+            with lock_path.open("a+b"):
+                pass
+        finally:
+            os.umask(previous_umask)
+        self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o664)
+
+        self.assertEqual(
+            state.cleanup(self.review.container_dir, timeout_seconds=1),
+            0,
+        )
+
+        self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o600)
+        self.assertFalse(self.review.workspace_root.exists())
+
+    def test_cleanup_rejects_0664_lock_outside_exact_private_state_mode(self) -> None:
+        self.write_completed_state()
+        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+        lock_path.write_bytes(b"")
+        lock_path.chmod(0o664)
+        self.review.container_dir.chmod(0o750)
+        try:
+            with self.assertRaisesRegex(ReviewError, "mode must be exactly 0700"):
+                state.cleanup(self.review.container_dir, timeout_seconds=1)
+        finally:
+            self.review.container_dir.chmod(0o700)
+
+        self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o664)
+        self.assertTrue(self.review.workspace_root.exists())
+
+    def test_cleanup_rejects_0664_lock_under_writable_review_root(self) -> None:
+        self.write_completed_state()
+        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+        lock_path.write_bytes(b"")
+        lock_path.chmod(0o664)
+        review_root = self.review.container_dir.parent
+        original_mode = stat.S_IMODE(review_root.stat().st_mode)
+        review_root.chmod(0o770)
+        try:
+            with self.assertRaisesRegex(
+                ReviewError,
+                "review state root must not be group or other writable",
+            ):
+                state.cleanup(self.review.container_dir, timeout_seconds=1)
+        finally:
+            review_root.chmod(original_mode)
+
+        self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o664)
+        self.assertTrue(self.review.workspace_root.exists())
+
+    def test_cleanup_revalidates_private_state_mode_after_flock(self) -> None:
+        self.write_completed_state()
+        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+        lock_path.write_bytes(b"")
+        lock_path.chmod(0o664)
+
+        def acquire_then_change_state_mode(handle, *, deadline):
+            del deadline
+            state.fcntl.flock(
+                handle.fileno(),
+                state.fcntl.LOCK_EX | state.fcntl.LOCK_NB,
+            )
+            self.review.container_dir.chmod(0o750)
+            return True
+
+        try:
+            with (
+                mock.patch.object(
+                    state,
+                    "_acquire_cleanup_lock",
+                    side_effect=acquire_then_change_state_mode,
+                ),
+                self.assertRaisesRegex(ReviewError, "mode must be exactly 0700"),
+            ):
+                state.cleanup(self.review.container_dir, timeout_seconds=1)
+        finally:
+            self.review.container_dir.chmod(0o700)
+
+        self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o664)
+        self.assertTrue(self.review.workspace_root.exists())
 
     def test_cleanup_rejects_unsafe_legacy_lock_modes(self) -> None:
         self.write_completed_state()

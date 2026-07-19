@@ -188,6 +188,61 @@ class WorkspaceTest(unittest.TestCase):
         cleanup_workspace(review, keep_container=False)
         self.assertFalse(review.container_dir.exists())
 
+    def test_prepare_rejects_lfs_pointer_after_attributes_are_deleted(self) -> None:
+        git(self.repo, "rm", ".gitattributes")
+        oid = "a" * 64
+        (self.repo / "asset.bin").write_text(
+            "version https://git-lfs.github.com/spec/v1\n"
+            f"oid sha256:{oid}\n"
+            "size 1\n",
+            encoding="utf-8",
+        )
+        git(self.repo, "add", "asset.bin")
+        git(self.repo, "commit", "-m", "Add direct LFS pointer")
+        self.head = git(self.repo, "rev-parse", "HEAD")
+        handoffs = []
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            r"blocked-checkout-lfs-pointer: review_status=not-run: .*asset\.bin",
+        ):
+            _prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+                ownership_handoff=handoffs.append,
+            )
+
+        self.assertEqual(handoffs, [])
+        self.assertEqual(
+            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            [],
+        )
+
+    def test_prepare_materializes_blob_at_lfs_pointer_cutoff(self) -> None:
+        git(self.repo, "rm", ".gitattributes")
+        oid = "a" * 64
+        canonical = (
+            "version https://git-lfs.github.com/spec/v1\n"
+            f"oid sha256:{oid}\n"
+            "size 1\n"
+        ).encode("ascii")
+        payload = canonical + (b" " * (1024 - len(canonical)))
+        self.assertEqual(len(payload), workspace_runtime.GIT_LFS_POINTER_MAX_BYTES)
+        (self.repo / "asset.bin").write_bytes(payload)
+        git(self.repo, "add", "asset.bin")
+        git(self.repo, "commit", "-m", "Add cutoff-sized pointer-like blob")
+        self.head = git(self.repo, "rev-parse", "HEAD")
+
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(review)
+
+        self.assertEqual((review.workspace_root / "asset.bin").read_bytes(), payload)
+
     def test_prepare_uses_private_control_modes_under_permissive_umask(self) -> None:
         for mask in (0o002, 0o000):
             with self.subTest(mask=oct(mask)):
@@ -333,6 +388,34 @@ class WorkspaceTest(unittest.TestCase):
                     label="growing evidence",
                     max_bytes=limit,
                 )
+
+    def test_bounded_json_reader_enforces_explicit_depth_limit(self) -> None:
+        path = pathlib.Path(self.temporary.name) / "nested.json"
+
+        def nested(depth: int) -> dict[str, object]:
+            value: object = None
+            for _ in range(depth):
+                value = [value]
+            return {"padding": value}
+
+        path.write_text(
+            json.dumps(nested(workspace_runtime.MAX_BOUNDED_JSON_DEPTH)),
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            workspace_runtime._read_bounded_json(path, label="nested evidence"),
+            nested(workspace_runtime.MAX_BOUNDED_JSON_DEPTH),
+        )
+
+        path.write_text(
+            json.dumps(nested(workspace_runtime.MAX_BOUNDED_JSON_DEPTH + 1)),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(
+            ReviewError,
+            "nested evidence exceeds the JSON nesting depth limit",
+        ):
+            workspace_runtime._read_bounded_json(path, label="nested evidence")
 
     def test_prompt_override_replaces_only_review_scope_placeholders(self) -> None:
         template = pathlib.Path(self.temporary.name) / "prompt.txt"

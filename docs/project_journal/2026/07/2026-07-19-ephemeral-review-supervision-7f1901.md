@@ -5,7 +5,7 @@ status: completed
 created: 2026-07-19
 updated: 2026-07-19
 branch: codex/ephemeral-review-supervision
-pr:
+pr: https://github.com/Joey-Tools/codex-review-workflows/pull/64
 supersedes:
   - 20260714-7a1401
 superseded_by:
@@ -54,12 +54,12 @@ superseded_by:
 ## Evidence
 
 - `codex exec --help` confirmed support for `--ephemeral`, `--json`, `--sandbox`, `--ignore-user-config`, `--ignore-rules`, and `--output-last-message` in the installed CLI.
-- `python3 -B skills/review-orchestration-playbook/tests/test_contracts.py` passed 39 tests.
-- Focused state and workspace suites passed 55 and 61 tests respectively.
+- `python3 -B skills/review-orchestration-playbook/tests/test_contracts.py` passed 40 tests.
+- Focused state and workspace suites passed 60 and 64 tests respectively.
 - `uv run --isolated --with pyyaml python3 .../quick_validate.py skills/review-orchestration-playbook` passed.
 - `python3 .../project_journal.py validate --repo .` passed.
 - Python byte-compilation, the C launcher syntax check, and `git diff --check` passed.
-- The final full unittest discovery ran 1,050 tests with 4 skips outside the workspace sandbox so the provider suite could bind its local loopback fixtures; all tests passed.
+- The final full unittest discovery ran 1,059 tests with 4 skips outside the workspace sandbox so the provider suite could bind its local loopback fixtures; all tests passed.
 - The current official Codex manual documents that `--ephemeral` does not persist rollout files and lists JSONL thread/turn/item/usage events without model/effort metadata. A live current-CLI ephemeral JSONL probe confirmed that shape; its task-scoped files were removed afterward.
 - Fresh-context Codex review raised the three intentional tradeoffs above. The final contract now states each limitation explicitly and forbids state-changing external tool actions without reversing the selected lightweight profile.
 - Whole-range rereview found that post-reap PGID cleanup could signal a reused unrelated group. The contract now keeps the leader unreaped during forced termination and performs no signal-based cleanup after reap.
@@ -86,6 +86,8 @@ superseded_by:
 - Focused review of those fixes found that a crash after deleting `.git` or `gitdir` could make successor cleanup delete injected entries, and that the new parser and size tests initially restated their implementation instead of exercising independent models. The final design adds executable reference models, requires a complete bounded descendant manifest before targeted deletion, permits retry only through the original continuously live descriptor/lock custody chain, and turns custody loss into fail-closed `manual-recovery-required` rather than pretending that persisted device/inode values are crash-durable capabilities.
 - Subsequent focused accounting reviews found that the external manifest was not fully charged, unique parent directories and registration descendants were omitted, a deep path could materialize quadratic prefix state, cap projection happened too late within a path, physical-headroom failure used the wrong terminal status, and root-only trees skipped the zero-parent projection. The final model charges every manifest/control allocation, streams each raw path once with linear retained state, runs the full baseline and per-parent projector before consuming more input, binds EOF to the authenticated entry count, and returns `blocked-worktree-capacity` for checkout-introduced physical shortfalls. The final focused rereview returned `No findings.`
 - The next fixed-range whole-change review found that deeply nested but size-bounded JSON could escape as `RecursionError` and interrupt retained-workspace cleanup, and that detection of an entry beyond the authenticated path count happened only after scanning its content. The bounded JSON reader now converts parser depth and numeric-limit failures into `ReviewError` without swallowing control-flow or memory failures; fallback status rejects the evidence and explicit cleanup still succeeds. The path model now rejects the first excess record before reading its length or bytes while retaining the EOF check for truncation. The focused rereview returned `No findings.`
+- GitHub PR review then exposed three implementation gaps that the earlier Python 3.13/local contract passes did not cover: Python 3.14 can parse the 50,000-level JSON payload without `RecursionError`; old cleanup locks created under `umask 002` can be mode `0664`; and the Git LFS pointer decoder existed only in the executable contract model rather than the raw materializer. The bounded JSON reader now enforces an iterative 64-level container limit on every supported Python version. Cleanup-only compatibility admits an empty owner-owned `0664` lock only through held no-follow descriptors for the revalidated private root/exact-`0700` state directory, then revalidates after exclusive `flock` before migrating to durable `0600`. The raw materializer now exact-buffers every nonempty regular blob below 1,024 bytes, validates its batch delimiter, runs the Git LFS 3.7.1-compatible byte decoder, and returns `blocked-checkout-lfs-pointer: review_status=not-run` before creating the destination file even when `.gitattributes` is deleted.
+- The three PR findings have focused regression coverage, including Python 3.14.3 reproduction, 64/65-level JSON boundaries, `0664` private-root and post-lock drift cases, decoder parity against the independent reference corpus, deleted-attribute blocking, and the 1,024-byte pass-through boundary. Contract, state, and workspace suites plus full discovery, skill/journal validation, source compilation, C launcher warnings-as-errors, and `git diff --check` all pass on the amended tree.
 
 ## Next Steps
 

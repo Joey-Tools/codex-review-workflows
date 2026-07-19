@@ -25,6 +25,7 @@ from review_runtime import (  # noqa: E402
     claude_linux,
     claude_refresh_lock,
     providers,
+    workspace as workspace_runtime,
 )
 
 
@@ -671,6 +672,29 @@ def _claude_auth_repository_policy_files(
 
 
 class RepositoryContractTest(unittest.TestCase):
+    def test_cleanup_only_legacy_0664_lock_migration_is_private_and_ordered(
+        self,
+    ) -> None:
+        contract = (SKILL_ROOT / "references/helper-contract.md").read_text(
+            encoding="utf-8"
+        )
+
+        anchors = (
+            "empty owner-owned mode-`0664` `cleanup.lock`",
+            "non-group/other-writable owner-owned `.codex-tmp` root",
+            "exact-mode-`0700` state directory",
+            "exclusive lock is acquired",
+            "revalidates both directories and the lock identity/mode",
+            "`fchmod(0600)`",
+            "`fsync`",
+            "exact mode-`0600` validation",
+        )
+        cursor = 0
+        for anchor in anchors:
+            cursor = contract.index(anchor, cursor) + len(anchor)
+        self.assertIn("Every other group/other-writable", contract)
+        self.assertIn("nonempty legacy lock fails closed", contract)
+
     def test_only_canonical_review_skill_entrypoint_remains(self) -> None:
         self.assertTrue((SKILL_ROOT / "SKILL.md").is_file())
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
@@ -3867,16 +3891,20 @@ class RepositoryContractTest(unittest.TestCase):
         for name, payload in accepted_cases.items():
             with self.subTest(pointer=name):
                 self.assertTrue(_git_lfs_3_7_1_reference_pointer_gate(payload))
+                self.assertTrue(workspace_runtime._is_git_lfs_pointer(payload))
         for name, payload in rejected_near_misses.items():
             with self.subTest(near_miss=name):
                 self.assertFalse(_git_lfs_3_7_1_reference_pointer_gate(payload))
+                self.assertFalse(workspace_runtime._is_git_lfs_pointer(payload))
 
         pointer_1023 = canonical + (b" " * (1023 - len(canonical)))
         pointer_1024 = canonical + (b" " * (1024 - len(canonical)))
         self.assertEqual(1023, len(pointer_1023))
         self.assertTrue(_git_lfs_3_7_1_reference_pointer_gate(pointer_1023))
+        self.assertTrue(workspace_runtime._is_git_lfs_pointer(pointer_1023))
         self.assertEqual(1024, len(pointer_1024))
         self.assertFalse(_git_lfs_3_7_1_reference_pointer_gate(pointer_1024))
+        self.assertFalse(workspace_runtime._is_git_lfs_pointer(pointer_1024))
 
     def test_raw_materializer_preserves_git_executable_bit(self) -> None:
         readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
