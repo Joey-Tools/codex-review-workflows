@@ -48,6 +48,7 @@ from .workspace import (
     remove_legacy_private_review_artifacts,
     remove_partial_review_container,
     remove_private_review_artifacts,
+    remove_ready_review_container,
     open_bound_review_lock,
     validate_workspace_layout,
     write_bound_review_text,
@@ -61,6 +62,7 @@ STATE_SCHEMA_VERSION = 2
 LEGACY_STATE_MARKER = b"isolated-review-state-v1\n"
 COMPATIBLE_STATE_MARKER_SCHEMA_VERSION = 2
 STATE_MARKER_SCHEMA_VERSION = 3
+MAX_STATE_MARKER_BYTES = 64 * 1024
 LEGACY_STATE_REQUIRED_FIELDS = frozenset(
     {
         "attempts_path",
@@ -304,15 +306,124 @@ def _validate_v3_marker_layout(
     return source_root
 
 
-def _load_state_marker(state_dir: pathlib.Path) -> LoadedStateMarker:
-    resolved_state_dir = state_dir.expanduser().resolve(strict=False)
-    marker_path = resolved_state_dir / STATE_MARKER
+def _state_marker_metadata_key(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _validate_state_marker_metadata(metadata: os.stat_result) -> None:
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ReviewError("isolated-review state marker must be a regular file")
+    if metadata.st_nlink != 1:
+        raise ReviewError(
+            "isolated-review state marker must have exactly one hard link"
+        )
+    if metadata.st_uid != os.geteuid():
+        raise ReviewError(
+            "isolated-review state marker must be owned by the current user"
+        )
+    if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise ReviewError(
+            "isolated-review state marker must not be group or other writable"
+        )
+    if metadata.st_size > MAX_STATE_MARKER_BYTES:
+        raise ReviewError("isolated-review state marker exceeds the size limit")
+
+
+def _read_state_marker_bytes(state_dir: pathlib.Path) -> bytes:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    nonblock = getattr(os, "O_NONBLOCK", None)
+    if nofollow is None or nonblock is None:
+        raise ReviewError("secure isolated-review state marker loading is unavailable")
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | nofollow
+    )
+    file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow | nonblock
+    directory_descriptor: int | None = None
+    marker_descriptor: int | None = None
     try:
-        encoded = marker_path.read_bytes()
+        directory_descriptor = os.open(state_dir, directory_flags)
+        before = os.stat(
+            STATE_MARKER,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        _validate_state_marker_metadata(before)
+        marker_descriptor = os.open(
+            STATE_MARKER,
+            file_flags,
+            dir_fd=directory_descriptor,
+        )
+        opened = os.fstat(marker_descriptor)
+        current = os.stat(
+            STATE_MARKER,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        for metadata in (opened, current):
+            _validate_state_marker_metadata(metadata)
+        initial_key = _state_marker_metadata_key(before)
+        if any(
+            _state_marker_metadata_key(metadata) != initial_key
+            for metadata in (opened, current)
+        ):
+            raise ReviewError("isolated-review state marker changed while opening")
+
+        chunks: list[bytes] = []
+        remaining = MAX_STATE_MARKER_BYTES + 1
+        while remaining:
+            chunk = os.read(marker_descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        encoded = b"".join(chunks)
+        if len(encoded) > MAX_STATE_MARKER_BYTES:
+            raise ReviewError("isolated-review state marker exceeds the size limit")
+
+        final = os.fstat(marker_descriptor)
+        path_final = os.stat(
+            STATE_MARKER,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        for metadata in (final, path_final):
+            _validate_state_marker_metadata(metadata)
+        if len(encoded) != opened.st_size or any(
+            _state_marker_metadata_key(metadata) != initial_key
+            for metadata in (final, path_final)
+        ):
+            raise ReviewError("isolated-review state marker changed while reading")
+        return encoded
+    except ReviewError:
+        raise
     except OSError as error:
         raise ReviewError(
-            f"cannot read isolated-review state marker {marker_path}: {error}"
+            f"cannot read isolated-review state marker {state_dir / STATE_MARKER}: "
+            f"{error}"
         ) from error
+    finally:
+        if marker_descriptor is not None:
+            os.close(marker_descriptor)
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
+
+
+def _load_state_marker(state_dir: pathlib.Path) -> LoadedStateMarker:
+    resolved_state_dir = state_dir.expanduser().resolve(strict=False)
+    encoded = _read_state_marker_bytes(resolved_state_dir)
     if encoded == LEGACY_STATE_MARKER:
         return LoadedStateMarker(
             version=LEGACY_STATE_SCHEMA_VERSION,
@@ -1126,7 +1237,7 @@ def _cleanup_terminal_workspace(
                 state_path = state_dir / STATE_FILE
                 if (
                     marker.version == STATE_MARKER_SCHEMA_VERSION
-                    and marker.phase in {"preparing", "ready"}
+                    and marker.phase == "preparing"
                     and marker.private_cleanup is not None
                     and not os.path.lexists(state_path)
                 ):
@@ -1138,6 +1249,22 @@ def _cleanup_terminal_workspace(
                         raise ReviewError(
                             f"{state_error}; partial container cleanup failed: "
                             f"{partial_cleanup_error}"
+                        ) from state_error
+                    return 0
+                if (
+                    marker.version == STATE_MARKER_SCHEMA_VERSION
+                    and marker.phase == "ready"
+                    and marker.private_cleanup is not None
+                    and not os.path.lexists(state_path)
+                ):
+                    ready_cleanup_error = remove_ready_review_container(
+                        state_dir,
+                        expected=marker.private_cleanup,
+                    )
+                    if ready_cleanup_error:
+                        raise ReviewError(
+                            f"{state_error}; ready container cleanup failed: "
+                            f"{ready_cleanup_error}"
                         ) from state_error
                     return 0
                 if marker.version == LEGACY_STATE_SCHEMA_VERSION:

@@ -2303,6 +2303,20 @@ def remove_partial_review_container(
     return _remove_partial_container(container, expected=expected)
 
 
+def remove_ready_review_container(
+    container: pathlib.Path,
+    *,
+    expected: PrivateCleanupEvidence,
+) -> str | None:
+    """Remove a ready container using durable private-artifact receipts."""
+
+    return _remove_review_container_tree(
+        container,
+        expected=expected,
+        use_control_state=True,
+    )
+
+
 def _bound_private_cleanup_target(
     review: ReviewWorkspace | LegacyReviewWorkspace,
 ) -> pathlib.Path | None:

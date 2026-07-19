@@ -28,6 +28,7 @@ from review_runtime.workspace import (  # noqa: E402
     PrivateCleanupEvidence,
     cleanup_workspace,
     prepare_workspace as _prepare_workspace,
+    remove_private_review_artifacts,
 )
 
 
@@ -157,6 +158,115 @@ class StatefulLifecycleTest(unittest.TestCase):
             self.review.private_cleanup,
         )
 
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "requires FIFO support")
+    def test_state_marker_fifo_is_rejected_without_blocking(self) -> None:
+        marker_path = self.review.container_dir / state.STATE_MARKER
+        os.mkfifo(marker_path, mode=0o600)
+        probe = (
+            "import pathlib, sys\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "from review_runtime import state\n"
+            "from review_runtime.common import ReviewError\n"
+            "try:\n"
+            "    state._load_state_marker(pathlib.Path(sys.argv[2]))\n"
+            "except ReviewError as error:\n"
+            "    print(error)\n"
+            "    raise SystemExit(0)\n"
+            "raise SystemExit(2)\n"
+        )
+
+        completed = subprocess.run(
+            (sys.executable, "-c", probe, str(SCRIPTS), str(self.review.container_dir)),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=2,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("must be a regular file", completed.stdout)
+
+    def test_state_marker_open_uses_nofollow_and_nonblock(self) -> None:
+        state._write_state_marker(self.review)
+        real_open = os.open
+        marker_flags = []
+
+        def guarded_open(path, flags, *args, **kwargs):
+            if path == state.STATE_MARKER:
+                marker_flags.append(flags)
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(state.os, "open", side_effect=guarded_open):
+            state._load_state_marker(self.review.container_dir)
+
+        self.assertEqual(len(marker_flags), 1)
+        self.assertTrue(marker_flags[0] & os.O_NOFOLLOW)
+        self.assertTrue(marker_flags[0] & os.O_NONBLOCK)
+
+    def test_state_marker_rejects_symlink_owner_and_writable_mode(self) -> None:
+        marker_path = self.review.container_dir / state.STATE_MARKER
+        state._write_state_marker(self.review)
+        marker_path.chmod(0o620)
+        with self.assertRaisesRegex(ReviewError, "group or other writable"):
+            state._load_state_marker(self.review.container_dir)
+
+        marker_path.chmod(0o644)
+        with (
+            mock.patch.object(state.os, "geteuid", return_value=os.geteuid() + 1),
+            self.assertRaisesRegex(ReviewError, "owned by the current user"),
+        ):
+            state._load_state_marker(self.review.container_dir)
+
+        marker_path.unlink()
+        target = self.review.container_dir / "marker-target"
+        target.write_bytes(state.LEGACY_STATE_MARKER)
+        marker_path.symlink_to(target.name)
+        with self.assertRaisesRegex(ReviewError, "must be a regular file"):
+            state._load_state_marker(self.review.container_dir)
+
+    def test_legacy_state_marker_allows_read_only_shared_mode(self) -> None:
+        marker_path = self.review.container_dir / state.STATE_MARKER
+        marker_path.write_bytes(state.LEGACY_STATE_MARKER)
+        marker_path.chmod(0o644)
+
+        loaded = state._load_state_marker(self.review.container_dir)
+
+        self.assertEqual(loaded.version, state.LEGACY_STATE_SCHEMA_VERSION)
+
+    def test_state_marker_rejects_hardlink_and_oversized_file(self) -> None:
+        marker_path = self.review.container_dir / state.STATE_MARKER
+        state._write_state_marker(self.review)
+        hardlink = self.review.container_dir / "marker-hardlink"
+        os.link(marker_path, hardlink)
+
+        with self.assertRaisesRegex(ReviewError, "exactly one hard link"):
+            state._load_state_marker(self.review.container_dir)
+
+        hardlink.unlink()
+        marker_path.write_bytes(b"x" * (state.MAX_STATE_MARKER_BYTES + 1))
+        with self.assertRaisesRegex(ReviewError, "exceeds the size limit"):
+            state._load_state_marker(self.review.container_dir)
+
+    def test_state_marker_rejects_content_change_while_reading(self) -> None:
+        marker_path = self.review.container_dir / state.STATE_MARKER
+        state._write_state_marker(self.review)
+        real_read = os.read
+        mutated = False
+
+        def mutate_before_read(descriptor: int, size: int) -> bytes:
+            nonlocal mutated
+            if not mutated:
+                mutated = True
+                marker_path.write_text("{}\n", encoding="utf-8")
+            return real_read(descriptor, size)
+
+        with (
+            mock.patch.object(state.os, "read", side_effect=mutate_before_read),
+            self.assertRaisesRegex(ReviewError, "changed while reading"),
+        ):
+            state._load_state_marker(self.review.container_dir)
+
     def test_v2_marker_and_state_remain_compatible(self) -> None:
         self.write_completed_state()
         write_json(
@@ -195,6 +305,31 @@ class StatefulLifecycleTest(unittest.TestCase):
 
     def test_ready_marker_recovers_complete_container_without_state(self) -> None:
         state._write_state_marker(self.review)
+
+        exit_code = state.cleanup(
+            self.review.container_dir,
+            timeout_seconds=state.FINAL_CLEANUP_TIMEOUT_SECONDS,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertFalse(self.review.container_dir.exists())
+
+    def test_ready_marker_recovers_after_private_artifact_receipts(self) -> None:
+        state._write_state_marker(self.review)
+        cleanup_error = remove_private_review_artifacts(
+            self.review.container_dir,
+            expected=self.review.private_cleanup,
+        )
+        self.assertIsNone(cleanup_error)
+        self.assertTrue(
+            all(
+                not (self.review.container_dir / name).exists()
+                for name in (
+                    PRIVATE_CHANGED_PATHS_NAME,
+                    SYNTHETIC_PRIVATE_MANIFEST_NAME,
+                )
+            )
+        )
 
         exit_code = state.cleanup(
             self.review.container_dir,
