@@ -558,7 +558,54 @@ class PublicPoolScannerTest(unittest.TestCase):
         self.assertEqual(adjacent.blocking_rule, "generic-secret-assignment")
         self.assertEqual(adjacent.accepted_counts[accepted], 1)
 
-    def test_provider_specific_legacy_acceptance_survives_stream_boundary(self) -> None:
+    def test_specific_matches_charge_one_event_regardless_of_acceptance(self) -> None:
+        provider = GITHUB_LEGACY.encode("ascii")
+        provider_accepted = accepted_legacy_value(
+            GITHUB_LEGACY,
+            rule="github-token",
+        )
+        provider_prefix = b"sk-" + b"A" * 513
+        provider_prefix_accepted = accepted_legacy_value(
+            provider_prefix.decode("ascii"),
+            rule="openai-key",
+        )
+        complete_pem = (
+            b"-----BEGIN PRIVATE KEY-----\n"
+            + b"A" * 32
+            + b"\n-----END PRIVATE KEY-----"
+        )
+        pem_accepted = accepted_legacy_value(
+            complete_pem.decode("ascii"),
+            rule="private-key",
+        )
+        unclosed_pem = b"-----BEGIN PRIVATE KEY-----\n" + b"A" * 32
+
+        for label, payload, accepted, expected_blocker, expected_count in (
+            ("accepted-provider", provider, provider_accepted, None, 1),
+            (
+                "blocking-provider-prefix",
+                provider_prefix,
+                provider_prefix_accepted,
+                "openai-key",
+                0,
+            ),
+            ("accepted-pem", complete_pem, pem_accepted, None, 1),
+            ("blocking-unclosed-pem", unclosed_pem, pem_accepted, "private-key", 0),
+        ):
+            with self.subTest(case=label):
+                budget = workspace.SecretScanBudget(1)
+                scan = workspace._scan_secret_value(
+                    payload,
+                    accepted_values=(accepted,),
+                    _event_budget=budget,
+                )
+                self.assertEqual(scan.blocking_rule, expected_blocker)
+                self.assertEqual(scan.accepted_counts[accepted], expected_count)
+                self.assertEqual(budget.remaining, 0)
+
+    def test_provider_specific_legacy_acceptance_charges_each_stream_event_once(
+        self,
+    ) -> None:
         accepted = accepted_legacy_value(GITHUB_LEGACY, rule="github-token")
         candidate = GITHUB_LEGACY.encode("ascii")
         assignment_prefix = b'access_token = "'
@@ -574,7 +621,7 @@ class PublicPoolScannerTest(unittest.TestCase):
             + b'"\nstate = "expired"\n'
             + b"x" * workspace.STREAM_SCAN_OVERLAP
         )
-        event_budget = workspace.SecretScanBudget(3)
+        event_budget = workspace.SecretScanBudget(2)
         with mock.patch.object(
             workspace.SecretScanBudget,
             "default",

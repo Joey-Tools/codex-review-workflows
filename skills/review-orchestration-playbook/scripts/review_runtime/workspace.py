@@ -746,7 +746,6 @@ class FileScanByteBudget:
 class AcceptedValueIndex:
     exact: dict[tuple[str, bytes], list[AcceptedSyntheticValue]]
     digests: dict[tuple[str, int], dict[str, list[AcceptedSyntheticValue]]]
-    rules: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -7505,7 +7504,6 @@ def _iter_secret_events(
     _event_budget: SecretScanBudget | None = None,
     _specific_spans: set[tuple[int, int, bytes]] | None = None,
     _capture_only_assignment_spans: set[tuple[int, int, bytes]] | None = None,
-    _accepted_specific_rules: frozenset[str] = frozenset(),
 ) -> Iterator[tuple[str, bytes | None, int, bool, int | None, int | None]]:
     event_budget = _event_budget or SecretScanBudget.default()
 
@@ -7546,8 +7544,6 @@ def _iter_secret_events(
                 _specific_spans.add((start, candidate_end, candidate))
             if not end_is_committable(candidate_end):
                 continue
-            if rule in _accepted_specific_rules:
-                event_budget.consume()
             event_budget.consume()
             yield (
                 rule,
@@ -7565,8 +7561,6 @@ def _iter_secret_events(
         )
         if not end_is_committable(event_end):
             continue
-        if rule in _accepted_specific_rules:
-            event_budget.consume()
         event_budget.consume()
         yield rule, None, event_end, False, None, None
     for rule, pattern in SECRET_PATTERNS:
@@ -7591,8 +7585,6 @@ def _iter_secret_events(
                     _specific_spans.add((start, candidate_end, candidate))
             if not match_is_committable(match):
                 continue
-            if rule in _accepted_specific_rules:
-                event_budget.consume()
             event_budget.consume()
             if prefix_only:
                 if any(
@@ -8672,9 +8664,7 @@ def _index_accepted_values(
 ) -> AcceptedValueIndex:
     exact: dict[tuple[str, bytes], list[AcceptedSyntheticValue]] = {}
     digests: dict[tuple[str, int], dict[str, list[AcceptedSyntheticValue]]] = {}
-    rules: set[str] = set()
     for accepted in accepted_values:
-        rules.add(accepted.rule)
         if accepted.value is not None:
             exact.setdefault((accepted.rule, accepted.value), []).append(accepted)
             continue
@@ -8683,7 +8673,7 @@ def _index_accepted_values(
             {},
         )
         by_digest.setdefault(accepted.value_sha256, []).append(accepted)
-    return AcceptedValueIndex(exact=exact, digests=digests, rules=frozenset(rules))
+    return AcceptedValueIndex(exact=exact, digests=digests)
 
 
 def _index_exact_values(
@@ -8880,10 +8870,6 @@ def _scan_secret_value(
     capture_only_assignment_spans: set[tuple[int, int, bytes]] | None = (
         set() if _capture_only_legacy_evidence else None
     )
-    accepted_specific_rules = frozenset(
-        rule for rule in accepted_index.rules if rule != "generic-secret-assignment"
-    )
-
     for rule, candidate, end, may_accept, start, candidate_end in _iter_secret_events(
         value,
         minimum_end=minimum_end,
@@ -8894,7 +8880,6 @@ def _scan_secret_value(
         _event_budget=event_budget,
         _specific_spans=specific_spans,
         _capture_only_assignment_spans=capture_only_assignment_spans,
-        _accepted_specific_rules=accepted_specific_rules,
     ):
         if not minimum_end < end <= upper:
             continue
