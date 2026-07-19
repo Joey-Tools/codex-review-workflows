@@ -227,6 +227,9 @@ CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC = (
     "Claude credential refresh persistence also failed; the selected host "
     "credential source changed or could not be safely updated."
 )
+CLAUDE_TRUST_EVIDENCE_WRITE_DIAGNOSTIC = (
+    "Claude trust policy evidence also failed to persist"
+)
 CLAUDE_REVIEW_TOOL_EXECUTABLE_CANDIDATES = (
     pathlib.Path("/opt/homebrew/bin/rg"),
     pathlib.Path("/usr/local/bin/rg"),
@@ -855,6 +858,60 @@ class ClaudeCACertificateNotFound(ReviewError):
 
 class ClaudeTrustSettingsDeny(ReviewError):
     """Host trust settings contain an explicit deny and require a hard stop."""
+
+
+class ClaudeTrustEvidenceWriteDiagnostic(Exception):
+    """Sanitized fallback for a secondary trust-evidence write failure."""
+
+
+def _attach_claude_trust_evidence_write_failure(primary: BaseException) -> None:
+    marker = "_codex_claude_trust_evidence_write_failed"
+    if getattr(primary, marker, False):
+        return
+    setattr(primary, marker, True)
+    note = CLAUDE_TRUST_EVIDENCE_WRITE_DIAGNOSTIC
+    add_note = getattr(primary, "add_note", None)
+    if callable(add_note):
+        add_note(note)
+        return
+    diagnostic = ClaudeTrustEvidenceWriteDiagnostic(note)
+    if primary.__cause__ is not None:
+        diagnostic.__cause__ = primary.__cause__
+    elif primary.__context__ is not None:
+        diagnostic.__context__ = primary.__context__
+    primary.__cause__ = diagnostic
+
+
+def _claude_trust_evidence_write_diagnostic(
+    error: BaseException,
+) -> str | None:
+    pending = [error]
+    seen: set[int] = set()
+    marker_found = False
+    while pending and len(seen) < 32:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if getattr(
+            current,
+            "_codex_claude_trust_evidence_write_failed",
+            False,
+        ):
+            marker_found = True
+        notes = getattr(current, "__notes__", ())
+        if isinstance(notes, (list, tuple)) and any(
+            note == CLAUDE_TRUST_EVIDENCE_WRITE_DIAGNOSTIC for note in notes
+        ):
+            return CLAUDE_TRUST_EVIDENCE_WRITE_DIAGNOSTIC
+        if isinstance(current, ClaudeTrustEvidenceWriteDiagnostic) and current.args == (
+            CLAUDE_TRUST_EVIDENCE_WRITE_DIAGNOSTIC,
+        ):
+            return CLAUDE_TRUST_EVIDENCE_WRITE_DIAGNOSTIC
+        for related in (current.__cause__, current.__context__):
+            if isinstance(related, BaseException):
+                pending.append(related)
+    return CLAUDE_TRUST_EVIDENCE_WRITE_DIAGNOSTIC if marker_found else None
 
 
 class ClaudeProvenanceVerifierUnavailable(ReviewError):
@@ -1667,9 +1724,24 @@ def _verify_unconditional_trust_root(
     canonical: bytes,
     *,
     ca_root: pathlib.Path,
-    timeout_seconds: float,
+    timeout_seconds: float | None = None,
+    deadline: float | None = None,
     allow_non_self_signed: bool = False,
 ) -> None:
+    if (timeout_seconds is None) == (deadline is None):
+        raise ValueError("exactly one trust-root timeout form is required")
+    if deadline is None:
+        assert timeout_seconds is not None
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+
+    def remaining_timeout() -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ReviewTimeoutError(
+                "Claude TLS root verification exceeded its total timeout"
+            )
+        return remaining
+
     _require_unconditional_root_extensions(
         der,
         require_self_issued=not allow_non_self_signed,
@@ -1717,6 +1789,7 @@ def _verify_unconditional_trust_root(
             raise ClaudeExecutableInspectionInconclusive(
                 "cannot prepare Claude trust verification input"
             ) from error
+
         try:
             use_partial_chain = False
             if allow_non_self_signed:
@@ -1724,11 +1797,12 @@ def _verify_unconditional_trust_root(
                     (str(CLAUDE_OPENSSL_CLIENT), "verify", "-help"),
                     cwd=ca_root,
                     env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
-                    timeout_seconds=timeout_seconds,
+                    timeout_seconds=remaining_timeout(),
                     stdout_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
                     stderr_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
                 )
                 try:
+                    remaining_timeout()
                     capability_output = bytes(capabilities.stdout) + bytes(
                         capabilities.stderr
                     )
@@ -1780,7 +1854,7 @@ def _verify_unconditional_trust_root(
                 verification_command,
                 cwd=ca_root,
                 env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
-                timeout_seconds=timeout_seconds,
+                timeout_seconds=remaining_timeout(),
                 stdout_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
                 stderr_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
             )
@@ -1789,6 +1863,7 @@ def _verify_unconditional_trust_root(
                 "Claude TLS root verification launch was inconclusive"
             ) from error
         try:
+            remaining_timeout()
             public_key_invalid = (
                 allow_non_self_signed
                 and not use_partial_chain
@@ -10572,7 +10647,7 @@ def _read_proxy_system_ca_source(path: pathlib.Path) -> bytes:
         if (
             not stat.S_ISREG(before.st_mode)
             or before.st_uid not in {0, os.geteuid()}
-            or before.st_nlink != 1
+            or (_is_claude_macos_host() and before.st_nlink != 1)
             or before.st_mode & 0o022
         ):
             raise ReviewError(f"{source} has unsafe metadata")
@@ -10678,6 +10753,10 @@ def _open_ca_directory_at(
         )
         opened = os.fstat(descriptor)
         _require_safe_ca_directory_metadata(opened, source=source)
+        _require_no_extended_acl(
+            descriptor,
+            label="Claude review CA path directory",
+        )
         after = os.stat(
             name,
             dir_fd=directory_descriptor,
@@ -10798,6 +10877,10 @@ def _read_ca_path_at_with_size(
         _require_safe_ca_directory_metadata(
             source_directory_metadata,
             source=source,
+        )
+        _require_no_extended_acl(
+            current_directory,
+            label="Claude review CA path directory",
         )
         directory_records.append((current_directory, source_directory_metadata))
         _absolute, pending_components = _ca_symlink_target_components(entry_name)
@@ -11225,6 +11308,15 @@ def _select_trust_certificates(
     trust_as_root_fingerprints: Iterable[str] = (),
     trust_root_fingerprints: Iterable[str] | None = None,
 ) -> ClaudeSelectedTrustMaterial:
+    deadline = time.monotonic() + CLAUDE_TRUST_ROOT_VERIFY_TOTAL_SECONDS
+
+    def require_time_remaining() -> None:
+        now = time.monotonic()
+        if now >= deadline:
+            raise ReviewTimeoutError(
+                "Claude additional trust root verification exceeded its deadline"
+            )
+
     requested = tuple(fingerprints)
     requested_set = set(requested)
     trust_as_root = set(trust_as_root_fingerprints)
@@ -11246,10 +11338,21 @@ def _select_trust_certificates(
     certificates: dict[str, bytes] = {}
     for source, data in materials:
         if not data:
+            require_time_remaining()
             continue
-        normalized = _extract_ca_certificates(bytes(data), source=source)
+        try:
+            normalized = _extract_ca_certificates(bytes(data), source=source)
+        except ReviewError:
+            require_time_remaining()
+            raise
+        require_time_remaining()
         for block in CLAUDE_CERTIFICATE_BLOCK.findall(normalized):
-            der, canonical = _canonical_ca_certificate(block, source=source)
+            try:
+                der, canonical = _canonical_ca_certificate(block, source=source)
+            except ReviewError:
+                require_time_remaining()
+                raise
+            require_time_remaining()
             fingerprint = (
                 hashlib.sha1(
                     der,
@@ -11260,60 +11363,63 @@ def _select_trust_certificates(
             )
             existing = certificates.get(fingerprint)
             if existing is not None and existing != canonical:
+                require_time_remaining()
                 raise ClaudeTrustPolicyUnavailable(
                     "Claude trust certificates contain a fingerprint collision"
                 )
             certificates[fingerprint] = canonical
     selected: list[bytes] = []
     omitted: set[str] = set()
-    deadline = time.monotonic() + CLAUDE_TRUST_ROOT_VERIFY_TOTAL_SECONDS
     for fingerprint in requested:
         canonical = certificates.get(fingerprint)
         if canonical is None:
+            require_time_remaining()
             omitted.add(fingerprint)
             continue
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise ReviewTimeoutError(
-                "Claude additional trust root verification exceeded its deadline"
+        require_time_remaining()
+        try:
+            der, _ = _canonical_ca_certificate(
+                canonical,
+                source="Claude trust certificates",
             )
-        der, _ = _canonical_ca_certificate(
-            canonical,
-            source="Claude trust certificates",
-        )
+        except ReviewError:
+            require_time_remaining()
+            raise
+        require_time_remaining()
         authorized = False
-        for allow_non_self_signed in (
-            ((False,) if fingerprint in trust_root else ())
-            + ((True,) if fingerprint in trust_as_root else ())
+        for allow_non_self_signed in ((False,) if fingerprint in trust_root else ()) + (
+            (True,) if fingerprint in trust_as_root else ()
         ):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise ReviewTimeoutError(
-                    "Claude additional trust root verification exceeded its deadline"
-                )
+            require_time_remaining()
             try:
                 _verify_unconditional_trust_root(
                     der,
                     canonical,
                     ca_root=ca_root,
-                    timeout_seconds=min(
-                        CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS,
-                        remaining,
-                    ),
+                    deadline=deadline,
                     allow_non_self_signed=allow_non_self_signed,
                 )
             except ClaudeTrustCertificateInvalid:
+                require_time_remaining()
                 continue
+            except ReviewError:
+                require_time_remaining()
+                raise
+            require_time_remaining()
             authorized = True
             break
         if not authorized:
+            require_time_remaining()
             omitted.add(fingerprint)
             continue
         selected.append(canonical)
-    return ClaudeSelectedTrustMaterial(
+    require_time_remaining()
+    selected_material = ClaudeSelectedTrustMaterial(
         certificates=b"".join(selected),
         omitted_sha1_fingerprints=frozenset(omitted),
     )
+    require_time_remaining()
+    return selected_material
 
 
 def _is_no_trust_settings(detail: str) -> bool:
@@ -11488,10 +11594,15 @@ def _write_claude_trust_policy_evidence(
     review: ReviewWorkspace,
     evidence: dict[str, object],
 ) -> None:
-    write_json(
-        review.container_dir / CLAUDE_TRUST_POLICY_EVIDENCE_NAME,
-        evidence,
-    )
+    try:
+        write_json(
+            review.container_dir / CLAUDE_TRUST_POLICY_EVIDENCE_NAME,
+            evidence,
+        )
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude trust policy evidence write was inconclusive"
+        ) from error
 
 
 def _terminalize_claude_trust_policy_evidence(
@@ -11500,12 +11611,18 @@ def _terminalize_claude_trust_policy_evidence(
     *,
     status: str,
     unresolved_resolution: str,
+    primary_error: BaseException | None = None,
 ) -> None:
     evidence["status"] = status
     for key in ("bundled_root_resolution", "additional_root_resolution"):
         if evidence.get(key) in {"not-started", "pending"}:
             evidence[key] = unresolved_resolution
-    _write_claude_trust_policy_evidence(review, evidence)
+    try:
+        _write_claude_trust_policy_evidence(review, evidence)
+    except (OSError, ClaudeExecutableInspectionInconclusive):
+        if primary_error is None:
+            raise
+        _attach_claude_trust_evidence_write_failure(primary_error)
 
 
 def _read_claude_trust_certificates(
@@ -11520,84 +11637,97 @@ def _read_claude_trust_certificates(
             ca_root,
             evidence=evidence,
         )
-    except ClaudeTrustSettingsDeny:
+    except ClaudeTrustSettingsDeny as error:
         _terminalize_claude_trust_policy_evidence(
             review,
             evidence,
             status="denied",
             unresolved_resolution="blocked",
+            primary_error=error,
         )
         raise
-    except ClaudeTrustPolicyUnavailable:
+    except ClaudeTrustPolicyUnavailable as error:
         _terminalize_claude_trust_policy_evidence(
             review,
             evidence,
             status="blocked",
             unresolved_resolution="blocked",
+            primary_error=error,
         )
         raise
-    except ClaudeTrustToolUnavailable:
+    except ClaudeTrustToolUnavailable as error:
         _terminalize_claude_trust_policy_evidence(
             review,
             evidence,
             status="unavailable",
             unresolved_resolution="unavailable",
+            primary_error=error,
         )
         raise
-    except ClaudeExecutableInspectionInconclusive:
+    except ClaudeExecutableInspectionInconclusive as error:
         _terminalize_claude_trust_policy_evidence(
             review,
             evidence,
             status="inconclusive",
             unresolved_resolution="inconclusive",
+            primary_error=error,
         )
         raise
     except ReviewOutputLimitError as error:
         if error.limit_kind == "regular-file":
+            failure = ClaudeTrustPolicyUnavailable(
+                "Claude trust policy exceeds the inspection limit"
+            )
+            failure.__cause__ = error
             _terminalize_claude_trust_policy_evidence(
                 review,
                 evidence,
                 status="blocked",
                 unresolved_resolution="blocked",
+                primary_error=failure,
             )
-            raise ClaudeTrustPolicyUnavailable(
-                "Claude trust policy exceeds the inspection limit"
-            ) from error
+            raise failure
+        failure = ClaudeExecutableInspectionInconclusive(
+            "Claude trust export stream exceeded the inspection limit"
+        )
+        failure.__cause__ = error
         _terminalize_claude_trust_policy_evidence(
             review,
             evidence,
             status="inconclusive",
             unresolved_resolution="inconclusive",
+            primary_error=failure,
         )
-        raise ClaudeExecutableInspectionInconclusive(
-            "Claude trust export stream exceeded the inspection limit"
-        ) from error
+        raise failure
     except (
         ReviewTimeoutError,
         ReviewOutputDrainError,
         ReviewProcessLeakError,
-    ):
+    ) as error:
         _terminalize_claude_trust_policy_evidence(
             review,
             evidence,
             status="inconclusive",
             unresolved_resolution="inconclusive",
+            primary_error=error,
         )
         raise
-    except ReviewError:
+    except ReviewError as error:
         _terminalize_claude_trust_policy_evidence(
             review,
             evidence,
             status="blocked",
             unresolved_resolution="blocked",
+            primary_error=error,
         )
         raise
-    except BaseException:
+    except BaseException as error:
         _terminalize_claude_trust_policy_evidence(
             review,
             evidence,
             status="inconclusive",
             unresolved_resolution="inconclusive",
+            primary_error=error,
         )
         raise
     _write_claude_trust_policy_evidence(review, evidence)
@@ -11720,20 +11850,24 @@ def _read_claude_trust_certificates_impl(
         except ReviewOutputLimitError as error:
             if error.limit_kind == "regular-file":
                 record_domain_failure(domain, "blocked")
+                failure = ClaudeTrustPolicyUnavailable(
+                    f"Claude {domain} trust export exceeds the inspection limit"
+                )
+                failure.__cause__ = error
                 defer_error(
                     2,
-                    ClaudeTrustPolicyUnavailable(
-                        f"Claude {domain} trust export exceeds the inspection limit"
-                    ),
+                    failure,
                 )
             else:
                 record_domain_failure(domain, "inconclusive")
+                failure = ClaudeExecutableInspectionInconclusive(
+                    f"Claude {domain} trust export stream exceeded the "
+                    "inspection limit"
+                )
+                failure.__cause__ = error
                 defer_error(
                     1,
-                    ClaudeExecutableInspectionInconclusive(
-                        f"Claude {domain} trust export stream exceeded the "
-                        "inspection limit"
-                    ),
+                    failure,
                 )
         except ReviewError as error:
             record_domain_failure(domain, "blocked")
@@ -12410,28 +12544,31 @@ def _prepare_claude_macos_tls_environment(
             unresolved_resolution="complete",
         )
         return result
-    except ClaudeTrustSettingsDeny:
+    except ClaudeTrustSettingsDeny as error:
         _terminalize_claude_trust_policy_evidence(
             review,
             evidence,
             status="denied",
             unresolved_resolution="blocked",
+            primary_error=error,
         )
         raise
-    except ClaudeTrustPolicyUnavailable:
+    except ClaudeTrustPolicyUnavailable as error:
         _terminalize_claude_trust_policy_evidence(
             review,
             evidence,
             status="blocked",
             unresolved_resolution="blocked",
+            primary_error=error,
         )
         raise
-    except ClaudeTrustToolUnavailable:
+    except ClaudeTrustToolUnavailable as error:
         _terminalize_claude_trust_policy_evidence(
             review,
             evidence,
             status="unavailable",
             unresolved_resolution="unavailable",
+            primary_error=error,
         )
         raise
     except (
@@ -12440,28 +12577,31 @@ def _prepare_claude_macos_tls_environment(
         ReviewOutputLimitError,
         ReviewProcessLeakError,
         ClaudeExecutableInspectionInconclusive,
-    ):
+    ) as error:
         _terminalize_claude_trust_policy_evidence(
             review,
             evidence,
             status="inconclusive",
             unresolved_resolution="inconclusive",
+            primary_error=error,
         )
         raise
-    except ReviewError:
+    except ReviewError as error:
         _terminalize_claude_trust_policy_evidence(
             review,
             evidence,
             status="blocked",
             unresolved_resolution="blocked",
+            primary_error=error,
         )
         raise
-    except BaseException:
+    except BaseException as error:
         _terminalize_claude_trust_policy_evidence(
             review,
             evidence,
             status="inconclusive",
             unresolved_resolution="inconclusive",
+            primary_error=error,
         )
         raise
 
@@ -15167,7 +15307,14 @@ def _claude_auth_rejection_after_credential_inspection(
     completed: Completed,
     inspection_error: BaseException,
 ) -> ClaudeKeychainCredentialUnavailable | None:
-    if classify_failure(completed.stdout, completed.stderr) != "auth":
+    if (
+        _claude_supported_failure_category(
+            completed.stdout,
+            stderr=completed.stderr,
+            requested_model=model,
+        )
+        != "auth"
+    ):
         return None
     failure = ClaudeKeychainCredentialUnavailable(
         "the restricted Claude runtime rejected the configured credential; "
@@ -16695,6 +16842,21 @@ def _review_supervision_failure_class(error: Exception) -> str:
     return "supervision-inconclusive"
 
 
+def _format_claude_runner_error(
+    prefix: str,
+    error: BaseException,
+    *secondary_diagnostics: str | None,
+) -> str:
+    lines = [f"{prefix}{error}"]
+    for diagnostic in secondary_diagnostics:
+        if diagnostic is not None and diagnostic not in lines:
+            lines.append(diagnostic)
+    trust_diagnostic = _claude_trust_evidence_write_diagnostic(error)
+    if trust_diagnostic is not None and trust_diagnostic not in lines:
+        lines.append(trust_diagnostic)
+    return "\n".join(lines) + "\n"
+
+
 def _attempt_summary(attempt: Attempt) -> dict[str, Any]:
     return {
         "runtime": attempt.runtime,
@@ -17031,15 +17193,21 @@ def run_review(
     ) as error:
         write_text_atomic(
             review.container_dir / "runner-error.txt",
-            f"Claude Code validation was inconclusive: {error}\n",
+            _format_claude_runner_error(
+                "Claude Code validation was inconclusive: ",
+                error,
+            ),
         )
         write_json(review.container_dir / "attempts.json", [])
         return Outcome(75, None, tuple(attempts))
     except ReviewError as error:
         write_text_atomic(
             review.container_dir / "runner-error.txt",
-            "Claude Code executable validation failed; refusing Copilot fallback: "
-            f"{error}\n",
+            _format_claude_runner_error(
+                "Claude Code executable validation failed; refusing Copilot "
+                "fallback: ",
+                error,
+            ),
         )
         write_json(review.container_dir / "attempts.json", [])
         return Outcome(2, None, tuple(attempts))
@@ -17118,11 +17286,10 @@ def run_review(
                 )
             write_text_atomic(
                 review.container_dir / "runner-error.txt",
-                f"Claude Code validation was inconclusive: {error}\n"
-                + (
-                    f"{persistence_diagnostic}\n"
-                    if persistence_diagnostic is not None
-                    else ""
+                _format_claude_runner_error(
+                    "Claude Code validation was inconclusive: ",
+                    error,
+                    persistence_diagnostic,
                 ),
             )
             _write_attempts(review, attempts)
@@ -17165,9 +17332,11 @@ def run_review(
             ):
                 write_text_atomic(
                     review.container_dir / "runner-error.txt",
-                    "Explicit CODEX_REVIEW_CLAUDE_PATH lacks a required secure "
-                    "runtime prerequisite; refusing Copilot fallback: "
-                    f"{error}\n",
+                    _format_claude_runner_error(
+                        "Explicit CODEX_REVIEW_CLAUDE_PATH lacks a required secure "
+                        "runtime prerequisite; refusing Copilot fallback: ",
+                        error,
+                    ),
                 )
                 _write_attempts(review, attempts)
                 return Outcome(2, None, tuple(attempts))
@@ -17175,7 +17344,10 @@ def run_review(
             final_text = None
             write_text_atomic(
                 review.container_dir / "claude-skip.txt",
-                f"Claude Code local authentication became unavailable: {error}\n",
+                _format_claude_runner_error(
+                    "Claude Code local authentication became unavailable: ",
+                    error,
+                ),
             )
         except ReviewError as error:
             persistence_diagnostic = _record_claude_secondary_persistence_failure(
@@ -17184,12 +17356,11 @@ def run_review(
             )
             write_text_atomic(
                 review.container_dir / "runner-error.txt",
-                "Claude Code failed executable validation; "
-                f"refusing Copilot fallback: {error}\n"
-                + (
-                    f"{persistence_diagnostic}\n"
-                    if persistence_diagnostic is not None
-                    else ""
+                _format_claude_runner_error(
+                    "Claude Code failed executable validation; refusing Copilot "
+                    "fallback: ",
+                    error,
+                    persistence_diagnostic,
                 ),
             )
             _write_attempts(review, attempts)

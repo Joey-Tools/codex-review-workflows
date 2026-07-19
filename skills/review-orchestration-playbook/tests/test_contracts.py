@@ -185,6 +185,17 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn(">=2.1.211,<3.0.0", helper_contract)
         self.assertIn("Linux and WSL2", helper_contract)
         self.assertIn("does not read or import `~/.claude.json`", helper_contract)
+        self.assertIn(
+            "rechecks both the current-account Keychain item and the empirically "
+            "compatible `.claude/.credentials.json`",
+            skill,
+        )
+        self.assertIn(
+            "local-login selection is limited to that Keychain item and pwd-home "
+            "credential file",
+            skill,
+        )
+        self.assertNotIn("Keychain is the only local-login source", skill)
         self.assertIn("Before every Claude model attempt", helper_contract)
         self.assertIn("bounded machine-readable `reason`", helper_contract)
         self.assertNotIn("requires `ANTHROPIC_API_KEY`", skill)
@@ -193,6 +204,18 @@ class RepositoryContractTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertNotIn(".claude.json", providers_source)
+
+    def test_completed_trust_port_journal_uses_current_claude_range(self) -> None:
+        if CI_PROFILE != "canonical":
+            self.skipTest("completed canonical project journal is not mirrored")
+        journal = (
+            REPO_ROOT
+            / "docs/project_journal/2026/07/"
+            / "2026-07-16-review-helper-trust-port-821601.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("`>=2.1.211,<3.0.0`", journal)
+        self.assertNotIn(">=2.1.187", journal)
 
     def test_claude_auth_carriers_refresh_without_a_freshness_gate(self) -> None:
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
@@ -236,6 +259,9 @@ class RepositoryContractTest(unittest.TestCase):
         run_review_source = inspect.getsource(providers.run_review)
         auth_outcome_source = inspect.getsource(
             providers._finish_claude_auth_required
+        )
+        post_inspection_auth_source = inspect.getsource(
+            providers._claude_auth_rejection_after_credential_inspection
         )
         linux_runtime_source = inspect.getsource(
             providers._claude_linux_review_runtime
@@ -450,6 +476,11 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("_finish_claude_auth_required", run_review_source)
         self.assertIn("validate_external_workspace", run_review_source)
         self.assertIn("sensitive-content and escaping-symlink checks passed", run_review_source)
+        self.assertIn(
+            "_claude_supported_failure_category",
+            post_inspection_auth_source,
+        )
+        self.assertIn("requested_model=model", post_inspection_auth_source)
 
         current_policy = "\n".join(
             (
@@ -476,6 +507,21 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("Access-token expiry alone is not login expiry", current_policy)
         self.assertIn("blocked-authentication", current_policy)
         self.assertIn("claude auth login", current_policy)
+        self.assertIn(
+            "unstructured HTTP 401 or authentication fragments remain "
+            "`inspection-inconclusive`",
+            skill,
+        )
+        self.assertIn("strict request/model-bound result envelope", skill)
+        self.assertIn(
+            "override credential reinspection and establish `blocked-authentication`",
+            skill,
+        )
+        self.assertNotIn(
+            "actually rejected local-login authentication (`Login expired`, "
+            "HTTP 401, or refresh failure)",
+            skill,
+        )
         for policy in (skill, helper_contract, runtime_trust):
             self.assertIn("claude auth login", policy)
             self.assertIn("ANTHROPIC_API_KEY", policy)

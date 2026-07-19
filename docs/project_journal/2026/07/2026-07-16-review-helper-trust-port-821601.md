@@ -44,7 +44,7 @@ metadata behavior.
   account binding and double-read tests cover the live credential source.
 - Tests tied to an exact Claude 2.1.202 artifact or a native-Claude-only lane are
   obsolete. Canonical accepts publisher-signed releases
-  `>=2.1.187,<3.0.0`, retains immutable snapshots, supports macOS and
+  `>=2.1.211,<3.0.0`, retains immutable snapshots, supports macOS and
   Linux/WSL2, and keeps the policy-controlled Copilot fallback.
 - Overlay fixture permutations that duplicated canonical CA directory,
   executable snapshot, supervisor, synthetic-token, and Python-version tests
@@ -57,15 +57,17 @@ metadata behavior.
 
 ## Validation
 
-- Python 3.10.19 complete canonical suite with the `tomli` test backport and
-  `PYTHONDONTWRITEBYTECODE=1`: 869 tests run, 4 skipped, no failures. Disabling
+- Python 3.10.19 complete canonical suite with `tomli==2.2.1` and
+  `PYTHONDONTWRITEBYTECODE=1`, run outside the inner sandbox: 1240 tests run,
+  4 skipped, no failures. Disabling
   bytecode writes keeps the intentional `RLIMIT_FSIZE` tests from truncating
   uv's own `_virtualenv.pyc` import hook.
-- Python 3.13.0 complete canonical suite: 869 tests run, 9 skipped, no failures.
-- Focused Python 3.13 suites: the 3 `SSL_CERT_DIR` regressions passed, providers
-  ran 402 tests with 6 skipped, and provenance ran 90 tests with no skips or
-  failures; earlier current-range common 49 and repository contract 14 test
-  suites also passed.
+- Python 3.13.0 complete canonical suite, run outside the inner sandbox with
+  bytecode writes disabled: 1240 tests run, 4 skipped, no failures.
+- Final focused Python 3.13 regressions ran 10 tests with no failures, including
+  deadline exhaustion, direct and deferred output limits, Python 3.10 cause
+  fallback, Python 3.11+ notes, and strict post-inspection authentication. The
+  complete repository contract suite ran 20 tests with no failures.
 - Final-head review remediation covers strict signed-manifest numeric parsing,
   system-domain custom roots, bounded snapshot revalidation without repeated
   OpenSSL self-signature work, blocked `runtime-unverified` outcomes,
@@ -196,9 +198,26 @@ metadata behavior.
   self-issued name cannot enter the `TrustAsRoot` path. Generated CA and
   bundled-root verification files also preserve a primary policy rejection
   across both descriptor-close and temporary-file cleanup failures.
-- Ruff 0.13.2 lint, Python compile, project-journal validation, the official
-  skill validator through its documented uv/PyYAML fallback, and working-tree
-  diff checks passed. No formatter churn was retained: the full-skill formatter
-  check still reports existing current-head drift in 13 files, while the focused
-  provider/test formatter diff contains no hunk in the new descriptor, ACL,
-  Trust Settings, or close-error logic. That unrelated drift remains untouched.
+- The latest trust-budget review moves the absolute verification deadline ahead
+  of certificate normalization and passes that same deadline through DER
+  validation, OpenSSL metadata inspection, temporary-file creation, ACL checks,
+  write/fsync preparation, capability probing, and final validation. Preparation
+  can consume the remaining budget, in which case no OpenSSL process starts and
+  the operation remains a timeout rather than receiving a fresh subprocess
+  budget.
+- A terminal trust-policy evidence write failure remains secondary to the
+  blocked or inconclusive trust failure. Production `runner-error.txt` output
+  now recognizes both Python 3.11+ exception notes and the Python 3.10 cause
+  fallback, emits one fixed redacted diagnostic, and never renders the private
+  evidence-write or output-limit exception text. End-to-end cases cover direct
+  and deferred trust-domain stream/regular-file limits.
+- Authentication guidance now matches the implemented post-attempt inspection
+  contract: unstructured HTTP 401 or authentication fragments cannot override
+  inconclusive credential reinspection. Only a strict request/model-bound
+  result envelope can establish `blocked-authentication`; partial result text
+  and loose stderr fragments remain non-authoritative.
+- Ruff 0.13.2 lint, Python compile, project-journal validation, and the official
+  skill validator passed. No formatter churn was retained: full-file
+  `ruff format --check` still reports existing drift in the three changed Python
+  files, while range checks over every newly added implementation, test, and
+  contract hunk pass. That unrelated drift remains untouched.
