@@ -2179,7 +2179,7 @@ with pathlib.Path(sys.argv[1]).open("a+b") as handle:
             ) as cleanup,
             self.assertRaisesRegex(
                 ReviewError,
-                r"evidence retained at .*isolated-review.*permission denied",
+                r"evidence may remain near .*isolated-review.*permission denied",
             ),
         ):
             state.start(

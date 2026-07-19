@@ -7182,6 +7182,31 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         )
         self.validate(review)
 
+    def test_path_only_jwt_requires_complete_head_removal(self) -> None:
+        raw_value = reduction_secret("jwt").decode("ascii")
+        for transition in ("delete", "prefix-retention"):
+            with self.subTest(transition=transition):
+                repo, base = self.new_repo({raw_value: "ordinary content\n"})
+                if transition == "delete":
+                    (repo / raw_value).unlink()
+                else:
+                    (repo / raw_value).rename(repo / f"x{raw_value}")
+                head = self.commit(repo)
+                review = self.prepare(repo=repo, base=base, head=head)
+
+                if transition == "delete":
+                    self.assertIn(
+                        raw_value.encode("ascii"), review.diff_file.read_bytes()
+                    )
+                    self.validate(review)
+                else:
+                    with self.assertRaisesRegex(
+                        ReviewError,
+                        "base-only-path-secret-retained",
+                    ) as caught:
+                        self.validate(review)
+                    self.assertNotIn(raw_value, str(caught.exception))
+
     def test_dynamic_value_matching_changed_path_digest_fails_closed(self) -> None:
         relative = "fixture.cfg"
         raw_value = hashlib.sha256(

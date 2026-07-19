@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import errno
 import fcntl
 import json
@@ -384,6 +385,23 @@ class WorkspaceTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ReviewError, "group or other writable"):
             validate_external_workspace(review)
+
+    def test_external_workspace_requires_private_artifact_mode_0600(self) -> None:
+        for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES:
+            with self.subTest(name=name):
+                review = prepare_workspace(
+                    repo=self.repo,
+                    base_ref=self.base,
+                    head_ref=self.head,
+                )
+                artifact = review.container_dir / name
+                artifact.chmod(0o644)
+
+                with self.assertRaisesRegex(ReviewError, "must have mode 0600"):
+                    validate_external_workspace(review)
+
+                self.assertIsNone(cleanup_workspace(review, keep_container=False))
+                self.assertFalse(review.container_dir.exists())
 
     def test_prompt_override_replaces_only_review_scope_placeholders(self) -> None:
         template = pathlib.Path(self.temporary.name) / "prompt.txt"
@@ -941,7 +959,7 @@ class WorkspaceTest(unittest.TestCase):
             ),
             self.assertRaisesRegex(
                 ReviewError,
-                r"evidence retained at .*isolated-review.*permission denied",
+                r"evidence may remain near .*isolated-review.*permission denied",
             ),
         ):
             prepare_workspace(
@@ -999,6 +1017,25 @@ class WorkspaceTest(unittest.TestCase):
         fcntl.flock(runner_lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         cleanup_events = []
         real_quarantine = workspace_runtime._quarantine_cleanup_entry
+        real_fsync = os.fsync
+        real_rmdir = os.rmdir
+        parent_metadata = review.container_dir.parent.stat()
+        parent_identity = (parent_metadata.st_dev, parent_metadata.st_ino)
+
+        def record_parent_fsync(descriptor):
+            metadata = os.fstat(descriptor)
+            if (metadata.st_dev, metadata.st_ino) == parent_identity:
+                cleanup_events.append("parent-fsync")
+            real_fsync(descriptor)
+
+        def record_container_rmdir(path, *, dir_fd=None):
+            if dir_fd is not None and str(path).startswith(
+                workspace_runtime.REVIEW_CLEANUP_QUARANTINE_PREFIX
+            ):
+                metadata = os.fstat(dir_fd)
+                if (metadata.st_dev, metadata.st_ino) == parent_identity:
+                    cleanup_events.append("container-rmdir")
+            real_rmdir(path, dir_fd=dir_fd)
 
         def record_final_entry(parent_descriptor, entry_name, metadata, **kwargs):
             label = kwargs.get("label")
@@ -1036,10 +1073,22 @@ class WorkspaceTest(unittest.TestCase):
             )
 
         try:
-            with mock.patch.object(
-                workspace_runtime,
-                "_quarantine_cleanup_entry",
-                side_effect=record_final_entry,
+            with (
+                mock.patch.object(
+                    workspace_runtime,
+                    "_quarantine_cleanup_entry",
+                    side_effect=record_final_entry,
+                ),
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "fsync",
+                    side_effect=record_parent_fsync,
+                ),
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "rmdir",
+                    side_effect=record_container_rmdir,
+                ),
             ):
                 cleanup_error = cleanup_workspace(review, keep_container=False)
         finally:
@@ -1051,13 +1100,99 @@ class WorkspaceTest(unittest.TestCase):
             cleanup_events,
             [
                 "container-quarantined",
+                "parent-fsync",
                 workspace_runtime.CONTROL_ARTIFACT_STATE_NAME,
                 workspace_runtime.REVIEW_CLEANUP_LOCK_NAME,
                 workspace_runtime.REVIEW_RUNNER_LOCK_NAME,
                 workspace_runtime.REVIEW_STATE_MARKER_NAME,
+                "container-rmdir",
+                "parent-fsync",
             ],
         )
         self.assertFalse(review.container_dir.exists())
+
+    def test_full_cleanup_preserves_protocol_when_parent_quarantine_sync_fails(
+        self,
+    ) -> None:
+        review = self.prepare_range(self.base, self.head)
+        protocol_names = (
+            workspace_runtime.CONTROL_ARTIFACT_STATE_NAME,
+            workspace_runtime.REVIEW_CLEANUP_LOCK_NAME,
+            workspace_runtime.REVIEW_RUNNER_LOCK_NAME,
+            workspace_runtime.REVIEW_STATE_MARKER_NAME,
+        )
+        for name in protocol_names[1:]:
+            (review.container_dir / name).touch()
+        real_fsync = os.fsync
+        parent_metadata = review.container_dir.parent.stat()
+        parent_identity = (parent_metadata.st_dev, parent_metadata.st_ino)
+
+        def fail_parent_fsync(descriptor):
+            metadata = os.fstat(descriptor)
+            if (metadata.st_dev, metadata.st_ino) == parent_identity:
+                raise OSError("injected parent quarantine sync failure")
+            real_fsync(descriptor)
+
+        with mock.patch.object(
+            workspace_runtime.os,
+            "fsync",
+            side_effect=fail_parent_fsync,
+        ):
+            cleanup_error = cleanup_workspace(review, keep_container=False)
+
+        self.assertIn("parent after quarantine", cleanup_error or "")
+        self.assertIn("quarantine retained", cleanup_error or "")
+        self.assertFalse(review.container_dir.exists())
+        quarantines = list(
+            review.container_dir.parent.glob(
+                f"{workspace_runtime.REVIEW_CLEANUP_QUARANTINE_PREFIX}*"
+            )
+        )
+        self.assertEqual(len(quarantines), 1)
+        for name in protocol_names:
+            self.assertTrue((quarantines[0] / name).is_file(), name)
+        self.assertIsNone(
+            workspace_runtime._remove_review_container_tree(
+                quarantines[0],
+                expected=review.private_cleanup,
+                use_control_state=True,
+            )
+        )
+
+    def test_full_cleanup_reports_unconfirmed_final_parent_sync(self) -> None:
+        review = self.prepare_range(self.base, self.head)
+        parent_metadata = review.container_dir.parent.stat()
+        parent_identity = (parent_metadata.st_dev, parent_metadata.st_ino)
+        real_fsync = os.fsync
+        parent_syncs = 0
+
+        def fail_second_parent_fsync(descriptor):
+            nonlocal parent_syncs
+            metadata = os.fstat(descriptor)
+            if (metadata.st_dev, metadata.st_ino) == parent_identity:
+                parent_syncs += 1
+                if parent_syncs == 2:
+                    raise OSError("injected final parent sync failure")
+            real_fsync(descriptor)
+
+        with mock.patch.object(
+            workspace_runtime.os,
+            "fsync",
+            side_effect=fail_second_parent_fsync,
+        ):
+            cleanup_error = cleanup_workspace(review, keep_container=False)
+
+        self.assertEqual(parent_syncs, 2)
+        self.assertIn("durable removal is unconfirmed", cleanup_error or "")
+        self.assertFalse(review.container_dir.exists())
+        self.assertEqual(
+            list(
+                review.container_dir.parent.glob(
+                    f"{workspace_runtime.REVIEW_CLEANUP_QUARANTINE_PREFIX}*"
+                )
+            ),
+            [],
+        )
 
     def test_full_cleanup_preserves_protocol_when_container_quarantine_fails(
         self,
@@ -2466,6 +2601,9 @@ class WorkspaceTest(unittest.TestCase):
                     root_metadata.st_dev,
                     root_metadata.st_ino,
                 ):
+                    if observed_container:
+                        real_fsync(descriptor)
+                        return
                     containers = list(review_root.glob("isolated-review-*"))
                     self.assertEqual(len(containers), 1)
                     observed_container = True
@@ -3178,6 +3316,117 @@ class WorkspaceTest(unittest.TestCase):
         review = self.prepare_range(credential_base, clean_head)
         validate_external_workspace(review)
         self.assertIn(b"fixtures/.netrc", review.diff_file.read_bytes())
+
+    def test_base_only_secret_path_pure_deletion_is_allowed(self) -> None:
+        secret = "sk-" + "A" * 40
+        source = f"fixtures/{secret}"
+        secret_base = self.commit_bytes(
+            source,
+            b"ordinary content\n",
+            "Add secret-shaped path",
+        )
+        clean_head = self.remove_and_commit(source, "Delete secret-shaped path")
+
+        review = self.prepare_range(secret_base, clean_head)
+        validate_external_workspace(review)
+        self.assertIn(os.fsencode(source), review.diff_file.read_bytes())
+        self.assertIn(
+            workspace_runtime.CHANGED_PATH_BASE_ONLY_TAG + os.fsencode(source),
+            (
+                review.container_dir / workspace_runtime.PRIVATE_CHANGED_PATHS_NAME
+            ).read_bytes(),
+        )
+
+    def test_renamed_base_only_secret_path_retention_is_blocked(self) -> None:
+        cases = (
+            ("head-before-base", "B", lambda secret: "a" + secret),
+            ("base-before-head", "C", lambda secret: "x" + secret),
+            (
+                "encoded-retention",
+                "D",
+                lambda secret: "x"
+                + base64.b64encode(secret.encode("ascii")).decode("ascii"),
+            ),
+        )
+        for label, fill, destination_name in cases:
+            with self.subTest(case=label):
+                secret = "sk-" + fill * 40
+                source = f"fixtures/{secret}"
+                destination = f"fixtures/{destination_name(secret)}"
+                secret_base = self.commit_bytes(
+                    source,
+                    b"ordinary content\n",
+                    f"Add {label} secret-shaped path",
+                )
+                git(self.repo, "mv", source, destination)
+                git(self.repo, "commit", "-m", f"Rename {label} secret-shaped path")
+                retained_head = git(self.repo, "rev-parse", "HEAD")
+                review = self.prepare_range(secret_base, retained_head)
+
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "base-only-path-secret-retained",
+                ) as caught:
+                    validate_external_workspace(review)
+
+                diagnostic = str(caught.exception)
+                self.assertNotIn(secret, diagnostic)
+                self.assertNotIn(source, diagnostic)
+                self.assertNotIn(destination, diagnostic)
+
+    def test_base_only_path_secret_moved_into_blob_is_blocked(self) -> None:
+        secret = "sk-" + "E" * 40
+        source = f"fixtures/{secret}"
+        secret_base = self.commit_bytes(
+            source,
+            b"ordinary content\n",
+            "Add path-only secret for blob move",
+        )
+        git(self.repo, "rm", source)
+        prefix = b"x" * (
+            workspace_runtime.MAX_SECRET_PREFIX_PROOF_BYTES
+            + workspace_runtime.STREAM_SCAN_OVERLAP
+            - 10
+        )
+        (self.repo / "retained.txt").write_bytes(
+            prefix + secret.encode("ascii") + b"\n"
+        )
+        git(self.repo, "add", "retained.txt")
+        git(self.repo, "commit", "-m", "Move path secret into blob")
+        retained_head = git(self.repo, "rev-parse", "HEAD")
+        review = self.prepare_range(secret_base, retained_head)
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "base-only-path-secret-retained",
+        ) as caught:
+            validate_external_workspace(review)
+
+        self.assertNotIn(secret, str(caught.exception))
+
+    def test_base_only_path_secret_moved_into_symlink_target_is_blocked(self) -> None:
+        secret = "sk-" + "F" * 40
+        source = f"fixtures/{secret}"
+        secret_base = self.commit_bytes(
+            source,
+            b"ordinary content\n",
+            "Add path-only secret for symlink move",
+        )
+        git(self.repo, "rm", source)
+        target = "x" + secret
+        (self.repo / "retained-link").symlink_to(target)
+        git(self.repo, "add", "retained-link")
+        git(self.repo, "commit", "-m", "Move path secret into symlink target")
+        retained_head = git(self.repo, "rev-parse", "HEAD")
+        review = self.prepare_range(secret_base, retained_head)
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "base-only-path-secret-retained",
+        ) as caught:
+            validate_external_workspace(review)
+
+        self.assertNotIn(secret, str(caught.exception))
 
     def test_base_only_cleanup_quarantine_path_is_allowed(self) -> None:
         deleted_path = "nested/.codex-review-cleanup-deleted-marker/tracked.txt"

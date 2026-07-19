@@ -855,6 +855,7 @@ class LegacyPathMatcher:
     transitions: tuple[dict[int, int], ...]
     failures: tuple[int, ...]
     identifiers: tuple[str | None, ...]
+    maximum_length: int
 
     def match(self, raw_path: bytes) -> str | None:
         state = 0
@@ -1086,6 +1087,8 @@ def _cleanup_identity_evidence(metadata: os.stat_result) -> CleanupIdentity:
 def _private_artifact_metadata_at(
     container_descriptor: int,
     artifact_name: str,
+    *,
+    require_private_mode: bool = True,
 ) -> os.stat_result:
     flags = (
         os.O_RDONLY
@@ -1128,7 +1131,12 @@ def _private_artifact_metadata_at(
                 raise ReviewError(
                     f"helper-private artifact {artifact_name} has an unexpected owner"
                 )
-            if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            mode = stat.S_IMODE(metadata.st_mode)
+            if require_private_mode and mode != 0o600:
+                raise ReviewError(
+                    f"helper-private artifact {artifact_name} must have mode 0600"
+                )
+            if not require_private_mode and mode & (stat.S_IWGRP | stat.S_IWOTH):
                 raise ReviewError(
                     f"helper-private artifact {artifact_name} must not be "
                     "group or other writable"
@@ -1520,6 +1528,16 @@ def _remove_open_directory_tree(
             )
             if directory_error:
                 return [directory_error]
+    if quarantine_before_final_entries:
+        if directory_quarantine_name is None:
+            return [f"cannot establish {label} quarantine before final cleanup"]
+        try:
+            os.fsync(parent_descriptor)
+        except OSError as error:
+            return detached_directory_errors + [
+                f"cannot sync {label} parent after quarantine: {error}; "
+                "quarantine retained"
+            ]
 
     for final_entry_name in final_entry_names:
         try:
@@ -1612,13 +1630,25 @@ def _remove_open_directory_tree(
         )
         if directory_error:
             return [directory_error]
-    return _remove_quarantined_cleanup_entry(
+    removal_errors = _remove_quarantined_cleanup_entry(
         parent_descriptor,
         directory_quarantine_name,
         directory_opened,
         label=label,
         is_directory=True,
     )
+    if removal_errors:
+        return removal_errors
+    if not quarantine_before_final_entries:
+        return []
+    try:
+        os.fsync(parent_descriptor)
+    except OSError as error:
+        return [
+            f"cannot sync {label} parent after removal: {error}; "
+            "durable removal is unconfirmed"
+        ]
+    return []
 
 
 def _remove_named_directory_tree(
@@ -1940,6 +1970,7 @@ def _unlink_private_review_artifacts(
             current_metadata = _private_artifact_metadata_at(
                 container_descriptor,
                 artifact_name,
+                require_private_mode=False,
             )
         except FileNotFoundError:
             cleanup_errors.append(
@@ -2575,8 +2606,8 @@ def _bound_private_cleanup_target(
 
 def _retained_container_detail(container: pathlib.Path, cleanup_error: str) -> str:
     return (
-        "review workspace preparation failed and cleanup failed; evidence retained at "
-        f"{container}: {cleanup_error}"
+        "review workspace preparation failed and cleanup failed; evidence may "
+        f"remain near {container}; inspect cleanup state: {cleanup_error}"
     )
 
 
@@ -2906,6 +2937,7 @@ def _exact_path_matcher(needles: dict[bytes, str]) -> LegacyPathMatcher:
         transitions=tuple(transitions),
         failures=tuple(failures),
         identifiers=tuple(identifiers),
+        maximum_length=max(map(len, needles), default=0),
     )
 
 
@@ -4557,6 +4589,8 @@ def _secure_file_reader(
             raise ReviewError(f"{label} is not a regular file with one link")
         if initial.st_uid != os.getuid():
             raise ReviewError(f"{label} must be owned by the current user")
+        if expected_identity is not None and stat.S_IMODE(initial.st_mode) != 0o600:
+            raise ReviewError(f"{label} must have mode 0600")
         if initial.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
             raise ReviewError(f"{label} must not be group or other writable")
         if (
@@ -5570,6 +5604,8 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     )
     accepted_index = _index_accepted_values(accepted_values)
     counted_exact_index = _index_exact_values(counted_values)
+    base_only_path_discovery = SecretScanResult.empty()
+    base_only_path_matcher = _exact_path_matcher({})
     event_budget = SecretScanBudget.default()
     occurrence_budget = LegacyOccurrenceBudget.default()
     snapshot_byte_budget = FileScanByteBudget.snapshot()
@@ -5712,6 +5748,22 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
                 )
                 continue
             if side_tag == CHANGED_PATH_BASE_ONLY_TAG:
+                base_only_path_scan = _scan_secret_value(
+                    raw_path,
+                    accepted_values=accepted_values,
+                    reduced_secret_values=reduced_secret_values,
+                    capture_blocking_candidates=True,
+                    _accepted_index=accepted_index,
+                    _event_budget=event_budget,
+                    _continue_after_blocking=True,
+                )
+                if base_only_path_scan.blocking_rule is not None:
+                    record_finding(
+                        "<redacted changed path> "
+                        f"({base_only_path_scan.blocking_rule}; "
+                        "base-only-path-without-exact-deletion-proof)"
+                    )
+                base_only_path_discovery.merge(base_only_path_scan)
                 continue
             reduction_path_token_id = reduction_path_matcher.match(raw_path)
             if reduction_path_token_id is not None:
@@ -5743,6 +5795,20 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
         raise ReviewError(
             "external review changed paths do not match helper-private record state"
         )
+    _reject_unselected_legacy_reduction_candidates(
+        catalog=catalog,
+        exemptions=exemptions,
+        candidates=base_only_path_discovery.blocking_candidates,
+    )
+    base_only_path_values = tuple(
+        _secret_reduction_descriptor(candidate, rules)
+        for candidate, rules in sorted(
+            base_only_path_discovery.blocking_candidates.items()
+        )
+        if candidate not in reduced_secret_values
+    )
+    base_only_path_matcher = _secret_reduction_path_matcher(base_only_path_values)
+    evidence_sensitive_values += base_only_path_values
     _reject_raw_values_in_evidence(
         changed_path_digest_evidence,
         accepted_values=evidence_sensitive_values,
@@ -5811,6 +5877,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
         raw_relative = os.fsencode(relative)
         legacy_path_token_id = catalog_legacy_path_matcher.match(raw_relative)
         reduction_path_token_id = reduction_path_matcher.match(raw_relative)
+        base_only_path_token_id = base_only_path_matcher.match(raw_relative)
         if legacy_path_token_id is not None:
             record_finding(
                 "<redacted snapshot path> (legacy-synthetic-value; path-name)"
@@ -5818,6 +5885,10 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
         if reduction_path_token_id is not None:
             record_finding(
                 "<redacted snapshot path> (secret-reduction-value; path-name)"
+            )
+        if base_only_path_token_id is not None:
+            record_finding(
+                "<redacted snapshot path> (base-only-path-secret-retained; path-name)"
             )
         path_secret_rule = _value_secret_rule(
             raw_relative,
@@ -5827,7 +5898,9 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
             record_finding(f"<redacted snapshot path> ({path_secret_rule}; path-name)")
         path_display = (
             "<redacted snapshot path>"
-            if legacy_path_token_id is not None or reduction_path_token_id is not None
+            if legacy_path_token_id is not None
+            or reduction_path_token_id is not None
+            or base_only_path_token_id is not None
             else _redact_secret_path(relative, "snapshot path")
         )
         path_rule = _sensitive_path_rule(relative)
@@ -5839,6 +5912,11 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
                 target = os.readlink(candidate)
                 raw_target = os.fsencode(target)
                 resolved_target = (candidate.parent / target).resolve(strict=False)
+                raw_resolved_target = os.fsencode(os.fspath(resolved_target))
+                target_contains_base_only_path_secret = (
+                    base_only_path_matcher.match(raw_target) is not None
+                    or base_only_path_matcher.match(raw_resolved_target) is not None
+                )
                 final_link = os.lstat(candidate)
                 if target != os.readlink(candidate) or (
                     initial_link.st_dev,
@@ -5868,12 +5946,12 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
                     f"cannot inspect external review symlink {path_display}{error_code}"
                 ) from error
             if not is_relative_to(resolved_target, workspace_root):
-                raw_resolved_target = os.fsencode(os.fspath(resolved_target))
                 target_display = (
                     "<redacted symlink target>"
                     if catalog_legacy_path_matcher.match(raw_target) is not None
                     or catalog_legacy_path_matcher.match(raw_resolved_target)
                     is not None
+                    or target_contains_base_only_path_secret
                     else _redact_secret_path(
                         os.fspath(resolved_target),
                         "symlink target",
@@ -5895,6 +5973,11 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
                 _exact_index=counted_exact_index,
                 _occurrence_budget=occurrence_budget,
             )
+            if (
+                target_contains_base_only_path_secret
+                and target_scan.blocking_rule is None
+            ):
+                target_scan.blocking_rule = "base-only-path-secret-retained"
             record_scan(
                 target_scan,
                 surface="symlink-target",
@@ -5923,6 +6006,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
             event_budget=event_budget,
             exact_index=counted_exact_index,
             occurrence_budget=occurrence_budget,
+            blocking_exact_matcher=base_only_path_matcher,
             max_bytes=MAX_SNAPSHOT_BLOB_BYTES,
             byte_budget=snapshot_byte_budget,
             diagnostic_path=path_display,
@@ -6118,6 +6202,7 @@ def _file_secret_scan(
     event_budget: SecretScanBudget | None = None,
     exact_index: ExactValueIndex | None = None,
     occurrence_budget: LegacyOccurrenceBudget | None = None,
+    blocking_exact_matcher: LegacyPathMatcher | None = None,
     max_bytes: int | None = None,
     byte_budget: FileScanByteBudget | None = None,
     expected_artifact: ControlArtifactEvidence | None = None,
@@ -6151,6 +6236,7 @@ def _file_secret_scan(
             _event_budget=event_budget,
             _exact_index=exact_index,
             _occurrence_budget=occurrence_budget,
+            _blocking_exact_matcher=blocking_exact_matcher,
             _continue_after_blocking=_continue_after_blocking,
         )
 
@@ -9798,6 +9884,7 @@ def _stream_secret_scan(
     _event_budget: SecretScanBudget | None = None,
     _exact_index: ExactValueIndex | None = None,
     _occurrence_budget: LegacyOccurrenceBudget | None = None,
+    _blocking_exact_matcher: LegacyPathMatcher | None = None,
     _continue_after_blocking: bool = False,
 ) -> SecretScanResult:
     if size is not None and size < 0:
@@ -9808,6 +9895,14 @@ def _stream_secret_scan(
     event_budget = _event_budget or SecretScanBudget.default()
     exact_values = tuple(raw_occurrence_values)
     exact_index = _exact_index or _index_exact_values(exact_values)
+    exact_retention_length = max(
+        exact_index.maximum_length,
+        (
+            _blocking_exact_matcher.maximum_length
+            if _blocking_exact_matcher is not None
+            else 0
+        ),
+    )
     occurrence_budget = _occurrence_budget or LegacyOccurrenceBudget.default()
     pending = b""
     pending_offset = 0
@@ -9857,10 +9952,17 @@ def _stream_secret_scan(
         total_read += len(chunk)
         at_end = reached_eof or remaining == 0
         exact_pending += chunk
+        if (
+            _blocking_exact_matcher is not None
+            and result.blocking_rule is None
+            and _blocking_exact_matcher.match(exact_pending) is not None
+        ):
+            result.blocking_rule = "base-only-path-secret-retained"
+            blocked = True
         next_committed_start = (
             total_read
             if at_end
-            else max(0, total_read - max(0, exact_index.maximum_length - 1))
+            else max(0, total_read - max(0, exact_retention_length - 1))
         )
         (
             raw_counts,
@@ -9903,7 +10005,7 @@ def _stream_secret_scan(
         if not at_end:
             retain_exact_from = max(
                 exact_pending_offset,
-                committed_start - max(0, exact_index.maximum_length - 1),
+                committed_start - max(0, exact_retention_length - 1),
             )
             exact_pending = exact_pending[retain_exact_from - exact_pending_offset :]
             exact_pending_offset = retain_exact_from

@@ -275,8 +275,9 @@ def _run_foreground(args: argparse.Namespace) -> int:
                         cleanup_error = cleanup_workspace(review, keep_container=True)
                 if cleanup_error:
                     print(
-                        "review cleanup failed; evidence retained at "
-                        f"{review.container_dir}: {cleanup_error}",
+                        "review cleanup failed; evidence may remain near "
+                        f"{review.container_dir}; inspect cleanup state: "
+                        f"{cleanup_error}",
                         file=sys.stderr,
                     )
             pending_signal = consume_pending_forwarded_signal()

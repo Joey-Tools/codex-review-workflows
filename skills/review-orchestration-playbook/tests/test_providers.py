@@ -233,7 +233,9 @@ class ProviderPolicyTest(unittest.TestCase):
         diff_file = control / "review.diff"
         diff_file.write_text("diff --git a/a b/a\n", encoding="utf-8")
         (control / workspace_runtime.CHANGED_PATH_DIGESTS_NAME).write_bytes(b"")
-        (container / workspace_runtime.PRIVATE_CHANGED_PATHS_NAME).write_bytes(b"")
+        private_changed_paths = container / workspace_runtime.PRIVATE_CHANGED_PATHS_NAME
+        private_changed_paths.write_bytes(b"")
+        private_changed_paths.chmod(0o600)
         (control / "changed-blob-findings.z").write_bytes(b"")
         catalog = workspace_runtime.load_catalog()
         base_ref = "a" * 40
@@ -267,6 +269,7 @@ class ProviderPolicyTest(unittest.TestCase):
             synthetic_manifest,
             label="synthetic secret helper-private state",
         )
+        (container / workspace_runtime.SYNTHETIC_PRIVATE_MANIFEST_NAME).chmod(0o600)
         workspace_runtime._write_bounded_json(
             control / workspace_runtime.SYNTHETIC_CHANGED_EVIDENCE_NAME,
             {"entries": [], "schema_version": 1},
@@ -399,7 +402,9 @@ class ProviderPolicyTest(unittest.TestCase):
 
     def _restore_private_review_artifacts(self) -> None:
         for name, payload in self.private_review_artifacts.items():
-            (self.review.container_dir / name).write_bytes(payload)
+            artifact = self.review.container_dir / name
+            artifact.write_bytes(payload)
+            artifact.chmod(0o600)
         private_cleanup = workspace_runtime._capture_private_cleanup_evidence(
             self.review.container_dir,
             expected_container=self.review.private_cleanup.container,

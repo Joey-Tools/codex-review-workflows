@@ -948,8 +948,9 @@ def start(
                 details.append(str(error))
             if cleanup_error and review is not None:
                 details.append(
-                    "review startup failed and cleanup failed; evidence retained at "
-                    f"{review.container_dir}: {cleanup_error}"
+                    "review startup failed and cleanup failed; evidence may remain "
+                    f"near {review.container_dir}; inspect cleanup state: "
+                    f"{cleanup_error}"
                 )
             raise ForwardedSignal(
                 pending_signal,
@@ -957,8 +958,8 @@ def start(
             ) from error
         if cleanup_error and review is not None:
             raise ReviewError(
-                "review startup failed and cleanup failed; evidence retained at "
-                f"{review.container_dir}: {cleanup_error}"
+                "review startup failed and cleanup failed; evidence may remain near "
+                f"{review.container_dir}; inspect cleanup state: {cleanup_error}"
             ) from error
         raise
     finally:
