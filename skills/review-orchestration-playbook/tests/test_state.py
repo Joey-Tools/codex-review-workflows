@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -16,8 +18,14 @@ SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from review_runtime import cleanup_worker, state  # noqa: E402
-from review_runtime.common import ReviewError, write_json  # noqa: E402
+from review_runtime.common import (  # noqa: E402
+    ReviewError,
+    read_json,
+    write_json,
+    write_text_atomic,
+)
 from review_runtime.workspace import (  # noqa: E402
+    _load_control_artifact_state,
     cleanup_workspace,
     prepare_workspace as _prepare_workspace,
 )
@@ -108,6 +116,46 @@ class StatefulLifecycleTest(unittest.TestCase):
         (state_dir / state.EXIT_FILE).write_text("0\n", encoding="utf-8")
         (state_dir / "final.txt").write_text("No findings.\n", encoding="utf-8")
 
+    def write_codex_unavailable_state(self) -> None:
+        self.write_completed_state()
+        current = state.load_state(self.review.container_dir)
+        current["reviewer"] = "codex"
+        current["egress_consent"] = None
+        write_json(self.review.container_dir / state.STATE_FILE, current)
+        (self.review.container_dir / state.EXIT_FILE).write_text(
+            "127\n",
+            encoding="utf-8",
+        )
+        (self.review.container_dir / "final.txt").unlink()
+        (self.review.container_dir / "runner-error.txt").write_text(
+            "codex is not available in a validated executable path\n",
+            encoding="utf-8",
+        )
+
+    def primary_diff_attestation(self) -> dict[str, object]:
+        control_state = _load_control_artifact_state(
+            container_dir=self.review.container_dir
+        )
+        primary_diff = control_state.artifacts["review.diff"]
+        return {
+            "path": state.PRIMARY_DIFF_RELATIVE_PATH,
+            "sha256": primary_diff.sha256,
+            "size": primary_diff.size,
+        }
+
+    def write_passed_preflight(
+        self,
+        *,
+        primary_diff: dict[str, object] | None = None,
+    ) -> None:
+        evidence: dict[str, object] = {
+            "review_range": f"{self.base}..{self.head}",
+            "status": "sensitive-content and escaping-symlink checks passed",
+        }
+        if primary_diff is not None:
+            evidence["primary_diff"] = primary_diff
+        write_json(self.review.container_dir / "preflight.json", evidence)
+
     def test_final_returns_artifact_and_cleans_detached_workspace(self) -> None:
         self.write_completed_state()
         summary = state.status(self.review.container_dir)
@@ -123,26 +171,9 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.assertTrue(self.review.container_dir.exists())
 
     def test_codex_unavailable_retains_preflight_workspace_until_cleanup(self) -> None:
-        self.write_completed_state()
-        current = state.load_state(self.review.container_dir)
-        current["reviewer"] = "codex"
-        current["egress_consent"] = None
-        write_json(self.review.container_dir / state.STATE_FILE, current)
-        (self.review.container_dir / state.EXIT_FILE).write_text(
-            "127\n",
-            encoding="utf-8",
-        )
-        (self.review.container_dir / "final.txt").unlink()
-        (self.review.container_dir / "runner-error.txt").write_text(
-            "codex is not available in a validated executable path\n",
-            encoding="utf-8",
-        )
-        write_json(
-            self.review.container_dir / "preflight.json",
-            {
-                "review_range": f"{self.base}..{self.head}",
-                "status": "sensitive-content and escaping-symlink checks passed",
-            },
+        self.write_codex_unavailable_state()
+        self.write_passed_preflight(
+            primary_diff=self.primary_diff_attestation(),
         )
 
         exit_code, text = state.final(self.review.container_dir)
@@ -165,6 +196,151 @@ class StatefulLifecycleTest(unittest.TestCase):
             0,
         )
         self.assertFalse(self.review.workspace_root.exists())
+        self.assertFalse(
+            state.status(self.review.container_dir)["fallback_workspace_retained"]
+        )
+
+    def test_fallback_accepts_bounded_preflight_larger_than_compact_evidence(self) -> None:
+        self.write_codex_unavailable_state()
+        evidence: dict[str, object] = {
+            "review_range": f"{self.base}..{self.head}",
+            "status": "sensitive-content and escaping-symlink checks passed",
+            "primary_diff": self.primary_diff_attestation(),
+            "padding": "",
+        }
+        preflight_path = self.review.container_dir / "preflight.json"
+
+        def write_exact_size(target_size: int) -> None:
+            evidence["padding"] = ""
+            empty_size = len(
+                (json.dumps(evidence, indent=2, sort_keys=True) + "\n").encode("utf-8")
+            )
+            evidence["padding"] = "x" * (target_size - empty_size)
+            encoded = json.dumps(evidence, indent=2, sort_keys=True) + "\n"
+            self.assertEqual(len(encoded.encode("utf-8")), target_size)
+            write_text_atomic(preflight_path, encoded)
+
+        write_exact_size(state.MAX_PREFLIGHT_JSON_BYTES)
+
+        self.assertTrue(
+            state.status(self.review.container_dir)["fallback_workspace_retained"]
+        )
+
+        write_exact_size(state.MAX_PREFLIGHT_JSON_BYTES + 1)
+        self.assertFalse(
+            state.status(self.review.container_dir)["fallback_workspace_retained"]
+        )
+
+    def test_deep_valid_fallback_preflight_is_rejected_and_cleanup_succeeds(
+        self,
+    ) -> None:
+        self.write_codex_unavailable_state()
+        evidence: dict[str, object] = {
+            "review_range": f"{self.base}..{self.head}",
+            "status": "sensitive-content and escaping-symlink checks passed",
+            "primary_diff": self.primary_diff_attestation(),
+        }
+        encoded_prefix = json.dumps(evidence, sort_keys=True)[:-1]
+        depth = 50_000
+        encoded = (
+            encoded_prefix
+            + ', "padding": '
+            + "[" * depth
+            + "null"
+            + "]" * depth
+            + "}\n"
+        )
+        self.assertLessEqual(
+            len(encoded.encode("utf-8")),
+            state.MAX_PREFLIGHT_JSON_BYTES,
+        )
+        preflight_path = self.review.container_dir / "preflight.json"
+        write_text_atomic(preflight_path, encoded)
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "retained fallback preflight evidence exceeds the JSON nesting depth limit",
+        ):
+            state._read_bounded_json(
+                preflight_path,
+                label="retained fallback preflight evidence",
+                max_bytes=state.MAX_PREFLIGHT_JSON_BYTES,
+            )
+        self.assertFalse(
+            state.status(self.review.container_dir)["fallback_workspace_retained"]
+        )
+
+        self.assertEqual(
+            state.cleanup(self.review.container_dir, timeout_seconds=1),
+            0,
+        )
+        self.assertFalse(self.review.workspace_root.exists())
+
+    def test_codex_unavailable_rejects_missing_or_tampered_diff_attestation(
+        self,
+    ) -> None:
+        self.write_codex_unavailable_state()
+        valid = self.primary_diff_attestation()
+        invalid_attestations = {
+            "missing": None,
+            "wrong path": {**valid, "path": "review.diff"},
+            "negative size": {**valid, "size": -1},
+            "oversized size": {**valid, "size": (128 * 1024 * 1024) + 1},
+            "boolean size": {**valid, "size": True},
+            "uppercase digest": {**valid, "sha256": "A" * 64},
+            "wrong digest": {**valid, "sha256": "0" * 64},
+            "extra field": {**valid, "unexpected": "value"},
+        }
+
+        for label, primary_diff in invalid_attestations.items():
+            with self.subTest(label=label):
+                self.write_passed_preflight(primary_diff=primary_diff)
+                self.assertFalse(
+                    state.status(self.review.container_dir)[
+                        "fallback_workspace_retained"
+                    ]
+                )
+
+    def test_status_does_not_digest_same_size_tampered_primary_diff(self) -> None:
+        self.write_codex_unavailable_state()
+        self.write_passed_preflight(
+            primary_diff=self.primary_diff_attestation(),
+        )
+        original = self.review.diff_file.read_bytes()
+        self.assertTrue(original)
+        self.review.diff_file.write_bytes(bytes([original[0] ^ 1]) + original[1:])
+
+        self.assertTrue(
+            state.status(self.review.container_dir)["fallback_workspace_retained"]
+        )
+
+    def test_status_rejects_current_primary_diff_size_mismatch(self) -> None:
+        self.write_codex_unavailable_state()
+        self.write_passed_preflight(
+            primary_diff=self.primary_diff_attestation(),
+        )
+        with self.review.diff_file.open("ab") as diff_handle:
+            diff_handle.write(b"x")
+
+        self.assertFalse(
+            state.status(self.review.container_dir)["fallback_workspace_retained"]
+        )
+
+    def test_status_rejects_control_state_primary_diff_mismatch(self) -> None:
+        self.write_codex_unavailable_state()
+        self.write_passed_preflight(
+            primary_diff=self.primary_diff_attestation(),
+        )
+        control_state_path = self.review.container_dir / "control-artifact-state.json"
+        control_state = read_json(control_state_path)
+        for artifact in control_state["artifacts"]:
+            if artifact["name"] == "review.diff":
+                artifact["sha256"] = "0" * 64
+                break
+        else:
+            self.fail("review.diff control artifact is missing")
+        write_json(control_state_path, control_state)
+
         self.assertFalse(
             state.status(self.review.container_dir)["fallback_workspace_retained"]
         )
@@ -248,11 +424,330 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.assertFalse(self.review.workspace_root.exists())
         self.assertFalse(cleanup_error_path.exists())
 
-    def test_wait_timeout_includes_cleanup_lock(self) -> None:
+    def test_private_lock_creation_has_fixed_mode_with_permissive_umask(self) -> None:
+        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+        previous_umask = os.umask(0)
+        try:
+            with state.open_private_lock_file(
+                lock_path,
+                label="test cleanup lock",
+            ) as cleanup_lock:
+                self.assertEqual(
+                    stat.S_IMODE(os.fstat(cleanup_lock.fileno()).st_mode),
+                    0o600,
+                )
+        finally:
+            os.umask(previous_umask)
+
+    def test_private_lock_existing_open_does_not_recreate_deleted_file(self) -> None:
+        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+        lock_path.write_bytes(b"")
+        lock_path.chmod(0o600)
+        original_open = os.open
+        open_count = 0
+
+        def delete_before_existing_open(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal open_count
+            open_count += 1
+            if open_count == 2:
+                lock_path.unlink()
+            return original_open(path, flags, mode, dir_fd=dir_fd)
+
+        with (
+            mock.patch.object(
+                state.os,
+                "open",
+                side_effect=delete_before_existing_open,
+            ),
+            self.assertRaisesRegex(ReviewError, "cannot open test cleanup lock safely"),
+        ):
+            state.open_private_lock_file(lock_path, label="test cleanup lock")
+
+        self.assertEqual(open_count, 2)
+        self.assertFalse(lock_path.exists())
+
+    def test_private_lock_existing_open_rejects_replacement(self) -> None:
+        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+        lock_path.write_bytes(b"original")
+        lock_path.chmod(0o644)
+        original_metadata = lock_path.stat()
+        original_identity = (original_metadata.st_dev, original_metadata.st_ino)
+        replacement_path = self.review.container_dir / "replacement.lock"
+        replacement_path.write_bytes(b"replacement")
+        replacement_path.chmod(0o644)
+        original_open = os.open
+        open_count = 0
+
+        def replace_before_existing_open(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal open_count
+            open_count += 1
+            if open_count == 2:
+                os.replace(replacement_path, lock_path)
+            return original_open(path, flags, mode, dir_fd=dir_fd)
+
+        with (
+            mock.patch.object(
+                state.os,
+                "open",
+                side_effect=replace_before_existing_open,
+            ),
+            self.assertRaisesRegex(
+                ReviewError,
+                "test cleanup lock changed before it could be opened safely",
+            ),
+        ):
+            state.open_private_lock_file(
+                lock_path,
+                label="test cleanup lock",
+                allow_legacy_read_mode=True,
+            )
+
+        replacement_metadata = lock_path.stat()
+        self.assertEqual(open_count, 2)
+        self.assertNotEqual(
+            (replacement_metadata.st_dev, replacement_metadata.st_ino),
+            original_identity,
+        )
+        self.assertEqual(lock_path.read_bytes(), b"replacement")
+        self.assertEqual(stat.S_IMODE(replacement_metadata.st_mode), 0o644)
+
+    def test_private_lock_accepts_exact_safe_legacy_modes(self) -> None:
+        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+
+        for mode in sorted(state.SAFE_LEGACY_LOCK_MODES):
+            with self.subTest(mode=oct(mode)):
+                lock_path.write_bytes(b"")
+                lock_path.chmod(mode)
+                with state.open_private_lock_file(
+                    lock_path,
+                    label="test cleanup lock",
+                    allow_legacy_read_mode=True,
+                ):
+                    pass
+                self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), mode)
+
+    def test_general_legacy_lock_open_rejects_cleanup_only_0664_mode(self) -> None:
+        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+        lock_path.write_bytes(b"")
+        lock_path.chmod(0o664)
+
+        with self.assertRaisesRegex(ReviewError, "unsafe legacy mode"):
+            state.open_private_lock_file(
+                lock_path,
+                label="test cleanup lock",
+                allow_legacy_read_mode=True,
+            )
+
+        self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o664)
+
+    def test_cleanup_migrates_safe_legacy_lock_mode_after_flock(self) -> None:
         self.write_completed_state()
         lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
-        with lock_path.open("a+b") as cleanup_lock:
-            state.fcntl.flock(cleanup_lock.fileno(), state.fcntl.LOCK_EX)
+        lock_path.write_bytes(b"")
+        lock_path.chmod(0o644)
+
+        self.assertEqual(
+            state.cleanup(self.review.container_dir, timeout_seconds=1),
+            0,
+        )
+
+        self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o600)
+        self.assertFalse(self.review.workspace_root.exists())
+
+    def test_cleanup_migrates_private_empty_legacy_0664_lock(self) -> None:
+        self.write_completed_state()
+        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+        previous_umask = os.umask(0o002)
+        try:
+            with lock_path.open("a+b"):
+                pass
+        finally:
+            os.umask(previous_umask)
+        self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o664)
+
+        self.assertEqual(
+            state.cleanup(self.review.container_dir, timeout_seconds=1),
+            0,
+        )
+
+        self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o600)
+        self.assertFalse(self.review.workspace_root.exists())
+
+    def test_cleanup_rejects_0664_lock_outside_exact_private_state_mode(self) -> None:
+        self.write_completed_state()
+        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+        lock_path.write_bytes(b"")
+        lock_path.chmod(0o664)
+        self.review.container_dir.chmod(0o750)
+        try:
+            with self.assertRaisesRegex(ReviewError, "mode must be exactly 0700"):
+                state.cleanup(self.review.container_dir, timeout_seconds=1)
+        finally:
+            self.review.container_dir.chmod(0o700)
+
+        self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o664)
+        self.assertTrue(self.review.workspace_root.exists())
+
+    def test_cleanup_rejects_0664_lock_under_writable_review_root(self) -> None:
+        self.write_completed_state()
+        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+        lock_path.write_bytes(b"")
+        lock_path.chmod(0o664)
+        review_root = self.review.container_dir.parent
+        original_mode = stat.S_IMODE(review_root.stat().st_mode)
+        review_root.chmod(0o770)
+        try:
+            with self.assertRaisesRegex(
+                ReviewError,
+                "review state root must not be group or other writable",
+            ):
+                state.cleanup(self.review.container_dir, timeout_seconds=1)
+        finally:
+            review_root.chmod(original_mode)
+
+        self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o664)
+        self.assertTrue(self.review.workspace_root.exists())
+
+    def test_cleanup_revalidates_private_state_mode_after_flock(self) -> None:
+        self.write_completed_state()
+        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+        lock_path.write_bytes(b"")
+        lock_path.chmod(0o664)
+
+        def acquire_then_change_state_mode(handle, *, deadline):
+            del deadline
+            state.fcntl.flock(
+                handle.fileno(),
+                state.fcntl.LOCK_EX | state.fcntl.LOCK_NB,
+            )
+            self.review.container_dir.chmod(0o750)
+            return True
+
+        try:
+            with (
+                mock.patch.object(
+                    state,
+                    "_acquire_cleanup_lock",
+                    side_effect=acquire_then_change_state_mode,
+                ),
+                self.assertRaisesRegex(ReviewError, "mode must be exactly 0700"),
+            ):
+                state.cleanup(self.review.container_dir, timeout_seconds=1)
+        finally:
+            self.review.container_dir.chmod(0o700)
+
+        self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o664)
+        self.assertTrue(self.review.workspace_root.exists())
+
+    def test_cleanup_rejects_unsafe_legacy_lock_modes(self) -> None:
+        self.write_completed_state()
+        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+        lock_path.write_bytes(b"")
+
+        for mode in (0o1644, 0o700, 0o611, 0o660):
+            with self.subTest(mode=oct(mode)):
+                lock_path.chmod(mode)
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "unsafe legacy mode|group or other writable",
+                ):
+                    state.cleanup(self.review.container_dir, timeout_seconds=1)
+
+        self.assertTrue(self.review.workspace_root.exists())
+
+    def test_legacy_lock_mode_whitelist_rejects_special_bits(self) -> None:
+        metadata = mock.Mock(st_mode=stat.S_IFREG | 0o4644)
+        handle = mock.Mock()
+        handle.fileno.return_value = 9
+
+        with mock.patch.object(
+            state,
+            "_validate_regular_file_path_identity",
+            return_value=metadata,
+        ):
+            with self.assertRaisesRegex(ReviewError, "unsafe legacy mode"):
+                state.validate_safe_legacy_lock_file(
+                    pathlib.Path("cleanup.lock"),
+                    handle,
+                    label="review cleanup lock",
+                )
+
+    def test_cleanup_revalidates_legacy_lock_mode_after_flock(self) -> None:
+        self.write_completed_state()
+        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+        lock_path.write_bytes(b"")
+        lock_path.chmod(0o644)
+
+        def mutate_mode_after_flock(*_args, **_kwargs) -> bool:
+            lock_path.chmod(0o700)
+            return True
+
+        with mock.patch.object(
+            state,
+            "_acquire_cleanup_lock",
+            side_effect=mutate_mode_after_flock,
+        ):
+            with self.assertRaisesRegex(ReviewError, "unsafe legacy mode"):
+                state.cleanup(self.review.container_dir, timeout_seconds=1)
+
+        self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o700)
+        self.assertTrue(self.review.workspace_root.exists())
+
+    def test_cleanup_rejects_symlink_lock(self) -> None:
+        self.write_completed_state()
+        lock_target = self.review.container_dir / "cleanup-lock-target"
+        lock_target.write_bytes(b"unchanged")
+        lock_target.chmod(0o600)
+        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+        lock_path.symlink_to(lock_target.name)
+
+        with self.assertRaisesRegex(ReviewError, "cannot open review cleanup lock"):
+            state.cleanup(self.review.container_dir, timeout_seconds=1)
+
+        self.assertEqual(lock_target.read_bytes(), b"unchanged")
+        self.assertTrue(self.review.workspace_root.exists())
+
+    def test_cleanup_rejects_lock_path_replacement_after_flock(self) -> None:
+        self.write_completed_state()
+        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+
+        def acquire_then_replace(handle, *, deadline):
+            del deadline
+            state.fcntl.flock(
+                handle.fileno(),
+                state.fcntl.LOCK_EX | state.fcntl.LOCK_NB,
+            )
+            lock_path.unlink()
+            with state.open_private_lock_file(
+                lock_path,
+                label="replacement cleanup lock",
+            ):
+                pass
+            return True
+
+        with (
+            mock.patch.object(
+                state,
+                "_acquire_cleanup_lock",
+                side_effect=acquire_then_replace,
+            ),
+            self.assertRaisesRegex(
+                ReviewError,
+                "path does not match its open file descriptor",
+            ),
+        ):
+            state.cleanup(self.review.container_dir, timeout_seconds=1)
+
+        self.assertTrue(self.review.workspace_root.exists())
+
+    def test_wait_timeout_includes_shared_cleanup_lock(self) -> None:
+        self.write_completed_state()
+        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+        with state.open_private_lock_file(
+            lock_path,
+            label="test cleanup lock",
+        ) as cleanup_lock:
+            state.fcntl.flock(cleanup_lock.fileno(), state.fcntl.LOCK_SH)
             started = time.monotonic()
             exit_code = state.wait(self.review.container_dir, timeout_seconds=0.05)
             elapsed = time.monotonic() - started
