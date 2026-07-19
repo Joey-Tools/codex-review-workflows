@@ -717,7 +717,7 @@ def _claude_effective_authentication(
     api_provider = status.get("apiProvider")
     auth_method = status.get("authMethod")
     api_key_source = status.get("apiKeySource")
-    if logged_in is not True:
+    if logged_in is False:
         raise ClaudeAuthenticationPreflightBlocked(
             f"Claude Code auth status reports no usable {requested_source}",
             action=action,
@@ -728,6 +728,8 @@ def _claude_effective_authentication(
                 "effective_api_key_source": api_key_source,
             },
         )
+    if logged_in is not True:
+        raise ReviewError("Claude Code auth status returned an invalid loggedIn field")
     if not isinstance(api_provider, str) or not isinstance(auth_method, str):
         raise ReviewError(
             "Claude Code auth status omitted its effective provider or method"
@@ -803,10 +805,6 @@ def _claude_authentication_preflight(
         output_file_limit_bytes=CLAUDE_AUTH_STATUS_OUTPUT_LIMIT_BYTES,
         redact_values=output_redact_values(redact_values),
     )
-    if completed.returncode != 0:
-        raise ReviewError(
-            "Claude Code auth-status preflight failed before review content was sent"
-        )
     try:
         evidence = _claude_effective_authentication(
             completed.stdout,
@@ -825,6 +823,17 @@ def _claude_authentication_preflight(
             egress["authentication"] = rejected
             write_json(egress_path, egress)
         raise
+    except ReviewError as error:
+        if completed.returncode != 0:
+            raise ReviewError(
+                "Claude Code auth-status preflight failed before review content was sent"
+            ) from error
+        raise
+    if completed.returncode != 0:
+        raise ReviewError(
+            "Claude Code auth-status preflight returned failure despite reporting "
+            "usable authentication"
+        )
     _update_claude_runtime_report(
         review,
         {

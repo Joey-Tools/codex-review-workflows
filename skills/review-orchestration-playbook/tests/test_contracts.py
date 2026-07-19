@@ -150,6 +150,7 @@ class RepositoryContractTest(unittest.TestCase):
             "Glob",
             "Read(./**)",
             "read-only command policy",
+            "recognized Bash file",
             "native sandbox",
             "unsandboxed",
             "original source checkout",
@@ -220,6 +221,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("opaque-forward", policies["helper-contract.md"])
         self.assertIn("never parses", policies["helper-contract.md"])
         self.assertIn("auth status --json", combined)
+        self.assertIn("loggedIn: false", combined)
         self.assertIn("system/init", combined)
         self.assertIn("The helper never:", policies["claude-runtime-trust.md"])
         for name in ("SKILL.md", "helper-contract.md", "claude-runtime-trust.md"):

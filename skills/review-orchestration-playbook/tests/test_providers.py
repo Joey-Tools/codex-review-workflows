@@ -5427,6 +5427,186 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn(ascii(secret)[1:-1], variants)
 
     @mock.patch.object(providers, "run")
+    def test_claude_auth_preflight_maps_nonzero_logged_out_status_to_blocked_auth(
+        self,
+        run_command: mock.Mock,
+    ) -> None:
+        run_command.return_value = Completed(
+            argv=("claude", "auth", "status", "--json"),
+            returncode=1,
+            stdout=json.dumps(
+                {
+                    "loggedIn": False,
+                    "authMethod": "none",
+                    "apiProvider": "firstParty",
+                }
+            ).encode(),
+            stderr=b"",
+        )
+        cases = (
+            (
+                "local-login",
+                {"HOME": str(self.claude_pwd_home)},
+                providers.CLAUDE_AUTH_LOGIN_ACTION,
+            ),
+            (
+                "api-key",
+                {
+                    "HOME": str(self.claude_pwd_home),
+                    "ANTHROPIC_API_KEY": "codex_public_synth_v1_api_key_a",
+                },
+                providers.CLAUDE_API_KEY_ACTION,
+            ),
+            (
+                "oauth-token",
+                {
+                    "HOME": str(self.claude_pwd_home),
+                    "CLAUDE_CODE_OAUTH_TOKEN": "codex_public_synth_v1_bearer_a",
+                },
+                providers.CLAUDE_OAUTH_TOKEN_ACTION,
+            ),
+        )
+        for index, (source, env, expected_action) in enumerate(cases, start=1):
+            with self.subTest(source=source):
+                for name in ("claude-runtime.json", "egress.json"):
+                    common.write_json(
+                        self.review.container_dir / name,
+                        {
+                            "authentication": {
+                                "requested_source": source,
+                                "status": "pending-effective-preflight",
+                            }
+                        },
+                    )
+
+                with self.assertRaises(
+                    providers.ClaudeAuthenticationPreflightBlocked
+                ) as blocked:
+                    providers._claude_authentication_preflight(
+                        review=self.review,
+                        executable=pathlib.Path("/bin/claude"),
+                        env=env,
+                        settings="{}",
+                        index=index,
+                        redact_values=tuple(
+                            value
+                            for key, value in env.items()
+                            if key in providers.CLAUDE_EXPLICIT_AUTH_ENV_KEYS
+                        ),
+                    )
+
+                self.assertEqual(blocked.exception.action, expected_action)
+                for name in ("claude-runtime.json", "egress.json"):
+                    authentication = json.loads(
+                        (self.review.container_dir / name).read_text(encoding="utf-8")
+                    )["authentication"]
+                    self.assertEqual(authentication["requested_source"], source)
+                    self.assertIs(authentication["logged_in"], False)
+                    self.assertEqual(
+                        authentication["effective_api_provider"], "firstParty"
+                    )
+                    self.assertEqual(authentication["effective_auth_method"], "none")
+                    self.assertIsNone(authentication["effective_api_key_source"])
+                    self.assertEqual(
+                        authentication["status"], "effective-auth-rejected"
+                    )
+
+    @mock.patch.object(providers, "run")
+    def test_claude_auth_preflight_rejects_nonzero_malformed_status_as_runtime_failure(
+        self,
+        run_command: mock.Mock,
+    ) -> None:
+        cases = (
+            {"authMethod": "none", "apiProvider": "firstParty"},
+            {
+                "loggedIn": "false",
+                "authMethod": "none",
+                "apiProvider": "firstParty",
+            },
+            {"loggedIn": 0, "authMethod": "none", "apiProvider": "firstParty"},
+        )
+        for index, payload in enumerate(cases, start=1):
+            with self.subTest(payload=payload):
+                run_command.return_value = Completed(
+                    argv=("claude", "auth", "status", "--json"),
+                    returncode=1,
+                    stdout=json.dumps(payload).encode(),
+                    stderr=b"",
+                )
+                for name in ("claude-runtime.json", "egress.json"):
+                    common.write_json(
+                        self.review.container_dir / name,
+                        {
+                            "authentication": {
+                                "requested_source": "local-login",
+                                "status": "pending-effective-preflight",
+                            }
+                        },
+                    )
+
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "auth-status preflight failed",
+                ):
+                    providers._claude_authentication_preflight(
+                        review=self.review,
+                        executable=pathlib.Path("/bin/claude"),
+                        env={"HOME": str(self.claude_pwd_home)},
+                        settings="{}",
+                        index=index,
+                        redact_values=(),
+                    )
+
+                for name in ("claude-runtime.json", "egress.json"):
+                    authentication = json.loads(
+                        (self.review.container_dir / name).read_text(encoding="utf-8")
+                    )["authentication"]
+                    self.assertEqual(
+                        authentication["status"], "pending-effective-preflight"
+                    )
+
+    @mock.patch.object(providers, "run")
+    def test_claude_auth_preflight_rejects_nonzero_usable_status_as_runtime_failure(
+        self,
+        run_command: mock.Mock,
+    ) -> None:
+        run_command.return_value = Completed(
+            argv=("claude", "auth", "status", "--json"),
+            returncode=1,
+            stdout=claude_auth_status_fixture("local-login"),
+            stderr=b"",
+        )
+        for name in ("claude-runtime.json", "egress.json"):
+            common.write_json(
+                self.review.container_dir / name,
+                {
+                    "authentication": {
+                        "requested_source": "local-login",
+                        "status": "pending-effective-preflight",
+                    }
+                },
+            )
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "returned failure despite reporting usable authentication",
+        ):
+            providers._claude_authentication_preflight(
+                review=self.review,
+                executable=pathlib.Path("/bin/claude"),
+                env={"HOME": str(self.claude_pwd_home)},
+                settings="{}",
+                index=1,
+                redact_values=(),
+            )
+
+        for name in ("claude-runtime.json", "egress.json"):
+            authentication = json.loads(
+                (self.review.container_dir / name).read_text(encoding="utf-8")
+            )["authentication"]
+            self.assertEqual(authentication["status"], "pending-effective-preflight")
+
+    @mock.patch.object(providers, "run")
     def test_claude_auth_preflight_records_observed_mismatch_without_claiming_carrier(
         self,
         run_command: mock.Mock,
