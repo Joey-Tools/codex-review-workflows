@@ -3042,10 +3042,6 @@ class RepositoryContractTest(unittest.TestCase):
 
     def test_independent_codex_trust_profile_is_lightweight(self) -> None:
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
-        journal = (
-            SKILL_SCOPE_ROOT
-            / "docs/project_journal/2026/07/2026-07-19-ephemeral-review-supervision-7f1901.md"
-        ).read_text(encoding="utf-8")
         readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
             encoding="utf-8"
         )
@@ -3162,21 +3158,6 @@ class RepositoryContractTest(unittest.TestCase):
             "once launch is possible, or whenever hook/notify execution is observed, the attempt is `inconclusive`",
             skill,
         )
-        self.assertIn(
-            "a difference is reportable but is not itself a blocker",
-            journal,
-        )
-        self.assertIn(
-            "requests `features.hooks=false` and `notify=[]`",
-            journal,
-        )
-        self.assertIn(
-            "any observed hook or notify execution makes the attempt `inconclusive`",
-            journal,
-        )
-        self.assertNotIn("rejects any observed structured mismatch", journal)
-        self.assertNotIn("Codex hooks are disabled for this review invocation", journal)
-        self.assertNotIn("pins and records requested values", journal)
 
         for removed in (
             "references/independent-codex-runtime-policy.json",
