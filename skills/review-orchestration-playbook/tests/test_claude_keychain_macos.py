@@ -1503,6 +1503,17 @@ class ClaudeKeychainMacOSTest(unittest.TestCase):
         notes = getattr(raised.exception, "__notes__", ())
         self.assertTrue(any("KeyboardInterrupt" in note for note in notes))
 
+    def test_exception_note_compat_preserves_notes_without_add_note(self) -> None:
+        class LegacyException(Exception):
+            add_note = None
+
+        error = LegacyException("primary")
+
+        claude_keychain_macos._add_exception_note_compat(error, "first")
+        claude_keychain_macos._add_exception_note_compat(error, "second")
+
+        self.assertEqual(error.__notes__, ["first", "second"])
+
     def test_cleanup_termination_failure_overrides_keyboard_interrupt(
         self,
     ) -> None:

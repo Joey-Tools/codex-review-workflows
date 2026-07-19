@@ -787,6 +787,17 @@ def _supervisor_control_flow_from_cause_chain(
     return None
 
 
+def _add_exception_note_compat(error: BaseException, note: str) -> None:
+    add_note = getattr(error, "add_note", None)
+    if callable(add_note):
+        add_note(note)
+        return
+    # BaseException.add_note() was added in Python 3.11. Preserve the same
+    # structured evidence for callers that inspect exceptions on Python 3.10.
+    existing = getattr(error, "__notes__", ())
+    setattr(error, "__notes__", [*existing, note])
+
+
 def _cleanup_supervised_keychain_worker(
     *,
     process: subprocess.Popen[bytes] | None,
@@ -884,12 +895,11 @@ def _cleanup_supervised_keychain_worker(
         ):
             if error is None or error is termination_failure:
                 continue
-            add_note = getattr(termination_failure, "add_note", None)
-            if callable(add_note):
-                add_note(
-                    "native Keychain worker termination cleanup also failed: "
-                    f"{type(error).__name__}: {error}"
-                )
+            _add_exception_note_compat(
+                termination_failure,
+                "native Keychain worker termination cleanup also failed: "
+                f"{type(error).__name__}: {error}",
+            )
         if selected_control_flow is not None:
             raise termination_failure from selected_control_flow
         if primary is None:
