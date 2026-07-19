@@ -223,6 +223,9 @@ SOURCE_GIT_TIMEOUT_SECONDS = 120.0
 MAX_PRIVATE_GIT_STDERR_BYTES = 64 * 1024
 MAX_PRIVATE_FSCK_OUTPUT_BYTES = 4 * 1024 * 1024
 PRIVATE_GIT_TIMEOUT_SECONDS = 300.0
+REVIEW_ROOT_BASE = pathlib.Path("/tmp")
+REVIEW_USER_ROOT_PREFIX = "codex-isolated-review-uid-"
+REVIEW_CONTAINER_PATTERN = re.compile(r"isolated-review-[0-9]{8}-[0-9]{6}-[0-9a-f]{10}")
 SYNTHETIC_MANIFEST_NAME = "synthetic-secret-manifest.json"
 SYNTHETIC_PRIVATE_MANIFEST_NAME = "synthetic-secret-state.json"
 SYNTHETIC_CHANGED_EVIDENCE_NAME = "synthetic-changed-evidence.json"
@@ -1556,72 +1559,190 @@ def _retained_container_detail(container: pathlib.Path, cleanup_error: str) -> s
     )
 
 
+def _review_directory_identity(item: os.stat_result) -> tuple[int, int, int, int]:
+    return (item.st_dev, item.st_ino, item.st_mode, item.st_uid)
+
+
+def _canonical_review_root_base() -> pathlib.Path:
+    try:
+        canonical_base = REVIEW_ROOT_BASE.resolve(strict=True)
+        base_status = os.lstat(canonical_base)
+    except (OSError, RuntimeError) as error:
+        raise ReviewError(f"cannot resolve helper review root: {error}") from error
+    if (
+        not stat.S_ISDIR(base_status.st_mode)
+        or stat.S_ISLNK(base_status.st_mode)
+        or base_status.st_uid != 0
+        or stat.S_IMODE(base_status.st_mode) != 0o1777
+    ):
+        raise ReviewError(
+            "helper review root base must be a root-owned 01777 real directory: "
+            f"{canonical_base}"
+        )
+    return canonical_base
+
+
+def _review_root_for_source(
+    source_root: pathlib.Path,
+    *,
+    require_source: bool = True,
+) -> pathlib.Path:
+    try:
+        canonical_source = source_root.resolve(strict=require_source)
+    except (OSError, RuntimeError) as error:
+        raise ReviewError(f"cannot resolve source repository: {error}") from error
+    if require_source and not canonical_source.is_dir():
+        raise ReviewError(f"source repository is not a directory: {canonical_source}")
+    canonical_base = _canonical_review_root_base()
+    digest = hashlib.sha256(os.fsencode(str(canonical_source))).hexdigest()
+    review_root = canonical_base / f"{REVIEW_USER_ROOT_PREFIX}{os.geteuid()}" / digest
+    if is_relative_to(review_root, canonical_source) or is_relative_to(
+        canonical_source, review_root
+    ):
+        raise ReviewError("helper review root must be outside the source repository")
+    return review_root
+
+
+def _open_or_create_private_review_directory(
+    *,
+    parent_fd: int,
+    parent_path: pathlib.Path,
+    name: str,
+) -> tuple[pathlib.Path, int]:
+    path = parent_path / name
+    try:
+        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+    try:
+        path_status = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as error:
+        raise ReviewError(
+            f"cannot inspect private review directory {path}: {error}"
+        ) from error
+    if (
+        not stat.S_ISDIR(path_status.st_mode)
+        or stat.S_ISLNK(path_status.st_mode)
+        or path_status.st_uid != os.geteuid()
+        or stat.S_IMODE(path_status.st_mode) != 0o700
+    ):
+        raise ReviewError(
+            "private review directory must be a current-user-owned 0700 real "
+            f"directory: {path}"
+        )
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as error:
+        raise ReviewError(
+            f"cannot securely open private review directory {path}: {error}"
+        ) from error
+    try:
+        opened_status = os.fstat(descriptor)
+        absolute_status = os.lstat(path)
+        if (
+            not stat.S_ISDIR(opened_status.st_mode)
+            or opened_status.st_uid != os.geteuid()
+            or stat.S_IMODE(opened_status.st_mode) != 0o700
+            or _review_directory_identity(opened_status)
+            != _review_directory_identity(path_status)
+            or _review_directory_identity(absolute_status)
+            != _review_directory_identity(path_status)
+        ):
+            raise ReviewError(
+                f"private review directory changed while opening it securely: {path}"
+            )
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return path, descriptor
+
+
 def _new_container(
     source_root: pathlib.Path,
 ) -> tuple[pathlib.Path, set[signal.Signals] | None]:
     handoff_mask = block_forwarded_signals()
     stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
     suffix = uuid.uuid4().hex[:10]
-    review_root = source_root / ".codex-tmp"
+    review_root = _review_root_for_source(source_root)
     container: pathlib.Path | None = None
     try:
-        try:
-            os.mkdir(review_root, mode=0o700)
-        except FileExistsError:
-            pass
-        try:
-            root_status = os.lstat(review_root)
-        except OSError as error:
-            raise ReviewError(
-                f"cannot inspect review root {review_root}: {error}"
-            ) from error
-        if not stat.S_ISDIR(root_status.st_mode) or stat.S_ISLNK(root_status.st_mode):
-            raise ReviewError(
-                f"review root must be a real directory, not a symlink: {review_root}"
-            )
-        if root_status.st_uid != os.geteuid():
-            raise ReviewError(
-                f"review root must be owned by the current user: {review_root}"
-            )
-        if root_status.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-            raise ReviewError(
-                f"review root must not be group or other writable: {review_root}"
-            )
-        if review_root.resolve() != review_root.absolute():
-            raise ReviewError(
-                f"review root resolves outside the source repository: {review_root}"
-            )
-
+        canonical_base = review_root.parents[1]
         flags = (
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
         )
         try:
-            root_fd = os.open(review_root, flags)
+            base_fd = os.open(canonical_base, flags)
         except OSError as error:
             raise ReviewError(
-                f"cannot securely open review root {review_root}: {error}"
+                f"cannot securely open helper review root base {canonical_base}: {error}"
             ) from error
         try:
-            opened_status = os.fstat(root_fd)
-            if (opened_status.st_dev, opened_status.st_ino) != (
-                root_status.st_dev,
-                root_status.st_ino,
+            base_status = os.fstat(base_fd)
+            base_path_status = os.lstat(canonical_base)
+            if (
+                not stat.S_ISDIR(base_status.st_mode)
+                or base_status.st_uid != 0
+                or stat.S_IMODE(base_status.st_mode) != 0o1777
+                or _review_directory_identity(base_status)
+                != _review_directory_identity(base_path_status)
             ):
-                raise ReviewError("review root changed while opening it securely")
-            name = f"isolated-review-{stamp}-{suffix}"
-            container = review_root / name
-            os.mkdir(name, mode=0o700, dir_fd=root_fd)
-            descriptor_status = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
-            path_status = os.lstat(container)
-            if (descriptor_status.st_dev, descriptor_status.st_ino) != (
-                path_status.st_dev,
-                path_status.st_ino,
-            ):
-                raise ReviewError(
-                    "review root changed while creating the private container"
+                raise ReviewError("helper review root base changed while opening it")
+            user_root, user_fd = _open_or_create_private_review_directory(
+                parent_fd=base_fd,
+                parent_path=canonical_base,
+                name=review_root.parent.name,
+            )
+            try:
+                source_review_root, source_fd = (
+                    _open_or_create_private_review_directory(
+                        parent_fd=user_fd,
+                        parent_path=user_root,
+                        name=review_root.name,
+                    )
                 )
+                try:
+                    name = f"isolated-review-{stamp}-{suffix}"
+                    container = source_review_root / name
+                    os.mkdir(name, mode=0o700, dir_fd=source_fd)
+                    descriptor_status = os.stat(
+                        name,
+                        dir_fd=source_fd,
+                        follow_symlinks=False,
+                    )
+                    path_status = os.lstat(container)
+                    if (
+                        not stat.S_ISDIR(descriptor_status.st_mode)
+                        or descriptor_status.st_uid != os.geteuid()
+                        or stat.S_IMODE(descriptor_status.st_mode) != 0o700
+                        or _review_directory_identity(descriptor_status)
+                        != _review_directory_identity(path_status)
+                    ):
+                        raise ReviewError(
+                            "review root changed while creating the private container"
+                        )
+                    if _review_directory_identity(os.fstat(user_fd)) != (
+                        _review_directory_identity(os.lstat(user_root))
+                    ) or _review_directory_identity(os.fstat(source_fd)) != (
+                        _review_directory_identity(os.lstat(source_review_root))
+                    ):
+                        raise ReviewError(
+                            "private review namespace changed while creating the container"
+                        )
+                finally:
+                    os.close(source_fd)
+            finally:
+                os.close(user_fd)
         finally:
-            os.close(root_fd)
+            os.close(base_fd)
         return container, handoff_mask
     except BaseException as error:
         cleanup_error: str | None = None
@@ -2662,12 +2783,13 @@ def _write_changed_blob_findings(
 def validate_workspace_layout(review: ReviewWorkspace) -> None:
     source_root = review.source_root.resolve(strict=False)
     container_dir = review.container_dir.resolve(strict=False)
-    expected_parent = (source_root / ".codex-tmp").resolve(strict=False)
-    if container_dir.parent != expected_parent or not container_dir.name.startswith(
-        "isolated-review-"
+    expected_parent = _review_root_for_source(source_root, require_source=False)
+    if (
+        container_dir.parent != expected_parent
+        or REVIEW_CONTAINER_PATTERN.fullmatch(container_dir.name) is None
     ):
         raise ReviewError(
-            f"review container is outside the source repository review root: {container_dir}"
+            f"review container is outside the helper-private review root: {container_dir}"
         )
     expected_workspace = container_dir / "workspace"
     if review.workspace_root.resolve(strict=False) != expected_workspace:
@@ -6083,23 +6205,6 @@ def _initial_untracked_wip_paths(
     return paths
 
 
-def _without_helper_container_status(
-    value: bytes,
-    *,
-    helper_container: pathlib.PurePosixPath,
-) -> bytes:
-    prefix = os.fsencode(helper_container.as_posix())
-    kept: list[bytes] = []
-    for group in _porcelain_v2_groups(value):
-        first = group[0]
-        if first.startswith(b"? "):
-            raw_path = first[2:]
-            if raw_path == prefix or raw_path.startswith(prefix + b"/"):
-                continue
-        kept.extend(group)
-    return b"\0".join(kept) + (b"\0" if kept else b"")
-
-
 def _source_wip_paths(
     repo: pathlib.Path,
     head_sha: str,
@@ -6338,13 +6443,7 @@ def _overlay_source_wip(
     )
     if resolve_commit(source_root, "HEAD", label="source WIP HEAD") != head_sha:
         raise ReviewError("source HEAD changed while the WIP snapshot was prepared")
-    helper_container = pathlib.PurePosixPath(
-        workspace_root.parent.relative_to(source_root).as_posix()
-    )
-    final_status = _without_helper_container_status(
-        _source_status(source_root),
-        helper_container=helper_container,
-    )
+    final_status = _source_status(source_root)
     if final_status != initial_status:
         raise ReviewError("source WIP changed while the review snapshot was prepared")
     recheck_remaining_bytes = MAX_SNAPSHOT_BYTES

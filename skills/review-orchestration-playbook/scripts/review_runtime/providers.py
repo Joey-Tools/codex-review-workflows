@@ -39,7 +39,6 @@ from .claude_linux import (
     build_probe_command as build_claude_linux_probe_command,
     detect_host as detect_claude_linux_host,
     discover_native_toolchain as discover_claude_linux_toolchain,
-    reject_wsl_windows_path as reject_claude_wsl_windows_path,
     reject_wsl_windows_paths as reject_claude_wsl_windows_paths,
     validate_claude_executable as validate_claude_linux_executable,
 )
@@ -122,7 +121,14 @@ CLAUDE_LINUX_BOOTSTRAP_LIBRARY_ROOT_CANDIDATES = (
     pathlib.Path("/usr/lib"),
     pathlib.Path("/usr/lib64"),
 )
+CLAUDE_REVIEW_ABSOLUTE_READ_DENY_RULES = (
+    "Read(//proc)",
+    "Read(//proc/**)",
+    "Read(//dev)",
+    "Read(//dev/**)",
+)
 CLAUDE_REVIEW_FILE_DENY_RULES = (
+    *CLAUDE_REVIEW_ABSOLUTE_READ_DENY_RULES,
     "Read(~/.aws/**)",
     "Read(~/.claude/**)",
     "Read(~/.codex/**)",
@@ -1340,7 +1346,7 @@ def _claude_init_contract_matches(
         return False
     if init.get("cwd") != str(review.workspace_root):
         return False
-    if init.get("permissionMode") != "plan":
+    if init.get("permissionMode") != "dontAsk":
         return False
     tools = init.get("tools")
     if (
@@ -2063,8 +2069,8 @@ def _resolve_validated_claude_executable(
     linux_host = _claude_linux_host() if _is_claude_linux_host() else None
     if linux_host is not None:
         try:
-            reject_claude_wsl_windows_path(
-                review.container_dir,
+            reject_claude_wsl_windows_paths(
+                (review.source_root, review.container_dir),
                 linux_host,
             )
         except LinuxRuntimeInspectionInconclusive as error:
@@ -2211,7 +2217,7 @@ def _claude_review_arguments(
         "--effort",
         CLAUDE_REASONING_EFFORT,
         "--permission-mode",
-        "plan",
+        "dontAsk",
         "--output-format",
         "stream-json",
         "--verbose",
@@ -2231,7 +2237,17 @@ def _claude_review_arguments(
         "--allowedTools",
         "Read(./**)",
         "--disallowedTools",
-        "Edit,Write,NotebookEdit,WebFetch,WebSearch,Task",
+        ",".join(
+            (
+                "Edit",
+                "Write",
+                "NotebookEdit",
+                "WebFetch",
+                "WebSearch",
+                "Task",
+                *CLAUDE_REVIEW_ABSOLUTE_READ_DENY_RULES,
+            )
+        ),
     )
 
 
@@ -2242,6 +2258,7 @@ def _claude_review_settings(
 ) -> str:
     workspace = review.workspace_root.resolve()
     git_view = (review.git_dir or review.container_dir / "review.git").resolve()
+    review_user_root = review.container_dir.resolve().parents[1]
     protected_files = (
         "~/.aws",
         "~/.claude",
@@ -2264,7 +2281,12 @@ def _claude_review_settings(
                 "autoAllowBashIfSandboxed": False,
                 "allowUnsandboxedCommands": False,
                 "filesystem": {
-                    "denyRead": [str(home)],
+                    "denyRead": [
+                        str(home),
+                        str(review_user_root),
+                        "/proc",
+                        "/dev",
+                    ],
                     "allowRead": [str(workspace), str(git_view)],
                     "denyWrite": [str(home), str(workspace), str(git_view)],
                 },
@@ -2737,7 +2759,8 @@ def _claude_attempt(
         _append_attempt_diagnostic(
             stderr_path,
             "effective Claude system/init or terminal result did not preserve the "
-            "plan-mode, tool, model, and authentication contract; refusing a result "
+            "dontAsk-mode, tool, model, and authentication contract; refusing a "
+            "result "
             "that may reflect managed-policy or provider override",
         )
         attempt = replace(
@@ -3099,7 +3122,7 @@ def run_review(
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
             "CLAUDE_CODE_SAFE_MODE": "1",
             # Claude Code 2.1.212 forces permissionMode=default when this is 1.
-            # Keep plan mode effective and delegate sandboxed-Bash credential
+            # Keep dontAsk mode effective and delegate sandboxed-Bash credential
             # removal to the fail-closed native sandbox credentials policy.
             "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "0",
         },

@@ -11,6 +11,26 @@ sys.path.insert(0, str(SCRIPTS))
 from review_runtime import claude_capabilities as capabilities  # noqa: E402
 
 
+CLAUDE_REQUIRED_OPTIONS_FIXTURE = (
+    "--print",
+    "--model",
+    "--effort",
+    "--permission-mode",
+    "--output-format",
+    "--no-session-persistence",
+    "--safe-mode",
+    "--no-chrome",
+    "--disable-slash-commands",
+    "--strict-mcp-config",
+    "--mcp-config",
+    "--setting-sources",
+    "--settings",
+    "--tools",
+    "--allowedTools",
+    "--disallowedTools",
+)
+
+
 def supported_help(*, safe_mode: str | None = None) -> str:
     safe_mode = safe_mode or (
         "Start with all customizations (CLAUDE.md, skills, plugins, hooks, MCP "
@@ -20,7 +40,7 @@ def supported_help(*, safe_mode: str | None = None) -> str:
         "normally. Sets CLAUDE_CODE_SAFE_MODE=1."
     )
     lines = ["Usage: claude [options]", "", "Options:"]
-    for option in capabilities.CLAUDE_REQUIRED_OPTIONS:
+    for option in CLAUDE_REQUIRED_OPTIONS_FIXTURE:
         if option == "--safe-mode":
             description = safe_mode
         elif option == "--permission-mode":
@@ -32,18 +52,34 @@ def supported_help(*, safe_mode: str | None = None) -> str:
 
 
 class ClaudeCapabilitiesTest(unittest.TestCase):
-    def test_version_range_floats_within_major_two(self) -> None:
-        for version in ("2.1.212", "2.1.213", "2.99.999"):
-            with self.subTest(version=version):
-                parsed = capabilities.parse_claude_version(
-                    f"{version} (Claude Code)\n"
-                )
-                self.assertEqual(parsed.text, version)
+    def test_required_options_include_workspace_allowlist_contract(self) -> None:
+        self.assertEqual(
+            capabilities.CLAUDE_REQUIRED_OPTIONS,
+            CLAUDE_REQUIRED_OPTIONS_FIXTURE,
+        )
 
-    def test_version_range_rejects_old_next_major_and_prerelease(self) -> None:
+    def test_version_pin_accepts_semantics_verified_release(self) -> None:
+        parsed = capabilities.parse_claude_version("2.1.212 (Claude Code)\n")
+
+        self.assertEqual(parsed.text, "2.1.212")
+        self.assertEqual(parsed.parts, (2, 1, 212))
+
+    def test_version_pin_rejects_every_other_stable_release(self) -> None:
         for output in (
             "2.1.211 (Claude Code)\n",
+            "2.1.213 (Claude Code)\n",
+            "2.99.999 (Claude Code)\n",
             "3.0.0 (Claude Code)\n",
+        ):
+            with self.subTest(output=output):
+                with self.assertRaisesRegex(
+                    capabilities.ClaudeCapabilityError,
+                    "review semantics are verified only for 2.1.212",
+                ):
+                    capabilities.parse_claude_version(output)
+
+    def test_version_pin_rejects_prerelease_or_ambiguous_output(self) -> None:
+        for output in (
             "2.1.212-beta.1 (Claude Code)\n",
             "2.1.212 (Claude Code)\nextra\n",
         ):
@@ -85,23 +121,25 @@ class ClaudeCapabilitiesTest(unittest.TestCase):
         self.assertEqual(options, capabilities.CLAUDE_REQUIRED_OPTIONS)
 
     def test_help_requires_every_option_used_by_final_command(self) -> None:
-        help_text = supported_help().replace(
-            "  --strict-mcp-config <value>  Supported option.\n",
-            "",
-        )
+        for option in ("--strict-mcp-config", "--allowedTools"):
+            with self.subTest(option=option):
+                help_text = supported_help().replace(
+                    f"  {option} <value>  Supported option.\n",
+                    "",
+                )
+
+                with self.assertRaisesRegex(
+                    capabilities.ClaudeCapabilityUnavailable,
+                    "required review option",
+                ):
+                    capabilities.validate_claude_help(help_text)
+
+    def test_help_requires_dont_ask_permission_mode(self) -> None:
+        help_text = supported_help().replace("dontAsk, ", "")
 
         with self.assertRaisesRegex(
             capabilities.ClaudeCapabilityUnavailable,
-            "required review option",
-        ):
-            capabilities.validate_claude_help(help_text)
-
-    def test_help_requires_plan_permission_mode(self) -> None:
-        help_text = supported_help().replace(", plan", "")
-
-        with self.assertRaisesRegex(
-            capabilities.ClaudeCapabilityUnavailable,
-            "required plan choice",
+            "required dontAsk choice",
         ):
             capabilities.validate_claude_help(help_text)
 

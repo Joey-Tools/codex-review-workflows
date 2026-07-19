@@ -36,8 +36,7 @@ if TYPE_CHECKING:
 CLAUDE_RELEASE_BASE_URL = "https://downloads.claude.ai/claude-code-releases"
 CLAUDE_RELEASE_KEY_FINGERPRINT = "31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE"
 CLAUDE_RELEASE_KEY_PATH = pathlib.Path(__file__).with_name("claude_code_release.asc")
-CLAUDE_MINIMUM_RELEASE = (2, 1, 212)
-CLAUDE_MAXIMUM_RELEASE = (3, 0, 0)
+CLAUDE_SUPPORTED_RELEASES = ((2, 1, 212),)
 CLAUDE_MANIFEST_MAX_BYTES = 256 * 1024
 CLAUDE_SIGNATURE_MAX_BYTES = 64 * 1024
 CLAUDE_BINARY_MAX_BYTES = 1024 * 1024 * 1024
@@ -354,10 +353,10 @@ def require_supported_release_version(version: str) -> tuple[int, int, int]:
             f"Claude Code version is not strict release semver: {version!r}"
         )
     parsed = tuple(int(component) for component in match.groups())
-    if not (CLAUDE_MINIMUM_RELEASE <= parsed < CLAUDE_MAXIMUM_RELEASE):
+    if parsed not in CLAUDE_SUPPORTED_RELEASES:
         raise ClaudeProvenanceInvalid(
-            "Claude Code version is outside the supported range "
-            f">=2.1.212,<3.0.0: {version}"
+            "Claude Code release is unsupported; publisher verification is "
+            f"enabled only for 2.1.212: {version}"
         )
     return parsed  # type: ignore[return-value]
 
@@ -2654,7 +2653,7 @@ def verify_claude_release(
     fetch_timeout_seconds: float = CLAUDE_FETCH_TIMEOUT_SECONDS,
     gpg_timeout_seconds: float = CLAUDE_GPG_TIMEOUT_SECONDS,
 ) -> VerifiedClaudeExecutable:
-    """Verify publisher provenance for one floating Claude Code 2.x release."""
+    """Verify publisher provenance for the exact supported Claude Code release."""
 
     require_supported_release_version(version)
     bundle = (

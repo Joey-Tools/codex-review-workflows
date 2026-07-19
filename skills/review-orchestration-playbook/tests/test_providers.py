@@ -4,6 +4,7 @@ from dataclasses import replace
 import json
 import os
 import pathlib
+import shutil
 import stat
 import subprocess
 import sys
@@ -21,7 +22,6 @@ SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from review_runtime import (  # noqa: E402
-    claude_capabilities,
     claude_linux,
     claude_provenance,
     common,
@@ -39,12 +39,30 @@ CLAUDE_SAFE_MODE_DESCRIPTION = (
     "still apply. Auth, model selection, built-in tools, and permissions work "
     "normally. Sets CLAUDE_CODE_SAFE_MODE=1."
 )
+CLAUDE_REQUIRED_OPTIONS_FIXTURE = (
+    "--print",
+    "--model",
+    "--effort",
+    "--permission-mode",
+    "--output-format",
+    "--no-session-persistence",
+    "--safe-mode",
+    "--no-chrome",
+    "--disable-slash-commands",
+    "--strict-mcp-config",
+    "--mcp-config",
+    "--setting-sources",
+    "--settings",
+    "--tools",
+    "--allowedTools",
+    "--disallowedTools",
+)
 
 
 def claude_help_fixture(*, safe_mode: str | None = None) -> bytes:
     safe_mode = safe_mode or CLAUDE_SAFE_MODE_DESCRIPTION
     lines = ["Usage: claude [options]", "", "Options:"]
-    for option in claude_capabilities.CLAUDE_REQUIRED_OPTIONS:
+    for option in CLAUDE_REQUIRED_OPTIONS_FIXTURE:
         if option == "--safe-mode":
             description = safe_mode
         elif option == "--permission-mode":
@@ -95,18 +113,18 @@ def claude_stream_fixture(
         "subtype": "init",
         "cwd": str(review.workspace_root),
         "session_id": "11111111-1111-4111-8111-111111111111",
-        "tools": list(providers.CLAUDE_INIT_TOOLS),
+        "tools": ["Bash", "Glob", "Grep", "Read"],
         "mcp_servers": [],
         "model": model,
-        "permissionMode": "plan",
+        "permissionMode": "dontAsk",
         "slash_commands": [],
         "apiKeySource": ("ANTHROPIC_API_KEY" if auth_source == "api-key" else "none"),
         "claude_code_version": "2.1.212",
         "output_style": "default",
-        "agents": list(providers.CLAUDE_INIT_AGENTS),
+        "agents": ["claude", "Explore", "general-purpose", "Plan"],
         "skills": [],
         "plugins": [],
-        "capabilities": list(providers.CLAUDE_INIT_CAPABILITIES),
+        "capabilities": ["interrupt_receipt_v1", "msg_lifecycle_v1"],
         "analytics_disabled": True,
         "product_feedback_disabled": False,
         "uuid": "22222222-2222-4222-8222-222222222222",
@@ -250,6 +268,16 @@ class ProviderPolicyTest(unittest.TestCase):
         self.macos_platform_patcher.stop()
         self.native_dependency_patcher.stop()
         self.claude_pwd_home_patcher.stop()
+        review_root = self.review.container_dir.parent
+        if self.review.container_dir.exists():
+            workspace_runtime.cleanup_workspace(
+                self.review,
+                keep_container=False,
+            )
+        if review_root.is_dir() and not review_root.is_symlink():
+            for container in review_root.glob("isolated-review-*"):
+                shutil.rmtree(container)
+            review_root.rmdir()
         self.temporary.cleanup()
 
     def attempt(
@@ -3479,7 +3507,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     )
 
     @mock.patch.object(providers, "_run_claude_probe")
-    def test_claude_identity_accepts_floating_supported_version(
+    def test_claude_identity_accepts_semantics_verified_version(
         self,
         run_probe: mock.Mock,
     ) -> None:
@@ -3498,12 +3526,14 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(version.text, "2.1.212")
 
     @mock.patch.object(providers, "_run_claude_probe")
-    def test_claude_identity_rejects_old_or_next_major_version(
+    def test_claude_identity_rejects_every_other_stable_version(
         self,
         run_probe: mock.Mock,
     ) -> None:
         for output in (
             b"2.1.211 (Claude Code)\n",
+            b"2.1.213 (Claude Code)\n",
+            b"2.99.999 (Claude Code)\n",
             b"3.0.0 (Claude Code)\n",
         ):
             with self.subTest(output=output):
@@ -3515,7 +3545,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(
                     providers.InvalidReviewerExecutable,
-                    "supported >=2.1.212,<3 range",
+                    "review semantics are verified only for 2.1.212",
                 ):
                     providers._require_claude_identity(
                         pathlib.Path("/bin/claude"),
@@ -3622,35 +3652,57 @@ class ProviderPolicyTest(unittest.TestCase):
             library_roots=library_roots,
         )
 
-    def test_claude_wsl2_rejects_review_state_on_windows_drive(self) -> None:
-        root = pathlib.Path("/mnt/c/review-source")
-        review = ReviewWorkspace(
-            source_root=root,
-            container_dir=root / ".codex-tmp" / "review",
-            workspace_root=root / ".codex-tmp" / "review" / "workspace",
-            base_ref="a" * 40,
-            head_ref="b" * 40,
-            diff_file=root / "review.diff",
-            prompt_file=root / "review.prompt",
-        )
+    def test_claude_wsl2_rejects_source_or_container_on_windows_drive(self) -> None:
         host = providers.LinuxHost(
             claude_linux.LinuxHostKind.WSL2,
             "x64",
             "microsoft-standard-WSL2",
         )
-
-        with (
-            mock.patch.object(providers, "_is_claude_linux_host", return_value=True),
-            mock.patch.object(providers, "_claude_linux_host", return_value=host),
-            self.assertRaisesRegex(
-                providers.LinuxRuntimeUnsafe,
-                "Windows drive",
+        cases = (
+            (
+                "source",
+                pathlib.Path("/mnt/c/review-source"),
+                pathlib.Path("/home/reviewer/review-container"),
             ),
-        ):
-            providers._resolve_validated_claude_executable(
-                review=review,
-                env={},
+            (
+                "container",
+                pathlib.Path("/home/reviewer/review-source"),
+                pathlib.Path("/mnt/c/review-container"),
+            ),
+        )
+
+        for label, source_root, container_dir in cases:
+            workspace_root = container_dir / "workspace"
+            review = ReviewWorkspace(
+                source_root=source_root,
+                container_dir=container_dir,
+                workspace_root=workspace_root,
+                base_ref="a" * 40,
+                head_ref="b" * 40,
+                diff_file=workspace_root / ".codex-review" / "review.diff",
+                prompt_file=workspace_root / ".codex-review" / "review.prompt",
             )
+            with (
+                self.subTest(path=label),
+                mock.patch.object(
+                    providers,
+                    "_is_claude_linux_host",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_claude_linux_host",
+                    return_value=host,
+                ),
+                self.assertRaisesRegex(
+                    providers.LinuxRuntimeUnsafe,
+                    "Windows drive",
+                ),
+            ):
+                providers._resolve_validated_claude_executable(
+                    review=review,
+                    env={},
+                )
 
     def test_claude_wsl2_review_state_mountinfo_failure_is_inconclusive(
         self,
@@ -3669,9 +3721,9 @@ class ProviderPolicyTest(unittest.TestCase):
             mock.patch.object(providers, "_claude_linux_host", return_value=host),
             mock.patch.object(
                 providers,
-                "reject_claude_wsl_windows_path",
+                "reject_claude_wsl_windows_paths",
                 side_effect=failure,
-            ),
+            ) as reject_windows_paths,
             self.assertRaisesRegex(
                 providers.ClaudeExecutableInspectionInconclusive,
                 "mountinfo",
@@ -3682,6 +3734,10 @@ class ProviderPolicyTest(unittest.TestCase):
                 env={},
             )
 
+        reject_windows_paths.assert_called_once_with(
+            (self.review.source_root, self.review.container_dir),
+            host,
+        )
         self.assertFalse((self.review.container_dir / "claude-home").exists())
 
     def test_claude_gpg_temp_root_does_not_repair_existing_mode(self) -> None:
@@ -3842,7 +3898,10 @@ class ProviderPolicyTest(unittest.TestCase):
                 "_require_claude_identity",
                 return_value=providers.ClaudeVersion("2.1.212", (2, 1, 202)),
             ),
-            mock.patch.object(providers, "_require_claude_safe_mode"),
+            mock.patch.object(
+                providers,
+                "_require_claude_safe_mode",
+            ) as require_safe_mode,
             mock.patch.object(
                 providers,
                 "resolve_reviewer_executable",
@@ -3855,6 +3914,10 @@ class ProviderPolicyTest(unittest.TestCase):
             )
 
         self.assertEqual(executable, snapshot)
+        require_safe_mode.assert_called_once_with(snapshot, mock.ANY)
+        preflight_env = require_safe_mode.call_args.args[1]
+        self.assertNotIn("ANTHROPIC_API_KEY", preflight_env)
+        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", preflight_env)
         self.trusted_release.assert_called_once_with(
             candidate,
             version="2.1.212",
@@ -3902,7 +3965,7 @@ class ProviderPolicyTest(unittest.TestCase):
         with (
             mock.patch.object(providers, "_is_claude_linux_host", return_value=True),
             mock.patch.object(providers, "_claude_linux_host", return_value=host),
-            mock.patch.object(providers, "reject_claude_wsl_windows_path"),
+            mock.patch.object(providers, "reject_claude_wsl_windows_paths"),
             mock.patch.object(
                 providers,
                 "validate_claude_linux_executable",
@@ -3938,7 +4001,7 @@ class ProviderPolicyTest(unittest.TestCase):
         with (
             mock.patch.object(providers, "_is_claude_linux_host", return_value=True),
             mock.patch.object(providers, "_claude_linux_host", return_value=host),
-            mock.patch.object(providers, "reject_claude_wsl_windows_path"),
+            mock.patch.object(providers, "reject_claude_wsl_windows_paths"),
             mock.patch.object(
                 providers,
                 "validate_claude_linux_executable",
@@ -4394,14 +4457,14 @@ class ProviderPolicyTest(unittest.TestCase):
                 "managed permission override",
                 claude_stream_fixture(
                     self.review,
-                    init_updates={"permissionMode": "acceptEdits"},
+                    init_updates={"permissionMode": "plan"},
                 ),
             ),
             (
                 "tool widening",
                 claude_stream_fixture(
                     self.review,
-                    init_updates={"tools": [*providers.CLAUDE_INIT_TOOLS, "Write"]},
+                    init_updates={"tools": ["Bash", "Glob", "Grep", "Read", "Write"]},
                 ),
             ),
             (
@@ -4481,6 +4544,7 @@ class ProviderPolicyTest(unittest.TestCase):
     def test_claude_arguments_and_native_sandbox_are_read_only(self) -> None:
         assert self.review.git_dir is not None
         git_view = self.review.git_dir
+        review_user_root = self.review.container_dir.resolve().parents[1]
         settings = providers._claude_review_settings(
             review=self.review,
             home=self.claude_pwd_home,
@@ -4490,15 +4554,15 @@ class ProviderPolicyTest(unittest.TestCase):
             settings=settings,
         )
 
-        self.assertEqual(arguments[arguments.index("--permission-mode") + 1], "plan")
+        self.assertEqual(arguments[arguments.index("--permission-mode") + 1], "dontAsk")
         self.assertEqual(
             arguments[arguments.index("--tools") + 1], "Read,Grep,Glob,Bash"
         )
         self.assertEqual(arguments[arguments.index("--allowedTools") + 1], "Read(./**)")
-        self.assertNotIn("Bash", arguments[arguments.index("--allowedTools") + 1])
         self.assertEqual(
             arguments[arguments.index("--disallowedTools") + 1],
-            "Edit,Write,NotebookEdit,WebFetch,WebSearch,Task",
+            "Edit,Write,NotebookEdit,WebFetch,WebSearch,Task,"
+            "Read(//proc),Read(//proc/**),Read(//dev),Read(//dev/**)",
         )
         self.assertIn("--no-session-persistence", arguments)
         self.assertIn("--verbose", arguments)
@@ -4528,7 +4592,15 @@ class ProviderPolicyTest(unittest.TestCase):
             },
         )
         filesystem = sandbox["filesystem"]
-        self.assertEqual(filesystem["denyRead"], [str(self.claude_pwd_home)])
+        self.assertEqual(
+            filesystem["denyRead"],
+            [
+                str(self.claude_pwd_home),
+                str(review_user_root),
+                "/proc",
+                "/dev",
+            ],
+        )
         self.assertEqual(
             filesystem["allowRead"],
             [str(self.review.workspace_root.resolve()), str(git_view.resolve())],
@@ -4548,6 +4620,62 @@ class ProviderPolicyTest(unittest.TestCase):
                 for name in providers.CLAUDE_MODEL_SECRET_ENV_KEYS
             ],
         )
+        absolute_read_denies = [
+            "Read(//proc)",
+            "Read(//proc/**)",
+            "Read(//dev)",
+            "Read(//dev/**)",
+        ]
+        self.assertEqual(
+            parsed["permissions"]["deny"],
+            [
+                *absolute_read_denies,
+                "Read(~/.aws/**)",
+                "Read(~/.claude/**)",
+                "Read(~/.codex/**)",
+                "Read(~/.config/**)",
+                "Read(~/.copilot/**)",
+                "Read(~/.gnupg/**)",
+                "Read(~/.kube/**)",
+                "Read(~/.ssh/**)",
+                "Read(~/.git-credentials)",
+                "Read(~/.netrc)",
+            ],
+        )
+        cli_denies = arguments[arguments.index("--disallowedTools") + 1].split(",")
+        self.assertEqual(cli_denies[-len(absolute_read_denies) :], absolute_read_denies)
+
+    def test_claude_sandbox_denies_other_same_uid_review_containers(self) -> None:
+        assert self.review.git_dir is not None
+        review_user_root = self.review.container_dir.resolve().parents[1]
+        sibling_container = (
+            review_user_root / ("f" * 64) / "isolated-review-20260719-000000-0000000000"
+        )
+        parsed = json.loads(
+            providers._claude_review_settings(
+                review=self.review,
+                home=self.claude_pwd_home,
+            )
+        )
+
+        self.assertTrue(sibling_container.is_relative_to(review_user_root))
+        self.assertTrue(
+            self.review.workspace_root.resolve().is_relative_to(review_user_root)
+        )
+        self.assertFalse(
+            sibling_container.is_relative_to(self.review.container_dir.resolve())
+        )
+        self.assertIn(
+            str(review_user_root), parsed["sandbox"]["filesystem"]["denyRead"]
+        )
+        self.assertEqual(
+            parsed["sandbox"]["filesystem"]["allowRead"],
+            [
+                str(self.review.workspace_root.resolve()),
+                str(self.review.git_dir.resolve()),
+            ],
+        )
+        self.assertNotIn(f"Read(/{review_user_root}/**)", parsed["permissions"]["deny"])
 
     @mock.patch.object(
         providers,
@@ -4620,13 +4748,22 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(argv[0], "/bin/claude")
         self.assertNotIn("sandbox-exec", argv)
         self.assertNotIn("bwrap", argv)
-        self.assertEqual(
-            run_command.call_args_list[1].kwargs["cwd"], self.review.workspace_root
+        expected_settings = providers._claude_review_settings(
+            review=self.review,
+            home=self.claude_pwd_home,
         )
-        self.assertEqual(
-            run_command.call_args_list[1].kwargs["env"]["HOME"],
-            str(self.claude_pwd_home),
-        )
+        for call in run_command.call_args_list:
+            call_argv = call.args[0]
+            self.assertEqual(call.kwargs["cwd"], self.review.workspace_root)
+            self.assertEqual(call.kwargs["env"]["HOME"], str(self.claude_pwd_home))
+            self.assertEqual(
+                call.kwargs["env"]["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"],
+                "0",
+            )
+            self.assertEqual(
+                call_argv[call_argv.index("--settings") + 1],
+                expected_settings,
+            )
         self.assertEqual(
             run_command.call_args_list[1].kwargs["env"][
                 "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"

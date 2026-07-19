@@ -60,7 +60,7 @@ isolated_review synthetic-tokens list-exemptions --json
 isolated_review synthetic-tokens audit-master --repo <path> --ref <sha> --exemption <id>
 ```
 
-Always pass `--state-dir`; it is not positional. `stateful wait --timeout-seconds` accepts only a non-negative finite value, bounds the caller's wait, and does not kill or downgrade a healthy reviewer. `stateful cleanup` explicitly removes a retained review worktree while preserving state artifacts.
+`stateful start` returns the helper-generated external per-run container as `state_dir`. Always pass that exact path with `--state-dir`; it is not positional. `stateful wait --timeout-seconds` accepts only a non-negative finite value, bounds the caller's wait, and does not kill or downgrade a healthy reviewer. `stateful cleanup` explicitly removes a retained review worktree while preserving state artifacts in that container.
 
 The parent acquires an exclusive runner lock before spawn and passes its file descriptor to the child for the child's full lifetime. Cross-process `status` / `wait` trusts that lock, not PID existence, so a reused PID cannot masquerade as the review runner.
 
@@ -86,6 +86,8 @@ Model verification normalizes punctuation only and requires exact equality. Capa
 
 Clean and WIP are two content variants of the same review workspace and runtime boundary.
 
+The helper places the detached worktree, private Git database, control artifacts, logs, and state outside the source checkout. Its fixed base is `/tmp`, resolved to a canonical real directory that must be root-owned with exact mode `01777`. Beneath that base it creates current-user-owned exact-`0700` namespaces for `codex-isolated-review-uid-<effective-uid>` and the SHA-256 of the canonical source path, then an exact generated per-run container. No caller-controlled `TMPDIR` or source path selects another root, and layout validation recomputes the same external namespace. Claude's publisher-verified executable snapshot is also run from this container during credential-free safe-mode preflight, so a `noexec` temporary mount fails before authentication or review content is exposed.
+
 ### Clean Content
 
 - Resolve `--base-ref` and `--head-ref` to commits and require base to be an ancestor of head.
@@ -103,7 +105,9 @@ Clean and WIP are two content variants of the same review workspace and runtime 
 - Drive the rendered diff, changed-path inventory, blob scan, prompt, and reviewer-visible files from that same captured artifact. Never scan one tree while reviewing another.
 - Treat the WIP digest as fixed review-only artifact evidence. It is not an authored Git commit and cannot count for formal PR-readiness or merge-ready review.
 
-The detached worktree contains Git metadata sufficient for read-only `git` inspection, but its database and administrative files stay helper-owned and immutable to model tools. Reviewer-visible control artifacts live outside tracked content and are independently identity/digest checked. Cleanup is idempotent and removes only the helper-owned container; it never prunes or mutates the source repository or another worktree.
+The detached worktree contains Git metadata sufficient for read-only `git` inspection, but its database and administrative files stay helper-owned and immutable to model tools. Reviewer-visible control artifacts live outside tracked content and are independently identity/digest checked. Cleanup is idempotent and removes only helper-owned external workspace content; it never prunes or mutates the source repository or another worktree.
+
+Source `.codex-tmp` content has no helper-status filter. Ordinary Git ignore/status semantics apply, any reported record makes clean mode dirty, and WIP capture rejects `.codex-tmp` as a reserved helper path. Stateful artifacts retained under `/tmp` can survive helper workspace cleanup, but they are not durable across reboot or host temporary-file cleanup; harvest required evidence before relying on either event boundary.
 
 Submodules remain uninitialized and unfetched. A partial clone with missing required objects fails closed instead of contacting a promisor remote or prompting for authentication.
 
@@ -115,23 +119,24 @@ The scanner reports only side/path/rule metadata, never the matched value. Exact
 
 ## Claude Combined Runtime
 
-Claude Code `>=2.1.212,<3.0.0` is eligible only after the fixed Anthropic signing-key fingerprint verifies the release's signed per-version manifest and the manifest checksum matches the native platform binary. Credential-free version/help probes validate the invoked public flags and the v2.1.212 plan/safe-mode contract before authentication or review data is exposed. Native sandbox availability and inline settings are then requested fail-closed on the actual review launch; because the init schema does not expose effective sandbox fields, evidence labels them requested rather than independently verified.
+Only Claude Code `2.1.212` is eligible, and only after the fixed Anthropic signing-key fingerprint verifies that release's signed per-version manifest and the manifest checksum matches the native platform binary. Credential-free version/help probes validate the invoked public flags and the v2.1.212 `dontAsk`/safe-mode contract before authentication or review data is exposed. Native sandbox availability and inline settings are then requested fail-closed on the actual review launch; because the init schema does not expose effective sandbox fields, evidence labels them requested rather than independently verified. A different release remains blocked until its read-only permission, path-rule, sandbox, and output semantics receive equivalent evidence and the exact supported-version contract is deliberately updated.
 
 Every Claude review then uses one combined runtime:
 
+- on WSL2, mount provenance must prove both the source checkout and external review container use supported local native Linux filesystems; Windows-backed provenance is blocked and unprovable provenance is inconclusive;
 - cwd is the helper-owned detached review worktree;
 - `HOME` is the current account's real home resolved from the operating-system account database, not a caller-controlled override;
 - helper-owned temporary paths are used for CLI scratch and bounded artifacts;
 - the trusted ordinary Claude control plane may use its supported authentication/configuration paths in real `HOME`, including admin-managed policy;
-- plan-mode `Read`, `Grep`, and `Glob` are exposed for detached-workspace review; the prompt forbids out-of-workspace reads and explicit file-tool rules deny sensitive HOME paths, but `--allowedTools` is not claimed as a filesystem allowlist;
-- `sandbox.autoAllowBashIfSandboxed` is requested false; the model prompt and verified effective plan/tool surface require read-only behavior, but the init schema cannot expose merged admin-managed permission arrays or prove that no preapproval exists;
-- every accepted stream has one first `system/init` that proves effective plan mode, exact tools, requested model, and authentication indicator, followed by one matching last result;
-- the native-sandbox request sets `failIfUnavailable`, denies unsandboxed-command escape, requests authentication/proxy removal from sandboxed commands, re-opens only the detached workspace and private Git view inside the broader real-`HOME` Bash read denial, and requests write denials for the worktree and real `HOME`.
+- `dontAsk` mode exposes `Read`, `Grep`, and `Glob` for detached-workspace review, explicitly allows `Read(./**)`, automatically denies unmatched permission requests, and uses deny-first rules for sensitive HOME paths, `/proc`, and `/dev`;
+- `Bash` is exposed only through Claude Code's non-prompting read-only command policy, while `sandbox.autoAllowBashIfSandboxed` is requested false; the init schema cannot expose merged admin-managed permission arrays or prove the requested sandbox settings;
+- every accepted stream has one first `system/init` that proves effective `dontAsk` mode, exact tools, requested model, and authentication indicator, followed by one matching last result;
+- the native-sandbox request sets `failIfUnavailable`, denies unsandboxed-command escape, requests authentication/proxy removal from sandboxed commands, denies Bash reads across the per-UID review namespace, real `HOME`, `/proc`, and `/dev`, re-opens only the current detached workspace and private Git view, and requests write denials for the worktree and real `HOME`.
 - credential-free probes use Claude Code's broad subprocess scrub, while the model-backed launch disables it because v2.1.212 otherwise forces effective permission mode to `default`; sandboxed-Bash credential deny rules and the separately disabled hook/MCP/plugin/skill/slash surfaces form the compatible runtime boundary.
 - immediately before launch, the Claude provider records whether the exact `.claude/.cc-writes` entry is absent and binds any already-existing real `.claude` parent's filesystem identity; immediately before common validation, it may use no-follow directory descriptors to verify and non-recursively remove only an exact empty, current-user-owned `0700` staging directory newly created by that attempt, while pre-existing entries are not cleaned; a newly created empty parent is atomically quarantined and identity-checked before removal, a swapped candidate is retained in quarantine and rejected, and all other topology remains subject to the unchanged validator.
 - after every completed Claude attempt, exact external-workspace validation must confirm the worktree snapshot, private Git state, diff, and prompt are unchanged before a result or model fallback is accepted.
 
-The helper does not make a separate model-backed behavioral request before every review. It relies on the publisher-verified version floor, the validated CLI contract, the documented plan-mode baseline, explicit tool denials, strict effective init/result evidence, the requested `failIfUnavailable` launch behavior, and post-attempt exact state validation. Admin-managed policy is part of the trusted ordinary CLI control plane. Observable init or workspace changes fail closed, but prompt instructions, merged managed permissions, and requested sandbox settings are not reported as independently observed OS enforcement. Post-attempt validation rejects observable review-workspace or private-Git mutation as terminal `permission-mismatch`; it does not prove that no transient write or out-of-workspace side effect occurred.
+The helper does not make a separate model-backed behavioral request before every review. It relies on the publisher-verified exact-version pin, the validated CLI contract, the documented `dontAsk` baseline, the workspace file allowlist, explicit tool/path denials, strict effective init/result evidence, the requested `failIfUnavailable` launch behavior, and post-attempt exact state validation. Admin-managed policy is part of the trusted ordinary CLI control plane. Observable init or workspace changes fail closed, but prompt instructions, merged managed permissions, and requested sandbox settings are not reported as independently observed OS enforcement. Post-attempt validation rejects observable review-workspace or private-Git mutation as terminal `permission-mismatch`; it does not prove that no transient write or out-of-workspace side effect occurred.
 
 Authentication precedence is:
 
@@ -151,7 +156,7 @@ Reviewer stdout/stderr stream to complete per-attempt files with finite deadline
 
 Only a validated non-empty terminal artifact counts. Every attempt records runtime, requested/effective model, requested/effective effort when observable, category, exit status, workspace content mode, exact range or WIP digest, and bounded log paths. Repository-controlled partial result text never authorizes authentication, entitlement, or fallback classification.
 
-Stateful final artifacts survive workspace cleanup. A retained fallback worktree is valid only when its preflight, mode, exact range, and clean-tree or WIP digest match the requested fallback evidence.
+Stateful final artifacts survive helper workspace cleanup inside the external per-run container, subject to the `/tmp` reboot and host-cleanup lifetime above. A retained fallback worktree is valid only when its preflight, mode, exact range, and clean-tree or WIP digest match the requested fallback evidence.
 
 ## Terminal States
 

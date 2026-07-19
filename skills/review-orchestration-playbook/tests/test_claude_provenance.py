@@ -76,21 +76,27 @@ def completed(
 
 
 class ReleaseVersionTest(unittest.TestCase):
-    def test_accepts_supported_floating_release_versions(self) -> None:
+    def test_accepts_only_supported_release_version(self) -> None:
         self.assertEqual(
             claude_provenance.require_supported_release_version("2.1.212"),
             (2, 1, 212),
         )
-        self.assertEqual(
-            claude_provenance.require_supported_release_version("2.99.1000"),
-            (2, 99, 1000),
-        )
 
-    def test_rejects_versions_outside_supported_major_range(self) -> None:
-        for version in ("2.1.211", "2.1.210", "1.99.999", "3.0.0", "4.1.0"):
+    def test_rejects_every_other_stable_release_version(self) -> None:
+        for version in (
+            "2.1.210",
+            "2.1.211",
+            "2.1.213",
+            "2.99.999",
+            "2.99.1000",
+            "1.99.999",
+            "3.0.0",
+            "4.1.0",
+        ):
             with self.subTest(version=version):
-                with self.assertRaises(
-                    claude_provenance.ClaudeProvenanceInvalid
+                with self.assertRaisesRegex(
+                    claude_provenance.ClaudeProvenanceInvalid,
+                    "publisher verification is enabled only for 2.1.212",
                 ):
                     claude_provenance.require_supported_release_version(version)
 

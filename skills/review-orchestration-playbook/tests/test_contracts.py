@@ -142,14 +142,19 @@ class RepositoryContractTest(unittest.TestCase):
         required = (
             "real `HOME`",
             "detached Git worktree",
-            ">=2.1.212,<3.0.0",
-            "plan mode",
+            "2.1.212",
+            "Every other release fails closed",
+            "`dontAsk` mode",
             "Read",
             "Grep",
             "Glob",
-            "read-only `Bash`",
+            "Read(./**)",
+            "read-only command policy",
             "native sandbox",
             "unsandboxed",
+            "per-UID review namespace",
+            "/proc",
+            "/dev",
         )
         for phrase in required:
             self.assertIn(phrase, combined)
@@ -170,12 +175,21 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("requested rather than claiming independent proof", combined)
         self.assertIn("model tools", combined)
         self.assertIn("authentication", combined)
+        self.assertIn("exact-version pin", combined)
         self.assertNotIn("separate HOME/runtime modes", combined)
 
         provider_source = (RUNTIME / "providers.py").read_text(encoding="utf-8")
         self.assertIn('"autoAllowBashIfSandboxed": False', provider_source)
         self.assertIn('"allowUnsandboxedCommands": False', provider_source)
+        self.assertIn("str(review_user_root)", provider_source)
         self.assertIn("model-backed behavioral probe", combined)
+        for stale_range_claim in (
+            "floating Claude Code",
+            "accepted range advances",
+            "publisher-verified release range",
+            "publisher-verified version floor",
+        ):
+            self.assertNotIn(stale_range_claim, combined + provider_source)
         for stale_claim in (
             "helper-controlled route",
             "materializes certificate-only",
@@ -272,6 +286,54 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("must be committed", readiness)
         self.assertIn("omit `--include-source-wip`", readiness)
         self.assertIn("never report a WIP digest", readiness)
+
+    def test_review_workspace_and_state_use_external_system_temp_root(self) -> None:
+        workspace_source = (RUNTIME / "workspace.py").read_text(encoding="utf-8")
+        provider_source = (RUNTIME / "providers.py").read_text(encoding="utf-8")
+        policies = _current_claude_contract_files()
+        combined = "\n".join(policies.values())
+
+        self.assertIn('REVIEW_ROOT_BASE = pathlib.Path("/tmp")', workspace_source)
+        self.assertIn(
+            'REVIEW_USER_ROOT_PREFIX = "codex-isolated-review-uid-"',
+            workspace_source,
+        )
+        self.assertIn(
+            "hashlib.sha256(os.fsencode(str(canonical_source))).hexdigest()",
+            workspace_source,
+        )
+        self.assertIn(
+            "helper review root must be outside the source repository",
+            workspace_source,
+        )
+        self.assertNotIn("_without_helper_container_status", workspace_source)
+        self.assertIn('".codex-review", ".codex-tmp"', workspace_source)
+        self.assertIn("(review.source_root, review.container_dir)", provider_source)
+
+        for phrase in (
+            "fixed system temporary root `/tmp`",
+            "outside the source checkout",
+            "`01777`",
+            "`0700`",
+            "effective UID",
+            "canonical source path",
+            "Source `.codex-tmp`",
+            "ordinary Git ignore/status",
+            "reserved",
+            "reboot",
+            "host temporary-file cleanup",
+            "both the source checkout and external review container",
+        ):
+            self.assertIn(phrase, combined)
+
+        for stale_claim in (
+            "excluded from clean/WIP source status",
+            "Filtering is limited to porcelain",
+            "filter applies only to untracked porcelain",
+            "no longer blocks the next clean or WIP review",
+            "does not itself block the next clean or WIP preparation",
+        ):
+            self.assertNotIn(stale_claim, combined)
 
     def test_wip_consent_includes_untracked_but_excludes_home(self) -> None:
         consent = (SKILL_ROOT / "references/egress-consent.md").read_text(

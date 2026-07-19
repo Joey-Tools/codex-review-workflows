@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import signal
+import shutil
 import stat
 import subprocess
 import sys
@@ -109,9 +110,23 @@ class WorkspaceTest(unittest.TestCase):
         self.reviews = []
 
     def tearDown(self) -> None:
+        review_roots = {review.container_dir.parent for review in self.reviews}
         for review in self.reviews:
-            if review.workspace_root.exists():
+            if review.container_dir.exists():
                 cleanup_workspace(review, keep_container=False)
+        if self.repo.exists():
+            review_roots.add(workspace_runtime._review_root_for_source(self.repo))
+        for review_root in review_roots:
+            try:
+                root_status = os.lstat(review_root)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(root_status.st_mode) and not stat.S_ISLNK(
+                root_status.st_mode
+            ):
+                for container in review_root.glob("isolated-review-*"):
+                    shutil.rmtree(container)
+                review_root.rmdir()
         self.temporary.cleanup()
 
     def install_raw_commit(self, raw_commit: bytes, *, previous: str) -> str:
@@ -134,6 +149,10 @@ class WorkspaceTest(unittest.TestCase):
         commit = created.stdout.decode("ascii").strip()
         git(self.repo, "update-ref", "refs/heads/master", commit, previous)
         return commit
+
+    def assert_no_review_containers(self, repo: pathlib.Path | None = None) -> None:
+        review_root = workspace_runtime._review_root_for_source(repo or self.repo)
+        self.assertEqual(list(review_root.glob("isolated-review-*")), [])
 
     def test_git_environment_disables_lazy_fetch_and_prompts(self) -> None:
         environment = workspace_runtime._git_environment()
@@ -202,10 +221,10 @@ class WorkspaceTest(unittest.TestCase):
             )
 
         self.assertFalse(marker.exists())
-        self.assertEqual(
-            list((partial / ".codex-tmp").glob("isolated-review-*")),
-            [],
-        )
+        partial_review_root = workspace_runtime._review_root_for_source(partial)
+        self.assertEqual(list(partial_review_root.glob("isolated-review-*")), [])
+        if partial_review_root.exists():
+            partial_review_root.rmdir()
 
     def test_prepare_materializes_frozen_range_and_local_control_files(self) -> None:
         review = prepare_workspace(
@@ -232,6 +251,26 @@ class WorkspaceTest(unittest.TestCase):
         self.assertRegex(review.scope_identity, r"^[0-9a-f]{64}$")
         self.assertEqual(git(review.workspace_root, "status", "--porcelain"), "")
         self.assertEqual(git(review.workspace_root, "rev-parse", "HEAD"), self.head)
+        self.assertEqual(
+            review.container_dir.parent,
+            workspace_runtime._review_root_for_source(self.repo),
+        )
+        self.assertFalse(
+            review.container_dir.resolve().is_relative_to(self.repo.resolve())
+        )
+        for helper_state in (
+            review.container_dir,
+            review.workspace_root,
+            review.diff_file,
+            review.prompt_file,
+            review.git_dir,
+            review.container_dir / workspace_runtime.CONTROL_ARTIFACT_STATE_NAME,
+        ):
+            with self.subTest(helper_state=helper_state):
+                self.assertIsNotNone(helper_state)
+                self.assertFalse(
+                    helper_state.resolve().is_relative_to(self.repo.resolve())
+                )
         self.assertEqual(review.container_dir.stat().st_mode & 0o777, 0o700)
         self.assertEqual(
             (review.workspace_root / "example.txt").read_text(encoding="utf-8"),
@@ -240,6 +279,32 @@ class WorkspaceTest(unittest.TestCase):
 
         cleanup_workspace(review, keep_container=False)
         self.assertFalse(review.container_dir.exists())
+
+    def test_review_root_is_exact_stable_and_source_specific(self) -> None:
+        canonical_source = self.repo.resolve(strict=True)
+        digest = hashlib.sha256(os.fsencode(str(canonical_source))).hexdigest()
+        expected = (
+            workspace_runtime._canonical_review_root_base()
+            / f"{workspace_runtime.REVIEW_USER_ROOT_PREFIX}{os.geteuid()}"
+            / digest
+        )
+        alias = pathlib.Path(self.temporary.name) / "repo-alias"
+        alias.symlink_to(self.repo, target_is_directory=True)
+        other_source = pathlib.Path(self.temporary.name) / "other-source"
+        other_source.mkdir()
+
+        self.assertEqual(
+            workspace_runtime._review_root_for_source(self.repo),
+            expected,
+        )
+        self.assertEqual(
+            workspace_runtime._review_root_for_source(self.repo),
+            workspace_runtime._review_root_for_source(alias),
+        )
+        self.assertNotEqual(
+            workspace_runtime._review_root_for_source(self.repo),
+            workspace_runtime._review_root_for_source(other_source),
+        )
 
     def test_default_rejects_dirty_source_before_creating_container(self) -> None:
         (self.repo / "example.txt").write_text("dirty\n", encoding="utf-8")
@@ -252,7 +317,11 @@ class WorkspaceTest(unittest.TestCase):
             )
 
         self.assertEqual(
-            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            list(
+                workspace_runtime._review_root_for_source(self.repo).glob(
+                    "isolated-review-*"
+                )
+            ),
             [],
         )
 
@@ -302,7 +371,11 @@ class WorkspaceTest(unittest.TestCase):
             )
 
         self.assertEqual(
-            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            list(
+                workspace_runtime._review_root_for_source(self.repo).glob(
+                    "isolated-review-*"
+                )
+            ),
             [],
         )
 
@@ -397,7 +470,14 @@ class WorkspaceTest(unittest.TestCase):
             )
 
         self.assertNotIn(marker.decode().strip(), str(raised.exception))
-        self.assertEqual(list((self.repo / ".codex-tmp").glob("isolated-review-*")), [])
+        self.assertEqual(
+            list(
+                workspace_runtime._review_root_for_source(self.repo).glob(
+                    "isolated-review-*"
+                )
+            ),
+            [],
+        )
 
     def test_external_preflight_rejects_post_prepare_workspace_mutation(self) -> None:
         review = prepare_workspace(
@@ -843,7 +923,14 @@ class WorkspaceTest(unittest.TestCase):
                 head_ref=head,
             )
 
-        self.assertEqual(list((self.repo / ".codex-tmp").glob("isolated-review-*")), [])
+        self.assertEqual(
+            list(
+                workspace_runtime._review_root_for_source(self.repo).glob(
+                    "isolated-review-*"
+                )
+            ),
+            [],
+        )
 
     def test_endpoint_commit_signature_block_is_not_scanned_as_human_metadata(
         self,
@@ -1315,7 +1402,11 @@ class WorkspaceTest(unittest.TestCase):
         self.assertIsNotNone(process.returncode)
         self.assertLess(process.returncode, 0)
         self.assertEqual(
-            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            list(
+                workspace_runtime._review_root_for_source(self.repo).glob(
+                    "isolated-review-*"
+                )
+            ),
             [],
         )
 
@@ -1412,6 +1503,29 @@ class WorkspaceTest(unittest.TestCase):
         )
         self.assertIsNone(cleanup_workspace(review, keep_container=False))
 
+    def test_retained_state_never_changes_source_git_status(self) -> None:
+        git(self.repo, "rm", ".gitignore")
+        git(self.repo, "commit", "-m", "Remove helper ignore")
+        head = git(self.repo, "rev-parse", "HEAD")
+        status_args = ("status", "--porcelain=v2", "--untracked-files=all")
+        source_status = git(self.repo, *status_args)
+        self.assertEqual(source_status, "")
+
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.head,
+            head_ref=head,
+        )
+        marker = review.container_dir / "state-marker"
+        marker.write_text("retain\n", encoding="utf-8")
+
+        self.assertEqual(git(self.repo, *status_args), source_status)
+        self.assertIsNone(cleanup_workspace(review, keep_container=True))
+        self.assertTrue(marker.is_file())
+        self.assertEqual(git(self.repo, *status_args), source_status)
+        self.assertIsNone(cleanup_workspace(review, keep_container=False))
+        self.assertEqual(git(self.repo, *status_args), source_status)
+
     def test_clean_and_wip_prepare_without_codex_tmp_ignore(self) -> None:
         plain = pathlib.Path(self.temporary.name) / "plain"
         plain.mkdir()
@@ -1428,22 +1542,35 @@ class WorkspaceTest(unittest.TestCase):
         git(plain, "add", "tracked.txt")
         git(plain, "commit", "-m", "Initial")
         head = git(plain, "rev-parse", "HEAD")
+        review_root = workspace_runtime._review_root_for_source(plain)
 
         clean_review = prepare_workspace(repo=plain, base_ref=head, head_ref=head)
+        self.assertEqual(clean_review.container_dir.parent, review_root)
+        self.assertFalse(clean_review.container_dir.resolve().is_relative_to(plain))
+        self.assertFalse((plain / ".codex-tmp").exists())
         self.assertIsNone(cleanup_workspace(clean_review, keep_container=False))
 
         (plain / "wip.txt").write_text("WIP\n", encoding="utf-8")
+        source_status = git(plain, "status", "--porcelain=v2", "--untracked-files=all")
         wip_review = prepare_workspace(
             repo=plain,
             base_ref=head,
             head_ref=head,
             include_source_wip=True,
         )
+        self.assertEqual(wip_review.container_dir.parent, review_root)
+        self.assertFalse(wip_review.container_dir.resolve().is_relative_to(plain))
         self.assertEqual(
             (wip_review.workspace_root / "wip.txt").read_text(encoding="utf-8"),
             "WIP\n",
         )
+        self.assertEqual(
+            git(plain, "status", "--porcelain=v2", "--untracked-files=all"),
+            source_status,
+        )
+        self.assertFalse((plain / ".codex-tmp").exists())
         self.assertIsNone(cleanup_workspace(wip_review, keep_container=False))
+        review_root.rmdir()
 
     def test_cleanup_of_detached_worktree_is_idempotent(self) -> None:
         review = prepare_workspace(
@@ -1561,7 +1688,11 @@ class WorkspaceTest(unittest.TestCase):
                 prompt_override=template,
             )
         self.assertEqual(
-            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            list(
+                workspace_runtime._review_root_for_source(self.repo).glob(
+                    "isolated-review-*"
+                )
+            ),
             [],
         )
 
@@ -1579,7 +1710,11 @@ class WorkspaceTest(unittest.TestCase):
                 prompt_override=template,
             )
         self.assertEqual(
-            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            list(
+                workspace_runtime._review_root_for_source(self.repo).glob(
+                    "isolated-review-*"
+                )
+            ),
             [],
         )
 
@@ -1615,7 +1750,11 @@ class WorkspaceTest(unittest.TestCase):
                     prompt_override=candidate,
                 )
         self.assertEqual(
-            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            list(
+                workspace_runtime._review_root_for_source(self.repo).glob(
+                    "isolated-review-*"
+                )
+            ),
             [],
         )
 
@@ -1733,7 +1872,11 @@ class WorkspaceTest(unittest.TestCase):
                 head_ref=self.head,
             )
         self.assertEqual(
-            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            list(
+                workspace_runtime._review_root_for_source(self.repo).glob(
+                    "isolated-review-*"
+                )
+            ),
             [],
         )
 
@@ -1747,10 +1890,7 @@ class WorkspaceTest(unittest.TestCase):
                 base_ref=self.base,
                 head_ref=self.head,
             )
-        self.assertEqual(
-            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
-            [],
-        )
+        self.assert_no_review_containers()
 
     def test_reserved_path_preflight_rejects_excessive_tree_entries(self) -> None:
         with (
@@ -1762,10 +1902,7 @@ class WorkspaceTest(unittest.TestCase):
                 base_ref=self.base,
                 head_ref=self.head,
             )
-        self.assertEqual(
-            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
-            [],
-        )
+        self.assert_no_review_containers()
 
     def test_snapshot_rejects_oversized_recursive_tree_metadata(self) -> None:
         with (
@@ -1787,10 +1924,7 @@ class WorkspaceTest(unittest.TestCase):
                 base_ref=self.base,
                 head_ref=self.head,
             )
-        self.assertEqual(
-            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
-            [],
-        )
+        self.assert_no_review_containers()
 
     def test_snapshot_rejects_oversized_total_before_materializing(self) -> None:
         with (
@@ -1802,10 +1936,7 @@ class WorkspaceTest(unittest.TestCase):
                 base_ref=self.base,
                 head_ref=self.head,
             )
-        self.assertEqual(
-            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
-            [],
-        )
+        self.assert_no_review_containers()
 
     def test_snapshot_rejects_oversized_generated_diff(self) -> None:
         with (
@@ -1817,10 +1948,7 @@ class WorkspaceTest(unittest.TestCase):
                 base_ref=self.base,
                 head_ref=self.head,
             )
-        self.assertEqual(
-            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
-            [],
-        )
+        self.assert_no_review_containers()
 
     def test_snapshot_rejects_oversized_changed_path_metadata(self) -> None:
         with (
@@ -1832,10 +1960,7 @@ class WorkspaceTest(unittest.TestCase):
                 base_ref=self.base,
                 head_ref=self.head,
             )
-        self.assertEqual(
-            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
-            [],
-        )
+        self.assert_no_review_containers()
 
     def test_snapshot_rejects_excessive_changed_path_entries(self) -> None:
         with (
@@ -1847,10 +1972,7 @@ class WorkspaceTest(unittest.TestCase):
                 base_ref=self.base,
                 head_ref=self.head,
             )
-        self.assertEqual(
-            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
-            [],
-        )
+        self.assert_no_review_containers()
 
     def test_snapshot_rejects_oversized_changed_blob_metadata(self) -> None:
         def write_empty_changed_paths(**kwargs) -> None:
@@ -1870,10 +1992,7 @@ class WorkspaceTest(unittest.TestCase):
                 base_ref=self.base,
                 head_ref=self.head,
             )
-        self.assertEqual(
-            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
-            [],
-        )
+        self.assert_no_review_containers()
 
     def test_snapshot_rejects_excessive_changed_blob_entries(self) -> None:
         def write_empty_changed_paths(**kwargs) -> None:
@@ -1893,10 +2012,7 @@ class WorkspaceTest(unittest.TestCase):
                 base_ref=self.base,
                 head_ref=self.head,
             )
-        self.assertEqual(
-            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
-            [],
-        )
+        self.assert_no_review_containers()
 
     def test_snapshot_rejects_oversized_changed_blob_scan(self) -> None:
         with (
@@ -1908,10 +2024,7 @@ class WorkspaceTest(unittest.TestCase):
                 base_ref=self.base,
                 head_ref=self.head,
             )
-        self.assertEqual(
-            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
-            [],
-        )
+        self.assert_no_review_containers()
 
     def test_materialization_os_error_redacts_secret_path(self) -> None:
         secret = "AKIA" + "B" * 16
@@ -1944,13 +2057,13 @@ class WorkspaceTest(unittest.TestCase):
         self.assertNotIn(secret, str(raised.exception))
 
     def test_invalid_ref_fails_before_creating_a_review_container(self) -> None:
+        review_root = workspace_runtime._review_root_for_source(self.repo)
         with self.assertRaises(ReviewError):
             prepare_workspace(
                 repo=self.repo,
                 base_ref="missing-ref",
                 head_ref=self.head,
             )
-        review_root = self.repo / ".codex-tmp"
         self.assertFalse(review_root.exists())
 
     def test_diverged_range_reports_merge_base_before_creating_container(self) -> None:
@@ -1969,7 +2082,7 @@ class WorkspaceTest(unittest.TestCase):
                 base_ref=diverged,
                 head_ref=self.head,
             )
-        self.assertFalse((self.repo / ".codex-tmp").exists())
+        self.assertFalse(workspace_runtime._review_root_for_source(self.repo).exists())
 
     def test_ancestor_check_ignores_local_replace_refs(self) -> None:
         git(self.repo, "switch", "-c", "replace-diverged", self.base)
@@ -2005,7 +2118,7 @@ class WorkspaceTest(unittest.TestCase):
                 base_ref=diverged,
                 head_ref=self.head,
             )
-        self.assertFalse((self.repo / ".codex-tmp").exists())
+        self.assertFalse(workspace_runtime._review_root_for_source(self.repo).exists())
 
     def test_keyboard_interrupt_cleans_partial_review_container(self) -> None:
         with (
@@ -2020,7 +2133,7 @@ class WorkspaceTest(unittest.TestCase):
                 base_ref=self.base,
                 head_ref=self.head,
             )
-        review_root = self.repo / ".codex-tmp"
+        review_root = workspace_runtime._review_root_for_source(self.repo)
         self.assertEqual(list(review_root.glob("isolated-review-*")), [])
 
     def test_prepare_cleanup_failure_reports_retained_container(self) -> None:
@@ -2044,8 +2157,10 @@ class WorkspaceTest(unittest.TestCase):
                 head_ref=self.head,
             )
 
-        review_root = self.repo / ".codex-tmp"
-        self.assertEqual(len(list(review_root.glob("isolated-review-*"))), 1)
+        review_root = workspace_runtime._review_root_for_source(self.repo)
+        retained = list(review_root.glob("isolated-review-*"))
+        self.assertEqual(len(retained), 1)
+        shutil.rmtree(retained[0])
 
     def test_container_handoff_signal_cleans_private_snapshot(self) -> None:
         restore_calls = 0
@@ -2069,7 +2184,7 @@ class WorkspaceTest(unittest.TestCase):
                 head_ref=self.head,
             )
 
-        review_root = self.repo / ".codex-tmp"
+        review_root = workspace_runtime._review_root_for_source(self.repo)
         self.assertEqual(list(review_root.glob("isolated-review-*")), [])
 
     def test_completed_workspace_is_owned_before_handoff_signal(self) -> None:
@@ -2124,12 +2239,16 @@ class WorkspaceTest(unittest.TestCase):
             )
 
         self.assertEqual(raised.exception.signum, signal.SIGQUIT)
-        review_root = self.repo / ".codex-tmp"
+        review_root = workspace_runtime._review_root_for_source(self.repo)
         self.assertEqual(list(review_root.glob("isolated-review-*")), [])
 
-    def test_review_root_symlink_is_rejected_without_writing_outside_repo(self) -> None:
+    def test_source_codex_tmp_symlink_rejects_clean_mode_without_touching_target(
+        self,
+    ) -> None:
         outside = pathlib.Path(self.temporary.name) / "outside"
         outside.mkdir()
+        marker = outside / "user-content.txt"
+        marker.write_text("keep\n", encoding="utf-8")
         (self.repo / ".codex-tmp").symlink_to(outside, target_is_directory=True)
 
         with self.assertRaisesRegex(ReviewError, "source repository has"):
@@ -2138,20 +2257,73 @@ class WorkspaceTest(unittest.TestCase):
                 base_ref=self.base,
                 head_ref=self.head,
             )
-        self.assertEqual(list(outside.iterdir()), [])
 
-    def test_group_writable_review_root_is_rejected(self) -> None:
-        review_root = self.repo / ".codex-tmp"
+        self.assertTrue((self.repo / ".codex-tmp").is_symlink())
+        self.assertEqual(marker.read_text(encoding="utf-8"), "keep\n")
+        self.assertEqual(list(outside.iterdir()), [marker])
+        self.assert_no_review_containers()
+
+    def test_source_codex_tmp_directory_is_preserved_as_user_content(self) -> None:
+        source_codex_tmp = self.repo / ".codex-tmp"
+        source_codex_tmp.mkdir(mode=0o700)
+        source_codex_tmp.chmod(0o770)
+        marker = source_codex_tmp / "user-content.txt"
+        marker.write_text("keep\n", encoding="utf-8")
+
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(review)
+
+        self.assertEqual(stat.S_IMODE(source_codex_tmp.stat().st_mode), 0o770)
+        self.assertEqual(marker.read_text(encoding="utf-8"), "keep\n")
+        self.assertEqual(list(source_codex_tmp.iterdir()), [marker])
+        self.assertFalse(review.container_dir.resolve().is_relative_to(self.repo))
+
+    def test_preexisting_external_review_root_symlink_fails_closed(self) -> None:
+        review_root = workspace_runtime._review_root_for_source(self.repo)
+        review_root.parent.mkdir(mode=0o700, exist_ok=True)
+        outside = pathlib.Path(self.temporary.name) / "outside-review-root"
+        outside.mkdir()
+        review_root.symlink_to(outside, target_is_directory=True)
+
+        try:
+            with self.assertRaisesRegex(
+                ReviewError,
+                "current-user-owned 0700 real directory",
+            ):
+                prepare_workspace(
+                    repo=self.repo,
+                    base_ref=self.base,
+                    head_ref=self.head,
+                )
+            self.assertEqual(list(outside.iterdir()), [])
+        finally:
+            review_root.unlink(missing_ok=True)
+
+    def test_preexisting_external_review_root_wrong_mode_fails_closed(self) -> None:
+        review_root = workspace_runtime._review_root_for_source(self.repo)
+        review_root.parent.mkdir(mode=0o700, exist_ok=True)
         review_root.mkdir(mode=0o700)
         review_root.chmod(0o770)
 
-        with self.assertRaisesRegex(ReviewError, "group or other writable"):
-            prepare_workspace(
-                repo=self.repo,
-                base_ref=self.base,
-                head_ref=self.head,
-            )
-        self.assertEqual(list(review_root.iterdir()), [])
+        try:
+            with self.assertRaisesRegex(
+                ReviewError,
+                "current-user-owned 0700 real directory",
+            ):
+                prepare_workspace(
+                    repo=self.repo,
+                    base_ref=self.base,
+                    head_ref=self.head,
+                )
+            self.assertEqual(stat.S_IMODE(review_root.stat().st_mode), 0o770)
+            self.assertEqual(list(review_root.iterdir()), [])
+        finally:
+            review_root.chmod(0o700)
+            review_root.rmdir()
 
     def test_reserved_control_path_in_base_is_rejected(self) -> None:
         control = self.repo / ".codex-review"
@@ -2187,8 +2359,39 @@ class WorkspaceTest(unittest.TestCase):
                 head_ref=alias_head,
             )
 
-        review_root = self.repo / ".codex-tmp"
+        review_root = workspace_runtime._review_root_for_source(self.repo)
         self.assertEqual(list(review_root.glob("isolated-review-*")), [])
+
+    def test_layout_rejects_source_local_fake_container(self) -> None:
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(review)
+        fake_container = (
+            self.repo / ".codex-tmp" / "isolated-review-20260720-010203-deadbeef01"
+        )
+        fake_workspace = fake_container / "workspace"
+        fake_control = fake_workspace / ".codex-review"
+        forged = review.to_json()
+        forged.update(
+            {
+                "container_dir": str(fake_container),
+                "workspace_root": str(fake_workspace),
+                "diff_file": str(fake_control / "review.diff"),
+                "prompt_file": str(fake_control / "review.prompt"),
+                "git_dir": str(fake_container / "review.git"),
+            }
+        )
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "outside the helper-private review root",
+        ):
+            workspace_runtime.validate_workspace_layout(
+                workspace_runtime.ReviewWorkspace.from_json(forged)
+            )
 
     def test_external_workspace_rejects_symlinks_that_escape_frozen_root(self) -> None:
         review = prepare_workspace(
@@ -2575,6 +2778,9 @@ class WorkspaceTest(unittest.TestCase):
             "base\nhead\n",
         )
         self.assertIn("+head", review.diff_file.read_text(encoding="utf-8"))
+        self.assertIsNone(cleanup_workspace(review, keep_container=False))
+        self.reviews.remove(review)
+        workspace_runtime._review_root_for_source(sha256_repo).rmdir()
 
 
 if __name__ == "__main__":
