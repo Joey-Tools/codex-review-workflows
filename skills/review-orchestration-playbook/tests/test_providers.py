@@ -27776,6 +27776,253 @@ class ProviderPolicyTest(unittest.TestCase):
 
             self.assertIs(raised.exception, policy_error)
 
+    def test_ca_path_directory_open_preserves_policy_error_when_close_fails(
+        self,
+    ) -> None:
+        source_dir = self.review.source_root / "ca-open-parent"
+        source_dir.mkdir(mode=0o700)
+        child_dir = source_dir / "child"
+        child_dir.mkdir(mode=0o700)
+        parent_descriptor = os.open(source_dir, os.O_RDONLY)
+        opened_descriptors: list[int] = []
+        real_open = os.open
+        real_close = os.close
+        policy_error = providers.ClaudeTrustPolicyUnavailable(
+            "fixture CA policy failure"
+        )
+
+        def capture_open(*args, **kwargs):
+            descriptor = real_open(*args, **kwargs)
+            opened_descriptors.append(descriptor)
+            return descriptor
+
+        def fail_child_close(descriptor: int) -> None:
+            if descriptor in opened_descriptors:
+                raise OSError(errno.EIO, "close failed")
+            real_close(descriptor)
+
+        try:
+            with (
+                mock.patch.object(
+                    providers,
+                    "_require_safe_ca_directory_metadata",
+                    side_effect=(None, policy_error),
+                ),
+                mock.patch.object(
+                    providers.os,
+                    "open",
+                    side_effect=capture_open,
+                ),
+                mock.patch.object(
+                    providers.os,
+                    "close",
+                    side_effect=fail_child_close,
+                ),
+                self.assertRaises(providers.ClaudeTrustPolicyUnavailable) as raised,
+            ):
+                providers._open_ca_directory_at(
+                    parent_descriptor,
+                    child_dir.name,
+                    source="fixture CA",
+                    owned_descriptors=[],
+                )
+
+            self.assertIs(raised.exception, policy_error)
+        finally:
+            for descriptor in opened_descriptors:
+                with contextlib.suppress(OSError):
+                    real_close(descriptor)
+            real_close(parent_descriptor)
+
+    def test_ca_path_directory_open_preserves_control_flow_when_close_fails(
+        self,
+    ) -> None:
+        source_dir = self.review.source_root / "ca-open-control-flow"
+        source_dir.mkdir(mode=0o700)
+        child_dir = source_dir / "child"
+        child_dir.mkdir(mode=0o700)
+        parent_descriptor = os.open(source_dir, os.O_RDONLY)
+        opened_descriptors: list[int] = []
+        close_attempts: list[int] = []
+        real_open = os.open
+        real_close = os.close
+        control_flow = KeyboardInterrupt("fixture interruption")
+
+        def capture_open(*args, **kwargs):
+            descriptor = real_open(*args, **kwargs)
+            opened_descriptors.append(descriptor)
+            return descriptor
+
+        def fail_child_close(descriptor: int) -> None:
+            if descriptor in opened_descriptors:
+                close_attempts.append(descriptor)
+                raise OSError(errno.EIO, "close failed")
+            real_close(descriptor)
+
+        try:
+            with (
+                mock.patch.object(
+                    providers,
+                    "_require_safe_ca_directory_metadata",
+                    side_effect=(None, control_flow),
+                ),
+                mock.patch.object(
+                    providers.os,
+                    "open",
+                    side_effect=capture_open,
+                ),
+                mock.patch.object(
+                    providers.os,
+                    "close",
+                    side_effect=fail_child_close,
+                ),
+                self.assertRaises(KeyboardInterrupt) as raised,
+            ):
+                providers._open_ca_directory_at(
+                    parent_descriptor,
+                    child_dir.name,
+                    source="fixture CA",
+                    owned_descriptors=[],
+                )
+
+            self.assertIs(raised.exception, control_flow)
+            self.assertEqual(close_attempts, opened_descriptors)
+        finally:
+            for descriptor in opened_descriptors:
+                with contextlib.suppress(OSError):
+                    real_close(descriptor)
+            real_close(parent_descriptor)
+
+    def test_ca_path_directory_comparison_preserves_control_flow(self) -> None:
+        metadata = self.review.source_root.stat()
+        control_flow = KeyboardInterrupt("fixture comparison interruption")
+
+        with (
+            mock.patch.object(
+                providers.os,
+                "stat",
+                return_value=metadata,
+            ),
+            mock.patch.object(
+                providers.os,
+                "open",
+                return_value=71,
+            ),
+            mock.patch.object(
+                providers.os,
+                "fstat",
+                return_value=metadata,
+            ),
+            mock.patch.object(
+                providers,
+                "_ca_source_metadata",
+                side_effect=control_flow,
+            ),
+            mock.patch.object(
+                providers.os,
+                "close",
+                side_effect=OSError(errno.EIO, "close failed"),
+            ) as close_descriptor,
+            self.assertRaises(KeyboardInterrupt) as raised,
+        ):
+            providers._open_ca_directory_at(
+                70,
+                "child",
+                source="fixture CA",
+                owned_descriptors=[],
+            )
+
+        self.assertIs(raised.exception, control_flow)
+        close_descriptor.assert_called_once_with(71)
+
+    def test_ca_descriptor_registration_failure_closes_before_handoff(
+        self,
+    ) -> None:
+        class InterruptingDescriptors(list[int]):
+            def append(self, descriptor: int) -> None:
+                del descriptor
+                raise KeyboardInterrupt("fixture registration interruption")
+
+        duplicated = InterruptingDescriptors()
+        with (
+            mock.patch.object(providers.os, "dup", return_value=71),
+            mock.patch.object(providers.os, "close") as close_descriptor,
+            self.assertRaisesRegex(KeyboardInterrupt, "registration interruption"),
+        ):
+            providers._acquire_owned_ca_descriptor(
+                lambda: providers.os.dup(70),
+                duplicated,
+            )
+        self.assertEqual(duplicated, [])
+        close_descriptor.assert_called_once_with(71)
+
+        metadata = self.review.source_root.stat()
+        opened = InterruptingDescriptors()
+        with (
+            mock.patch.object(providers.os, "stat", return_value=metadata),
+            mock.patch.object(providers.os, "open", return_value=72),
+            mock.patch.object(providers.os, "fstat", return_value=metadata),
+            mock.patch.object(providers.os, "close") as close_descriptor,
+            self.assertRaisesRegex(KeyboardInterrupt, "registration interruption"),
+        ):
+            providers._open_ca_directory_at(
+                70,
+                "child",
+                source="fixture CA",
+                owned_descriptors=opened,
+            )
+        self.assertEqual(opened, [])
+        close_descriptor.assert_called_once_with(72)
+
+    def test_ca_path_internal_close_only_failure_is_inconclusive(self) -> None:
+        source_dir = self.review.source_root / "ca-internal-close"
+        source_dir.mkdir(mode=0o700)
+        certificate = self.sample_ca_certificate()
+        target = source_dir / "certificate.pem"
+        self.write_private_source(target, certificate)
+        source_descriptor = os.open(source_dir, os.O_RDONLY)
+        duplicated_descriptors: list[int] = []
+        real_dup = os.dup
+        real_close = os.close
+
+        def capture_dup(descriptor: int) -> int:
+            duplicated = real_dup(descriptor)
+            duplicated_descriptors.append(duplicated)
+            return duplicated
+
+        def fail_duplicate_close(descriptor: int) -> None:
+            if descriptor in duplicated_descriptors:
+                raise OSError(errno.EIO, "close failed")
+            real_close(descriptor)
+
+        try:
+            with (
+                mock.patch.object(
+                    providers.os,
+                    "dup",
+                    side_effect=capture_dup,
+                ),
+                mock.patch.object(
+                    providers.os,
+                    "close",
+                    side_effect=fail_duplicate_close,
+                ),
+                self.assertRaisesRegex(
+                    providers.ClaudeExecutableInspectionInconclusive,
+                    "cannot close Claude review CA path descriptor chain",
+                ),
+            ):
+                providers._read_ca_path_at_with_size(
+                    source_descriptor,
+                    target.name,
+                    source="fixture CA",
+                )
+        finally:
+            for descriptor in duplicated_descriptors:
+                with contextlib.suppress(OSError):
+                    real_close(descriptor)
+            real_close(source_descriptor)
+
     def test_claude_tls_directory_symlink_rejects_unsafe_parent(self) -> None:
         source_dir = self.review.source_root / "unsafe-parent-source"
         source_dir.mkdir(mode=0o700)
@@ -28297,6 +28544,11 @@ class ProviderPolicyTest(unittest.TestCase):
 
         with (
             mock.patch.object(
+                providers,
+                "_is_claude_macos_host",
+                return_value=False,
+            ),
+            mock.patch.object(
                 providers.ssl,
                 "get_default_verify_paths",
                 return_value=mock.Mock(openssl_cafile=str(default_file)),
@@ -28318,6 +28570,46 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         context_type.assert_called_once_with(ssl.PROTOCOL_TLS_CLIENT)
         context.load_verify_locations.assert_called_once_with(cadata="system-ca")
+
+    @mock.patch.object(providers.ssl, "SSLContext")
+    def test_proxy_ssl_context_uses_fixed_macos_system_ca_file(
+        self,
+        context_type: mock.Mock,
+    ) -> None:
+        context = context_type.return_value
+        system_file = self.review.container_dir / "macos-system-ca.pem"
+        system_file.write_bytes(b"fixture")
+
+        with (
+            mock.patch.object(
+                providers,
+                "_is_claude_macos_host",
+                return_value=True,
+            ),
+            mock.patch.object(
+                providers,
+                "CLAUDE_SYSTEM_CA_FILE",
+                system_file,
+            ),
+            mock.patch.object(
+                providers.ssl,
+                "get_default_verify_paths",
+            ) as get_defaults,
+            mock.patch.object(
+                providers,
+                "_read_proxy_system_ca_source",
+                return_value=b"macos-system-ca",
+            ) as read_default,
+        ):
+            result = providers._proxy_ssl_context({}, snapshot_material={})
+
+        self.assertIs(result, context)
+        get_defaults.assert_not_called()
+        read_default.assert_called_once_with(system_file.resolve())
+        context_type.assert_called_once_with(ssl.PROTOCOL_TLS_CLIENT)
+        context.load_verify_locations.assert_called_once_with(
+            cadata="macos-system-ca"
+        )
 
     def test_proxy_system_ca_reader_accepts_public_read_only_bundle(self) -> None:
         default_file = self.review.container_dir / "system-ca.pem"

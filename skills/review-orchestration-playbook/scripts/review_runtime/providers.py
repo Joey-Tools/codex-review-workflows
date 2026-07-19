@@ -10623,12 +10623,47 @@ def _read_proxy_system_ca_source(path: pathlib.Path) -> bytes:
     return _extract_ca_certificates(bytes(payload), source=source)
 
 
+def _release_uncommitted_ca_descriptor(
+    descriptor: int | None,
+    owned_descriptors: list[int],
+    original_count: int,
+) -> None:
+    if descriptor is None:
+        return
+    if len(owned_descriptors) > original_count:
+        owned_descriptors.pop()
+    with contextlib.suppress(OSError):
+        os.close(descriptor)
+
+
+def _acquire_owned_ca_descriptor(
+    opener: Callable[[], int],
+    owned_descriptors: list[int],
+) -> int:
+    descriptor: int | None = None
+    original_count = len(owned_descriptors)
+    try:
+        descriptor = opener()
+        owned_descriptors.append(descriptor)
+        return descriptor
+    except BaseException:
+        _release_uncommitted_ca_descriptor(
+            descriptor,
+            owned_descriptors,
+            original_count,
+        )
+        raise
+
+
 def _open_ca_directory_at(
     directory_descriptor: int,
     name: str,
     *,
     source: str,
+    owned_descriptors: list[int],
 ) -> tuple[int, os.stat_result]:
+    descriptor: int | None = None
+    original_count = len(owned_descriptors)
     try:
         before = os.stat(
             name,
@@ -10641,13 +10676,6 @@ def _open_ca_directory_at(
             _ca_nofollow_flags(directory=True),
             dir_fd=directory_descriptor,
         )
-    except ReviewError:
-        raise
-    except OSError as error:
-        raise ClaudeExecutableInspectionInconclusive(
-            f"cannot open a stable Claude review CA path directory {source}: {error}"
-        ) from error
-    try:
         opened = os.fstat(descriptor)
         _require_safe_ca_directory_metadata(opened, source=source)
         after = os.stat(
@@ -10655,23 +10683,40 @@ def _open_ca_directory_at(
             dir_fd=directory_descriptor,
             follow_symlinks=False,
         )
+        if _ca_source_metadata(before) != _ca_source_metadata(
+            opened
+        ) or _ca_source_metadata(opened) != _ca_source_metadata(after):
+            raise ClaudeExecutableInspectionInconclusive(
+                f"Claude review CA path directory changed while being opened: "
+                f"{source}"
+            )
+        owned_descriptors.append(descriptor)
+        return descriptor, opened
     except ReviewError:
-        os.close(descriptor)
+        _release_uncommitted_ca_descriptor(
+            descriptor,
+            owned_descriptors,
+            original_count,
+        )
         raise
     except OSError as error:
-        os.close(descriptor)
-        raise ClaudeExecutableInspectionInconclusive(
-            f"cannot validate a stable Claude review CA path directory {source}: "
-            f"{error}"
-        ) from error
-    if _ca_source_metadata(before) != _ca_source_metadata(
-        opened
-    ) or _ca_source_metadata(opened) != _ca_source_metadata(after):
-        os.close(descriptor)
-        raise ClaudeExecutableInspectionInconclusive(
-            f"Claude review CA path directory changed while being opened: {source}"
+        operation = "open" if descriptor is None else "validate"
+        _release_uncommitted_ca_descriptor(
+            descriptor,
+            owned_descriptors,
+            original_count,
         )
-    return descriptor, opened
+        raise ClaudeExecutableInspectionInconclusive(
+            f"cannot {operation} a stable Claude review CA path directory "
+            f"{source}: {error}"
+        ) from error
+    except BaseException:
+        _release_uncommitted_ca_descriptor(
+            descriptor,
+            owned_descriptors,
+            original_count,
+        )
+        raise
 
 
 def _ca_symlink_target_components(raw_target: str) -> tuple[bool, list[str]]:
@@ -10743,9 +10788,12 @@ def _read_ca_path_at_with_size(
     seen_symlinks: set[tuple[int, int]] = set()
     symlink_count = 0
     component_count = 0
+    primary_error: BaseException | None = None
     try:
-        current_directory = os.dup(source_directory_descriptor)
-        owned_descriptors.append(current_directory)
+        current_directory = _acquire_owned_ca_descriptor(
+            lambda: os.dup(source_directory_descriptor),
+            owned_descriptors,
+        )
         source_directory_metadata = os.fstat(current_directory)
         _require_safe_ca_directory_metadata(
             source_directory_metadata,
@@ -10766,8 +10814,8 @@ def _read_ca_path_at_with_size(
                     current_directory,
                     "..",
                     source=source,
+                    owned_descriptors=owned_descriptors,
                 )
-                owned_descriptors.append(parent_descriptor)
                 directory_records.append((parent_descriptor, parent_metadata))
                 current_directory = parent_descriptor
                 continue
@@ -10838,11 +10886,13 @@ def _read_ca_path_at_with_size(
                         f"{source}"
                     )
                 if absolute:
-                    root_descriptor = _open_stable_ca_directory(
-                        pathlib.Path(os.sep),
-                        source=source,
+                    root_descriptor = _acquire_owned_ca_descriptor(
+                        lambda: _open_stable_ca_directory(
+                            pathlib.Path(os.sep),
+                            source=source,
+                        ),
+                        owned_descriptors,
                     )
-                    owned_descriptors.append(root_descriptor)
                     root_metadata = os.fstat(root_descriptor)
                     directory_records.append((root_descriptor, root_metadata))
                     current_directory = root_descriptor
@@ -10859,8 +10909,8 @@ def _read_ca_path_at_with_size(
                     current_directory,
                     component,
                     source=source,
+                    owned_descriptors=owned_descriptors,
                 )
-                owned_descriptors.append(next_directory)
                 directory_records.append((next_directory, next_metadata))
                 current_directory = next_directory
                 continue
@@ -10881,10 +10931,20 @@ def _read_ca_path_at_with_size(
         raise ReviewError(
             f"Claude review CA symlink does not resolve to a regular file: {source}"
         )
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
+        close_error: OSError | None = None
         for descriptor in reversed(owned_descriptors):
-            with contextlib.suppress(OSError):
+            try:
                 os.close(descriptor)
+            except OSError as error:
+                close_error = close_error or error
+        if primary_error is None and close_error is not None:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot close Claude review CA path descriptor chain: {source}"
+            ) from close_error
 
 
 def _read_ca_path_from_parent_with_size(
@@ -12637,12 +12697,15 @@ def _proxy_ssl_context(
                 cadata=b"".join(materials).decode("ascii")
             )
         else:
-            defaults = ssl.get_default_verify_paths()
-            if not defaults.openssl_cafile:
-                raise ClaudeExecutableInspectionInconclusive(
-                    "Claude proxy system CA file is unavailable"
-                )
-            default_cafile = pathlib.Path(defaults.openssl_cafile)
+            if _is_claude_macos_host():
+                default_cafile = CLAUDE_SYSTEM_CA_FILE
+            else:
+                defaults = ssl.get_default_verify_paths()
+                if not defaults.openssl_cafile:
+                    raise ClaudeExecutableInspectionInconclusive(
+                        "Claude proxy system CA file is unavailable"
+                    )
+                default_cafile = pathlib.Path(defaults.openssl_cafile)
             if not default_cafile.is_absolute():
                 raise ClaudeExecutableInspectionInconclusive(
                     "Claude proxy system CA file is not absolute"
