@@ -5443,6 +5443,8 @@ class ProviderPolicyTest(unittest.TestCase):
             ).encode(),
             stderr=b"",
         )
+        api_key = "codex_public_synth_v1_api_key_a"
+        bearer_token = "codex_public_synth_v1_bearer_a"
         cases = (
             (
                 "local-login",
@@ -5453,7 +5455,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 "api-key",
                 {
                     "HOME": str(self.claude_pwd_home),
-                    "ANTHROPIC_API_KEY": "codex_public_synth_v1_api_key_a",
+                    "ANTHROPIC_API_KEY": api_key,
                 },
                 providers.CLAUDE_API_KEY_ACTION,
             ),
@@ -5461,7 +5463,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 "oauth-token",
                 {
                     "HOME": str(self.claude_pwd_home),
-                    "CLAUDE_CODE_OAUTH_TOKEN": "codex_public_synth_v1_bearer_a",
+                    "CLAUDE_CODE_OAUTH_TOKEN": bearer_token,
                 },
                 providers.CLAUDE_OAUTH_TOKEN_ACTION,
             ),
