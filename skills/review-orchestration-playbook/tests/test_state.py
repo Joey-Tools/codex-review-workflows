@@ -471,6 +471,25 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertFalse(self.review.container_dir.exists())
 
+    def test_preparing_marker_recovers_partial_private_payloads(self) -> None:
+        for index, name in enumerate(
+            (PRIVATE_CHANGED_PATHS_NAME, SYNTHETIC_PRIVATE_MANIFEST_NAME),
+            start=1,
+        ):
+            (self.review.container_dir / name).write_bytes(b"partial" * index)
+        state._write_preparing_state_marker(
+            self.review.container_dir,
+            self.review.private_cleanup,
+        )
+
+        exit_code = state.cleanup(
+            self.review.container_dir,
+            timeout_seconds=state.FINAL_CLEANUP_TIMEOUT_SECONDS,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertFalse(self.review.container_dir.exists())
+
     def test_ready_marker_recovers_complete_container_without_state(self) -> None:
         state._write_state_marker(self.review)
 

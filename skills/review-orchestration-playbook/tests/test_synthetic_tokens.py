@@ -7182,6 +7182,31 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         )
         self.validate(review)
 
+    def test_deleted_dynamic_secret_path_blocks_encoded_head_retention(self) -> None:
+        raw_value = reduction_secret("github-token").decode("ascii")
+        fixture = reduction_fixture("github-token")
+        encoded_value = base64.b64encode(raw_value.encode("ascii")).decode("ascii")
+        repo, base = self.new_repo(
+            {
+                "fixture.cfg": fixture,
+                raw_value: fixture,
+            }
+        )
+        (repo / raw_value).unlink()
+        (repo / "encoded.txt").write_text(encoded_value + "\n", encoding="utf-8")
+        head = self.commit(repo)
+        review = self.prepare(repo=repo, base=base, head=head)
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "base-only-path-secret-retained",
+        ) as caught:
+            self.validate(review)
+
+        diagnostic = str(caught.exception)
+        self.assertNotIn(raw_value, diagnostic)
+        self.assertNotIn(encoded_value, diagnostic)
+
     def test_path_only_jwt_requires_complete_head_removal(self) -> None:
         raw_value = reduction_secret("jwt").decode("ascii")
         for transition in ("delete", "prefix-retention"):

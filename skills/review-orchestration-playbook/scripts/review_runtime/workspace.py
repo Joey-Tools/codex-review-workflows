@@ -3410,6 +3410,110 @@ def _open_new_private_binary(
             restore_signal_mask(creation_mask)
 
 
+def _validate_prepared_private_metadata(
+    metadata: os.stat_result,
+    *,
+    artifact_name: str,
+    expected_identity: CleanupIdentity,
+    require_empty: bool,
+) -> None:
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise ReviewError(
+            f"prepared helper-private artifact {artifact_name} is not a "
+            "regular file with one link"
+        )
+    if metadata.st_uid != os.geteuid():
+        raise ReviewError(
+            f"prepared helper-private artifact {artifact_name} has an unexpected owner"
+        )
+    if stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise ReviewError(
+            f"prepared helper-private artifact {artifact_name} must have mode 0600"
+        )
+    if require_empty and metadata.st_size != 0:
+        raise ReviewError(
+            f"prepared helper-private artifact {artifact_name} is not empty"
+        )
+    if _cleanup_identity_evidence(metadata) != expected_identity:
+        raise ReviewError(
+            f"prepared helper-private artifact {artifact_name} does not match its "
+            "preparation identity"
+        )
+
+
+@contextmanager
+def _open_prepared_private_binary(
+    path: pathlib.Path,
+    *,
+    expected_identity: CleanupIdentity,
+    parent_descriptor: int,
+) -> Iterator[BinaryIO]:
+    if path.name not in PRIVATE_HELPER_ARTIFACT_NAMES:
+        raise ReviewError("prepared helper-private artifact name is not allowed")
+    flags = (
+        os.O_WRONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    descriptor: int | None = None
+    try:
+        before = os.stat(
+            path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
+        opened = os.fstat(descriptor)
+        after = os.stat(
+            path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        for metadata in (before, opened, after):
+            _validate_prepared_private_metadata(
+                metadata,
+                artifact_name=path.name,
+                expected_identity=expected_identity,
+                require_empty=True,
+            )
+        handle = os.fdopen(descriptor, "wb")
+        descriptor = None
+        try:
+            yield handle
+            handle.flush()
+            os.fsync(handle.fileno())
+            opened_after_write = os.fstat(handle.fileno())
+            path_after_write = os.stat(
+                path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            for metadata in (opened_after_write, path_after_write):
+                _validate_prepared_private_metadata(
+                    metadata,
+                    artifact_name=path.name,
+                    expected_identity=expected_identity,
+                    require_empty=False,
+                )
+        finally:
+            handle.close()
+    except FileNotFoundError as error:
+        raise ReviewError(
+            f"prepared helper-private artifact {path.name} is missing"
+        ) from error
+    except ReviewError:
+        raise
+    except OSError as error:
+        raise ReviewError(
+            f"cannot securely access prepared helper-private artifact {path.name}: "
+            f"{error}"
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def _write_frozen_diff(
     *,
     git_view: pathlib.Path,
@@ -3517,8 +3621,8 @@ def _write_frozen_changed_paths(
     destination: pathlib.Path,
     private_destination: pathlib.Path,
     evidence_sensitive_values: Iterable[AcceptedSyntheticValue],
-    private_identity_handoff: Callable[[CleanupIdentity], None] | None = None,
-    private_parent_descriptor: int | None = None,
+    private_expected_identity: CleanupIdentity,
+    private_parent_descriptor: int,
 ) -> None:
     digest_evidence: list[str] = []
     with (
@@ -3553,9 +3657,9 @@ def _write_frozen_changed_paths(
         logical_record_count = 0
         private_bytes = 0
         with (
-            _open_new_private_binary(
+            _open_prepared_private_binary(
                 private_destination,
-                identity_handoff=private_identity_handoff,
+                expected_identity=private_expected_identity,
                 parent_descriptor=private_parent_descriptor,
             ) as private_output,
             _open_new_private_binary(destination) as public_output,
@@ -3649,7 +3753,7 @@ def _write_private_bounded_json(
     *,
     label: str,
     accepted_values: Iterable[AcceptedSyntheticValue] = (),
-    identity_handoff: Callable[[CleanupIdentity], None],
+    expected_identity: CleanupIdentity,
     parent_descriptor: int,
 ) -> None:
     encoded = _bounded_json_bytes(
@@ -3657,14 +3761,12 @@ def _write_private_bounded_json(
         label=label,
         accepted_values=accepted_values,
     )
-    with _open_new_private_binary(
+    with _open_prepared_private_binary(
         path,
-        identity_handoff=identity_handoff,
+        expected_identity=expected_identity,
         parent_descriptor=parent_descriptor,
     ) as handle:
         handle.write(encoded)
-        handle.flush()
-        os.fsync(handle.fileno())
 
 
 def _iter_evidence_strings(value: Any) -> Iterator[bytes]:
@@ -5751,7 +5853,6 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
                 base_only_path_scan = _scan_secret_value(
                     raw_path,
                     accepted_values=accepted_values,
-                    reduced_secret_values=reduced_secret_values,
                     capture_blocking_candidates=True,
                     _accepted_index=accepted_index,
                     _event_budget=event_budget,
@@ -5805,7 +5906,6 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
         for candidate, rules in sorted(
             base_only_path_discovery.blocking_candidates.items()
         )
-        if candidate not in reduced_secret_values
     )
     base_only_path_matcher = _secret_reduction_path_matcher(base_only_path_values)
     evidence_sensitive_values += base_only_path_values
@@ -10396,30 +10496,44 @@ def prepare_workspace(
     ) = _new_container(source_root)
     private_artifact_identities: dict[str, CleanupIdentity] = {}
 
-    def private_identity_handoff(
+    def capture_private_identity(
         artifact_name: str,
-    ) -> Callable[[CleanupIdentity], None]:
-        def accept(identity: CleanupIdentity) -> None:
-            if artifact_name in private_artifact_identities:
-                raise ReviewError(
-                    f"helper-private artifact identity was handed off twice: "
-                    f"{artifact_name}"
-                )
-            private_artifact_identities[artifact_name] = identity
-            if preparation_cleanup_handoff is not None:
-                preparation_cleanup_handoff(
-                    container,
-                    PrivateCleanupEvidence(
-                        container=container_identity,
-                        artifacts=private_artifact_identities,
-                    ),
-                )
-
-        return accept
+        identity: CleanupIdentity,
+    ) -> None:
+        if artifact_name in private_artifact_identities:
+            raise ReviewError(
+                f"helper-private artifact identity was captured twice: {artifact_name}"
+            )
+        private_artifact_identities[artifact_name] = identity
 
     ownership_transferred = False
 
     try:
+        for artifact_name in PRIVATE_HELPER_ARTIFACT_NAMES:
+            with _open_new_private_binary(
+                container / artifact_name,
+                parent_descriptor=container_descriptor,
+            ) as empty_private_artifact:
+                os.fchmod(empty_private_artifact.fileno(), 0o600)
+                metadata = os.fstat(empty_private_artifact.fileno())
+                identity = _cleanup_identity_evidence(metadata)
+                _validate_prepared_private_metadata(
+                    metadata,
+                    artifact_name=artifact_name,
+                    expected_identity=identity,
+                    require_empty=True,
+                )
+                capture_private_identity(artifact_name, identity)
+                empty_private_artifact.flush()
+                os.fsync(empty_private_artifact.fileno())
+        if set(private_artifact_identities) != set(PRIVATE_HELPER_ARTIFACT_NAMES):
+            raise ReviewError("helper-private preparation identities are incomplete")
+        try:
+            os.fsync(container_descriptor)
+        except OSError as error:
+            raise ReviewError(
+                f"cannot persist prepared helper-private artifact entries: {error}"
+            ) from error
         if preparation_cleanup_handoff is not None:
             preparation_cleanup_handoff(
                 container,
@@ -10497,7 +10611,9 @@ def prepare_workspace(
             private_synthetic_manifest,
             label="synthetic secret helper-private state",
             accepted_values=evidence_sensitive_values,
-            identity_handoff=private_identity_handoff(SYNTHETIC_PRIVATE_MANIFEST_NAME),
+            expected_identity=private_artifact_identities[
+                SYNTHETIC_PRIVATE_MANIFEST_NAME
+            ],
             parent_descriptor=container_descriptor,
         )
         changed_path_digests_file = control_dir / CHANGED_PATH_DIGESTS_NAME
@@ -10509,9 +10625,9 @@ def prepare_workspace(
             destination=changed_path_digests_file,
             private_destination=container / PRIVATE_CHANGED_PATHS_NAME,
             evidence_sensitive_values=manifest_sensitive_values,
-            private_identity_handoff=private_identity_handoff(
+            private_expected_identity=private_artifact_identities[
                 PRIVATE_CHANGED_PATHS_NAME
-            ),
+            ],
             private_parent_descriptor=container_descriptor,
         )
         changed_blob_findings = control_dir / "changed-blob-findings.z"

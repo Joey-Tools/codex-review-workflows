@@ -763,13 +763,13 @@ class WorkspaceTest(unittest.TestCase):
     def test_snapshot_rejects_oversized_changed_blob_metadata(self) -> None:
         def write_empty_changed_paths(**kwargs) -> None:
             kwargs["destination"].touch()
-            kwargs["private_destination"].touch()
             status = kwargs["private_destination"].stat()
-            kwargs["private_identity_handoff"](
+            self.assertEqual(
+                kwargs["private_expected_identity"],
                 workspace_runtime.CleanupIdentity(
                     device=status.st_dev,
                     inode=status.st_ino,
-                )
+                ),
             )
 
         with (
@@ -794,13 +794,13 @@ class WorkspaceTest(unittest.TestCase):
     def test_snapshot_rejects_excessive_changed_blob_entries(self) -> None:
         def write_empty_changed_paths(**kwargs) -> None:
             kwargs["destination"].touch()
-            kwargs["private_destination"].touch()
             status = kwargs["private_destination"].stat()
-            kwargs["private_identity_handoff"](
+            self.assertEqual(
+                kwargs["private_expected_identity"],
                 workspace_runtime.CleanupIdentity(
                     device=status.st_dev,
                     inode=status.st_ino,
-                )
+                ),
             )
 
         with (
@@ -2067,22 +2067,28 @@ class WorkspaceTest(unittest.TestCase):
         self.assertEqual(list(review_root.glob("isolated-review-*")), [])
 
     def test_preparation_cleanup_handoff_precedes_private_bytes(self) -> None:
-        observed_artifacts: set[str] = set()
         handoff_sizes: list[int] = []
 
         def capture_handoff(
             container: pathlib.Path,
             evidence: workspace_runtime.PrivateCleanupEvidence,
         ) -> None:
-            new_artifacts = set(evidence.artifacts) - observed_artifacts
-            if not evidence.artifacts:
-                self.assertEqual(list(container.iterdir()), [])
-            else:
-                self.assertEqual(len(new_artifacts), 1)
-                name = new_artifacts.pop()
+            self.assertEqual(
+                set(evidence.artifacts),
+                set(workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES),
+            )
+            self.assertFalse((container / "workspace").exists())
+            self.assertEqual(
+                {path.name for path in container.iterdir()},
+                set(workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES),
+            )
+            for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES:
                 path = container / name
                 metadata = path.stat()
                 self.assertEqual(metadata.st_size, 0)
+                self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+                self.assertEqual(metadata.st_nlink, 1)
+                self.assertEqual(metadata.st_uid, os.geteuid())
                 self.assertEqual(
                     evidence.artifacts[name],
                     workspace_runtime.CleanupIdentity(
@@ -2090,7 +2096,6 @@ class WorkspaceTest(unittest.TestCase):
                         inode=metadata.st_ino,
                     ),
                 )
-            observed_artifacts.update(evidence.artifacts)
             handoff_sizes.append(len(evidence.artifacts))
 
         review = _prepare_workspace(
@@ -2101,7 +2106,7 @@ class WorkspaceTest(unittest.TestCase):
             preparation_cleanup_handoff=capture_handoff,
         )
 
-        self.assertEqual(handoff_sizes, [0, 1, 2])
+        self.assertEqual(handoff_sizes, [2])
         self.assertEqual(self.reviews, [review])
         self.assertTrue(
             all(
@@ -2109,6 +2114,182 @@ class WorkspaceTest(unittest.TestCase):
                 for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
             )
         )
+
+    def test_preparation_handoff_failure_leaves_no_sensitive_workspace(self) -> None:
+        def reject_handoff(
+            container: pathlib.Path,
+            evidence: workspace_runtime.PrivateCleanupEvidence,
+        ) -> None:
+            self.assertEqual(
+                set(evidence.artifacts),
+                set(workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES),
+            )
+            self.assertFalse((container / "workspace").exists())
+            self.assertTrue(
+                all(
+                    (container / name).stat().st_size == 0
+                    for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
+                )
+            )
+            raise ReviewError("preparation marker failed")
+
+        with self.assertRaisesRegex(ReviewError, "preparation marker failed"):
+            _prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+                ownership_handoff=lambda _prepared: self.fail(
+                    "ownership must not transfer"
+                ),
+                preparation_cleanup_handoff=reject_handoff,
+            )
+
+        self.assertEqual(
+            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            [],
+        )
+
+    def test_prepared_private_writer_does_not_truncate_replacements(self) -> None:
+        container = pathlib.Path(self.temporary.name) / "prepared-private"
+        container.mkdir(mode=0o700)
+        name = workspace_runtime.SYNTHETIC_PRIVATE_MANIFEST_NAME
+        path = container / name
+        original = container / f"{name}.original"
+        path.write_bytes(b"")
+        path.chmod(0o600)
+        metadata = path.stat()
+        expected = workspace_runtime.CleanupIdentity(
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+        )
+        parent_descriptor = os.open(
+            container,
+            workspace_runtime._private_cleanup_directory_flags(),
+        )
+        try:
+            for replacement_bytes in (b"", b"replacement must remain"):
+                with self.subTest(replacement_bytes=replacement_bytes):
+                    path.rename(original)
+                    path.write_bytes(replacement_bytes)
+                    path.chmod(0o600)
+                    with self.assertRaisesRegex(
+                        ReviewError,
+                        "does not match its preparation identity|is not empty",
+                    ):
+                        with workspace_runtime._open_prepared_private_binary(
+                            path,
+                            expected_identity=expected,
+                            parent_descriptor=parent_descriptor,
+                        ) as handle:
+                            handle.write(b"sensitive bytes")
+                    self.assertEqual(path.read_bytes(), replacement_bytes)
+                    path.unlink()
+                    original.rename(path)
+        finally:
+            os.close(parent_descriptor)
+
+    def test_prepared_private_writer_uses_existing_nonblocking_file(self) -> None:
+        container = pathlib.Path(self.temporary.name) / "prepared-private-flags"
+        container.mkdir(mode=0o700)
+        name = workspace_runtime.SYNTHETIC_PRIVATE_MANIFEST_NAME
+        path = container / name
+        path.write_bytes(b"")
+        path.chmod(0o600)
+        metadata = path.stat()
+        expected = workspace_runtime.CleanupIdentity(
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+        )
+        parent_descriptor = os.open(
+            container,
+            workspace_runtime._private_cleanup_directory_flags(),
+        )
+        real_open = os.open
+        observed_flags: list[int] = []
+
+        def capture_open(target, flags, *args, **kwargs):
+            if target == name and kwargs.get("dir_fd") == parent_descriptor:
+                observed_flags.append(flags)
+            return real_open(target, flags, *args, **kwargs)
+
+        try:
+            with mock.patch.object(
+                workspace_runtime.os,
+                "open",
+                side_effect=capture_open,
+            ):
+                with workspace_runtime._open_prepared_private_binary(
+                    path,
+                    expected_identity=expected,
+                    parent_descriptor=parent_descriptor,
+                ) as handle:
+                    handle.write(b"payload")
+        finally:
+            os.close(parent_descriptor)
+
+        self.assertEqual(len(observed_flags), 1)
+        flags = observed_flags[0]
+        self.assertTrue(flags & os.O_NOFOLLOW)
+        self.assertTrue(flags & os.O_NONBLOCK)
+        self.assertFalse(flags & (os.O_CREAT | os.O_EXCL | os.O_TRUNC))
+
+    def test_prepared_private_writer_rechecks_path_after_write(self) -> None:
+        container = pathlib.Path(self.temporary.name) / "prepared-private-race"
+        container.mkdir(mode=0o700)
+        name = workspace_runtime.SYNTHETIC_PRIVATE_MANIFEST_NAME
+        path = container / name
+        moved = container / f"{name}.moved"
+        path.write_bytes(b"")
+        path.chmod(0o600)
+        metadata = path.stat()
+        expected = workspace_runtime.CleanupIdentity(
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+        )
+        parent_descriptor = os.open(
+            container,
+            workspace_runtime._private_cleanup_directory_flags(),
+        )
+        real_fsync = os.fsync
+        swapped = False
+
+        def swap_after_private_write(descriptor: int) -> None:
+            nonlocal swapped
+            real_fsync(descriptor)
+            current = os.fstat(descriptor)
+            if (
+                not swapped
+                and workspace_runtime._cleanup_identity_evidence(current) == expected
+            ):
+                path.rename(moved)
+                path.write_bytes(b"replacement must remain")
+                path.chmod(0o600)
+                swapped = True
+
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime.os,
+                    "fsync",
+                    side_effect=swap_after_private_write,
+                ),
+                self.assertRaisesRegex(
+                    ReviewError,
+                    "does not match its preparation identity|is not empty",
+                ),
+            ):
+                with workspace_runtime._open_prepared_private_binary(
+                    path,
+                    expected_identity=expected,
+                    parent_descriptor=parent_descriptor,
+                ) as handle:
+                    handle.write(b"sensitive bytes")
+        finally:
+            os.close(parent_descriptor)
+
+        self.assertTrue(swapped)
+        self.assertEqual(path.read_bytes(), b"replacement must remain")
+        self.assertEqual(moved.read_bytes(), b"sensitive bytes")
 
     def test_container_directory_entries_are_durable_before_handoff(self) -> None:
         self.assertFalse((self.repo / ".codex-tmp").exists())
@@ -2132,22 +2313,52 @@ class WorkspaceTest(unittest.TestCase):
                         root_metadata = review_root.stat()
                         if identity == (root_metadata.st_dev, root_metadata.st_ino):
                             events.append("review-root-fsync")
+                        else:
+                            for container in review_root.glob("isolated-review-*"):
+                                container_metadata = container.stat()
+                                if identity == (
+                                    container_metadata.st_dev,
+                                    container_metadata.st_ino,
+                                ):
+                                    events.append("container-fsync")
+                                    break
+            elif stat.S_ISREG(metadata.st_mode):
+                review_root = self.repo / ".codex-tmp"
+                for container in review_root.glob("isolated-review-*"):
+                    for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES:
+                        path = container / name
+                        if path.is_file():
+                            path_metadata = path.stat()
+                            if identity == (
+                                path_metadata.st_dev,
+                                path_metadata.st_ino,
+                            ):
+                                events.append(f"private-slot-fsync:{name}")
+                                break
             real_fsync(descriptor)
 
         def capture_handoff(
             _container: pathlib.Path,
             evidence: workspace_runtime.PrivateCleanupEvidence,
         ) -> None:
-            if not evidence.artifacts:
-                events.append("initial-handoff")
-                self.assertEqual(
-                    events,
-                    [
-                        "source-root-fsync",
-                        "review-root-fsync",
-                        "initial-handoff",
-                    ],
-                )
+            self.assertEqual(
+                set(evidence.artifacts),
+                set(workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES),
+            )
+            events.append("preparation-handoff")
+            self.assertEqual(
+                events,
+                [
+                    "source-root-fsync",
+                    "review-root-fsync",
+                    *(
+                        f"private-slot-fsync:{name}"
+                        for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
+                    ),
+                    "container-fsync",
+                    "preparation-handoff",
+                ],
+            )
 
         with mock.patch.object(
             workspace_runtime.os,
@@ -2236,17 +2447,20 @@ class WorkspaceTest(unittest.TestCase):
             container: pathlib.Path,
             evidence: workspace_runtime.PrivateCleanupEvidence,
         ) -> None:
-            if not evidence.artifacts:
-                self.assertEqual(list(container.iterdir()), [])
-                events.append("initial-handoff")
-                self.assertEqual(
-                    events,
-                    [
-                        "source-root-fsync",
-                        "review-root-fsync",
-                        "initial-handoff",
-                    ],
-                )
+            self.assertEqual(
+                set(evidence.artifacts),
+                set(workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES),
+            )
+            self.assertFalse((container / "workspace").exists())
+            events.append("preparation-handoff")
+            self.assertEqual(
+                events,
+                [
+                    "source-root-fsync",
+                    "review-root-fsync",
+                    "preparation-handoff",
+                ],
+            )
 
         with (
             mock.patch.object(
@@ -2399,15 +2613,19 @@ class WorkspaceTest(unittest.TestCase):
             real_fsync(descriptor)
 
         def capture_handoff(
-            _container: pathlib.Path,
+            container: pathlib.Path,
             evidence: workspace_runtime.PrivateCleanupEvidence,
         ) -> None:
-            if not evidence.artifacts:
-                events.append("initial-handoff")
-                self.assertEqual(
-                    events,
-                    ["review-root-fsync", "initial-handoff"],
-                )
+            self.assertEqual(
+                set(evidence.artifacts),
+                set(workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES),
+            )
+            self.assertFalse((container / "workspace").exists())
+            events.append("preparation-handoff")
+            self.assertEqual(
+                events,
+                ["review-root-fsync", "preparation-handoff"],
+            )
 
         with mock.patch.object(
             workspace_runtime.os,
@@ -2645,6 +2863,66 @@ class WorkspaceTest(unittest.TestCase):
             [],
         )
 
+    def test_private_slot_persistence_failure_precedes_handoff(self) -> None:
+        for failure_point in ("second-slot", "container"):
+            with self.subTest(failure_point=failure_point):
+                preparation_handoff = mock.Mock()
+                ownership_handoff = mock.Mock()
+                real_fsync = os.fsync
+                regular_fsyncs = 0
+                failed = False
+
+                def fail_selected_fsync(descriptor: int) -> None:
+                    nonlocal failed, regular_fsyncs
+                    metadata = os.fstat(descriptor)
+                    if stat.S_ISREG(metadata.st_mode):
+                        regular_fsyncs += 1
+                        if (
+                            not failed
+                            and failure_point == "second-slot"
+                            and regular_fsyncs == 2
+                        ):
+                            failed = True
+                            raise OSError("private slot fsync denied")
+                    elif stat.S_ISDIR(metadata.st_mode) and not failed:
+                        review_root = self.repo / ".codex-tmp"
+                        for container in review_root.glob("isolated-review-*"):
+                            container_metadata = container.stat()
+                            if failure_point == "container" and (
+                                metadata.st_dev,
+                                metadata.st_ino,
+                            ) == (
+                                container_metadata.st_dev,
+                                container_metadata.st_ino,
+                            ):
+                                failed = True
+                                raise OSError("private container fsync denied")
+                    real_fsync(descriptor)
+
+                with (
+                    mock.patch.object(
+                        workspace_runtime.os,
+                        "fsync",
+                        side_effect=fail_selected_fsync,
+                    ),
+                    self.assertRaisesRegex((OSError, ReviewError), "fsync denied"),
+                ):
+                    _prepare_workspace(
+                        repo=self.repo,
+                        base_ref=self.base,
+                        head_ref=self.head,
+                        ownership_handoff=ownership_handoff,
+                        preparation_cleanup_handoff=preparation_handoff,
+                    )
+
+                self.assertTrue(failed)
+                preparation_handoff.assert_not_called()
+                ownership_handoff.assert_not_called()
+                self.assertEqual(
+                    list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+                    [],
+                )
+
     def test_completed_workspace_is_owned_before_handoff_signal(self) -> None:
         restore_calls = 0
         captured = []
@@ -2682,7 +2960,7 @@ class WorkspaceTest(unittest.TestCase):
             ),
             mock.patch(
                 "review_runtime.workspace.block_forwarded_signals",
-                side_effect=({signal.SIGTERM}, {signal.SIGTERM}),
+                side_effect=lambda: {signal.SIGTERM},
             ),
             mock.patch(
                 "review_runtime.workspace.consume_pending_forwarded_signal",
