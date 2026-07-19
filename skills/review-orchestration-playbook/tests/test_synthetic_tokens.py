@@ -569,16 +569,14 @@ class PublicPoolScannerTest(unittest.TestCase):
             provider_prefix.decode("ascii"),
             rule="openai-key",
         )
-        complete_pem = (
-            b"-----BEGIN PRIVATE KEY-----\n"
-            + b"A" * 32
-            + b"\n-----END PRIVATE KEY-----"
-        )
+        pem_begin = b"-----BEGIN " + b"PRIVATE KEY-----\n"
+        pem_end = b"\n-----END " + b"PRIVATE KEY-----"
+        complete_pem = pem_begin + b"A" * 32 + pem_end
         pem_accepted = accepted_legacy_value(
             complete_pem.decode("ascii"),
             rule="private-key",
         )
-        unclosed_pem = b"-----BEGIN PRIVATE KEY-----\n" + b"A" * 32
+        unclosed_pem = pem_begin + b"A" * 32
 
         for label, payload, accepted, expected_blocker, expected_count in (
             ("accepted-provider", provider, provider_accepted, None, 1),
