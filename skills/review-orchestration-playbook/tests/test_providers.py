@@ -4263,6 +4263,36 @@ class ProviderPolicyTest(unittest.TestCase):
             "local-login",
         )
 
+    @mock.patch.object(providers, "_run_review_impl")
+    @mock.patch.object(providers, "_review_environment")
+    def test_claude_model_run_opts_out_of_broad_subprocess_scrub(
+        self,
+        review_environment: mock.Mock,
+        run_review_impl: mock.Mock,
+    ) -> None:
+        review_environment.side_effect = lambda **kwargs: {
+            "HOME": str(self.claude_pwd_home),
+            **kwargs["extra"],
+        }
+        run_review_impl.return_value = providers.Outcome(0, "No findings.", tuple())
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="explicit-claude-review",
+        )
+
+        self.assertEqual(outcome.returncode, 0)
+        extra = review_environment.call_args.kwargs["extra"]
+        self.assertEqual(extra["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"], "0")
+        claude_env = run_review_impl.call_args.kwargs["claude_env"]
+        self.assertEqual(claude_env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"], "0")
+        probe_env = providers._claude_preflight_probe_environment(
+            home=self.claude_pwd_home,
+            tmp=self.review.container_dir / "tmp",
+        )
+        self.assertEqual(probe_env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"], "1")
+
     def test_claude_auth_status_proves_each_supported_effective_source(self) -> None:
         for source in ("api-key", "oauth-token", "local-login"):
             with self.subTest(source=source):
@@ -4531,11 +4561,16 @@ class ProviderPolicyTest(unittest.TestCase):
         validate_workspace: mock.Mock,
     ) -> None:
         def complete(argv: tuple[str, ...], **kwargs: object) -> Completed:
+            is_auth = "auth" in argv
             payload = (
                 claude_auth_status_fixture("local-login")
-                if "auth" in argv
+                if is_auth
                 else claude_stream_fixture(self.review)
             )
+            if not is_auth:
+                parent = self.review.workspace_root / ".claude"
+                parent.mkdir(mode=0o755)
+                (parent / ".cc-writes").mkdir(mode=0o700)
             stdout_path = pathlib.Path(kwargs["stdout_path"])
             stderr_path = pathlib.Path(kwargs["stderr_path"])
             stdout_path.parent.mkdir(parents=True, exist_ok=True)
@@ -4569,13 +4604,14 @@ class ProviderPolicyTest(unittest.TestCase):
                 "TMP": str(temporary),
                 "TEMP": str(temporary),
                 "CLAUDE_CODE_TMPDIR": str(temporary),
-                "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
+                "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "0",
             },
             executable=pathlib.Path("/bin/claude"),
             redact_values=("alpha", "omega"),
         )
 
         self.assertEqual(attempt.category, "success")
+        self.assertFalse((self.review.workspace_root / ".claude").exists())
         self.assertEqual(run_command.call_count, 2)
         validate_workspace.assert_called_once_with(self.review)
         auth_argv = run_command.call_args_list[0].args[0]
@@ -4595,7 +4631,7 @@ class ProviderPolicyTest(unittest.TestCase):
             run_command.call_args_list[1].kwargs["env"][
                 "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"
             ],
-            "1",
+            "0",
         )
         self.assertEqual(
             run_command.call_args_list[1].kwargs["redact_values"],
@@ -4612,6 +4648,10 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(report["authentication"]["status"], "used")
         self.assertEqual(report["capabilities"]["effective_init_contract"], "verified")
         self.assertEqual(
+            report["capabilities"]["claude_bash_staging_contract"],
+            "verified-and-removed",
+        )
+        self.assertEqual(
             report["sandbox"]["status"],
             "requested-not-independently-observable",
         )
@@ -4627,6 +4667,453 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(egress["authentication"]["effective_auth_method"], "claude.ai")
         self.assertEqual(
             egress["authentication"]["effective_init_contract"], "verified"
+        )
+
+    def test_claude_bash_staging_cleanup_rejects_nonempty_directory(self) -> None:
+        baseline = providers._claude_bash_staging_baseline(self.review)
+        parent = self.review.workspace_root / ".claude"
+        parent.mkdir(mode=0o755)
+        staging = parent / ".cc-writes"
+        staging.mkdir(mode=0o700)
+        (staging / "unexpected").write_text("unexpected\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(ReviewError, "is not empty"):
+            providers._remove_claude_bash_staging_directory(
+                self.review,
+                baseline=baseline,
+            )
+
+        self.assertTrue((staging / "unexpected").is_file())
+
+    def test_claude_bash_staging_baseline_requires_no_follow_support(self) -> None:
+        with mock.patch.object(providers.os, "O_NOFOLLOW", None):
+            with self.assertRaisesRegex(ReviewError, "does not support no-follow"):
+                providers._claude_bash_staging_baseline(self.review)
+
+    def test_claude_bash_staging_cleanup_rejects_symlink(self) -> None:
+        baseline = providers._claude_bash_staging_baseline(self.review)
+        parent = self.review.workspace_root / ".claude"
+        parent.mkdir(mode=0o755)
+        target = self.review.workspace_root / "staging-target"
+        target.mkdir(mode=0o700)
+        (parent / ".cc-writes").symlink_to(target, target_is_directory=True)
+
+        with self.assertRaises(ReviewError):
+            providers._remove_claude_bash_staging_directory(
+                self.review,
+                baseline=baseline,
+            )
+
+        self.assertTrue((parent / ".cc-writes").is_symlink())
+
+    def test_claude_bash_staging_cleanup_rejects_wrong_mode(self) -> None:
+        baseline = providers._claude_bash_staging_baseline(self.review)
+        parent = self.review.workspace_root / ".claude"
+        parent.mkdir(mode=0o755)
+        staging = parent / ".cc-writes"
+        staging.mkdir(mode=0o700)
+        staging.chmod(0o755)
+
+        with self.assertRaisesRegex(ReviewError, "is unsafe"):
+            providers._remove_claude_bash_staging_directory(
+                self.review,
+                baseline=baseline,
+            )
+
+        self.assertTrue(staging.is_dir())
+
+    def test_claude_bash_staging_cleanup_preserves_other_topology(self) -> None:
+        baseline = providers._claude_bash_staging_baseline(self.review)
+        parent = self.review.workspace_root / ".claude"
+        parent.mkdir(mode=0o755)
+        staging = parent / ".cc-writes"
+        staging.mkdir(mode=0o700)
+        sibling = parent / "unexpected"
+        sibling.write_text("unexpected\n", encoding="utf-8")
+
+        self.assertEqual(
+            providers._remove_claude_bash_staging_directory(
+                self.review,
+                baseline=baseline,
+            ),
+            "verified-and-removed",
+        )
+        self.assertFalse(staging.exists())
+        self.assertTrue(sibling.is_file())
+        with self.assertRaisesRegex(ReviewError, "topology"):
+            workspace_runtime.validate_external_workspace(self.review)
+
+    def test_claude_bash_staging_cleanup_preserves_snapshotted_parent(self) -> None:
+        source_parent = self.review.source_root / ".claude"
+        source_parent.mkdir(mode=0o755)
+        (source_parent / "review-policy.txt").write_text(
+            "snapshotted\n",
+            encoding="utf-8",
+        )
+        handed_off: list[ReviewWorkspace] = []
+        review = workspace_runtime.prepare_workspace(
+            repo=self.review.source_root,
+            base_ref=self.review.base_ref,
+            head_ref=self.review.head_ref,
+            include_source_wip=True,
+            ownership_handoff=handed_off.append,
+        )
+        self.assertEqual(handed_off, [review])
+        parent = review.workspace_root / ".claude"
+        baseline = providers._claude_bash_staging_baseline(review)
+        (parent / ".cc-writes").mkdir(mode=0o700)
+
+        self.assertEqual(
+            providers._remove_claude_bash_staging_directory(
+                review,
+                baseline=baseline,
+            ),
+            "verified-and-removed",
+        )
+        self.assertEqual(
+            (parent / "review-policy.txt").read_text(encoding="utf-8"),
+            "snapshotted\n",
+        )
+        workspace_runtime.validate_external_workspace(review)
+        self.assertIsNone(
+            workspace_runtime.cleanup_workspace(review, keep_container=False)
+        )
+
+    def test_claude_bash_staging_cleanup_rejects_replaced_parent_symlink(
+        self,
+    ) -> None:
+        baseline = providers._claude_bash_staging_baseline(self.review)
+        self.assertTrue(baseline.staging_was_absent)
+        self.assertIsNone(baseline.parent_identity)
+        outside_parent = pathlib.Path(self.temporary.name) / "outside-claude"
+        outside_parent.mkdir(mode=0o700)
+        outside_staging = outside_parent / ".cc-writes"
+        outside_staging.mkdir(mode=0o700)
+        (self.review.workspace_root / ".claude").symlink_to(
+            outside_parent,
+            target_is_directory=True,
+        )
+
+        with self.assertRaises(ReviewError):
+            providers._remove_claude_bash_staging_directory(
+                self.review,
+                baseline=baseline,
+            )
+
+        self.assertTrue(outside_staging.is_dir())
+        self.assertTrue((self.review.workspace_root / ".claude").is_symlink())
+
+    def test_claude_bash_staging_cleanup_rejects_replaced_existing_parent(
+        self,
+    ) -> None:
+        source_parent = self.review.source_root / ".claude"
+        source_parent.mkdir(mode=0o755)
+        (source_parent / "review-policy.txt").write_text(
+            "snapshotted\n",
+            encoding="utf-8",
+        )
+        handed_off: list[ReviewWorkspace] = []
+        review = workspace_runtime.prepare_workspace(
+            repo=self.review.source_root,
+            base_ref=self.review.base_ref,
+            head_ref=self.review.head_ref,
+            include_source_wip=True,
+            ownership_handoff=handed_off.append,
+        )
+        self.assertEqual(handed_off, [review])
+        baseline = providers._claude_bash_staging_baseline(review)
+        self.assertTrue(baseline.staging_was_absent)
+        self.assertIsNotNone(baseline.parent_identity)
+        parent = review.workspace_root / ".claude"
+        moved_parent = pathlib.Path(self.temporary.name) / "moved-claude-parent"
+        parent.rename(moved_parent)
+        parent.mkdir(mode=0o755)
+        (parent / "review-policy.txt").write_text(
+            "snapshotted\n",
+            encoding="utf-8",
+        )
+        staging = parent / ".cc-writes"
+        staging.mkdir(mode=0o700)
+
+        with self.assertRaisesRegex(ReviewError, "changed after launch"):
+            providers._remove_claude_bash_staging_directory(
+                review,
+                baseline=baseline,
+            )
+
+        self.assertTrue(staging.is_dir())
+        staging.rmdir()
+        workspace_runtime.validate_external_workspace(review)
+        self.assertIsNone(
+            workspace_runtime.cleanup_workspace(review, keep_container=False)
+        )
+
+    def test_claude_bash_staging_cleanup_rejects_parent_replaced_mid_cleanup(
+        self,
+    ) -> None:
+        baseline = providers._claude_bash_staging_baseline(self.review)
+        parent = self.review.workspace_root / ".claude"
+        parent.mkdir(mode=0o755)
+        staging = parent / ".cc-writes"
+        staging.mkdir(mode=0o700)
+        moved_parent = pathlib.Path(self.temporary.name) / "mid-cleanup-parent"
+        real_rmdir = os.rmdir
+        replaced = False
+
+        def replace_parent_before_staging_removal(
+            path: str,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            nonlocal replaced
+            if path == ".cc-writes" and not replaced:
+                parent.rename(moved_parent)
+                parent.mkdir(mode=0o755)
+                replaced = True
+            real_rmdir(path, *args, **kwargs)
+
+        with mock.patch.object(
+            providers.os,
+            "rmdir",
+            side_effect=replace_parent_before_staging_removal,
+        ):
+            with self.assertRaisesRegex(ReviewError, "changed during cleanup"):
+                providers._remove_claude_bash_staging_directory(
+                    self.review,
+                    baseline=baseline,
+                )
+
+        self.assertTrue(replaced)
+        self.assertTrue(moved_parent.is_dir())
+        self.assertFalse((moved_parent / ".cc-writes").exists())
+        self.assertTrue(parent.is_dir())
+        parent.rmdir()
+        workspace_runtime.validate_external_workspace(self.review)
+
+    def test_claude_bash_staging_cleanup_rejects_final_parent_swap(self) -> None:
+        baseline = providers._claude_bash_staging_baseline(self.review)
+        parent = self.review.workspace_root / ".claude"
+        parent.mkdir(mode=0o755)
+        (parent / ".cc-writes").mkdir(mode=0o700)
+        moved_parent = pathlib.Path(self.temporary.name) / "final-parent"
+        real_rename = os.rename
+        swapped = False
+
+        def replace_parent_before_quarantine(
+            source: str,
+            destination: str,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            nonlocal swapped
+            if source == ".claude" and not swapped:
+                real_rename(parent, moved_parent)
+                parent.mkdir(mode=0o755)
+                swapped = True
+            real_rename(source, destination, *args, **kwargs)
+
+        with mock.patch.object(
+            providers.os,
+            "rename",
+            side_effect=replace_parent_before_quarantine,
+        ):
+            with self.assertRaisesRegex(
+                ReviewError,
+                "changed before quarantine removal",
+            ):
+                providers._remove_claude_bash_staging_directory(
+                    self.review,
+                    baseline=baseline,
+                )
+
+        self.assertTrue(swapped)
+        self.assertTrue(moved_parent.is_dir())
+        self.assertFalse((moved_parent / ".cc-writes").exists())
+        self.assertFalse(parent.exists())
+        quarantine_roots = list(
+            self.review.container_dir.glob(".claude-bash-staging-quarantine-*")
+        )
+        self.assertEqual(len(quarantine_roots), 1)
+        quarantined_parent = quarantine_roots[0] / "parent"
+        self.assertTrue(quarantined_parent.is_dir())
+        quarantined_parent.rmdir()
+        quarantine_roots[0].rmdir()
+        workspace_runtime.validate_external_workspace(self.review)
+
+    def test_claude_bash_staging_cleanup_skips_snapshotted_directory(
+        self,
+    ) -> None:
+        source_staging = self.review.source_root / ".claude" / ".cc-writes"
+        source_staging.mkdir(parents=True, mode=0o700)
+        tracked = source_staging / "tracked.txt"
+        tracked.write_text("snapshotted\n", encoding="utf-8")
+        self._git(self.review.source_root, "add", "-f", str(tracked))
+        handed_off: list[ReviewWorkspace] = []
+        review = workspace_runtime.prepare_workspace(
+            repo=self.review.source_root,
+            base_ref=self.review.base_ref,
+            head_ref=self.review.head_ref,
+            include_source_wip=True,
+            ownership_handoff=handed_off.append,
+        )
+        self.assertEqual(handed_off, [review])
+
+        baseline = providers._claude_bash_staging_baseline(review)
+        self.assertFalse(baseline.staging_was_absent)
+        self.assertEqual(
+            providers._remove_claude_bash_staging_directory(
+                review,
+                baseline=baseline,
+            ),
+            "preexisting-not-removed",
+        )
+        self.assertEqual(
+            (
+                review.workspace_root / ".claude" / ".cc-writes" / "tracked.txt"
+            ).read_text(encoding="utf-8"),
+            "snapshotted\n",
+        )
+        workspace_runtime.validate_external_workspace(review)
+        self.assertIsNone(
+            workspace_runtime.cleanup_workspace(review, keep_container=False)
+        )
+
+    def test_claude_bash_staging_cleanup_rejects_replaced_preexisting_parent(
+        self,
+    ) -> None:
+        source_staging = self.review.source_root / ".claude" / ".cc-writes"
+        source_staging.mkdir(parents=True, mode=0o700)
+        tracked = source_staging / "tracked.txt"
+        tracked.write_text("snapshotted\n", encoding="utf-8")
+        self._git(self.review.source_root, "add", "-f", str(tracked))
+        handed_off: list[ReviewWorkspace] = []
+        review = workspace_runtime.prepare_workspace(
+            repo=self.review.source_root,
+            base_ref=self.review.base_ref,
+            head_ref=self.review.head_ref,
+            include_source_wip=True,
+            ownership_handoff=handed_off.append,
+        )
+        self.assertEqual(handed_off, [review])
+        baseline = providers._claude_bash_staging_baseline(review)
+        self.assertFalse(baseline.staging_was_absent)
+        self.assertIsNotNone(baseline.parent_identity)
+        parent = review.workspace_root / ".claude"
+        moved_parent = pathlib.Path(self.temporary.name) / "preexisting-parent"
+        parent.rename(moved_parent)
+        replacement_staging = parent / ".cc-writes"
+        replacement_staging.mkdir(parents=True, mode=0o700)
+        (replacement_staging / "tracked.txt").write_text(
+            "snapshotted\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ReviewError, "changed after launch"):
+            providers._remove_claude_bash_staging_directory(
+                review,
+                baseline=baseline,
+            )
+
+        self.assertEqual(
+            (replacement_staging / "tracked.txt").read_text(encoding="utf-8"),
+            "snapshotted\n",
+        )
+        workspace_runtime.validate_external_workspace(review)
+        self.assertIsNone(
+            workspace_runtime.cleanup_workspace(review, keep_container=False)
+        )
+
+    def test_claude_bash_staging_cleanup_rechecks_preexisting_parent_path(
+        self,
+    ) -> None:
+        source_staging = self.review.source_root / ".claude" / ".cc-writes"
+        source_staging.mkdir(parents=True, mode=0o700)
+        tracked = source_staging / "tracked.txt"
+        tracked.write_text("snapshotted\n", encoding="utf-8")
+        self._git(self.review.source_root, "add", "-f", str(tracked))
+        handed_off: list[ReviewWorkspace] = []
+        review = workspace_runtime.prepare_workspace(
+            repo=self.review.source_root,
+            base_ref=self.review.base_ref,
+            head_ref=self.review.head_ref,
+            include_source_wip=True,
+            ownership_handoff=handed_off.append,
+        )
+        self.assertEqual(handed_off, [review])
+        baseline = providers._claude_bash_staging_baseline(review)
+        self.assertFalse(baseline.staging_was_absent)
+        self.assertIsNotNone(baseline.parent_identity)
+        parent = review.workspace_root / ".claude"
+        moved_parent = pathlib.Path(self.temporary.name) / "opened-parent"
+        real_fstat = os.fstat
+        replaced = False
+
+        def replace_parent_after_open(descriptor: int) -> os.stat_result:
+            nonlocal replaced
+            metadata = real_fstat(descriptor)
+            if (
+                not replaced
+                and providers._claude_directory_identity(metadata)
+                == baseline.parent_identity
+            ):
+                parent.rename(moved_parent)
+                replacement_staging = parent / ".cc-writes"
+                replacement_staging.mkdir(parents=True, mode=0o700)
+                (replacement_staging / "tracked.txt").write_text(
+                    "snapshotted\n",
+                    encoding="utf-8",
+                )
+                replaced = True
+            return metadata
+
+        with mock.patch.object(
+            providers.os,
+            "fstat",
+            side_effect=replace_parent_after_open,
+        ):
+            with self.assertRaisesRegex(ReviewError, "changed during cleanup"):
+                providers._remove_claude_bash_staging_directory(
+                    review,
+                    baseline=baseline,
+                )
+
+        self.assertTrue(replaced)
+        workspace_runtime.validate_external_workspace(review)
+        self.assertIsNone(
+            workspace_runtime.cleanup_workspace(review, keep_container=False)
+        )
+
+    def test_claude_bash_staging_cleanup_skips_snapshotted_symlink(self) -> None:
+        source_parent = self.review.source_root / ".claude"
+        source_parent.mkdir(mode=0o755)
+        source_staging = source_parent / ".cc-writes"
+        source_staging.symlink_to("../review-staging-target")
+        self._git(self.review.source_root, "add", "-f", str(source_staging))
+        handed_off: list[ReviewWorkspace] = []
+        review = workspace_runtime.prepare_workspace(
+            repo=self.review.source_root,
+            base_ref=self.review.base_ref,
+            head_ref=self.review.head_ref,
+            include_source_wip=True,
+            ownership_handoff=handed_off.append,
+        )
+        self.assertEqual(handed_off, [review])
+
+        baseline = providers._claude_bash_staging_baseline(review)
+        self.assertFalse(baseline.staging_was_absent)
+        self.assertEqual(
+            providers._remove_claude_bash_staging_directory(
+                review,
+                baseline=baseline,
+            ),
+            "preexisting-not-removed",
+        )
+        materialized = review.workspace_root / ".claude" / ".cc-writes"
+        self.assertTrue(materialized.is_symlink())
+        self.assertEqual(os.readlink(materialized), "../review-staging-target")
+        workspace_runtime.validate_external_workspace(review)
+        self.assertIsNone(
+            workspace_runtime.cleanup_workspace(review, keep_container=False)
         )
 
     @mock.patch.object(providers, "_parse_claude_stream_output_file")
@@ -4679,7 +5166,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 "TMP": str(temporary),
                 "TEMP": str(temporary),
                 "CLAUDE_CODE_TMPDIR": str(temporary),
-                "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
+                "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "0",
             },
             executable=pathlib.Path("/bin/claude"),
         )
@@ -4750,7 +5237,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 "TMP": str(temporary),
                 "TEMP": str(temporary),
                 "CLAUDE_CODE_TMPDIR": str(temporary),
-                "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
+                "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "0",
             },
             executable=pathlib.Path("/bin/claude"),
         )

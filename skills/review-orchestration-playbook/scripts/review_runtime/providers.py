@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import pathlib
@@ -476,6 +477,12 @@ class ClaudeAuthenticationEvidence:
     api_provider: str
     auth_method: str
     api_key_source: str | None
+
+
+@dataclass(frozen=True)
+class ClaudeBashStagingBaseline:
+    staging_was_absent: bool
+    parent_identity: tuple[int, int, int, int] | None
 
 
 def _merge_runtime_report(
@@ -988,6 +995,8 @@ def _claude_preflight_probe_environment(
     return {
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         "CLAUDE_CODE_SAFE_MODE": "1",
+        # These probes are credential-free and never enter a model-backed
+        # permission mode, so the CLI's subprocess scrub is compatible here.
         "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
         "HOME": str(home),
         "LANG": "C",
@@ -2295,6 +2304,319 @@ def _claude_review_prompt(
     return projected
 
 
+def _claude_directory_open_flags() -> int:
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    no_follow_flag = getattr(os, "O_NOFOLLOW", None)
+    if directory_flag is None or no_follow_flag is None:
+        raise ReviewError(
+            "host does not support no-follow Claude staging directory inspection"
+        )
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | directory_flag
+        | no_follow_flag
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+
+
+def _claude_directory_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+    )
+
+
+def _claude_bash_staging_baseline(
+    review: ReviewWorkspace,
+) -> ClaudeBashStagingBaseline:
+    """Capture the exact staging and parent identity before Claude starts."""
+
+    workspace_descriptor: int | None = None
+    parent_descriptor: int | None = None
+    try:
+        workspace_descriptor = os.open(
+            review.workspace_root,
+            _claude_directory_open_flags(),
+        )
+        try:
+            parent_descriptor = os.open(
+                ".claude",
+                _claude_directory_open_flags(),
+                dir_fd=workspace_descriptor,
+            )
+        except FileNotFoundError:
+            return ClaudeBashStagingBaseline(
+                staging_was_absent=True,
+                parent_identity=None,
+            )
+        except OSError as error:
+            if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                return ClaudeBashStagingBaseline(
+                    staging_was_absent=False,
+                    parent_identity=None,
+                )
+            raise ReviewError("cannot inspect Claude Bash staging parent") from error
+        opened_parent_identity = _claude_directory_identity(os.fstat(parent_descriptor))
+        try:
+            os.stat(
+                ".cc-writes",
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            staging_was_absent = True
+        except OSError as error:
+            raise ReviewError("cannot inspect Claude Bash staging entry") from error
+        else:
+            staging_was_absent = False
+        try:
+            current_parent_identity = _claude_directory_identity(
+                os.stat(
+                    ".claude",
+                    dir_fd=workspace_descriptor,
+                    follow_symlinks=False,
+                )
+            )
+        except FileNotFoundError as error:
+            raise ReviewError(
+                "Claude Bash staging parent disappeared during baseline capture"
+            ) from error
+        if current_parent_identity != opened_parent_identity:
+            raise ReviewError(
+                "Claude Bash staging parent changed during baseline capture"
+            )
+        return ClaudeBashStagingBaseline(
+            staging_was_absent=staging_was_absent,
+            parent_identity=opened_parent_identity,
+        )
+    except ReviewError:
+        raise
+    except OSError as error:
+        raise ReviewError("cannot inspect Claude Bash staging path") from error
+    finally:
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
+        if workspace_descriptor is not None:
+            os.close(workspace_descriptor)
+
+
+def _remove_empty_claude_bash_staging_parent(
+    review: ReviewWorkspace,
+    *,
+    workspace_descriptor: int,
+    parent_descriptor: int,
+    parent_identity: tuple[int, int, int, int],
+) -> None:
+    """Quarantine and remove only the exact opened empty parent directory."""
+
+    if os.listdir(parent_descriptor):
+        return
+    quarantine_root = pathlib.Path(
+        tempfile.mkdtemp(
+            prefix=".claude-bash-staging-quarantine-",
+            dir=review.container_dir,
+        )
+    )
+    quarantine_descriptor: int | None = None
+    try:
+        quarantine_descriptor = os.open(
+            quarantine_root,
+            _claude_directory_open_flags(),
+        )
+        try:
+            os.rename(
+                ".claude",
+                "parent",
+                src_dir_fd=workspace_descriptor,
+                dst_dir_fd=quarantine_descriptor,
+            )
+        except OSError as error:
+            raise ReviewError(
+                "cannot quarantine empty Claude Bash staging parent"
+            ) from error
+        quarantined_identity = _claude_directory_identity(
+            os.stat(
+                "parent",
+                dir_fd=quarantine_descriptor,
+                follow_symlinks=False,
+            )
+        )
+        if quarantined_identity != parent_identity:
+            raise ReviewError(
+                "Claude Bash staging parent changed before quarantine removal"
+            )
+        if os.listdir(parent_descriptor):
+            raise ReviewError("Claude Bash staging parent changed after quarantine")
+        os.rmdir("parent", dir_fd=quarantine_descriptor)
+    finally:
+        if quarantine_descriptor is not None:
+            os.close(quarantine_descriptor)
+        try:
+            quarantine_root.rmdir()
+        except OSError:
+            pass
+
+
+def _remove_claude_bash_staging_directory(
+    review: ReviewWorkspace,
+    *,
+    baseline: ClaudeBashStagingBaseline,
+) -> str:
+    """Remove only a newly created exact empty native-Bash staging path."""
+
+    if not baseline.staging_was_absent and baseline.parent_identity is None:
+        return "preexisting-not-removed"
+    workspace_descriptor: int | None = None
+    parent_descriptor: int | None = None
+    staging_descriptor: int | None = None
+    try:
+        workspace_descriptor = os.open(
+            review.workspace_root,
+            _claude_directory_open_flags(),
+        )
+        try:
+            parent_descriptor = os.open(
+                ".claude",
+                _claude_directory_open_flags(),
+                dir_fd=workspace_descriptor,
+            )
+        except FileNotFoundError:
+            if baseline.parent_identity is not None:
+                raise ReviewError("Claude Bash staging parent disappeared after launch")
+            return "absent"
+        parent_metadata = os.fstat(parent_descriptor)
+        parent_identity = _claude_directory_identity(parent_metadata)
+        if (
+            baseline.parent_identity is not None
+            and parent_identity != baseline.parent_identity
+        ):
+            raise ReviewError("Claude Bash staging parent changed after launch")
+        current_parent_identity = _claude_directory_identity(
+            os.stat(
+                ".claude",
+                dir_fd=workspace_descriptor,
+                follow_symlinks=False,
+            )
+        )
+        if current_parent_identity != parent_identity:
+            raise ReviewError("Claude Bash staging parent changed during cleanup")
+        if not baseline.staging_was_absent:
+            return "preexisting-not-removed"
+        if parent_metadata.st_uid != os.geteuid() or parent_metadata.st_mode & (
+            stat.S_IWGRP | stat.S_IWOTH
+        ):
+            raise ReviewError("Claude Bash staging parent is unsafe")
+        try:
+            staging_descriptor = os.open(
+                ".cc-writes",
+                _claude_directory_open_flags(),
+                dir_fd=parent_descriptor,
+            )
+        except FileNotFoundError:
+            current_parent_identity = _claude_directory_identity(
+                os.stat(
+                    ".claude",
+                    dir_fd=workspace_descriptor,
+                    follow_symlinks=False,
+                )
+            )
+            if current_parent_identity != parent_identity:
+                raise ReviewError(
+                    "Claude Bash staging parent changed before absent return"
+                )
+            return "absent"
+        opened = os.fstat(staging_descriptor)
+        if opened.st_uid != os.geteuid() or stat.S_IMODE(opened.st_mode) != 0o700:
+            raise ReviewError("Claude Bash staging directory is unsafe")
+        if os.listdir(staging_descriptor):
+            raise ReviewError("Claude Bash staging directory is not empty")
+        final = os.fstat(staging_descriptor)
+        if (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_mode,
+            opened.st_uid,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        ) != (
+            final.st_dev,
+            final.st_ino,
+            final.st_mode,
+            final.st_uid,
+            final.st_mtime_ns,
+            final.st_ctime_ns,
+        ):
+            raise ReviewError("Claude Bash staging directory changed during inspection")
+        current = os.stat(
+            ".cc-writes",
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            current.st_dev,
+            current.st_ino,
+            current.st_mode,
+            current.st_uid,
+        ) != (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_mode,
+            opened.st_uid,
+        ):
+            raise ReviewError("Claude Bash staging directory changed before removal")
+        current_parent_identity = _claude_directory_identity(
+            os.stat(
+                ".claude",
+                dir_fd=workspace_descriptor,
+                follow_symlinks=False,
+            )
+        )
+        if current_parent_identity != parent_identity:
+            raise ReviewError(
+                "Claude Bash staging parent changed before staging removal"
+            )
+        os.rmdir(".cc-writes", dir_fd=parent_descriptor)
+        try:
+            current_parent_identity = _claude_directory_identity(
+                os.stat(
+                    ".claude",
+                    dir_fd=workspace_descriptor,
+                    follow_symlinks=False,
+                )
+            )
+        except FileNotFoundError as error:
+            raise ReviewError(
+                "Claude Bash staging parent disappeared during cleanup"
+            ) from error
+        if current_parent_identity != parent_identity:
+            raise ReviewError("Claude Bash staging parent changed during cleanup")
+        if baseline.parent_identity is not None:
+            return "verified-and-removed"
+        _remove_empty_claude_bash_staging_parent(
+            review,
+            workspace_descriptor=workspace_descriptor,
+            parent_descriptor=parent_descriptor,
+            parent_identity=parent_identity,
+        )
+        return "verified-and-removed"
+    except ReviewError:
+        raise
+    except OSError as error:
+        raise ReviewError(
+            "cannot verify and remove Claude Bash staging path"
+        ) from error
+    finally:
+        if staging_descriptor is not None:
+            os.close(staging_descriptor)
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
+        if workspace_descriptor is not None:
+            os.close(workspace_descriptor)
+
+
 def _claude_attempt(
     *,
     review: ReviewWorkspace,
@@ -2352,6 +2674,7 @@ def _claude_attempt(
             "attempt": None,
         },
     )
+    claude_bash_staging_baseline = _claude_bash_staging_baseline(review)
     completed = run(
         (str(executable), *arguments),
         cwd=review.workspace_root,
@@ -2364,7 +2687,12 @@ def _claude_attempt(
         redact_values=output_redact_values(redact_values),
     )
     post_attempt_workspace_verified = True
+    claude_bash_staging_contract = "rejected"
     try:
+        claude_bash_staging_contract = _remove_claude_bash_staging_directory(
+            review,
+            baseline=claude_bash_staging_baseline,
+        )
         validate_external_workspace(review)
     except ReviewError:
         post_attempt_workspace_verified = False
@@ -2437,6 +2765,7 @@ def _claude_attempt(
                 "post_attempt_workspace_contract": (
                     "verified" if post_attempt_workspace_verified else "rejected"
                 ),
+                "claude_bash_staging_contract": claude_bash_staging_contract,
             },
             "sandbox": {
                 "implementation": "claude-native-sandbox",
@@ -2459,6 +2788,7 @@ def _claude_attempt(
                 "returncode": attempt.returncode,
                 "effective_init_contract": runtime_contract_verified,
                 "post_attempt_workspace_contract": (post_attempt_workspace_verified),
+                "claude_bash_staging_contract": claude_bash_staging_contract,
             },
         },
     )
@@ -2768,7 +3098,10 @@ def run_review(
         extra={
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
             "CLAUDE_CODE_SAFE_MODE": "1",
-            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
+            # Claude Code 2.1.212 forces permissionMode=default when this is 1.
+            # Keep plan mode effective and delegate sandboxed-Bash credential
+            # removal to the fail-closed native sandbox credentials policy.
+            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "0",
         },
     )
     claude_env, redact_values = _select_claude_authentication(raw_env)
