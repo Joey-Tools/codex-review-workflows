@@ -17842,6 +17842,75 @@ class ProviderPolicyTest(unittest.TestCase):
             if moved_container.is_dir():
                 moved_container.rename(container)
 
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_container_replacement_during_private_scrub_blocks_launch(
+        self,
+        run_model_chain: mock.Mock,
+        environment: mock.Mock,
+    ) -> None:
+        container = self.review.container_dir
+        moved_container = container.with_name(f"{container.name}-scrubbed")
+        real_unlink = workspace_runtime._unlink_private_review_artifacts
+        stderr = io.StringIO()
+
+        def scrub_then_replace(*args, **kwargs):
+            cleanup_errors = real_unlink(*args, **kwargs)
+            self.assertEqual(cleanup_errors, [])
+            container.rename(moved_container)
+            container.mkdir(mode=0o700)
+            (container / "sentinel").write_text("keep me\n", encoding="utf-8")
+            for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES:
+                (container / name).write_bytes(b"replacement-private-artifact")
+            return cleanup_errors
+
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime,
+                    "_unlink_private_review_artifacts",
+                    side_effect=scrub_then_replace,
+                ),
+                contextlib.redirect_stderr(stderr),
+            ):
+                outcome = providers.run_review(
+                    review=self.review,
+                    reviewer="codex",
+                )
+
+            self.assertEqual(outcome.returncode, 2)
+            run_model_chain.assert_not_called()
+            environment.assert_not_called()
+            self.assertEqual(
+                (container / "sentinel").read_text(encoding="utf-8"),
+                "keep me\n",
+            )
+            for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES:
+                self.assertEqual(
+                    (container / name).read_bytes(),
+                    b"replacement-private-artifact",
+                )
+            self.assertFalse((container / "preflight.json").exists())
+            self.assertFalse((moved_container / "preflight.json").exists())
+            self.assertFalse((container / "runner-error.txt").exists())
+            self.assertFalse((moved_container / "runner-error.txt").exists())
+            self.assertIn(
+                "review egress private artifact cleanup failed",
+                stderr.getvalue(),
+            )
+            self.assertIn("runner diagnostic was not persisted", stderr.getvalue())
+        finally:
+            if container.is_dir():
+                for name in (
+                    "sentinel",
+                    "runner-error.txt",
+                    *workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES,
+                ):
+                    (container / name).unlink(missing_ok=True)
+                container.rmdir()
+            if moved_container.is_dir():
+                moved_container.rename(container)
+
     def test_unknown_reviewer_does_not_write_replaced_container(self) -> None:
         container = self.review.container_dir
         moved_container = container.with_name(f"{container.name}-moved")

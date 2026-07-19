@@ -225,6 +225,16 @@ UNQUOTED_SECRET_ASSIGNMENT = re.compile(
     + GENERIC_SECRET_VALUE_BYTE_CLASS
     + rb")",
 )
+UNQUOTED_SECRET_VALUE = re.compile(
+    rb"((?:"
+    + GENERIC_SECRET_VALUE_BYTE_CLASS
+    + rb"){16,512})(?!"
+    + GENERIC_SECRET_VALUE_BYTE_CLASS
+    + rb")",
+)
+OVERSIZED_UNQUOTED_SECRET_VALUE = re.compile(
+    rb"(?:" + GENERIC_SECRET_VALUE_BYTE_CLASS + rb"){513}"
+)
 OVERSIZED_UNQUOTED_SECRET_ASSIGNMENT = re.compile(
     SECRET_KEY_PATTERN + rb"(?:" + GENERIC_SECRET_VALUE_BYTE_CLASS + rb"){513}"
 )
@@ -2111,10 +2121,24 @@ def remove_private_review_artifacts(
             return ["helper-private artifact removal receipts are incomplete"]
         return []
 
-    return _operate_on_private_review_container(
+    cleanup_error = _operate_on_private_review_container(
         container,
         unlink_bound_artifacts,
     )
+    if cleanup_error:
+        return cleanup_error
+    try:
+        final_state = load_bound_private_cleanup_state(
+            container,
+            expected=expected,
+        )
+    except ReviewError as error:
+        return str(error)
+    if final_state.private_artifacts_removed != frozenset(
+        PRIVATE_HELPER_ARTIFACT_NAMES
+    ):
+        return "helper-private artifact removal receipts are incomplete"
+    return None
 
 
 def write_bound_review_text(
@@ -6103,6 +6127,7 @@ def _secret_assignment_rhs_is_closed(
     literal_rhs_recorder: (
         Callable[[int, int | None, bytes, bytes, int | None], None] | None
     ) = None,
+    unquoted_rhs_recorder: Callable[[int, int | None], None] | None = None,
 ) -> bool:
     if not (
         0
@@ -6125,6 +6150,17 @@ def _secret_assignment_rhs_is_closed(
     rhs_prefix_is_wrapper_only = True
     literal_prefixes = (b"br", b"rb", b"fr", b"rf", b"b", b"f", b"r", b"u")
     continuation_operators = frozenset(b"+-*/%&|^!=<>?:,.`")
+    has_strong_secret_key = (
+        STRONG_SECRET_KEY_NAME_PATTERN.search(value[assignment_start:assignment_end])
+        is not None
+    )
+
+    def unquoted_candidate_is_sensitive(candidate: bytes) -> bool:
+        return (
+            not _is_placeholder_secret(candidate.lower())
+            and not _is_secret_pattern_marker(candidate)
+            and (_looks_like_unquoted_secret(candidate) or has_strong_secret_key)
+        )
 
     assignment_diff_side: int | None = None
     if (
@@ -6172,6 +6208,23 @@ def _secret_assignment_rhs_is_closed(
                 event_budget=event_budget,
                 maximum_end=proof_end,
                 inspection_recorder=record_tail_inspected,
+            )
+        except _IncompleteSecretScanSuffix:
+            return False
+
+    def external_closer_is_proven(closer_start: int) -> bool:
+        try:
+            return _quoted_assignment_may_accept(
+                value,
+                assignment_start=assignment_start,
+                assignment_end=closer_start,
+                prefix_proof_start=prefix_proof_start,
+                diff_surface=diff_surface,
+                prefix_context_complete=prefix_context_complete,
+                suffix_context_complete=True,
+                event_budget=event_budget,
+                maximum_end=closer_start + 1,
+                matching_external_closer_only=True,
             )
         except _IncompleteSecretScanSuffix:
             return False
@@ -6243,18 +6296,20 @@ def _secret_assignment_rhs_is_closed(
                     0x0D,
                     0x20,
                     0x29,
+                    0x2C,
                     0x3B,
                     0x5D,
                     0x7D,
                 ):
                     cursor = placeholder_end
                     record_inspected(cursor)
-                    return finish(
-                        tail_is_proven(
-                            rhs_end=placeholder_end,
-                            required_closers=tuple(reversed(wrapper_closers)),
-                        )
-                    )
+                    if tail_is_proven(
+                        rhs_end=placeholder_end,
+                        required_closers=tuple(reversed(wrapper_closers)),
+                    ):
+                        return finish(True)
+                    rhs_prefix_is_wrapper_only = False
+                    continue
         lowered_prefix = value[cursor : min(cursor + 3, proof_end)].lower()
         literal_prefix_length = 0
         quote = b""
@@ -6318,12 +6373,27 @@ def _secret_assignment_rhs_is_closed(
             closing_end = closing_start + len(delimiter)
             record_inspected(closing_end)
             if not rhs_prefix_is_wrapper_only:
-                return finish(False)
+                literal_prefix_is_valid = False
             tail_closed = tail_is_proven(
                 rhs_end=closing_end,
                 required_closers=tuple(reversed(wrapper_closers)),
             )
-            if literal_rhs_recorder is not None:
+            literal_candidate = value[content_start:closing_start]
+            literal_is_sensitive = (
+                closing_start - content_start >= 16
+                and not _is_placeholder_secret(literal_candidate.lower())
+                and not _is_secret_pattern_marker(literal_candidate)
+                and (
+                    rhs_prefix_is_wrapper_only
+                    or unquoted_candidate_is_sensitive(literal_candidate)
+                )
+            )
+            literal_is_closed = (
+                tail_closed and literal_prefix_is_valid and not wrapper_mismatch
+            )
+            if literal_rhs_recorder is not None and (
+                literal_is_closed or literal_is_sensitive
+            ):
                 literal_rhs_recorder(
                     content_start,
                     closing_start,
@@ -6331,9 +6401,13 @@ def _secret_assignment_rhs_is_closed(
                     value[cursor:delimiter_start],
                     assignment_diff_side,
                 )
-            return finish(
-                tail_closed and literal_prefix_is_valid and not wrapper_mismatch
-            )
+            if literal_is_closed:
+                return finish(True)
+            if literal_is_sensitive:
+                return finish(False)
+            rhs_prefix_is_wrapper_only = False
+            cursor = closing_end
+            continue
         if byte in (0x09, 0x20):
             cursor += 1
             continue
@@ -6344,6 +6418,13 @@ def _secret_assignment_rhs_is_closed(
             cursor += 1
             continue
         if byte in (0x29, 0x5D, 0x7D):
+            if (
+                not wrapper_closers
+                and not wrapper_mismatch
+                and not rhs_prefix_is_wrapper_only
+                and external_closer_is_proven(cursor)
+            ):
+                return finish(True)
             wrapper_token_seen = True
             wrapper_closed_before_literal = True
             if wrapper_closers:
@@ -6403,14 +6484,70 @@ def _secret_assignment_rhs_is_closed(
             )
             if not line_continues:
                 record_inspected(next_cursor)
-                return finish(False)
+                return finish(
+                    tail_is_proven(
+                        rhs_end=cursor,
+                        required_closers=(),
+                    )
+                )
             pending_expression_continuation = (
                 pending_expression_continuation or previous_continues or next_continues
             )
             cursor = logical_next
             continue
         if byte == 0x3B and not wrapper_closers and not wrapper_mismatch:
+            return finish(
+                tail_is_proven(
+                    rhs_end=cursor,
+                    required_closers=(),
+                )
+            )
+        if (
+            byte == 0x2C
+            and not wrapper_mismatch
+            and tail_is_proven(
+                rhs_end=cursor,
+                required_closers=tuple(reversed(wrapper_closers)),
+            )
+        ):
+            return finish(True)
+        oversized_unquoted = OVERSIZED_UNQUOTED_SECRET_VALUE.match(
+            value,
+            cursor,
+            proof_end,
+        )
+        if oversized_unquoted is not None:
+            record_inspected(oversized_unquoted.end())
+            if unquoted_rhs_recorder is not None:
+                unquoted_rhs_recorder(cursor, None)
             return finish(False)
+        unquoted_match = UNQUOTED_SECRET_VALUE.match(
+            value,
+            cursor,
+            proof_end,
+        )
+        if unquoted_match is not None:
+            candidate_start, candidate_end = unquoted_match.span(1)
+            candidate = value[candidate_start:candidate_end]
+            record_inspected(candidate_end)
+            candidate_is_sensitive = unquoted_candidate_is_sensitive(candidate)
+            candidate_is_closed = (
+                rhs_prefix_is_wrapper_only
+                and wrapper_token_seen
+                and not wrapper_closed_before_literal
+                and not wrapper_mismatch
+                and tail_is_proven(
+                    rhs_end=candidate_end,
+                    required_closers=tuple(reversed(wrapper_closers)),
+                )
+            )
+            if candidate_is_closed or candidate_is_sensitive:
+                if unquoted_rhs_recorder is not None:
+                    unquoted_rhs_recorder(candidate_start, candidate_end)
+                return finish(candidate_is_closed)
+            rhs_prefix_is_wrapper_only = False
+            cursor = candidate_end
+            continue
         rhs_prefix_is_wrapper_only = False
         pending_expression_continuation = byte in continuation_operators
         cursor += 1
@@ -6469,6 +6606,7 @@ def _quoted_assignment_may_accept(
     event_budget: SecretScanBudget,
     maximum_end: int | None = None,
     inspection_recorder: Callable[[int], None] | None = None,
+    matching_external_closer_only: bool = False,
 ) -> bool:
     logical_end = len(value) if maximum_end is None else min(len(value), maximum_end)
     if not (
@@ -7132,6 +7270,23 @@ def _quoted_assignment_may_accept(
         outer_quote_pending = outer_delimiter is not None
         external_wrapper_context_loaded = True
         return True
+
+    if matching_external_closer_only:
+        if (
+            required_closers
+            or cursor >= logical_end
+            or value[cursor] not in (0x29, 0x5D, 0x7D)
+            or not load_external_wrapper_context()
+        ):
+            return False
+        if source_wrapper_closers:
+            return value[cursor] == source_wrapper_closers[-1]
+        if outer_quote_pending:
+            return False
+        return (
+            bool(external_wrapper_closers)
+            and value[cursor] == (external_wrapper_closers[-1])
+        )
 
     def external_wrappers_are_closed() -> bool:
         return (
@@ -8256,6 +8411,7 @@ def _iter_secret_events(
             recorded_literal_rhs: list[
                 tuple[int, int | None, bytes, bytes, int | None]
             ] = []
+            recorded_unquoted_rhs: list[tuple[int, int | None]] = []
             assignment_closed = _secret_assignment_rhs_is_closed(
                 value,
                 prefix_proof_start=prefix_proof_start,
@@ -8272,6 +8428,9 @@ def _iter_secret_events(
                     recorded_literal_rhs.append(
                         (start, end, delimiter, prefix, diff_side)
                     )
+                ),
+                unquoted_rhs_recorder=lambda start, end: (
+                    recorded_unquoted_rhs.append((start, end))
                 ),
             )
             if assignment_closed:
@@ -8291,6 +8450,10 @@ def _iter_secret_events(
                         ) = recorded_literal_rhs[-1]
                         if candidate_end is not None:
                             sibling_search_start = candidate_end + len(delimiter)
+                    elif recorded_unquoted_rhs:
+                        _candidate_start, candidate_end = recorded_unquoted_rhs[-1]
+                        if candidate_end is not None:
+                            sibling_search_start = candidate_end
                     else:
                         direct_unquoted = UNQUOTED_SECRET_ASSIGNMENT.match(
                             value,
@@ -8377,6 +8540,61 @@ def _iter_secret_events(
                                     prefix_context_complete=prefix_context_complete,
                                 ),
                             )
+                elif recorded_unquoted_rhs:
+                    candidate_start, candidate_end = recorded_unquoted_rhs[-1]
+                    if candidate_end is None:
+                        raise ReviewError(
+                            "sensitive scanner closed an incomplete unquoted RHS"
+                        )
+                    candidate = value[candidate_start:candidate_end]
+                    closure_end = (
+                        recorded_closure_frontiers[-1]
+                        if recorded_closure_frontiers
+                        else candidate_end
+                    )
+                    has_strong_secret_key = (
+                        STRONG_SECRET_KEY_NAME_PATTERN.search(
+                            value[assignment_match.start() : candidate_start]
+                        )
+                        is not None
+                    )
+                    if (
+                        not _is_placeholder_secret(candidate.lower())
+                        and not _is_secret_pattern_marker(candidate)
+                        and (
+                            _looks_like_unquoted_secret(candidate)
+                            or has_strong_secret_key
+                        )
+                    ):
+                        if end_is_committable(closure_end):
+                            event_budget.consume()
+                            yield (
+                                "generic-secret-assignment",
+                                candidate,
+                                closure_end,
+                                True,
+                                candidate_start,
+                                candidate_end,
+                            )
+                        elif (
+                            maximum_end is not None
+                            and closure_end > maximum_end
+                            and maximum_end > minimum_end
+                        ):
+                            event_budget.consume()
+                            yield (
+                                _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE,
+                                None,
+                                maximum_end,
+                                False,
+                                assignment_match.start(),
+                                _assignment_proof_retention_start(
+                                    value,
+                                    assignment_start=assignment_match.start(),
+                                    diff_surface=diff_surface,
+                                    prefix_context_complete=prefix_context_complete,
+                                ),
+                            )
                 continue
             if recorded_literal_rhs and proof_suffix_context_complete:
                 (
@@ -8397,6 +8615,40 @@ def _iter_secret_events(
                     and not _is_secret_pattern_marker(candidate)
                     and end_is_committable(proof_end)
                 ):
+                    event_budget.consume()
+                    yield (
+                        "generic-secret-assignment",
+                        None,
+                        proof_end,
+                        False,
+                        assignment_match.start(),
+                        None,
+                    )
+                continue
+            if recorded_unquoted_rhs and proof_suffix_context_complete:
+                candidate_start, candidate_end = recorded_unquoted_rhs[-1]
+                candidate = (
+                    value[candidate_start:candidate_end]
+                    if candidate_end is not None
+                    else b""
+                )
+                has_strong_secret_key = (
+                    STRONG_SECRET_KEY_NAME_PATTERN.search(
+                        value[assignment_match.start() : candidate_start]
+                    )
+                    is not None
+                )
+                if (
+                    candidate_end is None
+                    or (
+                        not _is_placeholder_secret(candidate.lower())
+                        and not _is_secret_pattern_marker(candidate)
+                        and (
+                            _looks_like_unquoted_secret(candidate)
+                            or has_strong_secret_key
+                        )
+                    )
+                ) and end_is_committable(proof_end):
                     event_budget.consume()
                     yield (
                         "generic-secret-assignment",
