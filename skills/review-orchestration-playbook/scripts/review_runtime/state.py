@@ -6,10 +6,12 @@ import math
 import os
 import pathlib
 import signal
+import stat
 import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from .common import (
@@ -31,12 +33,18 @@ from .common import (
 from .providers import run_review
 from .workspace import (
     PRIVATE_HELPER_ARTIFACT_NAMES,
+    CleanupIdentity,
+    LegacyReviewWorkspace,
     PrivateCleanupEvidence,
     ReviewWorkspace,
+    cleanup_legacy_workspace,
     cleanup_workspace,
     load_bound_private_cleanup_state,
+    parse_partial_private_cleanup_evidence,
     parse_private_cleanup_evidence,
     prepare_workspace,
+    remove_legacy_private_review_artifacts,
+    remove_partial_review_container,
     remove_private_review_artifacts,
     validate_workspace_layout,
 )
@@ -44,14 +52,40 @@ from .workspace import (
 
 STATE_FILE = "state.json"
 STATE_MARKER = ".isolated-review-state"
+LEGACY_STATE_SCHEMA_VERSION = 1
 STATE_SCHEMA_VERSION = 2
-STATE_MARKER_SCHEMA_VERSION = 2
+LEGACY_STATE_MARKER = b"isolated-review-state-v1\n"
+COMPATIBLE_STATE_MARKER_SCHEMA_VERSION = 2
+STATE_MARKER_SCHEMA_VERSION = 3
+LEGACY_STATE_REQUIRED_FIELDS = frozenset(
+    {
+        "attempts_path",
+        "egress_consent",
+        "final_path",
+        "keep_workspace",
+        "reviewer",
+        "started_at",
+        "stderr_path",
+        "stdout_path",
+        "version",
+        "workspace",
+    }
+)
+LEGACY_STATE_OPTIONAL_FIELDS = frozenset({"pid", "synthetic_secret_exemptions"})
 EXIT_FILE = "exit-code"
 LOCK_FILE = "runner.lock"
 CLEANUP_LOCK_FILE = "cleanup.lock"
 FINAL_CLEANUP_TIMEOUT_SECONDS = 30.0
 RUNNER_SHUTDOWN_GRACE_SECONDS = PROCESS_GROUP_TERM_GRACE_SECONDS * 4
 _STARTED_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
+
+
+@dataclass(frozen=True)
+class LoadedStateMarker:
+    version: int
+    phase: str
+    private_cleanup: PrivateCleanupEvidence | None
+    source_root: pathlib.Path | None
 
 
 def _state_path(state_dir: pathlib.Path) -> pathlib.Path:
@@ -65,53 +99,332 @@ def _state_path(state_dir: pathlib.Path) -> pathlib.Path:
 def _state_marker_payload(review: ReviewWorkspace) -> dict[str, Any]:
     return {
         "container_dir": str(review.container_dir),
+        "phase": "ready",
         "private_cleanup": review.private_cleanup.to_json(),
+        "source_root": str(review.source_root),
         "version": STATE_MARKER_SCHEMA_VERSION,
     }
 
 
+def _preparing_state_marker_payload(
+    container: pathlib.Path,
+    private_cleanup: PrivateCleanupEvidence,
+) -> dict[str, Any]:
+    return {
+        "container_dir": str(container),
+        "phase": "preparing",
+        "private_cleanup": private_cleanup.to_json(),
+        "source_root": str(container.parent.parent),
+        "version": STATE_MARKER_SCHEMA_VERSION,
+    }
+
+
+def _fsync_state_marker_container(
+    container: pathlib.Path,
+    *,
+    expected: CleanupIdentity,
+) -> None:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(container, flags)
+        opened = os.fstat(descriptor)
+        current = os.lstat(container)
+        for metadata in (opened, current):
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or CleanupIdentity(metadata.st_dev, metadata.st_ino) != expected
+            ):
+                raise ReviewError(
+                    "isolated-review state marker container identity changed"
+                )
+        os.fsync(descriptor)
+        final = os.lstat(container)
+        if CleanupIdentity(final.st_dev, final.st_ino) != expected:
+            raise ReviewError("isolated-review state marker container identity changed")
+    except OSError as error:
+        raise ReviewError(
+            f"cannot durably persist isolated-review state marker: {error}"
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _write_state_marker_payload(
+    container: pathlib.Path,
+    payload: dict[str, Any],
+    *,
+    expected: CleanupIdentity,
+) -> None:
+    write_json(container / STATE_MARKER, payload)
+    _fsync_state_marker_container(container, expected=expected)
+
+
+def _write_preparing_state_marker(
+    container: pathlib.Path,
+    private_cleanup: PrivateCleanupEvidence,
+) -> None:
+    _write_state_marker_payload(
+        container,
+        _preparing_state_marker_payload(container, private_cleanup),
+        expected=private_cleanup.container,
+    )
+
+
 def _write_state_marker(review: ReviewWorkspace) -> None:
-    write_json(
-        review.container_dir / STATE_MARKER,
+    _write_state_marker_payload(
+        review.container_dir,
         _state_marker_payload(review),
+        expected=review.private_cleanup.container,
+    )
+
+
+def _reject_duplicate_marker_object(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ReviewError(
+                f"isolated-review state marker has duplicate field: {key}"
+            )
+        value[key] = item
+    return value
+
+
+def _validate_marker_container(
+    raw_container: Any,
+    *,
+    resolved_state_dir: pathlib.Path,
+) -> None:
+    if not isinstance(raw_container, str):
+        raise ReviewError("isolated-review state marker container is invalid")
+    try:
+        marker_container = (
+            pathlib.Path(raw_container).expanduser().resolve(strict=False)
+        )
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ReviewError(
+            "isolated-review state marker container is invalid"
+        ) from error
+    if marker_container != resolved_state_dir:
+        raise ReviewError("isolated-review state marker container is invalid")
+
+
+def _canonical_v3_marker_path(raw_path: Any, *, label: str) -> pathlib.Path:
+    if not isinstance(raw_path, str):
+        raise ReviewError(f"isolated-review state marker {label} is invalid")
+    candidate = pathlib.Path(raw_path)
+    if not candidate.is_absolute():
+        raise ReviewError(f"isolated-review state marker {label} is not canonical")
+    normalized = pathlib.Path(os.path.normpath(os.fspath(candidate)))
+    if candidate != normalized:
+        raise ReviewError(f"isolated-review state marker {label} is not canonical")
+    try:
+        resolved = candidate.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ReviewError(f"isolated-review state marker {label} is invalid") from error
+    if resolved != candidate:
+        raise ReviewError(f"isolated-review state marker {label} is not canonical")
+    return resolved
+
+
+def _validate_v3_marker_layout(
+    raw_source_root: Any,
+    raw_container: Any,
+    *,
+    resolved_state_dir: pathlib.Path,
+) -> pathlib.Path:
+    source_root = _canonical_v3_marker_path(
+        raw_source_root,
+        label="source root",
+    )
+    container = _canonical_v3_marker_path(
+        raw_container,
+        label="container",
+    )
+    if (
+        container != resolved_state_dir
+        or container.parent != source_root / ".codex-tmp"
+        or not container.name.startswith("isolated-review-")
+        or container.name == "isolated-review-"
+    ):
+        raise ReviewError("isolated-review state marker layout is invalid")
+    return source_root
+
+
+def _load_state_marker(state_dir: pathlib.Path) -> LoadedStateMarker:
+    resolved_state_dir = state_dir.expanduser().resolve(strict=False)
+    marker_path = resolved_state_dir / STATE_MARKER
+    try:
+        encoded = marker_path.read_bytes()
+    except OSError as error:
+        raise ReviewError(
+            f"cannot read isolated-review state marker {marker_path}: {error}"
+        ) from error
+    if encoded == LEGACY_STATE_MARKER:
+        return LoadedStateMarker(
+            version=LEGACY_STATE_SCHEMA_VERSION,
+            phase="legacy",
+            private_cleanup=None,
+            source_root=None,
+        )
+    try:
+        marker = json.loads(
+            encoded.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_marker_object,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReviewError("isolated-review state marker is invalid") from error
+    if not isinstance(marker, dict):
+        raise ReviewError("isolated-review state marker is not a JSON object")
+    version = marker.get("version")
+    if type(version) is not int:
+        raise ReviewError("isolated-review state marker version is invalid")
+    if version == COMPATIBLE_STATE_MARKER_SCHEMA_VERSION:
+        if set(marker) != {"container_dir", "private_cleanup", "version"}:
+            raise ReviewError("isolated-review state marker fields are invalid")
+        _validate_marker_container(
+            marker["container_dir"],
+            resolved_state_dir=resolved_state_dir,
+        )
+        return LoadedStateMarker(
+            version=version,
+            phase="ready",
+            private_cleanup=parse_private_cleanup_evidence(marker["private_cleanup"]),
+            source_root=None,
+        )
+    if version != STATE_MARKER_SCHEMA_VERSION:
+        raise ReviewError("isolated-review state marker version is invalid")
+    if set(marker) != {
+        "container_dir",
+        "phase",
+        "private_cleanup",
+        "source_root",
+        "version",
+    }:
+        raise ReviewError("isolated-review state marker fields are invalid")
+    source_root = _validate_v3_marker_layout(
+        marker["source_root"],
+        marker["container_dir"],
+        resolved_state_dir=resolved_state_dir,
+    )
+    phase = marker["phase"]
+    if not isinstance(phase, str) or phase not in {"preparing", "ready"}:
+        raise ReviewError("isolated-review state marker phase is invalid")
+    cleanup_parser = (
+        parse_private_cleanup_evidence
+        if phase == "ready"
+        else parse_partial_private_cleanup_evidence
+    )
+    return LoadedStateMarker(
+        version=version,
+        phase=phase,
+        private_cleanup=cleanup_parser(marker["private_cleanup"]),
+        source_root=source_root,
     )
 
 
 def _load_state_marker_cleanup(
     state_dir: pathlib.Path,
 ) -> PrivateCleanupEvidence:
-    resolved_state_dir = state_dir.expanduser().resolve(strict=False)
-    marker = read_json(resolved_state_dir / STATE_MARKER)
-    if set(marker) != {"container_dir", "private_cleanup", "version"}:
-        raise ReviewError("isolated-review state marker fields are invalid")
-    if marker.get("version") != STATE_MARKER_SCHEMA_VERSION:
-        raise ReviewError("isolated-review state marker version is invalid")
-    container_dir = marker["container_dir"]
-    if (
-        not isinstance(container_dir, str)
-        or pathlib.Path(container_dir).expanduser().resolve(strict=False)
-        != resolved_state_dir
-    ):
-        raise ReviewError("isolated-review state marker container is invalid")
-    return parse_private_cleanup_evidence(marker["private_cleanup"])
+    marker = _load_state_marker(state_dir)
+    if marker.private_cleanup is None:
+        raise ReviewError("legacy isolated-review state marker has no cleanup identity")
+    return marker.private_cleanup
 
 
 def load_state(state_dir: pathlib.Path) -> dict[str, Any]:
     return read_json(_state_path(state_dir))
 
 
+def _validate_legacy_state(
+    state: dict[str, Any],
+    *,
+    state_dir: pathlib.Path,
+) -> None:
+    fields = set(state)
+    if not LEGACY_STATE_REQUIRED_FIELDS <= fields or not fields <= (
+        LEGACY_STATE_REQUIRED_FIELDS | LEGACY_STATE_OPTIONAL_FIELDS
+    ):
+        raise ReviewError("legacy v1 review state fields are invalid")
+    if not isinstance(state["reviewer"], str):
+        raise ReviewError("legacy v1 review state reviewer is invalid")
+    if type(state["keep_workspace"]) is not bool:
+        raise ReviewError("legacy v1 review state keep flag is invalid")
+    if state["egress_consent"] is not None and not isinstance(
+        state["egress_consent"], str
+    ):
+        raise ReviewError("legacy v1 review state egress consent is invalid")
+    if not isinstance(state["workspace"], dict):
+        raise ReviewError("legacy v1 review state workspace is invalid")
+    started_at = state["started_at"]
+    if (
+        type(started_at) not in {int, float}
+        or not math.isfinite(started_at)
+        or started_at < 0
+    ):
+        raise ReviewError("legacy v1 review state start time is invalid")
+    expected_paths = {
+        "attempts_path": state_dir / "attempts.json",
+        "final_path": state_dir / "final.txt",
+        "stderr_path": state_dir / "runner.stderr.log",
+        "stdout_path": state_dir / "runner.stdout.log",
+    }
+    if any(state[field] != str(path) for field, path in expected_paths.items()):
+        raise ReviewError("legacy v1 review state artifact paths are invalid")
+    if "synthetic_secret_exemptions" in state:
+        exemptions = state["synthetic_secret_exemptions"]
+        if not isinstance(exemptions, list) or any(
+            not isinstance(item, str) for item in exemptions
+        ):
+            raise ReviewError(
+                "legacy v1 review state synthetic secret exemptions are invalid"
+            )
+    if "pid" in state and (type(state["pid"]) is not int or state["pid"] <= 0):
+        raise ReviewError("legacy v1 review state pid is invalid")
+
+
 def load_review_state(
     state_dir: pathlib.Path,
-) -> tuple[dict[str, Any], ReviewWorkspace]:
+) -> tuple[dict[str, Any], ReviewWorkspace | LegacyReviewWorkspace]:
     resolved_state_dir = state_dir.expanduser().resolve()
+    marker = _load_state_marker(resolved_state_dir)
     state = load_state(resolved_state_dir)
-    if state.get("version") != STATE_SCHEMA_VERSION:
+    version = state.get("version")
+    if type(version) is not int or version not in {
+        LEGACY_STATE_SCHEMA_VERSION,
+        STATE_SCHEMA_VERSION,
+    }:
         raise ReviewError("review state version is invalid")
+    if version == LEGACY_STATE_SCHEMA_VERSION:
+        if marker.version != LEGACY_STATE_SCHEMA_VERSION:
+            raise ReviewError("review state and marker versions are inconsistent")
+        _validate_legacy_state(state, state_dir=resolved_state_dir)
+        workspace_type = LegacyReviewWorkspace
+    else:
+        if (
+            marker.version
+            not in {
+                COMPATIBLE_STATE_MARKER_SCHEMA_VERSION,
+                STATE_MARKER_SCHEMA_VERSION,
+            }
+            or marker.phase != "ready"
+        ):
+            raise ReviewError("review state and marker versions are inconsistent")
+        workspace_type = ReviewWorkspace
     review_value = state.get("workspace")
     if not isinstance(review_value, dict):
         raise ReviewError("review state does not contain a workspace object")
     try:
-        review = ReviewWorkspace.from_json(review_value)
+        review = workspace_type.from_json(review_value)
     except (KeyError, TypeError, ValueError, ReviewError) as error:
         raise ReviewError(
             f"review state contains an invalid workspace: {error}"
@@ -119,7 +432,11 @@ def load_review_state(
     validate_workspace_layout(review)
     if review.container_dir.resolve(strict=False) != resolved_state_dir:
         raise ReviewError("review state container does not match its state directory")
-    marker_cleanup = _load_state_marker_cleanup(resolved_state_dir)
+    if isinstance(review, LegacyReviewWorkspace):
+        return state, review
+    marker_cleanup = marker.private_cleanup
+    if marker_cleanup is None:
+        raise ReviewError("review state marker cleanup identity is missing")
     if marker_cleanup != review.private_cleanup:
         raise ReviewError(
             "review state cleanup identity does not match its state marker"
@@ -203,6 +520,7 @@ def start(
     process: subprocess.Popen[bytes] | None = None
     review: ReviewWorkspace | None = None
     lock_handle = None
+    lock_container: pathlib.Path | None = None
     pending_signal: signal.Signals | None = None
     spawning = False
     published = False
@@ -228,8 +546,83 @@ def start(
             previous_handlers[forwarded] = signal.getsignal(forwarded)
             signal.signal(forwarded, forward_signal)
 
+    def ensure_preparation_lock(container: pathlib.Path) -> None:
+        nonlocal lock_container, lock_handle
+        lock_path = container / LOCK_FILE
+        if lock_handle is not None:
+            if lock_container != container:
+                raise ReviewError(
+                    "workspace preparation lock container changed during handoff"
+                )
+            opened = os.fstat(lock_handle.fileno())
+            try:
+                current = os.lstat(lock_path)
+            except OSError as error:
+                raise ReviewError(
+                    f"workspace preparation lock changed during handoff: {error}"
+                ) from error
+            if CleanupIdentity(opened.st_dev, opened.st_ino) != CleanupIdentity(
+                current.st_dev,
+                current.st_ino,
+            ):
+                raise ReviewError("workspace preparation lock changed during handoff")
+            return
+
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor: int | None = None
+        candidate = None
+        try:
+            descriptor = os.open(lock_path, flags, 0o600)
+            candidate = os.fdopen(descriptor, "w+b")
+            descriptor = None
+            opened = os.fstat(candidate.fileno())
+            current = os.lstat(lock_path)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or opened.st_uid != os.geteuid()
+                or opened.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                or CleanupIdentity(opened.st_dev, opened.st_ino)
+                != CleanupIdentity(current.st_dev, current.st_ino)
+            ):
+                raise ReviewError("workspace preparation lock is invalid")
+            fcntl.flock(candidate.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_handle = candidate
+            lock_container = container
+            candidate = None
+        except OSError as error:
+            raise ReviewError(
+                f"cannot acquire workspace preparation lock {lock_path}: {error}"
+            ) from error
+        finally:
+            if candidate is not None:
+                candidate.close()
+            elif descriptor is not None:
+                os.close(descriptor)
+
+    def accept_preparation_cleanup(
+        container: pathlib.Path,
+        private_cleanup: PrivateCleanupEvidence,
+    ) -> None:
+        ensure_preparation_lock(container)
+        _write_preparing_state_marker(container, private_cleanup)
+
     def accept_workspace(prepared: ReviewWorkspace) -> None:
         nonlocal review
+        if lock_handle is None:
+            accept_preparation_cleanup(
+                prepared.container_dir,
+                prepared.private_cleanup,
+            )
+        else:
+            ensure_preparation_lock(prepared.container_dir)
+        _write_state_marker(prepared)
         review = prepared
 
     try:
@@ -238,13 +631,13 @@ def start(
             base_ref=base_ref,
             head_ref=head_ref,
             ownership_handoff=accept_workspace,
+            preparation_cleanup_handoff=accept_preparation_cleanup,
             synthetic_secret_exemptions=synthetic_secret_exemptions,
             prompt_override=prompt_file,
         )
         if review is None:
             raise ReviewError("workspace ownership handoff did not complete")
         state_dir = review.container_dir
-        _write_state_marker(review)
         stdout_path = state_dir / "runner.stdout.log"
         stderr_path = state_dir / "runner.stderr.log"
         state: dict[str, Any] = {
@@ -261,9 +654,8 @@ def start(
             "started_at": time.time(),
         }
         write_json(state_dir / STATE_FILE, state)
-        lock_path = state_dir / LOCK_FILE
-        lock_handle = lock_path.open("wb")
-        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if lock_handle is None or lock_container != state_dir:
+            raise ReviewError("workspace preparation lock handoff did not complete")
         with (
             stdout_path.open("wb") as stdout_handle,
             stderr_path.open("wb") as stderr_handle,
@@ -392,6 +784,10 @@ def run_state(
     try:
         state, review = load_review_state(state_dir)
         state_loaded = True
+        if isinstance(review, LegacyReviewWorkspace):
+            raise ReviewError(
+                "legacy v1 review state cannot be resumed; start a new review"
+            )
         unblock_forwarded_signals()
         reviewer = state.get("reviewer")
         if not isinstance(reviewer, str):
@@ -517,7 +913,7 @@ def _should_retain_fallback_workspace(
     *,
     state_dir: pathlib.Path,
     state: dict[str, Any],
-    review: ReviewWorkspace,
+    review: ReviewWorkspace | LegacyReviewWorkspace,
     exit_code: int | None,
 ) -> bool:
     if (
@@ -528,18 +924,28 @@ def _should_retain_fallback_workspace(
         return False
     try:
         preflight = read_json(state_dir / "preflight.json")
+    except ReviewError:
+        return False
+    if isinstance(review, LegacyReviewWorkspace):
+        return (
+            preflight.get("review_range") == f"{review.base_ref}..{review.head_ref}"
+            and preflight.get("status")
+            == "sensitive-content and escaping-symlink checks passed"
+        )
+    preflight_matches = (
+        preflight.get("review_range") == f"{review.base_ref}..{review.head_ref}"
+        and preflight.get("private_artifacts") == "removed"
+        and preflight.get("status") == "secret-delta and escaping-symlink checks passed"
+    )
+    try:
         cleanup_state = load_bound_private_cleanup_state(
             review.container_dir,
             expected=review.private_cleanup,
         )
     except ReviewError:
         return False
-    return (
-        preflight.get("review_range") == f"{review.base_ref}..{review.head_ref}"
-        and preflight.get("private_artifacts") == "removed"
-        and preflight.get("status") == "secret-delta and escaping-symlink checks passed"
-        and cleanup_state.private_artifacts_removed
-        == frozenset(PRIVATE_HELPER_ARTIFACT_NAMES)
+    return preflight_matches and cleanup_state.private_artifacts_removed == frozenset(
+        PRIVATE_HELPER_ARTIFACT_NAMES
     )
 
 
@@ -614,15 +1020,38 @@ def _cleanup_terminal_workspace(
                 if not force or not (state_dir / STATE_MARKER).is_file():
                     raise
                 try:
-                    marker_cleanup = _load_state_marker_cleanup(state_dir)
+                    marker = _load_state_marker(state_dir)
                 except ReviewError as marker_error:
                     raise ReviewError(
                         f"{state_error}; private artifact cleanup identity failed: "
                         f"{marker_error}"
                     ) from state_error
+                state_path = state_dir / STATE_FILE
+                if (
+                    marker.version == STATE_MARKER_SCHEMA_VERSION
+                    and marker.phase in {"preparing", "ready"}
+                    and marker.private_cleanup is not None
+                    and not os.path.lexists(state_path)
+                ):
+                    partial_cleanup_error = remove_partial_review_container(
+                        state_dir,
+                        expected=marker.private_cleanup,
+                    )
+                    if partial_cleanup_error:
+                        raise ReviewError(
+                            f"{state_error}; partial container cleanup failed: "
+                            f"{partial_cleanup_error}"
+                        ) from state_error
+                    return 0
+                if marker.version == LEGACY_STATE_SCHEMA_VERSION:
+                    raise ReviewError(
+                        f"{state_error}; legacy v1 state requires manual recovery"
+                    ) from state_error
+                if marker.phase != "ready" or marker.private_cleanup is None:
+                    raise
                 private_cleanup_error = remove_private_review_artifacts(
                     state_dir,
-                    expected=marker_cleanup,
+                    expected=marker.private_cleanup,
                 )
                 if private_cleanup_error:
                     raise ReviewError(
@@ -640,10 +1069,13 @@ def _cleanup_terminal_workspace(
             )
             should_keep = not force and (keep_workspace or retain_for_fallback)
             if should_keep:
-                cleanup_error = remove_private_review_artifacts(
-                    review.container_dir,
-                    expected=review.private_cleanup,
-                )
+                if isinstance(review, LegacyReviewWorkspace):
+                    cleanup_error = remove_legacy_private_review_artifacts(review)
+                else:
+                    cleanup_error = remove_private_review_artifacts(
+                        review.container_dir,
+                        expected=review.private_cleanup,
+                    )
                 cleanup_completed = True
             else:
                 cleanup_completed, cleanup_error = _cleanup_before_deadline(
@@ -683,15 +1115,25 @@ def _acquire_cleanup_lock(handle, *, deadline: float | None) -> bool:
             time.sleep(0.05 if remaining is None else min(0.05, max(0.0, remaining)))
 
 
+def _cleanup_review_workspace(
+    review: ReviewWorkspace | LegacyReviewWorkspace,
+    *,
+    keep_container: bool,
+) -> str | None:
+    if isinstance(review, LegacyReviewWorkspace):
+        return cleanup_legacy_workspace(review, keep_container=keep_container)
+    return cleanup_workspace(review, keep_container=keep_container)
+
+
 def _cleanup_before_deadline(
-    review: ReviewWorkspace,
+    review: ReviewWorkspace | LegacyReviewWorkspace,
     *,
     deadline: float | None,
     cleanup_lock_fd: int,
     lock_handoff: Callable[[], None],
 ) -> tuple[bool, str | None]:
     if deadline is None:
-        return True, cleanup_workspace(review, keep_container=True)
+        return True, _cleanup_review_workspace(review, keep_container=True)
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         return False, None

@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1677,6 +1678,582 @@ class WorkspaceTest(unittest.TestCase):
         review_root = self.repo / ".codex-tmp"
         self.assertEqual(list(review_root.glob("isolated-review-*")), [])
 
+    def test_preparation_cleanup_handoff_precedes_private_bytes(self) -> None:
+        observed_artifacts: set[str] = set()
+        handoff_sizes: list[int] = []
+
+        def capture_handoff(
+            container: pathlib.Path,
+            evidence: workspace_runtime.PrivateCleanupEvidence,
+        ) -> None:
+            new_artifacts = set(evidence.artifacts) - observed_artifacts
+            if not evidence.artifacts:
+                self.assertEqual(list(container.iterdir()), [])
+            else:
+                self.assertEqual(len(new_artifacts), 1)
+                name = new_artifacts.pop()
+                path = container / name
+                metadata = path.stat()
+                self.assertEqual(metadata.st_size, 0)
+                self.assertEqual(
+                    evidence.artifacts[name],
+                    workspace_runtime.CleanupIdentity(
+                        device=metadata.st_dev,
+                        inode=metadata.st_ino,
+                    ),
+                )
+            observed_artifacts.update(evidence.artifacts)
+            handoff_sizes.append(len(evidence.artifacts))
+
+        review = _prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+            ownership_handoff=lambda prepared: self.reviews.append(prepared),
+            preparation_cleanup_handoff=capture_handoff,
+        )
+
+        self.assertEqual(handoff_sizes, [0, 1, 2])
+        self.assertEqual(self.reviews, [review])
+        self.assertTrue(
+            all(
+                (review.container_dir / name).stat().st_size > 0
+                for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
+            )
+        )
+
+    def test_container_directory_entries_are_durable_before_handoff(self) -> None:
+        self.assertFalse((self.repo / ".codex-tmp").exists())
+        source_identity = (
+            self.repo.stat().st_dev,
+            self.repo.stat().st_ino,
+        )
+        events: list[str] = []
+        captured = []
+        real_fsync = os.fsync
+
+        def record_directory_fsync(descriptor: int) -> None:
+            metadata = os.fstat(descriptor)
+            identity = (metadata.st_dev, metadata.st_ino)
+            if stat.S_ISDIR(metadata.st_mode):
+                if identity == source_identity:
+                    events.append("source-root-fsync")
+                else:
+                    review_root = self.repo / ".codex-tmp"
+                    if review_root.is_dir():
+                        root_metadata = review_root.stat()
+                        if identity == (root_metadata.st_dev, root_metadata.st_ino):
+                            events.append("review-root-fsync")
+            real_fsync(descriptor)
+
+        def capture_handoff(
+            _container: pathlib.Path,
+            evidence: workspace_runtime.PrivateCleanupEvidence,
+        ) -> None:
+            if not evidence.artifacts:
+                events.append("initial-handoff")
+                self.assertEqual(
+                    events,
+                    [
+                        "source-root-fsync",
+                        "review-root-fsync",
+                        "initial-handoff",
+                    ],
+                )
+
+        with mock.patch.object(
+            workspace_runtime.os,
+            "fsync",
+            side_effect=record_directory_fsync,
+        ):
+            review = _prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+                ownership_handoff=captured.append,
+                preparation_cleanup_handoff=capture_handoff,
+            )
+
+        self.reviews.append(review)
+        self.assertEqual(captured, [review])
+
+    def test_review_root_creation_race_fsyncs_source_before_handoff(self) -> None:
+        source_identity = (
+            self.repo.stat().st_dev,
+            self.repo.stat().st_ino,
+        )
+        real_stat = os.stat
+        real_mkdir = os.mkdir
+        real_fsync = os.fsync
+        initial_missing_injected = False
+        racing_create_injected = False
+        events: list[str] = []
+        captured = []
+
+        def race_stat(
+            path: os.PathLike[str] | str,
+            *args: object,
+            **kwargs: object,
+        ) -> os.stat_result:
+            nonlocal initial_missing_injected
+            if (
+                not initial_missing_injected
+                and path == ".codex-tmp"
+                and kwargs.get("dir_fd") is not None
+                and kwargs.get("follow_symlinks") is False
+            ):
+                initial_missing_injected = True
+                raise FileNotFoundError(
+                    errno.ENOENT,
+                    os.strerror(errno.ENOENT),
+                    ".codex-tmp",
+                )
+            return real_stat(path, *args, **kwargs)
+
+        def race_mkdir(
+            path: os.PathLike[str] | str,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> None:
+            nonlocal racing_create_injected
+            if (
+                path == ".codex-tmp"
+                and dir_fd is not None
+                and not racing_create_injected
+            ):
+                real_mkdir(path, mode=mode, dir_fd=dir_fd)
+                racing_create_injected = True
+                raise FileExistsError(
+                    errno.EEXIST,
+                    os.strerror(errno.EEXIST),
+                    ".codex-tmp",
+                )
+            real_mkdir(path, mode=mode, dir_fd=dir_fd)
+
+        def record_directory_fsync(descriptor: int) -> None:
+            metadata = os.fstat(descriptor)
+            identity = (metadata.st_dev, metadata.st_ino)
+            if identity == source_identity:
+                events.append("source-root-fsync")
+            else:
+                review_root = self.repo / ".codex-tmp"
+                if review_root.is_dir():
+                    root_metadata = real_stat(review_root)
+                    if identity == (root_metadata.st_dev, root_metadata.st_ino):
+                        events.append("review-root-fsync")
+            real_fsync(descriptor)
+
+        def capture_handoff(
+            container: pathlib.Path,
+            evidence: workspace_runtime.PrivateCleanupEvidence,
+        ) -> None:
+            if not evidence.artifacts:
+                self.assertEqual(list(container.iterdir()), [])
+                events.append("initial-handoff")
+                self.assertEqual(
+                    events,
+                    [
+                        "source-root-fsync",
+                        "review-root-fsync",
+                        "initial-handoff",
+                    ],
+                )
+
+        with (
+            mock.patch.object(
+                workspace_runtime.os,
+                "stat",
+                side_effect=race_stat,
+            ),
+            mock.patch.object(
+                workspace_runtime.os,
+                "mkdir",
+                side_effect=race_mkdir,
+            ),
+            mock.patch.object(
+                workspace_runtime.os,
+                "fsync",
+                side_effect=record_directory_fsync,
+            ),
+        ):
+            review = _prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+                ownership_handoff=captured.append,
+                preparation_cleanup_handoff=capture_handoff,
+            )
+
+        self.reviews.append(review)
+        self.assertTrue(initial_missing_injected)
+        self.assertTrue(racing_create_injected)
+        self.assertEqual(captured, [review])
+
+    def test_review_root_creation_race_fsync_failure_fails_closed(self) -> None:
+        source_identity = (
+            self.repo.stat().st_dev,
+            self.repo.stat().st_ino,
+        )
+        real_stat = os.stat
+        real_mkdir = os.mkdir
+        real_fsync = os.fsync
+        initial_missing_injected = False
+        racing_create_injected = False
+        handoff = mock.Mock()
+
+        def race_stat(
+            path: os.PathLike[str] | str,
+            *args: object,
+            **kwargs: object,
+        ) -> os.stat_result:
+            nonlocal initial_missing_injected
+            if (
+                not initial_missing_injected
+                and path == ".codex-tmp"
+                and kwargs.get("dir_fd") is not None
+                and kwargs.get("follow_symlinks") is False
+            ):
+                initial_missing_injected = True
+                raise FileNotFoundError(
+                    errno.ENOENT,
+                    os.strerror(errno.ENOENT),
+                    ".codex-tmp",
+                )
+            return real_stat(path, *args, **kwargs)
+
+        def race_mkdir(
+            path: os.PathLike[str] | str,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> None:
+            nonlocal racing_create_injected
+            if (
+                path == ".codex-tmp"
+                and dir_fd is not None
+                and not racing_create_injected
+            ):
+                real_mkdir(path, mode=mode, dir_fd=dir_fd)
+                racing_create_injected = True
+                raise FileExistsError(
+                    errno.EEXIST,
+                    os.strerror(errno.EEXIST),
+                    ".codex-tmp",
+                )
+            real_mkdir(path, mode=mode, dir_fd=dir_fd)
+
+        def fail_source_root_fsync(descriptor: int) -> None:
+            metadata = os.fstat(descriptor)
+            if (metadata.st_dev, metadata.st_ino) == source_identity:
+                raise OSError("source root fsync denied after creation race")
+            real_fsync(descriptor)
+
+        with (
+            mock.patch.object(
+                workspace_runtime.os,
+                "stat",
+                side_effect=race_stat,
+            ),
+            mock.patch.object(
+                workspace_runtime.os,
+                "mkdir",
+                side_effect=race_mkdir,
+            ),
+            mock.patch.object(
+                workspace_runtime.os,
+                "fsync",
+                side_effect=fail_source_root_fsync,
+            ),
+            self.assertRaisesRegex(
+                ReviewError,
+                "cannot persist the repository review-root directory entry",
+            ),
+        ):
+            _prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+                ownership_handoff=mock.Mock(),
+                preparation_cleanup_handoff=handoff,
+            )
+
+        self.assertTrue(initial_missing_injected)
+        self.assertTrue(racing_create_injected)
+        handoff.assert_not_called()
+        review_root = self.repo / ".codex-tmp"
+        self.assertTrue(review_root.is_dir())
+        self.assertEqual(list(review_root.iterdir()), [])
+
+    def test_existing_review_root_does_not_fsync_source_root(self) -> None:
+        review_root = self.repo / ".codex-tmp"
+        review_root.mkdir(mode=0o700)
+        source_identity = (
+            self.repo.stat().st_dev,
+            self.repo.stat().st_ino,
+        )
+        review_root_identity = (
+            review_root.stat().st_dev,
+            review_root.stat().st_ino,
+        )
+        events: list[str] = []
+        captured = []
+        real_fsync = os.fsync
+
+        def record_directory_fsync(descriptor: int) -> None:
+            metadata = os.fstat(descriptor)
+            identity = (metadata.st_dev, metadata.st_ino)
+            if stat.S_ISDIR(metadata.st_mode):
+                if identity == source_identity:
+                    events.append("unexpected-source-root-fsync")
+                elif identity == review_root_identity:
+                    events.append("review-root-fsync")
+            real_fsync(descriptor)
+
+        def capture_handoff(
+            _container: pathlib.Path,
+            evidence: workspace_runtime.PrivateCleanupEvidence,
+        ) -> None:
+            if not evidence.artifacts:
+                events.append("initial-handoff")
+                self.assertEqual(
+                    events,
+                    ["review-root-fsync", "initial-handoff"],
+                )
+
+        with mock.patch.object(
+            workspace_runtime.os,
+            "fsync",
+            side_effect=record_directory_fsync,
+        ):
+            review = _prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+                ownership_handoff=captured.append,
+                preparation_cleanup_handoff=capture_handoff,
+            )
+
+        self.reviews.append(review)
+        self.assertEqual(captured, [review])
+        self.assertNotIn("unexpected-source-root-fsync", events)
+
+    def test_existing_review_root_allows_shared_source_owner(self) -> None:
+        review_root = self.repo / ".codex-tmp"
+        review_root.mkdir(mode=0o700)
+        source_identity = (
+            self.repo.stat().st_dev,
+            self.repo.stat().st_ino,
+        )
+        foreign_uid = os.geteuid() + 1
+        real_lstat = os.lstat
+        real_fstat = os.fstat
+        captured = []
+
+        def with_foreign_owner(metadata: os.stat_result) -> os.stat_result:
+            fields = list(metadata)
+            fields[4] = foreign_uid
+            return os.stat_result(fields)
+
+        def foreign_source_lstat(
+            path: os.PathLike[str] | str,
+            *args: object,
+            **kwargs: object,
+        ) -> os.stat_result:
+            metadata = real_lstat(path, *args, **kwargs)
+            if (metadata.st_dev, metadata.st_ino) == source_identity:
+                return with_foreign_owner(metadata)
+            return metadata
+
+        def foreign_source_fstat(descriptor: int) -> os.stat_result:
+            metadata = real_fstat(descriptor)
+            if (metadata.st_dev, metadata.st_ino) == source_identity:
+                return with_foreign_owner(metadata)
+            return metadata
+
+        with (
+            mock.patch.object(
+                workspace_runtime.os,
+                "lstat",
+                side_effect=foreign_source_lstat,
+            ),
+            mock.patch.object(
+                workspace_runtime.os,
+                "fstat",
+                side_effect=foreign_source_fstat,
+            ),
+        ):
+            review = _prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+                ownership_handoff=captured.append,
+            )
+
+        self.reviews.append(review)
+        self.assertEqual(captured, [review])
+
+    def test_shared_source_owner_cannot_create_review_root(self) -> None:
+        source_identity = (
+            self.repo.stat().st_dev,
+            self.repo.stat().st_ino,
+        )
+        foreign_uid = os.geteuid() + 1
+        real_lstat = os.lstat
+        real_fstat = os.fstat
+        handoff = mock.Mock()
+
+        def with_foreign_owner(metadata: os.stat_result) -> os.stat_result:
+            fields = list(metadata)
+            fields[4] = foreign_uid
+            return os.stat_result(fields)
+
+        def foreign_source_lstat(
+            path: os.PathLike[str] | str,
+            *args: object,
+            **kwargs: object,
+        ) -> os.stat_result:
+            metadata = real_lstat(path, *args, **kwargs)
+            if (metadata.st_dev, metadata.st_ino) == source_identity:
+                return with_foreign_owner(metadata)
+            return metadata
+
+        def foreign_source_fstat(descriptor: int) -> os.stat_result:
+            metadata = real_fstat(descriptor)
+            if (metadata.st_dev, metadata.st_ino) == source_identity:
+                return with_foreign_owner(metadata)
+            return metadata
+
+        with (
+            mock.patch.object(
+                workspace_runtime.os,
+                "lstat",
+                side_effect=foreign_source_lstat,
+            ),
+            mock.patch.object(
+                workspace_runtime.os,
+                "fstat",
+                side_effect=foreign_source_fstat,
+            ),
+            self.assertRaisesRegex(
+                ReviewError,
+                "must be owned by the current user to create the review root",
+            ),
+        ):
+            _prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+                ownership_handoff=handoff,
+            )
+
+        handoff.assert_not_called()
+        self.assertFalse((self.repo / ".codex-tmp").exists())
+
+    def test_new_review_root_fsync_failure_precedes_handoff(self) -> None:
+        handoff = mock.Mock()
+        source_identity = (
+            self.repo.stat().st_dev,
+            self.repo.stat().st_ino,
+        )
+        real_fsync = os.fsync
+
+        def fail_source_root_fsync(descriptor: int) -> None:
+            metadata = os.fstat(descriptor)
+            if (metadata.st_dev, metadata.st_ino) == source_identity:
+                raise OSError("source root fsync denied")
+            real_fsync(descriptor)
+
+        with (
+            mock.patch.object(
+                workspace_runtime.os,
+                "fsync",
+                side_effect=fail_source_root_fsync,
+            ),
+            self.assertRaisesRegex(
+                ReviewError,
+                "cannot persist the repository review-root directory entry",
+            ),
+        ):
+            _prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+                ownership_handoff=mock.Mock(),
+                preparation_cleanup_handoff=handoff,
+            )
+
+        handoff.assert_not_called()
+        self.assertEqual(
+            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            [],
+        )
+
+    def test_container_parent_fsync_failure_precedes_private_bytes(self) -> None:
+        marker = b"PRIVATE_PATH_FSYNC_FAILURE_MARKER_29871"
+        failed_head = self.commit_bytes(
+            marker.decode("ascii") + ".txt",
+            b"ordinary payload\n",
+            "Add fsync failure marker path",
+        )
+        handoff = mock.Mock()
+        real_fsync = os.fsync
+        observed_container = False
+
+        def fail_review_root_fsync(descriptor: int) -> None:
+            nonlocal observed_container
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISDIR(metadata.st_mode):
+                real_fsync(descriptor)
+                return
+            review_root = self.repo / ".codex-tmp"
+            if review_root.is_dir():
+                root_metadata = review_root.stat()
+                if (metadata.st_dev, metadata.st_ino) == (
+                    root_metadata.st_dev,
+                    root_metadata.st_ino,
+                ):
+                    containers = list(review_root.glob("isolated-review-*"))
+                    self.assertEqual(len(containers), 1)
+                    observed_container = True
+                    self.assertFalse(
+                        any(
+                            (containers[0] / name).exists()
+                            for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
+                        )
+                    )
+                    for path in containers[0].rglob("*"):
+                        if path.is_file():
+                            self.assertNotIn(marker, path.read_bytes())
+                    raise OSError("review root fsync denied")
+            real_fsync(descriptor)
+
+        with (
+            mock.patch.object(
+                workspace_runtime.os,
+                "fsync",
+                side_effect=fail_review_root_fsync,
+            ),
+            self.assertRaisesRegex(
+                ReviewError,
+                "cannot persist the private review container directory entry",
+            ),
+        ):
+            _prepare_workspace(
+                repo=self.repo,
+                base_ref=self.head,
+                head_ref=failed_head,
+                ownership_handoff=mock.Mock(),
+                preparation_cleanup_handoff=handoff,
+            )
+
+        self.assertTrue(observed_container)
+        handoff.assert_not_called()
+        self.assertEqual(
+            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            [],
+        )
+
     def test_completed_workspace_is_owned_before_handoff_signal(self) -> None:
         restore_calls = 0
         captured = []
@@ -2052,6 +2629,62 @@ class WorkspaceTest(unittest.TestCase):
         self.assertIn(b"GIT binary patch", diff)
         self.assert_control_evidence_omits(review, secret)
 
+    def test_frozen_diff_keeps_initialized_submodule_metadata_only(self) -> None:
+        subrepo = pathlib.Path(self.temporary.name) / "external-repo"
+        subprocess.run(
+            ("git", "init", "-b", "master", str(subrepo)),
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        git(subrepo, "config", "user.name", "Review Test")
+        git(subrepo, "config", "user.email", "review@example.com")
+        git(subrepo, "config", "commit.gpgsign", "false")
+        marker = b"EXTERNAL_SUBMODULE_CONTENT_MARKER_987654\n"
+        (subrepo / "foreign.txt").write_bytes(b"safe submodule content\n")
+        git(subrepo, "add", "foreign.txt")
+        git(subrepo, "commit", "-m", "External base")
+        submodule_base = git(subrepo, "rev-parse", "HEAD")
+        (subrepo / "foreign.txt").write_bytes(marker)
+        git(subrepo, "add", "foreign.txt")
+        git(subrepo, "commit", "-m", "External head")
+        submodule_head = git(subrepo, "rev-parse", "HEAD")
+
+        gitlink_path = "vendor/external"
+        git(
+            self.repo,
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            str(subrepo),
+            gitlink_path,
+        )
+        checkout = self.repo / gitlink_path
+        git(checkout, "checkout", "--detach", submodule_base)
+        git(self.repo, "add", ".gitmodules", gitlink_path)
+        git(self.repo, "commit", "-m", "Add external gitlink")
+        gitlink_base = git(self.repo, "rev-parse", "HEAD")
+        git(checkout, "checkout", "--detach", submodule_head)
+        git(self.repo, "add", gitlink_path)
+        git(self.repo, "commit", "-m", "Update external gitlink")
+        gitlink_head = git(self.repo, "rev-parse", "HEAD")
+        self.assertEqual(git(checkout, "rev-parse", "HEAD"), submodule_head)
+
+        previous_cwd = pathlib.Path.cwd()
+        try:
+            os.chdir(self.repo)
+            review = self.prepare_range(gitlink_base, gitlink_head)
+        finally:
+            os.chdir(previous_cwd)
+        diff = review.diff_file.read_bytes()
+
+        self.assertIn(f"Subproject commit {submodule_base}".encode(), diff)
+        self.assertIn(f"Subproject commit {submodule_head}".encode(), diff)
+        self.assertNotIn(marker.rstrip(), diff)
+        self.assertNotIn(b"diff --git a/vendor/external/foreign.txt", diff)
+        validate_external_workspace(review)
+
     def test_oauth_refresh_token_is_detected_in_head_content(self) -> None:
         credential = pathlib.Path(self.temporary.name) / "oauth.json"
         credential.write_text(
@@ -2089,6 +2722,16 @@ class WorkspaceTest(unittest.TestCase):
                 "generic",
                 unregistered_generic_credential(),
                 lambda value: b'password = "' + value + b'"\n',
+            ),
+            (
+                "wrapped-generic",
+                unregistered_generic_credential(),
+                lambda value: b'password = ("""' + value + b'""")\n',
+            ),
+            (
+                "multiline-wrapped-generic",
+                b"CriticalCredential\nAlpha9!",
+                lambda value: b'password = ("""' + value + b'""")\n',
             ),
             (
                 "jwt",
@@ -2150,6 +2793,33 @@ class WorkspaceTest(unittest.TestCase):
             "added-secret.txt",
             b'password = "' + raw_value + b'"\n',
             "Add unregistered credential",
+        )
+
+        self.assert_external_review_blocked(
+            base_ref=self.head,
+            head_ref=added_head,
+            rule="generic-secret-assignment",
+        )
+
+    def test_wrapped_unregistered_secret_addition_is_blocked(self) -> None:
+        raw_value = unregistered_generic_credential()
+        added_head = self.commit_bytes(
+            "added-wrapped-secret.txt",
+            b'password = ("""' + raw_value + b'""")\n',
+            "Add wrapped unregistered credential",
+        )
+
+        self.assert_external_review_blocked(
+            base_ref=self.head,
+            head_ref=added_head,
+            rule="generic-secret-assignment",
+        )
+
+    def test_multiline_generic_secret_addition_fails_closed(self) -> None:
+        added_head = self.commit_bytes(
+            "added-multiline-secret.txt",
+            b'password = """CriticalCredential\nAlpha9!"""\n',
+            "Add multiline unregistered credential",
         )
 
         self.assert_external_review_blocked(

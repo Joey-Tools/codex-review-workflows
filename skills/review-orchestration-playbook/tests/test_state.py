@@ -21,6 +21,8 @@ from review_runtime.common import ReviewError, write_json  # noqa: E402
 from review_runtime.workspace import (  # noqa: E402
     PRIVATE_CHANGED_PATHS_NAME,
     SYNTHETIC_PRIVATE_MANIFEST_NAME,
+    CleanupIdentity,
+    PrivateCleanupEvidence,
     cleanup_workspace,
     prepare_workspace as _prepare_workspace,
 )
@@ -108,12 +110,370 @@ class StatefulLifecycleTest(unittest.TestCase):
         (state_dir / state.EXIT_FILE).write_text("0\n", encoding="utf-8")
         (state_dir / "final.txt").write_text("No findings.\n", encoding="utf-8")
 
+    def legacy_workspace_json(self) -> dict[str, str]:
+        workspace = self.review.to_json()
+        workspace.pop("private_cleanup")
+        return workspace
+
+    def write_legacy_state(
+        self,
+        *,
+        keep_workspace: bool = False,
+        terminal: bool = True,
+    ) -> None:
+        state_dir = self.review.container_dir
+        (state_dir / state.STATE_MARKER).write_bytes(state.LEGACY_STATE_MARKER)
+        write_json(
+            state_dir / state.STATE_FILE,
+            {
+                "version": state.LEGACY_STATE_SCHEMA_VERSION,
+                "reviewer": "claude",
+                "egress_consent": "double-review",
+                "workspace": self.legacy_workspace_json(),
+                "keep_workspace": keep_workspace,
+                "stdout_path": str(state_dir / "runner.stdout.log"),
+                "stderr_path": str(state_dir / "runner.stderr.log"),
+                "final_path": str(state_dir / "final.txt"),
+                "attempts_path": str(state_dir / "attempts.json"),
+                "started_at": time.time(),
+                "pid": 99999999,
+            },
+        )
+        if terminal:
+            (state_dir / state.EXIT_FILE).write_text("0\n", encoding="utf-8")
+            (state_dir / "final.txt").write_text(
+                "Legacy result.\n",
+                encoding="utf-8",
+            )
+
     def test_state_marker_round_trips_private_cleanup_identity(self) -> None:
         state._write_state_marker(self.review)
 
         self.assertEqual(
             state._load_state_marker_cleanup(self.review.container_dir),
             self.review.private_cleanup,
+        )
+
+    def test_v2_marker_and_state_remain_compatible(self) -> None:
+        self.write_completed_state()
+        write_json(
+            self.review.container_dir / state.STATE_MARKER,
+            {
+                "container_dir": str(self.review.container_dir),
+                "private_cleanup": self.review.private_cleanup.to_json(),
+                "version": state.COMPATIBLE_STATE_MARKER_SCHEMA_VERSION,
+            },
+        )
+
+        loaded, review = state.load_review_state(self.review.container_dir)
+
+        self.assertEqual(loaded["version"], state.STATE_SCHEMA_VERSION)
+        self.assertEqual(review, self.review)
+
+    def test_preparing_marker_recovers_partial_container_without_state(self) -> None:
+        retained_name = PRIVATE_CHANGED_PATHS_NAME
+        removed_name = SYNTHETIC_PRIVATE_MANIFEST_NAME
+        (self.review.container_dir / removed_name).unlink()
+        partial = PrivateCleanupEvidence(
+            container=self.review.private_cleanup.container,
+            artifacts={
+                retained_name: self.review.private_cleanup.artifacts[retained_name]
+            },
+        )
+        state._write_preparing_state_marker(self.review.container_dir, partial)
+
+        exit_code = state.cleanup(
+            self.review.container_dir,
+            timeout_seconds=state.FINAL_CLEANUP_TIMEOUT_SECONDS,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertFalse(self.review.container_dir.exists())
+
+    def test_ready_marker_recovers_complete_container_without_state(self) -> None:
+        state._write_state_marker(self.review)
+
+        exit_code = state.cleanup(
+            self.review.container_dir,
+            timeout_seconds=state.FINAL_CLEANUP_TIMEOUT_SECONDS,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertFalse(self.review.container_dir.exists())
+
+    def test_v3_marker_layout_is_bound_to_canonical_source_root(self) -> None:
+        marker_path = self.review.container_dir / state.STATE_MARKER
+        victim = self.review.workspace_root / "layout-victim.txt"
+        victim.write_text("retain\n", encoding="utf-8")
+        payload = state._state_marker_payload(self.review)
+        invalid_source_roots = (
+            str(self.review.source_root.parent),
+            str(self.review.source_root / "missing" / ".."),
+            "relative-source-root",
+        )
+
+        for source_root in invalid_source_roots:
+            with self.subTest(source_root=source_root):
+                payload["source_root"] = source_root
+                write_json(marker_path, payload)
+                with self.assertRaises(ReviewError):
+                    state.cleanup(
+                        self.review.container_dir,
+                        timeout_seconds=state.FINAL_CLEANUP_TIMEOUT_SECONDS,
+                    )
+                self.assertEqual(victim.read_text(encoding="utf-8"), "retain\n")
+
+    def test_preparing_marker_forged_container_identity_fails_closed(self) -> None:
+        identity = self.review.private_cleanup.container
+        forged = PrivateCleanupEvidence(
+            container=CleanupIdentity(identity.device, identity.inode + 1),
+            artifacts={},
+        )
+        write_json(
+            self.review.container_dir / state.STATE_MARKER,
+            state._preparing_state_marker_payload(
+                self.review.container_dir,
+                forged,
+            ),
+        )
+        victim = self.review.workspace_root / "victim.txt"
+        victim.write_text("retain\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(ReviewError, "partial container cleanup failed"):
+            state.cleanup(
+                self.review.container_dir,
+                timeout_seconds=state.FINAL_CLEANUP_TIMEOUT_SECONDS,
+            )
+
+        self.assertEqual(victim.read_text(encoding="utf-8"), "retain\n")
+
+    def test_marker_phase_and_partial_evidence_are_strict(self) -> None:
+        marker_path = self.review.container_dir / state.STATE_MARKER
+        partial = PrivateCleanupEvidence(
+            container=self.review.private_cleanup.container,
+            artifacts={},
+        )
+        invalid_payloads = (
+            {
+                "container_dir": str(self.review.container_dir),
+                "phase": "ready",
+                "private_cleanup": partial.to_json(),
+                "source_root": str(self.review.source_root),
+                "version": state.STATE_MARKER_SCHEMA_VERSION,
+            },
+            {
+                "container_dir": str(self.review.container_dir),
+                "phase": False,
+                "private_cleanup": partial.to_json(),
+                "source_root": str(self.review.source_root),
+                "version": state.STATE_MARKER_SCHEMA_VERSION,
+            },
+            {
+                "container_dir": str(self.review.container_dir),
+                "phase": "preparing",
+                "private_cleanup": {
+                    **partial.to_json(),
+                    "schema_version": True,
+                },
+                "source_root": str(self.review.source_root),
+                "version": state.STATE_MARKER_SCHEMA_VERSION,
+            },
+        )
+
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                write_json(marker_path, payload)
+                with self.assertRaises(ReviewError):
+                    state._load_state_marker(self.review.container_dir)
+
+    def test_terminal_v1_status_final_and_cleanup(self) -> None:
+        self.write_legacy_state()
+        private_artifacts = tuple(
+            self.review.container_dir / name
+            for name in (PRIVATE_CHANGED_PATHS_NAME, SYNTHETIC_PRIVATE_MANIFEST_NAME)
+        )
+
+        summary = state.status(self.review.container_dir)
+        self.assertFalse(summary["running"])
+        self.assertEqual(summary["exit_code"], 0)
+
+        exit_code, text = state.final(self.review.container_dir)
+        self.assertEqual((exit_code, text), (0, "Legacy result."))
+        self.assertFalse(self.review.workspace_root.exists())
+        self.assertFalse(any(path.exists() for path in private_artifacts))
+        self.assertEqual(
+            state.cleanup(
+                self.review.container_dir,
+                timeout_seconds=state.FINAL_CLEANUP_TIMEOUT_SECONDS,
+            ),
+            0,
+        )
+
+    def test_active_v1_status_uses_runner_lock(self) -> None:
+        self.write_legacy_state(terminal=False)
+        lock_path = self.review.container_dir / state.LOCK_FILE
+
+        with lock_path.open("a+b") as runner_lock:
+            state.fcntl.flock(runner_lock.fileno(), state.fcntl.LOCK_EX)
+            summary = state.status(self.review.container_dir)
+
+        self.assertTrue(summary["running"])
+        self.assertTrue(summary["runner_lock_held"])
+        self.assertIsNone(summary["exit_code"])
+
+    def test_v1_keep_scrubs_private_artifacts_and_retains_workspace(self) -> None:
+        self.write_legacy_state(keep_workspace=True)
+
+        exit_code, text = state.final(self.review.container_dir)
+
+        self.assertEqual((exit_code, text), (0, "Legacy result."))
+        self.assertTrue(self.review.workspace_root.exists())
+        self.assertFalse(
+            any(
+                (self.review.container_dir / name).exists()
+                for name in (
+                    PRIVATE_CHANGED_PATHS_NAME,
+                    SYNTHETIC_PRIVATE_MANIFEST_NAME,
+                )
+            )
+        )
+
+    def test_v1_codex_unavailable_retains_validated_fallback_workspace(self) -> None:
+        self.write_legacy_state()
+        current = state.load_state(self.review.container_dir)
+        current["reviewer"] = "codex"
+        current["egress_consent"] = None
+        write_json(self.review.container_dir / state.STATE_FILE, current)
+        (self.review.container_dir / state.EXIT_FILE).write_text(
+            "127\n",
+            encoding="utf-8",
+        )
+        (self.review.container_dir / "final.txt").unlink()
+        (self.review.container_dir / "runner-error.txt").write_text(
+            "codex is unavailable\n",
+            encoding="utf-8",
+        )
+        write_json(
+            self.review.container_dir / "preflight.json",
+            {
+                "review_range": f"{self.base}..{self.head}",
+                "scope": "frozen tracked workspace, diff, and review prompt",
+                "status": "sensitive-content and escaping-symlink checks passed",
+            },
+        )
+
+        exit_code, text = state.final(self.review.container_dir)
+
+        self.assertEqual(exit_code, 127)
+        self.assertIn("retained for clean-context fallback", text)
+        self.assertTrue(self.review.workspace_root.exists())
+        self.assertTrue(
+            state.status(self.review.container_dir)["fallback_workspace_retained"]
+        )
+
+        preflight_path = self.review.container_dir / "preflight.json"
+        preflight = state.read_json(preflight_path)
+        preflight["status"] = "secret-delta and escaping-symlink checks passed"
+        write_json(preflight_path, preflight)
+        self.assertFalse(
+            state.status(self.review.container_dir)["fallback_workspace_retained"]
+        )
+
+    def test_v1_marker_is_exact_and_versions_cannot_be_mixed(self) -> None:
+        self.write_legacy_state()
+        marker_path = self.review.container_dir / state.STATE_MARKER
+        state_path = self.review.container_dir / state.STATE_FILE
+        state.load_review_state(self.review.container_dir)
+
+        for invalid_marker in (
+            b"isolated-review-state-v1",
+            b"isolated-review-state-v1\n\n",
+        ):
+            with self.subTest(invalid_marker=invalid_marker):
+                marker_path.write_bytes(invalid_marker)
+                with self.assertRaises(ReviewError):
+                    state.load_review_state(self.review.container_dir)
+
+        marker_path.write_bytes(state.LEGACY_STATE_MARKER)
+        current = state.load_state(self.review.container_dir)
+        current["version"] = state.STATE_SCHEMA_VERSION
+        write_json(state_path, current)
+        with self.assertRaisesRegex(ReviewError, "versions are inconsistent"):
+            state.load_review_state(self.review.container_dir)
+
+        current["version"] = True
+        write_json(state_path, current)
+        with self.assertRaisesRegex(ReviewError, "version is invalid"):
+            state.load_review_state(self.review.container_dir)
+
+    def test_v1_top_level_schema_and_artifact_paths_are_strict(self) -> None:
+        self.write_legacy_state()
+        state_path = self.review.container_dir / state.STATE_FILE
+        original = state.load_state(self.review.container_dir)
+        mutations = (
+            ("extra", "unexpected"),
+            ("keep_workspace", 1),
+            ("started_at", float("nan")),
+            ("stdout_path", str(self.repo / "outside.log")),
+            ("synthetic_secret_exemptions", [1]),
+            ("pid", True),
+            ("reviewer", None),
+            ("egress_consent", 1),
+        )
+
+        for field, value in mutations:
+            with self.subTest(field=field):
+                current = dict(original)
+                current[field] = value
+                write_json(state_path, current)
+                with self.assertRaisesRegex(ReviewError, "legacy v1 review state"):
+                    state.load_review_state(self.review.container_dir)
+
+        compatible = dict(original)
+        compatible["synthetic_secret_exemptions"] = ["known-fixture"]
+        write_json(state_path, compatible)
+        loaded, _review = state.load_review_state(self.review.container_dir)
+        self.assertEqual(
+            loaded["synthetic_secret_exemptions"],
+            ["known-fixture"],
+        )
+
+    def test_invalid_v1_layout_is_retained_for_manual_recovery(self) -> None:
+        self.write_legacy_state()
+        current = state.load_state(self.review.container_dir)
+        current["workspace"]["workspace_root"] = str(self.repo)
+        write_json(self.review.container_dir / state.STATE_FILE, current)
+        private_artifacts = tuple(
+            self.review.container_dir / name
+            for name in (PRIVATE_CHANGED_PATHS_NAME, SYNTHETIC_PRIVATE_MANIFEST_NAME)
+        )
+
+        with self.assertRaisesRegex(ReviewError, "manual recovery"):
+            state.cleanup(
+                self.review.container_dir,
+                timeout_seconds=state.FINAL_CLEANUP_TIMEOUT_SECONDS,
+            )
+
+        self.assertTrue(self.review.workspace_root.exists())
+        self.assertTrue(all(path.exists() for path in private_artifacts))
+
+    def test_run_state_refuses_v1_before_reviewer_launch(self) -> None:
+        self.write_legacy_state(terminal=False)
+
+        with mock.patch.object(state, "run_review") as launch:
+            exit_code = state.run_state(state_dir=self.review.container_dir)
+
+        self.assertEqual(exit_code, 1)
+        launch.assert_not_called()
+        self.assertEqual(
+            (self.review.container_dir / state.EXIT_FILE).read_text().strip(),
+            "1",
+        )
+        self.assertIn(
+            "legacy v1 review state cannot be resumed",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
         )
 
     def test_marker_control_identity_mismatch_fails_closed(self) -> None:
@@ -932,6 +1292,128 @@ time.sleep(0.2)
                 )
 
         popen.assert_not_called()
+
+    def test_start_holds_preparation_lock_through_child_fd_handoff(self) -> None:
+        process = mock.Mock(pid=12345)
+        lock_identity: tuple[int, int] | None = None
+
+        def prepare_with_live_cleanup_probe(**kwargs):
+            nonlocal lock_identity
+            self.assertFalse((self.review.container_dir / state.LOCK_FILE).exists())
+            self.assertFalse((self.review.container_dir / state.STATE_MARKER).exists())
+            kwargs["preparation_cleanup_handoff"](
+                self.review.container_dir,
+                self.review.private_cleanup,
+            )
+            lock_metadata = os.lstat(self.review.container_dir / state.LOCK_FILE)
+            lock_identity = (lock_metadata.st_dev, lock_metadata.st_ino)
+            self.assertEqual(
+                state.cleanup(
+                    self.review.container_dir,
+                    timeout_seconds=state.FINAL_CLEANUP_TIMEOUT_SECONDS,
+                ),
+                3,
+            )
+            kwargs["ownership_handoff"](self.review)
+            return self.review
+
+        def spawn_with_inherited_lock(*_args, **kwargs):
+            self.assertIsNotNone(lock_identity)
+            self.assertEqual(len(kwargs["pass_fds"]), 1)
+            inherited = os.fstat(kwargs["pass_fds"][0])
+            self.assertEqual(
+                (inherited.st_dev, inherited.st_ino),
+                lock_identity,
+            )
+            self.assertTrue(
+                state._runner_lock_held(self.review.container_dir / state.LOCK_FILE)
+            )
+            return process
+
+        with (
+            mock.patch.object(
+                state,
+                "prepare_workspace",
+                side_effect=prepare_with_live_cleanup_probe,
+            ),
+            mock.patch.object(
+                state.subprocess,
+                "Popen",
+                side_effect=spawn_with_inherited_lock,
+            ),
+        ):
+            state_dir = state.start(
+                script_path=pathlib.Path("runner.py"),
+                repo=self.repo,
+                reviewer="codex",
+                base_ref=self.base,
+                head_ref=self.head,
+                prompt_file=None,
+                keep_workspace=False,
+                egress_consent=None,
+            )
+
+        self.assertEqual(state_dir, self.review.container_dir)
+        state._STARTED_PROCESSES.pop(process.pid, None)
+
+    def test_sigkill_releases_preparation_lock_for_recovery(self) -> None:
+        state._write_preparing_state_marker(
+            self.review.container_dir,
+            self.review.private_cleanup,
+        )
+        lock_script = pathlib.Path(self.temporary.name) / "hold_runner_lock.py"
+        lock_script.write_text(
+            """import fcntl
+import pathlib
+import sys
+import time
+
+with pathlib.Path(sys.argv[1]).open("a+b") as handle:
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    print("locked", flush=True)
+    time.sleep(60)
+""",
+            encoding="utf-8",
+        )
+        holder = subprocess.Popen(
+            (
+                sys.executable,
+                str(lock_script),
+                str(self.review.container_dir / state.LOCK_FILE),
+            ),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert holder.stdout is not None
+            self.assertEqual(holder.stdout.readline().strip(), "locked")
+            self.assertEqual(
+                state.cleanup(
+                    self.review.container_dir,
+                    timeout_seconds=state.FINAL_CLEANUP_TIMEOUT_SECONDS,
+                ),
+                3,
+            )
+            holder.kill()
+            holder.wait(timeout=5)
+
+            self.assertEqual(
+                state.cleanup(
+                    self.review.container_dir,
+                    timeout_seconds=state.FINAL_CLEANUP_TIMEOUT_SECONDS,
+                ),
+                0,
+            )
+            self.assertFalse(self.review.container_dir.exists())
+        finally:
+            if holder.poll() is None:
+                holder.kill()
+                holder.wait(timeout=5)
+            if holder.stdout is not None:
+                holder.stdout.close()
+            if holder.stderr is not None:
+                holder.stderr.close()
 
     def test_start_cleans_workspace_when_signal_follows_handoff(self) -> None:
         def handoff_then_signal(**kwargs):

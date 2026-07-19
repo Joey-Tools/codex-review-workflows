@@ -133,6 +133,18 @@ class RepositoryContractTest(unittest.TestCase):
             "do not end the task merely because one wait window expires", skill
         )
 
+    def test_frozen_diff_contract_keeps_submodules_metadata_only(self) -> None:
+        helper_contract = (SKILL_ROOT / "references/helper-contract.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("`--submodule=short`", helper_contract)
+        self.assertIn(
+            "never includes nested submodule logs, diffs, or content",
+            helper_contract,
+        )
+        self.assertNotIn("`--submodule=diff`", helper_contract)
+
     def test_models_are_pinned_in_runtime_and_clean_context_agent(self) -> None:
         self.assertEqual(providers.CODEX_MODELS, ("gpt-5.6-sol", "gpt-5.5"))
         self.assertEqual(providers.CODEX_REASONING_EFFORT, "xhigh")

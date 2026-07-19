@@ -10,7 +10,11 @@ sys.path.insert(0, str(SCRIPTS))
 
 from review_runtime.common import write_text_atomic  # noqa: E402
 from review_runtime.state import load_review_state  # noqa: E402
-from review_runtime.workspace import cleanup_workspace  # noqa: E402
+from review_runtime.workspace import (  # noqa: E402
+    LegacyReviewWorkspace,
+    cleanup_legacy_workspace,
+    cleanup_workspace,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -23,7 +27,10 @@ def main(argv: list[str] | None = None) -> int:
         lock_fd = int(arguments[1])
         os.fstat(lock_fd)
         _state, review = load_review_state(state_dir)
-        cleanup_error = cleanup_workspace(review, keep_container=True)
+        if isinstance(review, LegacyReviewWorkspace):
+            cleanup_error = cleanup_legacy_workspace(review, keep_container=True)
+        else:
+            cleanup_error = cleanup_workspace(review, keep_container=True)
         if not cleanup_error:
             cleanup_error_path.unlink(missing_ok=True)
     except BaseException as error:
