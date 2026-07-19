@@ -1519,6 +1519,7 @@ def _operate_on_private_review_container(
                 follow_symlinks=False,
             )
         except FileNotFoundError:
+            cleanup_errors.append("private artifact container is missing")
             container_before = None
         if container_before is not None:
             container_error = _private_cleanup_directory_error(
@@ -3666,17 +3667,26 @@ def _write_changed_blob_findings(
 
 
 def validate_workspace_layout(review: ReviewWorkspace) -> None:
+    def resolve_path(path: pathlib.Path, *, label: str) -> pathlib.Path:
+        try:
+            return path.expanduser().resolve(strict=False)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise ReviewError(f"review {label} path cannot be resolved") from error
+
     def canonical_path(path: pathlib.Path, *, label: str) -> pathlib.Path:
-        absolute = path.expanduser().absolute()
+        expanded = path.expanduser()
+        absolute = expanded.absolute()
         normalized = pathlib.Path(os.path.normpath(os.fspath(absolute)))
-        resolved = path.expanduser().resolve(strict=False)
         if absolute != normalized:
             raise ReviewError(f"review {label} path is not canonical: {absolute}")
-        return resolved
+        return resolve_path(expanded, label=label)
 
     source_root = canonical_path(review.source_root, label="source root")
     container_dir = canonical_path(review.container_dir, label="container")
-    expected_parent = (source_root / ".codex-tmp").resolve(strict=False)
+    expected_parent = resolve_path(
+        source_root / ".codex-tmp",
+        label="source review root",
+    )
     if container_dir.parent != expected_parent or not container_dir.name.startswith(
         "isolated-review-"
     ):

@@ -1211,6 +1211,34 @@ class WorkspaceTest(unittest.TestCase):
             )
         )
 
+    def test_private_cleanup_rejects_container_moved_before_cleanup(self) -> None:
+        review = self.prepare_range(self.base, self.head)
+        container = review.container_dir
+        moved_container = container.with_name(container.name + "-moved-missing")
+        container.rename(moved_container)
+
+        try:
+            cleanup_error = workspace_runtime.remove_private_review_artifacts(
+                container,
+                expected=review.private_cleanup,
+            )
+
+            self.assertIn("private artifact container is missing", cleanup_error or "")
+            self.assertFalse(container.exists())
+            self.assertTrue(
+                all(
+                    (moved_container / name).exists()
+                    for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
+                )
+            )
+        finally:
+            moved_cleanup_error = workspace_runtime._remove_review_container_tree(
+                moved_container,
+                expected=review.private_cleanup,
+                use_control_state=True,
+            )
+            self.assertIsNone(moved_cleanup_error)
+
     def test_private_cleanup_receipts_distinguish_removed_from_moved(self) -> None:
         review = self.prepare_range(self.base, self.head)
         container = review.container_dir

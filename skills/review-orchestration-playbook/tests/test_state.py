@@ -549,6 +549,82 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.assertTrue(self.review.workspace_root.exists())
         self.assertFalse(any(path.exists() for path in private_artifacts))
 
+    def test_explicit_cleanup_scrubs_private_artifacts_after_symlink_loop_state(
+        self,
+    ) -> None:
+        self.write_completed_state()
+        private_artifacts = (
+            self.review.container_dir / PRIVATE_CHANGED_PATHS_NAME,
+            self.review.container_dir / SYNTHETIC_PRIVATE_MANIFEST_NAME,
+        )
+        first_loop = self.repo / "cleanup-loop-first"
+        second_loop = self.repo / "cleanup-loop-second"
+        first_loop.symlink_to(second_loop.name)
+        second_loop.symlink_to(first_loop.name)
+        current = state.load_state(self.review.container_dir)
+        workspace = self.review.to_json()
+        workspace["workspace_root"] = str(first_loop)
+        current["workspace"] = workspace
+        write_json(self.review.container_dir / state.STATE_FILE, current)
+        real_resolve = pathlib.Path.resolve
+
+        def fail_loop_resolution(path, *args, **kwargs):
+            if path == first_loop:
+                raise RuntimeError("symlink loop")
+            return real_resolve(path, *args, **kwargs)
+
+        try:
+            with (
+                mock.patch.object(
+                    pathlib.Path,
+                    "resolve",
+                    autospec=True,
+                    side_effect=fail_loop_resolution,
+                ),
+                self.assertRaisesRegex(
+                    ReviewError,
+                    "review workspace path cannot be resolved",
+                ),
+            ):
+                state.cleanup(
+                    self.review.container_dir,
+                    timeout_seconds=state.FINAL_CLEANUP_TIMEOUT_SECONDS,
+                )
+
+            self.assertTrue(first_loop.is_symlink())
+            self.assertTrue(second_loop.is_symlink())
+            self.assertTrue(self.review.workspace_root.exists())
+            self.assertFalse(any(path.exists() for path in private_artifacts))
+        finally:
+            first_loop.unlink(missing_ok=True)
+            second_loop.unlink(missing_ok=True)
+
+    def test_explicit_cleanup_scrubs_private_artifacts_after_invalid_state_path(
+        self,
+    ) -> None:
+        self.write_completed_state()
+        private_artifacts = (
+            self.review.container_dir / PRIVATE_CHANGED_PATHS_NAME,
+            self.review.container_dir / SYNTHETIC_PRIVATE_MANIFEST_NAME,
+        )
+        current = state.load_state(self.review.container_dir)
+        workspace = self.review.to_json()
+        workspace["workspace_root"] = str(self.repo / "invalid-path") + "\0suffix"
+        current["workspace"] = workspace
+        write_json(self.review.container_dir / state.STATE_FILE, current)
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "review workspace path cannot be resolved",
+        ):
+            state.cleanup(
+                self.review.container_dir,
+                timeout_seconds=state.FINAL_CLEANUP_TIMEOUT_SECONDS,
+            )
+
+        self.assertTrue(self.review.workspace_root.exists())
+        self.assertFalse(any(path.exists() for path in private_artifacts))
+
     def test_invalid_state_cleanup_aggregates_private_scrub_failure(self) -> None:
         self.write_completed_state()
         (self.review.container_dir / state.STATE_FILE).write_text(
