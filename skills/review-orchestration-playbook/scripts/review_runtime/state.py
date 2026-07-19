@@ -33,6 +33,9 @@ from .common import (
 from .providers import run_review
 from .workspace import (
     PRIVATE_HELPER_ARTIFACT_NAMES,
+    REVIEW_CLEANUP_LOCK_NAME,
+    REVIEW_RUNNER_LOCK_NAME,
+    REVIEW_STATE_MARKER_NAME,
     BoundReviewLock,
     CleanupIdentity,
     LegacyReviewWorkspace,
@@ -56,7 +59,7 @@ from .workspace import (
 
 
 STATE_FILE = "state.json"
-STATE_MARKER = ".isolated-review-state"
+STATE_MARKER = REVIEW_STATE_MARKER_NAME
 LEGACY_STATE_SCHEMA_VERSION = 1
 STATE_SCHEMA_VERSION = 2
 LEGACY_STATE_MARKER = b"isolated-review-state-v1\n"
@@ -79,8 +82,8 @@ LEGACY_STATE_REQUIRED_FIELDS = frozenset(
 )
 LEGACY_STATE_OPTIONAL_FIELDS = frozenset({"pid", "synthetic_secret_exemptions"})
 EXIT_FILE = "exit-code"
-LOCK_FILE = "runner.lock"
-CLEANUP_LOCK_FILE = "cleanup.lock"
+LOCK_FILE = REVIEW_RUNNER_LOCK_NAME
+CLEANUP_LOCK_FILE = REVIEW_CLEANUP_LOCK_NAME
 FINAL_CLEANUP_TIMEOUT_SECONDS = 30.0
 RUNNER_SHUTDOWN_GRACE_SECONDS = PROCESS_GROUP_TERM_GRACE_SECONDS * 4
 _STARTED_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
@@ -230,6 +233,164 @@ def _write_state_marker(review: ReviewWorkspace) -> None:
         _state_marker_payload(review),
         expected=review.private_cleanup.container,
     )
+
+
+class ReviewPreparationGuard:
+    def __init__(self) -> None:
+        self._lock_handle = None
+        self._lock_container: pathlib.Path | None = None
+        self._cleanup_lock: BoundReviewLock | None = None
+        self._review: ReviewWorkspace | None = None
+
+    def _ensure_lock(self, container: pathlib.Path) -> None:
+        lock_path = container / LOCK_FILE
+        if self._lock_handle is not None:
+            if self._lock_container != container:
+                raise ReviewError(
+                    "workspace preparation lock container changed during handoff"
+                )
+            opened = os.fstat(self._lock_handle.fileno())
+            try:
+                current = os.lstat(lock_path)
+            except OSError as error:
+                raise ReviewError(
+                    f"workspace preparation lock changed during handoff: {error}"
+                ) from error
+            if CleanupIdentity(opened.st_dev, opened.st_ino) != CleanupIdentity(
+                current.st_dev,
+                current.st_ino,
+            ):
+                raise ReviewError("workspace preparation lock changed during handoff")
+            return
+
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor: int | None = None
+        candidate = None
+        try:
+            descriptor = os.open(lock_path, flags, 0o600)
+            candidate = os.fdopen(descriptor, "w+b")
+            descriptor = None
+            opened = os.fstat(candidate.fileno())
+            current = os.lstat(lock_path)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or opened.st_uid != os.geteuid()
+                or opened.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                or CleanupIdentity(opened.st_dev, opened.st_ino)
+                != CleanupIdentity(current.st_dev, current.st_ino)
+            ):
+                raise ReviewError("workspace preparation lock is invalid")
+            fcntl.flock(candidate.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._lock_handle = candidate
+            self._lock_container = container
+            candidate = None
+        except OSError as error:
+            raise ReviewError(
+                f"cannot acquire workspace preparation lock {lock_path}: {error}"
+            ) from error
+        finally:
+            if candidate is not None:
+                candidate.close()
+            elif descriptor is not None:
+                os.close(descriptor)
+
+    def accept_preparation_cleanup(
+        self,
+        container: pathlib.Path,
+        private_cleanup: PrivateCleanupEvidence,
+    ) -> None:
+        self._ensure_lock(container)
+        _write_preparing_state_marker(container, private_cleanup)
+
+    def accept_workspace(self, prepared: ReviewWorkspace) -> None:
+        if self._lock_handle is None:
+            self.accept_preparation_cleanup(
+                prepared.container_dir,
+                prepared.private_cleanup,
+            )
+        else:
+            self._ensure_lock(prepared.container_dir)
+        _write_state_marker(prepared)
+        self._review = prepared
+
+    @property
+    def review(self) -> ReviewWorkspace | None:
+        return self._review
+
+    def require_review(self) -> ReviewWorkspace:
+        review = self._review
+        if review is None:
+            raise ReviewError("workspace ownership handoff did not complete")
+        if self._lock_handle is None or self._lock_container != review.container_dir:
+            raise ReviewError("workspace preparation lock handoff did not complete")
+        return review
+
+    def lock_fd(self) -> int:
+        review = self.require_review()
+        if self._lock_container != review.container_dir or self._lock_handle is None:
+            raise ReviewError("workspace preparation lock handoff did not complete")
+        return self._lock_handle.fileno()
+
+    def acquire_final_cleanup_lock(
+        self,
+        *,
+        timeout_seconds: float = FINAL_CLEANUP_TIMEOUT_SECONDS,
+    ) -> str | None:
+        if self._cleanup_lock is not None:
+            return None
+        review = self.require_review()
+        cleanup_lock, lock_error = open_bound_review_lock(
+            review.container_dir,
+            expected=review.private_cleanup,
+            name=CLEANUP_LOCK_FILE,
+        )
+        if lock_error or cleanup_lock is None:
+            return (
+                "cannot open preparation-bound cleanup lock: "
+                f"{lock_error or 'lock handle is unavailable'}"
+            )
+        deadline = time.monotonic() + timeout_seconds
+        try:
+            acquired = _acquire_cleanup_lock(cleanup_lock, deadline=deadline)
+        except BaseException:
+            cleanup_lock.close()
+            raise
+        if not acquired:
+            cleanup_lock.close()
+            return "timed out acquiring preparation-bound cleanup lock"
+        self._cleanup_lock = cleanup_lock
+        return None
+
+    def close(self) -> None:
+        first_error: OSError | None = None
+        if self._lock_handle is not None:
+            try:
+                self._lock_handle.close()
+            except OSError as error:
+                first_error = error
+            self._lock_handle = None
+        if self._cleanup_lock is not None:
+            for descriptor in reversed(_cleanup_lock_fds(self._cleanup_lock)):
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                except OSError as error:
+                    if first_error is None:
+                        first_error = error
+            try:
+                self._cleanup_lock.close()
+            except OSError as error:
+                if first_error is None:
+                    first_error = error
+            self._cleanup_lock = None
+        if first_error is not None:
+            raise first_error
 
 
 def _reject_duplicate_marker_object(
@@ -674,8 +835,7 @@ def start(
 ) -> pathlib.Path:
     process: subprocess.Popen[bytes] | None = None
     review: ReviewWorkspace | None = None
-    lock_handle = None
-    lock_container: pathlib.Path | None = None
+    preparation_guard = ReviewPreparationGuard()
     pending_signal: signal.Signals | None = None
     spawning = False
     published = False
@@ -701,84 +861,10 @@ def start(
             previous_handlers[forwarded] = signal.getsignal(forwarded)
             signal.signal(forwarded, forward_signal)
 
-    def ensure_preparation_lock(container: pathlib.Path) -> None:
-        nonlocal lock_container, lock_handle
-        lock_path = container / LOCK_FILE
-        if lock_handle is not None:
-            if lock_container != container:
-                raise ReviewError(
-                    "workspace preparation lock container changed during handoff"
-                )
-            opened = os.fstat(lock_handle.fileno())
-            try:
-                current = os.lstat(lock_path)
-            except OSError as error:
-                raise ReviewError(
-                    f"workspace preparation lock changed during handoff: {error}"
-                ) from error
-            if CleanupIdentity(opened.st_dev, opened.st_ino) != CleanupIdentity(
-                current.st_dev,
-                current.st_ino,
-            ):
-                raise ReviewError("workspace preparation lock changed during handoff")
-            return
-
-        flags = (
-            os.O_RDWR
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-        )
-        descriptor: int | None = None
-        candidate = None
-        try:
-            descriptor = os.open(lock_path, flags, 0o600)
-            candidate = os.fdopen(descriptor, "w+b")
-            descriptor = None
-            opened = os.fstat(candidate.fileno())
-            current = os.lstat(lock_path)
-            if (
-                not stat.S_ISREG(opened.st_mode)
-                or opened.st_nlink != 1
-                or opened.st_uid != os.geteuid()
-                or opened.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-                or CleanupIdentity(opened.st_dev, opened.st_ino)
-                != CleanupIdentity(current.st_dev, current.st_ino)
-            ):
-                raise ReviewError("workspace preparation lock is invalid")
-            fcntl.flock(candidate.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            lock_handle = candidate
-            lock_container = container
-            candidate = None
-        except OSError as error:
-            raise ReviewError(
-                f"cannot acquire workspace preparation lock {lock_path}: {error}"
-            ) from error
-        finally:
-            if candidate is not None:
-                candidate.close()
-            elif descriptor is not None:
-                os.close(descriptor)
-
-    def accept_preparation_cleanup(
-        container: pathlib.Path,
-        private_cleanup: PrivateCleanupEvidence,
-    ) -> None:
-        ensure_preparation_lock(container)
-        _write_preparing_state_marker(container, private_cleanup)
-
     def accept_workspace(prepared: ReviewWorkspace) -> None:
         nonlocal review
-        if lock_handle is None:
-            accept_preparation_cleanup(
-                prepared.container_dir,
-                prepared.private_cleanup,
-            )
-        else:
-            ensure_preparation_lock(prepared.container_dir)
-        _write_state_marker(prepared)
-        review = prepared
+        preparation_guard.accept_workspace(prepared)
+        review = preparation_guard.require_review()
 
     try:
         prepare_workspace(
@@ -786,12 +872,11 @@ def start(
             base_ref=base_ref,
             head_ref=head_ref,
             ownership_handoff=accept_workspace,
-            preparation_cleanup_handoff=accept_preparation_cleanup,
+            preparation_cleanup_handoff=(preparation_guard.accept_preparation_cleanup),
             synthetic_secret_exemptions=synthetic_secret_exemptions,
             prompt_override=prompt_file,
         )
-        if review is None:
-            raise ReviewError("workspace ownership handoff did not complete")
+        review = preparation_guard.require_review()
         state_dir = review.container_dir
         stdout_path = state_dir / "runner.stdout.log"
         stderr_path = state_dir / "runner.stderr.log"
@@ -809,8 +894,7 @@ def start(
             "started_at": time.time(),
         }
         write_json(state_dir / STATE_FILE, state)
-        if lock_handle is None or lock_container != state_dir:
-            raise ReviewError("workspace preparation lock handoff did not complete")
+        lock_fd = preparation_guard.lock_fd()
         with (
             stdout_path.open("wb") as stdout_handle,
             stderr_path.open("wb") as stderr_handle,
@@ -826,7 +910,7 @@ def start(
                         "--state-dir",
                         str(state_dir),
                         "--lock-fd",
-                        str(lock_handle.fileno()),
+                        str(lock_fd),
                     ),
                     cwd=review.workspace_root,
                     stdin=subprocess.DEVNULL,
@@ -834,7 +918,7 @@ def start(
                     stderr=stderr_handle,
                     start_new_session=True,
                     close_fds=True,
-                    pass_fds=(lock_handle.fileno(),),
+                    pass_fds=(lock_fd,),
                 )
             finally:
                 spawning = False
@@ -907,8 +991,7 @@ def start(
             ) from error
         raise
     finally:
-        if lock_handle is not None:
-            lock_handle.close()
+        preparation_guard.close()
         if not handlers_restored:
             for forwarded, previous in previous_handlers.items():
                 signal.signal(forwarded, previous)

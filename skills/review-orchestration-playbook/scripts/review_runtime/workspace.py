@@ -284,6 +284,9 @@ MAX_SYNTHETIC_EVIDENCE_BYTES = 64 * 1024
 MAX_SYNTHETIC_EVIDENCE_ENTRIES = 512
 MAX_REVIEW_CLEANUP_DEPTH = 256
 REVIEW_CLEANUP_QUARANTINE_PREFIX = ".codex-review-cleanup-"
+REVIEW_CLEANUP_LOCK_NAME = "cleanup.lock"
+REVIEW_RUNNER_LOCK_NAME = "runner.lock"
+REVIEW_STATE_MARKER_NAME = ".isolated-review-state"
 SYNTHETIC_MANIFEST_NAME = "synthetic-secret-manifest.json"
 SYNTHETIC_PRIVATE_MANIFEST_NAME = "synthetic-secret-state.json"
 SYNTHETIC_CHANGED_EVIDENCE_NAME = "synthetic-changed-evidence.json"
@@ -1396,9 +1399,10 @@ def _remove_open_directory_tree(
     label: str,
     require_private_mode: bool,
     excluded_entry_names: frozenset[str] = frozenset(),
-    final_entry_names: frozenset[str] = frozenset(),
+    final_entry_names: tuple[str, ...] = (),
     depth: int = 0,
     quarantine_before_recursion: bool = False,
+    quarantine_before_final_entries: bool = False,
 ) -> list[str]:
     try:
         directory_opened = os.fstat(directory_descriptor)
@@ -1413,6 +1417,7 @@ def _remove_open_directory_tree(
         return [directory_error]
 
     directory_quarantine_name: str | None = None
+    detached_directory_errors: list[str] = []
     if quarantine_before_recursion:
         try:
             parent_opened = os.fstat(parent_descriptor)
@@ -1448,12 +1453,65 @@ def _remove_open_directory_tree(
     cleanup_errors = _remove_open_directory_contents(
         directory_descriptor,
         depth=depth,
-        excluded_entry_names=excluded_entry_names | final_entry_names,
+        excluded_entry_names=excluded_entry_names | frozenset(final_entry_names),
     )
     if cleanup_errors:
         return cleanup_errors
 
-    for final_entry_name in sorted(final_entry_names):
+    if quarantine_before_final_entries and directory_quarantine_name is None:
+        try:
+            os.fsync(directory_descriptor)
+        except OSError as error:
+            return [f"cannot sync cleaned {label} before quarantine: {error}"]
+        try:
+            directory_before_quarantine = os.fstat(directory_descriptor)
+        except OSError as error:
+            return [f"cannot revalidate {label} before quarantine: {error}"]
+        directory_error = _private_cleanup_directory_error(
+            directory_before_quarantine,
+            label=label,
+            require_private_mode=require_private_mode,
+        )
+        if directory_error:
+            return [directory_error]
+        if _private_cleanup_identity(
+            directory_before_quarantine
+        ) != _private_cleanup_identity(directory_opened):
+            return [f"{label} changed during cleanup"]
+        (
+            directory_quarantine_name,
+            quarantined,
+            quarantine_errors,
+        ) = _quarantine_cleanup_entry(
+            parent_descriptor,
+            directory_name,
+            directory_before_quarantine,
+            label=label,
+            missing_is_error=True,
+        )
+        if quarantine_errors:
+            if directory_quarantine_name is None or quarantined is None:
+                return quarantine_errors
+            if _private_cleanup_identity(quarantined) == _private_cleanup_identity(
+                directory_before_quarantine
+            ):
+                return quarantine_errors
+            # The canonical name was replaced while the original directory
+            # remained bound to our descriptor. Retire only the original's
+            # non-sensitive protocol entries, then report the detached tree.
+            detached_directory_errors.extend(quarantine_errors)
+        elif directory_quarantine_name is None or quarantined is None:
+            return [f"cannot quarantine {label}"]
+        else:
+            directory_error = _private_cleanup_directory_error(
+                quarantined,
+                label=label,
+                require_private_mode=require_private_mode,
+            )
+            if directory_error:
+                return [directory_error]
+
+    for final_entry_name in final_entry_names:
         try:
             final_entry_metadata = os.stat(
                 final_entry_name,
@@ -1463,9 +1521,13 @@ def _remove_open_directory_tree(
         except FileNotFoundError:
             continue
         except OSError as error:
-            return [f"cannot inspect final review cleanup entry: {error}"]
+            return detached_directory_errors + [
+                f"cannot inspect final review cleanup entry: {error}"
+            ]
         if stat.S_ISDIR(final_entry_metadata.st_mode):
-            return ["final review cleanup entry is unexpectedly a directory"]
+            return detached_directory_errors + [
+                "final review cleanup entry is unexpectedly a directory"
+            ]
         final_quarantine_name, _, quarantine_errors = _quarantine_cleanup_entry(
             directory_descriptor,
             final_entry_name,
@@ -1474,7 +1536,7 @@ def _remove_open_directory_tree(
             missing_is_error=True,
         )
         if quarantine_errors or final_quarantine_name is None:
-            return quarantine_errors
+            return detached_directory_errors + quarantine_errors
         cleanup_errors.extend(
             _remove_quarantined_cleanup_entry(
                 directory_descriptor,
@@ -1485,7 +1547,10 @@ def _remove_open_directory_tree(
             )
         )
         if cleanup_errors:
-            return cleanup_errors
+            return detached_directory_errors + cleanup_errors
+
+    if detached_directory_errors:
+        return detached_directory_errors
 
     try:
         remaining_entry_names = os.listdir(directory_descriptor)
@@ -2271,10 +2336,20 @@ def _remove_review_container_tree(
             require_private_mode=True,
             excluded_entry_names=frozenset(PRIVATE_HELPER_ARTIFACT_NAMES),
             final_entry_names=(
-                frozenset({CONTROL_ARTIFACT_STATE_NAME})
+                (
+                    CONTROL_ARTIFACT_STATE_NAME,
+                    REVIEW_CLEANUP_LOCK_NAME,
+                    REVIEW_RUNNER_LOCK_NAME,
+                    REVIEW_STATE_MARKER_NAME,
+                )
                 if use_control_state
-                else frozenset()
+                else (
+                    REVIEW_CLEANUP_LOCK_NAME,
+                    REVIEW_RUNNER_LOCK_NAME,
+                    REVIEW_STATE_MARKER_NAME,
+                )
             ),
+            quarantine_before_final_entries=True,
         )
         return cleanup_errors
 
@@ -8204,10 +8279,38 @@ def _iter_secret_events(
                     closed_assignment_proof_frontier is not None
                     and recorded_closure_frontiers
                 ):
-                    closed_assignment_proof_frontier = max(
-                        closed_assignment_proof_frontier,
-                        recorded_closure_frontiers[-1],
+                    closure_frontier = recorded_closure_frontiers[-1]
+                    sibling_search_start = assignment_match.end()
+                    if recorded_literal_rhs:
+                        (
+                            _candidate_start,
+                            candidate_end,
+                            delimiter,
+                            _literal_prefix,
+                            _literal_diff_side,
+                        ) = recorded_literal_rhs[-1]
+                        if candidate_end is not None:
+                            sibling_search_start = candidate_end + len(delimiter)
+                    else:
+                        direct_unquoted = UNQUOTED_SECRET_ASSIGNMENT.match(
+                            value,
+                            assignment_match.start(),
+                            proof_end,
+                        )
+                        if direct_unquoted is not None:
+                            sibling_search_start = direct_unquoted.end(1)
+                    # Structural closure can cross a sibling assignment without
+                    # classifying its RHS, so only reuse a fully covered frontier.
+                    crossed_sibling = SECRET_ASSIGNMENT_PREFIX.search(
+                        value,
+                        sibling_search_start,
+                        closure_frontier,
                     )
+                    if crossed_sibling is None:
+                        closed_assignment_proof_frontier = max(
+                            closed_assignment_proof_frontier,
+                            closure_frontier,
+                        )
                 if recorded_literal_rhs:
                     (
                         candidate_start,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import fcntl
 import json
 import os
 import pathlib
@@ -980,6 +981,131 @@ class WorkspaceTest(unittest.TestCase):
         )
         self.assertTrue(quarantines[0].exists())
 
+    def test_full_cleanup_quarantines_container_before_retiring_protocol(self) -> None:
+        review = self.prepare_range(self.base, self.head)
+        marker = review.container_dir / workspace_runtime.REVIEW_STATE_MARKER_NAME
+        marker.write_text("recovery marker\n", encoding="utf-8")
+        cleanup_lock_path = (
+            review.container_dir / workspace_runtime.REVIEW_CLEANUP_LOCK_NAME
+        )
+        runner_lock_path = (
+            review.container_dir / workspace_runtime.REVIEW_RUNNER_LOCK_NAME
+        )
+        cleanup_lock_path.touch()
+        runner_lock_path.touch()
+        cleanup_lock_handle = cleanup_lock_path.open("r+b")
+        runner_lock_handle = runner_lock_path.open("r+b")
+        fcntl.flock(cleanup_lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(runner_lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        cleanup_events = []
+        real_quarantine = workspace_runtime._quarantine_cleanup_entry
+
+        def record_final_entry(parent_descriptor, entry_name, metadata, **kwargs):
+            label = kwargs.get("label")
+            if label == "private artifact container":
+                self.assertFalse(review.workspace_root.exists())
+                self.assertTrue(marker.is_file())
+                self.assertTrue(cleanup_lock_path.is_file())
+                self.assertTrue(runner_lock_path.is_file())
+                for lock_path, held_handle in (
+                    (cleanup_lock_path, cleanup_lock_handle),
+                    (runner_lock_path, runner_lock_handle),
+                ):
+                    with lock_path.open("a+b") as probe:
+                        self.assertEqual(
+                            (
+                                os.fstat(held_handle.fileno()).st_dev,
+                                os.fstat(held_handle.fileno()).st_ino,
+                            ),
+                            (os.lstat(lock_path).st_dev, os.lstat(lock_path).st_ino),
+                        )
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(
+                                probe.fileno(),
+                                fcntl.LOCK_EX | fcntl.LOCK_NB,
+                            )
+                cleanup_events.append("container-quarantined")
+            elif label == "final review cleanup entry":
+                self.assertFalse(review.container_dir.exists())
+                cleanup_events.append(entry_name)
+            return real_quarantine(
+                parent_descriptor,
+                entry_name,
+                metadata,
+                **kwargs,
+            )
+
+        try:
+            with mock.patch.object(
+                workspace_runtime,
+                "_quarantine_cleanup_entry",
+                side_effect=record_final_entry,
+            ):
+                cleanup_error = cleanup_workspace(review, keep_container=False)
+        finally:
+            cleanup_lock_handle.close()
+            runner_lock_handle.close()
+
+        self.assertIsNone(cleanup_error)
+        self.assertEqual(
+            cleanup_events,
+            [
+                "container-quarantined",
+                workspace_runtime.CONTROL_ARTIFACT_STATE_NAME,
+                workspace_runtime.REVIEW_CLEANUP_LOCK_NAME,
+                workspace_runtime.REVIEW_RUNNER_LOCK_NAME,
+                workspace_runtime.REVIEW_STATE_MARKER_NAME,
+            ],
+        )
+        self.assertFalse(review.container_dir.exists())
+
+    def test_full_cleanup_preserves_protocol_when_container_quarantine_fails(
+        self,
+    ) -> None:
+        review = self.prepare_range(self.base, self.head)
+        protocol_names = (
+            workspace_runtime.REVIEW_CLEANUP_LOCK_NAME,
+            workspace_runtime.REVIEW_RUNNER_LOCK_NAME,
+            workspace_runtime.REVIEW_STATE_MARKER_NAME,
+        )
+        for name in protocol_names:
+            (review.container_dir / name).touch()
+        real_quarantine = workspace_runtime._quarantine_cleanup_entry
+
+        def fail_container_quarantine(
+            parent_descriptor,
+            entry_name,
+            metadata,
+            **kwargs,
+        ):
+            if kwargs.get("label") == "private artifact container":
+                return None, None, ["cannot quarantine private artifact container"]
+            return real_quarantine(
+                parent_descriptor,
+                entry_name,
+                metadata,
+                **kwargs,
+            )
+
+        with mock.patch.object(
+            workspace_runtime,
+            "_quarantine_cleanup_entry",
+            side_effect=fail_container_quarantine,
+        ):
+            cleanup_error = cleanup_workspace(review, keep_container=False)
+
+        self.assertEqual(
+            cleanup_error,
+            "cannot quarantine private artifact container",
+        )
+        self.assertTrue(review.container_dir.is_dir())
+        self.assertFalse(review.workspace_root.exists())
+        for name in (
+            workspace_runtime.CONTROL_ARTIFACT_STATE_NAME,
+            *protocol_names,
+        ):
+            self.assertTrue((review.container_dir / name).is_file())
+
     def test_partial_cleanup_removes_private_artifacts_when_rmtree_fails(self) -> None:
         container = pathlib.Path(self.temporary.name) / "partial-container"
         container.mkdir(mode=0o700)
@@ -1004,7 +1130,12 @@ class WorkspaceTest(unittest.TestCase):
             mock.ANY,
             depth=0,
             excluded_entry_names=frozenset(
-                workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
+                (
+                    *workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES,
+                    workspace_runtime.REVIEW_CLEANUP_LOCK_NAME,
+                    workspace_runtime.REVIEW_RUNNER_LOCK_NAME,
+                    workspace_runtime.REVIEW_STATE_MARKER_NAME,
+                )
             ),
         )
         self.assertTrue(container.exists())

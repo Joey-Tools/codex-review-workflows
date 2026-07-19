@@ -314,6 +314,65 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertFalse(self.review.container_dir.exists())
 
+    def test_preparation_guard_ready_marker_recovers_without_state(self) -> None:
+        guard = state.ReviewPreparationGuard()
+        guard.accept_preparation_cleanup(
+            self.review.container_dir,
+            self.review.private_cleanup,
+        )
+        self.assertEqual(
+            state._load_state_marker(self.review.container_dir).phase,
+            "preparing",
+        )
+        guard.accept_workspace(self.review)
+        self.assertEqual(
+            state._load_state_marker(self.review.container_dir).phase,
+            "ready",
+        )
+        self.assertEqual(
+            state.cleanup(
+                self.review.container_dir,
+                timeout_seconds=state.FINAL_CLEANUP_TIMEOUT_SECONDS,
+            ),
+            3,
+        )
+        guard.close()
+
+        self.assertFalse((self.review.container_dir / state.STATE_FILE).exists())
+        self.assertEqual(
+            state.cleanup(
+                self.review.container_dir,
+                timeout_seconds=state.FINAL_CLEANUP_TIMEOUT_SECONDS,
+            ),
+            0,
+        )
+        self.assertFalse(self.review.container_dir.exists())
+
+    def test_preparation_guard_does_not_expose_workspace_before_ready_marker(
+        self,
+    ) -> None:
+        guard = state.ReviewPreparationGuard()
+        guard.accept_preparation_cleanup(
+            self.review.container_dir,
+            self.review.private_cleanup,
+        )
+        with (
+            mock.patch.object(
+                state,
+                "_write_state_marker",
+                side_effect=ReviewError("ready marker failed"),
+            ),
+            self.assertRaisesRegex(ReviewError, "ready marker failed"),
+        ):
+            guard.accept_workspace(self.review)
+
+        self.assertIsNone(guard.review)
+        self.assertEqual(
+            state._load_state_marker(self.review.container_dir).phase,
+            "preparing",
+        )
+        guard.close()
+
     def test_ready_marker_recovers_after_private_artifact_receipts(self) -> None:
         state._write_state_marker(self.review)
         cleanup_error = remove_private_review_artifacts(

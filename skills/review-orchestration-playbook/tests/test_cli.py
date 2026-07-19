@@ -3,10 +3,13 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import os
 import pathlib
 import signal
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -14,26 +17,33 @@ from unittest import mock
 SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from review_runtime import cli, providers  # noqa: E402
+from review_runtime import cli, providers, state  # noqa: E402
 from review_runtime.workspace import (  # noqa: E402
     PRIVATE_HELPER_ARTIFACT_NAMES,
     CleanupIdentity,
     PrivateCleanupEvidence,
     ReviewWorkspace,
+    cleanup_workspace as cleanup_workspace_impl,
+    prepare_workspace as prepare_workspace_impl,
 )
 
 
 def prepared_workspace(review):
     def prepare(**kwargs):
+        kwargs["preparation_cleanup_handoff"](
+            review.container_dir,
+            review.private_cleanup,
+        )
         kwargs["ownership_handoff"](review)
         return review
 
     return prepare
 
 
-def private_cleanup_evidence() -> PrivateCleanupEvidence:
+def private_cleanup_evidence(container: pathlib.Path) -> PrivateCleanupEvidence:
+    metadata = os.lstat(container)
     return PrivateCleanupEvidence(
-        container=CleanupIdentity(device=1, inode=1),
+        container=CleanupIdentity(device=metadata.st_dev, inode=metadata.st_ino),
         artifacts={
             name: CleanupIdentity(device=1, inode=index + 2)
             for index, name in enumerate(PRIVATE_HELPER_ARTIFACT_NAMES)
@@ -134,49 +144,212 @@ class ForegroundCleanupTest(unittest.TestCase):
         self.assertEqual(raised.exception.signum, signal.SIGTERM)
         run_review.assert_not_called()
 
+    def test_foreground_guard_holds_runner_and_cleanup_locks_until_zero_residue(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = pathlib.Path(temporary) / "repo"
+            repo.mkdir()
+            subprocess.run(
+                ("git", "init", "-b", "master", str(repo)),
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            for key, value in (
+                ("user.name", "Review Test"),
+                ("user.email", "review@example.com"),
+                ("commit.gpgsign", "false"),
+            ):
+                subprocess.run(
+                    ("git", "-C", str(repo), "config", key, value),
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            (repo / ".gitignore").write_text(".codex-tmp/\n", encoding="utf-8")
+            (repo / "example.txt").write_text("one\n", encoding="utf-8")
+            subprocess.run(
+                ("git", "-C", str(repo), "add", ".gitignore", "example.txt"),
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            subprocess.run(
+                ("git", "-C", str(repo), "commit", "-m", "Initial"),
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            base = subprocess.run(
+                ("git", "-C", str(repo), "rev-parse", "HEAD"),
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            ).stdout.strip()
+            (repo / "example.txt").write_text("two\n", encoding="utf-8")
+            subprocess.run(
+                ("git", "-C", str(repo), "add", "example.txt"),
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            subprocess.run(
+                ("git", "-C", str(repo), "commit", "-m", "Update"),
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            head = subprocess.run(
+                ("git", "-C", str(repo), "rev-parse", "HEAD"),
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            ).stdout.strip()
+            captured: list[ReviewWorkspace] = []
+            review = prepare_workspace_impl(
+                repo=repo,
+                base_ref=base,
+                head_ref=head,
+                ownership_handoff=captured.append,
+            )
+            self.assertEqual(captured, [review])
+
+            args = argparse.Namespace(
+                repo=str(repo),
+                reviewer="codex",
+                base_ref=base,
+                head_ref=head,
+                prompt_file=None,
+                keep_workspace=False,
+                egress_consent=None,
+            )
+
+            def prepare_with_guard(**kwargs):
+                kwargs["preparation_cleanup_handoff"](
+                    review.container_dir,
+                    review.private_cleanup,
+                )
+                self.assertEqual(
+                    state._load_state_marker(review.container_dir).phase,
+                    "preparing",
+                )
+                kwargs["ownership_handoff"](review)
+                self.assertEqual(
+                    state._load_state_marker(review.container_dir).phase,
+                    "ready",
+                )
+                return review
+
+            def review_with_live_cleanup_probe(**_kwargs):
+                self.assertFalse((review.container_dir / state.STATE_FILE).exists())
+                self.assertEqual(
+                    state.cleanup(review.container_dir, timeout_seconds=0),
+                    3,
+                )
+                (review.container_dir / "final.txt").write_text(
+                    "No findings.\n",
+                    encoding="utf-8",
+                )
+                return providers.Outcome(0, "No findings.", tuple())
+
+            def cleanup_with_lock_probe(prepared, *, keep_container):
+                self.assertIs(prepared, review)
+                self.assertFalse(keep_container)
+                self.assertTrue(
+                    state._runner_lock_held(review.container_dir / state.LOCK_FILE)
+                )
+                probe, lock_error = state.open_bound_review_lock(
+                    review.container_dir,
+                    expected=review.private_cleanup,
+                    name=state.CLEANUP_LOCK_FILE,
+                )
+                self.assertIsNone(lock_error)
+                assert probe is not None
+                try:
+                    self.assertFalse(
+                        state._acquire_cleanup_lock(
+                            probe,
+                            deadline=time.monotonic(),
+                        )
+                    )
+                finally:
+                    probe.close()
+                return cleanup_workspace_impl(prepared, keep_container=False)
+
+            with (
+                mock.patch.object(
+                    cli,
+                    "prepare_workspace",
+                    side_effect=prepare_with_guard,
+                ),
+                mock.patch.object(
+                    cli,
+                    "run_review",
+                    side_effect=review_with_live_cleanup_probe,
+                ),
+                mock.patch.object(
+                    cli,
+                    "cleanup_workspace",
+                    side_effect=cleanup_with_lock_probe,
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                returncode = cli._run_foreground(args)
+
+            self.assertEqual(returncode, 0)
+            self.assertFalse(review.container_dir.exists())
+
     def test_handoff_signal_cleans_workspace_owned_by_caller(self) -> None:
-        root = pathlib.Path("/tmp/review-handoff")
-        review = ReviewWorkspace(
-            source_root=root,
-            container_dir=root / ".codex-tmp/isolated-review-test",
-            workspace_root=root / ".codex-tmp/isolated-review-test/workspace",
-            base_ref="a" * 40,
-            head_ref="b" * 40,
-            diff_file=root
-            / ".codex-tmp/isolated-review-test/workspace/.codex-review/review.diff",
-            prompt_file=root
-            / ".codex-tmp/isolated-review-test/workspace/.codex-review/review.prompt",
-            private_cleanup=private_cleanup_evidence(),
-        )
-        args = argparse.Namespace(
-            repo=str(root),
-            reviewer="codex",
-            base_ref=review.base_ref,
-            head_ref=review.head_ref,
-            prompt_file=None,
-            keep_workspace=False,
-            egress_consent=None,
-        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            container = root / ".codex-tmp/isolated-review-test"
+            container.mkdir(mode=0o700, parents=True)
+            review = ReviewWorkspace(
+                source_root=root,
+                container_dir=container,
+                workspace_root=container / "workspace",
+                base_ref="a" * 40,
+                head_ref="b" * 40,
+                diff_file=container / "workspace/.codex-review/review.diff",
+                prompt_file=container / "workspace/.codex-review/review.prompt",
+                private_cleanup=private_cleanup_evidence(container),
+            )
+            args = argparse.Namespace(
+                repo=str(root),
+                reviewer="codex",
+                base_ref=review.base_ref,
+                head_ref=review.head_ref,
+                prompt_file=None,
+                keep_workspace=False,
+                egress_consent=None,
+            )
 
-        def handoff_then_signal(**kwargs):
-            kwargs["ownership_handoff"](review)
-            raise cli.ForwardedSignal(signal.SIGTERM)
+            def handoff_then_signal(**kwargs):
+                kwargs["preparation_cleanup_handoff"](
+                    review.container_dir,
+                    review.private_cleanup,
+                )
+                kwargs["ownership_handoff"](review)
+                raise cli.ForwardedSignal(signal.SIGTERM)
 
-        with (
-            mock.patch.object(
-                cli,
-                "prepare_workspace",
-                side_effect=handoff_then_signal,
-            ),
-            mock.patch.object(cli, "run_review") as run_review,
-            mock.patch.object(
-                cli,
-                "cleanup_workspace",
-                return_value=None,
-            ) as cleanup,
-            self.assertRaises(cli.ForwardedSignal) as raised,
-        ):
-            cli._run_foreground(args)
+            with (
+                mock.patch.object(
+                    cli,
+                    "prepare_workspace",
+                    side_effect=handoff_then_signal,
+                ),
+                mock.patch.object(cli, "run_review") as run_review,
+                mock.patch.object(
+                    cli,
+                    "cleanup_workspace",
+                    return_value=None,
+                ) as cleanup,
+                self.assertRaises(cli.ForwardedSignal) as raised,
+            ):
+                cli._run_foreground(args)
 
         self.assertEqual(raised.exception.signum, signal.SIGTERM)
         run_review.assert_not_called()
@@ -185,17 +358,19 @@ class ForegroundCleanupTest(unittest.TestCase):
     def test_success_becomes_failure_when_workspace_cleanup_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
+            container = root / ".codex-tmp/isolated-review-test"
+            container.mkdir(mode=0o700, parents=True)
             review = ReviewWorkspace(
                 source_root=root,
-                container_dir=root / ".codex-tmp/isolated-review-test",
-                workspace_root=root / ".codex-tmp/isolated-review-test/workspace",
+                container_dir=container,
+                workspace_root=container / "workspace",
                 base_ref="a" * 40,
                 head_ref="b" * 40,
                 diff_file=root
                 / ".codex-tmp/isolated-review-test/workspace/.codex-review/review.diff",
                 prompt_file=root
                 / ".codex-tmp/isolated-review-test/workspace/.codex-review/review.prompt",
-                private_cleanup=private_cleanup_evidence(),
+                private_cleanup=private_cleanup_evidence(container),
             )
             args = argparse.Namespace(
                 repo=str(root),
@@ -230,49 +405,50 @@ class ForegroundCleanupTest(unittest.TestCase):
         self.assertIn("isolated-review-test", stderr.getvalue())
 
     def test_keep_workspace_retries_private_artifact_cleanup(self) -> None:
-        root = pathlib.Path("/tmp/review-keep")
-        review = ReviewWorkspace(
-            source_root=root,
-            container_dir=root / ".codex-tmp/isolated-review-test",
-            workspace_root=root / ".codex-tmp/isolated-review-test/workspace",
-            base_ref="a" * 40,
-            head_ref="b" * 40,
-            diff_file=root
-            / ".codex-tmp/isolated-review-test/workspace/.codex-review/review.diff",
-            prompt_file=root
-            / ".codex-tmp/isolated-review-test/workspace/.codex-review/review.prompt",
-            private_cleanup=private_cleanup_evidence(),
-        )
-        args = argparse.Namespace(
-            repo=str(root),
-            reviewer="codex",
-            base_ref=review.base_ref,
-            head_ref=review.head_ref,
-            prompt_file=None,
-            keep_workspace=True,
-            egress_consent=None,
-        )
-        stderr = io.StringIO()
-        with (
-            mock.patch.object(
-                cli,
-                "prepare_workspace",
-                side_effect=prepared_workspace(review),
-            ),
-            mock.patch.object(
-                cli,
-                "run_review",
-                return_value=providers.Outcome(0, "No findings.", tuple()),
-            ),
-            mock.patch.object(
-                cli,
-                "remove_private_review_artifacts",
-                return_value="unlink denied",
-            ) as remove_private,
-            contextlib.redirect_stderr(stderr),
-            contextlib.redirect_stdout(io.StringIO()),
-        ):
-            returncode = cli._run_foreground(args)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            container = root / ".codex-tmp/isolated-review-test"
+            container.mkdir(mode=0o700, parents=True)
+            review = ReviewWorkspace(
+                source_root=root,
+                container_dir=container,
+                workspace_root=container / "workspace",
+                base_ref="a" * 40,
+                head_ref="b" * 40,
+                diff_file=container / "workspace/.codex-review/review.diff",
+                prompt_file=container / "workspace/.codex-review/review.prompt",
+                private_cleanup=private_cleanup_evidence(container),
+            )
+            args = argparse.Namespace(
+                repo=str(root),
+                reviewer="codex",
+                base_ref=review.base_ref,
+                head_ref=review.head_ref,
+                prompt_file=None,
+                keep_workspace=True,
+                egress_consent=None,
+            )
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(
+                    cli,
+                    "prepare_workspace",
+                    side_effect=prepared_workspace(review),
+                ),
+                mock.patch.object(
+                    cli,
+                    "run_review",
+                    return_value=providers.Outcome(0, "No findings.", tuple()),
+                ),
+                mock.patch.object(
+                    cli,
+                    "remove_private_review_artifacts",
+                    return_value="unlink denied",
+                ) as remove_private,
+                contextlib.redirect_stderr(stderr),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                returncode = cli._run_foreground(args)
 
         self.assertEqual(returncode, 1)
         remove_private.assert_called_once_with(

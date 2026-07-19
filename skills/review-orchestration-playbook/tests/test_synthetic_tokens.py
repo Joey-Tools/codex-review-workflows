@@ -3915,6 +3915,31 @@ class PublicPoolScannerTest(unittest.TestCase):
                 {candidate: {"generic-secret-assignment"}},
             )
 
+    def test_nested_sibling_assignment_after_placeholder_is_not_skipped(self) -> None:
+        candidate = reduction_secret("generic-secret-assignment", b"N") + b"'segment"
+        payload = b'configure(api_token="placeholder", password="' + candidate + b'")\n'
+
+        ordinary = workspace._scan_secret_value(payload)
+        direct = workspace._scan_secret_value(
+            payload,
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+        streamed = workspace._stream_secret_scan(
+            io.BytesIO(payload),
+            size=len(payload),
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+
+        self.assertEqual(ordinary.blocking_rule, "generic-secret-assignment")
+        self.assertIsNone(direct.blocking_rule)
+        self.assertEqual(
+            direct.blocking_candidates,
+            {candidate: {"generic-secret-assignment"}},
+        )
+        self.assertEqual(streamed, direct)
+
     def test_closed_literal_proof_in_overlap_retains_assignment(self) -> None:
         candidate = reduction_secret("generic-secret-assignment", b"F")
         assignment_start = 20

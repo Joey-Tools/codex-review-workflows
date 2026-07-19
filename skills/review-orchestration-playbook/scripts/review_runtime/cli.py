@@ -16,7 +16,7 @@ from .common import (
     restore_signal_mask,
 )
 from .providers import CLAUDE_EGRESS_CONSENTS, run_review
-from .state import FINAL_CLEANUP_TIMEOUT_SECONDS
+from .state import FINAL_CLEANUP_TIMEOUT_SECONDS, ReviewPreparationGuard
 from .state import cleanup as cleanup_state
 from .state import final, run_state, start, status, wait
 from .synthetic_tokens import (
@@ -199,6 +199,7 @@ def _run_synthetic_tokens(argv: list[str]) -> int:
 
 
 def _run_foreground(args: argparse.Namespace) -> int:
+    preparation_guard = ReviewPreparationGuard()
     _validate_review_arguments(args)
     review = None
     returncode = 1
@@ -213,7 +214,8 @@ def _run_foreground(args: argparse.Namespace) -> int:
 
     def accept_workspace(prepared: ReviewWorkspace) -> None:
         nonlocal review
-        review = prepared
+        preparation_guard.accept_workspace(prepared)
+        review = preparation_guard.require_review()
 
     try:
         prepare_workspace(
@@ -221,6 +223,7 @@ def _run_foreground(args: argparse.Namespace) -> int:
             base_ref=args.base_ref,
             head_ref=args.head_ref,
             ownership_handoff=accept_workspace,
+            preparation_cleanup_handoff=(preparation_guard.accept_preparation_cleanup),
             synthetic_secret_exemptions=tuple(
                 getattr(args, "synthetic_secret_exemption", ())
             ),
@@ -255,19 +258,21 @@ def _run_foreground(args: argparse.Namespace) -> int:
         pending_signal: signal.Signals | None = None
         try:
             if review is not None:
-                if args.keep_workspace:
-                    cleanup_error = remove_private_review_artifacts(
-                        review.container_dir,
-                        expected=review.private_cleanup,
-                    )
-                    print(
-                        f"kept review workspace: {review.container_dir}",
-                        file=sys.stderr,
-                    )
-                elif (review.container_dir / "final.txt").is_file():
-                    cleanup_error = cleanup_workspace(review, keep_container=False)
-                else:
-                    cleanup_error = cleanup_workspace(review, keep_container=True)
+                cleanup_error = preparation_guard.acquire_final_cleanup_lock()
+                if cleanup_error is None:
+                    if args.keep_workspace:
+                        cleanup_error = remove_private_review_artifacts(
+                            review.container_dir,
+                            expected=review.private_cleanup,
+                        )
+                        print(
+                            f"kept review workspace: {review.container_dir}",
+                            file=sys.stderr,
+                        )
+                    elif (review.container_dir / "final.txt").is_file():
+                        cleanup_error = cleanup_workspace(review, keep_container=False)
+                    else:
+                        cleanup_error = cleanup_workspace(review, keep_container=True)
                 if cleanup_error:
                     print(
                         "review cleanup failed; evidence retained at "
@@ -276,9 +281,12 @@ def _run_foreground(args: argparse.Namespace) -> int:
                     )
             pending_signal = consume_pending_forwarded_signal()
         finally:
-            restore_signal_mask(previous_mask)
-            for signum, previous_handler in previous_handlers.items():
-                signal.signal(signum, previous_handler)
+            try:
+                preparation_guard.close()
+            finally:
+                restore_signal_mask(previous_mask)
+                for signum, previous_handler in previous_handlers.items():
+                    signal.signal(signum, previous_handler)
         if pending_signal is not None:
             raise ForwardedSignal(pending_signal)
     return 1 if cleanup_error and returncode == 0 else returncode
