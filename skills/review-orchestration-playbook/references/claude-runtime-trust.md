@@ -22,7 +22,8 @@ is supported only when every applicable gate below passes.
   provenance, platform, capability, credential, and isolation checks pass.
   Local-login refresh writeback additionally requires an exact
   version/platform/SHA-256 entry from the signed artifact in the credential-lock
-  protocol catalog. An explicit API key does not require that internal protocol.
+  protocol catalog. An explicit API key or OAuth token does not require that
+  internal protocol.
 - Do not pin the helper to `latest`, `stable`, or one current patch release. The
   helper never upgrades Claude Code and reviews the installed release it finds.
 - The former exact patch pin was a compact trust-and-compatibility shortcut for
@@ -139,9 +140,9 @@ explicitly configured Claude Code candidate:
     with the later access-token expiry, and load it into the restricted broker.
     On Linux and WSL2, validate the host credential file and stage a private
     copy. An expired access token is accepted when a usable refresh token remains;
-    there is no warmup or attempt-duration freshness gate. An explicit API key
-    skips local credential selection, staging, and the internal lock-protocol
-    gate. Before local-login preparation, require the captured signed artifact
+    there is no warmup or attempt-duration freshness gate. A nonempty explicit
+    API key or OAuth token skips local credential selection, staging, and the
+    internal lock-protocol gate. Before local-login preparation, require the captured signed artifact
     to resolve to one exact certified lock protocol; an unknown artifact is
     inspection-inconclusive before credentials or review data are exposed.
 11. Launch only the one captured verified snapshot for every real model attempt
@@ -653,10 +654,15 @@ filesystem boundary.
 
 ## Credentials
 
-An explicitly supplied `ANTHROPIC_API_KEY` remains an optional override and does
-not require local-login credential access or an internal credential-lock
-protocol entry. Never pass Claude and Copilot credentials into the same child
-environment.
+Authentication precedence is `ANTHROPIC_API_KEY` over
+`CLAUDE_CODE_OAUTH_TOKEN` over pwd-resolved real login Keychain local login.
+Empty explicit values are absent. Only the nonempty winner is injected into the
+final Claude runtime, while both nonempty startup values—including the loser—are
+frozen for artifact, exception, and output redaction. Either explicit winner
+short-circuits the temporary broker, Keychain access, refresh-lock protocol,
+credential staging, recovery setup, and host writeback before any of those
+local-login facilities are inspected, acquired, or created. Never pass Claude
+and Copilot credentials into the same child environment.
 
 Before local-login credential access on any platform, bind the verified
 executable, release version, manifest platform key, and signed SHA-256 from
@@ -669,10 +675,21 @@ unavailability, or Copilot fallback reasons.
 
 On macOS, retain the capability-authenticated temporary Keychain broker but
 allow it to coordinate the current CLI's normal refresh behavior without giving
-the final Claude process direct host credential access. Before each model
-attempt, after trusted executable, review-tool, and TLS preparation, the parent
-reads the current-account `Claude Code-credentials` item with Apple's trusted
-client. It also resolves the current account through `pwd.getpwuid(os.getuid())`
+the final Claude process direct host credential access. Before each local-login
+model attempt, after trusted executable, review-tool, and TLS preparation, the
+parent uses Security.framework to open the current account's real login
+Keychain and read the `Claude Code-credentials` generic-password item by exact
+item reference. The login-Keychain path is descriptor-bound from `/` through
+the leaf, must remain on local APFS, rejects every ALLOW or unknown ACL entry so
+only DENY-only ACL metadata is accepted, and uses kqueue vnode monitoring to
+fail closed on unexpected component changes. Every complete read or guarded
+replacement runs in its own dedicated supervised helper process. The worker
+disables Security.framework user interaction before Keychain access, restores
+the prior setting after native cleanup on a normal exit, and is killed and
+reaped when its monotonic hard timeout expires. Credentials cross only an
+anonymous bounded socket protocol; they never enter argv, the environment,
+temporary files, stdout, or stderr, and mutable transport copies are scrubbed.
+It also resolves the current account through `pwd.getpwuid(os.getuid())`
 and safely inspects `<pwd-home>/.claude/.credentials.json`; caller-controlled
 `HOME` never selects this source. The file must be a stable no-follow regular
 file owned by the current user with exact mode `0600`, bounded size, and valid
@@ -722,10 +739,10 @@ recovery staging, not host persistence or an absolute power-loss guarantee.
 and storage hardware may still fail to honor it. A
 generation that fails structural validation invalidates any older published
 host-writeback candidate while leaving the older durable carrier available for
-recovery. It never exposes
-`/usr/bin/security`, the Keychain service, the file source, or arbitrary update
-commands to Claude. The parent retains both carriers' existence, payload and
-refresh-token digests, plus the file identity, not only the selected carrier.
+recovery. It never exposes the host Keychain service, the file source, or
+arbitrary update commands to Claude. The parent retains both carriers'
+existence, payload and refresh-token digests, plus the Keychain descriptor
+identity and file identity, not only the selected carrier.
 Carriers with the same refresh-token digest are one logical login even when
 their access-token payloads or expiry metadata differ. After the server and
 every handler have quiesced, the outer runtime is the single host-persistence
@@ -744,7 +761,9 @@ staged or non-staged control-flow stop leaves any stale carrier unvisited,
 cleanup reporting is promoted to the macOS recovery-root scope. It
 maintains the certified
 5-second heartbeat, rechecks both carriers under those locks, and performs
-guarded writeback against each carrier's own current payload. The helper
+guarded writeback against each carrier's own current payload. The caller keeps
+the certified writer lease held across the Security.framework expected-payload
+check, exact-item replacement, and readback. The helper
 prevalidates the stable macOS recovery-root cleanup scope before broker exposure.
 On unquiescent shutdown, the server first irreversibly closes the pending-update
 publication/acknowledgement gate, then boundedly drains handlers already inside
@@ -788,10 +807,33 @@ file identity, for final verification and subsequent model attempts. Supported
 Claude Code login/refresh writers therefore serialize with the commit window; observed
 concurrent changes win and successful refresh-token rotation is normally
 retained. The Keychain and POSIX file do not share one transaction. After the
-file commit, a failed Keychain command therefore triggers locked readback: an
-already-complete update is accepted, an exact file-new/Keychain-old state gets
-one bounded Keychain retry against the original Keychain payload, and any other
-state pauses without overwriting it. For a Keychain-only refresh, the same
+file commit, an ordinary guarded Keychain failure from a worker that exited
+cleanly triggers locked readback: an already-complete update is accepted, an
+exact file-new/Keychain-old state gets one bounded retry against the original
+Keychain payload, and any other state pauses without overwriting it. This
+permits at most two Keychain replacement attempts: the initial replacement and
+that one exact retry. A hard timeout after replacement dispatch instead has a
+write outcome unknown: killing the client process cannot prove that securityd
+will not complete the request later. While the same certified writer lease is
+still held, the parent performs a single bounded readback. It accepts only the
+exact completed replacement; an original, third-party, missing, malformed, or
+timed-out readback preserves recovery state and pauses without a second
+replacement. A forwarded signal or other control-flow interruption after
+replacement dispatch is wrapped into this same write-outcome-unknown path. The
+parent completes the one locked reconciliation before restoring the original
+interruption object. If the worker cannot be proven reaped, the parent performs
+neither readback nor retry, retains the shared refresh locks for controlled
+operator cleanup, and only then restores any deferred interruption. The parent
+blocks forwarded signals across transport cleanup and worker termination,
+consumes pending signals before restoring the prior mask, and carries explicit
+spawned/proven state across the complete supervisor `finally` boundary. Any
+failure or control-flow interruption in worker inspection, kill, bounded wait,
+or background-reaper startup is therefore worker-termination-inconclusive and
+cannot be downgraded by a later cleanup interruption. The provider also blocks
+forwarded signals before each guarded Keychain write begins and publishes
+retained-lock ownership for a worker-termination-inconclusive result before any
+later lease assertion, readback, or signal restoration. For a
+Keychain-only refresh, the same
 readback requires an unrelated file carrier to remain unchanged or absent rather
 than incorrectly requiring it to contain the refreshed Keychain value. If the
 retry remains partial, preserve the
@@ -868,12 +910,11 @@ the credential inode and digest. Path/proof propagation and clearing are paired,
 so a bare path, a post-capture new inode, or an ancestor replacement cannot be
 promoted to current recovery metadata.
 
-The `security -i` transport-size limit applies only when the selected source is
-the Keychain or when matching refresh-token digests require a file-selected
-rotation to update the Keychain too. A structurally valid but unselected
-Keychain credential from a distinct logical login remains part of the observed
-snapshot, but its encoded update size does not block an independently usable
-file credential that will never write that Keychain item.
+Security.framework replacement uses the same 1 MiB credential ceiling as the
+broker, file carrier, and recovery journal. There is no smaller command-transport
+limit. A structurally valid but unselected Keychain credential from a distinct
+logical login remains part of the observed snapshot, but it does not block an
+independently usable file credential that will never write that Keychain item.
 
 Helper-lock or Claude-lock contention, heartbeat/lease compromise, a stale
 shared lock, a change to either macOS carrier, and credential inspection I/O uncertainty are
@@ -967,9 +1008,9 @@ exception chain through a dedicated diagnostic cause because
 A private staged carrier prevents direct host-file mutation but does not hide a
 secret from the Claude process that must authenticate with it. The Linux/WSL2
 inner permission policy therefore denies `/auth` from model-visible `Read`.
-In API-key mode, it also
+In explicit-auth mode, it also
 denies `/proc` and `/dev` so `Read(//proc/self/environ)` and file-descriptor
-aliases cannot expose `ANTHROPIC_API_KEY`. This boundary trusts the
+aliases cannot expose `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`. This boundary trusts the
 publisher-verified Claude runtime to enforce its own tool permissions against
 prompt injection; `bubblewrap` cannot distinguish two reads made by the same
 process. Stronger isolation would require an external authentication proxy that
@@ -1004,9 +1045,10 @@ reached:
 3. Authentication failure is explicit. Missing, malformed, unsafe, or
    refresh-token-less local credentials, plus a final-runtime `Login expired`,
    HTTP 401, or refresh failure, write `blocked-authentication` and the operator
-   action `claude auth login`. A rejected explicit API key instead instructs the
-   operator to unset or replace `ANTHROPIC_API_KEY`; it is not evaluated for an
-   OAuth refresh token. The phase carries no Copilot fallback eligibility.
+   action `claude auth login`. A rejected explicit API key or OAuth token instead
+   instructs the operator to unset or replace the selected
+   `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`; neither is evaluated as a
+   local-login refresh carrier. The phase carries no Copilot fallback eligibility.
    Credential-source/broker I/O races, lock contention, heartbeat failure,
    uncatalogued lock protocols, or bounded-supervision failures remain
    inconclusive. For every Keychain-broker, TCP-proxy, and Unix-proxy endpoint,
@@ -1046,7 +1088,7 @@ described as an enforced final launch.
 | No automatic candidate, supported platform unavailable, or an accepted-range automatic candidate cleanly lacks a required non-security capability or secure runtime dependency | `runtime-unavailable` | Only for explicit double/triple-review consent |
 | A helper-owned Keychain-broker, TCP-proxy, or Unix-proxy bind fails with an explicit OS policy or socket-capability errno | `runtime-unavailable` | Only for explicit double/triple-review consent |
 | The Keychain-broker source and compiler exist, but the compiler cannot start or the broker build returns nonzero | `inconclusive`; report the build gate and pause | No |
-| Local/API authentication is missing, malformed, unsafe, refresh-token-less, or actually rejected as `Login expired`, HTTP 401, or refresh failure | `blocked-authentication`; request `claude auth login` for local login or unset/replace the explicit API key, then pause | No |
+| Local or explicit authentication is missing, malformed, unsafe, refresh-token-less where applicable, or actually rejected as `Login expired`, HTTP 401, or refresh failure | `blocked-authentication`; request `claude auth login` for local login or unset/replace the selected explicit API key or OAuth token, then pause | No |
 | Signed artifact has no exact credential-lock protocol entry, either macOS carrier changed, lock contention/heartbeat failed, or credential inspection was unstable | `inconclusive`; report the exact coordination/inspection gate and pause without a login prompt | No |
 | The current macOS update would consume the reserved eighth generation or final 1 MiB | `inconclusive`; atomically close later `W` admission, durably stage that current update in the terminal recovery slot, invalidate any older staged host-writeback candidate, and NACK without publication or host writeback; NACK later requests before their callbacks or filesystem work | No |
 | The macOS broker cannot prove handler quiescence, bounded abandonment or detach is inconclusive, or its latest acknowledged durable rotation cannot be completely guarded-written to every required host carrier | `inconclusive`; irreversibly close pending publication/ACK before draining entered commit sections, use an event-only bounded abandonment latch and timed retryable detach, transfer no payload on timeout, converge a racing terminal stage through bounded recovery even for detached `None`, and use only a nonblocking timeout snapshot; any abandonment journal/quiescence stage keeps the recovery-root cleanup scope in the final error even beside an exact current carrier; after an actual recovery timeout, let only the handler/recovery state machine exact-clean a late stage/fallback or keep it within that root scope | No |
@@ -1060,8 +1102,8 @@ described as an enforced final launch.
 
 Authentication failure never becomes runtime unavailability. The helper reports
 `blocked-authentication`, tells the operator to run `claude auth login` for local
-login or unset/replace an explicit `ANTHROPIC_API_KEY`, and pauses for an explicit
-retry. Access-token expiry alone is not this state: the current CLI may refresh
+login or unset/replace the selected `ANTHROPIC_API_KEY` or
+`CLAUDE_CODE_OAUTH_TOKEN`, and pauses for an explicit retry. Access-token expiry alone is not this state: the current CLI may refresh
 inside the temporary carrier, and the parent uses validated guarded writeback to
 retain a rotation when the observed host source still matches.
 Only stderr and structured primary error fields are failure-classification
@@ -1077,7 +1119,7 @@ fallback. `explicit-claude-review` remains Anthropic-only.
 An unsupported future patch inside the version range may be treated as automatic
 runtime unavailability only when it cleanly lacks a required public capability.
 An uncatalogued internal credential-lock protocol is instead inconclusive for
-local login and remains usable with an explicit API key. Evidence
+local login and remains usable with an explicit API key or OAuth token. Evidence
 of tampering, contradictory claims, or boundary failure is blocked, not converted
 into availability fallback. Capacity, rate limits, timeouts, and 5xx errors never
 authorize a model or backend switch. On WSL2, a path positively covered by a

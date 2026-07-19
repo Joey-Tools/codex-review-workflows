@@ -54,6 +54,18 @@ from .claude_refresh_lock import (
     certified_claude_refresh_lock_protocol,
     claude_refresh_lock,
 )
+from .claude_keychain_macos import (
+    KeychainIdentity,
+    MacOSKeychainIdentityMismatch,
+    MacOSKeychainInspectionInconclusive,
+    MacOSKeychainPayloadMismatch,
+    MacOSKeychainUnavailable,
+    MacOSKeychainUnsafe,
+    MacOSKeychainWorkerTerminationInconclusive,
+    MacOSKeychainWriteOutcomeUnknown,
+    read_login_keychain_credential,
+    replace_login_keychain_credential,
+)
 from .claude_linux import (
     CLAUDE_LINUX_FILE_TOOL_DENY_RULES,
     CLAUDE_LINUX_REVIEW_ALLOWED_TOOLS,
@@ -94,15 +106,18 @@ from .common import (
     ReviewOutputLimitError,
     ReviewProcessLeakError,
     ReviewTimeoutError,
+    atomic_write_redactions,
     block_forwarded_signals,
     child_environment,
+    consume_pending_forwarded_signal,
     is_relative_to,
+    output_redact_values,
     read_json,
+    redact_text,
     reviewer_executable_path,
     resolve_reviewer_executable,
     restore_signal_mask,
     run,
-    run_bounded_capture,
     write_json,
     write_text_atomic,
 )
@@ -177,7 +192,6 @@ CLAUDE_REVIEW_BASE_MACH_SERVICES = (
     "com.apple.trustd.agent",
 )
 CLAUDE_KEYCHAIN_BROKER_COMPILER = pathlib.Path("/usr/bin/clang")
-CLAUDE_KEYCHAIN_CLIENT = pathlib.Path("/usr/bin/security")
 CLAUDE_KEYCHAIN_BROKER_SOURCE = pathlib.Path(__file__).with_name(
     "claude_keychain_broker.c"
 )
@@ -189,32 +203,34 @@ CLAUDE_KEYCHAIN_BROKER_CAPABILITY = re.compile(r"^[0-9a-f]{64}$")
 CLAUDE_KEYCHAIN_BROKER_CAPABILITY_BYTES = 32
 CLAUDE_KEYCHAIN_BROKER_TIMEOUT_SECONDS = 20.0
 CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES = 64 * 1024
-CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS = 5.0
 CLAUDE_KEYCHAIN_SERVER_START_TIMEOUT_SECONDS = 5.0
 CLAUDE_KEYCHAIN_SERVER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 CLAUDE_KEYCHAIN_RECOVERY_TIMEOUT_SECONDS = 5.0
 CLAUDE_KEYCHAIN_SERVER_POLL_INTERVAL_SECONDS = 0.05
 CLAUDE_CREDENTIAL_UPDATE_LOCK_TIMEOUT_SECONDS = 5.0
 CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES = 1024 * 1024
-CLAUDE_KEYCHAIN_SECURITY_STDIN_LIMIT_BYTES = 4032
 CLAUDE_MACOS_DUAL_CARRIER_KEYCHAIN_ATTEMPTS = 2
 CLAUDE_CREDENTIAL_FILE_NAME = ".credentials.json"
 CLAUDE_MACOS_RECOVERY_ENTRY_LIMIT = 64
-CLAUDE_MACOS_RECOVERY_UPDATE_PREFIX = (
-    f".{CLAUDE_CREDENTIAL_FILE_NAME}.codex-"
-)
+CLAUDE_MACOS_RECOVERY_UPDATE_PREFIX = f".{CLAUDE_CREDENTIAL_FILE_NAME}.codex-"
 CLAUDE_MACOS_RECOVERY_UPDATE_SUFFIX = ".tmp"
 CLAUDE_MACOS_DURABLE_STAGE_GENERATION_WIDTH = 20
 CLAUDE_MACOS_DURABLE_STAGE_PENDING_PREFIX = "claude-carrier-pending-"
 CLAUDE_MACOS_DURABLE_STAGE_COMMITTED_PREFIX = "claude-carrier-durable-"
 CLAUDE_MACOS_DURABLE_STAGE_MAX_GENERATIONS = 8
 CLAUDE_MACOS_DURABLE_STAGE_MAX_BYTES = (
-    CLAUDE_MACOS_DURABLE_STAGE_MAX_GENERATIONS
-    * CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES
+    CLAUDE_MACOS_DURABLE_STAGE_MAX_GENERATIONS * CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES
 )
-CLAUDE_AUTH_LOGIN_ACTION = "Run `claude auth login`, then retry the review."
+CLAUDE_AUTH_LOGIN_ACTION = (
+    "Run `claude auth login` or set `CLAUDE_CODE_OAUTH_TOKEN`, then restart "
+    "the stateful review."
+)
+CLAUDE_OAUTH_TOKEN_ACTION = (
+    "Unset or replace `CLAUDE_CODE_OAUTH_TOKEN`, then restart the stateful review."
+)
 CLAUDE_API_KEY_ACTION = (
-    "Unset or replace `ANTHROPIC_API_KEY`, then retry the review."
+    "`ANTHROPIC_API_KEY` takes precedence over `CLAUDE_CODE_OAUTH_TOKEN`; "
+    "Unset or replace `ANTHROPIC_API_KEY`, then restart the stateful review."
 )
 CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC = (
     "Claude credential refresh persistence also failed; the selected host "
@@ -304,11 +320,26 @@ CLAUDE_EGRESS_CONSENTS = (
 )
 COPILOT_EGRESS_CONSENTS = ("double-review", "triple-review")
 CODEX_ENV_KEYS = ("CODEX_HOME", "OPENAI_API_KEY")
-CLAUDE_ENV_KEYS = ("ANTHROPIC_API_KEY", "NODE_EXTRA_CA_CERTS")
+CLAUDE_EXPLICIT_AUTH_ENV_KEYS = (
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+)
+CLAUDE_ENV_KEYS = (*CLAUDE_EXPLICIT_AUTH_ENV_KEYS, "NODE_EXTRA_CA_CERTS")
 COPILOT_ENV_KEYS = (
     "COPILOT_GITHUB_TOKEN",
     "GH_TOKEN",
     "GITHUB_TOKEN",
+)
+_PROVIDER_OWNED_ATOMIC_TEXT_ARTIFACT_NAMES = frozenset(
+    {
+        "attempts.json",
+        "claude-runtime.json",
+        "claude-skip.txt",
+        "egress.json",
+        "final.txt",
+        "preflight.json",
+        "runner-error.txt",
+    }
 )
 
 TRANSIENT_FAILURE_FRAGMENTS = (
@@ -427,6 +458,16 @@ class ClaudeCredentialInspectionInconclusive(ReviewError):
     """Credential I/O or a source race prevented a stable inspection."""
 
 
+class ClaudeCredentialWriteOutcomeUnknown(ClaudeCredentialInspectionInconclusive):
+    """A supervised native Keychain replacement may have completed."""
+
+
+class ClaudeCredentialWorkerTerminationInconclusive(
+    ClaudeCredentialWriteOutcomeUnknown
+):
+    """A native Keychain replacement worker could not be proven reaped."""
+
+
 class ClaudeCredentialStaleRefreshLock(ClaudeCredentialInspectionInconclusive):
     """A stale shared refresh lock needs controlled operator recovery."""
 
@@ -441,6 +482,22 @@ class ClaudeCredentialCleanupDiagnostic(Exception):
 
 def _is_claude_control_flow_error(error: BaseException) -> bool:
     return not isinstance(error, Exception) or isinstance(error, ForwardedSignal)
+
+
+def _claude_control_flow_from_cause_chain(
+    error: BaseException | None,
+) -> BaseException | None:
+    current = error
+    seen: set[int] = set()
+    for _ in range(16):
+        if current is None or id(current) in seen:
+            return None
+        seen.add(id(current))
+        if _is_claude_control_flow_error(current):
+            return current
+        cause = current.__cause__
+        current = cause if isinstance(cause, BaseException) else None
+    return None
 
 
 def _attach_claude_credential_cleanup_failure(
@@ -493,11 +550,7 @@ def _raise_or_attach_claude_credential_cleanup(
     if not cleanup_errors:
         return
     cleanup_control_flow = next(
-        (
-            error
-            for error in cleanup_errors
-            if _is_claude_control_flow_error(error)
-        ),
+        (error for error in cleanup_errors if _is_claude_control_flow_error(error)),
         None,
     )
     if primary is not None and _is_claude_control_flow_error(primary):
@@ -610,9 +663,7 @@ def _is_claude_macos_host() -> bool:
 
 def _claude_linux_bootstrap_library_roots() -> tuple[pathlib.Path, ...]:
     roots = tuple(
-        path
-        for path in CLAUDE_LINUX_BOOTSTRAP_LIBRARY_ROOT_CANDIDATES
-        if path.is_dir()
+        path for path in CLAUDE_LINUX_BOOTSTRAP_LIBRARY_ROOT_CANDIDATES if path.is_dir()
     )
     if not roots:
         raise ClaudeProbeSandboxUnavailable(
@@ -655,18 +706,12 @@ def _create_or_validate_claude_runtime_directory(
         ) from error
     mode = stat.S_IMODE(before.st_mode)
     if not stat.S_ISDIR(before.st_mode):
-        raise ReviewError(
-            f"Claude runtime path must be a real directory: {path}"
-        )
+        raise ReviewError(f"Claude runtime path must be a real directory: {path}")
     if before.st_uid != os.geteuid():
-        raise ReviewError(
-            f"Claude runtime directory has an unexpected owner: {path}"
-        )
+        raise ReviewError(f"Claude runtime directory has an unexpected owner: {path}")
     if (private and mode != 0o700) or (not private and mode & 0o022):
         requirement = "0700" if private else "not group- or world-writable"
-        raise ReviewError(
-            f"Claude runtime directory must be {requirement}: {path}"
-        )
+        raise ReviewError(f"Claude runtime directory must be {requirement}: {path}")
     flags = (
         os.O_RDONLY
         | getattr(os, "O_CLOEXEC", 0)
@@ -688,13 +733,16 @@ def _create_or_validate_claude_runtime_directory(
         ) from error
     finally:
         os.close(descriptor)
-    if len(
-        {
-            _claude_linux_directory_identity(before),
-            _claude_linux_directory_identity(opened),
-            _claude_linux_directory_identity(after),
-        }
-    ) != 1:
+    if (
+        len(
+            {
+                _claude_linux_directory_identity(before),
+                _claude_linux_directory_identity(opened),
+                _claude_linux_directory_identity(after),
+            }
+        )
+        != 1
+    ):
         raise ReviewError("Claude runtime directory changed during validation")
     return path
 
@@ -864,9 +912,7 @@ def _claude_macos_platform_key(path: pathlib.Path) -> str:
             f"cannot inspect Claude Code architecture: {error}"
         ) from error
     if len(header) < 8:
-        raise InvalidReviewerExecutable(
-            "Claude Code Mach-O header is truncated"
-        )
+        raise InvalidReviewerExecutable("Claude Code Mach-O header is truncated")
     magic = header[:4]
     if magic == b"\xcf\xfa\xed\xfe":
         byteorder = "little"
@@ -956,15 +1002,9 @@ def _prepare_claude_keychain_broker(
     review: ReviewWorkspace,
     env: dict[str, str],
 ) -> dict[str, str]:
-    result = dict(env)
-    if result.get("ANTHROPIC_API_KEY"):
+    result = _claude_environment_with_selected_explicit_auth(env)
+    if _claude_has_explicit_auth(result):
         return result
-    if not CLAUDE_KEYCHAIN_CLIENT.is_file() or not os.access(
-        CLAUDE_KEYCHAIN_CLIENT, os.X_OK
-    ):
-        raise ClaudeKeychainBrokerUnavailable(
-            "Claude local-login review requires /usr/bin/security"
-        )
     compiler = CLAUDE_KEYCHAIN_BROKER_COMPILER
     if not compiler.is_file() or not os.access(compiler, os.X_OK):
         raise ClaudeKeychainBrokerUnavailable(
@@ -1076,6 +1116,7 @@ class _ClaudeMacOSCarrierSnapshot:
     keychain_digest: bytes | None
     file_digest: bytes | None
     file_snapshot: _ClaudeCredentialFileSnapshot | None
+    keychain_identity: KeychainIdentity | None = None
     keychain_refresh_digest: bytes | None = None
     file_refresh_digest: bytes | None = None
 
@@ -1192,9 +1233,7 @@ def _open_absolute_directory_chain_without_symlinks(
         pending_descriptor = root_descriptor = os.open("/", flags)
         descriptors.append(root_descriptor)
         pending_descriptor = None
-        identities.append(
-            _claude_linux_directory_identity(os.fstat(root_descriptor))
-        )
+        identities.append(_claude_linux_directory_identity(os.fstat(root_descriptor)))
         for component in components:
             parent_descriptor = descriptors[-1]
             before_metadata = os.stat(
@@ -1220,8 +1259,7 @@ def _open_absolute_directory_chain_without_symlinks(
                 )
             )
             if (
-                _claude_linux_directory_identity(before_metadata)
-                != opened_identity
+                _claude_linux_directory_identity(before_metadata) != opened_identity
                 or after_identity != opened_identity
             ):
                 raise ClaudeCredentialInspectionInconclusive(
@@ -1229,10 +1267,7 @@ def _open_absolute_directory_chain_without_symlinks(
                 )
             identities.append(opened_identity)
         yield descriptors[-1], tuple(identities)
-        if (
-            _claude_linux_directory_identity(os.fstat(descriptors[0]))
-            != identities[0]
-        ):
+        if _claude_linux_directory_identity(os.fstat(descriptors[0])) != identities[0]:
             raise ClaudeCredentialInspectionInconclusive(
                 "the retained Claude artifact root changed while inspected"
             )
@@ -1261,10 +1296,7 @@ def _open_absolute_directory_chain_without_symlinks(
         raise
     finally:
         cleanup_errors: list[BaseException] = []
-        if (
-            pending_descriptor is not None
-            and pending_descriptor not in descriptors
-        ):
+        if pending_descriptor is not None and pending_descriptor not in descriptors:
             try:
                 os.close(pending_descriptor)
             except BaseException as error:
@@ -1286,9 +1318,7 @@ def _open_claude_credential_config_directory(
 ) -> tuple[int, int, tuple[int, ...], tuple[int, ...]] | None:
     owner_uid = os.getuid()
     try:
-        home_descriptor: int | None = _open_absolute_directory_without_symlinks(
-            home
-        )
+        home_descriptor: int | None = _open_absolute_directory_without_symlinks(home)
     except FileNotFoundError:
         return None
     except OSError as error:
@@ -1417,15 +1447,15 @@ def _read_claude_credential_file_from_directory(
             raise ClaudeCredentialUnsafe(
                 "the Claude credential file must have exactly one hard link"
             )
-        if metadata.st_size <= 0 or metadata.st_size > CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES:
+        if (
+            metadata.st_size <= 0
+            or metadata.st_size > CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES
+        ):
             raise ClaudeCredentialUnsafe(
                 "the Claude credential file has an invalid bounded size"
             )
         initial_identity = _claude_credential_file_identity(metadata)
-        if (
-            expected_identity is not None
-            and initial_identity != expected_identity
-        ):
+        if expected_identity is not None and initial_identity != expected_identity:
             raise ClaudeCredentialInspectionInconclusive(
                 "the Claude credential file identity changed before readback"
             )
@@ -1444,8 +1474,7 @@ def _read_claude_credential_file_from_directory(
         if (
             len(payload) != metadata.st_size
             or len(payload) > CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES
-            or initial_identity
-            != _claude_credential_file_identity(final_metadata)
+            or initial_identity != _claude_credential_file_identity(final_metadata)
         ):
             raise ClaudeCredentialInspectionInconclusive(
                 "the Claude credential file changed while it was read"
@@ -1535,60 +1564,30 @@ def _read_claude_macos_file_credential(
             )
 
 
+def _read_claude_keychain_credential_snapshot(
+    review: ReviewWorkspace,
+) -> tuple[bytearray, KeychainIdentity] | None:
+    del review
+    try:
+        return read_login_keychain_credential(
+            _claude_keychain_account(),
+            CLAUDE_KEYCHAIN_SERVICE,
+        )
+    except MacOSKeychainUnavailable as error:
+        raise ClaudeKeychainBrokerUnavailable(str(error)) from error
+    except MacOSKeychainUnsafe as error:
+        raise ClaudeCredentialUnsafe(str(error)) from error
+    except MacOSKeychainInspectionInconclusive as error:
+        raise ClaudeCredentialInspectionInconclusive(str(error)) from error
+
+
 def _read_claude_keychain_credential(
     review: ReviewWorkspace,
 ) -> bytearray | None:
-    client = CLAUDE_KEYCHAIN_CLIENT
-    if not client.is_file() or not os.access(client, os.X_OK):
-        raise ClaudeCredentialInspectionInconclusive(
-            "Claude local-login review requires /usr/bin/security"
-        )
-    account = _claude_keychain_account()
-    security_env = child_environment(container_dir=review.container_dir)
-    security_env["USER"] = account
-    try:
-        completed = run_bounded_capture(
-            (
-                str(client),
-                "find-generic-password",
-                "-a",
-                account,
-                "-w",
-                "-s",
-                CLAUDE_KEYCHAIN_SERVICE,
-            ),
-            cwd=review.container_dir,
-            env=security_env,
-            timeout_seconds=CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS,
-            stdout_limit_bytes=CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES,
-            stderr_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
-        )
-    except OSError as error:
-        raise ClaudeCredentialInspectionInconclusive(
-            f"Claude Keychain query failed: {error}"
-        ) from error
-    try:
-        if completed.returncode == 44:
-            return None
-        if completed.returncode != 0:
-            raise ClaudeCredentialInspectionInconclusive(
-                "Claude Keychain query failed closed with status "
-                f"{completed.returncode}"
-            )
-        credential = bytearray(completed.stdout)
-        while credential and credential[-1] in b" \t\r\n":
-            credential[-1] = 0
-            credential.pop()
-        leading = 0
-        while leading < len(credential) and credential[leading] in b" \t\r\n":
-            credential[leading] = 0
-            leading += 1
-        if leading:
-            del credential[:leading]
-        return credential
-    finally:
-        completed.stdout[:] = b"\x00" * len(completed.stdout)
-        completed.stderr[:] = b"\x00" * len(completed.stderr)
+    """Compatibility adapter for callers that do not retain writeback identity."""
+
+    result = _read_claude_keychain_credential_snapshot(review)
+    return result[0] if result is not None else None
 
 
 def _claude_macos_carriers_match(
@@ -1596,9 +1595,12 @@ def _claude_macos_carriers_match(
     expected: _ClaudeMacOSCarrierSnapshot,
 ) -> bool:
     keychain_credential: bytearray | None = None
+    keychain_identity: KeychainIdentity | None = None
     file_credential: bytearray | None = None
     try:
-        keychain_credential = _read_claude_keychain_credential(review)
+        keychain_result = _read_claude_keychain_credential_snapshot(review)
+        if keychain_result is not None:
+            keychain_credential, keychain_identity = keychain_result
         file_result = _read_claude_macos_file_credential()
         current_file_snapshot: _ClaudeCredentialFileSnapshot | None = None
         if file_result is not None:
@@ -1612,6 +1614,7 @@ def _claude_macos_carriers_match(
                 file_credential,
                 expected.file_digest,
             )
+            and keychain_identity == expected.keychain_identity
             and current_file_snapshot == expected.file_snapshot
         )
     finally:
@@ -1625,10 +1628,13 @@ def _read_claude_macos_carrier_snapshot(
     review: ReviewWorkspace,
 ) -> _ClaudeMacOSCarrierSnapshot:
     keychain_credential: bytearray | None = None
+    keychain_identity: KeychainIdentity | None = None
     file_credential: bytearray | None = None
     file_snapshot: _ClaudeCredentialFileSnapshot | None = None
     try:
-        keychain_credential = _read_claude_keychain_credential(review)
+        keychain_result = _read_claude_keychain_credential_snapshot(review)
+        if keychain_result is not None:
+            keychain_credential, keychain_identity = keychain_result
         file_result = _read_claude_macos_file_credential()
         if file_result is not None:
             file_credential, file_snapshot = file_result
@@ -1644,6 +1650,7 @@ def _read_claude_macos_carrier_snapshot(
                 else None
             ),
             file_snapshot=file_snapshot,
+            keychain_identity=keychain_identity,
             keychain_refresh_digest=(
                 _claude_credential_refresh_digest(keychain_credential)
                 if keychain_credential is not None
@@ -1751,45 +1758,6 @@ def _claude_macos_carriers_share_refresh_token(
     )
 
 
-def _claude_keychain_update_script_prefix() -> bytes:
-    account = _claude_keychain_account()
-    return (
-        f'add-generic-password -U -a "{account}" '
-        f'-s "{CLAUDE_KEYCHAIN_SERVICE}" -X "'
-    ).encode("ascii")
-
-
-CLAUDE_KEYCHAIN_UPDATE_SCRIPT_SUFFIX = b'"\n'
-CLAUDE_KEYCHAIN_HEX_DIGITS = b"0123456789abcdef"
-
-
-def _claude_keychain_update_script(
-    credential: bytes | bytearray,
-) -> bytearray:
-    prefix = _claude_keychain_update_script_prefix()
-    suffix = CLAUDE_KEYCHAIN_UPDATE_SCRIPT_SUFFIX
-    script = bytearray(len(prefix) + 2 * len(credential) + len(suffix))
-    script[: len(prefix)] = prefix
-    offset = len(prefix)
-    for value in credential:
-        script[offset] = CLAUDE_KEYCHAIN_HEX_DIGITS[value >> 4]
-        script[offset + 1] = CLAUDE_KEYCHAIN_HEX_DIGITS[value & 0x0F]
-        offset += 2
-    script[offset:] = suffix
-    return script
-
-
-def _claude_keychain_credential_has_refresh_margin(
-    credential: bytes | bytearray,
-) -> bool:
-    return (
-        len(_claude_keychain_update_script_prefix())
-        + 2 * len(credential)
-        + len(CLAUDE_KEYCHAIN_UPDATE_SCRIPT_SUFFIX)
-        <= CLAUDE_KEYCHAIN_SECURITY_STDIN_LIMIT_BYTES
-    )
-
-
 def _select_claude_macos_credential(
     review: ReviewWorkspace,
 ) -> _ClaudeLocalCredential:
@@ -1800,10 +1768,12 @@ def _select_claude_macos_credential(
     file_digest: bytes | None = None
     keychain_refresh_digest: bytes | None = None
     file_refresh_digest: bytes | None = None
+    keychain_identity: KeychainIdentity | None = None
     observed_file_snapshot: _ClaudeCredentialFileSnapshot | None = None
     try:
-        keychain_credential = _read_claude_keychain_credential(review)
-        if keychain_credential is not None:
+        keychain_result = _read_claude_keychain_credential_snapshot(review)
+        if keychain_result is not None:
+            keychain_credential, keychain_identity = keychain_result
             expires_at_ms = _validate_claude_local_credential(
                 keychain_credential,
                 source="macOS Keychain",
@@ -1857,32 +1827,11 @@ def _select_claude_macos_credential(
             keychain_digest=keychain_digest,
             file_digest=file_digest,
             file_snapshot=observed_file_snapshot,
+            keychain_identity=keychain_identity,
             keychain_refresh_digest=keychain_refresh_digest,
             file_refresh_digest=file_refresh_digest,
         )
         selected.carrier_snapshot = carrier_snapshot
-        keychain_candidate = next(
-            (
-                candidate
-                for candidate in candidates
-                if candidate.source == "macos-keychain"
-            ),
-            None,
-        )
-        if (
-            keychain_candidate is not None
-            and (
-                selected.source == "macos-keychain"
-                or _claude_macos_carriers_share_refresh_token(carrier_snapshot)
-            )
-            and not _claude_keychain_credential_has_refresh_margin(
-                selected.payload
-            )
-        ):
-            raise ClaudeCredentialUnsafe(
-                "Claude macOS Keychain credential is too large for safe refresh "
-                "persistence without command-line exposure"
-            )
         for candidate in candidates:
             if candidate is not selected:
                 candidate.payload[:] = b"\x00" * len(candidate.payload)
@@ -1992,77 +1941,88 @@ def _write_claude_keychain_credential(
         )
     except ClaudeCredentialUnsafe:
         return False
-    if not _claude_keychain_credential_has_refresh_margin(credential):
+    expected_identity = carrier_snapshot.keychain_identity
+    if expected_identity is None:
         return False
-    script = _claude_keychain_update_script(credential)
-    account = _claude_keychain_account()
-    security_env = child_environment(container_dir=review.container_dir)
-    security_env["USER"] = account
     try:
-        try:
-            update_lock_context = (
-                contextlib.nullcontext()
+        update_lock_context = (
+            contextlib.nullcontext()
+            if coordinated_refresh_lock is not None
+            else _claude_credential_update_lock("keychain")
+        )
+        with update_lock_context:
+            refresh_lock_context = (
+                contextlib.nullcontext(coordinated_refresh_lock)
                 if coordinated_refresh_lock is not None
-                else _claude_credential_update_lock("keychain")
+                else claude_refresh_lock(
+                    _claude_refresh_lock_config_directory(),
+                    protocol=refresh_lock_protocol,
+                )
             )
-            with update_lock_context:
+            with refresh_lock_context as refresh_lock:
+                refresh_lock.assert_held()
+                if not carriers_already_matched and not _claude_macos_carriers_match(
+                    review,
+                    carrier_snapshot,
+                ):
+                    return False
+                current_result = _read_claude_keychain_credential_snapshot(review)
+                if current_result is None:
+                    return False
+                current, current_identity = current_result
                 try:
-                    refresh_lock_context = (
-                        contextlib.nullcontext(coordinated_refresh_lock)
-                        if coordinated_refresh_lock is not None
-                        else claude_refresh_lock(
-                            _claude_refresh_lock_config_directory(),
-                            protocol=refresh_lock_protocol,
+                    if current_identity != expected_identity or not (
+                        hmac.compare_digest(current, expected_credential)
+                    ):
+                        return False
+                    refresh_lock.assert_held()
+                    try:
+                        updated_identity = replace_login_keychain_credential(
+                            _claude_keychain_account(),
+                            CLAUDE_KEYCHAIN_SERVICE,
+                            current,
+                            credential,
+                            expected_identity,
                         )
-                    )
-                    with refresh_lock_context as refresh_lock:
-                        if (
-                            not carriers_already_matched
-                            and not _claude_macos_carriers_match(
-                            review,
-                            carrier_snapshot,
-                            )
-                        ):
-                            return False
-                        current = _read_claude_keychain_credential(review)
-                        if current is None:
-                            return False
-                        try:
-                            if not hmac.compare_digest(current, expected_credential):
-                                return False
-                        finally:
-                            current[:] = b"\x00" * len(current)
-                        refresh_lock.assert_held()
-                        completed = run_bounded_capture(
-                            (str(CLAUDE_KEYCHAIN_CLIENT), "-i"),
-                            cwd=review.container_dir,
-                            env=security_env,
-                            stdin=script,
-                            timeout_seconds=CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS,
-                            stdout_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
-                            stderr_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
-                        )
-                except ClaudeRefreshLockStale as error:
-                    raise ClaudeCredentialStaleRefreshLock(
-                        "a stale Claude refresh lock requires controlled cleanup "
-                        "after confirming that no Claude credential writer is active"
-                    ) from error
-                except ClaudeRefreshLockError as error:
-                    raise ClaudeCredentialInspectionInconclusive(
-                        "cannot coordinate Claude Keychain refresh writeback: "
-                        f"{error}"
-                    ) from error
-        except ClaudeCredentialInspectionInconclusive:
-            raise
-        except (OSError, ReviewError):
-            return False
-        try:
-            return completed.returncode == 0
-        finally:
-            completed.stdout[:] = b"\x00" * len(completed.stdout)
-            completed.stderr[:] = b"\x00" * len(completed.stderr)
-    finally:
-        script[:] = b"\x00" * len(script)
+                    except (
+                        MacOSKeychainIdentityMismatch,
+                        MacOSKeychainPayloadMismatch,
+                    ):
+                        return False
+                    except MacOSKeychainUnsafe as error:
+                        raise ClaudeCredentialUnsafe(str(error)) from error
+                    except MacOSKeychainWorkerTerminationInconclusive as error:
+                        raise ClaudeCredentialWorkerTerminationInconclusive(
+                            str(error)
+                        ) from error
+                    except MacOSKeychainWriteOutcomeUnknown as error:
+                        raise ClaudeCredentialWriteOutcomeUnknown(str(error)) from error
+                    except (
+                        MacOSKeychainUnavailable,
+                        MacOSKeychainInspectionInconclusive,
+                    ) as error:
+                        raise ClaudeCredentialInspectionInconclusive(
+                            str(error)
+                        ) from error
+                    refresh_lock.assert_held()
+                    return updated_identity == expected_identity
+                finally:
+                    current[:] = b"\x00" * len(current)
+    except ClaudeRefreshLockStale as error:
+        raise ClaudeCredentialStaleRefreshLock(
+            "a stale Claude refresh lock requires controlled cleanup after "
+            "confirming that no Claude credential writer is active"
+        ) from error
+    except ClaudeRefreshLockError as error:
+        raise ClaudeCredentialInspectionInconclusive(
+            f"cannot coordinate Claude Keychain refresh writeback: {error}"
+        ) from error
+    except ClaudeCredentialUnsafe:
+        raise
+    except ClaudeCredentialInspectionInconclusive:
+        raise
+    except (OSError, ReviewError):
+        return False
 
 
 def _write_all_to_descriptor(descriptor: int, payload: bytearray) -> None:
@@ -2096,9 +2056,7 @@ def _write_claude_file_credential(
         )
     except ClaudeCredentialUnsafe:
         return False
-    temporary_name = (
-        f".{CLAUDE_CREDENTIAL_FILE_NAME}.codex-{secrets.token_hex(16)}.tmp"
-    )
+    temporary_name = f".{CLAUDE_CREDENTIAL_FILE_NAME}.codex-{secrets.token_hex(16)}.tmp"
     temporary_created = False
     try:
         update_lock_context = (
@@ -2120,8 +2078,8 @@ def _write_claude_file_credential(
                     if (
                         not carriers_already_matched
                         and not _claude_macos_carriers_match(
-                        review,
-                        carrier_snapshot,
+                            review,
+                            carrier_snapshot,
                         )
                     ):
                         return False
@@ -2175,9 +2133,7 @@ def _write_claude_file_credential(
                         try:
                             os.fchmod(temporary_descriptor, 0o600)
                             _write_all_to_descriptor(temporary_descriptor, credential)
-                            _sync_claude_credential_descriptor(
-                                temporary_descriptor
-                            )
+                            _sync_claude_credential_descriptor(temporary_descriptor)
                             temporary_metadata = os.fstat(temporary_descriptor)
                             if (
                                 not stat.S_ISREG(temporary_metadata.st_mode)
@@ -2343,9 +2299,8 @@ def _claude_review_workspace_roots(
             "the Claude review workspace paths are not canonical absolute paths"
         )
     review_root = source_root / ".codex-tmp"
-    if (
-        container_root.parent != review_root
-        or not container_root.name.startswith("isolated-review-")
+    if container_root.parent != review_root or not container_root.name.startswith(
+        "isolated-review-"
     ):
         raise ClaudeCredentialInspectionInconclusive(
             "the Claude review container is outside its private review root"
@@ -2354,9 +2309,7 @@ def _claude_review_workspace_roots(
 
 
 def _claude_macos_recovery_root(review: ReviewWorkspace) -> pathlib.Path:
-    _source_root, _review_root, container_root = (
-        _claude_review_workspace_roots(review)
-    )
+    _source_root, _review_root, container_root = _claude_review_workspace_roots(review)
     try:
         with _open_absolute_directory_chain_without_symlinks(container_root):
             pass
@@ -2391,8 +2344,8 @@ def _retain_claude_macos_refreshed_credential(
         )
     credential_digest = _claude_credential_digest(credential)
     if durable_directories:
-        source_root, review_root, container_root = (
-            _claude_review_workspace_roots(review)
+        source_root, review_root, container_root = _claude_review_workspace_roots(
+            review
         )
         _fsync_claude_runtime_directory(
             source_root,
@@ -2454,9 +2407,7 @@ def _retain_claude_macos_refreshed_credential(
             if (
                 not requested_carrier_root.is_absolute()
                 or requested_carrier_root.parent != recovery_root
-                or not requested_carrier_root.name.startswith(
-                    "claude-carrier-"
-                )
+                or not requested_carrier_root.name.startswith("claude-carrier-")
             ):
                 raise ClaudeCredentialInspectionInconclusive(
                     "the requested macOS Claude recovery carrier path is unsafe"
@@ -2625,9 +2576,7 @@ def _retain_claude_macos_refreshed_credential(
         try:
             if (
                 not hmac.compare_digest(recovered, credential)
-                or _claude_credential_file_identity(
-                    os.fstat(credential_descriptor)
-                )
+                or _claude_credential_file_identity(os.fstat(credential_descriptor))
                 != recovered_identity
             ):
                 raise ClaudeCredentialInspectionInconclusive(
@@ -2722,9 +2671,7 @@ def _read_claude_macos_recovery_credential(
     try:
         config_descriptor = os.open(config_dir, flags)
         opened_config_metadata = os.fstat(config_descriptor)
-        result = _read_claude_credential_file_from_directory(
-            config_descriptor
-        )
+        result = _read_claude_credential_file_from_directory(config_descriptor)
         if result is None:
             raise ClaudeCredentialInspectionInconclusive(
                 "the private macOS Claude recovery credential is missing"
@@ -2887,10 +2834,9 @@ def _commit_claude_macos_durable_stage(
             dir_fd=recovery_descriptor,
             follow_symlinks=False,
         )
-        if (
-            _claude_linux_directory_identity(pending_metadata)
-            != _claude_linux_directory_identity(acknowledged_metadata)
-        ):
+        if _claude_linux_directory_identity(
+            pending_metadata
+        ) != _claude_linux_directory_identity(acknowledged_metadata):
             raise ClaudeCredentialInspectionInconclusive(
                 "the macOS Claude durable-stage carrier changed during commit"
             )
@@ -2915,14 +2861,10 @@ def _commit_claude_macos_durable_stage(
             _raise_or_attach_claude_credential_cleanup(
                 primary_error,
                 cleanup_errors,
-                message=(
-                    "cannot close the macOS Claude durable-stage root safely"
-                ),
+                message=("cannot close the macOS Claude durable-stage root safely"),
             )
         except BaseException as cleanup_error:
-            retained_path = (
-                acknowledged_carrier if renamed else pending_carrier
-            )
+            retained_path = acknowledged_carrier if renamed else pending_carrier
             mark_stage_failure(
                 cleanup_error,
                 retained_path,
@@ -3150,11 +3092,9 @@ def _remove_claude_macos_recovery_carrier(
                 credential_path,
                 expected_digest=expected_digest,
             )
-        retained_cleanup_scope = (
-            _existing_claude_macos_recovery_cleanup_scope(
-                cleanup_scope,
-                recovery_root,
-            )
+        retained_cleanup_scope = _existing_claude_macos_recovery_cleanup_scope(
+            cleanup_scope,
+            recovery_root,
         )
         if retained_cleanup_scope is not None:
             _mark_claude_macos_recovery_cleanup_artifact(
@@ -3270,12 +3210,8 @@ def _capture_claude_retained_credential_proof(
         or not (
             artifact.name == CLAUDE_CREDENTIAL_FILE_NAME
             or (
-                artifact.name.startswith(
-                    CLAUDE_MACOS_RECOVERY_UPDATE_PREFIX
-                )
-                and artifact.name.endswith(
-                    CLAUDE_MACOS_RECOVERY_UPDATE_SUFFIX
-                )
+                artifact.name.startswith(CLAUDE_MACOS_RECOVERY_UPDATE_PREFIX)
+                and artifact.name.endswith(CLAUDE_MACOS_RECOVERY_UPDATE_SUFFIX)
             )
         )
         or any(part in {".", ".."} for part in artifact.parts)
@@ -3293,9 +3229,10 @@ def _capture_claude_retained_credential_proof(
     result: tuple[bytearray, tuple[int, ...]] | None = None
     payload: bytearray | None = None
     try:
-        with _open_absolute_directory_chain_without_symlinks(
-            artifact.parent
-        ) as (parent_descriptor, ancestor_identities):
+        with _open_absolute_directory_chain_without_symlinks(artifact.parent) as (
+            parent_descriptor,
+            ancestor_identities,
+        ):
             result = _read_claude_credential_file_from_directory(
                 parent_descriptor,
                 credential_name=artifact.name,
@@ -3312,12 +3249,9 @@ def _capture_claude_retained_credential_proof(
                     follow_symlinks=False,
                 )
             )
-            if (
-                final_identity != file_identity
-                or not hmac.compare_digest(
-                    _claude_credential_digest(payload),
-                    expected_digest,
-                )
+            if final_identity != file_identity or not hmac.compare_digest(
+                _claude_credential_digest(payload),
+                expected_digest,
             ):
                 raise ClaudeCredentialInspectionInconclusive(
                     "the retained macOS Claude credential does not match its "
@@ -3564,9 +3498,7 @@ def _replace_claude_macos_recovery_credential(
             raise ClaudeCredentialInspectionInconclusive(
                 "the private macOS Claude recovery update is unsafe"
             )
-        temporary_identity = _claude_credential_file_identity(
-            temporary_metadata
-        )
+        temporary_identity = _claude_credential_file_identity(temporary_metadata)
         temporary_complete = True
         try:
             os.close(temporary_descriptor)
@@ -3666,28 +3598,22 @@ def _replace_claude_macos_recovery_credential(
                     retained_payload: bytearray | None = None
                     try:
                         if (
-                            _claude_credential_file_identity(
-                                visible_temporary_metadata
-                            )
+                            _claude_credential_file_identity(visible_temporary_metadata)
                             != temporary_identity
                         ):
                             raise ClaudeCredentialInspectionInconclusive(
                                 "the private macOS Claude recovery update "
                                 "identity changed before failure readback"
                             )
-                        retained_result = (
-                            _read_claude_credential_file_from_directory(
-                                config_descriptor,
-                                credential_name=temporary_name,
-                                expected_identity=temporary_identity,
-                            )
+                        retained_result = _read_claude_credential_file_from_directory(
+                            config_descriptor,
+                            credential_name=temporary_name,
+                            expected_identity=temporary_identity,
                         )
                         if retained_result is None:
                             temporary_created = False
                         else:
-                            retained_payload, retained_identity = (
-                                retained_result
-                            )
+                            retained_payload, retained_identity = retained_result
                             try:
                                 final_temporary_metadata = os.stat(
                                     temporary_name,
@@ -3720,9 +3646,7 @@ def _replace_claude_macos_recovery_credential(
                             retained_update_artifact = artifact
                     finally:
                         if retained_payload is not None:
-                            retained_payload[:] = (
-                                b"\x00" * len(retained_payload)
-                            )
+                            retained_payload[:] = b"\x00" * len(retained_payload)
                 else:
                     try:
                         os.unlink(temporary_name, dir_fd=config_descriptor)
@@ -3732,9 +3656,7 @@ def _replace_claude_macos_recovery_credential(
                     else:
                         temporary_created = False
                         try:
-                            _sync_claude_credential_descriptor(
-                                config_descriptor
-                            )
+                            _sync_claude_credential_descriptor(config_descriptor)
                         except BaseException as error:
                             cleanup_errors.append(error)
         current_credential_artifact = (
@@ -3869,8 +3791,7 @@ def _failed_claude_macos_recovery_error(
         )
     if isinstance(retained_artifact, str):
         message = (
-            f"{message}; the current recovery credential is at "
-            f"{retained_artifact}"
+            f"{message}; the current recovery credential is at {retained_artifact}"
         )
     if isinstance(retained_cleanup_artifact, str):
         message = (
@@ -3918,16 +3839,11 @@ def _persist_claude_macos_refreshed_credential_impl(
     if write_file and file_snapshot is None:
         return None
     selected_digest = (
-        keychain_digest
-        if selected.source == "macos-keychain"
-        else file_digest
+        keychain_digest if selected.source == "macos-keychain" else file_digest
     )
-    if (
-        selected_digest is None
-        or not hmac.compare_digest(
-            _claude_credential_digest(expected_credential),
-            selected_digest,
-        )
+    if selected_digest is None or not hmac.compare_digest(
+        _claude_credential_digest(expected_credential),
+        selected_digest,
     ):
         return None
     try:
@@ -3937,21 +3853,18 @@ def _persist_claude_macos_refreshed_credential_impl(
         )
     except ClaudeCredentialUnsafe:
         return None
-    # Complete all pure validation before the first carrier is mutated. In
-    # particular, a same-login file selection may also require a Keychain write.
-    if write_keychain and not _claude_keychain_credential_has_refresh_margin(
-        refreshed
-    ):
-        return None
     refreshed_digest = _claude_credential_digest(refreshed)
 
     with _claude_macos_carrier_coordination(
         refresh_lock_protocol,
     ) as refresh_lock:
         current_keychain: bytearray | None = None
+        current_keychain_identity: KeychainIdentity | None = None
         current_file: bytearray | None = None
         try:
-            current_keychain = _read_claude_keychain_credential(review)
+            current_keychain_result = _read_claude_keychain_credential_snapshot(review)
+            if current_keychain_result is not None:
+                current_keychain, current_keychain_identity = current_keychain_result
             current_file_result = _read_claude_macos_file_credential()
             current_file_snapshot: _ClaudeCredentialFileSnapshot | None = None
             if current_file_result is not None:
@@ -3961,6 +3874,7 @@ def _persist_claude_macos_refreshed_credential_impl(
                     current_keychain,
                     keychain_digest,
                 )
+                and current_keychain_identity == carrier_snapshot.keychain_identity
                 and _claude_optional_credential_digest_matches(
                     current_file,
                     file_digest,
@@ -3987,34 +3901,119 @@ def _persist_claude_macos_refreshed_credential_impl(
             if write_keychain:
                 assert current_keychain is not None
                 keychain_write_error: Exception | None = None
-                for attempt_index in range(
-                    CLAUDE_MACOS_DUAL_CARRIER_KEYCHAIN_ATTEMPTS
-                ):
+                for attempt_index in range(CLAUDE_MACOS_DUAL_CARRIER_KEYCHAIN_ATTEMPTS):
                     keychain_write_error = None
+                    deferred_control_flow: BaseException | None = None
+                    worker_termination_inconclusive = False
+                    attempt_mask = block_forwarded_signals()
+                    pending_attempt_signal = None
                     try:
-                        keychain_written = _write_claude_keychain_credential(
-                            review,
-                            refreshed,
-                            current_keychain,
-                            carrier_snapshot,
-                            refresh_lock_protocol,
-                            coordinated_refresh_lock=refresh_lock,
-                            carriers_already_matched=True,
+                        try:
+                            keychain_written = _write_claude_keychain_credential(
+                                review,
+                                refreshed,
+                                current_keychain,
+                                carrier_snapshot,
+                                refresh_lock_protocol,
+                                coordinated_refresh_lock=refresh_lock,
+                                carriers_already_matched=True,
+                            )
+                        except Exception as error:
+                            if _is_claude_control_flow_error(error):
+                                raise
+                            keychain_write_error = error
+                            keychain_written = False
+                        deferred_control_flow = (
+                            _claude_control_flow_from_cause_chain(
+                                keychain_write_error
+                            )
                         )
-                    except Exception as error:
-                        if _is_claude_control_flow_error(error):
-                            raise
-                        keychain_write_error = error
-                        keychain_written = False
+                        worker_termination_inconclusive = isinstance(
+                            keychain_write_error,
+                            ClaudeCredentialWorkerTerminationInconclusive,
+                        )
+                        if worker_termination_inconclusive:
+                            refresh_lock.retain_for_controlled_cleanup(
+                                "a native Keychain replacement worker could not be "
+                                "proven terminated"
+                            )
+                        if attempt_mask is not None:
+                            pending_attempt_signal = (
+                                consume_pending_forwarded_signal()
+                            )
+                    finally:
+                        restore_signal_mask(attempt_mask)
+                    if (
+                        deferred_control_flow is None
+                        and pending_attempt_signal is not None
+                    ):
+                        deferred_control_flow = ForwardedSignal(
+                            pending_attempt_signal
+                        )
+                    if worker_termination_inconclusive:
+                        detail = (
+                            "the native Keychain replacement worker could not be "
+                            "proven terminated; the shared writer lock was retained "
+                            "for controlled cleanup"
+                        )
+                        if deferred_control_flow is not None:
+                            _attach_claude_persistence_signal_detail(
+                                deferred_control_flow,
+                                detail,
+                            )
+                            raise deferred_control_flow
+                        raise ClaudeCredentialInspectionInconclusive(
+                            "the native Keychain replacement worker could not be "
+                            "proven terminated, so its write outcome cannot be "
+                            "reconciled or retried safely"
+                        ) from keychain_write_error
                     if keychain_written:
+                        if deferred_control_flow is not None:
+                            raise deferred_control_flow
                         break
                     refresh_lock.assert_held()
-                    readback = _read_claude_macos_carrier_snapshot(review)
+                    write_outcome_unknown = isinstance(
+                        keychain_write_error,
+                        ClaudeCredentialWriteOutcomeUnknown,
+                    )
+                    try:
+                        readback = _read_claude_macos_carrier_snapshot(review)
+                    except BaseException as error:
+                        if deferred_control_flow is None and (
+                            _is_claude_control_flow_error(error)
+                        ):
+                            deferred_control_flow = error
+                        if (
+                            not write_outcome_unknown
+                            and deferred_control_flow is None
+                        ):
+                            raise
+                        detail = (
+                            "the native Keychain replacement outcome is unknown and "
+                            "its single bounded readback was inconclusive; the "
+                            "replacement was not retried"
+                        )
+                        if deferred_control_flow is not None:
+                            _attach_claude_persistence_signal_detail(
+                                deferred_control_flow,
+                                detail,
+                            )
+                            raise deferred_control_flow
+                        raise ClaudeCredentialInspectionInconclusive(
+                            "the native Keychain replacement outcome is unknown and "
+                            "its single bounded readback was inconclusive; review is "
+                            "paused without retrying the replacement"
+                        ) from error
                     refresh_lock.assert_held()
-                    keychain_is_refreshed = hmac.compare_digest(
-                        readback.keychain_digest or b"",
-                        refreshed_digest,
-                    ) and readback.keychain_digest is not None
+                    keychain_is_refreshed = (
+                        hmac.compare_digest(
+                            readback.keychain_digest or b"",
+                            refreshed_digest,
+                        )
+                        and readback.keychain_digest is not None
+                        and readback.keychain_identity
+                        == carrier_snapshot.keychain_identity
+                    )
                     expected_file_digest = (
                         refreshed_digest if write_file else file_digest
                     )
@@ -4025,22 +4024,55 @@ def _persist_claude_macos_refreshed_credential_impl(
                         expected_file_digest is None
                     )
                     if keychain_is_refreshed and file_is_expected:
+                        if deferred_control_flow is not None:
+                            _attach_claude_persistence_signal_detail(
+                                deferred_control_flow,
+                                "the native Keychain replacement was reconciled as "
+                                "completed before restoring the interrupted control "
+                                "flow",
+                            )
+                            raise deferred_control_flow
                         return readback
-                    keychain_is_original = hmac.compare_digest(
-                        readback.keychain_digest or b"",
-                        keychain_digest or b"",
-                    ) and (readback.keychain_digest is None) == (
-                        keychain_digest is None
+                    keychain_is_original = (
+                        hmac.compare_digest(
+                            readback.keychain_digest or b"",
+                            keychain_digest or b"",
+                        )
+                        and (readback.keychain_digest is None)
+                        == (keychain_digest is None)
+                        and (
+                            readback.keychain_identity
+                            == carrier_snapshot.keychain_identity
+                        )
                     )
                     if not (keychain_is_original and file_is_expected):
+                        if deferred_control_flow is not None:
+                            _attach_claude_persistence_signal_detail(
+                                deferred_control_flow,
+                                "Claude credential carriers changed unexpectedly "
+                                "during the single bounded reconciliation readback",
+                            )
+                            raise deferred_control_flow
                         raise ClaudeCredentialInspectionInconclusive(
                             "Claude credential carriers changed unexpectedly while "
                             "a refreshed Keychain credential was being reconciled"
                         ) from keychain_write_error
-                    if (
-                        attempt_index + 1
-                        < CLAUDE_MACOS_DUAL_CARRIER_KEYCHAIN_ATTEMPTS
-                    ):
+                    if deferred_control_flow is not None:
+                        _attach_claude_persistence_signal_detail(
+                            deferred_control_flow,
+                            "the single bounded Keychain reconciliation readback "
+                            "showed the original carrier; the replacement was not "
+                            "retried before restoring the interrupted control flow",
+                        )
+                        raise deferred_control_flow
+                    if write_outcome_unknown:
+                        raise ClaudeCredentialInspectionInconclusive(
+                            "the native Keychain replacement outcome is unknown and "
+                            "its single bounded readback still showed the original "
+                            "carrier; review is paused without retrying because a "
+                            "later securityd completion cannot be disproved"
+                        ) from keychain_write_error
+                    if attempt_index + 1 < CLAUDE_MACOS_DUAL_CARRIER_KEYCHAIN_ATTEMPTS:
                         continue
                     if write_file:
                         message = (
@@ -4072,12 +4104,12 @@ def _persist_claude_macos_refreshed_credential_impl(
                 )
                 and (observed.keychain_digest is None)
                 == (expected_keychain_digest is None)
+                and observed.keychain_identity == carrier_snapshot.keychain_identity
                 and hmac.compare_digest(
                     observed.file_digest or b"",
                     expected_file_digest or b"",
                 )
-                and (observed.file_digest is None)
-                == (expected_file_digest is None)
+                and (observed.file_digest is None) == (expected_file_digest is None)
             ):
                 return None
             return observed
@@ -4158,8 +4190,7 @@ def _add_claude_persistence_note(
             retained_cleanup_artifact,
         )
     note = (
-        f"{CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC} "
-        f"({type(persistence_error).__name__})"
+        f"{CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC} ({type(persistence_error).__name__})"
     )
     add_note = getattr(error, "add_note", None)
     if callable(add_note):
@@ -4208,9 +4239,10 @@ def _claude_artifact_is_lexically_contained(
 def _claude_nofollow_artifact_snapshot(
     candidate: pathlib.Path,
 ) -> _ClaudeNoFollowArtifactSnapshot:
-    with _open_absolute_directory_chain_without_symlinks(
-        candidate.parent
-    ) as (parent_descriptor, ancestor_identities):
+    with _open_absolute_directory_chain_without_symlinks(candidate.parent) as (
+        parent_descriptor,
+        ancestor_identities,
+    ):
         leaf_metadata = os.stat(
             candidate.name,
             dir_fd=parent_descriptor,
@@ -4219,9 +4251,7 @@ def _claude_nofollow_artifact_snapshot(
         snapshot = _ClaudeNoFollowArtifactSnapshot(
             ancestor_identities=ancestor_identities,
             leaf_identity=_claude_cleanup_artifact_identity(leaf_metadata),
-            leaf_complete_identity=_claude_credential_file_identity(
-                leaf_metadata
-            ),
+            leaf_complete_identity=_claude_credential_file_identity(leaf_metadata),
             leaf_mode=leaf_metadata.st_mode,
             leaf_uid=leaf_metadata.st_uid,
         )
@@ -4251,9 +4281,10 @@ def _claude_retained_credential_artifact_matches_proof(
     result: tuple[bytearray, tuple[int, ...]] | None = None
     payload: bytearray | None = None
     try:
-        with _open_absolute_directory_chain_without_symlinks(
-            candidate.parent
-        ) as (parent_descriptor, ancestor_identities):
+        with _open_absolute_directory_chain_without_symlinks(candidate.parent) as (
+            parent_descriptor,
+            ancestor_identities,
+        ):
             if ancestor_identities != proof.ancestor_identities:
                 return False
             result = _read_claude_credential_file_from_directory(
@@ -4381,10 +4412,7 @@ def _validated_claude_retained_cleanup_artifact(
     if (
         initial.ancestor_identities != final.ancestor_identities
         or initial.leaf_identity != final.leaf_identity
-        or not (
-            stat.S_ISDIR(final.leaf_mode)
-            or stat.S_ISREG(final.leaf_mode)
-        )
+        or not (stat.S_ISDIR(final.leaf_mode) or stat.S_ISREG(final.leaf_mode))
     ):
         return None
     return str(candidate_path)
@@ -4430,14 +4458,11 @@ def _record_claude_secondary_persistence_failure(
     if retained_artifact is not None:
         authentication_report["recovery_artifact"] = retained_artifact
     if retained_cleanup_artifact is not None:
-        authentication_report["recovery_cleanup_artifact"] = (
-            retained_cleanup_artifact
-        )
+        authentication_report["recovery_cleanup_artifact"] = retained_cleanup_artifact
     diagnostic = CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC
     if retained_carrier is not None:
         diagnostic = (
-            f"{diagnostic} Private recovery carrier retained at "
-            f"{retained_carrier}."
+            f"{diagnostic} Private recovery carrier retained at {retained_carrier}."
         )
     if retained_artifact is not None:
         diagnostic = (
@@ -4452,9 +4477,7 @@ def _record_claude_secondary_persistence_failure(
     try:
         _update_claude_runtime_report(
             review,
-            {
-                "authentication": authentication_report
-            },
+            {"authentication": authentication_report},
         )
     except BaseException as report_error:
         if _is_claude_control_flow_error(report_error):
@@ -4529,8 +4552,7 @@ def _propagate_claude_persistence_state(
             retained_carrier,
         )
         diagnostic = (
-            f"{diagnostic} Private recovery carrier retained at "
-            f"{retained_carrier}."
+            f"{diagnostic} Private recovery carrier retained at {retained_carrier}."
         )
     if retained_artifact is not None:
         _copy_claude_retained_credential_proof(source, target)
@@ -4596,11 +4618,12 @@ def _update_claude_runtime_report_preserving_persistence(
             review,
             persistence_error,
         )
-        message = "cannot update the Claude runtime report after refresh persistence failed"
+        message = (
+            "cannot update the Claude runtime report after refresh persistence failed"
+        )
         if retained_carrier is not None:
             message = (
-                f"{message}; private recovery carrier retained at "
-                f"{retained_carrier}"
+                f"{message}; private recovery carrier retained at {retained_carrier}"
             )
         if retained_artifact is not None:
             message = (
@@ -4663,9 +4686,7 @@ class _ClaudeKeychainCredentialHandler(socketserver.BaseRequestHandler):
         updated_credential = raw_credential
         pending_generation: int | None = None
         try:
-            pending_generation = server.stage_pending_update(
-                updated_credential
-            )
+            pending_generation = server.stage_pending_update(updated_credential)
             if pending_generation is None:
                 if server.pending_updates_closed():
                     self.request.sendall(b"\x01")
@@ -4674,9 +4695,7 @@ class _ClaudeKeychainCredentialHandler(socketserver.BaseRequestHandler):
                 with server.credential_lock:
                     read_completed = server.consumed
                 if (
-                    not server.pending_update_is_current(
-                        pending_generation
-                    )
+                    not server.pending_update_is_current(pending_generation)
                     or not read_completed
                     or server.update_callback is None
                 ):
@@ -4723,9 +4742,7 @@ class _ClaudeKeychainCredentialServer(socketserver.ThreadingTCPServer):
         | None,
     ) -> None:
         super().__init__(("127.0.0.1", 0), _ClaudeKeychainCredentialHandler)
-        self.credential = (
-            bytearray(credential) if credential is not None else None
-        )
+        self.credential = bytearray(credential) if credential is not None else None
         self.capability = capability
         self.credential_lock = threading.Lock()
         self.consumed = False
@@ -4854,11 +4871,7 @@ class _ClaudeKeychainCredentialServer(socketserver.ThreadingTCPServer):
 
     def take_initial_credential(self) -> bytearray:
         with self.credential_lock:
-            if (
-                self._abandoned.is_set()
-                or self.consumed
-                or self.credential is None
-            ):
+            if self._abandoned.is_set() or self.consumed or self.credential is None:
                 return bytearray()
             self.consumed = True
             credential = self.credential
@@ -4935,9 +4948,7 @@ class _ClaudeKeychainCredentialServer(socketserver.ThreadingTCPServer):
 
     def close_pending_update_publication(self, timeout: float) -> bool:
         self._abandoned.set()
-        acquired = self._pending_update_lock.acquire(
-            timeout=max(0.0, timeout)
-        )
+        acquired = self._pending_update_lock.acquire(timeout=max(0.0, timeout))
         if not acquired:
             return False
         try:
@@ -4950,20 +4961,14 @@ class _ClaudeKeychainCredentialServer(socketserver.ThreadingTCPServer):
         timeout: float | None,
     ) -> tuple[bool, bytearray | None]:
         self._abandoned.set()
-        deadline = (
-            None
-            if timeout is None
-            else time.monotonic() + max(0.0, timeout)
-        )
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
 
         def acquire(lock: object) -> bool:
             acquire_lock = getattr(lock, "acquire")
             if deadline is None:
                 acquire_lock()
                 return True
-            return bool(
-                acquire_lock(timeout=max(0.0, deadline - time.monotonic()))
-            )
+            return bool(acquire_lock(timeout=max(0.0, deadline - time.monotonic())))
 
         initial_credential: bytearray | None = None
         if not acquire(self.credential_lock):
@@ -5049,9 +5054,7 @@ class _ClaudeMacOSDurableStage:
     committed: bool = False
     error: BaseException | None = None
     cleanup_after_completion: bool = False
-    recovery_decided: _ClaudeThreadEvent = field(
-        default_factory=_ClaudeThreadEvent
-    )
+    recovery_decided: _ClaudeThreadEvent = field(default_factory=_ClaudeThreadEvent)
     fallback_proven: bool = False
     handler_wait_expired: bool = False
 
@@ -5154,8 +5157,7 @@ def _bounded_claude_keychain_fail_closed_error(
         return (
             None,
             ClaudeCredentialInspectionInconclusive(
-                "Claude Keychain broker fail-closed scope returned an "
-                "invalid error"
+                "Claude Keychain broker fail-closed scope returned an invalid error"
             ),
         )
     return results[0], None
@@ -5167,9 +5169,7 @@ def _bounded_claude_keychain_server_shutdown(
     *,
     abandon_callback: Callable[[], None] | None = None,
 ) -> _ClaudeKeychainServerShutdown:
-    deadline = (
-        time.monotonic() + CLAUDE_KEYCHAIN_SERVER_SHUTDOWN_TIMEOUT_SECONDS
-    )
+    deadline = time.monotonic() + CLAUDE_KEYCHAIN_SERVER_SHUTDOWN_TIMEOUT_SECONDS
     errors: list[BaseException] = []
 
     def remaining() -> float:
@@ -5243,16 +5243,12 @@ def _bounded_claude_keychain_server_shutdown(
     except BaseException as error:
         errors.append(error)
         handlers_quiescent = False
-    shutdown_quiescent = (
-        shutdown_started and not shutdown_thread.is_alive()
-    )
+    shutdown_quiescent = shutdown_started and not shutdown_thread.is_alive()
     serve_quiescent = not serve_thread.is_alive()
     pending_update = None
     abandonment_latched = False
     pending_update_detached = False
-    quiescent = (
-        shutdown_quiescent and serve_quiescent and handlers_quiescent
-    )
+    quiescent = shutdown_quiescent and serve_quiescent and handlers_quiescent
     serve_error = server.serve_error()
     if serve_error is not None:
         errors.append(serve_error)
@@ -5303,21 +5299,18 @@ def _bounded_claude_keychain_quiescence_recovery(
         return max(0.0, deadline - time.monotonic())
 
     def bounded_timeout_error() -> BaseException:
-        captured, callback_error = (
-            _bounded_claude_keychain_fail_closed_error(
-                callbacks.timeout_error,
-                min(
-                    CLAUDE_KEYCHAIN_SERVER_POLL_INTERVAL_SECONDS,
-                    max(0.0, CLAUDE_KEYCHAIN_RECOVERY_TIMEOUT_SECONDS),
-                ),
-            )
+        captured, callback_error = _bounded_claude_keychain_fail_closed_error(
+            callbacks.timeout_error,
+            min(
+                CLAUDE_KEYCHAIN_SERVER_POLL_INTERVAL_SECONDS,
+                max(0.0, CLAUDE_KEYCHAIN_RECOVERY_TIMEOUT_SECONDS),
+            ),
         )
         failure = (
             captured
             or callbacks.timeout_fallback_error
             or ClaudeCredentialInspectionInconclusive(
-                "Claude Keychain broker recovery timeout state could not be "
-                "captured"
+                "Claude Keychain broker recovery timeout state could not be captured"
             )
         )
         if callback_error is not None and callback_error is not failure:
@@ -5328,11 +5321,9 @@ def _bounded_claude_keychain_quiescence_recovery(
         return failure
 
     if not already_abandoned:
-        abandonment_latched, abandonment_error = (
-            _bounded_claude_keychain_abandonment(
-                callbacks.abandon,
-                remaining(),
-            )
+        abandonment_latched, abandonment_error = _bounded_claude_keychain_abandonment(
+            callbacks.abandon,
+            remaining(),
         )
         if not abandonment_latched:
             if pending_update is not None:
@@ -5368,9 +5359,7 @@ def _bounded_claude_keychain_quiescence_recovery(
         _attach_claude_credential_cleanup_failure(timeout_error, error)
         return timeout_error
     try:
-        recovery_completed = completed.wait(
-            timeout=remaining()
-        )
+        recovery_completed = completed.wait(timeout=remaining())
     except BaseException as error:
         timeout_error = bounded_timeout_error()
         if getattr(
@@ -5463,9 +5452,7 @@ def _claude_keychain_credential_server(
             ) from error
         serve_admitted = True
         serve_gate.set()
-        if not server.wait_until_serving(
-            CLAUDE_KEYCHAIN_SERVER_START_TIMEOUT_SECONDS
-        ):
+        if not server.wait_until_serving(CLAUDE_KEYCHAIN_SERVER_START_TIMEOUT_SECONDS):
             failure = ClaudeCredentialInspectionInconclusive(
                 "Claude Keychain broker did not enter its serve loop"
             )
@@ -5487,9 +5474,7 @@ def _claude_keychain_credential_server(
             thread_started = _claude_thread_may_have_started(thread)
         if thread_started and not serve_admitted and thread is not None:
             try:
-                thread.join(
-                    timeout=CLAUDE_KEYCHAIN_SERVER_SHUTDOWN_TIMEOUT_SECONDS
-                )
+                thread.join(timeout=CLAUDE_KEYCHAIN_SERVER_SHUTDOWN_TIMEOUT_SECONDS)
             except BaseException as error:
                 shutdown_errors.append(error)
             else:
@@ -5607,9 +5592,7 @@ def _claude_keychain_credential_server(
                                     fail_closed_failure,
                                 )
                                 retention_error = error
-                            elif _is_claude_control_flow_error(
-                                fail_closed_failure
-                            ):
+                            elif _is_claude_control_flow_error(fail_closed_failure):
                                 _add_claude_persistence_note(
                                     fail_closed_failure,
                                     error,
@@ -5657,12 +5640,10 @@ def _claude_keychain_credential_server(
                             )
                         )
                 if retention_error is None:
-                    retention_error = (
-                        _bounded_claude_keychain_quiescence_recovery(
-                            quiescence_callbacks,
-                            pending_update,
-                            already_abandoned=abandonment_latched,
-                        )
+                    retention_error = _bounded_claude_keychain_quiescence_recovery(
+                        quiescence_callbacks,
+                        pending_update,
+                        already_abandoned=abandonment_latched,
                     )
                 if fail_closed_scope_error is not None:
                     if retention_error is None:
@@ -5690,9 +5671,8 @@ def _claude_keychain_credential_server(
             for error in shutdown_errors:
                 _attach_claude_credential_cleanup_failure(failure, error)
             candidates = [failure, *shutdown_errors]
-            if (
-                retention_error is not None
-                and _is_claude_control_flow_error(retention_error)
+            if retention_error is not None and _is_claude_control_flow_error(
+                retention_error
             ):
                 candidates.append(retention_error)
             for candidate in (primary_error, *candidates):
@@ -5714,16 +5694,13 @@ def _claude_keychain_credential_server(
                     if callable(add_note):
                         add_note(str(failure))
             if primary_error is None and not any(
-                _is_claude_control_flow_error(candidate)
-                for candidate in candidates
+                _is_claude_control_flow_error(candidate) for candidate in candidates
             ):
                 raise failure
             _raise_or_attach_claude_credential_cleanup(
                 primary_error,
                 candidates,
-                message=(
-                    "cannot prove Claude Keychain broker handler quiescence"
-                ),
+                message=("cannot prove Claude Keychain broker handler quiescence"),
             )
         if shutdown.quiescent:
             _raise_or_attach_claude_credential_cleanup(
@@ -5739,8 +5716,8 @@ def _claude_keychain_runtime(
     env: dict[str, str],
     refresh_lock_protocol: ClaudeRefreshLockProtocol | None,
 ) -> Iterator[dict[str, str]]:
-    result = dict(env)
-    if result.get("ANTHROPIC_API_KEY"):
+    result = _claude_environment_with_selected_explicit_auth(env)
+    if _claude_has_explicit_auth(result):
         yield result
         return
     if refresh_lock_protocol is None:
@@ -5762,8 +5739,7 @@ def _claude_keychain_runtime(
         if _is_claude_control_flow_error(error):
             raise
         failure = ClaudeCredentialInspectionInconclusive(
-            "the macOS Claude fail-closed recovery scope could not be "
-            "initialized"
+            "the macOS Claude fail-closed recovery scope could not be initialized"
         )
         failure.__cause__ = error
         raise failure
@@ -5794,10 +5770,7 @@ def _claude_keychain_runtime(
     ) -> bool:
         nonlocal durable_stage_inflight
         nonlocal quiescence_durable_stage
-        if (
-            not runtime_is_abandoned()
-            or durable_stage_inflight is not stage
-        ):
+        if not runtime_is_abandoned() or durable_stage_inflight is not stage:
             return False
         quiescence_durable_stage = stage
         durable_stage_inflight = None
@@ -5851,13 +5824,10 @@ def _claude_keychain_runtime(
             or not hmac.compare_digest(expectation.digest, proof.digest)
         ):
             return False
-        return (
-            _validated_claude_retained_credential_artifact(
-                review,
-                error,
-            )
-            == str(proof.artifact)
-        )
+        return _validated_claude_retained_credential_artifact(
+            review,
+            error,
+        ) == str(proof.artifact)
 
     def cleanup_late_durable_stage(
         stage: _ClaudeMacOSDurableStage,
@@ -5944,9 +5914,7 @@ def _claude_keychain_runtime(
                 )
                 _mark_claude_macos_recovery_update_artifact(
                     malformed,
-                    retained_carrier
-                    / "config"
-                    / CLAUDE_CREDENTIAL_FILE_NAME,
+                    retained_carrier / "config" / CLAUDE_CREDENTIAL_FILE_NAME,
                     expected_digest=retained_digest,
                 )
                 setattr(
@@ -5978,10 +5946,8 @@ def _claude_keychain_runtime(
                 - CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES,
             )
             terminal_generation = (
-                durable_stage_reserved_generations
-                >= normal_generation_limit
-                or durable_stage_reserved_bytes + requested_bytes
-                > normal_byte_limit
+                durable_stage_reserved_generations >= normal_generation_limit
+                or durable_stage_reserved_bytes + requested_bytes > normal_byte_limit
             )
             if not terminal_generation:
                 durable_stage_reserved_generations += 1
@@ -5990,9 +5956,7 @@ def _claude_keychain_runtime(
                 generation = durable_stage_generation
         if terminal_generation:
             try:
-                terminal_claimed = (
-                    True if claim_terminal is None else claim_terminal()
-                )
+                terminal_claimed = True if claim_terminal is None else claim_terminal()
             except BaseException as claim_error:
                 if _is_claude_control_flow_error(claim_error):
                     raise
@@ -6018,9 +5982,7 @@ def _claude_keychain_runtime(
                     )
                     _mark_claude_macos_recovery_update_artifact(
                         claim_failure,
-                        retained_carrier
-                        / "config"
-                        / CLAUDE_CREDENTIAL_FILE_NAME,
+                        retained_carrier / "config" / CLAUDE_CREDENTIAL_FILE_NAME,
                         expected_digest=retained_digest,
                     )
                 with runtime_state_lock:
@@ -6068,9 +6030,7 @@ def _claude_keychain_runtime(
                 )
                 _mark_claude_macos_recovery_update_artifact(
                     quota_failure,
-                    retained_carrier
-                    / "config"
-                    / CLAUDE_CREDENTIAL_FILE_NAME,
+                    retained_carrier / "config" / CLAUDE_CREDENTIAL_FILE_NAME,
                     expected_digest=retained_digest,
                 )
             with runtime_state_lock:
@@ -6106,8 +6066,7 @@ def _claude_keychain_runtime(
                 setup_failure = setup_error
             else:
                 setup_failure = ClaudeCredentialInspectionInconclusive(
-                    "the macOS Claude durable recovery stage could not be "
-                    "initialized"
+                    "the macOS Claude durable recovery stage could not be initialized"
                 )
                 setup_failure.__cause__ = setup_error
             setattr(
@@ -6117,9 +6076,7 @@ def _claude_keychain_runtime(
             )
             with runtime_state_lock:
                 previous_durable_entry = (
-                    durable_stage_carriers[-1]
-                    if durable_stage_carriers
-                    else None
+                    durable_stage_carriers[-1] if durable_stage_carriers else None
                 )
             if previous_durable_entry is not None:
                 previous_durable_carrier, previous_durable_digest = (
@@ -6132,9 +6089,7 @@ def _claude_keychain_runtime(
                 )
                 _mark_claude_macos_recovery_update_artifact(
                     setup_failure,
-                    previous_durable_carrier
-                    / "config"
-                    / CLAUDE_CREDENTIAL_FILE_NAME,
+                    previous_durable_carrier / "config" / CLAUDE_CREDENTIAL_FILE_NAME,
                     expected_digest=previous_durable_digest,
                 )
             with runtime_state_lock:
@@ -6181,9 +6136,7 @@ def _claude_keychain_runtime(
                 )
                 _mark_claude_macos_recovery_update_artifact(
                     error,
-                    committed_carrier
-                    / "config"
-                    / CLAUDE_CREDENTIAL_FILE_NAME,
+                    committed_carrier / "config" / CLAUDE_CREDENTIAL_FILE_NAME,
                     expected_digest=stage.credential_digest,
                 )
                 setattr(
@@ -6193,13 +6146,8 @@ def _claude_keychain_runtime(
                 )
             with runtime_state_lock:
                 stage.error = error
-                transferred_to_recovery = transfer_abandoned_stage_locked(
-                    stage
-                )
-                if (
-                    not transferred_to_recovery
-                    and durable_stage_inflight is stage
-                ):
+                transferred_to_recovery = transfer_abandoned_stage_locked(stage)
+                if not transferred_to_recovery and durable_stage_inflight is stage:
                     durable_stage_inflight = None
             stage.completed.set()
             retained_candidate = getattr(
@@ -6284,9 +6232,7 @@ def _claude_keychain_runtime(
                             if not isinstance(value, str):
                                 continue
                             with contextlib.suppress(ValueError):
-                                pathlib.Path(value).relative_to(
-                                    cleanup_candidate
-                                )
+                                pathlib.Path(value).relative_to(cleanup_candidate)
                                 delattr(error, attribute)
                         proof = _get_claude_retained_credential_proof(error)
                         if proof is not None:
@@ -6296,9 +6242,7 @@ def _claude_keychain_runtime(
             if not isinstance(retained_candidate, str):
                 with runtime_state_lock:
                     previous_durable_entry = (
-                        durable_stage_carriers[-1]
-                        if durable_stage_carriers
-                        else None
+                        durable_stage_carriers[-1] if durable_stage_carriers else None
                     )
                 setattr(
                     error,
@@ -6337,10 +6281,7 @@ def _claude_keychain_runtime(
                     timeout=CLAUDE_KEYCHAIN_RECOVERY_TIMEOUT_SECONDS
                 )
                 with runtime_state_lock:
-                    if (
-                        not decision_ready
-                        and not stage.recovery_decided.is_set()
-                    ):
+                    if not decision_ready and not stage.recovery_decided.is_set():
                         stage.handler_wait_expired = True
                         return False
                     fallback_proven = stage.fallback_proven
@@ -6378,9 +6319,7 @@ def _claude_keychain_runtime(
             )
             _mark_claude_macos_recovery_update_artifact(
                 quota_failure,
-                committed_carrier
-                / "config"
-                / CLAUDE_CREDENTIAL_FILE_NAME,
+                committed_carrier / "config" / CLAUDE_CREDENTIAL_FILE_NAME,
                 expected_digest=stage.credential_digest,
             )
             with runtime_state_lock:
@@ -6408,9 +6347,7 @@ def _claude_keychain_runtime(
                 quiescence_recovery_proven = True
                 quiescence_recovery_expectation = _ClaudeRecoveryExpectation(
                     committed_carrier,
-                    committed_carrier
-                    / "config"
-                    / CLAUDE_CREDENTIAL_FILE_NAME,
+                    committed_carrier / "config" / CLAUDE_CREDENTIAL_FILE_NAME,
                     stage.credential_digest,
                 )
                 if durable_stage_inflight is stage:
@@ -6421,9 +6358,7 @@ def _claude_keychain_runtime(
             if commit_pending is None:
                 committed_current = publish_current_generation()
             else:
-                committed_current = commit_pending(
-                    publish_current_generation
-                )
+                committed_current = commit_pending(publish_current_generation)
         except BaseException as publish_error:
             staged[:] = b"\x00" * len(staged)
             setattr(
@@ -6433,9 +6368,7 @@ def _claude_keychain_runtime(
             )
             _mark_claude_macos_recovery_update_artifact(
                 publish_error,
-                committed_carrier
-                / "config"
-                / CLAUDE_CREDENTIAL_FILE_NAME,
+                committed_carrier / "config" / CLAUDE_CREDENTIAL_FILE_NAME,
                 expected_digest=stage.credential_digest,
             )
             setattr(
@@ -6444,13 +6377,8 @@ def _claude_keychain_runtime(
                 True,
             )
             with runtime_state_lock:
-                transferred_to_recovery = transfer_abandoned_stage_locked(
-                    stage
-                )
-                if (
-                    not transferred_to_recovery
-                    and durable_stage_inflight is stage
-                ):
+                transferred_to_recovery = transfer_abandoned_stage_locked(stage)
+                if not transferred_to_recovery and durable_stage_inflight is stage:
                     durable_stage_inflight = None
                 if _is_claude_control_flow_error(publish_error):
                     persistence_errors.insert(0, publish_error)
@@ -6464,10 +6392,7 @@ def _claude_keychain_runtime(
         staged[:] = b"\x00" * len(staged)
         with runtime_state_lock:
             transferred_to_recovery = transfer_abandoned_stage_locked(stage)
-            if (
-                not transferred_to_recovery
-                and durable_stage_inflight is stage
-            ):
+            if not transferred_to_recovery and durable_stage_inflight is stage:
                 durable_stage_inflight = None
         return False
 
@@ -6497,14 +6422,12 @@ def _claude_keychain_runtime(
             with runtime_state_lock:
                 if runtime_is_abandoned():
                     return False
-                prior_error = (
-                    persistence_errors[0] if persistence_errors else None
-                )
+                prior_error = persistence_errors[0] if persistence_errors else None
                 callback_carrier_snapshot = carrier_snapshot
                 callback_expected_credential = bytearray(expected_credential)
             if prior_error is not None:
-                callback_expected_credential[:] = (
-                    b"\x00" * len(callback_expected_credential)
+                callback_expected_credential[:] = b"\x00" * len(
+                    callback_expected_credential
                 )
                 retained_candidate = getattr(
                     prior_error,
@@ -6528,9 +6451,7 @@ def _claude_keychain_runtime(
                         retained_candidate,
                         str,
                     )
-                    quiescence_recovery_proven = (
-                        prior_expectation is not None
-                    )
+                    quiescence_recovery_proven = prior_expectation is not None
                     quiescence_recovery_expectation = prior_expectation
                 try:
                     if isinstance(retained_candidate, str):
@@ -6541,19 +6462,15 @@ def _claude_keychain_runtime(
                         )
                         retained_carrier = pathlib.Path(retained_candidate)
                     else:
-                        retained_carrier = (
-                            _retain_claude_macos_refreshed_credential(
-                                review,
-                                updated,
-                                requested_carrier_root=recovery_candidate,
-                            )
+                        retained_carrier = _retain_claude_macos_refreshed_credential(
+                            review,
+                            updated,
+                            requested_carrier_root=recovery_candidate,
                         )
                 except BaseException as recovery_error:
-                    failed_recovery_expectation = (
-                        recovery_expectation_from_error(
-                            recovery_error,
-                            recovery_candidate,
-                        )
+                    failed_recovery_expectation = recovery_expectation_from_error(
+                        recovery_error,
+                        recovery_candidate,
                     )
                     if _is_claude_control_flow_error(prior_error):
                         replacement_error = prior_error
@@ -6577,10 +6494,7 @@ def _claude_keychain_runtime(
                             and persistence_errors
                             and persistence_errors[0] is prior_error
                         ):
-                            if (
-                                quiescence_recovery_candidate
-                                == recovery_candidate
-                            ):
+                            if quiescence_recovery_candidate == recovery_candidate:
                                 if failed_recovery_expectation is not None:
                                     quiescence_recovery_replaces_existing = True
                                     quiescence_recovery_proven = True
@@ -6617,14 +6531,10 @@ def _claude_keychain_runtime(
                         quiescence_recovery_candidate = retained_carrier
                         quiescence_recovery_replaces_existing = True
                         quiescence_recovery_proven = True
-                        quiescence_recovery_expectation = (
-                            _ClaudeRecoveryExpectation(
-                                retained_carrier,
-                                retained_carrier
-                                / "config"
-                                / CLAUDE_CREDENTIAL_FILE_NAME,
-                                updated_digest,
-                            )
+                        quiescence_recovery_expectation = _ClaudeRecoveryExpectation(
+                            retained_carrier,
+                            retained_carrier / "config" / CLAUDE_CREDENTIAL_FILE_NAME,
+                            updated_digest,
                         )
                         if deferred_persistence_note is not None:
                             _add_claude_persistence_note(
@@ -6633,19 +6543,6 @@ def _claude_keychain_runtime(
                             )
                         persistence_errors[0] = replacement_error
                 return False
-            if (
-                (
-                    selected.source == "macos-keychain"
-                    or _claude_macos_carriers_share_refresh_token(
-                        callback_carrier_snapshot
-                    )
-                )
-                and not _claude_keychain_credential_has_refresh_margin(updated)
-            ):
-                raise ClaudeCredentialInspectionInconclusive(
-                    "Claude refreshed its OAuth credential, but the result is too "
-                    "large for safe Keychain persistence"
-                )
             updated_snapshot = _persist_claude_macos_refreshed_credential(
                 review,
                 selected,
@@ -6675,18 +6572,12 @@ def _claude_keychain_runtime(
                     if runtime_is_abandoned():
                         return False
                     if quiescence_recovery_candidate is None:
-                        quiescence_recovery_candidate = (
-                            proposed_recovery_candidate
-                        )
+                        quiescence_recovery_candidate = proposed_recovery_candidate
                         quiescence_recovery_replaces_existing = False
                         quiescence_recovery_proven = False
                         quiescence_recovery_expectation = None
-                    callback_recovery_candidate = (
-                        quiescence_recovery_candidate
-                    )
-                    callback_replaces_existing = (
-                        quiescence_recovery_replaces_existing
-                    )
+                    callback_recovery_candidate = quiescence_recovery_candidate
+                    callback_replaces_existing = quiescence_recovery_replaces_existing
                 assert callback_recovery_candidate is not None
                 if callback_replaces_existing:
                     _replace_claude_macos_recovery_credential(
@@ -6696,14 +6587,10 @@ def _claude_keychain_runtime(
                     )
                     retained_carrier = callback_recovery_candidate
                 else:
-                    retained_carrier = (
-                        _retain_claude_macos_refreshed_credential(
-                            review,
-                            updated,
-                            requested_carrier_root=(
-                                callback_recovery_candidate
-                            ),
-                        )
+                    retained_carrier = _retain_claude_macos_refreshed_credential(
+                        review,
+                        updated,
+                        requested_carrier_root=(callback_recovery_candidate),
                     )
             except BaseException as recovery_error:
                 failed_recovery_expectation = (
@@ -6745,26 +6632,19 @@ def _claude_keychain_runtime(
                     quiescence_recovery_candidate = retained_carrier
                     quiescence_recovery_replaces_existing = True
                     quiescence_recovery_proven = True
-                    quiescence_recovery_expectation = (
-                        _ClaudeRecoveryExpectation(
-                            retained_carrier,
-                            retained_carrier
-                            / "config"
-                            / CLAUDE_CREDENTIAL_FILE_NAME,
-                            updated_digest,
-                        )
+                    quiescence_recovery_expectation = _ClaudeRecoveryExpectation(
+                        retained_carrier,
+                        retained_carrier / "config" / CLAUDE_CREDENTIAL_FILE_NAME,
+                        updated_digest,
                     )
                 elif (
                     callback_recovery_candidate is not None
-                    and quiescence_recovery_candidate
-                    == callback_recovery_candidate
+                    and quiescence_recovery_candidate == callback_recovery_candidate
                 ):
                     if failed_recovery_expectation is not None:
                         quiescence_recovery_replaces_existing = True
                         quiescence_recovery_proven = True
-                        quiescence_recovery_expectation = (
-                            failed_recovery_expectation
-                        )
+                        quiescence_recovery_expectation = failed_recovery_expectation
                     else:
                         quiescence_recovery_proven = False
                         quiescence_recovery_expectation = None
@@ -6788,8 +6668,8 @@ def _claude_keychain_runtime(
             return False
         finally:
             if callback_expected_credential is not None:
-                callback_expected_credential[:] = (
-                    b"\x00" * len(callback_expected_credential)
+                callback_expected_credential[:] = b"\x00" * len(
+                    callback_expected_credential
                 )
 
     def abandon_unquiescent_handler() -> None:
@@ -6852,10 +6732,7 @@ def _claude_keychain_runtime(
             current_claim_present = (
                 isinstance(retained_value, str) or retained_proof is not None
             )
-            if (
-                current_claim_present
-                and not published_recovery_claim_is_current(error)
-            ):
+            if current_claim_present and not published_recovery_claim_is_current(error):
                 _clear_claude_retained_credential_proof(error)
                 with contextlib.suppress(AttributeError):
                     delattr(
@@ -6868,11 +6745,9 @@ def _claude_keychain_runtime(
             try:
                 recovery_root = _claude_macos_recovery_root(review)
             except BaseException as root_error:
-                error = (
-                    _attach_claude_persistence_failure_preserving_control_flow(
-                        error,
-                        root_error,
-                    )
+                error = _attach_claude_persistence_failure_preserving_control_flow(
+                    error,
+                    root_error,
                 )
             else:
                 _mark_claude_macos_recovery_cleanup_artifact(
@@ -6885,10 +6760,7 @@ def _claude_keychain_runtime(
         wait_for_inflight_stage = False
         if inflight_stage is not None:
             with runtime_state_lock:
-                if (
-                    inflight_stage.completed.is_set()
-                    and inflight_stage.committed
-                ):
+                if inflight_stage.completed.is_set() and inflight_stage.committed:
                     recovery_candidate = inflight_stage.committed_carrier
                     replace_existing = True
                     recovery_proven = True
@@ -6897,9 +6769,7 @@ def _claude_keychain_runtime(
                     quiescence_recovery_proven = True
                     recovery_expectation = _ClaudeRecoveryExpectation(
                         recovery_candidate,
-                        recovery_candidate
-                        / "config"
-                        / CLAUDE_CREDENTIAL_FILE_NAME,
+                        recovery_candidate / "config" / CLAUDE_CREDENTIAL_FILE_NAME,
                         inflight_stage.credential_digest,
                     )
                     quiescence_recovery_expectation = recovery_expectation
@@ -6936,9 +6806,7 @@ def _claude_keychain_runtime(
                     recovery_proven = True
                     recovery_expectation = _ClaudeRecoveryExpectation(
                         recovery_candidate,
-                        recovery_candidate
-                        / "config"
-                        / CLAUDE_CREDENTIAL_FILE_NAME,
+                        recovery_candidate / "config" / CLAUDE_CREDENTIAL_FILE_NAME,
                         inflight_stage.credential_digest,
                     )
                     quiescence_recovery_candidate = recovery_candidate
@@ -6960,8 +6828,7 @@ def _claude_keychain_runtime(
             )
             if (
                 inflight_expectation is not None
-                and inflight_expectation.digest
-                != inflight_stage.credential_digest
+                and inflight_expectation.digest != inflight_stage.credential_digest
             ):
                 inflight_expectation = None
             if inflight_expectation is not None:
@@ -7107,20 +6974,15 @@ def _claude_keychain_runtime(
                     quiescence_recovery_expectation = None
                 else:
                     recovery_candidate = quiescence_recovery_candidate
-                    replace_existing = (
-                        quiescence_recovery_replaces_existing
-                    )
+                    replace_existing = quiescence_recovery_replaces_existing
                     recovery_expectation = quiescence_recovery_expectation
                     recovery_proven = (
                         quiescence_recovery_proven
                         and recovery_expectation is not None
-                        and recovery_expectation.carrier
-                        == recovery_candidate
+                        and recovery_expectation.carrier == recovery_candidate
                     )
         recovery_succeeded = False
-        recovery_payload_digest = _claude_credential_digest(
-            recovery_payload
-        )
+        recovery_payload_digest = _claude_credential_digest(recovery_payload)
         try:
             if replace_existing and recovery_proven:
                 _replace_claude_macos_recovery_credential(
@@ -7177,9 +7039,7 @@ def _claude_keychain_runtime(
                 )
             with runtime_state_lock:
                 if failed_recovery_expectation is not None:
-                    recovery_candidate = (
-                        failed_recovery_expectation.carrier
-                    )
+                    recovery_candidate = failed_recovery_expectation.carrier
                     replace_existing = True
                     recovery_expectation = failed_recovery_expectation
                     recovery_proven = True
@@ -7220,24 +7080,17 @@ def _claude_keychain_runtime(
         else:
             successful_expectation = _ClaudeRecoveryExpectation(
                 retained_carrier,
-                retained_carrier
-                / "config"
-                / CLAUDE_CREDENTIAL_FILE_NAME,
+                retained_carrier / "config" / CLAUDE_CREDENTIAL_FILE_NAME,
                 recovery_payload_digest,
             )
             with runtime_state_lock:
                 timeout_failure = quiescence_recovery_timeout_failure
                 recovery_timed_out = timeout_failure is not None
-                if (
-                    not recovery_timed_out
-                    or (replace_existing and recovery_proven)
-                ):
+                if not recovery_timed_out or (replace_existing and recovery_proven):
                     quiescence_recovery_candidate = retained_carrier
                     quiescence_recovery_replaces_existing = True
                     quiescence_recovery_proven = True
-                    quiescence_recovery_expectation = (
-                        successful_expectation
-                    )
+                    quiescence_recovery_expectation = successful_expectation
             if (
                 recovery_timed_out
                 and timeout_failure is not None
@@ -7251,15 +7104,10 @@ def _claude_keychain_runtime(
                 )
                 _mark_claude_macos_recovery_update_artifact(
                     timeout_failure,
-                    retained_carrier
-                    / "config"
-                    / CLAUDE_CREDENTIAL_FILE_NAME,
+                    retained_carrier / "config" / CLAUDE_CREDENTIAL_FILE_NAME,
                     expected_digest=recovery_payload_digest,
                 )
-            if (
-                recovery_timed_out
-                and not (replace_existing and recovery_proven)
-            ):
+            if recovery_timed_out and not (replace_existing and recovery_proven):
                 late_cleanup_error: BaseException | None = None
                 try:
                     _remove_claude_macos_recovery_carrier(
@@ -7417,9 +7265,7 @@ def _claude_keychain_runtime(
                     and recovery_expectation is not None
                     and recovery_expectation.carrier == recovery_candidate
                 )
-                inflight_stage = (
-                    quiescence_durable_stage or durable_stage_inflight
-                )
+                inflight_stage = quiescence_durable_stage or durable_stage_inflight
                 unresolved_inflight_stage = (
                     inflight_stage is not None
                     and not inflight_stage.recovery_decided.is_set()
@@ -7429,15 +7275,12 @@ def _claude_keychain_runtime(
                     recovery_expectation = None
                     recovery_proven = False
                 recovery_cleanup_scope_required = (
-                    bool(durable_stage_carriers)
-                    or unresolved_inflight_stage
+                    bool(durable_stage_carriers) or unresolved_inflight_stage
                 )
         except BaseException as state_error:
-            failure = (
-                _attach_claude_persistence_failure_preserving_control_flow(
-                    failure,
-                    state_error,
-                )
+            failure = _attach_claude_persistence_failure_preserving_control_flow(
+                failure,
+                state_error,
             )
         finally:
             if state_acquired:
@@ -7506,9 +7349,7 @@ def _claude_keychain_runtime(
                         "source": selected.source,
                         "carrier": "one-shot-security-broker",
                         "status": "sandbox-auth-staged",
-                        "refresh_persistence": (
-                            "durable-recovery-before-ack"
-                        ),
+                        "refresh_persistence": ("durable-recovery-before-ack"),
                     }
                 },
             )
@@ -7519,23 +7360,22 @@ def _claude_keychain_runtime(
     finally:
         persistence_error: BaseException | None = None
         staged_for_commit: bytearray | None = None
-        durable_carriers_for_cleanup: tuple[
-            tuple[pathlib.Path, bytes], ...
-        ] = ()
-        finalization_abandoned = bool(
-            primary_error is not None
-            and getattr(
-                primary_error,
-                "_codex_claude_keychain_handler_quiescence_unproven",
-                False,
+        durable_carriers_for_cleanup: tuple[tuple[pathlib.Path, bytes], ...] = ()
+        finalization_abandoned = (
+            bool(
+                primary_error is not None
+                and getattr(
+                    primary_error,
+                    "_codex_claude_keychain_handler_quiescence_unproven",
+                    False,
+                )
             )
-        ) or runtime_is_abandoned()
+            or runtime_is_abandoned()
+        )
         if not finalization_abandoned:
             errors_for_latest_reproof: tuple[BaseException, ...] = ()
             with runtime_state_lock:
-                durable_carriers_for_cleanup = tuple(
-                    durable_stage_carriers
-                )
+                durable_carriers_for_cleanup = tuple(durable_stage_carriers)
                 if staged_credential is not None:
                     staged_for_commit = staged_credential
                     staged_credential = None
@@ -7546,9 +7386,7 @@ def _claude_keychain_runtime(
                     durable_carriers_for_cleanup[-1]
                 )
                 latest_durable_artifact = (
-                    latest_durable_carrier
-                    / "config"
-                    / CLAUDE_CREDENTIAL_FILE_NAME
+                    latest_durable_carrier / "config" / CLAUDE_CREDENTIAL_FILE_NAME
                 )
                 for existing_error in errors_for_latest_reproof:
                     retained_value = getattr(
@@ -7561,8 +7399,7 @@ def _claude_keychain_runtime(
                     )
                     if (
                         not isinstance(retained_value, str)
-                        or pathlib.Path(retained_value)
-                        != latest_durable_carrier
+                        or pathlib.Path(retained_value) != latest_durable_carrier
                         or existing_proof is None
                         or existing_proof.artifact != latest_durable_artifact
                         or not hmac.compare_digest(
@@ -7587,15 +7424,13 @@ def _claude_keychain_runtime(
                 else:
                     cleanup_primary = None
             if cleanup_primary is None:
-                created_cleanup_primary = (
-                    _retained_claude_macos_credential_error(
-                        durable_carriers_for_cleanup[-1][0],
-                        ClaudeCredentialInspectionInconclusive(
-                            "Claude durable-stage finalization did not retain "
-                            "a host-writeback candidate"
-                        ),
-                        expected_digest=durable_carriers_for_cleanup[-1][1],
-                    )
+                created_cleanup_primary = _retained_claude_macos_credential_error(
+                    durable_carriers_for_cleanup[-1][0],
+                    ClaudeCredentialInspectionInconclusive(
+                        "Claude durable-stage finalization did not retain "
+                        "a host-writeback candidate"
+                    ),
+                    expected_digest=durable_carriers_for_cleanup[-1][1],
                 )
                 with runtime_state_lock:
                     if persistence_errors:
@@ -7615,15 +7450,11 @@ def _claude_keychain_runtime(
             retained_path: pathlib.Path | None = None
             retained_digest: bytes | None = None
             retained_proof_is_current = False
-            retained_proof = _get_claude_retained_credential_proof(
-                cleanup_primary
-            )
+            retained_proof = _get_claude_retained_credential_proof(cleanup_primary)
             if isinstance(retained_value, str) and retained_proof is not None:
                 candidate_path = pathlib.Path(retained_value)
                 expected_artifact = (
-                    candidate_path
-                    / "config"
-                    / CLAUDE_CREDENTIAL_FILE_NAME
+                    candidate_path / "config" / CLAUDE_CREDENTIAL_FILE_NAME
                 )
                 if (
                     retained_proof.artifact == expected_artifact
@@ -7648,9 +7479,7 @@ def _claude_keychain_runtime(
                 assert retained_digest is not None
                 _mark_claude_macos_recovery_update_artifact(
                     cleanup_primary,
-                    retained_path
-                    / "config"
-                    / CLAUDE_CREDENTIAL_FILE_NAME,
+                    retained_path / "config" / CLAUDE_CREDENTIAL_FILE_NAME,
                     expected_digest=retained_digest,
                 )
                 setattr(
@@ -7658,13 +7487,9 @@ def _claude_keychain_runtime(
                     "_codex_claude_refresh_persistence_failed",
                     True,
                 )
-                retained_proof = _get_claude_retained_credential_proof(
-                    cleanup_primary
-                )
+                retained_proof = _get_claude_retained_credential_proof(cleanup_primary)
                 expected_artifact = (
-                    retained_path
-                    / "config"
-                    / CLAUDE_CREDENTIAL_FILE_NAME
+                    retained_path / "config" / CLAUDE_CREDENTIAL_FILE_NAME
                 )
                 retained_proof_is_current = (
                     retained_proof is not None
@@ -7750,16 +7575,12 @@ def _claude_keychain_runtime(
                         assert retained_digest is not None
                         _mark_claude_macos_recovery_update_artifact(
                             cleanup_error,
-                            retained_path
-                            / "config"
-                            / CLAUDE_CREDENTIAL_FILE_NAME,
+                            retained_path / "config" / CLAUDE_CREDENTIAL_FILE_NAME,
                             expected_digest=retained_digest,
                         )
                     cleanup_failures.append(cleanup_error)
                     if _is_claude_control_flow_error(cleanup_error):
-                        cleanup_stopped_early = (
-                            cleanup_index + 1 < len(cleanup_targets)
-                        )
+                        cleanup_stopped_early = cleanup_index + 1 < len(cleanup_targets)
                         break
                 else:
                     with runtime_state_lock:
@@ -7799,9 +7620,7 @@ def _claude_keychain_runtime(
                     try:
                         recovery_root = _claude_macos_recovery_root(review)
                     except BaseException as root_error:
-                        root_primary = (
-                            control_flow_cleanup or cleanup_primary
-                        )
+                        root_primary = control_flow_cleanup or cleanup_primary
                         preferred_primary = (
                             _attach_claude_persistence_failure_preserving_control_flow(
                                 root_primary,
@@ -7835,9 +7654,7 @@ def _claude_keychain_runtime(
             accepted = False
             persistence_control_flow = False
             stale_durable_cleanup_errors: list[BaseException] = []
-            stale_durable_cleanup_targets = (
-                durable_carriers_for_cleanup[:-1]
-            )
+            stale_durable_cleanup_targets = durable_carriers_for_cleanup[:-1]
             try:
                 latest_carrier_verified = False
                 latest_readback: bytearray | None = None
@@ -7848,24 +7665,17 @@ def _claude_keychain_runtime(
                             "the latest durable recovery carrier is missing "
                             "before host writeback"
                         )
-                    latest_carrier, latest_digest = (
-                        durable_carriers_for_cleanup[-1]
+                    latest_carrier, latest_digest = durable_carriers_for_cleanup[-1]
+                    latest_readback = _read_claude_macos_recovery_credential(
+                        review,
+                        latest_carrier,
                     )
-                    latest_readback = (
-                        _read_claude_macos_recovery_credential(
-                            review,
-                            latest_carrier,
-                        )
-                    )
-                    if (
-                        not hmac.compare_digest(
-                            _claude_credential_digest(latest_readback),
-                            latest_digest,
-                        )
-                        or not hmac.compare_digest(
-                            latest_readback,
-                            staged_for_commit,
-                        )
+                    if not hmac.compare_digest(
+                        _claude_credential_digest(latest_readback),
+                        latest_digest,
+                    ) or not hmac.compare_digest(
+                        latest_readback,
+                        staged_for_commit,
                     ):
                         raise ClaudeCredentialInspectionInconclusive(
                             "the latest durable recovery carrier no longer "
@@ -7875,20 +7685,15 @@ def _claude_keychain_runtime(
                 except BaseException as error:
                     if _is_claude_control_flow_error(error):
                         verification_error = error
-                    elif (
-                        isinstance(
-                            error,
-                            ClaudeCredentialInspectionInconclusive,
-                        )
-                        and "latest durable recovery carrier" in str(error)
-                    ):
+                    elif isinstance(
+                        error,
+                        ClaudeCredentialInspectionInconclusive,
+                    ) and "latest durable recovery carrier" in str(error):
                         verification_error = error
                     else:
-                        verification_error = (
-                            ClaudeCredentialInspectionInconclusive(
-                                "cannot re-verify the latest durable recovery "
-                                "carrier before host writeback"
-                            )
+                        verification_error = ClaudeCredentialInspectionInconclusive(
+                            "cannot re-verify the latest durable recovery "
+                            "carrier before host writeback"
                         )
                         verification_error.__cause__ = error
                 finally:
@@ -7938,17 +7743,13 @@ def _claude_keychain_runtime(
                     with runtime_state_lock:
                         if (
                             existing_control_flow is not None
-                            and not _is_claude_control_flow_error(
-                                verification_error
-                            )
+                            and not _is_claude_control_flow_error(verification_error)
                         ):
                             _attach_claude_credential_cleanup_failure(
                                 existing_control_flow,
                                 verification_error,
                             )
-                            persistence_errors.remove(
-                                existing_control_flow
-                            )
+                            persistence_errors.remove(existing_control_flow)
                             persistence_errors.insert(
                                 0,
                                 existing_control_flow,
@@ -7973,21 +7774,18 @@ def _claude_keychain_runtime(
                             )
                         except BaseException as error:
                             if _is_claude_control_flow_error(error):
-                                cleanup_stopped_early = (
-                                    stale_index + 1
-                                    < len(stale_durable_cleanup_targets)
+                                cleanup_stopped_early = stale_index + 1 < len(
+                                    stale_durable_cleanup_targets
                                 )
                                 if cleanup_stopped_early:
                                     try:
-                                        recovery_root = (
-                                            _claude_macos_recovery_root(review)
+                                        recovery_root = _claude_macos_recovery_root(
+                                            review
                                         )
                                     except BaseException as root_error:
-                                        error = (
-                                            _attach_claude_persistence_failure_preserving_control_flow(
-                                                error,
-                                                root_error,
-                                            )
+                                        error = _attach_claude_persistence_failure_preserving_control_flow(
+                                            error,
+                                            root_error,
                                         )
                                     else:
                                         _mark_claude_macos_recovery_cleanup_artifact(
@@ -7997,10 +7795,7 @@ def _claude_keychain_runtime(
                                 elif not isinstance(
                                     getattr(
                                         error,
-                                        (
-                                            "_codex_claude_retained_"
-                                            "cleanup_artifact"
-                                        ),
+                                        ("_codex_claude_retained_cleanup_artifact"),
                                         None,
                                     ),
                                     str,
@@ -8015,10 +7810,7 @@ def _claude_keychain_runtime(
                                 ) = durable_carriers_for_cleanup[-1]
                                 setattr(
                                     error,
-                                    (
-                                        "_codex_claude_retained_"
-                                        "credential_carrier"
-                                    ),
+                                    ("_codex_claude_retained_credential_carrier"),
                                     str(latest_carrier),
                                 )
                                 _mark_claude_macos_recovery_update_artifact(
@@ -8040,9 +7832,7 @@ def _claude_keychain_runtime(
                             stale_durable_cleanup_errors.append(error)
                 if not persistence_control_flow:
                     try:
-                        accepted = accept_refreshed_credential(
-                            staged_for_commit
-                        )
+                        accepted = accept_refreshed_credential(staged_for_commit)
                     except BaseException as error:
                         with runtime_state_lock:
                             if _is_claude_control_flow_error(error):
@@ -8051,9 +7841,9 @@ def _claude_keychain_runtime(
                             else:
                                 persistence_errors.append(error)
                 if accepted and not persistence_control_flow:
-                    for durable_carrier, durable_digest in (
-                        durable_carriers_for_cleanup[-1:]
-                    ):
+                    for durable_carrier, durable_digest in durable_carriers_for_cleanup[
+                        -1:
+                    ]:
                         try:
                             _remove_claude_macos_recovery_carrier(
                                 review,
@@ -8064,10 +7854,7 @@ def _claude_keychain_runtime(
                             with contextlib.suppress(AttributeError):
                                 delattr(
                                     error,
-                                    (
-                                        "_codex_claude_retained_"
-                                        "credential_carrier"
-                                    ),
+                                    ("_codex_claude_retained_credential_carrier"),
                                 )
                             _clear_claude_retained_credential_proof(error)
                             with runtime_state_lock:
@@ -8085,13 +7872,9 @@ def _claude_keychain_runtime(
                                 cleanup_error,
                                 "_codex_claude_retained_credential_carrier",
                             )
-                        _clear_claude_retained_credential_proof(
-                            cleanup_error
-                        )
+                        _clear_claude_retained_credential_proof(cleanup_error)
                     with runtime_state_lock:
-                        persistence_errors.extend(
-                            stale_durable_cleanup_errors
-                        )
+                        persistence_errors.extend(stale_durable_cleanup_errors)
             finally:
                 staged_for_commit[:] = b"\x00" * len(staged_for_commit)
         if finalization_abandoned:
@@ -8182,8 +7965,7 @@ def _claude_keychain_runtime(
                 final_recovery_proven = (
                     quiescence_recovery_proven
                     and final_recovery_expectation is not None
-                    and final_recovery_expectation.carrier
-                    == final_recovery_candidate
+                    and final_recovery_expectation.carrier == final_recovery_candidate
                 )
                 remaining_staged_credential = staged_credential
                 staged_credential = None
@@ -8214,9 +7996,7 @@ def _claude_keychain_runtime(
                         if secondary is persistence_error:
                             continue
                         if (
-                            _get_claude_retained_credential_proof(
-                                persistence_error
-                            )
+                            _get_claude_retained_credential_proof(persistence_error)
                             is None
                         ):
                             _copy_claude_retained_credential_proof(
@@ -8225,57 +8005,38 @@ def _claude_keychain_runtime(
                             )
                         secondary_cleanup_artifact = getattr(
                             secondary,
-                            (
-                                "_codex_claude_retained_"
-                                "cleanup_artifact"
-                            ),
+                            ("_codex_claude_retained_cleanup_artifact"),
                             None,
                         )
-                        if (
-                            isinstance(secondary_cleanup_artifact, str)
-                            and not isinstance(
-                                getattr(
-                                    persistence_error,
-                                    (
-                                        "_codex_claude_retained_"
-                                        "cleanup_artifact"
-                                    ),
-                                    None,
-                                ),
-                                str,
-                            )
+                        if isinstance(
+                            secondary_cleanup_artifact, str
+                        ) and not isinstance(
+                            getattr(
+                                persistence_error,
+                                ("_codex_claude_retained_cleanup_artifact"),
+                                None,
+                            ),
+                            str,
                         ):
                             setattr(
                                 persistence_error,
-                                (
-                                    "_codex_claude_retained_"
-                                    "cleanup_artifact"
-                                ),
+                                ("_codex_claude_retained_cleanup_artifact"),
                                 secondary_cleanup_artifact,
                             )
-                        if (
-                            not isinstance(
-                                getattr(
-                                    persistence_error,
-                                    (
-                                        "_codex_claude_retained_"
-                                        "credential_carrier"
-                                    ),
-                                    None,
-                                ),
-                                str,
-                            )
-                            and isinstance(
-                                getattr(
-                                    secondary,
-                                    (
-                                        "_codex_claude_retained_"
-                                        "credential_carrier"
-                                    ),
-                                    None,
-                                ),
-                                str,
-                            )
+                        if not isinstance(
+                            getattr(
+                                persistence_error,
+                                ("_codex_claude_retained_credential_carrier"),
+                                None,
+                            ),
+                            str,
+                        ) and isinstance(
+                            getattr(
+                                secondary,
+                                ("_codex_claude_retained_credential_carrier"),
+                                None,
+                            ),
+                            str,
                         ):
                             _add_claude_persistence_note(
                                 persistence_error,
@@ -8294,24 +8055,16 @@ def _claude_keychain_runtime(
                             secondary,
                         )
                 elif final_runtime_abandoned:
-                    persistence_error = (
-                        ClaudeCredentialInspectionInconclusive(
-                            "Claude Keychain broker handler quiescence could not "
-                            "be proven before runtime cleanup"
-                        )
+                    persistence_error = ClaudeCredentialInspectionInconclusive(
+                        "Claude Keychain broker handler quiescence could not "
+                        "be proven before runtime cleanup"
                     )
                     setattr(
                         persistence_error,
-                        (
-                            "_codex_claude_keychain_handler_"
-                            "quiescence_unproven"
-                        ),
+                        ("_codex_claude_keychain_handler_quiescence_unproven"),
                         True,
                     )
-                    if (
-                        final_recovery_candidate is not None
-                        and final_recovery_proven
-                    ):
+                    if final_recovery_candidate is not None and final_recovery_proven:
                         assert final_recovery_expectation is not None
                         setattr(
                             persistence_error,
@@ -8321,9 +8074,7 @@ def _claude_keychain_runtime(
                         _mark_claude_macos_recovery_update_artifact(
                             persistence_error,
                             final_recovery_expectation.artifact,
-                            expected_digest=(
-                                final_recovery_expectation.digest
-                            ),
+                            expected_digest=(final_recovery_expectation.digest),
                         )
                         setattr(
                             persistence_error,
@@ -8334,9 +8085,7 @@ def _claude_keychain_runtime(
                         review,
                         {
                             "authentication": {
-                                "refresh_persistence": (
-                                    "broker-shutdown-inconclusive"
-                                ),
+                                "refresh_persistence": ("broker-shutdown-inconclusive"),
                             }
                         },
                     )
@@ -8374,17 +8123,16 @@ def _claude_keychain_runtime(
                     persistence_error = error
         finally:
             if remaining_staged_credential is not None:
-                remaining_staged_credential[:] = (
-                    b"\x00" * len(remaining_staged_credential)
+                remaining_staged_credential[:] = b"\x00" * len(
+                    remaining_staged_credential
                 )
             expected_credential[:] = b"\x00" * len(expected_credential)
             selected.payload[:] = b"\x00" * len(selected.payload)
         if persistence_error is not None:
             if primary_error is not None:
-                if (
-                    not _is_claude_control_flow_error(primary_error)
-                    and _is_claude_control_flow_error(persistence_error)
-                ):
+                if not _is_claude_control_flow_error(
+                    primary_error
+                ) and _is_claude_control_flow_error(persistence_error):
                     _attach_claude_credential_cleanup_failure(
                         persistence_error,
                         primary_error,
@@ -8396,11 +8144,9 @@ def _claude_keychain_runtime(
                     raise persistence_error
                 if isinstance(primary_error, OSError):
                     active_io_error = primary_error
-                    normalized_primary = (
-                        _claude_macos_runtime_io_inconclusive(
-                            review,
-                            active_io_error,
-                        )
+                    normalized_primary = _claude_macos_runtime_io_inconclusive(
+                        review,
+                        active_io_error,
                     )
                     if persistence_error is not active_io_error:
                         _add_claude_persistence_note(
@@ -8444,7 +8190,9 @@ def _extract_ca_certificates(data: bytes, *, source: str) -> bytes:
         raise ReviewError(f"Claude review CA source contains a private key: {source}")
     blocks = CLAUDE_CERTIFICATE_BLOCK.findall(data)
     if not blocks:
-        raise ReviewError(f"Claude review CA source contains no PEM certificate: {source}")
+        raise ReviewError(
+            f"Claude review CA source contains no PEM certificate: {source}"
+        )
     return b"\n".join(block.strip() for block in blocks) + b"\n"
 
 
@@ -8483,7 +8231,9 @@ def _require_safe_ca_symlink_metadata(
     source: str,
 ) -> None:
     if not stat.S_ISLNK(metadata.st_mode):
-        raise ReviewError(f"Claude review CA directory entry is not a symlink: {source}")
+        raise ReviewError(
+            f"Claude review CA directory entry is not a symlink: {source}"
+        )
     if metadata.st_uid not in {0, os.geteuid()}:
         raise ReviewError(
             f"Claude review CA directory symlink has an unsafe owner: {source}"
@@ -8608,10 +8358,9 @@ def _open_stable_ca_directory(path: pathlib.Path, *, source: str) -> int:
         raise ClaudeExecutableInspectionInconclusive(
             f"cannot validate a stable Claude review CA directory {source}: {error}"
         ) from error
-    if (
-        _ca_source_metadata(path_before) != _ca_source_metadata(opened)
-        or _ca_source_metadata(opened) != _ca_source_metadata(path_after)
-    ):
+    if _ca_source_metadata(path_before) != _ca_source_metadata(
+        opened
+    ) or _ca_source_metadata(opened) != _ca_source_metadata(path_after):
         os.close(descriptor)
         raise ClaudeExecutableInspectionInconclusive(
             f"Claude review CA directory changed while being opened: {source}"
@@ -8694,9 +8443,7 @@ def _read_ca_source_with_size(
         raise ClaudeExecutableInspectionInconclusive(
             f"Claude review CA source changed while being read: {source}"
         ) from error
-    if (
-        _ca_source_metadata(after) != _ca_source_metadata(path_after)
-    ):
+    if _ca_source_metadata(after) != _ca_source_metadata(path_after):
         raise ClaudeExecutableInspectionInconclusive(
             f"Claude review CA source changed while being read: {source}"
         )
@@ -8801,10 +8548,9 @@ def _open_ca_directory_at(
             f"cannot validate a stable Claude review CA path directory {source}: "
             f"{error}"
         ) from error
-    if (
-        _ca_source_metadata(before) != _ca_source_metadata(opened)
-        or _ca_source_metadata(opened) != _ca_source_metadata(after)
-    ):
+    if _ca_source_metadata(before) != _ca_source_metadata(
+        opened
+    ) or _ca_source_metadata(opened) != _ca_source_metadata(after):
         os.close(descriptor)
         raise ClaudeExecutableInspectionInconclusive(
             f"Claude review CA path directory changed while being opened: {source}"
@@ -8845,8 +8591,7 @@ def _revalidate_ca_symlink_path(
             raise
         except OSError as error:
             raise ClaudeExecutableInspectionInconclusive(
-                f"Claude review CA directory symlink changed while being read: "
-                f"{source}"
+                f"Claude review CA directory symlink changed while being read: {source}"
             ) from error
         if (
             _ca_source_metadata(expected) != _ca_source_metadata(before)
@@ -8854,8 +8599,7 @@ def _revalidate_ca_symlink_path(
             or target != expected_target
         ):
             raise ClaudeExecutableInspectionInconclusive(
-                f"Claude review CA directory symlink changed while being read: "
-                f"{source}"
+                f"Claude review CA directory symlink changed while being read: {source}"
             )
     for descriptor, expected in directory_records:
         try:
@@ -8969,9 +8713,7 @@ def _read_ca_path_at_with_size(
                         raw_target,
                     )
                 )
-                absolute, target_components = _ca_symlink_target_components(
-                    raw_target
-                )
+                absolute, target_components = _ca_symlink_target_components(raw_target)
                 if len(target_components) + len(pending_components) > (
                     CLAUDE_CA_PATH_COMPONENT_LIMIT
                 ):
@@ -9156,7 +8898,9 @@ def _prepare_claude_tls_environment(
         result[key] = str(destination)
 
     for key in CLAUDE_TLS_DIR_ENV_KEYS:
-        raw_entries = [entry for entry in result.get(key, "").split(os.pathsep) if entry]
+        raw_entries = [
+            entry for entry in result.get(key, "").split(os.pathsep) if entry
+        ]
         if not raw_entries:
             continue
         destination_root = pathlib.Path(
@@ -9195,19 +8939,16 @@ def _prepare_claude_tls_environment(
                         )
                     except OSError as error:
                         raise ClaudeExecutableInspectionInconclusive(
-                            f"cannot inspect Claude review CA directory entry: "
-                            f"{error}"
+                            f"cannot inspect Claude review CA directory entry: {error}"
                         ) from error
                     if stat.S_ISDIR(entry_metadata.st_mode):
                         continue
-                    raw_material, source_size = (
-                        _read_ca_directory_entry_at_with_size(
-                            source_directory,
-                            source_name,
-                            entry_metadata,
-                            source=f"{key}:{source_name}",
-                            extract_certificates=False,
-                        )
+                    raw_material, source_size = _read_ca_directory_entry_at_with_size(
+                        source_directory,
+                        source_name,
+                        entry_metadata,
+                        source=f"{key}:{source_name}",
+                        extract_certificates=False,
                     )
                     total_size += source_size
                     if total_size > CLAUDE_CA_DIR_LIMIT_BYTES:
@@ -9315,9 +9056,7 @@ def _parse_upstream_proxy_url(
     except ValueError as error:
         raise ReviewError("Claude review upstream proxy URL is invalid") from error
     if parsed.scheme not in {"http", "https"} or not hostname:
-        raise ReviewError(
-            "Claude review proxy supports only HTTP(S) upstream proxies"
-        )
+        raise ReviewError("Claude review proxy supports only HTTP(S) upstream proxies")
     proxy_port = (
         explicit_port
         if explicit_port is not None
@@ -9429,9 +9168,7 @@ class _ClaudeProxyHandler(socketserver.BaseRequestHandler):
             _tunnel_proxy_sockets(client, upstream)
         except (OSError, ReviewError):
             with contextlib.suppress(OSError):
-                client.sendall(
-                    b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n"
-                )
+                client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
         finally:
             if upstream is not None:
                 upstream.close()
@@ -9667,9 +9404,7 @@ def _claude_connect_proxy(
             ) from error
         serve_admitted = True
         serve_gate.set()
-        if not server.wait_until_serving(
-            CLAUDE_PROXY_SERVER_START_TIMEOUT_SECONDS
-        ):
+        if not server.wait_until_serving(CLAUDE_PROXY_SERVER_START_TIMEOUT_SECONDS):
             failure = ClaudeCredentialInspectionInconclusive(
                 "Claude CONNECT proxy did not enter its serve loop"
             )
@@ -9740,8 +9475,7 @@ def _claude_unix_connect_proxy(
             socket_path.chmod(0o600)
         except OSError as error:
             failure = ClaudeCredentialInspectionInconclusive(
-                "Claude CONNECT proxy cannot make its Unix socket private: "
-                f"{error}"
+                f"Claude CONNECT proxy cannot make its Unix socket private: {error}"
             )
             failure.__cause__ = error
             cleanup_errors: list[BaseException] = []
@@ -9791,8 +9525,7 @@ def _claude_unix_connect_proxy(
                 raise
             except Exception as error:
                 raise ClaudeCredentialInspectionInconclusive(
-                    "Claude Unix CONNECT proxy cannot construct its thread: "
-                    f"{error}"
+                    f"Claude Unix CONNECT proxy cannot construct its thread: {error}"
                 ) from error
             try:
                 thread.start()
@@ -9807,9 +9540,7 @@ def _claude_unix_connect_proxy(
                 ) from error
             serve_admitted = True
             serve_gate.set()
-            if not server.wait_until_serving(
-                CLAUDE_PROXY_SERVER_START_TIMEOUT_SECONDS
-            ):
+            if not server.wait_until_serving(CLAUDE_PROXY_SERVER_START_TIMEOUT_SECONDS):
                 failure = ClaudeCredentialInspectionInconclusive(
                     "Claude Unix CONNECT proxy did not enter its serve loop"
                 )
@@ -9854,6 +9585,126 @@ def _with_claude_proxy_environment(
     result["NO_PROXY"] = ""
     result["no_proxy"] = ""
     return result
+
+
+def _claude_explicit_auth_source(env: dict[str, str]) -> str | None:
+    if env.get("ANTHROPIC_API_KEY"):
+        return "api-key"
+    if env.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        return "oauth-token"
+    return None
+
+
+def _claude_explicit_auth_environment(env: dict[str, str]) -> dict[str, str]:
+    source = _claude_explicit_auth_source(env)
+    if source == "api-key":
+        return {"ANTHROPIC_API_KEY": env["ANTHROPIC_API_KEY"]}
+    if source == "oauth-token":
+        return {"CLAUDE_CODE_OAUTH_TOKEN": env["CLAUDE_CODE_OAUTH_TOKEN"]}
+    return {}
+
+
+def _claude_environment_with_selected_explicit_auth(
+    env: dict[str, str],
+) -> dict[str, str]:
+    result = dict(env)
+    for key in CLAUDE_EXPLICIT_AUTH_ENV_KEYS:
+        result.pop(key, None)
+    result.update(_claude_explicit_auth_environment(env))
+    return result
+
+
+def _claude_has_explicit_auth(env: dict[str, str]) -> bool:
+    return _claude_explicit_auth_source(env) is not None
+
+
+def _claude_auth_action(env: dict[str, str]) -> str:
+    source = _claude_explicit_auth_source(env)
+    if source == "api-key":
+        return CLAUDE_API_KEY_ACTION
+    if source == "oauth-token":
+        return CLAUDE_OAUTH_TOKEN_ACTION
+    return CLAUDE_AUTH_LOGIN_ACTION
+
+
+def _claude_explicit_auth_secrets(
+    env: dict[str, str],
+) -> tuple[str, ...]:
+    """Freeze every configured explicit secret before winner selection."""
+
+    values: list[str] = []
+    for key in CLAUDE_EXPLICIT_AUTH_ENV_KEYS:
+        value = env.get(key)
+        if value:
+            values.append(value)
+    return tuple(dict.fromkeys(values))
+
+
+def _claude_explicit_auth_redact_values(
+    env: dict[str, str],
+) -> tuple[str, ...]:
+    return output_redact_values(_claude_explicit_auth_secrets(env))
+
+
+def _provider_atomic_write_filter(
+    review: ReviewWorkspace,
+) -> Callable[[pathlib.Path], bool]:
+    root = review.container_dir.expanduser().absolute()
+    attempts_root = root / "attempts"
+    protected_inputs = frozenset(
+        {
+            review.diff_file.expanduser().absolute(),
+            review.prompt_file.expanduser().absolute(),
+        }
+    )
+    workspace_root = review.workspace_root.expanduser().absolute()
+
+    def includes(path: pathlib.Path) -> bool:
+        candidate = path.expanduser().absolute()
+        if (
+            candidate in protected_inputs
+            or candidate == workspace_root
+            or is_relative_to(candidate, workspace_root)
+        ):
+            return False
+        return (
+            candidate.parent == root
+            and candidate.name in _PROVIDER_OWNED_ATOMIC_TEXT_ARTIFACT_NAMES
+        ) or candidate.parent == attempts_root
+
+    return includes
+
+
+def _redact_claude_bytes(
+    payload: bytes,
+    redact_secrets: Iterable[str],
+) -> bytes:
+    secrets = tuple(redact_secrets)
+    if not payload or not secrets:
+        return payload
+    return os.fsencode(redact_text(os.fsdecode(payload), secrets))
+
+
+def _redact_claude_text(
+    text: str,
+    redact_secrets: Iterable[str],
+) -> str:
+    return redact_text(text, redact_secrets)
+
+
+def _redact_claude_completed(
+    completed: Completed,
+    redact_secrets: Iterable[str],
+) -> Completed:
+    frozen = tuple(redact_secrets)
+    if not frozen:
+        return completed
+    return Completed(
+        argv=tuple(_redact_claude_text(item, frozen) for item in completed.argv),
+        returncode=completed.returncode,
+        stdout=_redact_claude_bytes(completed.stdout, frozen),
+        stderr=_redact_claude_bytes(completed.stderr, frozen),
+    )
 
 
 def _review_environment(
@@ -9925,7 +9776,7 @@ def _with_claude_review_tool_path(
         except InvalidReviewerExecutable as error:
             raise ClaudeReviewToolUnavailable(str(error)) from error
     entries: list[pathlib.Path] = []
-    if not _is_claude_linux_host() and not env.get("ANTHROPIC_API_KEY"):
+    if not _is_claude_linux_host() and not _claude_has_explicit_auth(env):
         broker_dir = (
             review.container_dir.resolve() / "claude-runtime" / "keychain-broker"
         )
@@ -9937,9 +9788,7 @@ def _with_claude_review_tool_path(
         entries.append(broker_dir)
     entries.append(rg.absolute().parent)
     result = dict(env)
-    result["PATH"] = os.pathsep.join(
-        dict.fromkeys(str(entry) for entry in entries)
-    )
+    result["PATH"] = os.pathsep.join(dict.fromkeys(str(entry) for entry in entries))
     return result
 
 
@@ -10031,9 +9880,7 @@ def _claude_linux_ca_bundle(
             entries = _bounded_ca_directory_names(
                 directory_descriptor,
                 remaining_entries,
-                too_many_message=(
-                    "Claude Linux CA directories have too many entries"
-                ),
+                too_many_message=("Claude Linux CA directories have too many entries"),
             )
             entry_count += len(entries)
             for entry in entries:
@@ -10217,9 +10064,11 @@ def _claude_probe_sandbox_profile(
     probe_cwd: pathlib.Path,
 ) -> str:
     dependencies = _native_macho_dependencies(executable, label="Claude Code")
-    host_home = pathlib.Path(
-        os.environ.get("HOME", str(pathlib.Path.home()))
-    ).expanduser().resolve()
+    host_home = (
+        pathlib.Path(os.environ.get("HOME", str(pathlib.Path.home())))
+        .expanduser()
+        .resolve()
+    )
     dependency_roots = {path.parent.resolve() for path in dependencies}
     if any(
         root == pathlib.Path("/") or root == host_home or root in host_home.parents
@@ -10315,12 +10164,12 @@ def _claude_review_sandbox_profile(
             continue
         path = pathlib.Path(raw)
         if not path.is_absolute() or not path.is_file():
-            raise ReviewError(f"Claude Code review sandbox requires valid absolute {key}")
+            raise ReviewError(
+                f"Claude Code review sandbox requires valid absolute {key}"
+            )
         resolved = path.resolve()
         if not is_relative_to(resolved, container):
-            raise ReviewError(
-                f"Claude Code review sandbox requires helper-owned {key}"
-            )
+            raise ReviewError(f"Claude Code review sandbox requires helper-owned {key}")
         tls_files.update((path.absolute(), resolved))
     tls_dirs: set[pathlib.Path] = set()
     for key in CLAUDE_TLS_DIR_ENV_KEYS:
@@ -10340,7 +10189,7 @@ def _claude_review_sandbox_profile(
             tls_dirs.update((path.absolute(), resolved))
     auth_executables: tuple[pathlib.Path, ...] = ()
     keychain_broker_port: int | None = None
-    if not env.get("ANTHROPIC_API_KEY"):
+    if not _claude_has_explicit_auth(env):
         broker_dir = container / "claude-runtime" / "keychain-broker"
         security_candidate = next(
             (
@@ -10363,7 +10212,9 @@ def _claude_review_sandbox_profile(
             broker_dir / "security",
             label="Claude Keychain broker",
         )
-        if any(not is_relative_to(path.resolve(), container) for path in auth_executables):
+        if any(
+            not is_relative_to(path.resolve(), container) for path in auth_executables
+        ):
             raise ReviewError("Claude Keychain broker must be helper-owned")
         try:
             keychain_broker_port = int(env[CLAUDE_KEYCHAIN_BROKER_PORT_ENV])
@@ -10446,8 +10297,7 @@ def _claude_review_sandbox_profile(
         _sandbox_path_filter("subpath", path) for path in sorted((home, tmp), key=str)
     )
     mach_filters = "".join(
-        f"(global-name {json.dumps(name)})"
-        for name in CLAUDE_REVIEW_BASE_MACH_SERVICES
+        f"(global-name {json.dumps(name)})" for name in CLAUDE_REVIEW_BASE_MACH_SERVICES
     )
     network_filters = f'(remote ip "localhost:{proxy_port}")'
     if keychain_broker_port is not None:
@@ -10575,9 +10425,7 @@ def classify_failure(stdout: bytes | str, stderr: bytes | str) -> str:
         return "transient"
     if any(fragment in primary_message for fragment in ENTITLEMENT_FAILURE_FRAGMENTS):
         return "entitlement"
-    if any(
-        code in structured_primary_error for code in STRUCTURED_ENTITLEMENT_CODES
-    ):
+    if any(code in structured_primary_error for code in STRUCTURED_ENTITLEMENT_CODES):
         return "entitlement"
     if (
         any(
@@ -10747,15 +10595,17 @@ def _structured_error_text(
     return "\n".join(
         message
         for item in _json_objects(stdout)
-        if (
-            message := _structured_error_item_text(item)
-        )
+        if (message := _structured_error_item_text(item))
     )
 
 
 def _parse_claude_output(
-    stdout: bytes, *, requested_model: str | None = None
+    stdout: bytes,
+    *,
+    requested_model: str | None = None,
+    redact_values: Iterable[str] = (),
 ) -> tuple[str | None, str | None]:
+    stdout = _redact_claude_bytes(stdout, redact_values)
     result = _strict_json_object(stdout)
     if result is None:
         return None, None
@@ -10765,9 +10615,7 @@ def _parse_claude_output(
     if not isinstance(model_usage, dict) or not model_usage:
         return None, None
     if any(
-        not isinstance(key, str)
-        or not key
-        or not isinstance(value, dict)
+        not isinstance(key, str) or not key or not isinstance(value, dict)
         for key, value in model_usage.items()
     ):
         return None, None
@@ -10799,9 +10647,7 @@ def _parse_claude_output(
             return None, effective_model
     if "api_error_status" in result:
         value = result["api_error_status"]
-        if value is not None and not (
-            isinstance(value, str) and not value.strip()
-        ):
+        if value is not None and not (isinstance(value, str) and not value.strip()):
             return None, effective_model
     final_text = result.get("result")
     if not isinstance(final_text, str) or not final_text.strip() or not candidates:
@@ -10938,9 +10784,7 @@ def _parse_copilot_objects(
         turn = open_turn if open_turn is not None else completed_turn[1]
         message = turn["message"]
         message_model = message.get("model") if isinstance(message, dict) else None
-        effective_model = (
-            turn["usage_model"] or message_model or turn["session_model"]
-        )
+        effective_model = turn["usage_model"] or message_model or turn["session_model"]
         if not isinstance(effective_model, str) or not effective_model:
             return None, None
         return None, effective_model
@@ -10986,7 +10830,9 @@ def _strict_jsonl_file_objects(path: pathlib.Path) -> Iterable[dict[str, Any]]:
         while raw_line := handle.readline(COPILOT_JSONL_RECORD_LIMIT_BYTES + 2):
             line = raw_line[:-1] if raw_line.endswith(b"\n") else raw_line
             if len(line) > COPILOT_JSONL_RECORD_LIMIT_BYTES:
-                raise ValueError("Copilot JSONL record exceeds the bounded parser limit")
+                raise ValueError(
+                    "Copilot JSONL record exceeds the bounded parser limit"
+                )
             if not line.strip(b" \t\r"):
                 continue
             text = line.decode("utf-8")
@@ -11136,17 +10982,16 @@ def _codex_permissions_match(
         access = entry["access"]
         if path_type == "special":
             value = path_value.get("value")
-            if (
-                minimal_seen
-                or access != "read"
-                or value != {"kind": "minimal"}
-            ):
+            if minimal_seen or access != "read" or value != {"kind": "minimal"}:
                 return False
             minimal_seen = True
             continue
         if path_type == "glob_pattern":
             pattern = path_value.get("pattern")
-            if not isinstance(pattern, str) or remaining_globs.pop(pattern, None) != access:
+            if (
+                not isinstance(pattern, str)
+                or remaining_globs.pop(pattern, None) != access
+            ):
                 return False
             continue
         if path_type != "path":
@@ -11282,7 +11127,17 @@ def _record_attempt(
     effective_effort: str | None,
     require_verified_model: bool = False,
     require_verified_effort: bool = False,
+    redact_values: Iterable[str] = (),
 ) -> Attempt:
+    frozen_redact_values = tuple(redact_values)
+    completed = _redact_claude_completed(completed, frozen_redact_values)
+    if final_text is not None:
+        final_text = _redact_claude_text(final_text, frozen_redact_values)
+    if effective_model is not None:
+        effective_model = _redact_claude_text(
+            effective_model,
+            frozen_redact_values,
+        )
     stdout_path, stderr_path = _attempt_paths(review, index, runtime, model)
     if not stdout_path.exists():
         stdout_path.write_bytes(completed.stdout)
@@ -11486,7 +11341,7 @@ def _resolve_validated_claude_executable(
             raise ClaudeExecutableInspectionInconclusive(str(error)) from error
     claude_home = review.container_dir / "claude-home"
     claude_home.mkdir(parents=True, exist_ok=True)
-    prepared_env = dict(env)
+    prepared_env = _claude_environment_with_selected_explicit_auth(env)
     prepared_env["HOME"] = str(claude_home)
     claude_tmp = review.container_dir / "tmp"
     claude_tmp.mkdir(parents=True, exist_ok=True)
@@ -11503,9 +11358,7 @@ def _resolve_validated_claude_executable(
         private=True,
     )
     gpg_temp_root_validator = (
-        _claude_gpg_temp_root_validator(linux_host)
-        if linux_host is not None
-        else None
+        _claude_gpg_temp_root_validator(linux_host) if linux_host is not None else None
     )
     prepared_env.pop("XDG_CONFIG_HOME", None)
     probe_home = review.container_dir / "claude-probe-home"
@@ -11549,9 +11402,7 @@ def _resolve_validated_claude_executable(
             platform_key=platform_key,
             gpg_temp_root=gpg_temp_root,
             gpg_temp_root_validator=gpg_temp_root_validator,
-            cache_dir=(
-                review.container_dir / "claude-runtime" / "provenance-cache"
-            ),
+            cache_dir=(review.container_dir / "claude-runtime" / "provenance-cache"),
             snapshot_dir=(
                 review.container_dir / "claude-runtime" / "verified-executables"
             ),
@@ -11598,19 +11449,15 @@ def _resolve_validated_claude_executable(
                 },
                 "outer_sandbox": {
                     "implementation": (
-                        "bubblewrap"
-                        if _is_claude_linux_host()
-                        else "sandbox-exec"
+                        "bubblewrap" if _is_claude_linux_host() else "sandbox-exec"
                     ),
                     "status": "pending-runtime-launch",
                 },
                 "authentication": {
-                    "source": (
-                        "api-key" if prepared_env.get("ANTHROPIC_API_KEY") else "pending"
-                    ),
+                    "source": _claude_explicit_auth_source(prepared_env) or "pending",
                     "carrier": (
                         "environment"
-                        if prepared_env.get("ANTHROPIC_API_KEY")
+                        if _claude_has_explicit_auth(prepared_env)
                         else (
                             "writable-private-config-guarded-writeback"
                             if _is_claude_linux_host()
@@ -11685,9 +11532,9 @@ def _claude_linux_review_runtime(
         raise ClaudeExecutableInspectionInconclusive(str(error)) from error
     ca_bundle = _claude_linux_ca_bundle(review, env)
     with contextlib.ExitStack() as stack:
-        auth_env: dict[str, str] = {}
-        api_key = env.get("ANTHROPIC_API_KEY")
-        if api_key:
+        auth_env = _claude_explicit_auth_environment(env)
+        explicit_auth_source = _claude_explicit_auth_source(env)
+        if auth_env:
             api_carrier = _create_or_validate_claude_runtime_directory(
                 _claude_linux_private_directory(review, "api-carrier"),
                 private=True,
@@ -11696,7 +11543,6 @@ def _claude_linux_review_runtime(
                 api_carrier / "config",
                 private=True,
             )
-            auth_env["ANTHROPIC_API_KEY"] = api_key
         else:
             if refresh_lock_protocol is None:
                 raise ClaudeExecutableInspectionInconclusive(
@@ -11714,9 +11560,7 @@ def _claude_linux_review_runtime(
                 )
             )
             config_dir = staged.config_dir
-        proxy_socket = stack.enter_context(
-            _claude_unix_connect_proxy(review, env)
-        )
+        proxy_socket = stack.enter_context(_claude_unix_connect_proxy(review, env))
         spec = SandboxSpec(
             host=host,
             toolchain=toolchain,
@@ -11749,10 +11593,10 @@ def _claude_linux_review_runtime(
                 "phase": "runtime-ready",
                 "outer_sandbox": {"status": "isolation-probe-verified"},
                 "authentication": {
-                    "source": "api-key" if api_key else "credential-file",
+                    "source": explicit_auth_source or "credential-file",
                     "carrier": (
                         "environment"
-                        if api_key
+                        if explicit_auth_source is not None
                         else "writable-private-config-guarded-writeback"
                     ),
                     "status": "sandbox-auth-staged",
@@ -11776,13 +11620,9 @@ def _claude_review_arguments(
     settings: str,
     linux: bool,
 ) -> tuple[str, ...]:
-    permission_mode = (
-        CLAUDE_LINUX_REVIEW_PERMISSION_MODE if linux else "default"
-    )
+    permission_mode = CLAUDE_LINUX_REVIEW_PERMISSION_MODE if linux else "default"
     visible_tools = CLAUDE_LINUX_REVIEW_VISIBLE_TOOLS if linux else "Read,Grep,Glob"
-    allowed_tools = (
-        CLAUDE_LINUX_REVIEW_ALLOWED_TOOLS if linux else "Read(./**)"
-    )
+    allowed_tools = CLAUDE_LINUX_REVIEW_ALLOWED_TOOLS if linux else "Read(./**)"
     disallowed_tools = (
         CLAUDE_LINUX_REVIEW_DISALLOWED_TOOLS
         if linux
@@ -11869,9 +11709,7 @@ def _replace_claude_prompt_host_path(
         if not right_ok and allow_descendants and prompt[end : end + 1] == b"/":
             preceding = prompt[occurrence - 1] if occurrence else None
             quote = (
-                bytes((preceding,))
-                if preceding in CLAUDE_PROMPT_PATH_QUOTES
-                else b""
+                bytes((preceding,)) if preceding in CLAUDE_PROMPT_PATH_QUOTES else b""
             )
             if quote:
                 token_end = prompt.find(quote, end)
@@ -11886,8 +11724,7 @@ def _replace_claude_prompt_host_path(
                         break
                     if current == ord(".") and (
                         token_end + 1 == len(prompt)
-                        or prompt[token_end + 1]
-                        in CLAUDE_PROMPT_PATH_RIGHT_BOUNDARIES
+                        or prompt[token_end + 1] in CLAUDE_PROMPT_PATH_RIGHT_BOUNDARIES
                     ):
                         break
                     token_end += 1
@@ -11923,9 +11760,7 @@ def _claude_review_prompt(
     workspace = str(review.workspace_root).encode("utf-8")
     diff_file = str(review.diff_file).encode("utf-8")
     target_workspace = b"/workspace" if linux else workspace
-    target_diff = (
-        b"/workspace/.codex-review/review.diff" if linux else diff_file
-    )
+    target_diff = b"/workspace/.codex-review/review.diff" if linux else diff_file
     projected = prompt.replace(
         b"- Workspace: .\n",
         b"- Workspace: " + target_workspace + b"\n",
@@ -11966,7 +11801,14 @@ def _claude_attempt(
     refresh_lock_protocol: ClaudeRefreshLockProtocol | None | object = (
         _UNRESOLVED_CLAUDE_REFRESH_LOCK_PROTOCOL
     ),
+    redact_values: Iterable[str] | None = None,
 ) -> Attempt:
+    frozen_redact_values = (
+        _claude_explicit_auth_secrets(env)
+        if redact_values is None
+        else tuple(redact_values)
+    )
+    env = _claude_environment_with_selected_explicit_auth(env)
     if executable is None:
         executable, env = _resolve_validated_claude_executable(
             review=review,
@@ -11986,7 +11828,7 @@ def _claude_attempt(
         _require_claude_linux_prompt_without_file_mentions(prompt)
     env = _with_claude_review_tool_path(review, env)
     env = _prepare_claude_tls_environment(review, env)
-    if env.get("ANTHROPIC_API_KEY"):
+    if _claude_has_explicit_auth(env):
         selected_refresh_lock_protocol = None
     elif refresh_lock_protocol is _UNRESOLVED_CLAUDE_REFRESH_LOCK_PROTOCOL:
         selected_refresh_lock_protocol = _certified_claude_refresh_lock_protocol(
@@ -12006,15 +11848,15 @@ def _claude_attempt(
                 "phase": "authentication-source-pending",
                 "outer_sandbox": {"status": "pending-runtime-launch"},
                 "authentication": {
-                    "source": "api-key" if env.get("ANTHROPIC_API_KEY") else "pending",
+                    "source": _claude_explicit_auth_source(env) or "pending",
                     "carrier": (
                         "environment"
-                        if env.get("ANTHROPIC_API_KEY")
+                        if _claude_has_explicit_auth(env)
                         else "one-shot-security-broker"
                     ),
                     "status": (
                         "configured"
-                        if env.get("ANTHROPIC_API_KEY")
+                        if _claude_has_explicit_auth(env)
                         else "pending-source-selection"
                     ),
                     "model": model,
@@ -12043,16 +11885,20 @@ def _claude_attempt(
                 writer_started=writer_started.is_set,
                 writer_quiescent=writer_quiescent.is_set,
             ) as sandbox_command:
-                completed = run(
-                    sandbox_command.argv,
-                    cwd=review.workspace_root,
-                    env=sandbox_command.env,
-                    stdin=prompt,
-                    stdout_path=stdout_path,
-                    stderr_path=stderr_path,
-                    timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
-                    output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
-                    on_process_started=writer_started.set,
+                completed = _redact_claude_completed(
+                    run(
+                        sandbox_command.argv,
+                        cwd=review.workspace_root,
+                        env=sandbox_command.env,
+                        stdin=prompt,
+                        stdout_path=stdout_path,
+                        stderr_path=stderr_path,
+                        timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
+                        output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
+                        on_process_started=writer_started.set,
+                        redact_values=output_redact_values(frozen_redact_values),
+                    ),
+                    frozen_redact_values,
                 )
                 quiescence_mask = block_forwarded_signals()
                 try:
@@ -12245,21 +12091,25 @@ def _claude_attempt(
                     },
                 )
                 runtime_started = True
-                completed = run(
-                    (
-                        str(CLAUDE_PROBE_SANDBOX),
-                        "-p",
-                        sandbox_profile,
-                        str(executable),
-                        *arguments,
+                completed = _redact_claude_completed(
+                    run(
+                        (
+                            str(CLAUDE_PROBE_SANDBOX),
+                            "-p",
+                            sandbox_profile,
+                            str(executable),
+                            *arguments,
+                        ),
+                        cwd=review.workspace_root,
+                        env=review_env,
+                        stdin=prompt,
+                        stdout_path=stdout_path,
+                        stderr_path=stderr_path,
+                        timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
+                        output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
+                        redact_values=output_redact_values(frozen_redact_values),
                     ),
-                    cwd=review.workspace_root,
-                    env=review_env,
-                    stdin=prompt,
-                    stdout_path=stdout_path,
-                    stderr_path=stderr_path,
-                    timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
-                    output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
+                    frozen_redact_values,
                 )
         except ClaudeCredentialInspectionInconclusive as error:
             persistence_failed = completed is not None
@@ -12406,7 +12256,9 @@ def _claude_attempt(
             raise
     assert completed is not None
     final_text, effective_model = _parse_claude_output(
-        completed.stdout, requested_model=model
+        completed.stdout,
+        requested_model=model,
+        redact_values=frozen_redact_values,
     )
     attempt = _record_attempt(
         review=review,
@@ -12419,6 +12271,7 @@ def _claude_attempt(
         requested_effort=CLAUDE_REASONING_EFFORT,
         effective_effort=None,
         require_verified_model=True,
+        redact_values=frozen_redact_values,
     )
     _update_claude_runtime_report(
         review,
@@ -12450,7 +12303,10 @@ def _copilot_attempt(
     model: str,
     index: int,
     env: dict[str, str],
+    redact_values: Iterable[str] = (),
 ) -> Attempt:
+    frozen_redact_values = tuple(redact_values)
+    output_redactions = output_redact_values(frozen_redact_values)
     executable = resolve_reviewer_executable("copilot")
     if executable is None:
         raise FileNotFoundError(
@@ -12467,14 +12323,18 @@ def _copilot_attempt(
     env = dict(env)
     env["COPILOT_HOME"] = str(copilot_home)
     stdout_path, stderr_path = _attempt_paths(review, index, "copilot", model)
-    permission_help = run(
-        (str(executable), "help", "permissions"),
-        env=env,
-        stdout_path=stdout_path,
-        stderr_path=stderr_path,
-        capture_limit_bytes=COPILOT_PROBE_OUTPUT_LIMIT_BYTES,
-        timeout_seconds=COPILOT_PROBE_TIMEOUT_SECONDS,
-        output_file_limit_bytes=COPILOT_PROBE_OUTPUT_LIMIT_BYTES,
+    permission_help = _redact_claude_completed(
+        run(
+            (str(executable), "help", "permissions"),
+            env=env,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            capture_limit_bytes=COPILOT_PROBE_OUTPUT_LIMIT_BYTES,
+            timeout_seconds=COPILOT_PROBE_TIMEOUT_SECONDS,
+            output_file_limit_bytes=COPILOT_PROBE_OUTPUT_LIMIT_BYTES,
+            redact_values=output_redactions,
+        ),
+        frozen_redact_values,
     )
     normalized_permission_help = " ".join(
         (permission_help.stdout + b"\n" + permission_help.stderr)
@@ -12537,14 +12397,18 @@ def _copilot_attempt(
     )
     if sensitive_names:
         command.append(f"--secret-env-vars={','.join(sensitive_names)}")
-    completed = run(
-        command,
-        cwd=review.workspace_root,
-        env=env,
-        stdout_path=stdout_path,
-        stderr_path=stderr_path,
-        timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
-        output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
+    completed = _redact_claude_completed(
+        run(
+            command,
+            cwd=review.workspace_root,
+            env=env,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
+            output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
+            redact_values=output_redactions,
+        ),
+        frozen_redact_values,
     )
     final_text, effective_model = _parse_copilot_output_file(
         stdout_path, requested_model=model
@@ -12560,14 +12424,13 @@ def _copilot_attempt(
         requested_effort=COPILOT_REASONING_EFFORT,
         effective_effort=None,
         require_verified_model=True,
+        redact_values=frozen_redact_values,
     )
 
 
 AttemptRunner = Callable[..., Attempt]
 
-REVIEW_SUPERVISION_FAILURE_CLASSES: tuple[
-    tuple[type[Exception], str], ...
-] = (
+REVIEW_SUPERVISION_FAILURE_CLASSES: tuple[tuple[type[Exception], str], ...] = (
     (ReviewTimeoutError, "timeout"),
     (ReviewOutputLimitError, "output-limit"),
     (ReviewOutputDrainError, "output-drain"),
@@ -12605,8 +12468,35 @@ def _write_attempts(review: ReviewWorkspace, attempts: Iterable[Attempt]) -> Non
 
 
 def _finish(
-    review: ReviewWorkspace, attempts: list[Attempt], final_text: str | None
+    review: ReviewWorkspace,
+    attempts: list[Attempt],
+    final_text: str | None,
+    *,
+    redact_values: Iterable[str] = (),
 ) -> Outcome:
+    frozen_redact_values = tuple(redact_values)
+    for index, attempt in enumerate(attempts):
+        redacted_final = (
+            _redact_claude_text(attempt.final_text, frozen_redact_values)
+            if attempt.final_text is not None
+            else None
+        )
+        redacted_effective_model = (
+            _redact_claude_text(attempt.effective_model, frozen_redact_values)
+            if attempt.effective_model is not None
+            else None
+        )
+        if (
+            redacted_final != attempt.final_text
+            or redacted_effective_model != attempt.effective_model
+        ):
+            attempts[index] = replace(
+                attempt,
+                final_text=redacted_final,
+                effective_model=redacted_effective_model,
+            )
+    if final_text is not None:
+        final_text = _redact_claude_text(final_text, frozen_redact_values)
     _write_attempts(review, attempts)
     if final_text:
         write_text_atomic(
@@ -12624,7 +12514,20 @@ def _finish_claude_auth_required(
     detail: str,
     *,
     action: str = CLAUDE_AUTH_LOGIN_ACTION,
+    redact_values: Iterable[str] = (),
 ) -> Outcome:
+    frozen_redact_values = tuple(redact_values)
+    detail = _redact_claude_text(detail, frozen_redact_values)
+    action = _redact_claude_text(action, frozen_redact_values)
+    for index, attempt in enumerate(attempts):
+        if attempt.final_text is not None:
+            attempts[index] = replace(
+                attempt,
+                final_text=_redact_claude_text(
+                    attempt.final_text,
+                    frozen_redact_values,
+                ),
+            )
     if attempts and attempts[-1].category == "auth":
         attempts[-1] = replace(
             attempts[-1],
@@ -12655,8 +12558,7 @@ def _finish_claude_auth_required(
     )
     write_text_atomic(
         review.container_dir / "runner-error.txt",
-        f"Claude Code authentication requires user action: {detail}. "
-        f"{action}\n",
+        f"Claude Code authentication requires user action: {detail}. {action}\n",
     )
     _write_attempts(review, attempts)
     return Outcome(2, None, tuple(attempts))
@@ -12671,7 +12573,9 @@ def _run_model_chain(
     requested_effort: str,
     env: dict[str, str],
     attempts: list[Attempt],
+    redact_values: Iterable[str] = (),
 ) -> tuple[str, str | None]:
+    frozen_redact_values = tuple(redact_values)
     for model in models:
         index = len(attempts) + 1
         try:
@@ -12689,7 +12593,11 @@ def _run_model_chain(
         ) as error:
             stdout_path, stderr_path = _attempt_paths(review, index, runtime, model)
             stdout_path.touch(exist_ok=True)
-            _append_attempt_diagnostic(stderr_path, f"review supervision failed: {error}")
+            diagnostic = _redact_claude_text(
+                f"review supervision failed: {error}",
+                frozen_redact_values,
+            )
+            _append_attempt_diagnostic(stderr_path, diagnostic)
             attempts.append(
                 Attempt(
                     runtime=runtime,
@@ -12706,6 +12614,22 @@ def _run_model_chain(
             )
             _write_attempts(review, attempts)
             raise
+        if attempt.final_text is not None:
+            attempt = replace(
+                attempt,
+                final_text=_redact_claude_text(
+                    attempt.final_text,
+                    frozen_redact_values,
+                ),
+            )
+        if attempt.effective_model is not None:
+            attempt = replace(
+                attempt,
+                effective_model=_redact_claude_text(
+                    attempt.effective_model,
+                    frozen_redact_values,
+                ),
+            )
         attempts.append(attempt)
         _write_attempts(review, attempts)
         if attempt.category == "success":
@@ -12715,11 +12639,13 @@ def _run_model_chain(
     return "entitlement", None
 
 
-def run_review(
+def _run_review_with_frozen_auth(
     *,
     review: ReviewWorkspace,
     reviewer: str,
     egress_consent: str | None = None,
+    claude_env: dict[str, str] | None,
+    claude_redact_values: tuple[str, ...],
 ) -> Outcome:
     if reviewer not in ("codex", "claude"):
         write_text_atomic(
@@ -12741,12 +12667,17 @@ def run_review(
         )
         return Outcome(2, None, tuple())
 
+    if reviewer == "claude":
+        if claude_env is None:
+            raise ReviewError("the frozen Claude environment is unavailable")
+
     try:
         synthetic_evidence = validate_external_workspace(review) or {}
     except ReviewError as error:
         write_text_atomic(
             review.container_dir / "runner-error.txt",
-            f"review egress workspace preflight failed: {error}\n",
+            "review egress workspace preflight failed: "
+            f"{_redact_claude_text(str(error), claude_redact_values)}\n",
         )
         return Outcome(2, None, tuple())
 
@@ -12814,18 +12745,8 @@ def run_review(
             return Outcome(75, None, tuple(attempts))
         return _finish(review, attempts, final_text)
 
-    claude_env = _review_environment(
-        review=review,
-        passthrough_keys=CLAUDE_ENV_KEYS,
-        extra={
-            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-            "CLAUDE_CODE_SAFE_MODE": "1",
-            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
-        },
-    )
-    explicit_claude_override = bool(
-        os.environ.get("CODEX_REVIEW_CLAUDE_PATH")
-    )
+    assert claude_env is not None
+    explicit_claude_override = bool(os.environ.get("CODEX_REVIEW_CLAUDE_PATH"))
     try:
         linux_host = _is_claude_linux_host()
         prompt = _claude_review_prompt(
@@ -12834,9 +12755,7 @@ def run_review(
             linux=linux_host,
         )
         if linux_host:
-            _require_claude_linux_prompt_without_file_mentions(
-                prompt
-            )
+            _require_claude_linux_prompt_without_file_mentions(prompt)
         claude_executable, claude_env = _resolve_validated_claude_executable(
             review=review,
             env=claude_env,
@@ -12854,7 +12773,12 @@ def run_review(
         )
         if isinstance(persistence_attempt, Attempt):
             attempts.append(persistence_attempt)
-        return _finish_claude_auth_required(review, attempts, str(error))
+        return _finish_claude_auth_required(
+            review,
+            attempts,
+            _redact_claude_text(str(error), claude_redact_values),
+            redact_values=claude_redact_values,
+        )
     except (
         ClaudeProbeSandboxUnavailable,
         ClaudeKeychainBrokerUnavailable,
@@ -12876,14 +12800,15 @@ def run_review(
                 review.container_dir / "runner-error.txt",
                 "Explicit CODEX_REVIEW_CLAUDE_PATH lacks a required secure "
                 "runtime prerequisite; refusing Copilot fallback: "
-                f"{error}\n",
+                f"{_redact_claude_text(str(error), claude_redact_values)}\n",
             )
             _write_attempts(review, attempts)
             return Outcome(2, None, tuple(attempts))
         claude_available = False
         write_text_atomic(
             review.container_dir / "claude-skip.txt",
-            f"Claude Code secure runtime is unavailable: {error}\n",
+            "Claude Code secure runtime is unavailable: "
+            f"{_redact_claude_text(str(error), claude_redact_values)}\n",
         )
     except (
         FileNotFoundError,
@@ -12893,10 +12818,12 @@ def run_review(
         ReviewOutputDrainError,
         ReviewOutputLimitError,
         ReviewProcessLeakError,
+        OSError,
     ) as error:
         write_text_atomic(
             review.container_dir / "runner-error.txt",
-            f"Claude Code validation was inconclusive: {error}\n",
+            "Claude Code validation was inconclusive: "
+            f"{_redact_claude_text(str(error), claude_redact_values)}\n",
         )
         write_json(review.container_dir / "attempts.json", [])
         return Outcome(75, None, tuple(attempts))
@@ -12904,11 +12831,12 @@ def run_review(
         write_text_atomic(
             review.container_dir / "runner-error.txt",
             "Claude Code executable validation failed; refusing Copilot fallback: "
-            f"{error}\n",
+            f"{_redact_claude_text(str(error), claude_redact_values)}\n",
         )
         write_json(review.container_dir / "attempts.json", [])
         return Outcome(2, None, tuple(attempts))
     if claude_available and claude_executable is not None:
+
         def run_claude_attempt_with_verified_executable(
             *,
             review: ReviewWorkspace,
@@ -12922,6 +12850,7 @@ def run_review(
                 index=index,
                 env=env,
                 executable=claude_executable,
+                redact_values=claude_redact_values,
             )
 
         try:
@@ -12933,6 +12862,7 @@ def run_review(
                 requested_effort=CLAUDE_REASONING_EFFORT,
                 env=claude_env,
                 attempts=attempts,
+                redact_values=claude_redact_values,
             )
         except (
             FileNotFoundError,
@@ -12942,6 +12872,7 @@ def run_review(
             ReviewOutputDrainError,
             ReviewOutputLimitError,
             ReviewProcessLeakError,
+            OSError,
         ) as error:
             persistence_attempt = getattr(
                 error,
@@ -12975,7 +12906,8 @@ def run_review(
                 )
             write_text_atomic(
                 review.container_dir / "runner-error.txt",
-                f"Claude Code validation was inconclusive: {error}\n"
+                "Claude Code validation was inconclusive: "
+                f"{_redact_claude_text(str(error), claude_redact_values)}\n"
                 + (
                     f"{persistence_diagnostic}\n"
                     if persistence_diagnostic is not None
@@ -12996,13 +12928,15 @@ def run_review(
                 review,
                 error,
             )
-            detail = str(error)
+            detail = _redact_claude_text(str(error), claude_redact_values)
             if persistence_diagnostic is not None:
-                detail = (
-                    f"{detail.rstrip('.')}; "
-                    f"{persistence_diagnostic.rstrip('.')}"
-                )
-            return _finish_claude_auth_required(review, attempts, detail)
+                detail = f"{detail.rstrip('.')}; {persistence_diagnostic.rstrip('.')}"
+            return _finish_claude_auth_required(
+                review,
+                attempts,
+                detail,
+                redact_values=claude_redact_values,
+            )
         except (
             ClaudeKeychainBrokerUnavailable,
             ClaudeReviewToolUnavailable,
@@ -13024,7 +12958,7 @@ def run_review(
                     review.container_dir / "runner-error.txt",
                     "Explicit CODEX_REVIEW_CLAUDE_PATH lacks a required secure "
                     "runtime prerequisite; refusing Copilot fallback: "
-                    f"{error}\n",
+                    f"{_redact_claude_text(str(error), claude_redact_values)}\n",
                 )
                 _write_attempts(review, attempts)
                 return Outcome(2, None, tuple(attempts))
@@ -13032,7 +12966,8 @@ def run_review(
             final_text = None
             write_text_atomic(
                 review.container_dir / "claude-skip.txt",
-                f"Claude Code local authentication became unavailable: {error}\n",
+                "Claude Code local authentication became unavailable: "
+                f"{_redact_claude_text(str(error), claude_redact_values)}\n",
             )
         except ReviewError as error:
             persistence_diagnostic = _record_claude_secondary_persistence_failure(
@@ -13042,7 +12977,8 @@ def run_review(
             write_text_atomic(
                 review.container_dir / "runner-error.txt",
                 "Claude Code failed executable validation; "
-                f"refusing Copilot fallback: {error}\n"
+                "refusing Copilot fallback: "
+                f"{_redact_claude_text(str(error), claude_redact_values)}\n"
                 + (
                     f"{persistence_diagnostic}\n"
                     if persistence_diagnostic is not None
@@ -13052,20 +12988,27 @@ def run_review(
             _write_attempts(review, attempts)
             return Outcome(2, None, tuple(attempts))
         if final_text:
-            return _finish(review, attempts, final_text)
+            return _finish(
+                review,
+                attempts,
+                final_text,
+                redact_values=claude_redact_values,
+            )
         if category == "auth":
             return _finish_claude_auth_required(
                 review,
                 attempts,
                 "the restricted Claude runtime rejected the configured credential",
-                action=(
-                    CLAUDE_API_KEY_ACTION
-                    if claude_env.get("ANTHROPIC_API_KEY")
-                    else CLAUDE_AUTH_LOGIN_ACTION
-                ),
+                action=_claude_auth_action(claude_env),
+                redact_values=claude_redact_values,
             )
         if category not in {"entitlement", "unavailable"}:
-            return _finish(review, attempts, None)
+            return _finish(
+                review,
+                attempts,
+                None,
+                redact_values=claude_redact_values,
+            )
 
     if egress_consent not in COPILOT_EGRESS_CONSENTS:
         write_text_atomic(
@@ -13081,7 +13024,8 @@ def run_review(
     except ReviewError as error:
         write_text_atomic(
             review.container_dir / "runner-error.txt",
-            f"Copilot CLI executable validation failed: {error}\n",
+            "Copilot CLI executable validation failed: "
+            f"{_redact_claude_text(str(error), claude_redact_values)}\n",
         )
         _write_attempts(review, attempts)
         return Outcome(2, None, tuple(attempts))
@@ -13091,20 +13035,42 @@ def run_review(
             "Claude Code was unavailable or lacked model entitlement, and "
             "Copilot CLI is unavailable.\n",
         )
-        return _finish(review, attempts, None)
+        return _finish(
+            review,
+            attempts,
+            None,
+            redact_values=claude_redact_values,
+        )
     copilot_env = _review_environment(
         review=review,
         passthrough_keys=COPILOT_ENV_KEYS,
     )
+
+    def run_copilot_attempt_with_startup_redactions(
+        *,
+        review: ReviewWorkspace,
+        model: str,
+        index: int,
+        env: dict[str, str],
+    ) -> Attempt:
+        return _copilot_attempt(
+            review=review,
+            model=model,
+            index=index,
+            env=env,
+            redact_values=claude_redact_values,
+        )
+
     try:
         _, final_text = _run_model_chain(
             review=review,
             models=COPILOT_MODELS,
-            runner=_copilot_attempt,
+            runner=run_copilot_attempt_with_startup_redactions,
             runtime="copilot",
             requested_effort=COPILOT_REASONING_EFFORT,
             env=copilot_env,
             attempts=attempts,
+            redact_values=claude_redact_values,
         )
     except (
         ReviewTimeoutError,
@@ -13114,15 +13080,56 @@ def run_review(
     ) as error:
         write_text_atomic(
             review.container_dir / "runner-error.txt",
-            f"Copilot review was inconclusive: {error}\n",
+            "Copilot review was inconclusive: "
+            f"{_redact_claude_text(str(error), claude_redact_values)}\n",
         )
         _write_attempts(review, attempts)
         return Outcome(75, None, tuple(attempts))
-    except (FileNotFoundError, ReviewError) as error:
+    except (OSError, ReviewError) as error:
         write_text_atomic(
             review.container_dir / "runner-error.txt",
-            f"Copilot CLI became unavailable or failed executable validation: {error}\n",
+            "Copilot CLI became unavailable or failed executable validation: "
+            f"{_redact_claude_text(str(error), claude_redact_values)}\n",
         )
         _write_attempts(review, attempts)
         return Outcome(2, None, tuple(attempts))
-    return _finish(review, attempts, final_text)
+    return _finish(
+        review,
+        attempts,
+        final_text,
+        redact_values=claude_redact_values,
+    )
+
+
+def run_review(
+    *,
+    review: ReviewWorkspace,
+    reviewer: str,
+    egress_consent: str | None = None,
+) -> Outcome:
+    claude_env: dict[str, str] | None = None
+    claude_redact_values: tuple[str, ...] = ()
+    if reviewer == "claude":
+        raw_claude_env = _review_environment(
+            review=review,
+            passthrough_keys=CLAUDE_ENV_KEYS,
+            extra={
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                "CLAUDE_CODE_SAFE_MODE": "1",
+                "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
+            },
+        )
+        claude_redact_values = _claude_explicit_auth_secrets(raw_claude_env)
+        claude_env = _claude_environment_with_selected_explicit_auth(raw_claude_env)
+
+    with atomic_write_redactions(
+        claude_redact_values,
+        path_filter=_provider_atomic_write_filter(review),
+    ):
+        return _run_review_with_frozen_auth(
+            review=review,
+            reviewer=reviewer,
+            egress_consent=egress_consent,
+            claude_env=claude_env,
+            claude_redact_values=claude_redact_values,
+        )

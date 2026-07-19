@@ -5231,6 +5231,14 @@ def build_sandbox_command(
         not isinstance(value, str) or "\x00" in value for value in environment.values()
     ):
         raise LinuxRuntimeError("Claude authentication environment value is invalid")
+    # The provider resolves API-key > OAuth-token > local-login precedence.
+    # This final process boundary accepts only that single explicit winner.
+    configured_auth = tuple(key for key in _AUTH_ENV_KEYS if environment.get(key))
+    if len(configured_auth) > 1:
+        raise LinuxRuntimeError(
+            "Claude sandbox accepts at most one explicit authentication carrier"
+        )
+    environment = {key: value for key, value in environment.items() if value}
     executable_mounts = (
         RuntimeMount(validated.claude, SANDBOX_CLAUDE),
         RuntimeMount(validated.launcher, SANDBOX_LAUNCHER),

@@ -136,6 +136,39 @@ class ClaudeRefreshLockTest(unittest.TestCase):
             self.assertFalse(primary.exists())
             self.assertFalse(legacy.exists())
 
+    def test_terminal_worker_failure_retains_locks_for_controlled_cleanup(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = self._config_dir(pathlib.Path(temporary))
+            lease = claude_refresh_lock.acquire_claude_refresh_lock(
+                config,
+                protocol=self.PROTOCOL,
+                timeout_seconds=0,
+            )
+            lease.assert_held()
+
+            lease.retain_for_controlled_cleanup(
+                "a native Keychain replacement worker could not be proven terminated"
+            )
+
+            with self.assertRaisesRegex(
+                claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive,
+                "could not be proven terminated",
+            ) as raised:
+                lease.release()
+            self.assertFalse(lease.released)
+            self.assertTrue(all(path.is_dir() for path in lease.paths))
+            self.assertEqual(
+                getattr(
+                    raised.exception,
+                    "_codex_claude_refresh_lock_paths",
+                    None,
+                ),
+                tuple(str(path) for path in lease.paths),
+            )
+            self._operator_cleanup_inconclusive_lease(lease)
+
     def test_signed_artifact_catalog_is_exact_and_cross_platform(self) -> None:
         catalog = claude_refresh_lock.CERTIFIED_CLAUDE_REFRESH_LOCK_ARTIFACTS
         self.assertEqual(set(catalog), EXPECTED_CLAUDE_2_1_211_LOCK_ARTIFACTS)

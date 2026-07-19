@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import signal
@@ -7,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
@@ -15,12 +17,20 @@ from unittest import mock
 SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from review_runtime import cleanup_worker, state  # noqa: E402
-from review_runtime.common import ReviewError, write_json  # noqa: E402
+from review_runtime import cleanup_worker, common, state  # noqa: E402
+from review_runtime.common import (  # noqa: E402
+    ReviewError,
+    write_json,
+    write_text_atomic,
+)
 from review_runtime.workspace import (  # noqa: E402
     cleanup_workspace,
     prepare_workspace as _prepare_workspace,
 )
+
+
+SYNTH_API_KEY_A = "codex_synth_v1_api_key_a"  # Synthetic token id: api-key-a.
+SYNTH_BEARER_A = "codex_synth_v1_bearer_a"  # Synthetic token id: bearer-a.
 
 
 def git(repo: pathlib.Path, *args: str) -> str:
@@ -84,6 +94,210 @@ class StatefulLifecycleTest(unittest.TestCase):
             cleanup_workspace(self.review, keep_container=False)
         self.temporary.cleanup()
 
+    def test_explicit_claude_redactions_freeze_both_nonempty_startup_values(
+        self,
+    ) -> None:
+        self.assertEqual(
+            set(
+                state._freeze_explicit_claude_redactions(
+                    {
+                        "ANTHROPIC_API_KEY": SYNTH_API_KEY_A,
+                        "CLAUDE_CODE_OAUTH_TOKEN": SYNTH_BEARER_A,
+                    }
+                )
+            ),
+            {SYNTH_API_KEY_A, SYNTH_BEARER_A},
+        )
+        self.assertEqual(
+            state._freeze_explicit_claude_redactions(
+                {
+                    "ANTHROPIC_API_KEY": "",
+                    "CLAUDE_CODE_OAUTH_TOKEN": "",
+                }
+            ),
+            (),
+        )
+
+    def test_state_json_redaction_preserves_json_syntax_and_fixed_keys(
+        self,
+    ) -> None:
+        redact_values = ("false", "true", "null", "1", ":")
+        safe_path = self.review.container_dir / "syntax-state.json"
+        safe_value = {
+            "false": False,
+            "true": True,
+            "null": None,
+            "1": 1,
+            "reviewer": "codex",
+        }
+
+        with common.atomic_write_redactions(redact_values):
+            state._write_state_json_without_credentials(
+                safe_path,
+                safe_value,
+                redact_values,
+            )
+
+        self.assertEqual(common.read_json(safe_path), safe_value)
+
+        unsafe_path = self.review.container_dir / "unsafe-state.json"
+        with (
+            common.atomic_write_redactions(("null",)),
+            self.assertRaisesRegex(
+                ReviewError,
+                "metadata contains an explicit Claude credential",
+            ),
+        ):
+            state._write_state_json_without_credentials(
+                unsafe_path,
+                {"detail": "prefix-null-suffix"},
+                ("null",),
+            )
+        self.assertFalse(unsafe_path.exists())
+
+    def test_start_fails_before_workspace_write_or_launch_when_mask_is_exhausted(
+        self,
+    ) -> None:
+        exhausted = "".join(common._PRINTABLE_MASK_CHARACTERS)
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "ANTHROPIC_API_KEY": exhausted,
+                    "CLAUDE_CODE_OAUTH_TOKEN": "",
+                },
+            ),
+            mock.patch.object(state, "prepare_workspace") as prepare,
+            mock.patch.object(state, "write_text_atomic") as write,
+            mock.patch.object(state.subprocess, "Popen") as popen,
+            self.assertRaisesRegex(
+                ReviewError,
+                "printable text mask alphabet",
+            ),
+        ):
+            state.start(
+                script_path=pathlib.Path("runner.py"),
+                repo=self.repo,
+                reviewer="claude",
+                base_ref=self.base,
+                head_ref=self.head,
+                prompt_file=None,
+                keep_workspace=False,
+                egress_consent="double-review",
+            )
+
+        prepare.assert_not_called()
+        write.assert_not_called()
+        popen.assert_not_called()
+
+    def test_run_state_fails_before_state_write_when_mask_is_exhausted(
+        self,
+    ) -> None:
+        exhausted = "".join(common._PRINTABLE_MASK_CHARACTERS)
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "ANTHROPIC_API_KEY": exhausted,
+                    "CLAUDE_CODE_OAUTH_TOKEN": "",
+                },
+            ),
+            mock.patch.object(state, "load_review_state") as load,
+            mock.patch.object(state, "write_text_atomic") as write,
+            mock.patch.object(state, "run_review") as run_review,
+            self.assertRaisesRegex(
+                ReviewError,
+                "printable text mask alphabet",
+            ),
+        ):
+            state.run_state(state_dir=self.review.container_dir)
+
+        load.assert_not_called()
+        write.assert_not_called()
+        run_review.assert_not_called()
+
+    def test_start_does_not_exit_redaction_scope_when_enter_fails(self) -> None:
+        failed_scope = mock.MagicMock()
+        failed_scope.__enter__.side_effect = ReviewError("redaction scope enter failed")
+        failed_scope.__exit__.side_effect = RuntimeError(
+            "scope exit masked enter failure"
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "ANTHROPIC_API_KEY": SYNTH_API_KEY_A,
+                    "CLAUDE_CODE_OAUTH_TOKEN": "",
+                },
+            ),
+            mock.patch.object(
+                state,
+                "prepare_workspace",
+                side_effect=prepared_workspace(self.review),
+            ),
+            mock.patch.object(
+                state,
+                "atomic_write_redactions",
+                return_value=failed_scope,
+            ),
+            mock.patch.object(state, "write_text_atomic") as write,
+            mock.patch.object(state.subprocess, "Popen") as popen,
+            mock.patch.object(state, "cleanup_workspace", return_value=None),
+            self.assertRaisesRegex(
+                ReviewError,
+                "redaction scope enter failed",
+            ),
+        ):
+            state.start(
+                script_path=pathlib.Path("runner.py"),
+                repo=self.repo,
+                reviewer="claude",
+                base_ref=self.base,
+                head_ref=self.head,
+                prompt_file=None,
+                keep_workspace=False,
+                egress_consent="double-review",
+            )
+
+        failed_scope.__exit__.assert_not_called()
+        write.assert_not_called()
+        popen.assert_not_called()
+
+    def test_run_state_does_not_exit_redaction_scope_when_enter_fails(
+        self,
+    ) -> None:
+        failed_scope = mock.MagicMock()
+        failed_scope.__enter__.side_effect = ReviewError("redaction scope enter failed")
+        failed_scope.__exit__.side_effect = RuntimeError(
+            "scope exit masked enter failure"
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "ANTHROPIC_API_KEY": SYNTH_API_KEY_A,
+                    "CLAUDE_CODE_OAUTH_TOKEN": "",
+                },
+            ),
+            mock.patch.object(
+                state,
+                "load_review_state",
+                return_value=({"reviewer": "claude"}, self.review),
+            ),
+            mock.patch.object(
+                state,
+                "atomic_write_redactions",
+                return_value=failed_scope,
+            ),
+            mock.patch.object(state, "write_text_atomic"),
+            mock.patch.object(state, "run_review") as run_review,
+        ):
+            exit_code = state.run_state(state_dir=self.review.container_dir)
+
+        self.assertEqual(exit_code, 1)
+        failed_scope.__exit__.assert_not_called()
+        run_review.assert_not_called()
+
     def write_completed_state(self) -> None:
         state_dir = self.review.container_dir
         (state_dir / state.STATE_MARKER).write_text(
@@ -121,6 +335,25 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.assertEqual(text, "No findings.")
         self.assertFalse(self.review.workspace_root.exists())
         self.assertTrue(self.review.container_dir.exists())
+
+    def test_status_preserves_schema_when_redaction_matches_fixed_keys(self) -> None:
+        self.write_completed_state()
+
+        with mock.patch.object(
+            state,
+            "_freeze_explicit_claude_redactions",
+            return_value=("run", "runtime", "claude"),
+        ):
+            summary = state.status(self.review.container_dir)
+            exit_code, text = state.final(self.review.container_dir)
+
+        self.assertIn("runner_lock_held", summary)
+        self.assertIn("running", summary)
+        self.assertFalse(summary["running"])
+        self.assertIn("runtime", summary["attempts"][0])
+        self.assertNotEqual(summary["attempts"][0]["runtime"], "claude")
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(text, "No findings.")
 
     def test_codex_unavailable_retains_preflight_workspace_until_cleanup(self) -> None:
         self.write_completed_state()
@@ -205,8 +438,12 @@ class StatefulLifecycleTest(unittest.TestCase):
     def test_concurrent_wait_serializes_workspace_cleanup(self) -> None:
         self.write_completed_state()
         with ThreadPoolExecutor(max_workers=2) as executor:
-            first = executor.submit(state.wait, self.review.container_dir, timeout_seconds=2)
-            second = executor.submit(state.wait, self.review.container_dir, timeout_seconds=2)
+            first = executor.submit(
+                state.wait, self.review.container_dir, timeout_seconds=2
+            )
+            second = executor.submit(
+                state.wait, self.review.container_dir, timeout_seconds=2
+            )
             self.assertEqual(first.result(timeout=2), 0)
             self.assertEqual(second.result(timeout=2), 0)
 
@@ -436,15 +673,213 @@ time.sleep(0.2)
             exit_code = state.run_state(state_dir=state_dir)
 
         self.assertEqual(exit_code, 128 + signal.SIGTERM)
-        runner_error = (state_dir / "runner-error.txt").read_text(
-            encoding="utf-8"
-        )
+        runner_error = (state_dir / "runner-error.txt").read_text(encoding="utf-8")
         self.assertIn(f"signal {int(signal.SIGTERM)}", runner_error)
         self.assertIn(str(carrier), runner_error)
         self.assertEqual(
             (state_dir / state.EXIT_FILE).read_text(encoding="utf-8").strip(),
             str(128 + signal.SIGTERM),
         )
+
+    def test_runner_redacts_frozen_explicit_credentials_from_terminal_artifacts(
+        self,
+    ) -> None:
+        state_dir = self.review.container_dir
+        (state_dir / state.STATE_MARKER).write_text(
+            "isolated-review-state-v1\n",
+            encoding="utf-8",
+        )
+        write_json(
+            state_dir / state.STATE_FILE,
+            {
+                "version": 1,
+                "reviewer": "claude",
+                "egress_consent": "double-review",
+                "workspace": self.review.to_json(),
+            },
+        )
+        escaped_bearer = json.dumps(SYNTH_BEARER_A, ensure_ascii=True)[1:-1]
+
+        def fail_after_writing_artifacts(**_kwargs):
+            exposed = f"raw={SYNTH_API_KEY_A}; json={escaped_bearer}"
+            for name in (
+                "final.txt",
+                "preflight.json",
+                "runner.stdout.log",
+                "runner.stderr.log",
+                "cleanup-error.txt",
+            ):
+                write_text_atomic(state_dir / name, exposed + "\n")
+            write_text_atomic(
+                state_dir / "attempts.json",
+                json.dumps([{"detail": exposed}]) + "\n",
+            )
+            cause = OSError(f"cause exposed {SYNTH_API_KEY_A}")
+            context = ValueError(f"context exposed {escaped_bearer}")
+            cause.__context__ = context
+            failure = ReviewError(f"late runner failure: {exposed}")
+            failure.__cause__ = cause
+            raise failure
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "ANTHROPIC_API_KEY": SYNTH_API_KEY_A,
+                    "CLAUDE_CODE_OAUTH_TOKEN": SYNTH_BEARER_A,
+                },
+            ),
+            mock.patch.object(
+                state,
+                "run_review",
+                side_effect=fail_after_writing_artifacts,
+            ),
+        ):
+            exit_code = state.run_state(state_dir=state_dir)
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ANTHROPIC_API_KEY": "",
+                "CLAUDE_CODE_OAUTH_TOKEN": "",
+            },
+        ):
+            summary = state.status(state_dir)
+            final_exit_code, final_text = state.final(state_dir)
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(final_exit_code, 1)
+        retained = "\n".join(
+            path.read_text(encoding="utf-8", errors="replace")
+            for name in state._STATE_OWNED_TEXT_ARTIFACTS
+            if (path := state_dir / name).is_file()
+        )
+        for exposed in (SYNTH_API_KEY_A, SYNTH_BEARER_A, escaped_bearer):
+            self.assertNotIn(exposed, retained)
+            self.assertNotIn(exposed, str(summary))
+            self.assertNotIn(exposed, final_text)
+        self.assertIn("*", retained)
+        self.assertIn("caused by OSError", retained)
+        self.assertIn("context: ValueError", retained)
+
+    def test_runner_redacts_canonical_artifacts_through_state_dir_aliases(
+        self,
+    ) -> None:
+        state_dir = self.review.container_dir
+        (state_dir / state.STATE_MARKER).write_text(
+            "isolated-review-state-v1\n",
+            encoding="utf-8",
+        )
+        write_json(
+            state_dir / state.STATE_FILE,
+            {
+                "version": 1,
+                "reviewer": "claude",
+                "egress_consent": "double-review",
+                "workspace": self.review.to_json(),
+            },
+        )
+        symlink_alias = pathlib.Path(self.temporary.name) / "state-dir-alias"
+        symlink_alias.symlink_to(state_dir, target_is_directory=True)
+        detour = state_dir.parent / "state-dir-detour"
+        detour.mkdir()
+        dotdot_alias = detour / ".." / state_dir.name
+
+        for alias_name, alias in (
+            ("symlink", symlink_alias),
+            ("dotdot", dotdot_alias),
+        ):
+            with self.subTest(alias=alias_name):
+                artifact_paths = {
+                    "attempts.json": state_dir / "attempts.json",
+                    "cleanup-error.txt": state_dir / "cleanup-error.txt",
+                    "final.txt": state_dir / "final.txt",
+                    "preflight.json": state_dir / "preflight.json",
+                    "runner.stdout.log": state_dir / "runner.stdout.log",
+                }
+                for path in artifact_paths.values():
+                    path.unlink(missing_ok=True)
+                outside = (
+                    pathlib.Path(self.temporary.name) / f"outside-{alias_name}.txt"
+                )
+                outside.write_text("outside remains unchanged\n", encoding="utf-8")
+                artifact_paths["final.txt"].symlink_to(outside)
+
+                def write_canonical_artifacts(**_kwargs):
+                    write_text_atomic(
+                        artifact_paths["attempts.json"],
+                        json.dumps([{"detail": SYNTH_API_KEY_A}]) + "\n",
+                    )
+                    write_text_atomic(
+                        artifact_paths["preflight.json"],
+                        json.dumps({"detail": SYNTH_API_KEY_A}) + "\n",
+                    )
+                    for name in (
+                        "cleanup-error.txt",
+                        "final.txt",
+                        "runner.stdout.log",
+                    ):
+                        write_text_atomic(
+                            artifact_paths[name],
+                            f"artifact exposed {SYNTH_API_KEY_A}\n",
+                        )
+                    return mock.Mock(returncode=0)
+
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {
+                            "ANTHROPIC_API_KEY": SYNTH_API_KEY_A,
+                            "CLAUDE_CODE_OAUTH_TOKEN": "",
+                        },
+                    ),
+                    mock.patch.object(
+                        state,
+                        "run_review",
+                        side_effect=write_canonical_artifacts,
+                    ),
+                ):
+                    exit_code = state.run_state(state_dir=alias)
+
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "ANTHROPIC_API_KEY": "",
+                        "CLAUDE_CODE_OAUTH_TOKEN": "",
+                    },
+                ):
+                    summary = state.status(alias)
+
+                self.assertEqual(exit_code, 0)
+                self.assertNotIn(SYNTH_API_KEY_A, str(summary))
+                self.assertEqual(
+                    outside.read_text(encoding="utf-8"),
+                    "outside remains unchanged\n",
+                )
+                self.assertFalse(artifact_paths["final.txt"].is_symlink())
+                for path in artifact_paths.values():
+                    self.assertNotIn(
+                        SYNTH_API_KEY_A,
+                        path.read_text(encoding="utf-8"),
+                    )
+
+    def test_state_artifact_parent_resolution_failure_blocks_the_write(
+        self,
+    ) -> None:
+        loop = pathlib.Path(self.temporary.name) / "artifact-parent-loop"
+        loop.symlink_to(loop, target_is_directory=True)
+        path_filter = state._state_owned_write_filter(self.review.container_dir)
+        with (
+            mock.patch.object(common, "_write_text_atomic_unredacted") as sink,
+            common.atomic_write_redactions(
+                (SYNTH_API_KEY_A,),
+                path_filter=path_filter,
+            ),
+            self.assertRaisesRegex(ReviewError, "cannot resolve atomic write parent"),
+        ):
+            write_text_atomic(loop / "final.txt", SYNTH_API_KEY_A)
+
+        sink.assert_not_called()
 
     def test_runner_preserves_signal_exit_when_diagnostic_write_fails(self) -> None:
         state_dir = self.review.container_dir
@@ -576,6 +1011,213 @@ time.sleep(0.2)
                 )
 
         popen.assert_not_called()
+
+    def test_start_redacts_frozen_explicit_credentials_from_spawn_failure(
+        self,
+    ) -> None:
+        escaped_bearer = json.dumps(SYNTH_BEARER_A, ensure_ascii=True)[1:-1]
+        spawn_error = OSError(f"spawn exposed {SYNTH_API_KEY_A} and {escaped_bearer}")
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "ANTHROPIC_API_KEY": SYNTH_API_KEY_A,
+                    "CLAUDE_CODE_OAUTH_TOKEN": SYNTH_BEARER_A,
+                },
+            ),
+            mock.patch.object(
+                state,
+                "prepare_workspace",
+                side_effect=prepared_workspace(self.review),
+            ),
+            mock.patch.object(state.subprocess, "Popen", side_effect=spawn_error),
+            mock.patch.object(state, "cleanup_workspace", return_value=None),
+            self.assertRaises(ReviewError) as raised,
+        ):
+            state.start(
+                script_path=pathlib.Path("runner.py"),
+                repo=self.repo,
+                reviewer="claude",
+                base_ref=self.base,
+                head_ref=self.head,
+                prompt_file=None,
+                keep_workspace=False,
+                egress_consent="double-review",
+            )
+
+        detail = str(raised.exception)
+        self.assertNotIn(SYNTH_API_KEY_A, detail)
+        self.assertNotIn(SYNTH_BEARER_A, detail)
+        self.assertNotIn(escaped_bearer, detail)
+        self.assertIn("*", detail)
+        formatted = "".join(
+            traceback.TracebackException.from_exception(
+                raised.exception,
+            ).format(chain=True)
+        )
+        self.assertNotIn(SYNTH_API_KEY_A, formatted)
+        self.assertNotIn(SYNTH_BEARER_A, formatted)
+        self.assertNotIn(escaped_bearer, formatted)
+        self.assertNotIn(
+            SYNTH_API_KEY_A,
+            (self.review.container_dir / state.STATE_FILE).read_text(encoding="utf-8"),
+        )
+
+    def test_start_recursively_redacts_nested_cause_and_context(self) -> None:
+        cause = OSError(f"cause exposed {SYNTH_API_KEY_A}")
+        hidden_context = ValueError(f"hidden-context-marker {SYNTH_BEARER_A}")
+        spawn_error = RuntimeError("outer spawn failure")
+        spawn_error.__cause__ = cause
+        spawn_error.__context__ = hidden_context
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "ANTHROPIC_API_KEY": SYNTH_API_KEY_A,
+                    "CLAUDE_CODE_OAUTH_TOKEN": SYNTH_BEARER_A,
+                },
+            ),
+            mock.patch.object(
+                state,
+                "prepare_workspace",
+                side_effect=prepared_workspace(self.review),
+            ),
+            mock.patch.object(state.subprocess, "Popen", side_effect=spawn_error),
+            mock.patch.object(state, "cleanup_workspace", return_value=None),
+            self.assertRaises(ReviewError) as raised,
+        ):
+            state.start(
+                script_path=pathlib.Path("runner.py"),
+                repo=self.repo,
+                reviewer="claude",
+                base_ref=self.base,
+                head_ref=self.head,
+                prompt_file=None,
+                keep_workspace=False,
+                egress_consent="double-review",
+            )
+
+        detail = str(raised.exception)
+        self.assertIn("caused by OSError", detail)
+        self.assertNotIn("hidden-context-marker", detail)
+        self.assertNotIn("context: ValueError", detail)
+        formatted = "".join(
+            traceback.TracebackException.from_exception(
+                raised.exception,
+            ).format(chain=True)
+        )
+        for exposed in (SYNTH_API_KEY_A, SYNTH_BEARER_A):
+            self.assertNotIn(exposed, detail)
+            self.assertNotIn(exposed, formatted)
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertTrue(raised.exception.__suppress_context__)
+
+    def test_exception_detail_honors_visible_and_suppressed_context(self) -> None:
+        visible_context = ValueError(f"visible-context-marker {SYNTH_BEARER_A}")
+        visible = RuntimeError("visible outer")
+        visible.__context__ = visible_context
+        visible_detail = state._redacted_exception_detail(
+            visible,
+            (SYNTH_BEARER_A,),
+        )
+
+        hidden_context = ValueError(f"hidden-context-marker {SYNTH_BEARER_A}")
+        suppressed = RuntimeError("suppressed outer")
+        suppressed.__context__ = hidden_context
+        suppressed.__suppress_context__ = True
+        suppressed_detail = state._redacted_exception_detail(
+            suppressed,
+            (SYNTH_BEARER_A,),
+        )
+
+        self.assertIn("visible-context-marker", visible_detail)
+        self.assertIn("context: ValueError", visible_detail)
+        self.assertNotIn(SYNTH_BEARER_A, visible_detail)
+        self.assertNotIn("hidden-context-marker", suppressed_detail)
+        self.assertNotIn("context: ValueError", suppressed_detail)
+
+    def test_start_discards_runner_stdio_when_explicit_credentials_are_present(
+        self,
+    ) -> None:
+        process = mock.Mock(pid=12345)
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "ANTHROPIC_API_KEY": SYNTH_API_KEY_A,
+                    "CLAUDE_CODE_OAUTH_TOKEN": SYNTH_BEARER_A,
+                },
+            ),
+            mock.patch.object(
+                state,
+                "prepare_workspace",
+                side_effect=prepared_workspace(self.review),
+            ),
+            mock.patch.object(
+                state.subprocess,
+                "Popen",
+                return_value=process,
+            ) as popen,
+        ):
+            state_dir = state.start(
+                script_path=pathlib.Path("runner.py"),
+                repo=self.repo,
+                reviewer="claude",
+                base_ref=self.base,
+                head_ref=self.head,
+                prompt_file=None,
+                keep_workspace=False,
+                egress_consent="double-review",
+            )
+
+        self.assertEqual(state_dir, self.review.container_dir)
+        self.assertEqual(popen.call_args.kwargs["stdout"], subprocess.DEVNULL)
+        self.assertEqual(popen.call_args.kwargs["stderr"], subprocess.DEVNULL)
+        self.assertEqual((state_dir / "runner.stdout.log").read_bytes(), b"")
+        self.assertEqual((state_dir / "runner.stderr.log").read_bytes(), b"")
+        state._STARTED_PROCESSES.pop(process.pid, None)
+
+    def test_start_redaction_scope_does_not_rewrite_prepared_review_inputs(
+        self,
+    ) -> None:
+        process = mock.Mock(pid=12345)
+
+        def prepare_with_coincident_content(**kwargs):
+            write_text_atomic(self.review.prompt_file, SYNTH_API_KEY_A + "\n")
+            kwargs["ownership_handoff"](self.review)
+            return self.review
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "ANTHROPIC_API_KEY": SYNTH_API_KEY_A,
+                    "CLAUDE_CODE_OAUTH_TOKEN": SYNTH_BEARER_A,
+                },
+            ),
+            mock.patch.object(
+                state,
+                "prepare_workspace",
+                side_effect=prepare_with_coincident_content,
+            ),
+            mock.patch.object(state.subprocess, "Popen", return_value=process),
+        ):
+            state.start(
+                script_path=pathlib.Path("runner.py"),
+                repo=self.repo,
+                reviewer="claude",
+                base_ref=self.base,
+                head_ref=self.head,
+                prompt_file=None,
+                keep_workspace=False,
+                egress_consent="double-review",
+            )
+
+        self.assertEqual(
+            self.review.prompt_file.read_text(encoding="utf-8"),
+            SYNTH_API_KEY_A + "\n",
+        )
+        state._STARTED_PROCESSES.pop(process.pid, None)
 
     def test_start_cleans_workspace_when_signal_follows_handoff(self) -> None:
         def handoff_then_signal(**kwargs):
@@ -772,9 +1414,7 @@ time.sleep(0.2)
             ),
             mock.patch.object(state.subprocess, "Popen", return_value=process),
             mock.patch.object(state, "terminate_process_group") as terminate,
-            mock.patch.object(
-                state, "cleanup_workspace", return_value=None
-            ) as cleanup,
+            mock.patch.object(state, "cleanup_workspace", return_value=None) as cleanup,
         ):
             with self.assertRaises(BrokenPipeError):
                 state.start(
@@ -861,9 +1501,7 @@ time.sleep(0.2)
                 "terminate_process_group",
                 side_effect=signal_during_cleanup,
             ) as terminate,
-            mock.patch.object(
-                state, "cleanup_workspace", return_value=None
-            ) as cleanup,
+            mock.patch.object(state, "cleanup_workspace", return_value=None) as cleanup,
         ):
             with self.assertRaises(state.ForwardedSignal) as raised:
                 state.start(

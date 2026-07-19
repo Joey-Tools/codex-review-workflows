@@ -20,6 +20,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 from review_runtime import (  # noqa: E402
     claude_capabilities,
+    claude_keychain_macos,
     claude_linux,
     claude_refresh_lock,
     providers,
@@ -58,6 +59,10 @@ EXPECTED_CLAUDE_2_1_211_LOCK_ARTIFACTS = {
         "c99bd7934ac841d5be6ee7d3644cb63bccef2cd495c6c1bb982a1b1deac1b466",
     ),
 }
+
+
+SYNTH_API_KEY_A = "codex_synth_v1_api_key_a"  # Synthetic token id: api-key-a.
+SYNTH_BEARER_A = "codex_synth_v1_bearer_a"  # Synthetic token id: bearer-a.
 
 
 CI_FIXTURE_ROOT = SKILL_ROOT / "tests" / "fixtures" / "ci"
@@ -186,6 +191,194 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("Linux and WSL2", helper_contract)
         self.assertNotIn("requires `ANTHROPIC_API_KEY`", skill)
 
+    def test_claude_explicit_auth_and_keychain_binding_contract(self) -> None:
+        explicit_env = {
+            "ANTHROPIC_API_KEY": SYNTH_API_KEY_A,
+            "CLAUDE_CODE_OAUTH_TOKEN": SYNTH_BEARER_A,
+        }
+        self.assertEqual(
+            providers.CLAUDE_EXPLICIT_AUTH_ENV_KEYS,
+            ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"),
+        )
+        self.assertEqual(
+            providers._claude_explicit_auth_source(explicit_env),
+            "api-key",
+        )
+        self.assertEqual(
+            providers._claude_explicit_auth_environment(explicit_env),
+            {"ANTHROPIC_API_KEY": SYNTH_API_KEY_A},
+        )
+        self.assertEqual(
+            set(providers._claude_explicit_auth_secrets(explicit_env)),
+            {SYNTH_API_KEY_A, SYNTH_BEARER_A},
+        )
+        self.assertEqual(
+            providers._claude_explicit_auth_environment(
+                {
+                    "ANTHROPIC_API_KEY": "",
+                    "CLAUDE_CODE_OAUTH_TOKEN": SYNTH_BEARER_A,
+                }
+            ),
+            {"CLAUDE_CODE_OAUTH_TOKEN": SYNTH_BEARER_A},
+        )
+
+        broker_source = inspect.getsource(
+            providers._prepare_claude_keychain_broker
+        )
+        macos_runtime_source = inspect.getsource(providers._claude_keychain_runtime)
+        linux_runtime_source = inspect.getsource(
+            providers._claude_linux_review_runtime
+        )
+        attempt_source = inspect.getsource(providers._claude_attempt)
+        tool_path_source = inspect.getsource(providers._with_claude_review_tool_path)
+        sandbox_source = inspect.getsource(providers._claude_review_sandbox_profile)
+        run_review_source = inspect.getsource(providers.run_review)
+        keychain_read_source = inspect.getsource(
+            providers._read_claude_keychain_credential_snapshot
+        )
+        keychain_write_source = inspect.getsource(
+            providers._write_claude_keychain_credential
+        )
+        keychain_persistence_source = inspect.getsource(
+            providers._persist_claude_macos_refreshed_credential_impl
+        )
+
+        self.assertLess(
+            broker_source.index("_claude_has_explicit_auth"),
+            broker_source.index("CLAUDE_KEYCHAIN_BROKER_COMPILER"),
+        )
+        self.assertLess(
+            macos_runtime_source.index("_claude_has_explicit_auth"),
+            macos_runtime_source.index("refresh_lock_protocol is None"),
+        )
+        self.assertLess(
+            macos_runtime_source.index("_claude_has_explicit_auth"),
+            macos_runtime_source.index("_select_claude_macos_credential"),
+        )
+        self.assertLess(
+            linux_runtime_source.index("_claude_explicit_auth_environment"),
+            linux_runtime_source.index("stage_claude_credentials"),
+        )
+        for source in (attempt_source, tool_path_source, sandbox_source):
+            self.assertIn("_claude_has_explicit_auth", source)
+        self.assertIn("_claude_explicit_auth_secrets", run_review_source)
+
+        self.assertIn("read_login_keychain_credential", keychain_read_source)
+        self.assertIn("replace_login_keychain_credential", keychain_write_source)
+        replacement_index = keychain_write_source.index(
+            "replace_login_keychain_credential"
+        )
+        self.assertLess(
+            keychain_write_source.index("refresh_lock.assert_held()"),
+            replacement_index,
+        )
+        self.assertGreater(
+            keychain_write_source.rindex("refresh_lock.assert_held()"),
+            replacement_index,
+        )
+        self.assertFalse(hasattr(providers, "CLAUDE_KEYCHAIN_CLIENT"))
+        self.assertFalse(
+            hasattr(providers, "CLAUDE_KEYCHAIN_SECURITY_STDIN_LIMIT_BYTES")
+        )
+        self.assertEqual(
+            claude_keychain_macos.MAXIMUM_CREDENTIAL_BYTES,
+            providers.CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES,
+        )
+
+        keychain_source = inspect.getsource(claude_keychain_macos)
+        for expected in (
+            "Security.framework",
+            'pathlib.Path("/")',
+            'decoded_type != "apfs"',
+            "_MNT_LOCAL",
+            "_ACL_EXTENDED_ALLOW",
+            "select.kqueue()",
+            "consume_expected_update_events",
+            "SecKeychainGetUserInteractionAllowed",
+            "SecKeychainSetUserInteractionAllowed",
+            "socket.socketpair",
+            "pass_fds",
+            "start_new_session=True",
+            "KEYCHAIN_WORKER_TIMEOUT_SECONDS",
+            "MacOSKeychainWriteOutcomeUnknown",
+            "_kill_and_reap_worker",
+        ):
+            self.assertIn(expected, keychain_source)
+        self.assertIn(
+            "ClaudeCredentialWriteOutcomeUnknown", keychain_persistence_source
+        )
+        self.assertIn(
+            "ClaudeCredentialWorkerTerminationInconclusive",
+            keychain_persistence_source,
+        )
+        self.assertIn(
+            "retain_for_controlled_cleanup",
+            keychain_persistence_source,
+        )
+        self.assertNotIn("/usr/bin/" + "security", keychain_source)
+
+        policy_files = {
+            "SKILL.md": SKILL_ROOT / "SKILL.md",
+            "helper-contract.md": SKILL_ROOT / "references/helper-contract.md",
+            "claude-runtime-trust.md": (
+                SKILL_ROOT / "references/claude-runtime-trust.md"
+            ),
+        }
+        policies = {
+            name: path.read_text(encoding="utf-8")
+            for name, path in policy_files.items()
+        }
+        if CI_PROFILE == "canonical":
+            policies.update(
+                _claude_auth_repository_policy_files(REPO_ROOT, CI_PROFILE)
+            )
+            policies["project journal"] = (
+                REPO_ROOT
+                / "docs/project_journal/2026/07/"
+                / "2026-07-18-claude-explicit-auth-sources-a718e2.md"
+            ).read_text(encoding="utf-8")
+        forbidden_phrases = (
+            "/usr/bin/" + "security",
+            "security" + " -i",
+            "40" + "32",
+            "batch" + "-hex",
+            "Keychain update " + "transport" + "-size limit",
+        )
+        for name, policy in policies.items():
+            with self.subTest(policy=name):
+                self.assertIn("ANTHROPIC_API_KEY", policy)
+                self.assertIn("CLAUDE_CODE_OAUTH_TOKEN", policy)
+                for forbidden in forbidden_phrases:
+                    self.assertNotIn(forbidden, policy)
+
+        current_policy = "\n".join(policies.values())
+        for name in (
+            "SKILL.md",
+            "helper-contract.md",
+            "claude-runtime-trust.md",
+        ):
+            self.assertIn("post-ready serve-loop failure", policies[name])
+        for expected in (
+            "Security.framework",
+            "exact item reference",
+            "descriptor-bound",
+            "local APFS",
+            "DENY-only ACL",
+            "kqueue",
+            "certified writer lease",
+            "winner",
+            "loser",
+            "redaction",
+            "at most two Keychain replacement attempts",
+            "dedicated supervised helper process",
+            "monotonic hard timeout",
+            "write outcome unknown",
+            "one bounded readback",
+            "no second replacement",
+            "shared refresh locks",
+        ):
+            self.assertIn(expected, current_policy)
+
     def test_claude_auth_carriers_refresh_without_a_freshness_gate(self) -> None:
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
         helper_contract = (SKILL_ROOT / "references/helper-contract.md").read_text(
@@ -225,7 +418,9 @@ class RepositoryContractTest(unittest.TestCase):
         macos_recovery_report_source = inspect.getsource(
             providers._record_claude_secondary_persistence_failure
         )
-        run_review_source = inspect.getsource(providers.run_review)
+        run_review_source = inspect.getsource(
+            providers.run_review
+        ) + inspect.getsource(providers._run_review_with_frozen_auth)
         auth_outcome_source = inspect.getsource(
             providers._finish_claude_auth_required
         )
@@ -435,7 +630,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("refresh_lock.assert_held()", linux_write_source)
         self.assertIn("refresh_lock_protocol", linux_write_source)
         self.assertIn("_certified_claude_refresh_lock_protocol", attempt_source)
-        self.assertIn('env.get("ANTHROPIC_API_KEY")', attempt_source)
+        self.assertIn("_claude_has_explicit_auth", attempt_source)
 
         self.assertIn('"phase": "blocked-authentication"', auth_outcome_source)
         self.assertIn("CLAUDE_AUTH_LOGIN_ACTION", auth_outcome_source)

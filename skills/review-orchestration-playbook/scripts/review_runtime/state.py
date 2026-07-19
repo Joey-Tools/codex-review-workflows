@@ -10,16 +10,20 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Mapping
 from typing import Any, Callable
 
 from .common import (
     PROCESS_GROUP_TERM_GRACE_SECONDS,
     ForwardedSignal,
     ReviewError,
+    atomic_write_redactions,
     block_forwarded_signals,
     consume_pending_forwarded_signal,
     forwarded_signals,
     read_json,
+    redact_json_string_values,
+    redact_text,
     restore_signal_mask,
     signal_process_group,
     tail_text,
@@ -45,6 +49,119 @@ CLEANUP_LOCK_FILE = "cleanup.lock"
 FINAL_CLEANUP_TIMEOUT_SECONDS = 30.0
 RUNNER_SHUTDOWN_GRACE_SECONDS = PROCESS_GROUP_TERM_GRACE_SECONDS * 4
 _STARTED_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
+_EXPLICIT_CLAUDE_CREDENTIAL_ENV_KEYS = (
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+)
+_STATE_OWNED_TEXT_ARTIFACTS = (
+    STATE_MARKER,
+    STATE_FILE,
+    EXIT_FILE,
+    "attempts.json",
+    "claude-runtime.json",
+    "claude-skip.txt",
+    "egress.json",
+    "final.txt",
+    "preflight.json",
+    "runner.stdout.log",
+    "runner.stderr.log",
+    "runner-error.txt",
+    "cleanup-error.txt",
+)
+_STATE_OWNED_TEXT_ARTIFACT_NAMES = frozenset(_STATE_OWNED_TEXT_ARTIFACTS)
+
+
+def _state_owned_write_filter(
+    state_dir: pathlib.Path,
+) -> Callable[[pathlib.Path], bool]:
+    try:
+        root = state_dir.expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ReviewError(
+            f"cannot resolve isolated-review state directory {state_dir}: {error}"
+        ) from error
+    if not root.is_dir():
+        raise ReviewError(f"isolated-review state path is not a directory: {root}")
+
+    def includes(path: pathlib.Path) -> bool:
+        candidate = path.expanduser()
+        try:
+            # Resolve only the parent. Atomic replacement must classify the
+            # destination name without following an attacker-controlled leaf
+            # symlink that the writer will replace rather than dereference.
+            parent = candidate.parent.resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise ReviewError(
+                f"cannot resolve atomic write parent {candidate.parent}: {error}"
+            ) from error
+        return parent == root and candidate.name in _STATE_OWNED_TEXT_ARTIFACT_NAMES
+
+    return includes
+
+
+def _freeze_explicit_claude_redactions(
+    environment: Mapping[str, str] | None = None,
+) -> tuple[str, ...]:
+    source = os.environ if environment is None else environment
+    values = {
+        value
+        for key in _EXPLICIT_CLAUDE_CREDENTIAL_ENV_KEYS
+        if (value := source.get(key, ""))
+    }
+    return tuple(sorted(values, key=lambda value: (-len(value), value)))
+
+
+def _redact_claude_text(text: str, redact_values: tuple[str, ...]) -> str:
+    return redact_text(text, redact_values)
+
+
+def _redacted_exception_detail(
+    error: BaseException,
+    redact_values: tuple[str, ...],
+) -> str:
+    details: list[str] = []
+    seen: set[int] = set()
+
+    def visit(current: BaseException, relation: str) -> None:
+        identity = id(current)
+        if identity in seen:
+            details.append(f"{relation}<exception cycle>")
+            return
+        if len(seen) >= 32:
+            details.append(f"{relation}<exception chain truncated>")
+            return
+        seen.add(identity)
+        try:
+            message = str(current)
+        except Exception:
+            message = "<unprintable exception>"
+        label = f"{type(current).__name__}: {message}"
+        details.append(relation + _redact_claude_text(label, redact_values))
+        cause = current.__cause__
+        context = current.__context__
+        if cause is not None:
+            visit(cause, "caused by ")
+        elif context is not None and not current.__suppress_context__:
+            visit(context, "context: ")
+
+    visit(error, "")
+    return "; ".join(details)
+
+
+def _redact_claude_value(value: Any, redact_values: tuple[str, ...]) -> Any:
+    return redact_json_string_values(value, redact_values)
+
+
+def _write_state_json_without_credentials(
+    path: pathlib.Path,
+    value: dict[str, Any],
+    redact_values: tuple[str, ...],
+) -> None:
+    if redact_json_string_values(value, redact_values) != value:
+        raise ReviewError(
+            "review state metadata contains an explicit Claude credential"
+        )
+    write_json(path, value)
 
 
 def _state_path(state_dir: pathlib.Path) -> pathlib.Path:
@@ -148,6 +265,8 @@ def start(
     synthetic_secret_exemptions: tuple[str, ...] = (),
     publisher: Callable[[pathlib.Path], None] | None = None,
 ) -> pathlib.Path:
+    redact_values = _freeze_explicit_claude_redactions()
+    _redact_claude_text("", redact_values)
     process: subprocess.Popen[bytes] | None = None
     review: ReviewWorkspace | None = None
     lock_handle = None
@@ -156,6 +275,8 @@ def start(
     published = False
     cleaning = False
     handlers_restored = False
+    write_redaction_scope = None
+    write_redaction_entered = False
 
     def forward_signal(signum: int, _frame: object) -> None:
         nonlocal pending_signal
@@ -192,6 +313,12 @@ def start(
         if review is None:
             raise ReviewError("workspace ownership handoff did not complete")
         state_dir = review.container_dir
+        write_redaction_scope = atomic_write_redactions(
+            redact_values,
+            path_filter=_state_owned_write_filter(state_dir),
+        )
+        write_redaction_scope.__enter__()
+        write_redaction_entered = True
         write_text_atomic(state_dir / STATE_MARKER, "isolated-review-state-v1\n")
         stdout_path = state_dir / "runner.stdout.log"
         stderr_path = state_dir / "runner.stderr.log"
@@ -208,7 +335,11 @@ def start(
             "attempts_path": str(state_dir / "attempts.json"),
             "started_at": time.time(),
         }
-        write_json(state_dir / STATE_FILE, state)
+        _write_state_json_without_credentials(
+            state_dir / STATE_FILE,
+            state,
+            redact_values,
+        )
         lock_path = state_dir / LOCK_FILE
         lock_handle = lock_path.open("wb")
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -231,8 +362,11 @@ def start(
                     ),
                     cwd=review.workspace_root,
                     stdin=subprocess.DEVNULL,
-                    stdout=stdout_handle,
-                    stderr=stderr_handle,
+                    # The detached parent cannot stream-redact these descriptors.
+                    # Explicit-auth diagnostics are recorded through sanitized
+                    # state artifacts instead of process stdio.
+                    stdout=(subprocess.DEVNULL if redact_values else stdout_handle),
+                    stderr=(subprocess.DEVNULL if redact_values else stderr_handle),
                     start_new_session=True,
                     close_fds=True,
                     pass_fds=(lock_handle.fileno(),),
@@ -245,7 +379,11 @@ def start(
             raise ForwardedSignal(pending_signal)
         state["pid"] = process.pid
         _STARTED_PROCESSES[process.pid] = process
-        write_json(state_dir / STATE_FILE, state)
+        _write_state_json_without_credentials(
+            state_dir / STATE_FILE,
+            state,
+            redact_values,
+        )
         publication_mask = block_forwarded_signals()
         publication_signal: signal.Signals | None = None
         try:
@@ -289,30 +427,51 @@ def start(
         if pending_signal is not None:
             details: list[str] = []
             if isinstance(error, ForwardedSignal) and error.detail:
-                details.append(error.detail)
+                details.append(_redact_claude_text(error.detail, redact_values))
             elif isinstance(error, ReviewError):
-                details.append(str(error))
+                details.append(
+                    _redacted_exception_detail(error, redact_values)
+                    if redact_values
+                    else str(error)
+                )
             if cleanup_error and review is not None:
                 details.append(
                     "review startup failed and cleanup failed; evidence retained at "
-                    f"{review.container_dir}: {cleanup_error}"
+                    f"{review.container_dir}: "
+                    f"{_redact_claude_text(cleanup_error, redact_values)}"
                 )
             raise ForwardedSignal(
                 pending_signal,
                 detail="; ".join(details) or None,
-            ) from error
+            ) from None
         if cleanup_error and review is not None:
+            primary_detail = (
+                f"; primary failure: {_redacted_exception_detail(error, redact_values)}"
+                if redact_values
+                else ""
+            )
             raise ReviewError(
                 "review startup failed and cleanup failed; evidence retained at "
-                f"{review.container_dir}: {cleanup_error}"
-            ) from error
+                f"{review.container_dir}: "
+                f"{_redact_claude_text(cleanup_error, redact_values)}"
+                f"{primary_detail}"
+            ) from None
+        if redact_values:
+            raise ReviewError(
+                "review startup failed: "
+                f"{_redacted_exception_detail(error, redact_values)}"
+            ) from None
         raise
     finally:
-        if lock_handle is not None:
-            lock_handle.close()
-        if not handlers_restored:
-            for forwarded, previous in previous_handlers.items():
-                signal.signal(forwarded, previous)
+        try:
+            if lock_handle is not None:
+                lock_handle.close()
+            if not handlers_restored:
+                for forwarded, previous in previous_handlers.items():
+                    signal.signal(forwarded, previous)
+        finally:
+            if write_redaction_entered and write_redaction_scope is not None:
+                write_redaction_scope.__exit__(None, None, None)
 
 
 def run_state(
@@ -320,10 +479,14 @@ def run_state(
     state_dir: pathlib.Path,
     terminal_process: bool = False,
 ) -> int:
+    redact_values = _freeze_explicit_claude_redactions()
+    _redact_claude_text("", redact_values)
     exit_code = 1
     pending_signal: signal.Signals | None = None
     suppress_signal_raise = False
     state_loaded = False
+    write_redaction_scope = None
+    write_redaction_entered = False
 
     def record_signal(signum: int, _frame: object) -> None:
         nonlocal pending_signal
@@ -339,7 +502,14 @@ def run_state(
 
     try:
         state, review = load_review_state(state_dir)
+        state_dir = review.container_dir.expanduser().resolve(strict=True)
         state_loaded = True
+        write_redaction_scope = atomic_write_redactions(
+            redact_values,
+            path_filter=_state_owned_write_filter(state_dir),
+        )
+        write_redaction_scope.__enter__()
+        write_redaction_entered = True
         unblock_forwarded_signals()
         reviewer = state.get("reviewer")
         if not isinstance(reviewer, str):
@@ -359,47 +529,54 @@ def run_state(
                 write_text_atomic(
                     state_dir / "runner-error.txt",
                     "review orchestration interrupted by signal "
-                    f"{int(error.signum)}: {error.detail}\n",
+                    f"{int(error.signum)}: "
+                    f"{_redact_claude_text(error.detail, redact_values)}\n",
                 )
             except Exception:
                 pass
     except Exception as error:
         if state_loaded:
             write_text_atomic(
-                state_dir / "runner-error.txt", f"{type(error).__name__}: {error}\n"
+                state_dir / "runner-error.txt",
+                _redacted_exception_detail(error, redact_values) + "\n",
             )
         exit_code = 1
     finally:
-        suppress_signal_raise = True
-        previous_mask = block_forwarded_signals()
         try:
-            while True:
-                masked_signal = (
-                    consume_pending_forwarded_signal()
-                    if previous_mask is not None
-                    else None
-                )
-                if pending_signal is None:
-                    pending_signal = masked_signal
-                if pending_signal is not None:
-                    exit_code = 128 + int(pending_signal)
-                if state_loaded:
-                    write_text_atomic(state_dir / EXIT_FILE, f"{exit_code}\n")
-                if previous_mask is None:
-                    break
-                pending_signal = consume_pending_forwarded_signal()
-                if pending_signal is None:
-                    break
-            if not terminal_process:
-                for forwarded, previous in previous_handlers.items():
-                    signal.signal(forwarded, previous)
+            suppress_signal_raise = True
+            previous_mask = block_forwarded_signals()
+            try:
+                while True:
+                    masked_signal = (
+                        consume_pending_forwarded_signal()
+                        if previous_mask is not None
+                        else None
+                    )
+                    if pending_signal is None:
+                        pending_signal = masked_signal
+                    if pending_signal is not None:
+                        exit_code = 128 + int(pending_signal)
+                    if state_loaded:
+                        write_text_atomic(state_dir / EXIT_FILE, f"{exit_code}\n")
+                    if previous_mask is None:
+                        break
+                    pending_signal = consume_pending_forwarded_signal()
+                    if pending_signal is None:
+                        break
+                if not terminal_process:
+                    for forwarded, previous in previous_handlers.items():
+                        signal.signal(forwarded, previous)
+            finally:
+                if not terminal_process:
+                    restore_signal_mask(previous_mask)
         finally:
-            if not terminal_process:
-                restore_signal_mask(previous_mask)
+            if write_redaction_entered and write_redaction_scope is not None:
+                write_redaction_scope.__exit__(None, None, None)
     return exit_code
 
 
 def status(state_dir: pathlib.Path) -> dict[str, Any]:
+    redact_values = _freeze_explicit_claude_redactions()
     state_dir = state_dir.expanduser().resolve()
     state, review = load_review_state(state_dir)
     pid_value = state.get("pid")
@@ -419,14 +596,11 @@ def status(state_dir: pathlib.Path) -> dict[str, Any]:
             state_dir / "runner-error.txt",
             "review runner exited without recording a terminal result\n",
         )
-    fallback_workspace_retained = (
-        not running
-        and _should_retain_fallback_workspace(
-            state_dir=state_dir,
-            state=state,
-            review=review,
-            exit_code=exit_code,
-        )
+    fallback_workspace_retained = not running and _should_retain_fallback_workspace(
+        state_dir=state_dir,
+        state=state,
+        review=review,
+        exit_code=exit_code,
     )
     attempts: list[Any] = []
     attempts_path = state_dir / "attempts.json"
@@ -444,7 +618,7 @@ def status(state_dir: pathlib.Path) -> dict[str, Any]:
                 if legacy_final is not None:
                     summary["final_available"] = bool(legacy_final)
                 attempts.append(summary)
-    return {
+    summary = {
         "state_dir": str(state_dir),
         "reviewer": state.get("reviewer"),
         "egress_consent": state.get("egress_consent"),
@@ -461,6 +635,11 @@ def status(state_dir: pathlib.Path) -> dict[str, Any]:
         "stderr_tail": tail_text(state_dir / "runner.stderr.log"),
         "runner_error": tail_text(state_dir / "runner-error.txt"),
         "cleanup_error": tail_text(state_dir / "cleanup-error.txt"),
+    }
+    # These keys are the public status schema. Redacting a key can make wait()
+    # and final() lose fields such as "running" when a credential matches it.
+    return {
+        key: _redact_claude_value(item, redact_values) for key, item in summary.items()
     }
 
 
@@ -538,6 +717,7 @@ def _cleanup_terminal_workspace(
     deadline: float | None,
     force: bool,
 ) -> int:
+    redact_values = _freeze_explicit_claude_redactions()
     cleanup_lock_path = state_dir / CLEANUP_LOCK_FILE
     cleanup_error_path = state_dir / "cleanup-error.txt"
     with cleanup_lock_path.open("a+b") as cleanup_lock:
@@ -570,7 +750,10 @@ def _cleanup_terminal_workspace(
                 if not cleanup_completed:
                     return 124
                 if cleanup_error:
-                    write_text_atomic(cleanup_error_path, cleanup_error + "\n")
+                    write_text_atomic(
+                        cleanup_error_path,
+                        _redact_claude_text(cleanup_error, redact_values) + "\n",
+                    )
                     return 1
             if not should_keep and not review.workspace_root.exists():
                 try:
@@ -655,6 +838,7 @@ def _cleanup_before_deadline(
 
 
 def final(state_dir: pathlib.Path) -> tuple[int, str]:
+    redact_values = _freeze_explicit_claude_redactions()
     summary = status(state_dir)
     if summary["running"]:
         return 3, "review is still running"
@@ -663,14 +847,17 @@ def final(state_dir: pathlib.Path) -> tuple[int, str]:
         return 3, "review completed but workspace cleanup did not finish before timeout"
     cleanup_error = tail_text(state_dir.expanduser().resolve() / "cleanup-error.txt")
     if cleanup_error:
-        return 1, f"review completed but workspace cleanup failed: {cleanup_error}"
+        return 1, (
+            "review completed but workspace cleanup failed: "
+            f"{_redact_claude_text(cleanup_error, redact_values)}"
+        )
     summary = status(state_dir)
     exit_code = summary["exit_code"]
     final_path = state_dir.expanduser().resolve() / "final.txt"
     if exit_code == 0 and final_path.is_file():
         text = final_path.read_text(encoding="utf-8", errors="replace").strip()
         if text:
-            return 0, text
+            return 0, _redact_claude_text(text, redact_values)
     details = (
         summary.get("runner_error")
         or summary.get("stderr_tail")
@@ -681,4 +868,7 @@ def final(state_dir: pathlib.Path) -> tuple[int, str]:
             f"{details}\nfrozen workspace retained for clean-context fallback: "
             f"{summary['fallback_workspace']}"
         )
-    return int(wait_code or exit_code or 1), str(details)
+    return int(wait_code or exit_code or 1), _redact_claude_text(
+        str(details),
+        redact_values,
+    )

@@ -1169,6 +1169,19 @@ class ClaudeRefreshLockLease:
                         "Claude refresh-lock lease release already started"
                     )
 
+    def retain_for_controlled_cleanup(self, reason: str) -> None:
+        if not isinstance(reason, str) or not reason or "\x00" in reason:
+            raise ClaudeRefreshLockError(
+                "Claude refresh-lock retention requires a safe reason"
+            )
+        with self._state_lock:
+            if self._released or self._release_started:
+                raise ClaudeRefreshLockCompromised(
+                    "cannot retain a releasing or released Claude refresh-lock lease"
+                )
+            self._heartbeat_stop.set()
+        self._mark_cleanup_inconclusive(reason)
+
     def release(self) -> None:
         with self._release_lock:
             with self._state_lock:

@@ -5637,6 +5637,9 @@ class CredentialStagingTest(unittest.TestCase):
 
 
 class SandboxCommandTest(unittest.TestCase):
+    SYNTH_API_KEY_A = "codex_synth_v1_api_key_a"  # Synthetic token id: api-key-a.
+    SYNTH_BEARER_A = "codex_synth_v1_bearer_a"  # Synthetic token id: bearer-a.
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(dir="/tmp")
         self.root = pathlib.Path(self.temporary.name)
@@ -5701,12 +5704,80 @@ class SandboxCommandTest(unittest.TestCase):
         self.socket_validation.stop()
         self.temporary.cleanup()
 
+    def test_passes_only_selected_explicit_authentication_carrier(self) -> None:
+        cases = (
+            ("ANTHROPIC_API_KEY", self.SYNTH_API_KEY_A),
+            ("CLAUDE_CODE_OAUTH_TOKEN", self.SYNTH_BEARER_A),
+        )
+
+        for key, value in cases:
+            with self.subTest(key=key):
+                sandbox_command = claude_linux.build_sandbox_command(
+                    self.spec,
+                    _linux_review_arguments(),
+                    auth_env={key: value},
+                )
+
+                self.assertEqual(sandbox_command.env, {key: value})
+                self.assertNotIn(value, sandbox_command.argv)
+                self.assertNotIn("--clearenv", sandbox_command.argv)
+
+    def test_rejects_multiple_explicit_authentication_carriers(self) -> None:
+        with self.assertRaisesRegex(
+            claude_linux.LinuxRuntimeError,
+            "at most one explicit authentication carrier",
+        ):
+            claude_linux.build_sandbox_command(
+                self.spec,
+                _linux_review_arguments(),
+                auth_env={
+                    "ANTHROPIC_API_KEY": self.SYNTH_API_KEY_A,
+                    "CLAUDE_CODE_OAUTH_TOKEN": self.SYNTH_BEARER_A,
+                },
+            )
+
+    def test_drops_empty_explicit_authentication_carriers(self) -> None:
+        cases = (
+            (
+                {
+                    "ANTHROPIC_API_KEY": "",
+                    "CLAUDE_CODE_OAUTH_TOKEN": self.SYNTH_BEARER_A,
+                },
+                {"CLAUDE_CODE_OAUTH_TOKEN": self.SYNTH_BEARER_A},
+            ),
+            (
+                {
+                    "ANTHROPIC_API_KEY": self.SYNTH_API_KEY_A,
+                    "CLAUDE_CODE_OAUTH_TOKEN": "",
+                },
+                {"ANTHROPIC_API_KEY": self.SYNTH_API_KEY_A},
+            ),
+            (
+                {
+                    "ANTHROPIC_API_KEY": "",
+                    "CLAUDE_CODE_OAUTH_TOKEN": "",
+                },
+                {},
+            ),
+        )
+
+        for auth_env, expected in cases:
+            with self.subTest(auth_env=auth_env):
+                sandbox_command = claude_linux.build_sandbox_command(
+                    self.spec,
+                    _linux_review_arguments(),
+                    auth_env=auth_env,
+                )
+
+                self.assertEqual(sandbox_command.env, expected)
+                self.assertEqual("--clearenv" in sandbox_command.argv, not expected)
+
     def test_builds_synthetic_root_no_shell_review_command(self) -> None:
         review_arguments = _linux_review_arguments()
         sandbox_command = claude_linux.build_sandbox_command(
             self.spec,
             review_arguments,
-            auth_env={"ANTHROPIC_API_KEY": "test-only"},
+            auth_env={"ANTHROPIC_API_KEY": self.SYNTH_API_KEY_A},
         )
         command = sandbox_command.argv
 
@@ -5735,8 +5806,11 @@ class SandboxCommandTest(unittest.TestCase):
         self.assertNotIn("sh", {pathlib.Path(item).name for item in command})
         self.assertNotIn("/mnt", command)
         self.assertNotIn("/etc/claude-code", command)
-        self.assertNotIn("test-only", command)
-        self.assertEqual(sandbox_command.env, {"ANTHROPIC_API_KEY": "test-only"})
+        self.assertNotIn(self.SYNTH_API_KEY_A, command)
+        self.assertEqual(
+            sandbox_command.env,
+            {"ANTHROPIC_API_KEY": self.SYNTH_API_KEY_A},
+        )
         self.assertNotIn("--clearenv", command)
         environment_triples = tuple(zip(command, command[1:], command[2:]))
         for key in (
@@ -5854,7 +5928,7 @@ class SandboxCommandTest(unittest.TestCase):
                         claude_linux.build_sandbox_command(
                             self.spec,
                             _linux_review_arguments(),
-                            auth_env={"ANTHROPIC_API_KEY": "test-only"},
+                            auth_env={"ANTHROPIC_API_KEY": self.SYNTH_API_KEY_A},
                         )
                 finally:
                     link.unlink()
@@ -6226,18 +6300,45 @@ class SandboxCommandTest(unittest.TestCase):
         self.assertIn("--clearenv", command.argv)
         self.assertEqual(command.env, {})
 
-    def test_rejects_incomplete_linux_file_tool_boundary(self) -> None:
-        arguments = list(_linux_review_arguments())
-        settings_index = arguments.index("--settings") + 1
-        settings = json.loads(arguments[settings_index])
-        settings["permissions"]["deny"].remove("Read(//proc/**)")
-        arguments[settings_index] = json.dumps(settings, separators=(",", ":"))
+    def test_rejects_incomplete_linux_file_tool_boundary_for_every_auth_mode(
+        self,
+    ) -> None:
+        auth_modes = (
+            ("local-login", None),
+            ("api-key", {"ANTHROPIC_API_KEY": self.SYNTH_API_KEY_A}),
+            (
+                "oauth-token",
+                {"CLAUDE_CODE_OAUTH_TOKEN": self.SYNTH_BEARER_A},
+            ),
+        )
+        required_denies = (
+            "Read(//proc)",
+            "Read(//proc/**)",
+            "Read(//dev)",
+            "Read(//dev/**)",
+        )
 
-        with self.assertRaisesRegex(
-            claude_linux.LinuxRuntimeUnsafe,
-            "omit synthetic-root file-tool denies",
-        ):
-            claude_linux.build_sandbox_command(self.spec, tuple(arguments))
+        for auth_mode, auth_env in auth_modes:
+            for deny_rule in required_denies:
+                with self.subTest(auth_mode=auth_mode, deny_rule=deny_rule):
+                    arguments = list(_linux_review_arguments())
+                    settings_index = arguments.index("--settings") + 1
+                    settings = json.loads(arguments[settings_index])
+                    settings["permissions"]["deny"].remove(deny_rule)
+                    arguments[settings_index] = json.dumps(
+                        settings,
+                        separators=(",", ":"),
+                    )
+
+                    with self.assertRaisesRegex(
+                        claude_linux.LinuxRuntimeUnsafe,
+                        "omit synthetic-root file-tool denies",
+                    ):
+                        claude_linux.build_sandbox_command(
+                            self.spec,
+                            tuple(arguments),
+                            auth_env=auth_env,
+                        )
 
     def test_rejects_cli_boundary_that_exposes_search_tools(self) -> None:
         arguments = list(_linux_review_arguments())
