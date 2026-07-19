@@ -4596,6 +4596,7 @@ class ProviderPolicyTest(unittest.TestCase):
             filesystem["denyRead"],
             [
                 str(self.claude_pwd_home),
+                str(self.review.source_root.resolve()),
                 str(review_user_root),
                 "/proc",
                 "/dev",
@@ -4667,6 +4668,10 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         self.assertIn(
             str(review_user_root), parsed["sandbox"]["filesystem"]["denyRead"]
+        )
+        self.assertIn(
+            str(self.review.source_root.resolve()),
+            parsed["sandbox"]["filesystem"]["denyRead"],
         )
         self.assertEqual(
             parsed["sandbox"]["filesystem"]["allowRead"],

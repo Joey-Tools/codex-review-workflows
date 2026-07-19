@@ -152,6 +152,7 @@ class RepositoryContractTest(unittest.TestCase):
             "read-only command policy",
             "native sandbox",
             "unsandboxed",
+            "original source checkout",
             "per-UID review namespace",
             "/proc",
             "/dev",
@@ -181,6 +182,7 @@ class RepositoryContractTest(unittest.TestCase):
         provider_source = (RUNTIME / "providers.py").read_text(encoding="utf-8")
         self.assertIn('"autoAllowBashIfSandboxed": False', provider_source)
         self.assertIn('"allowUnsandboxedCommands": False', provider_source)
+        self.assertIn("str(source)", provider_source)
         self.assertIn("str(review_user_root)", provider_source)
         self.assertIn("model-backed behavioral probe", combined)
         for stale_range_claim in (

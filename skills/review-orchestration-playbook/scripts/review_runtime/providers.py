@@ -2256,6 +2256,7 @@ def _claude_review_settings(
     review: ReviewWorkspace,
     home: pathlib.Path,
 ) -> str:
+    source = review.source_root.resolve()
     workspace = review.workspace_root.resolve()
     git_view = (review.git_dir or review.container_dir / "review.git").resolve()
     review_user_root = review.container_dir.resolve().parents[1]
@@ -2283,6 +2284,7 @@ def _claude_review_settings(
                 "filesystem": {
                     "denyRead": [
                         str(home),
+                        str(source),
                         str(review_user_root),
                         "/proc",
                         "/dev",
