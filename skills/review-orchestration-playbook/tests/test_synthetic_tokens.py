@@ -8552,6 +8552,83 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                 self.assertNotIn(raw_value, str(raised.exception))
                 self.assertNotIn(path_value, str(raised.exception))
 
+    def test_runtime_catalog_rechecks_changed_path_digest_evidence(self) -> None:
+        catalog = synthetic_tokens.load_catalog()
+        relative = "fixture.txt"
+        cases = {
+            "head": workspace.CHANGED_PATH_HEAD_TAG,
+            "base-only": workspace.CHANGED_PATH_BASE_ONLY_TAG,
+        }
+
+        for label, side_tag in cases.items():
+            with self.subTest(side=label):
+                repo, base = self.new_repo({relative: "base\n"})
+                if side_tag == workspace.CHANGED_PATH_HEAD_TAG:
+                    (repo / relative).write_text("head\n", encoding="utf-8")
+                else:
+                    (repo / relative).unlink()
+                head = self.commit(repo)
+                review = self.prepare(
+                    repo=repo,
+                    base=base,
+                    head=head,
+                    catalog=catalog,
+                )
+                digest = workspace._changed_path_digest(
+                    side_tag,
+                    relative.encode("ascii"),
+                ).decode("ascii")
+                raw_value = digest[8:32]
+                mutated_catalog = legacy_catalog(values=(raw_value,))
+                self.assertEqual(mutated_catalog.schema_version, catalog.schema_version)
+                self.assertEqual(mutated_catalog.pool_version, catalog.pool_version)
+
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "frozen changed path digest evidence would expose",
+                ) as raised:
+                    self.validate(review, catalog=mutated_catalog)
+                self.assertNotIn(raw_value, str(raised.exception))
+
+    def test_runtime_catalog_rechecks_changed_blob_path_digest_evidence(
+        self,
+    ) -> None:
+        catalog = synthetic_tokens.load_catalog()
+        relative = "fixture.txt"
+        repo, base = self.new_repo({relative: "base\n"})
+        (repo / relative).write_text("head\n", encoding="utf-8")
+        head = self.commit(repo)
+        review = self.prepare(
+            repo=repo,
+            base=base,
+            head=head,
+            catalog=catalog,
+        )
+        path_digest = hashlib.sha256(relative.encode("ascii")).hexdigest()
+        control_dir = review.workspace_root / ".codex-review"
+        (control_dir / "changed-blob-findings.z").write_bytes(
+            b"head\0" + path_digest.encode("ascii") + b"\0generic-secret-assignment\0"
+        )
+        control_state = workspace._build_control_artifact_state(
+            control_dir=control_dir,
+            private_cleanup=review.private_cleanup,
+        )
+        (review.container_dir / workspace.CONTROL_ARTIFACT_STATE_NAME).write_text(
+            json.dumps(control_state),
+            encoding="utf-8",
+        )
+        raw_value = path_digest[8:32]
+        mutated_catalog = legacy_catalog(values=(raw_value,))
+        self.assertEqual(mutated_catalog.schema_version, catalog.schema_version)
+        self.assertEqual(mutated_catalog.pool_version, catalog.pool_version)
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "changed-blob finding path digest evidence would expose",
+        ) as raised:
+            self.validate(review, catalog=mutated_catalog)
+        self.assertNotIn(raw_value, str(raised.exception))
+
     def test_legacy_counts_accept_authoring_values_but_not_unknown_secrets(
         self,
     ) -> None:

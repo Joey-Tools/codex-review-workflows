@@ -112,6 +112,7 @@ from .workspace import (
     build_preflight_evidence,
     remove_private_review_artifacts,
     validate_external_workspace,
+    write_bound_review_json,
     write_bound_runner_error,
 )
 
@@ -12199,10 +12200,14 @@ def _attempt_summary(attempt: Attempt) -> dict[str, Any]:
 
 
 def _write_attempts(review: ReviewWorkspace, attempts: Iterable[Attempt]) -> None:
-    write_json(
-        review.container_dir / "attempts.json",
-        [_attempt_summary(item) for item in attempts],
+    attempts_error = write_bound_review_json(
+        review.container_dir,
+        expected=review.private_cleanup,
+        name="attempts.json",
+        value=[_attempt_summary(item) for item in attempts],
     )
+    if attempts_error:
+        raise ReviewError(f"cannot persist review attempts: {attempts_error}")
 
 
 def _finish(

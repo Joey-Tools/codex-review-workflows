@@ -15575,6 +15575,61 @@ class ProviderPolicyTest(unittest.TestCase):
             (self.review.container_dir / "attempts.json").read_text(encoding="utf-8"),
         )
 
+    def test_failure_attempts_do_not_follow_container_swap_to_victim(self) -> None:
+        container = self.review.container_dir
+        moved_container = container.with_name(f"{container.name}-attempts-bound")
+        victim = container.with_name(f"{container.name}-attempts-victim")
+        victim.mkdir(mode=0o700)
+        victim_attempts = victim / "attempts.json"
+        original_attempts = '[{"keep":"original"}]\n'
+        victim_attempts.write_text(original_attempts, encoding="utf-8")
+        sentinel = victim / "sentinel"
+        sentinel.write_text("keep me\n", encoding="utf-8")
+        real_persist_runner_error = providers._persist_runner_error
+        stderr = io.StringIO()
+
+        def persist_then_replace(review, text):
+            diagnostic_error = real_persist_runner_error(review, text)
+            self.assertIsNone(diagnostic_error)
+            container.rename(moved_container)
+            container.symlink_to(victim, target_is_directory=True)
+            return diagnostic_error
+
+        try:
+            with (
+                mock.patch.object(
+                    providers,
+                    "_persist_runner_error",
+                    side_effect=persist_then_replace,
+                ),
+                contextlib.redirect_stderr(stderr),
+            ):
+                persisted = providers._persist_failure_artifacts(
+                    self.review,
+                    "review failed safely\n",
+                    (),
+                )
+
+            self.assertFalse(persisted)
+            self.assertEqual(
+                victim_attempts.read_text(encoding="utf-8"), original_attempts
+            )
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep me\n")
+            self.assertEqual(
+                (moved_container / "runner-error.txt").read_text(encoding="utf-8"),
+                "review failed safely\n",
+            )
+            self.assertFalse((moved_container / "attempts.json").exists())
+            self.assertIn("review attempts were not persisted", stderr.getvalue())
+        finally:
+            if container.is_symlink():
+                container.unlink()
+            if moved_container.is_dir():
+                moved_container.rename(container)
+            victim_attempts.unlink(missing_ok=True)
+            sentinel.unlink(missing_ok=True)
+            victim.rmdir()
+
     def test_finish_preserves_unicode_separator_at_result_edges(self) -> None:
         final_text = "\u2028No findings.\u2029"
 

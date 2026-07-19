@@ -54,6 +54,7 @@ from .workspace import (
     remove_ready_review_container,
     open_bound_review_lock,
     validate_workspace_layout,
+    write_bound_review_json,
     write_bound_review_text,
 )
 
@@ -168,52 +169,22 @@ def _preparing_state_marker_payload(
     }
 
 
-def _fsync_state_marker_container(
-    container: pathlib.Path,
-    *,
-    expected: CleanupIdentity,
-) -> None:
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_CLOEXEC", 0)
-    )
-    descriptor: int | None = None
-    try:
-        descriptor = os.open(container, flags)
-        opened = os.fstat(descriptor)
-        current = os.lstat(container)
-        for metadata in (opened, current):
-            if (
-                not stat.S_ISDIR(metadata.st_mode)
-                or stat.S_ISLNK(metadata.st_mode)
-                or CleanupIdentity(metadata.st_dev, metadata.st_ino) != expected
-            ):
-                raise ReviewError(
-                    "isolated-review state marker container identity changed"
-                )
-        os.fsync(descriptor)
-        final = os.lstat(container)
-        if CleanupIdentity(final.st_dev, final.st_ino) != expected:
-            raise ReviewError("isolated-review state marker container identity changed")
-    except OSError as error:
-        raise ReviewError(
-            f"cannot durably persist isolated-review state marker: {error}"
-        ) from error
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-
-
 def _write_state_marker_payload(
     container: pathlib.Path,
     payload: dict[str, Any],
     *,
-    expected: CleanupIdentity,
+    expected: PrivateCleanupEvidence,
 ) -> None:
-    write_json(container / STATE_MARKER, payload)
-    _fsync_state_marker_container(container, expected=expected)
+    marker_error = write_bound_review_json(
+        container,
+        expected=expected,
+        name=STATE_MARKER,
+        value=payload,
+    )
+    if marker_error:
+        raise ReviewError(
+            f"cannot durably persist isolated-review state marker: {marker_error}"
+        )
 
 
 def _write_preparing_state_marker(
@@ -223,7 +194,7 @@ def _write_preparing_state_marker(
     _write_state_marker_payload(
         container,
         _preparing_state_marker_payload(container, private_cleanup),
-        expected=private_cleanup.container,
+        expected=private_cleanup,
     )
 
 
@@ -231,7 +202,7 @@ def _write_state_marker(review: ReviewWorkspace) -> None:
     _write_state_marker_payload(
         review.container_dir,
         _state_marker_payload(review),
-        expected=review.private_cleanup.container,
+        expected=review.private_cleanup,
     )
 
 

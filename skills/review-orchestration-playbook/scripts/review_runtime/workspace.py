@@ -2141,25 +2141,24 @@ def remove_private_review_artifacts(
     return None
 
 
-def write_bound_review_text(
+BOUND_REVIEW_TEXT_ARTIFACT_NAMES = frozenset(
+    {"cleanup-error.txt", "exit-code", "runner-error.txt"}
+)
+BOUND_REVIEW_JSON_ARTIFACT_NAMES = frozenset(
+    {REVIEW_STATE_MARKER_NAME, "attempts.json"}
+)
+
+
+def _write_bound_review_bytes(
     container: pathlib.Path,
     *,
     expected: PrivateCleanupEvidence,
     name: str,
-    text: str,
+    encoded: bytes,
+    artifact_label: str,
 ) -> str | None:
-    """Persist one runtime text artifact inside the preparation-bound container."""
-
-    if name not in {"cleanup-error.txt", "exit-code", "runner-error.txt"}:
-        return "review runtime text artifact name is not allowed"
-
-    try:
-        encoded = text.encode("utf-8")
-    except UnicodeEncodeError as error:
-        return f"cannot encode runner diagnostic: {error}"
-
-    def persist_text(
-        _parent_descriptor: int,
+    def persist_bytes(
+        parent_descriptor: int,
         container_descriptor: int,
     ) -> list[str]:
         if (
@@ -2179,6 +2178,7 @@ def write_bound_review_text(
         )
         descriptor: int | None = None
         handle: BinaryIO | None = None
+        read_descriptor: int | None = None
         try:
             descriptor = os.open(
                 temporary_name,
@@ -2199,10 +2199,106 @@ def write_bound_review_text(
                 src_dir_fd=container_descriptor,
                 dst_dir_fd=container_descriptor,
             )
+            read_flags = (
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+            )
+            read_descriptor = os.open(
+                target_name,
+                read_flags,
+                dir_fd=container_descriptor,
+            )
+            opened = os.fstat(read_descriptor)
+            current = os.stat(
+                target_name,
+                dir_fd=container_descriptor,
+                follow_symlinks=False,
+            )
+            for metadata in (opened, current):
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    return [f"{artifact_label} is not a regular file with one link"]
+                if metadata.st_uid != os.geteuid():
+                    return [f"{artifact_label} has an unexpected owner"]
+                if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                    return [f"{artifact_label} must not be group or other writable"]
+            if _private_cleanup_identity(opened) != _private_cleanup_identity(current):
+                return [f"{artifact_label} changed during persistence"]
+            readback = bytearray()
+            while len(readback) <= len(encoded):
+                chunk = os.read(
+                    read_descriptor,
+                    min(64 * 1024, len(encoded) + 1 - len(readback)),
+                )
+                if not chunk:
+                    break
+                readback.extend(chunk)
+            final = os.fstat(read_descriptor)
+            current_after = os.stat(
+                target_name,
+                dir_fd=container_descriptor,
+                follow_symlinks=False,
+            )
+            artifact_states = {
+                (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    metadata.st_mode,
+                    metadata.st_nlink,
+                    metadata.st_uid,
+                    metadata.st_size,
+                    metadata.st_mtime_ns,
+                    metadata.st_ctime_ns,
+                )
+                for metadata in (opened, current, final, current_after)
+            }
+            if len(artifact_states) != 1 or bytes(readback) != encoded:
+                return [f"{artifact_label} changed during persistence"]
             os.fsync(container_descriptor)
+            bound_parent = os.fstat(parent_descriptor)
+            canonical_parent = os.lstat(container.parent)
+            for metadata in (bound_parent, canonical_parent):
+                parent_error = _private_cleanup_directory_error(
+                    metadata,
+                    label="private artifact parent",
+                    require_private_mode=False,
+                )
+                if parent_error:
+                    return [parent_error]
+            if _private_cleanup_identity(bound_parent) != _private_cleanup_identity(
+                canonical_parent
+            ):
+                return [
+                    "private artifact parent changed after runtime artifact persistence"
+                ]
+            bound_container = os.stat(
+                container.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            canonical_container = os.lstat(container)
+            for metadata in (bound_container, canonical_container):
+                container_error = _private_cleanup_directory_error(
+                    metadata,
+                    label="private artifact container",
+                    require_private_mode=True,
+                )
+                if container_error:
+                    return [container_error]
+            if any(
+                _cleanup_identity_evidence(metadata) != expected.container
+                for metadata in (bound_container, canonical_container)
+            ):
+                return [
+                    "private artifact container changed after runtime artifact "
+                    "persistence"
+                ]
         except OSError as error:
-            return [f"cannot persist review runtime text artifact: {error}"]
+            return [f"cannot persist {artifact_label}: {error}"]
         finally:
+            if read_descriptor is not None:
+                os.close(read_descriptor)
             if handle is not None:
                 handle.close()
             elif descriptor is not None:
@@ -2215,7 +2311,56 @@ def write_bound_review_text(
                 pass
         return []
 
-    return _operate_on_private_review_container(container, persist_text)
+    return _operate_on_private_review_container(container, persist_bytes)
+
+
+def write_bound_review_text(
+    container: pathlib.Path,
+    *,
+    expected: PrivateCleanupEvidence,
+    name: str,
+    text: str,
+) -> str | None:
+    """Persist one runtime text artifact inside the preparation-bound container."""
+
+    if name not in BOUND_REVIEW_TEXT_ARTIFACT_NAMES:
+        return "review runtime text artifact name is not allowed"
+
+    try:
+        encoded = text.encode("utf-8")
+    except UnicodeEncodeError as error:
+        return f"cannot encode runner diagnostic: {error}"
+    return _write_bound_review_bytes(
+        container,
+        expected=expected,
+        name=name,
+        encoded=encoded,
+        artifact_label="review runtime text artifact",
+    )
+
+
+def write_bound_review_json(
+    container: pathlib.Path,
+    *,
+    expected: PrivateCleanupEvidence,
+    name: str,
+    value: Any,
+) -> str | None:
+    """Persist one runtime JSON artifact inside the preparation-bound container."""
+
+    if name not in BOUND_REVIEW_JSON_ARTIFACT_NAMES:
+        return "review runtime JSON artifact name is not allowed"
+    try:
+        encoded = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as error:
+        return f"cannot encode review runtime JSON artifact: {error}"
+    return _write_bound_review_bytes(
+        container,
+        expected=expected,
+        name=name,
+        encoded=encoded,
+        artifact_label="review runtime JSON artifact",
+    )
 
 
 def write_bound_runner_error(
@@ -2240,7 +2385,7 @@ def remove_bound_review_text(
 ) -> str | None:
     """Remove one runtime text artifact from the preparation-bound container."""
 
-    if name not in {"cleanup-error.txt", "exit-code", "runner-error.txt"}:
+    if name not in BOUND_REVIEW_TEXT_ARTIFACT_NAMES:
         return "review runtime text artifact name is not allowed"
 
     def remove_text(
@@ -5511,6 +5656,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     )
     private_changed_paths_file = review.container_dir / PRIVATE_CHANGED_PATHS_NAME
     changed_path_count = 0
+    changed_path_digest_evidence: list[str] = []
     changed_path_artifact = control_artifacts[CHANGED_PATH_DIGESTS_NAME]
     with (
         _secure_file_reader(
@@ -5557,6 +5703,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
                     "external review changed path digests do not match "
                     "helper-private changed paths"
                 )
+            changed_path_digest_evidence.append(expected_digest.decode("ascii"))
             legacy_path_token_id = catalog_legacy_path_matcher.match(raw_path)
             if legacy_path_token_id is not None:
                 record_finding(
@@ -5596,10 +5743,16 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
         raise ReviewError(
             "external review changed paths do not match helper-private record state"
         )
+    _reject_raw_values_in_evidence(
+        changed_path_digest_evidence,
+        accepted_values=evidence_sensitive_values,
+        label="frozen changed path digest evidence",
+    )
     changed_blob_findings = (
         review.workspace_root / ".codex-review/changed-blob-findings.z"
     )
     changed_blob_record_count = 0
+    changed_blob_path_digest_evidence: list[str] = []
     changed_blob_artifact = control_artifacts["changed-blob-findings.z"]
     with _secure_file_reader(
         changed_blob_findings,
@@ -5628,6 +5781,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
                 ) from error
             if re.fullmatch(r"[0-9a-f]{64}", path_digest) is None:
                 raise ReviewError("external review changed-blob findings are malformed")
+            changed_blob_path_digest_evidence.append(path_digest)
             changed_blob_record_count += 3
             record_finding(f"<redacted changed blob path> ({rule}; {side}-blob)")
     if changed_blob_record_count != changed_blob_artifact.record_count:
@@ -5635,6 +5789,11 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
             "external review changed-blob findings do not match "
             "helper-private record state"
         )
+    _reject_raw_values_in_evidence(
+        changed_blob_path_digest_evidence,
+        accepted_values=evidence_sensitive_values,
+        label="changed-blob finding path digest evidence",
+    )
     snapshot_entries = 0
     for candidate in review.workspace_root.rglob("*"):
         relative_path = candidate.relative_to(review.workspace_root)

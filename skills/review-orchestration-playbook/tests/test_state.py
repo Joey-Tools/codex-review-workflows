@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import pathlib
 import signal
@@ -157,6 +158,173 @@ class StatefulLifecycleTest(unittest.TestCase):
             state._load_state_marker_cleanup(self.review.container_dir),
             self.review.private_cleanup,
         )
+
+    def test_ready_marker_bound_write_survives_container_swap_back(self) -> None:
+        container = self.review.container_dir
+        moved_container = container.with_name(f"{container.name}-marker-bound")
+        replacement = container.with_name(f"{container.name}-marker-replacement")
+        guard = state.ReviewPreparationGuard()
+        guard.accept_preparation_cleanup(container, self.review.private_cleanup)
+        real_replace = os.replace
+        swapped = False
+
+        def swap_around_bound_replace(source, destination, *args, **kwargs):
+            nonlocal swapped
+            if destination != state.STATE_MARKER or kwargs.get("dst_dir_fd") is None:
+                return real_replace(source, destination, *args, **kwargs)
+            swapped = True
+            container.rename(moved_container)
+            container.mkdir(mode=0o700)
+            (container / "sentinel").write_text("keep me\n", encoding="utf-8")
+            result = real_replace(source, destination, *args, **kwargs)
+            container.rename(replacement)
+            moved_container.rename(container)
+            return result
+
+        try:
+            with mock.patch.object(
+                os, "replace", side_effect=swap_around_bound_replace
+            ):
+                guard.accept_workspace(self.review)
+
+            self.assertTrue(swapped)
+            self.assertIs(guard.review, self.review)
+            self.assertEqual(state._load_state_marker(container).phase, "ready")
+            self.assertFalse((replacement / state.STATE_MARKER).exists())
+            self.assertEqual(
+                (replacement / "sentinel").read_text(encoding="utf-8"),
+                "keep me\n",
+            )
+        finally:
+            guard.close()
+            if replacement.is_dir():
+                (replacement / "sentinel").unlink(missing_ok=True)
+                replacement.rmdir()
+
+    def test_ready_marker_rejects_container_left_replaced_after_bound_write(
+        self,
+    ) -> None:
+        container = self.review.container_dir
+        moved_container = container.with_name(f"{container.name}-marker-bound")
+        guard = state.ReviewPreparationGuard()
+        guard.accept_preparation_cleanup(container, self.review.private_cleanup)
+        real_replace = os.replace
+        swapped = False
+
+        def leave_replacement_after_bound_replace(
+            source,
+            destination,
+            *args,
+            **kwargs,
+        ):
+            nonlocal swapped
+            if destination != state.STATE_MARKER or kwargs.get("dst_dir_fd") is None:
+                return real_replace(source, destination, *args, **kwargs)
+            swapped = True
+            container.rename(moved_container)
+            container.mkdir(mode=0o700)
+            (container / "sentinel").write_text("keep me\n", encoding="utf-8")
+            return real_replace(source, destination, *args, **kwargs)
+
+        try:
+            with (
+                mock.patch.object(
+                    os,
+                    "replace",
+                    side_effect=leave_replacement_after_bound_replace,
+                ),
+                self.assertRaisesRegex(
+                    ReviewError,
+                    "container changed after runtime artifact persistence",
+                ),
+            ):
+                guard.accept_workspace(self.review)
+
+            self.assertTrue(swapped)
+            self.assertIsNone(guard.review)
+            self.assertFalse((container / state.STATE_MARKER).exists())
+            self.assertEqual(
+                (container / "sentinel").read_text(encoding="utf-8"),
+                "keep me\n",
+            )
+            self.assertEqual(
+                json.loads(
+                    (moved_container / state.STATE_MARKER).read_text(encoding="utf-8")
+                )["phase"],
+                "ready",
+            )
+        finally:
+            guard.close()
+            if container.is_dir():
+                (container / "sentinel").unlink(missing_ok=True)
+                container.rmdir()
+            if moved_container.is_dir():
+                moved_container.rename(container)
+
+    def test_ready_marker_rejects_parent_left_replaced_after_bound_write(
+        self,
+    ) -> None:
+        container = self.review.container_dir
+        parent = container.parent
+        moved_parent = parent.with_name(f"{parent.name}-marker-bound")
+        moved_container = moved_parent / container.name
+        guard = state.ReviewPreparationGuard()
+        guard.accept_preparation_cleanup(container, self.review.private_cleanup)
+        real_replace = os.replace
+        swapped = False
+
+        def leave_parent_replacement_after_bound_replace(
+            source,
+            destination,
+            *args,
+            **kwargs,
+        ):
+            nonlocal swapped
+            if destination != state.STATE_MARKER or kwargs.get("dst_dir_fd") is None:
+                return real_replace(source, destination, *args, **kwargs)
+            swapped = True
+            parent.rename(moved_parent)
+            parent.mkdir(mode=0o700)
+            container.mkdir(mode=0o700)
+            (container / "sentinel").write_text("keep me\n", encoding="utf-8")
+            return real_replace(source, destination, *args, **kwargs)
+
+        try:
+            with (
+                mock.patch.object(
+                    os,
+                    "replace",
+                    side_effect=leave_parent_replacement_after_bound_replace,
+                ),
+                self.assertRaisesRegex(
+                    ReviewError,
+                    "parent changed after runtime artifact persistence",
+                ),
+            ):
+                guard.accept_workspace(self.review)
+
+            self.assertTrue(swapped)
+            self.assertIsNone(guard.review)
+            self.assertFalse((container / state.STATE_MARKER).exists())
+            self.assertEqual(
+                (container / "sentinel").read_text(encoding="utf-8"),
+                "keep me\n",
+            )
+            self.assertEqual(
+                json.loads(
+                    (moved_container / state.STATE_MARKER).read_text(encoding="utf-8")
+                )["phase"],
+                "ready",
+            )
+        finally:
+            guard.close()
+            if container.is_dir():
+                (container / "sentinel").unlink(missing_ok=True)
+                container.rmdir()
+            if parent.is_dir():
+                parent.rmdir()
+            if moved_parent.is_dir():
+                moved_parent.rename(parent)
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "requires FIFO support")
     def test_state_marker_fifo_is_rejected_without_blocking(self) -> None:
