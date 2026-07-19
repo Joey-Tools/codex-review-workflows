@@ -193,6 +193,25 @@ class ChildEnvironmentTest(unittest.TestCase):
 
         self.assertEqual(completed.stdout, b"review prompt")
 
+    def test_bounded_capture_supports_mutable_stdin(self) -> None:
+        payload = bytearray(b"mutable review prompt")
+        completed = common.run_bounded_capture(
+            (
+                sys.executable,
+                "-c",
+                "import os,sys; os.write(1, sys.stdin.buffer.read())",
+            ),
+            stdin=payload,
+            timeout_seconds=5,
+            stdout_limit_bytes=4096,
+            stderr_limit_bytes=4096,
+        )
+
+        self.assertEqual(completed.stdout, payload)
+        payload[:] = b"\x00" * len(payload)
+        completed.stdout[:] = b"\x00" * len(completed.stdout)
+        completed.stderr[:] = b"\x00" * len(completed.stderr)
+
     @mock.patch.object(common.threading, "Thread")
     def test_failed_drain_thread_start_is_not_joined(
         self, thread_factory: mock.Mock
@@ -489,6 +508,134 @@ class ChildEnvironmentTest(unittest.TestCase):
                 initial_signal=signal.SIGTERM,
                 signal_already_sent=True,
             )
+
+    def test_logged_command_does_not_publish_failed_process_start(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            on_process_started = mock.Mock()
+            with (
+                mock.patch.object(
+                    common.subprocess,
+                    "Popen",
+                    side_effect=OSError("spawn failed"),
+                ),
+                mock.patch.object(
+                    common.signal,
+                    "signal",
+                    return_value=signal.SIG_DFL,
+                ),
+                mock.patch.object(
+                    common,
+                    "block_forwarded_signals",
+                    return_value=None,
+                ),
+            ):
+                with self.assertRaisesRegex(OSError, "spawn failed"):
+                    common.run(
+                        ("reviewer",),
+                        stdout_path=root / "stdout.log",
+                        stderr_path=root / "stderr.log",
+                        on_process_started=on_process_started,
+                    )
+
+            on_process_started.assert_not_called()
+
+    def test_logged_command_publishes_successful_process_start_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            events: list[str] = []
+            process = mock.Mock(pid=12345, returncode=0)
+
+            def communicate(*, input=None):
+                self.assertIsNone(input)
+                events.append("communicate")
+
+            process.communicate.side_effect = communicate
+
+            def spawn(*args, **kwargs):
+                events.append("spawn")
+                return process
+
+            on_process_started = mock.Mock(
+                side_effect=lambda: events.append("started")
+            )
+            with (
+                mock.patch.object(common.subprocess, "Popen", side_effect=spawn),
+                mock.patch.object(
+                    common.signal,
+                    "signal",
+                    return_value=signal.SIG_DFL,
+                ),
+                mock.patch.object(common, "terminate_process_group"),
+                mock.patch.object(
+                    common,
+                    "block_forwarded_signals",
+                    return_value=None,
+                ),
+            ):
+                common.run(
+                    ("reviewer",),
+                    stdout_path=root / "stdout.log",
+                    stderr_path=root / "stderr.log",
+                    on_process_started=on_process_started,
+                )
+
+            self.assertEqual(events, ["spawn", "started", "communicate"])
+            on_process_started.assert_called_once_with()
+
+    def test_logged_command_publishes_start_before_pending_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            events: list[str] = []
+            installed: dict[signal.Signals, object] = {}
+            process = mock.Mock(pid=12345, returncode=None)
+
+            def install_handler(signum, handler):
+                previous = installed.get(signum, signal.SIG_DFL)
+                installed[signum] = handler
+                return previous
+
+            def spawn(*args, **kwargs):
+                events.append("spawn")
+                return process
+
+            def publish_process_start():
+                events.append("hook")
+                handler = installed[signal.SIGTERM]
+                assert callable(handler)
+                handler(signal.SIGTERM, None)
+                events.append("started")
+
+            on_process_started = mock.Mock(side_effect=publish_process_start)
+            with (
+                mock.patch.object(common.subprocess, "Popen", side_effect=spawn),
+                mock.patch.object(common.signal, "signal", side_effect=install_handler),
+                mock.patch.object(
+                    common,
+                    "signal_process_group",
+                    side_effect=lambda *_args: events.append("forward"),
+                ),
+                mock.patch.object(common, "terminate_process_group"),
+                mock.patch.object(
+                    common,
+                    "block_forwarded_signals",
+                    return_value=None,
+                ),
+            ):
+                with self.assertRaises(common.ForwardedSignal) as raised:
+                    common.run(
+                        ("reviewer",),
+                        stdout_path=root / "stdout.log",
+                        stderr_path=root / "stderr.log",
+                        on_process_started=on_process_started,
+                    )
+
+            self.assertEqual(raised.exception.signum, signal.SIGTERM)
+            self.assertEqual(
+                events[:4],
+                ["spawn", "hook", "started", "forward"],
+            )
+            on_process_started.assert_called_once_with()
 
     def test_passes_only_review_runtime_and_auth_environment(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

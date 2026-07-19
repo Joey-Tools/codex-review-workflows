@@ -410,6 +410,89 @@ time.sleep(0.2)
         unblock.assert_called_once_with()
         self.assertEqual((state_dir / state.EXIT_FILE).read_text().strip(), "0")
 
+    def test_runner_records_forwarded_signal_detail_for_stateful_final(self) -> None:
+        state_dir = self.review.container_dir
+        (state_dir / state.STATE_MARKER).write_text(
+            "isolated-review-state-v1\n",
+            encoding="utf-8",
+        )
+        write_json(
+            state_dir / state.STATE_FILE,
+            {
+                "version": 1,
+                "reviewer": "claude",
+                "egress_consent": "double-review",
+                "workspace": self.review.to_json(),
+            },
+        )
+        carrier = state_dir / "claude-runtime" / "linux" / "claude-carrier-signal"
+        detail = f"private recovery carrier retained at {carrier}"
+
+        with mock.patch.object(
+            state,
+            "run_review",
+            side_effect=state.ForwardedSignal(signal.SIGTERM, detail=detail),
+        ):
+            exit_code = state.run_state(state_dir=state_dir)
+
+        self.assertEqual(exit_code, 128 + signal.SIGTERM)
+        runner_error = (state_dir / "runner-error.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(f"signal {int(signal.SIGTERM)}", runner_error)
+        self.assertIn(str(carrier), runner_error)
+        self.assertEqual(
+            (state_dir / state.EXIT_FILE).read_text(encoding="utf-8").strip(),
+            str(128 + signal.SIGTERM),
+        )
+
+    def test_runner_preserves_signal_exit_when_diagnostic_write_fails(self) -> None:
+        state_dir = self.review.container_dir
+        (state_dir / state.STATE_MARKER).write_text(
+            "isolated-review-state-v1\n",
+            encoding="utf-8",
+        )
+        write_json(
+            state_dir / state.STATE_FILE,
+            {
+                "version": 1,
+                "reviewer": "claude",
+                "egress_consent": "double-review",
+                "workspace": self.review.to_json(),
+            },
+        )
+        runner_error_path = state_dir / "runner-error.txt"
+        original_write_text_atomic = state.write_text_atomic
+
+        def fail_runner_error_write(path: pathlib.Path, text: str) -> None:
+            if path == runner_error_path:
+                raise RuntimeError("runner error diagnostic unavailable")
+            original_write_text_atomic(path, text)
+
+        with (
+            mock.patch.object(
+                state,
+                "run_review",
+                side_effect=state.ForwardedSignal(
+                    signal.SIGTERM,
+                    detail="recovery carrier retained",
+                ),
+            ),
+            mock.patch.object(
+                state,
+                "write_text_atomic",
+                side_effect=fail_runner_error_write,
+            ),
+        ):
+            exit_code = state.run_state(state_dir=state_dir)
+
+        self.assertEqual(exit_code, 128 + signal.SIGTERM)
+        self.assertEqual(
+            (state_dir / state.EXIT_FILE).read_text(encoding="utf-8").strip(),
+            str(128 + signal.SIGTERM),
+        )
+        self.assertFalse(runner_error_path.exists())
+
     def test_runner_installs_signal_handler_before_unblocking_inherited_mask(
         self,
     ) -> None:
