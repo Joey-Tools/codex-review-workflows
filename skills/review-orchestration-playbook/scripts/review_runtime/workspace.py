@@ -3494,12 +3494,15 @@ def _reject_unselected_legacy_reduction_candidates(
     candidates: Mapping[bytes, Iterable[str]],
 ) -> None:
     selected_exemption_ids = frozenset(exemption.identifier for exemption in exemptions)
-    unselected_legacy_values = {
-        token.value: exemption.identifier
-        for exemption in catalog.legacy_exemptions
-        if exemption.identifier not in selected_exemption_ids
-        for token in exemption.values
-    }
+    unselected_legacy_values: dict[bytes, str] = {}
+    for exemption in catalog.legacy_exemptions:
+        if exemption.identifier in selected_exemption_ids:
+            continue
+        for token in exemption.values:
+            for representation in (token.value, base64.b64encode(token.value)):
+                previous = unselected_legacy_values.get(representation)
+                if previous is None or exemption.identifier < previous:
+                    unselected_legacy_values[representation] = exemption.identifier
     unselected_legacy_matcher = _exact_path_matcher(unselected_legacy_values)
     unselected_legacy_candidates = {
         candidate: (tuple(rules), exemption_id)

@@ -8120,6 +8120,66 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             (2, 1),
         )
 
+    def test_unselected_legacy_storage_reduction_requires_explicit_exemption(
+        self,
+    ) -> None:
+        catalog = legacy_catalog(values=(LEGACY_A,))
+        storage = legacy_value_base64(LEGACY_A)
+        for label, candidate in (
+            ("exact", storage),
+            ("substring", "Prefix" + storage + "Suffix"),
+        ):
+            with self.subTest(case=label):
+                fixture = assignment_text("access_token", candidate)
+                repo, base = self.new_repo(
+                    {
+                        "fixture.cfg": fixture * 2,
+                        "legacy.txt": LEGACY_A + "\n",
+                    }
+                )
+                (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
+                head = self.commit(repo)
+
+                with mock.patch.object(
+                    workspace,
+                    "_secret_reduction_descriptor",
+                    wraps=workspace._secret_reduction_descriptor,
+                ) as descriptor:
+                    with self.assertRaisesRegex(
+                        ReviewError,
+                        "explicitly selected synthetic secret exemption",
+                    ) as raised:
+                        self.prepare(
+                            repo=repo,
+                            base=base,
+                            head=head,
+                            catalog=catalog,
+                        )
+                descriptor.assert_not_called()
+                message = str(raised.exception)
+                self.assertNotIn(LEGACY_A, message)
+                self.assertNotIn(storage, message)
+                self.assertNotIn(candidate, message)
+
+                review = self.prepare(
+                    repo=repo,
+                    base=base,
+                    head=head,
+                    catalog=catalog,
+                    exemptions=("historical-fixtures",),
+                )
+                evidence = self.validate(review, catalog=catalog)
+                counts = evidence["synthetic_tokens"]["legacy_counts"]
+                reductions = evidence["synthetic_tokens"]["secret_reductions"]
+                self.assertEqual(
+                    (counts[0]["base_count"], counts[0]["head_count"]),
+                    (1, 1),
+                )
+                self.assertEqual(
+                    (reductions[0]["base_count"], reductions[0]["head_count"]),
+                    (2, 1),
+                )
+
     def test_runtime_catalog_rechecks_unselected_legacy_reduction_overlap(
         self,
     ) -> None:
@@ -8147,6 +8207,37 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             self.validate(review, catalog=mutated_catalog)
         self.assertNotIn(candidate.decode("ascii"), str(raised.exception))
         self.assertNotIn(legacy_substring, str(raised.exception))
+
+    def test_runtime_catalog_rechecks_unselected_legacy_storage_overlap(
+        self,
+    ) -> None:
+        catalog = synthetic_tokens.load_catalog()
+        raw_value = "RuntimeCatalogLegacyA9Z8Y7"
+        storage = legacy_value_base64(raw_value)
+        candidate = "Prefix" + storage + "Suffix"
+        fixture = assignment_text("access_token", candidate)
+        repo, base = self.new_repo({"fixture.cfg": fixture * 2})
+        (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
+        head = self.commit(repo)
+        review = self.prepare(
+            repo=repo,
+            base=base,
+            head=head,
+            catalog=catalog,
+        )
+        mutated_catalog = legacy_catalog(values=(raw_value,))
+        self.assertEqual(mutated_catalog.schema_version, catalog.schema_version)
+        self.assertEqual(mutated_catalog.pool_version, catalog.pool_version)
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "explicitly selected synthetic secret exemption",
+        ) as raised:
+            self.validate(review, catalog=mutated_catalog)
+        message = str(raised.exception)
+        self.assertNotIn(raw_value, message)
+        self.assertNotIn(storage, message)
+        self.assertNotIn(candidate, message)
 
     def test_runtime_catalog_rechecks_base_only_legacy_paths(self) -> None:
         catalog = synthetic_tokens.load_catalog()

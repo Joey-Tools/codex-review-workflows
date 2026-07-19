@@ -52,7 +52,7 @@ Diagnostic and preflight evidence remain bounded audit surfaces. They use stable
 
 - Authoring entries keep their exact catalog-declared scanner-rule acceptance behavior.
 - Explicit legacy envelopes keep the existing non-increasing raw and unembedded count policy, including equal-count moves between safe paths when all other legacy checks pass.
-- Dynamic reduction does not create catalog entries, select a legacy envelope, weaken catalog validation, or relax sensitive-path checks. A dynamic candidate that equals or contains a value registered in an unselected legacy envelope must use explicit legacy selection and cannot reclassify that catalog value as part of an unregistered deletion.
+- Dynamic reduction does not create catalog entries, select a legacy envelope, weaken catalog validation, or relax sensitive-path checks. A dynamic candidate that equals or contains either a raw value or its canonical Base64 storage encoding from an unselected legacy envelope must use explicit legacy selection and cannot reclassify that catalog value as part of an unregistered deletion.
 - New fixtures must still use the authoring pool, and master-proven historical fixtures must still use explicit legacy selection.
 
 ## Current State
@@ -90,12 +90,12 @@ Diagnostic and preflight evidence remain bounded audit surfaces. They use stable
 
 ## Validation
 
-- Post-integration frozen-range review found and fixed scope/scanner gaps: initialized submodule content can no longer enter `review.diff`; wrapped/triple/multiline and opposite-quote generic literals now participate in exact reduction proof; malformed closer prefixes remain blockers instead of disappearing or producing a reduction candidate; provider-specific and PEM events are charged exactly once regardless of later accepted/blocking classification. `PublicPoolScannerTest`: 96 passed. Synthetic-token module: 215 passed.
+- Post-integration frozen-range review found and fixed scope/scanner gaps: initialized submodule content can no longer enter `review.diff`; wrapped/triple/multiline and opposite-quote generic literals now participate in exact reduction proof; malformed closer prefixes remain blockers instead of disappearing or producing a reduction candidate; provider-specific and PEM events are charged exactly once regardless of later accepted/blocking classification; unselected legacy overlap covers raw and canonical Base64 representations during preparation and runtime catalog reload. `PublicPoolScannerTest`: 96 passed. Synthetic-token module: 217 passed.
 - Focused complete-path, catalog-reload, side-binding, quarantine-before-recursion, and failure-regression runs passed. The final lifecycle gate additionally passed 66 state-module tests, 31 cleanup/handoff/durability tests, 12 state-start tests, and the missing-to-concurrent-create durability race regressions.
 - Latest `master` (`6dc2050`) was merged without rewriting history. Its Claude authentication, recovery-carrier, and refresh-lock fail-closed policies remain intact; authentication failure is not a Copilot fallback reason.
 - Provider tests: 457 passed, 3 platform-conditional skips.
-- Python 3.13 full suite: 1209 tests passed, 4 skipped.
-- Python 3.10.19 full suite: 1209 tests passed, 4 skipped.
+- Python 3.13 full suite: 1211 tests passed, 4 skipped.
+- Python 3.10.19 full suite: 1211 tests passed, 4 skipped.
 - `ruff check` and `ruff format --check` on all 10 Python files changed from the refreshed `master`: passed.
 - `git diff --check`: passed.
 - Fixed-range Codex review and PR readiness evidence are recorded in the delivery thread and PR.
