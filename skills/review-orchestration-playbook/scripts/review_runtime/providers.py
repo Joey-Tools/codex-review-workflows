@@ -110,6 +110,7 @@ from .workspace import (
     MAX_REVIEW_PROMPT_BYTES,
     ReviewWorkspace,
     build_preflight_evidence,
+    encode_preflight_json,
     remove_private_review_artifacts,
     validate_external_workspace,
     write_bound_review_json,
@@ -12383,6 +12384,7 @@ def run_review(
     try:
         synthetic_evidence = validate_external_workspace(review) or {}
         preflight_evidence = build_preflight_evidence(review, synthetic_evidence)
+        preflight_json = encode_preflight_json(preflight_evidence)
     except ReviewError as error:
         private_cleanup_error = remove_private_review_artifacts(
             review.container_dir,
@@ -12410,7 +12412,10 @@ def run_review(
         _persist_runner_error(review, diagnostic)
         return Outcome(2, None, tuple())
 
-    write_json(review.container_dir / "preflight.json", preflight_evidence)
+    write_text_atomic(
+        review.container_dir / "preflight.json",
+        preflight_json,
+    )
 
     if reviewer == "claude":
         write_json(

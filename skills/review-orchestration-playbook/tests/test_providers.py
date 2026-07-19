@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import errno
+import hashlib
 import io
 import itertools
 import json
@@ -18251,6 +18252,15 @@ class ProviderPolicyTest(unittest.TestCase):
                     (self.review.container_dir / name).exists()
                     for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
                 )
+            )
+            diff_bytes = self.review.diff_file.read_bytes()
+            self.assertEqual(
+                evidence["primary_diff"],
+                {
+                    "path": ".codex-review/review.diff",
+                    "sha256": hashlib.sha256(diff_bytes).hexdigest(),
+                    "size": len(diff_bytes),
+                },
             )
             return "success", "No findings."
 

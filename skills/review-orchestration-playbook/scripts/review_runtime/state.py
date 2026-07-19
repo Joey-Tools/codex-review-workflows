@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import fcntl
 import json
 import math
 import os
 import pathlib
+import re
 import signal
 import stat
 import subprocess
@@ -12,7 +14,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, BinaryIO, Callable, Iterator
 
 from .common import (
     PROCESS_GROUP_TERM_GRACE_SECONDS,
@@ -32,6 +34,7 @@ from .common import (
 )
 from .providers import run_review
 from .workspace import (
+    MAX_PREFLIGHT_JSON_BYTES,
     PRIVATE_HELPER_ARTIFACT_NAMES,
     REVIEW_CLEANUP_LOCK_NAME,
     REVIEW_RUNNER_LOCK_NAME,
@@ -41,6 +44,9 @@ from .workspace import (
     LegacyReviewWorkspace,
     PrivateCleanupEvidence,
     ReviewWorkspace,
+    _inspect_control_directory,
+    _load_control_artifact_state,
+    _read_bounded_json,
     cleanup_legacy_workspace,
     cleanup_workspace,
     load_bound_private_cleanup_state,
@@ -87,6 +93,9 @@ LOCK_FILE = REVIEW_RUNNER_LOCK_NAME
 CLEANUP_LOCK_FILE = REVIEW_CLEANUP_LOCK_NAME
 FINAL_CLEANUP_TIMEOUT_SECONDS = 30.0
 RUNNER_SHUTDOWN_GRACE_SECONDS = PROCESS_GROUP_TERM_GRACE_SECONDS * 4
+PRIMARY_DIFF_RELATIVE_PATH = ".codex-review/review.diff"
+SAFE_LEGACY_LOCK_MODES = frozenset({0o600, 0o604, 0o640, 0o644})
+PRIVATE_STATE_LEGACY_LOCK_MODES = SAFE_LEGACY_LOCK_MODES | {0o664}
 _STARTED_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
 
 
@@ -136,6 +145,277 @@ class LoadedStateMarker:
     phase: str
     private_cleanup: PrivateCleanupEvidence | None
     source_root: pathlib.Path | None
+
+
+@dataclass(frozen=True)
+class _CleanupLockSet:
+    container: BoundReviewLock
+    compatibility: BinaryIO
+
+    def fileno(self) -> int:
+        return self.compatibility.fileno()
+
+    def filenos(self) -> tuple[int, ...]:
+        return (*self.container.filenos(), self.compatibility.fileno())
+
+
+def _regular_file_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _validate_regular_file_path_identity(
+    path: pathlib.Path,
+    descriptor: int,
+    *,
+    label: str,
+    expected_mode: int | None = None,
+    expected_size: int | None = None,
+    dir_fd: int | None = None,
+    allow_group_or_other_write: bool = False,
+) -> os.stat_result:
+    try:
+        descriptor_before = os.fstat(descriptor)
+        path_before = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+        descriptor_after = os.fstat(descriptor)
+        path_after = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError as error:
+        raise ReviewError(f"cannot validate {label}: {error}") from error
+
+    descriptor_identity = _regular_file_identity(descriptor_before)
+    if descriptor_identity != _regular_file_identity(descriptor_after):
+        raise ReviewError(f"{label} changed while its identity was validated")
+    path_identity = _regular_file_identity(path_before)
+    if path_identity != _regular_file_identity(path_after):
+        raise ReviewError(f"{label} path changed while its identity was validated")
+    if descriptor_identity != path_identity:
+        raise ReviewError(f"{label} path does not match its open file descriptor")
+    if not stat.S_ISREG(descriptor_after.st_mode):
+        raise ReviewError(f"{label} is not a regular file")
+    if descriptor_after.st_uid != os.getuid():
+        raise ReviewError(f"{label} is not owned by the current user")
+    if descriptor_after.st_nlink != 1:
+        raise ReviewError(f"{label} must have exactly one hard link")
+    if expected_mode is not None:
+        if stat.S_IMODE(descriptor_after.st_mode) != expected_mode:
+            raise ReviewError(f"{label} mode must be exactly {expected_mode:04o}")
+    elif not allow_group_or_other_write and descriptor_after.st_mode & (
+        stat.S_IWGRP | stat.S_IWOTH
+    ):
+        raise ReviewError(f"{label} must not be group or other writable")
+    if expected_size is not None and descriptor_after.st_size != expected_size:
+        raise ReviewError(f"{label} has an unexpected size")
+    return descriptor_after
+
+
+def validate_private_lock_file(
+    path: pathlib.Path,
+    handle: BinaryIO,
+    *,
+    label: str,
+    dir_fd: int | None = None,
+) -> None:
+    _validate_regular_file_path_identity(
+        path,
+        handle.fileno(),
+        label=label,
+        expected_mode=0o600,
+        dir_fd=dir_fd,
+    )
+
+
+def validate_safe_legacy_lock_file(
+    path: pathlib.Path,
+    handle: BinaryIO,
+    *,
+    label: str,
+    allowed_modes: frozenset[int] = SAFE_LEGACY_LOCK_MODES,
+    dir_fd: int | None = None,
+) -> os.stat_result:
+    metadata = _validate_regular_file_path_identity(
+        path,
+        handle.fileno(),
+        label=label,
+        dir_fd=dir_fd,
+        allow_group_or_other_write=True,
+    )
+    mode = stat.S_IMODE(metadata.st_mode)
+    if mode not in allowed_modes:
+        raise ReviewError(f"{label} has an unsafe legacy mode")
+    if mode == 0o664 and metadata.st_size != 0:
+        raise ReviewError(f"{label} legacy 0664 file must be empty")
+    return metadata
+
+
+def open_private_lock_file(
+    path: pathlib.Path,
+    *,
+    label: str,
+    allow_legacy_read_mode: bool = False,
+    allowed_legacy_modes: frozenset[int] = SAFE_LEGACY_LOCK_MODES,
+    dir_fd: int | None = None,
+) -> BinaryIO:
+    existing_flags = (
+        os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+    )
+    descriptor: int | None = None
+    created = False
+    try:
+        try:
+            descriptor = os.open(
+                path,
+                existing_flags | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=dir_fd,
+            )
+            created = True
+        except FileExistsError:
+            existing_metadata = os.stat(
+                path,
+                dir_fd=dir_fd,
+                follow_symlinks=False,
+            )
+            existing_identity = (
+                existing_metadata.st_dev,
+                existing_metadata.st_ino,
+            )
+            descriptor = os.open(path, existing_flags, dir_fd=dir_fd)
+            opened_metadata = os.fstat(descriptor)
+            if existing_identity != (
+                opened_metadata.st_dev,
+                opened_metadata.st_ino,
+            ):
+                raise ReviewError(f"{label} changed before it could be opened safely")
+        if created:
+            os.fchmod(descriptor, 0o600)
+        handle = os.fdopen(descriptor, "r+b", buffering=0)
+        descriptor = None
+        try:
+            if allow_legacy_read_mode:
+                validate_safe_legacy_lock_file(
+                    path,
+                    handle,
+                    label=label,
+                    allowed_modes=allowed_legacy_modes,
+                    dir_fd=dir_fd,
+                )
+            else:
+                validate_private_lock_file(
+                    path,
+                    handle,
+                    label=label,
+                    dir_fd=dir_fd,
+                )
+        except BaseException:
+            handle.close()
+            raise
+        return handle
+    except OSError as error:
+        raise ReviewError(f"cannot open {label} safely: {error}") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _validate_private_directory_path_identity(
+    path: pathlib.Path,
+    descriptor: int,
+    *,
+    label: str,
+    expected_mode: int | None = None,
+    dir_fd: int | None = None,
+) -> None:
+    try:
+        descriptor_before = os.fstat(descriptor)
+        path_before = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+        descriptor_after = os.fstat(descriptor)
+        path_after = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError as error:
+        raise ReviewError(f"cannot validate {label}: {error}") from error
+
+    descriptor_identity = _directory_identity(descriptor_before)
+    if descriptor_identity != _directory_identity(descriptor_after):
+        raise ReviewError(f"{label} changed while its identity was validated")
+    path_identity = _directory_identity(path_before)
+    if path_identity != _directory_identity(path_after):
+        raise ReviewError(f"{label} path changed while its identity was validated")
+    if descriptor_identity != path_identity:
+        raise ReviewError(f"{label} path does not match its open descriptor")
+    if not stat.S_ISDIR(descriptor_after.st_mode):
+        raise ReviewError(f"{label} is not a real directory")
+    if descriptor_after.st_uid != os.geteuid():
+        raise ReviewError(f"{label} is not owned by the current user")
+    mode = stat.S_IMODE(descriptor_after.st_mode)
+    if expected_mode is not None:
+        if mode != expected_mode:
+            raise ReviewError(f"{label} mode must be exactly {expected_mode:04o}")
+    elif descriptor_after.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise ReviewError(f"{label} must not be group or other writable")
+
+
+@contextmanager
+def _open_private_cleanup_state_directory(
+    state_dir: pathlib.Path,
+) -> Iterator[tuple[int, Callable[[], None]]]:
+    review_root = state_dir.parent
+    if review_root.name != ".codex-tmp" or not state_dir.name.startswith(
+        "isolated-review-"
+    ):
+        raise ReviewError("review state directory is outside a private review root")
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW
+    review_root_fd: int | None = None
+    state_dir_fd: int | None = None
+    try:
+        review_root_fd = os.open(review_root, flags)
+        state_dir_fd = os.open(state_dir.name, flags, dir_fd=review_root_fd)
+
+        def revalidate() -> None:
+            assert review_root_fd is not None
+            assert state_dir_fd is not None
+            _validate_private_directory_path_identity(
+                review_root,
+                review_root_fd,
+                label="review state root",
+            )
+            _validate_private_directory_path_identity(
+                pathlib.Path(state_dir.name),
+                state_dir_fd,
+                label="review state directory",
+                expected_mode=0o700,
+                dir_fd=review_root_fd,
+            )
+
+        revalidate()
+        yield state_dir_fd, revalidate
+    except OSError as error:
+        raise ReviewError(
+            f"cannot open review state directory safely: {error}"
+        ) from error
+    finally:
+        if state_dir_fd is not None:
+            os.close(state_dir_fd)
+        if review_root_fd is not None:
+            os.close(review_root_fd)
 
 
 def _state_path(state_dir: pathlib.Path) -> pathlib.Path:
@@ -1174,28 +1454,77 @@ def _should_retain_fallback_workspace(
     ):
         return False
     try:
-        preflight = read_json(state_dir / "preflight.json")
-    except ReviewError:
-        return False
-    if isinstance(review, LegacyReviewWorkspace):
-        return (
-            preflight.get("review_range") == f"{review.base_ref}..{review.head_ref}"
-            and preflight.get("status")
-            == "sensitive-content and escaping-symlink checks passed"
+        preflight = _read_bounded_json(
+            state_dir / "preflight.json",
+            label="retained fallback preflight evidence",
+            max_bytes=MAX_PREFLIGHT_JSON_BYTES,
         )
-    preflight_matches = (
-        preflight.get("review_range") == f"{review.base_ref}..{review.head_ref}"
-        and preflight.get("private_artifacts") == "removed"
-        and preflight.get("status") == "secret-delta and escaping-symlink checks passed"
-    )
-    try:
+        if preflight.get("review_range") != f"{review.base_ref}..{review.head_ref}":
+            return False
+        if isinstance(review, LegacyReviewWorkspace):
+            return (
+                preflight.get("status")
+                == "sensitive-content and escaping-symlink checks passed"
+            )
+        if (
+            preflight.get("private_artifacts") != "removed"
+            or preflight.get("status")
+            != "secret-delta and escaping-symlink checks passed"
+        ):
+            return False
+        primary_diff = preflight.get("primary_diff")
+        if (
+            not isinstance(primary_diff, dict)
+            or set(primary_diff) != {"path", "sha256", "size"}
+            or primary_diff.get("path") != PRIMARY_DIFF_RELATIVE_PATH
+            or type(primary_diff.get("size")) is not int
+            or primary_diff["size"] < 0
+            or not isinstance(primary_diff.get("sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", primary_diff["sha256"]) is None
+        ):
+            return False
+
+        expected_diff_path = review.workspace_root / PRIMARY_DIFF_RELATIVE_PATH
+        if review.diff_file != expected_diff_path:
+            return False
+        control_state = _load_control_artifact_state(container_dir=state_dir)
+        expected_diff = control_state.artifacts["review.diff"]
+        if (
+            primary_diff["size"] != expected_diff.size
+            or primary_diff["sha256"] != expected_diff.sha256
+        ):
+            return False
+        control_dir = review.workspace_root / ".codex-review"
+        _inspect_control_directory(control_dir, expected=control_state.directory)
+        flags = (
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+        )
+        try:
+            descriptor = os.open(expected_diff_path, flags)
+        except OSError as error:
+            raise ReviewError(
+                f"cannot open retained fallback primary diff safely: {error}"
+            ) from error
+        try:
+            _validate_regular_file_path_identity(
+                expected_diff_path,
+                descriptor,
+                label="retained fallback primary diff",
+                expected_size=expected_diff.size,
+            )
+        finally:
+            os.close(descriptor)
+        _inspect_control_directory(control_dir, expected=control_state.directory)
         cleanup_state = load_bound_private_cleanup_state(
             review.container_dir,
             expected=review.private_cleanup,
         )
     except ReviewError:
         return False
-    return preflight_matches and cleanup_state.private_artifacts_removed == frozenset(
+    # This synchronous status path intentionally validates only bounded metadata.
+    # The actual fallback consumer must supervise a complete read and verify the
+    # primary diff SHA-256 against both attestations before using any diff bytes.
+    return cleanup_state.private_artifacts_removed == frozenset(
         PRIVATE_HELPER_ARTIFACT_NAMES
     )
 
@@ -1245,6 +1574,59 @@ def cleanup(state_dir: pathlib.Path, *, timeout_seconds: float | None) -> int:
     return _cleanup_terminal_workspace(state_dir, deadline=deadline, force=True)
 
 
+@contextmanager
+def _open_cleanup_locks(
+    state_dir: pathlib.Path,
+    marker: LoadedStateMarker,
+) -> Iterator[tuple[_CleanupLockSet, pathlib.Path, int, Callable[[], None]]]:
+    cleanup_lock_name = pathlib.Path(CLEANUP_LOCK_FILE)
+    with _open_private_cleanup_state_directory(state_dir) as (
+        state_dir_fd,
+        revalidate_state_directory,
+    ):
+        if marker.private_cleanup is not None:
+            metadata = os.fstat(state_dir_fd)
+            actual_identity = CleanupIdentity(metadata.st_dev, metadata.st_ino)
+            if actual_identity != marker.private_cleanup.container:
+                raise ReviewError(
+                    "cannot open preparation-bound cleanup lock: private artifact "
+                    "container does not match preparation identity"
+                )
+            container_lock, lock_error = open_bound_review_lock(
+                state_dir,
+                expected=marker.private_cleanup,
+                name=CLEANUP_LOCK_FILE,
+            )
+            if lock_error or container_lock is None:
+                raise ReviewError(
+                    "cannot open preparation-bound cleanup lock: "
+                    f"{lock_error or 'lock handle is unavailable'}"
+                )
+        else:
+            try:
+                container_lock = BoundReviewLock(os.dup(state_dir_fd))
+            except OSError as error:
+                raise ReviewError(
+                    f"cannot duplicate legacy cleanup directory lock: {error}"
+                ) from error
+        try:
+            with open_private_lock_file(
+                cleanup_lock_name,
+                label="review cleanup lock",
+                allow_legacy_read_mode=True,
+                allowed_legacy_modes=PRIVATE_STATE_LEGACY_LOCK_MODES,
+                dir_fd=state_dir_fd,
+            ) as compatibility_lock:
+                yield (
+                    _CleanupLockSet(container_lock, compatibility_lock),
+                    cleanup_lock_name,
+                    state_dir_fd,
+                    revalidate_state_directory,
+                )
+        finally:
+            container_lock.close()
+
+
 def _cleanup_terminal_workspace(
     state_dir: pathlib.Path,
     *,
@@ -1252,22 +1634,15 @@ def _cleanup_terminal_workspace(
     force: bool,
 ) -> int:
     marker = _load_state_marker(state_dir)
-    if marker.private_cleanup is not None:
-        cleanup_lock, lock_error = open_bound_review_lock(
-            state_dir,
-            expected=marker.private_cleanup,
-            name=CLEANUP_LOCK_FILE,
-        )
-        if lock_error or cleanup_lock is None:
-            raise ReviewError(
-                "cannot open preparation-bound cleanup lock: "
-                f"{lock_error or 'lock handle is unavailable'}"
-            )
-    else:
-        cleanup_lock = (state_dir / CLEANUP_LOCK_FILE).open("a+b")
-    with cleanup_lock:
+    with _open_cleanup_locks(state_dir, marker) as (
+        cleanup_lock,
+        cleanup_lock_name,
+        state_dir_fd,
+        revalidate_state_directory,
+    ):
         if not _acquire_cleanup_lock(cleanup_lock, deadline=deadline):
             return 124
+        revalidate_state_directory()
         cleanup_lock_transferred = False
 
         def transfer_cleanup_lock() -> None:
@@ -1275,6 +1650,23 @@ def _cleanup_terminal_workspace(
             cleanup_lock_transferred = True
 
         try:
+            locked_metadata = validate_safe_legacy_lock_file(
+                cleanup_lock_name,
+                cleanup_lock.compatibility,
+                label="review cleanup lock",
+                allowed_modes=PRIVATE_STATE_LEGACY_LOCK_MODES,
+                dir_fd=state_dir_fd,
+            )
+            if stat.S_IMODE(locked_metadata.st_mode) != 0o600:
+                os.fchmod(cleanup_lock.fileno(), 0o600)
+                os.fsync(cleanup_lock.fileno())
+            validate_private_lock_file(
+                cleanup_lock_name,
+                cleanup_lock.compatibility,
+                label="review cleanup lock",
+                dir_fd=state_dir_fd,
+            )
+            revalidate_state_directory()
             if force and _runner_lock_held(state_dir / LOCK_FILE):
                 return 3
             try:
@@ -1395,17 +1787,20 @@ def _cleanup_terminal_workspace(
 
 
 def _cleanup_lock_fds(handle) -> tuple[int, ...]:
-    if isinstance(handle, BoundReviewLock):
+    if isinstance(handle, (BoundReviewLock, _CleanupLockSet)):
         return handle.filenos()
     return (handle.fileno(),)
 
 
 def _acquire_cleanup_lock(handle, *, deadline: float | None) -> bool:
-    primary_descriptor = handle.fileno()
-    if not _acquire_cleanup_lock_descriptor(primary_descriptor, deadline=deadline):
-        return False
-    acquired = [primary_descriptor]
     if isinstance(handle, BoundReviewLock):
+        primary_descriptor = handle.fileno()
+        if not _acquire_cleanup_lock_descriptor(
+            primary_descriptor,
+            deadline=deadline,
+        ):
+            return False
+        acquired = [primary_descriptor]
         compatibility_error = handle.open_compatibility_lock(CLEANUP_LOCK_FILE)
         if compatibility_error:
             fcntl.flock(primary_descriptor, fcntl.LOCK_UN)
@@ -1415,7 +1810,8 @@ def _acquire_cleanup_lock(handle, *, deadline: float | None) -> bool:
             )
         descriptors = list(handle.filenos()[1:])
     else:
-        descriptors = []
+        acquired = []
+        descriptors = list(_cleanup_lock_fds(handle))
     for descriptor in descriptors:
         if _acquire_cleanup_lock_descriptor(descriptor, deadline=deadline):
             acquired.append(descriptor)
