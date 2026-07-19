@@ -3541,7 +3541,7 @@ class ProviderPolicyTest(unittest.TestCase):
             callback_payload[:] = b"\x00" * len(callback_payload)
             yield 43211
 
-        lease = mock.Mock(spec=["assert_held"])
+        lease = mock.Mock(spec=["assert_held", "retain_for_controlled_cleanup"])
         common.write_json(
             self.review.container_dir / "claude-runtime.json",
             {"authentication": {}, "phase": "runtime-launching"},
@@ -3610,6 +3610,9 @@ class ProviderPolicyTest(unittest.TestCase):
             str(raised.exception),
         )
         self.assertEqual(write_keychain.call_count, 1)
+        lease.retain_for_controlled_cleanup.assert_called_once_with(
+            providers._CLAUDE_UNKNOWN_KEYCHAIN_WRITE_RETENTION_REASON
+        )
         write_file.assert_not_called()
         self.assertIn(str(carrier), str(raised.exception))
         recovery_artifact = carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
@@ -13612,9 +13615,25 @@ class ProviderPolicyTest(unittest.TestCase):
                     "synthetic interrupted replacement"
                 )
                 unknown.__cause__ = forwarded
+                events: list[str] = []
                 lease = mock.Mock(
                     spec=["assert_held", "retain_for_controlled_cleanup"]
                 )
+                lease.retain_for_controlled_cleanup.side_effect = (
+                    lambda _reason: events.append("retain")
+                )
+
+                def fail_keychain_write(*_args: object, **_kwargs: object) -> None:
+                    events.append("write")
+                    raise unknown
+
+                def readback_side_effect(
+                    _review: providers.ReviewWorkspace,
+                ) -> providers._ClaudeMacOSCarrierSnapshot:
+                    events.append("readback")
+                    if isinstance(readback_result, BaseException):
+                        raise readback_result
+                    return readback_result
 
                 with (
                     mock.patch.object(
@@ -13635,22 +13654,28 @@ class ProviderPolicyTest(unittest.TestCase):
                     mock.patch.object(
                         providers,
                         "_write_claude_keychain_credential",
-                        side_effect=unknown,
+                        side_effect=fail_keychain_write,
                     ) as write_keychain,
                     mock.patch.object(
                         providers,
                         "_read_claude_macos_carrier_snapshot",
-                        side_effect=(
-                            readback_result
-                            if isinstance(readback_result, BaseException)
-                            else None
-                        ),
-                        return_value=(
-                            None
-                            if isinstance(readback_result, BaseException)
-                            else readback_result
-                        ),
+                        side_effect=readback_side_effect,
                     ) as readback,
+                    mock.patch.object(
+                        providers,
+                        "block_forwarded_signals",
+                        side_effect=lambda: events.append("block") or set(),
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "consume_pending_forwarded_signal",
+                        side_effect=lambda: events.append("consume") or None,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "restore_signal_mask",
+                        side_effect=lambda _mask: events.append("restore"),
+                    ),
                     self.assertRaises(providers.ForwardedSignal) as raised,
                 ):
                     providers._persist_claude_macos_refreshed_credential(
@@ -13665,7 +13690,27 @@ class ProviderPolicyTest(unittest.TestCase):
                 self.assertIs(raised.exception, forwarded)
                 write_keychain.assert_called_once()
                 readback.assert_called_once_with(self.review)
-                lease.retain_for_controlled_cleanup.assert_not_called()
+                if readback_state == "complete":
+                    lease.retain_for_controlled_cleanup.assert_not_called()
+                    self.assertEqual(
+                        events,
+                        ["block", "write", "consume", "readback", "restore"],
+                    )
+                else:
+                    lease.retain_for_controlled_cleanup.assert_called_once_with(
+                        providers._CLAUDE_UNKNOWN_KEYCHAIN_WRITE_RETENTION_REASON
+                    )
+                    self.assertEqual(
+                        events,
+                        [
+                            "block",
+                            "write",
+                            "consume",
+                            "readback",
+                            "retain",
+                            "restore",
+                        ],
+                    )
                 self.assertTrue(lease.assert_held.called)
                 for payload in (
                     original,
@@ -13779,6 +13824,62 @@ class ProviderPolicyTest(unittest.TestCase):
         for payload in (original, refreshed, selected.payload):
             payload[:] = b"\x00" * len(payload)
 
+    def test_unknown_write_retains_lock_when_pending_signal_probe_fails(
+        self,
+    ) -> None:
+        lease = mock.Mock(spec=["assert_held", "retain_for_controlled_cleanup"])
+        events: list[str] = []
+        interruption = KeyboardInterrupt()
+        lease.retain_for_controlled_cleanup.side_effect = (
+            lambda _reason: events.append("retain")
+        )
+
+        def fail_pending_signal_probe() -> None:
+            events.append("consume")
+            raise interruption
+
+        with (
+            mock.patch.object(
+                providers,
+                "consume_pending_forwarded_signal",
+                side_effect=fail_pending_signal_probe,
+            ),
+            mock.patch.object(
+                providers,
+                "restore_signal_mask",
+                side_effect=lambda _mask: events.append("restore"),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_claude_macos_carrier_snapshot",
+            ) as readback,
+            self.assertRaises(KeyboardInterrupt) as raised,
+        ):
+            providers._reconcile_unknown_claude_keychain_write(
+                self.review,
+                carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
+                    keychain_digest=bytes.fromhex("01" * 32),
+                    file_digest=None,
+                    file_snapshot=None,
+                    keychain_identity=TEST_KEYCHAIN_IDENTITY,
+                ),
+                refreshed_digest=bytes.fromhex("02" * 32),
+                expected_file_digest=None,
+                keychain_write_error=(
+                    providers.ClaudeCredentialWriteOutcomeUnknown("synthetic")
+                ),
+                deferred_control_flow=None,
+                refresh_lock=lease,
+                attempt_mask=set(),
+            )
+
+        self.assertIs(raised.exception, interruption)
+        self.assertEqual(events, ["consume", "retain", "restore"])
+        readback.assert_not_called()
+        lease.retain_for_controlled_cleanup.assert_called_once_with(
+            providers._CLAUDE_UNKNOWN_KEYCHAIN_WRITE_RETENTION_REASON
+        )
+
     def test_dual_write_reconciles_keychain_result_before_pausing(self) -> None:
         cases = (
             (
@@ -13834,6 +13935,17 @@ class ProviderPolicyTest(unittest.TestCase):
                 ("inconclusive",),
                 1,
                 "single bounded readback was inconclusive",
+            ),
+            (
+                "unknown-third-party",
+                (
+                    providers.ClaudeCredentialWriteOutcomeUnknown(
+                        "synthetic replacement timeout"
+                    ),
+                ),
+                ("third-party",),
+                1,
+                "changed unexpectedly",
             ),
             (
                 "worker-not-reaped",
@@ -13910,6 +14022,14 @@ class ProviderPolicyTest(unittest.TestCase):
                     keychain_refresh_digest=refreshed_refresh_digest,
                     file_refresh_digest=refreshed_refresh_digest,
                 )
+                third_party_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+                    keychain_digest=bytes.fromhex("ab" * 32),
+                    file_digest=refreshed_digest,
+                    file_snapshot=refreshed_file_snapshot,
+                    keychain_identity=TEST_KEYCHAIN_IDENTITY,
+                    keychain_refresh_digest=bytes.fromhex("cd" * 32),
+                    file_refresh_digest=refreshed_refresh_digest,
+                )
                 readbacks = tuple(
                     (
                         complete_snapshot
@@ -13919,7 +14039,11 @@ class ProviderPolicyTest(unittest.TestCase):
                                 "synthetic readback timeout"
                             )
                             if state == "inconclusive"
-                            else partial_snapshot
+                            else (
+                                third_party_snapshot
+                                if state == "third-party"
+                                else partial_snapshot
+                            )
                         )
                     )
                     for state in readback_states
@@ -14014,6 +14138,14 @@ class ProviderPolicyTest(unittest.TestCase):
                     lease.retain_for_controlled_cleanup.assert_called_once_with(
                         "a native Keychain replacement worker could not be "
                         "proven terminated"
+                    )
+                elif label in {
+                    "unknown-original",
+                    "unknown-readback-inconclusive",
+                    "unknown-third-party",
+                }:
+                    lease.retain_for_controlled_cleanup.assert_called_once_with(
+                        providers._CLAUDE_UNKNOWN_KEYCHAIN_WRITE_RETENTION_REASON
                     )
                 else:
                     lease.retain_for_controlled_cleanup.assert_not_called()

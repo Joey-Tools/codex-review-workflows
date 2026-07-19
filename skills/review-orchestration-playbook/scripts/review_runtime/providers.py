@@ -14,6 +14,7 @@ import pathlib
 import re
 import secrets
 import select
+import signal
 import socket
 import socketserver
 import ssl
@@ -3822,6 +3823,118 @@ def _failed_claude_macos_recovery_error(
     return failed
 
 
+_CLAUDE_UNKNOWN_KEYCHAIN_WRITE_RETENTION_REASON = (
+    "a native Keychain replacement outcome remained unresolved after bounded "
+    "reconciliation"
+)
+
+
+def _reconcile_unknown_claude_keychain_write(
+    review: ReviewWorkspace,
+    *,
+    carrier_snapshot: _ClaudeMacOSCarrierSnapshot,
+    refreshed_digest: bytes,
+    expected_file_digest: bytes | None,
+    keychain_write_error: Exception,
+    deferred_control_flow: BaseException | None,
+    refresh_lock: ClaudeRefreshLockLease,
+    attempt_mask: set[signal.Signals] | None,
+) -> _ClaudeMacOSCarrierSnapshot:
+    replacement_committed = False
+    try:
+        if attempt_mask is not None:
+            pending_signal = consume_pending_forwarded_signal()
+            if deferred_control_flow is None and pending_signal is not None:
+                deferred_control_flow = ForwardedSignal(pending_signal)
+        refresh_lock.assert_held()
+        try:
+            readback = _read_claude_macos_carrier_snapshot(review)
+        except BaseException as error:
+            if deferred_control_flow is None and _is_claude_control_flow_error(error):
+                deferred_control_flow = error
+            detail = (
+                "the native Keychain replacement outcome is unknown and its single "
+                "bounded readback was inconclusive; the replacement was not retried"
+            )
+            if deferred_control_flow is not None:
+                _attach_claude_persistence_signal_detail(
+                    deferred_control_flow,
+                    detail,
+                )
+                raise deferred_control_flow
+            raise ClaudeCredentialInspectionInconclusive(
+                "the native Keychain replacement outcome is unknown and its single "
+                "bounded readback was inconclusive; review is paused without "
+                "retrying the replacement"
+            ) from error
+        refresh_lock.assert_held()
+        keychain_is_refreshed = (
+            hmac.compare_digest(
+                readback.keychain_digest or b"",
+                refreshed_digest,
+            )
+            and readback.keychain_digest is not None
+            and readback.keychain_identity == carrier_snapshot.keychain_identity
+        )
+        file_is_expected = hmac.compare_digest(
+            readback.file_digest or b"",
+            expected_file_digest or b"",
+        ) and (readback.file_digest is None) == (expected_file_digest is None)
+        if keychain_is_refreshed and file_is_expected:
+            replacement_committed = True
+            if deferred_control_flow is not None:
+                _attach_claude_persistence_signal_detail(
+                    deferred_control_flow,
+                    "the native Keychain replacement was reconciled as completed "
+                    "before restoring the interrupted control flow",
+                )
+                raise deferred_control_flow
+            return readback
+        keychain_is_original = (
+            hmac.compare_digest(
+                readback.keychain_digest or b"",
+                carrier_snapshot.keychain_digest or b"",
+            )
+            and (readback.keychain_digest is None)
+            == (carrier_snapshot.keychain_digest is None)
+            and readback.keychain_identity == carrier_snapshot.keychain_identity
+        )
+        if not (keychain_is_original and file_is_expected):
+            if deferred_control_flow is not None:
+                _attach_claude_persistence_signal_detail(
+                    deferred_control_flow,
+                    "Claude credential carriers changed unexpectedly during the "
+                    "single bounded reconciliation readback",
+                )
+                raise deferred_control_flow
+            raise ClaudeCredentialInspectionInconclusive(
+                "Claude credential carriers changed unexpectedly while a refreshed "
+                "Keychain credential was being reconciled"
+            ) from keychain_write_error
+        if deferred_control_flow is not None:
+            _attach_claude_persistence_signal_detail(
+                deferred_control_flow,
+                "the single bounded Keychain reconciliation readback showed the "
+                "original carrier; the replacement was not retried before restoring "
+                "the interrupted control flow",
+            )
+            raise deferred_control_flow
+        raise ClaudeCredentialInspectionInconclusive(
+            "the native Keychain replacement outcome is unknown and its single "
+            "bounded readback still showed the original carrier; review is paused "
+            "without retrying because a later securityd completion cannot be "
+            "disproved"
+        ) from keychain_write_error
+    finally:
+        try:
+            if not replacement_committed:
+                refresh_lock.retain_for_controlled_cleanup(
+                    _CLAUDE_UNKNOWN_KEYCHAIN_WRITE_RETENTION_REASON
+                )
+        finally:
+            restore_signal_mask(attempt_mask)
+
+
 def _persist_claude_macos_refreshed_credential_impl(
     review: ReviewWorkspace,
     selected: _ClaudeLocalCredential,
@@ -3905,6 +4018,8 @@ def _persist_claude_macos_refreshed_credential_impl(
                     keychain_write_error = None
                     deferred_control_flow: BaseException | None = None
                     worker_termination_inconclusive = False
+                    write_outcome_unknown = False
+                    reconciliation_mask: set[signal.Signals] | None = None
                     attempt_mask = block_forwarded_signals()
                     pending_attempt_signal = None
                     try:
@@ -3937,12 +4052,39 @@ def _persist_claude_macos_refreshed_credential_impl(
                                 "a native Keychain replacement worker could not be "
                                 "proven terminated"
                             )
-                        if attempt_mask is not None:
+                        write_outcome_unknown = (
+                            not worker_termination_inconclusive
+                            and not keychain_written
+                            and isinstance(
+                                keychain_write_error,
+                                ClaudeCredentialWriteOutcomeUnknown,
+                            )
+                        )
+                        if write_outcome_unknown:
+                            reconciliation_mask = attempt_mask
+                            attempt_mask = None
+                        elif attempt_mask is not None:
                             pending_attempt_signal = (
                                 consume_pending_forwarded_signal()
                             )
                     finally:
-                        restore_signal_mask(attempt_mask)
+                        if attempt_mask is not None:
+                            restore_signal_mask(attempt_mask)
+                    if write_outcome_unknown:
+                        assert keychain_write_error is not None
+                        expected_file_digest = (
+                            refreshed_digest if write_file else file_digest
+                        )
+                        return _reconcile_unknown_claude_keychain_write(
+                            review,
+                            carrier_snapshot=carrier_snapshot,
+                            refreshed_digest=refreshed_digest,
+                            expected_file_digest=expected_file_digest,
+                            keychain_write_error=keychain_write_error,
+                            deferred_control_flow=deferred_control_flow,
+                            refresh_lock=refresh_lock,
+                            attempt_mask=reconciliation_mask,
+                        )
                     if (
                         deferred_control_flow is None
                         and pending_attempt_signal is not None
@@ -3972,10 +4114,6 @@ def _persist_claude_macos_refreshed_credential_impl(
                             raise deferred_control_flow
                         break
                     refresh_lock.assert_held()
-                    write_outcome_unknown = isinstance(
-                        keychain_write_error,
-                        ClaudeCredentialWriteOutcomeUnknown,
-                    )
                     try:
                         readback = _read_claude_macos_carrier_snapshot(review)
                     except BaseException as error:
@@ -3983,10 +4121,7 @@ def _persist_claude_macos_refreshed_credential_impl(
                             _is_claude_control_flow_error(error)
                         ):
                             deferred_control_flow = error
-                        if (
-                            not write_outcome_unknown
-                            and deferred_control_flow is None
-                        ):
+                        if deferred_control_flow is None:
                             raise
                         detail = (
                             "the native Keychain replacement outcome is unknown and "
@@ -4065,13 +4200,6 @@ def _persist_claude_macos_refreshed_credential_impl(
                             "retried before restoring the interrupted control flow",
                         )
                         raise deferred_control_flow
-                    if write_outcome_unknown:
-                        raise ClaudeCredentialInspectionInconclusive(
-                            "the native Keychain replacement outcome is unknown and "
-                            "its single bounded readback still showed the original "
-                            "carrier; review is paused without retrying because a "
-                            "later securityd completion cannot be disproved"
-                        ) from keychain_write_error
                     if attempt_index + 1 < CLAUDE_MACOS_DUAL_CARRIER_KEYCHAIN_ATTEMPTS:
                         continue
                     if write_file:
