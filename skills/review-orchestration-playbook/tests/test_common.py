@@ -181,6 +181,103 @@ class ForwardedSignalMaskTest(unittest.TestCase):
 
 
 class ChildEnvironmentTest(unittest.TestCase):
+    def test_process_start_owner_transitions_monotonically(self) -> None:
+        owner = common.ProcessStartOwner()
+
+        self.assertEqual(owner.state, common.ProcessStartState.NOT_STARTED)
+        self.assertFalse(owner.may_have_started())
+        self.assertFalse(owner.started())
+
+        owner.publish_starting()
+
+        self.assertEqual(owner.state, common.ProcessStartState.UNKNOWN)
+        self.assertTrue(owner.may_have_started())
+        self.assertFalse(owner.started())
+
+        owner.publish_started()
+        owner.publish_starting()
+
+        self.assertEqual(owner.state, common.ProcessStartState.CONFIRMED)
+        self.assertTrue(owner.may_have_started())
+        self.assertTrue(owner.started())
+
+    def test_logged_process_popen_result_interruption_keeps_start_unknown(
+        self,
+    ) -> None:
+        instructions = list(dis.get_instructions(common._run_logged_process))
+        result_store_offsets: set[int] = set()
+        for index, instruction in enumerate(instructions):
+            if instruction.argval != "Popen":
+                continue
+            for candidate_index in range(index + 1, len(instructions) - 1):
+                if not instructions[candidate_index].opname.startswith("CALL"):
+                    continue
+                result_store = instructions[candidate_index + 1]
+                self.assertIn(
+                    result_store.opname,
+                    ("STORE_FAST", "STORE_DEREF"),
+                )
+                self.assertEqual(result_store.argval, "process")
+                result_store_offsets.add(result_store.offset)
+                break
+        self.assertEqual(len(result_store_offsets), 1)
+
+        owner = common.ProcessStartOwner()
+        process = mock.Mock(pid=12345, returncode=None)
+        interruption = common.ForwardedSignal(signal.SIGTERM)
+        on_process_quiescent = mock.Mock()
+        terminate = mock.Mock()
+        armed = True
+
+        def trace(frame, event, _arg):
+            nonlocal armed
+            if frame.f_code is common._run_logged_process.__code__:
+                frame.f_trace_opcodes = True
+                if (
+                    event == "opcode"
+                    and armed
+                    and frame.f_lasti in result_store_offsets
+                ):
+                    armed = False
+                    raise interruption
+            return trace
+
+        previous_trace = sys.gettrace()
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(
+                common.subprocess,
+                "Popen",
+                return_value=process,
+            ) as popen,
+            mock.patch.object(common.signal, "signal", return_value=signal.SIG_DFL),
+            mock.patch.object(common, "terminate_process_group", terminate),
+            mock.patch.object(common, "block_forwarded_signals", return_value=None),
+        ):
+            root = pathlib.Path(temporary)
+            sys.settrace(trace)
+            try:
+                with self.assertRaises(common.ForwardedSignal) as raised:
+                    common.run(
+                        ("reviewer",),
+                        stdout_path=root / "stdout.log",
+                        stderr_path=root / "stderr.log",
+                        on_process_starting=owner.publish_starting,
+                        on_process_started=owner.publish_started,
+                        on_process_quiescent=on_process_quiescent,
+                    )
+            finally:
+                sys.settrace(previous_trace)
+
+        self.assertIs(raised.exception, interruption)
+        self.assertFalse(armed)
+        popen.assert_called_once()
+        self.assertEqual(owner.state, common.ProcessStartState.UNKNOWN)
+        self.assertTrue(owner.may_have_started())
+        self.assertFalse(owner.started())
+        terminate.assert_not_called()
+        on_process_quiescent.assert_not_called()
+
     def test_logged_process_mask_handoffs_survive_call_result_interruptions(
         self,
     ) -> None:
@@ -742,6 +839,19 @@ class ChildEnvironmentTest(unittest.TestCase):
                 )
 
         callback.assert_called_once_with()
+
+    @mock.patch.object(common.subprocess, "run")
+    def test_unlogged_process_starting_callback_is_rejected_before_launch(
+        self,
+        subprocess_run: mock.Mock,
+    ) -> None:
+        with self.assertRaisesRegex(ReviewError, "requires logged output paths"):
+            common.run(
+                (sys.executable, "-c", "pass"),
+                on_process_starting=mock.Mock(),
+            )
+
+        subprocess_run.assert_not_called()
 
     @mock.patch.object(common.subprocess, "run")
     def test_unlogged_process_quiescent_callback_is_rejected_before_launch(
@@ -1317,10 +1427,10 @@ class ChildEnvironmentTest(unittest.TestCase):
         )
         on_process_quiescent.assert_called_once_with()
 
-    def test_logged_command_does_not_publish_failed_process_start(self) -> None:
+    def test_logged_command_keeps_failed_process_start_unknown(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
-            on_process_started = mock.Mock()
+            owner = common.ProcessStartOwner()
             on_process_quiescent = mock.Mock()
             with (
                 mock.patch.object(
@@ -1344,11 +1454,14 @@ class ChildEnvironmentTest(unittest.TestCase):
                         ("reviewer",),
                         stdout_path=root / "stdout.log",
                         stderr_path=root / "stderr.log",
-                        on_process_started=on_process_started,
+                        on_process_starting=owner.publish_starting,
+                        on_process_started=owner.publish_started,
                         on_process_quiescent=on_process_quiescent,
                     )
 
-            on_process_started.assert_not_called()
+            self.assertEqual(owner.state, common.ProcessStartState.UNKNOWN)
+            self.assertTrue(owner.may_have_started())
+            self.assertFalse(owner.started())
             on_process_quiescent.assert_not_called()
 
     def test_logged_command_publishes_successful_process_start_once(self) -> None:
@@ -1367,6 +1480,9 @@ class ChildEnvironmentTest(unittest.TestCase):
                 events.append("spawn")
                 return process
 
+            on_process_starting = mock.Mock(
+                side_effect=lambda: events.append("starting")
+            )
             on_process_started = mock.Mock(side_effect=lambda: events.append("started"))
             with (
                 mock.patch.object(common.subprocess, "Popen", side_effect=spawn),
@@ -1386,10 +1502,15 @@ class ChildEnvironmentTest(unittest.TestCase):
                     ("reviewer",),
                     stdout_path=root / "stdout.log",
                     stderr_path=root / "stderr.log",
+                    on_process_starting=on_process_starting,
                     on_process_started=on_process_started,
                 )
 
-            self.assertEqual(events, ["spawn", "started", "communicate"])
+            self.assertEqual(
+                events,
+                ["starting", "spawn", "started", "communicate"],
+            )
+            on_process_starting.assert_called_once_with()
             on_process_started.assert_called_once_with()
 
     def test_logged_command_publishes_start_before_pending_signal(self) -> None:

@@ -3712,6 +3712,56 @@ class CredentialStagingTest(unittest.TestCase):
                 self.SYNTH_REFRESH_A,
             )
 
+    def test_unknown_writer_start_retains_private_recovery_carrier(
+        self,
+    ) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+            source = self._credential(
+                root / ".credentials.json",
+                expires_at_ms=(now - 60) * 1000,
+                access_token=self.SYNTH_ACCESS_EXPIRED,
+                refresh_token=self.SYNTH_REFRESH_A,
+            )
+            staged: claude_linux.StagedCredential | None = None
+
+            with (
+                mock.patch.object(
+                    claude_linux,
+                    "STAGED_CREDENTIAL_POLL_SECONDS",
+                    60.0,
+                ),
+                self.assertRaisesRegex(
+                    claude_linux.LinuxCredentialInspectionInconclusive,
+                    "private recovery carrier was retained",
+                ) as raised,
+            ):
+                with claude_linux.stage_claude_credentials(
+                    source,
+                    helper,
+                    now=now,
+                    refresh_lock_protocol=self.PROTOCOL,
+                    writer_started=lambda: True,
+                    writer_quiescent=lambda: False,
+                ) as staged:
+                    pass
+
+            assert staged is not None
+            self._assert_retained_recovery_carrier(
+                error=raised.exception,
+                staged=staged,
+                helper=helper,
+                expected_refresh_token=self.SYNTH_REFRESH_A,
+            )
+            host = json.loads(source.read_text(encoding="utf-8"))
+            self.assertEqual(
+                host["claudeAiOauth"]["refreshToken"],
+                self.SYNTH_REFRESH_A,
+            )
+
     def test_stale_host_refresh_lock_is_never_reclaimed(self) -> None:
         now = time.time()
         with tempfile.TemporaryDirectory() as temporary:

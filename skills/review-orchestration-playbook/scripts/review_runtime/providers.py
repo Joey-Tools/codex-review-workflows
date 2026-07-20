@@ -92,6 +92,7 @@ from .common import (
     Completed,
     ForwardedSignal,
     InvalidReviewerExecutable,
+    ProcessStartOwner,
     RejectedReviewerCandidates,
     ReviewError,
     ReviewOutputDrainError,
@@ -13874,7 +13875,7 @@ def _claude_attempt(
     )
     completed: Completed | None = None
     if linux_host:
-        writer_started = threading.Event()
+        writer_start = ProcessStartOwner()
         writer_quiescent = threading.Event()
         try:
             with _claude_linux_review_runtime(
@@ -13883,7 +13884,7 @@ def _claude_attempt(
                 env,
                 arguments,
                 selected_refresh_lock_protocol,
-                writer_started=writer_started.is_set,
+                writer_started=writer_start.may_have_started,
                 writer_quiescent=writer_quiescent.is_set,
             ) as sandbox_command:
                 completed = run(
@@ -13895,7 +13896,8 @@ def _claude_attempt(
                     stderr_path=stderr_path,
                     timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
                     output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
-                    on_process_started=writer_started.set,
+                    on_process_starting=writer_start.publish_starting,
+                    on_process_started=writer_start.publish_started,
                     on_process_quiescent=writer_quiescent.set,
                 )
                 quiescence_signal_mask_owner = _ClaudeSignalMaskOwner()
@@ -14091,7 +14093,7 @@ def _claude_attempt(
             raise
     else:
         runtime_started = False
-        process_started = threading.Event()
+        process_start = ProcessStartOwner()
         process_quiescent = threading.Event()
         try:
             with contextlib.ExitStack() as stack:
@@ -14100,7 +14102,7 @@ def _claude_attempt(
                         review,
                         env,
                         selected_refresh_lock_protocol,
-                        process_started=process_started.is_set,
+                        process_started=process_start.may_have_started,
                         process_quiescent=process_quiescent.is_set,
                     )
                 )
@@ -14136,7 +14138,8 @@ def _claude_attempt(
                     stderr_path=stderr_path,
                     timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
                     output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
-                    on_process_started=process_started.set,
+                    on_process_starting=process_start.publish_starting,
+                    on_process_started=process_start.publish_started,
                     on_process_quiescent=process_quiescent.set,
                 )
                 quiescence_signal_mask_owner = _ClaudeSignalMaskOwner()

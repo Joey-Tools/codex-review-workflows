@@ -28596,8 +28596,11 @@ class ProviderPolicyTest(unittest.TestCase):
         )
 
         def run_after_spawn(*_args: object, **kwargs: object) -> Completed:
+            on_process_starting = kwargs.get("on_process_starting")
             on_process_started = kwargs.get("on_process_started")
+            assert callable(on_process_starting)
             assert callable(on_process_started)
+            on_process_starting()
             on_process_started()
             return completed
 
@@ -28685,8 +28688,11 @@ class ProviderPolicyTest(unittest.TestCase):
         )
 
         def run_after_spawn(*_args: object, **kwargs: object) -> Completed:
+            on_process_starting = kwargs.get("on_process_starting")
             on_process_started = kwargs.get("on_process_started")
+            assert callable(on_process_starting)
             assert callable(on_process_started)
+            on_process_starting()
             on_process_started()
             return completed
 
@@ -28907,8 +28913,11 @@ class ProviderPolicyTest(unittest.TestCase):
         original_update = providers._update_claude_runtime_report
 
         def run_after_spawn(*_args: object, **kwargs: object) -> Completed:
+            on_process_starting = kwargs.get("on_process_starting")
             on_process_started = kwargs.get("on_process_started")
+            assert callable(on_process_starting)
             assert callable(on_process_started)
+            on_process_starting()
             on_process_started()
             return completed
 
@@ -29008,8 +29017,11 @@ class ProviderPolicyTest(unittest.TestCase):
                 )
 
         def timeout_after_spawn(*_args: object, **kwargs: object) -> None:
+            on_process_starting = kwargs.get("on_process_starting")
             on_process_started = kwargs.get("on_process_started")
+            assert callable(on_process_starting)
             assert callable(on_process_started)
+            on_process_starting()
             on_process_started()
             raise providers.ReviewTimeoutError("review timed out")
 
@@ -29036,6 +29048,79 @@ class ProviderPolicyTest(unittest.TestCase):
                 side_effect=timeout_after_spawn,
             ),
             self.assertRaises(providers.ReviewTimeoutError),
+        ):
+            providers._claude_attempt(
+                review=self.review,
+                model=providers.CLAUDE_MODELS[0],
+                index=1,
+                env={},
+                executable=executable,
+                refresh_lock_protocol=self.claude_refresh_lock_protocol,
+            )
+
+        self.assertEqual(lifecycle_states, [(True, False)])
+
+    def test_claude_linux_incomplete_process_start_is_conservative(
+        self,
+    ) -> None:
+        executable = pathlib.Path("/verified/claude")
+        lifecycle_states: list[tuple[bool, bool]] = []
+
+        @contextlib.contextmanager
+        def observing_runtime(
+            *_args: object,
+            writer_started=None,
+            writer_quiescent=None,
+            **_kwargs: object,
+        ):
+            assert callable(writer_started)
+            assert callable(writer_quiescent)
+            self.assertFalse(writer_started())
+            self.assertFalse(writer_quiescent())
+            try:
+                yield mock.Mock(argv=("sandbox",), env={})
+            finally:
+                lifecycle_states.append(
+                    (writer_started(), writer_quiescent())
+                )
+
+        def fail_during_start_publication(
+            *_args: object,
+            **kwargs: object,
+        ) -> None:
+            on_process_starting = kwargs.get("on_process_starting")
+            assert callable(on_process_starting)
+            on_process_starting()
+            raise providers.ReviewProcessLeakError(
+                "process start publication was interrupted"
+            )
+
+        with (
+            mock.patch.object(providers, "_is_claude_linux_host", return_value=True),
+            mock.patch.object(
+                providers,
+                "_with_claude_review_tool_path",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_prepare_claude_tls_environment",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_linux_review_runtime",
+                side_effect=observing_runtime,
+            ),
+            mock.patch.object(
+                providers,
+                "run",
+                side_effect=fail_during_start_publication,
+            ),
+            self.assertRaisesRegex(
+                providers.ReviewProcessLeakError,
+                "start publication was interrupted",
+            ),
         ):
             providers._claude_attempt(
                 review=self.review,
@@ -29104,6 +29189,99 @@ class ProviderPolicyTest(unittest.TestCase):
             )
 
         self.assertEqual(lifecycle_states, [(False, False)])
+
+    def test_claude_macos_incomplete_process_start_is_conservative(
+        self,
+    ) -> None:
+        executable = self.review.container_dir / "verified-claude"
+        executable.write_bytes(b"snapshot")
+        lifecycle_states: list[tuple[bool, bool]] = []
+
+        providers.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {
+                "phase": "publisher-and-capabilities-verified",
+                "outer_sandbox": {"status": "pending-runtime-launch"},
+                "authentication": {"status": "pending"},
+            },
+        )
+
+        @contextlib.contextmanager
+        def observing_runtime(
+            _review: ReviewWorkspace,
+            env: dict[str, str],
+            _refresh_lock_protocol: object,
+            *,
+            process_started: Callable[[], bool],
+            process_quiescent: Callable[[], bool],
+        ):
+            self.assertFalse(process_started())
+            self.assertFalse(process_quiescent())
+            try:
+                yield dict(env)
+            finally:
+                lifecycle_states.append(
+                    (process_started(), process_quiescent())
+                )
+
+        def fail_during_start_publication(
+            *_args: object,
+            **kwargs: object,
+        ) -> None:
+            on_process_starting = kwargs.get("on_process_starting")
+            assert callable(on_process_starting)
+            on_process_starting()
+            raise providers.ReviewProcessLeakError(
+                "process start publication was interrupted"
+            )
+
+        with (
+            mock.patch.object(providers, "_is_claude_linux_host", return_value=False),
+            mock.patch.object(
+                providers,
+                "_with_claude_review_tool_path",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_prepare_claude_tls_environment",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_runtime",
+                side_effect=observing_runtime,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_connect_proxy",
+                return_value=contextlib.nullcontext(43210),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_review_sandbox_profile",
+                return_value="(version 1)",
+            ),
+            mock.patch.object(
+                providers,
+                "run",
+                side_effect=fail_during_start_publication,
+            ),
+            self.assertRaisesRegex(
+                providers.ReviewProcessLeakError,
+                "start publication was interrupted",
+            ),
+        ):
+            providers._claude_attempt(
+                review=self.review,
+                model=providers.CLAUDE_MODELS[0],
+                index=1,
+                env={},
+                executable=executable,
+                refresh_lock_protocol=self.claude_refresh_lock_protocol,
+            )
+
+        self.assertEqual(lifecycle_states, [(True, False)])
 
     def test_claude_persistence_diagnostic_reports_retained_private_carrier(
         self,
@@ -29706,8 +29884,11 @@ class ProviderPolicyTest(unittest.TestCase):
         )
 
         def run_after_spawn(*_args: object, **kwargs: object) -> Completed:
+            on_process_starting = kwargs.get("on_process_starting")
             on_process_started = kwargs.get("on_process_started")
+            assert callable(on_process_starting)
             assert callable(on_process_started)
+            on_process_starting()
             on_process_started()
             return completed
 
@@ -31012,10 +31193,13 @@ class ProviderPolicyTest(unittest.TestCase):
             )
 
         def run_review(*_args: object, **kwargs: object) -> Completed:
+            on_process_starting = kwargs.get("on_process_starting")
             on_process_started = kwargs.get("on_process_started")
             on_process_quiescent = kwargs.get("on_process_quiescent")
+            assert callable(on_process_starting)
             assert callable(on_process_started)
             assert callable(on_process_quiescent)
+            on_process_starting()
             on_process_started()
             on_process_quiescent()
             return completed
@@ -31352,7 +31536,6 @@ class ProviderPolicyTest(unittest.TestCase):
                 ):
                     primary_signal = providers.ForwardedSignal(signal.SIGTERM)
                     restore_error = restore_error_factory()
-                    started_event = FixtureEvent()
                     quiescent_event = FixtureEvent(primary_signal)
                     observed_owners: list[
                         providers._ClaudeSignalMaskOwner
@@ -31435,10 +31618,7 @@ class ProviderPolicyTest(unittest.TestCase):
                             mock.patch.object(
                                 providers.threading,
                                 "Event",
-                                side_effect=(
-                                    started_event,
-                                    quiescent_event,
-                                ),
+                                return_value=quiescent_event,
                             )
                         )
                         stack.enter_context(

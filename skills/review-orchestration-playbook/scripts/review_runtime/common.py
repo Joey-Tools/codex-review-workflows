@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enum
 import json
 import os
 import pathlib
@@ -12,7 +13,7 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, BinaryIO, Callable, Iterable
 
 
@@ -58,6 +59,44 @@ class ForwardedSignal(RuntimeError):
         if detail:
             message += f"; {detail}"
         super().__init__(message)
+
+
+class ProcessStartState(enum.Enum):
+    NOT_STARTED = "not-started"
+    UNKNOWN = "unknown"
+    CONFIRMED = "confirmed"
+
+
+@dataclass
+class ProcessStartOwner:
+    """Publish monotonic process-start state across Popen handoff gaps."""
+
+    _state: ProcessStartState = ProcessStartState.NOT_STARTED
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+    )
+
+    @property
+    def state(self) -> ProcessStartState:
+        with self._lock:
+            return self._state
+
+    def publish_starting(self) -> None:
+        with self._lock:
+            if self._state is ProcessStartState.NOT_STARTED:
+                self._state = ProcessStartState.UNKNOWN
+
+    def publish_started(self) -> None:
+        with self._lock:
+            self._state = ProcessStartState.CONFIRMED
+
+    def may_have_started(self) -> bool:
+        return self.state is not ProcessStartState.NOT_STARTED
+
+    def started(self) -> bool:
+        return self.state is ProcessStartState.CONFIRMED
 
 
 def _is_process_control_flow_error(error: BaseException) -> bool:
@@ -198,6 +237,7 @@ def run(
     capture_limit_bytes: int = 4 * 1024 * 1024,
     timeout_seconds: float | None = None,
     output_file_limit_bytes: int | None = None,
+    on_process_starting: Callable[[], None] | None = None,
     on_process_started: Callable[[], None] | None = None,
     on_process_quiescent: Callable[[], None] | None = None,
 ) -> Completed:
@@ -212,6 +252,10 @@ def run(
         raise ReviewError("output_file_limit_bytes requires timeout_seconds")
     if timeout_seconds is not None and (stdout_path is None or stderr_path is None):
         raise ReviewError("timeout_seconds requires logged output paths")
+    if on_process_starting is not None and (
+        stdout_path is None or stderr_path is None
+    ):
+        raise ReviewError("on_process_starting requires logged output paths")
     if on_process_started is not None and (stdout_path is None or stderr_path is None):
         raise ReviewError("on_process_started requires logged output paths")
     if on_process_quiescent is not None and (
@@ -251,6 +295,7 @@ def run(
                     timeout_seconds=timeout_seconds,
                     stdout_file_limit_bytes=output_file_limit_bytes,
                     stderr_file_limit_bytes=output_file_limit_bytes,
+                    on_process_starting=on_process_starting,
                     on_process_started=on_process_started,
                     on_process_quiescent=on_process_quiescent,
                 )
@@ -569,6 +614,7 @@ def _run_logged_process(
     timeout_seconds: float | None = None,
     stdout_file_limit_bytes: int | None = None,
     stderr_file_limit_bytes: int | None = None,
+    on_process_starting: Callable[[], None] | None = None,
     on_process_started: Callable[[], None] | None = None,
     on_process_quiescent: Callable[[], None] | None = None,
 ) -> int:
@@ -603,6 +649,10 @@ def _run_logged_process(
     try:
         if pending_signal is not None:
             raise ForwardedSignal(pending_signal)
+        if on_process_starting is not None:
+            # Popen can create a child before either returning or raising, and
+            # its result can be interrupted before Python stores the handle.
+            on_process_starting()
         process = subprocess.Popen(
             command,
             cwd=cwd,

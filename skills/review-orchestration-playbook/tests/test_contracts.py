@@ -891,7 +891,14 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("stage_claude_credentials", linux_runtime_source)
         self.assertIn("writer_started", linux_runtime_source)
         self.assertIn("writer_quiescent", linux_runtime_source)
-        self.assertIn("on_process_started=writer_started.set", attempt_source)
+        self.assertIn(
+            "on_process_starting=writer_start.publish_starting",
+            attempt_source,
+        )
+        self.assertIn(
+            "on_process_started=writer_start.publish_started",
+            attempt_source,
+        )
         self.assertIn("writer_quiescent.set()", attempt_source)
         self.assertIn(
             "retain_for_recovery",
