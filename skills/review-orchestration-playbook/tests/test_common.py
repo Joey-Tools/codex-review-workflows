@@ -17,13 +17,24 @@ from review_runtime import common  # noqa: E402
 from review_runtime.common import ReviewError  # noqa: E402
 
 
+def _visible_exception_messages(error: BaseException) -> tuple[str, ...]:
+    messages: list[str] = []
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen and len(seen) < 32:
+        seen.add(id(current))
+        messages.append(str(current))
+        messages.extend(str(note) for note in getattr(current, "__notes__", ()))
+        current = current.__cause__ or current.__context__
+    return tuple(messages)
+
+
 class ChildEnvironmentTest(unittest.TestCase):
     def test_tail_text_reads_only_a_bounded_suffix(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = pathlib.Path(temporary) / "review.log"
             path.write_bytes(
-                b"discarded-line\n" * 10_000
-                + b"keep-one\nkeep-two\nkeep-three\n"
+                b"discarded-line\n" * 10_000 + b"keep-one\nkeep-two\nkeep-three\n"
             )
 
             result = common.tail_text(path, line_count=2, byte_count=128)
@@ -41,6 +52,457 @@ class ChildEnvironmentTest(unittest.TestCase):
                     stderr_path=root / "stderr.log",
                     timeout_seconds=0.05,
                 )
+
+    def test_process_quiescent_callback_runs_once_for_success_and_nonzero(
+        self,
+    ) -> None:
+        for returncode in (0, 7):
+            with (
+                self.subTest(returncode=returncode),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = pathlib.Path(temporary)
+                callback = mock.Mock()
+
+                completed = common.run(
+                    (sys.executable, "-c", f"raise SystemExit({returncode})"),
+                    stdout_path=root / "stdout.log",
+                    stderr_path=root / "stderr.log",
+                    on_process_quiescent=callback,
+                )
+
+                self.assertEqual(completed.returncode, returncode)
+                callback.assert_called_once_with()
+
+    def test_process_quiescent_callback_precedes_check_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            callback = mock.Mock()
+
+            with self.assertRaisesRegex(ReviewError, r"command failed \(7\)"):
+                common.run(
+                    (sys.executable, "-c", "raise SystemExit(7)"),
+                    check=True,
+                    stdout_path=root / "stdout.log",
+                    stderr_path=root / "stderr.log",
+                    on_process_quiescent=callback,
+                )
+
+            callback.assert_called_once_with()
+
+    def test_process_quiescent_callback_runs_once_after_timeout_cleanup(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            callback = mock.Mock()
+
+            with self.assertRaises(common.ReviewTimeoutError):
+                common.run(
+                    (sys.executable, "-c", "import time; time.sleep(5)"),
+                    stdout_path=root / "stdout.log",
+                    stderr_path=root / "stderr.log",
+                    timeout_seconds=0.05,
+                    on_process_quiescent=callback,
+                )
+
+            callback.assert_called_once_with()
+
+    def test_process_quiescent_callback_runs_after_timeout_group_cleanup(
+        self,
+    ) -> None:
+        process = mock.Mock(pid=12345, returncode=0)
+        process.communicate.side_effect = common.subprocess.TimeoutExpired(
+            ("reviewer",),
+            0.05,
+        )
+        process.poll.return_value = 0
+        callback = mock.Mock()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with (
+                mock.patch.object(common.subprocess, "Popen", return_value=process),
+                mock.patch.object(
+                    common,
+                    "_process_group_exists",
+                    side_effect=(True, False, False, False),
+                ),
+                mock.patch.object(common, "signal_process_group") as terminate,
+            ):
+                with self.assertRaises(common.ReviewTimeoutError):
+                    common.run(
+                        ("reviewer",),
+                        stdout_path=root / "stdout.log",
+                        stderr_path=root / "stderr.log",
+                        timeout_seconds=0.05,
+                        on_process_quiescent=callback,
+                    )
+
+        terminate.assert_called_once_with(process, signal.SIGTERM)
+        callback.assert_called_once_with()
+
+    def test_cleanup_failure_preserves_timeout_and_runs_quiescent_callback(
+        self,
+    ) -> None:
+        process = mock.Mock(pid=12345, returncode=0)
+        process.communicate.side_effect = common.subprocess.TimeoutExpired(
+            ("reviewer",),
+            0.05,
+        )
+        process.poll.return_value = 0
+        callback = mock.Mock()
+        cleanup_error = RuntimeError("injected process-group cleanup failure")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with (
+                mock.patch.object(common.subprocess, "Popen", return_value=process),
+                mock.patch.object(
+                    common,
+                    "terminate_process_group",
+                    side_effect=cleanup_error,
+                ),
+                mock.patch.object(
+                    common,
+                    "_process_group_exists",
+                    return_value=False,
+                ),
+                mock.patch.object(common.signal, "signal", return_value=signal.SIG_DFL),
+                mock.patch.object(common, "block_forwarded_signals", return_value=None),
+            ):
+                with self.assertRaises(common.ReviewTimeoutError) as raised:
+                    common.run(
+                        ("reviewer",),
+                        stdout_path=root / "stdout.log",
+                        stderr_path=root / "stderr.log",
+                        timeout_seconds=0.05,
+                        on_process_quiescent=callback,
+                    )
+
+        timeout = raised.exception.__cause__
+        self.assertIsInstance(timeout, common.subprocess.TimeoutExpired)
+        self.assertIn(
+            "terminating the supervised process group (RuntimeError): "
+            "injected process-group cleanup failure",
+            _visible_exception_messages(timeout),
+        )
+        callback.assert_called_once_with()
+
+    def test_handler_restore_failure_preserves_timeout_and_callback(
+        self,
+    ) -> None:
+        process = mock.Mock(pid=12345, returncode=0)
+        process.communicate.side_effect = common.subprocess.TimeoutExpired(
+            ("reviewer",),
+            0.05,
+        )
+        process.poll.return_value = 0
+        callback = mock.Mock()
+
+        def signal_handler(signum, handler):
+            if not callable(handler) and signum == signal.SIGTERM:
+                raise OSError("injected handler restore failure")
+            return signal.SIG_DFL
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with (
+                mock.patch.object(common.subprocess, "Popen", return_value=process),
+                mock.patch.object(common, "terminate_process_group"),
+                mock.patch.object(
+                    common,
+                    "_process_group_exists",
+                    return_value=False,
+                ),
+                mock.patch.object(common.signal, "signal", side_effect=signal_handler),
+                mock.patch.object(
+                    common, "block_forwarded_signals", return_value=set()
+                ),
+                mock.patch.object(
+                    common,
+                    "consume_pending_forwarded_signal",
+                    return_value=None,
+                ),
+                mock.patch.object(common, "restore_signal_mask"),
+            ):
+                with self.assertRaises(common.ReviewTimeoutError) as raised:
+                    common.run(
+                        ("reviewer",),
+                        stdout_path=root / "stdout.log",
+                        stderr_path=root / "stderr.log",
+                        timeout_seconds=0.05,
+                        on_process_quiescent=callback,
+                    )
+
+        timeout = raised.exception.__cause__
+        self.assertIsInstance(timeout, common.subprocess.TimeoutExpired)
+        self.assertIn(
+            "restoring the SIGTERM signal handler (OSError): "
+            "injected handler restore failure",
+            _visible_exception_messages(timeout),
+        )
+        callback.assert_called_once_with()
+
+    def test_cleanup_keyboard_interrupt_replaces_ordinary_primary(self) -> None:
+        process = mock.Mock(pid=12345, returncode=0)
+        process.communicate.side_effect = OSError("injected process failure")
+        interruption = KeyboardInterrupt("injected cleanup interruption")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with (
+                mock.patch.object(common.subprocess, "Popen", return_value=process),
+                mock.patch.object(common.signal, "signal", return_value=signal.SIG_DFL),
+                mock.patch.object(common, "terminate_process_group"),
+                mock.patch.object(
+                    common,
+                    "block_forwarded_signals",
+                    return_value=set(),
+                ),
+                mock.patch.object(
+                    common,
+                    "consume_pending_forwarded_signal",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    common,
+                    "restore_signal_mask",
+                    side_effect=interruption,
+                ),
+            ):
+                with self.assertRaises(KeyboardInterrupt) as raised:
+                    common.run(
+                        ("reviewer",),
+                        stdout_path=root / "stdout.log",
+                        stderr_path=root / "stderr.log",
+                    )
+
+        self.assertIs(raised.exception, interruption)
+        self.assertIn(
+            "process operation failed before cleanup control flow (OSError): "
+            "injected process failure",
+            _visible_exception_messages(raised.exception),
+        )
+
+    def test_later_cleanup_control_flow_replaces_ordinary_cleanup(self) -> None:
+        process = mock.Mock(pid=12345, returncode=0)
+        process.communicate.return_value = (None, None)
+        cleanup_error = RuntimeError("injected process cleanup failure")
+        interruption = common.ForwardedSignal(signal.SIGINT)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with (
+                mock.patch.object(common.subprocess, "Popen", return_value=process),
+                mock.patch.object(common.signal, "signal", return_value=signal.SIG_DFL),
+                mock.patch.object(
+                    common,
+                    "terminate_process_group",
+                    side_effect=cleanup_error,
+                ),
+                mock.patch.object(
+                    common,
+                    "block_forwarded_signals",
+                    return_value=set(),
+                ),
+                mock.patch.object(
+                    common,
+                    "consume_pending_forwarded_signal",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    common,
+                    "restore_signal_mask",
+                    side_effect=interruption,
+                ),
+            ):
+                with self.assertRaises(common.ForwardedSignal) as raised:
+                    common.run(
+                        ("reviewer",),
+                        stdout_path=root / "stdout.log",
+                        stderr_path=root / "stderr.log",
+                    )
+
+        self.assertIs(raised.exception, interruption)
+        self.assertEqual(raised.exception.signum, signal.SIGINT)
+        self.assertIn(
+            "terminating the supervised process group (RuntimeError): "
+            "injected process cleanup failure",
+            _visible_exception_messages(raised.exception),
+        )
+
+    def test_process_quiescent_callback_runs_once_after_output_limit_cleanup(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            callback = mock.Mock()
+
+            with self.assertRaises(common.ReviewOutputLimitError):
+                common.run(
+                    (
+                        sys.executable,
+                        "-c",
+                        "import os,time; os.write(1, b'x' * 4097); time.sleep(5)",
+                    ),
+                    stdout_path=root / "stdout.log",
+                    stderr_path=root / "stderr.log",
+                    timeout_seconds=2,
+                    output_file_limit_bytes=4096,
+                    on_process_quiescent=callback,
+                )
+
+            callback.assert_called_once_with()
+
+    def test_output_limit_remains_primary_when_initial_cleanup_fails(
+        self,
+    ) -> None:
+        callback = mock.Mock()
+        real_terminate = common.terminate_process_group
+        cleanup_calls = 0
+
+        def fail_initial_cleanup(process, **kwargs):
+            nonlocal cleanup_calls
+            cleanup_calls += 1
+            if cleanup_calls == 1:
+                raise RuntimeError("injected initial cleanup failure")
+            return real_terminate(process, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with mock.patch.object(
+                common,
+                "terminate_process_group",
+                side_effect=fail_initial_cleanup,
+            ):
+                with self.assertRaises(common.ReviewOutputLimitError) as raised:
+                    common.run(
+                        (
+                            sys.executable,
+                            "-c",
+                            (
+                                "import os,signal,time; "
+                                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                                "os.write(1, b'x' * 4097); time.sleep(5)"
+                            ),
+                        ),
+                        stdout_path=root / "stdout.log",
+                        stderr_path=root / "stderr.log",
+                        timeout_seconds=2,
+                        output_file_limit_bytes=4096,
+                        on_process_quiescent=callback,
+                    )
+
+        self.assertGreaterEqual(cleanup_calls, 2)
+        self.assertIn(
+            "terminating the supervised process group (RuntimeError): "
+            "injected initial cleanup failure",
+            _visible_exception_messages(raised.exception),
+        )
+        callback.assert_not_called()
+
+    def test_process_secondary_failure_legacy_fallback_preserves_chain(
+        self,
+    ) -> None:
+        class LegacyError(RuntimeError):
+            add_note = None
+
+        original_cause = ValueError("original cause")
+        primary = LegacyError("primary failure")
+        primary.__cause__ = original_cause
+
+        common._attach_process_secondary_failure(
+            primary,
+            OSError("first secondary"),
+            context="first process cleanup",
+        )
+        common._attach_process_secondary_failure(
+            primary,
+            RuntimeError("second secondary"),
+            context="second process cleanup",
+        )
+
+        newest = primary.__cause__
+        self.assertIsInstance(
+            newest,
+            common.ReviewProcessSecondaryFailureDiagnostic,
+        )
+        self.assertEqual(
+            str(newest),
+            "second process cleanup (RuntimeError): second secondary",
+        )
+        first = newest.__cause__
+        self.assertIsInstance(
+            first,
+            common.ReviewProcessSecondaryFailureDiagnostic,
+        )
+        self.assertEqual(
+            str(first),
+            "first process cleanup (OSError): first secondary",
+        )
+        self.assertIs(first.__cause__, original_cause)
+
+    def test_process_quiescent_callback_failure_is_fail_closed(self) -> None:
+        marker = RuntimeError("injected quiescent callback failure")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with self.assertRaises(RuntimeError) as raised:
+                common.run(
+                    (sys.executable, "-c", "pass"),
+                    stdout_path=root / "stdout.log",
+                    stderr_path=root / "stderr.log",
+                    on_process_quiescent=mock.Mock(side_effect=marker),
+                )
+
+        self.assertIs(raised.exception, marker)
+
+    def test_process_quiescent_callback_failure_ignores_outer_exception(
+        self,
+    ) -> None:
+        marker = RuntimeError("injected quiescent callback failure")
+        try:
+            raise ValueError("outer exception")
+        except ValueError:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary)
+                with self.assertRaises(RuntimeError) as raised:
+                    common.run(
+                        (sys.executable, "-c", "pass"),
+                        stdout_path=root / "stdout.log",
+                        stderr_path=root / "stderr.log",
+                        on_process_quiescent=mock.Mock(side_effect=marker),
+                    )
+
+        self.assertIs(raised.exception, marker)
+
+    def test_process_quiescent_callback_failure_preserves_timeout(self) -> None:
+        callback = mock.Mock(
+            side_effect=RuntimeError("injected quiescent callback failure")
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with self.assertRaises(common.ReviewTimeoutError):
+                common.run(
+                    (sys.executable, "-c", "import time; time.sleep(5)"),
+                    stdout_path=root / "stdout.log",
+                    stderr_path=root / "stderr.log",
+                    timeout_seconds=0.05,
+                    on_process_quiescent=callback,
+                )
+
+        callback.assert_called_once_with()
+
+    @mock.patch.object(common.subprocess, "run")
+    def test_unlogged_process_quiescent_callback_is_rejected_before_launch(
+        self,
+        subprocess_run: mock.Mock,
+    ) -> None:
+        with self.assertRaisesRegex(ReviewError, "requires logged output paths"):
+            common.run(
+                (sys.executable, "-c", "pass"),
+                on_process_quiescent=mock.Mock(),
+            )
+
+        subprocess_run.assert_not_called()
 
     @mock.patch.object(common.subprocess, "run")
     def test_unlogged_timeout_is_rejected_before_launch(
@@ -93,11 +555,7 @@ class ChildEnvironmentTest(unittest.TestCase):
                     (
                         sys.executable,
                         "-c",
-                        (
-                            "import os,time; "
-                            "os.write(1, b'x' * 4097); "
-                            "time.sleep(5)"
-                        ),
+                        ("import os,time; os.write(1, b'x' * 4097); time.sleep(5)"),
                     ),
                     stdout_path=root / "stdout.log",
                     stderr_path=root / "stderr.log",
@@ -149,9 +607,7 @@ class ChildEnvironmentTest(unittest.TestCase):
     def test_invalid_bounded_output_arguments_preserve_existing_logs(
         self, popen: mock.Mock
     ) -> None:
-        cases = (
-            ({"output_file_limit_bytes": 0}, "must be positive"),
-        )
+        cases = (({"output_file_limit_bytes": 0}, "must be positive"),)
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             for index, (arguments, message) in enumerate(cases):
@@ -218,6 +674,7 @@ class ChildEnvironmentTest(unittest.TestCase):
     ) -> None:
         thread = thread_factory.return_value
         thread.start.side_effect = RuntimeError("thread start failed")
+        on_process_quiescent = mock.Mock()
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             with self.assertRaisesRegex(RuntimeError, "thread start failed"):
@@ -227,9 +684,11 @@ class ChildEnvironmentTest(unittest.TestCase):
                     stderr_path=root / "stderr.log",
                     timeout_seconds=5,
                     output_file_limit_bytes=4096,
+                    on_process_quiescent=on_process_quiescent,
                 )
 
         thread.join.assert_not_called()
+        on_process_quiescent.assert_not_called()
 
     def test_drain_thread_io_failure_is_propagated(self) -> None:
         process = mock.Mock(pid=12345, returncode=0)
@@ -243,7 +702,9 @@ class ChildEnvironmentTest(unittest.TestCase):
                 mock.patch.object(
                     common.select, "select", return_value=([123], [], [])
                 ),
-                mock.patch.object(common.os, "read", side_effect=OSError("read failed")),
+                mock.patch.object(
+                    common.os, "read", side_effect=OSError("read failed")
+                ),
             ):
                 with self.assertRaises(common.ReviewOutputDrainError):
                     common.run(
@@ -337,6 +798,7 @@ class ChildEnvironmentTest(unittest.TestCase):
     def test_logged_command_rejects_descendant_holding_output_stream(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
+            callback = mock.Mock()
             with self.assertRaises(common.ReviewProcessLeakError):
                 common.run(
                     (
@@ -351,7 +813,10 @@ class ChildEnvironmentTest(unittest.TestCase):
                     stderr_path=root / "stderr.log",
                     timeout_seconds=5,
                     output_file_limit_bytes=4096,
+                    on_process_quiescent=callback,
                 )
+
+        callback.assert_not_called()
 
     def test_streamed_command_logs_are_complete_and_memory_capture_is_bounded(
         self,
@@ -509,10 +974,102 @@ class ChildEnvironmentTest(unittest.TestCase):
                 signal_already_sent=True,
             )
 
+    def test_pending_signal_remains_primary_when_spawn_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            installed: dict[signal.Signals, object] = {}
+            on_process_quiescent = mock.Mock()
+
+            def install_handler(signum, handler):
+                previous = installed.get(signum, signal.SIG_DFL)
+                installed[signum] = handler
+                return previous
+
+            def spawn(*args, **kwargs):
+                handler = installed[signal.SIGTERM]
+                assert callable(handler)
+                handler(signal.SIGTERM, None)
+                raise OSError("injected spawn failure")
+
+            with (
+                mock.patch.object(common.subprocess, "Popen", side_effect=spawn),
+                mock.patch.object(common.signal, "signal", side_effect=install_handler),
+                mock.patch.object(common, "block_forwarded_signals", return_value=None),
+            ):
+                with self.assertRaises(common.ForwardedSignal) as raised:
+                    common.run(
+                        ("reviewer",),
+                        stdout_path=root / "stdout.log",
+                        stderr_path=root / "stderr.log",
+                        on_process_quiescent=on_process_quiescent,
+                    )
+
+        self.assertEqual(raised.exception.signum, signal.SIGTERM)
+        self.assertIn(
+            "process operation failed after a signal became pending (OSError): "
+            "injected spawn failure",
+            _visible_exception_messages(raised.exception),
+        )
+        on_process_quiescent.assert_not_called()
+
+    def test_pending_signal_remains_primary_when_start_hook_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            installed: dict[signal.Signals, object] = {}
+            process = mock.Mock(pid=12345, returncode=0)
+            process.poll.return_value = 0
+            on_process_quiescent = mock.Mock()
+
+            def install_handler(signum, handler):
+                previous = installed.get(signum, signal.SIG_DFL)
+                installed[signum] = handler
+                return previous
+
+            def fail_after_signal():
+                handler = installed[signal.SIGTERM]
+                assert callable(handler)
+                handler(signal.SIGTERM, None)
+                raise OSError("injected process-start hook failure")
+
+            with (
+                mock.patch.object(common.subprocess, "Popen", return_value=process),
+                mock.patch.object(common.signal, "signal", side_effect=install_handler),
+                mock.patch.object(common, "signal_process_group"),
+                mock.patch.object(common, "terminate_process_group") as terminate,
+                mock.patch.object(
+                    common,
+                    "_process_group_exists",
+                    return_value=False,
+                ),
+                mock.patch.object(common, "block_forwarded_signals", return_value=None),
+            ):
+                with self.assertRaises(common.ForwardedSignal) as raised:
+                    common.run(
+                        ("reviewer",),
+                        stdout_path=root / "stdout.log",
+                        stderr_path=root / "stderr.log",
+                        on_process_started=fail_after_signal,
+                        on_process_quiescent=on_process_quiescent,
+                    )
+
+        self.assertEqual(raised.exception.signum, signal.SIGTERM)
+        self.assertIn(
+            "process operation failed after a signal became pending (OSError): "
+            "injected process-start hook failure",
+            _visible_exception_messages(raised.exception),
+        )
+        terminate.assert_called_once_with(
+            process,
+            initial_signal=signal.SIGTERM,
+            signal_already_sent=False,
+        )
+        on_process_quiescent.assert_called_once_with()
+
     def test_logged_command_does_not_publish_failed_process_start(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             on_process_started = mock.Mock()
+            on_process_quiescent = mock.Mock()
             with (
                 mock.patch.object(
                     common.subprocess,
@@ -536,9 +1093,11 @@ class ChildEnvironmentTest(unittest.TestCase):
                         stdout_path=root / "stdout.log",
                         stderr_path=root / "stderr.log",
                         on_process_started=on_process_started,
+                        on_process_quiescent=on_process_quiescent,
                     )
 
             on_process_started.assert_not_called()
+            on_process_quiescent.assert_not_called()
 
     def test_logged_command_publishes_successful_process_start_once(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -556,9 +1115,7 @@ class ChildEnvironmentTest(unittest.TestCase):
                 events.append("spawn")
                 return process
 
-            on_process_started = mock.Mock(
-                side_effect=lambda: events.append("started")
-            )
+            on_process_started = mock.Mock(side_effect=lambda: events.append("started"))
             with (
                 mock.patch.object(common.subprocess, "Popen", side_effect=spawn),
                 mock.patch.object(

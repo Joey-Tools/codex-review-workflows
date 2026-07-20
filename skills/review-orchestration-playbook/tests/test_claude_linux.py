@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import dataclasses
+import dis
+import errno
 import json
 import os
 import pathlib
@@ -14,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -2290,6 +2293,366 @@ class CredentialStagingTest(unittest.TestCase):
     SYNTH_REFRESH_A = "codex_synth_v1_refresh_a"
     SYNTH_REFRESH_B = "codex_synth_v1_refresh_b"
 
+    def _interrupt_acquire_assignment(
+        self,
+        function: object,
+        *,
+        local_name: str,
+        armed: list[bool],
+        error: BaseException,
+    ) -> mock._patch:
+        code = function.__code__
+        instructions = {
+            instruction.offset: instruction
+            for instruction in dis.get_instructions(function)
+        }
+        previous_trace = sys.gettrace()
+
+        def trace(frame: object, event: str, _argument: object) -> object:
+            if frame.f_code is code:
+                frame.f_trace_opcodes = True
+                instruction = instructions.get(frame.f_lasti)
+                if (
+                    event == "opcode"
+                    and armed[0]
+                    and instruction is not None
+                    and instruction.opname == "STORE_FAST"
+                    and instruction.argval == local_name
+                ):
+                    armed[0] = False
+                    raise error
+            return trace
+
+        class TracePatch:
+            def __enter__(self) -> None:
+                sys.settrace(trace)
+
+            def __exit__(
+                self,
+                _error_type: object,
+                _error: object,
+                _traceback: object,
+            ) -> None:
+                sys.settrace(previous_trace)
+
+        return TracePatch()
+
+    def _interrupt_release_call_entry(
+        self,
+        *,
+        armed: list[bool],
+        error: BaseException,
+        target_lease: list[
+            claude_refresh_lock.ClaudeRefreshLockLease
+        ],
+    ) -> mock._patch:
+        function = claude_linux._release_owned_claude_refresh_lock
+        code = function.__code__
+        instructions = list(dis.get_instructions(function))
+        release_call_offsets: set[int] = set()
+        for index, instruction in enumerate(instructions):
+            if instruction.argval != "release" or instruction.opname not in {
+                "LOAD_ATTR",
+                "LOAD_METHOD",
+            }:
+                continue
+            for candidate in instructions[index + 1 :]:
+                if candidate.opname.startswith("CALL"):
+                    release_call_offsets.add(candidate.offset)
+                    break
+        self.assertTrue(release_call_offsets)
+        release_call_offsets = {min(release_call_offsets)}
+        previous_trace = sys.gettrace()
+
+        def trace(frame: object, event: str, _argument: object) -> object:
+            if frame.f_code is code:
+                frame.f_trace_opcodes = True
+                if (
+                    event == "opcode"
+                    and armed[0]
+                    and frame.f_lasti in release_call_offsets
+                    and target_lease
+                    and frame.f_locals.get("cleanup_lease")
+                    is target_lease[0]
+                ):
+                    armed[0] = False
+                    raise error
+            return trace
+
+        class TracePatch:
+            def __enter__(self) -> None:
+                sys.settrace(trace)
+
+            def __exit__(
+                self,
+                _error_type: object,
+                _error: object,
+                _traceback: object,
+            ) -> None:
+                sys.settrace(previous_trace)
+
+        return TracePatch()
+
+    def _interrupt_cleanup_call_boundaries(
+        self,
+        function: object,
+        *,
+        target_lease: list[
+            claude_refresh_lock.ClaudeRefreshLockLease
+        ],
+        injections: list[
+            tuple[str, str, list[BaseException]]
+        ],
+    ) -> mock._patch:
+        code = function.__code__
+        instructions = list(dis.get_instructions(function))
+        offsets_by_boundary: dict[tuple[str, str], set[int]] = {}
+        for method_name, window, _errors in injections:
+            boundary = (method_name, window)
+            if boundary in offsets_by_boundary:
+                continue
+            offsets: set[int] = set()
+            for index, instruction in enumerate(instructions):
+                if (
+                    instruction.argval != method_name
+                    or instruction.opname
+                    not in {"LOAD_ATTR", "LOAD_METHOD"}
+                ):
+                    continue
+                call_index: int | None = None
+                for candidate_index in range(index + 1, len(instructions)):
+                    if instructions[candidate_index].opname.startswith(
+                        "CALL"
+                    ):
+                        call_index = candidate_index
+                        break
+                assert call_index is not None
+                target_index = (
+                    call_index
+                    if window == "entry"
+                    else call_index + 1
+                )
+                self.assertLess(target_index, len(instructions))
+                offsets.add(instructions[target_index].offset)
+            self.assertTrue(offsets, boundary)
+            offsets_by_boundary[boundary] = offsets
+        remaining = [list(errors) for _name, _window, errors in injections]
+        previous_trace = sys.gettrace()
+
+        def trace(frame: object, event: str, _argument: object) -> object:
+            if frame.f_code is code:
+                frame.f_trace_opcodes = True
+                if event != "opcode" or not target_lease:
+                    return trace
+                cleanup_lease = next(
+                    (
+                        frame.f_locals.get(local_name)
+                        for local_name in (
+                            "cleanup_lease",
+                            "cleanup_host_refresh_lock",
+                            "lease",
+                        )
+                        if frame.f_locals.get(local_name) is target_lease[0]
+                    ),
+                    None,
+                )
+                if cleanup_lease is None:
+                    return trace
+                for index, (method_name, window, _errors) in enumerate(
+                    injections
+                ):
+                    if (
+                        remaining[index]
+                        and frame.f_lasti
+                        in offsets_by_boundary[(method_name, window)]
+                    ):
+                        raise remaining[index].pop(0)
+            return trace
+
+        class TracePatch:
+            def __enter__(self) -> None:
+                sys.settrace(trace)
+
+            def __exit__(
+                self,
+                _error_type: object,
+                _error: object,
+                _traceback: object,
+            ) -> None:
+                sys.settrace(previous_trace)
+
+        return TracePatch()
+
+    def _interrupt_function_call_boundary(
+        self,
+        function: object,
+        *,
+        callee_name: str,
+        window: str,
+        target_lease: list[
+            claude_refresh_lock.ClaudeRefreshLockLease
+        ],
+        error: BaseException,
+    ) -> mock._patch:
+        code = function.__code__
+        instructions = list(dis.get_instructions(function))
+        boundary_offsets: set[int] = set()
+        for index, instruction in enumerate(instructions):
+            if instruction.argval != callee_name:
+                continue
+            call_index: int | None = None
+            for candidate_index in range(index + 1, len(instructions)):
+                if instructions[candidate_index].opname.startswith("CALL"):
+                    call_index = candidate_index
+                    break
+            assert call_index is not None
+            target_index = call_index if window == "entry" else call_index + 1
+            self.assertLess(target_index, len(instructions))
+            boundary_offsets.add(instructions[target_index].offset)
+        self.assertTrue(boundary_offsets)
+        previous_trace = sys.gettrace()
+        armed = [True]
+
+        def trace(frame: object, event: str, _argument: object) -> object:
+            if frame.f_code is code:
+                frame.f_trace_opcodes = True
+                if (
+                    event == "opcode"
+                    and armed[0]
+                    and frame.f_lasti in boundary_offsets
+                    and target_lease
+                    and any(
+                        frame.f_locals.get(local_name)
+                        is target_lease[0]
+                        for local_name in (
+                            "cleanup_lease",
+                            "cleanup_host_refresh_lock",
+                            "lease",
+                            "refresh_lock",
+                            "stateful_lease",
+                            "stateful_host_refresh_lock",
+                        )
+                    )
+                ):
+                    armed[0] = False
+                    raise error
+            return trace
+
+        class TracePatch:
+            def __enter__(self) -> None:
+                sys.settrace(trace)
+
+            def __exit__(
+                self,
+                _error_type: object,
+                _error: object,
+                _traceback: object,
+            ) -> None:
+                sys.settrace(previous_trace)
+
+        return TracePatch()
+
+    def _interrupt_opcode(
+        self,
+        function: object,
+        *,
+        opname: str,
+        target_lease: list[
+            claude_refresh_lock.ClaudeRefreshLockLease
+        ],
+        error: BaseException,
+    ) -> mock._patch:
+        code = function.__code__
+        equivalent_opnames = {
+            "BEFORE_WITH": {"BEFORE_WITH", "SETUP_WITH"},
+        }.get(opname, {opname})
+        offsets = {
+            instruction.offset
+            for instruction in dis.get_instructions(function)
+            if instruction.opname in equivalent_opnames
+        }
+        self.assertTrue(offsets)
+        previous_trace = sys.gettrace()
+        armed = [True]
+
+        def trace(frame: object, event: str, _argument: object) -> object:
+            if frame.f_code is code:
+                frame.f_trace_opcodes = True
+                if (
+                    event == "opcode"
+                    and armed[0]
+                    and frame.f_lasti in offsets
+                    and target_lease
+                    and frame.f_locals.get("lease") is target_lease[0]
+                ):
+                    armed[0] = False
+                    raise error
+            return trace
+
+        class TracePatch:
+            def __enter__(self) -> None:
+                sys.settrace(trace)
+
+            def __exit__(
+                self,
+                _error_type: object,
+                _error: object,
+                _traceback: object,
+            ) -> None:
+                sys.settrace(previous_trace)
+
+        return TracePatch()
+
+    def _dispose_refresh_lock_fixture(
+        self,
+        lease: claude_refresh_lock.ClaudeRefreshLockLease,
+    ) -> None:
+        lease._heartbeat_stop.set()
+        heartbeat = lease._heartbeat_thread
+        if heartbeat is not None:
+            heartbeat.join(timeout=2.0)
+        if not lease.released and not lease._deletion_prohibited:
+            lease._release(skip_abandoned=False)
+            return
+        descriptors = {
+            *(lock.descriptor for lock in lease._locks),
+            lease._legacy_parent_anchor.descriptor,
+            lease._config_anchor.descriptor,
+        }
+        for descriptor in descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+    def _assert_refresh_lock_descriptors_closed(
+        self,
+        lease: claude_refresh_lock.ClaudeRefreshLockLease,
+    ) -> None:
+        descriptors = {
+            *(lock.descriptor for lock in lease._locks),
+            lease._legacy_parent_anchor.descriptor,
+            lease._config_anchor.descriptor,
+        }
+        for descriptor in descriptors:
+            with self.assertRaises(OSError) as raised:
+                os.fstat(descriptor)
+            self.assertEqual(raised.exception.errno, errno.EBADF)
+
+    def _assert_assignment_interrupt_released_lock(
+        self,
+        lease: claude_refresh_lock.ClaudeRefreshLockLease,
+    ) -> None:
+        heartbeat = lease._heartbeat_thread
+        self.assertIsNotNone(heartbeat)
+        assert heartbeat is not None
+        self.assertFalse(
+            heartbeat.is_alive(),
+            "caller assignment interruption orphaned a renewing heartbeat",
+        )
+        self.assertTrue(lease.released)
+        self.assertTrue(all(not path.exists() for path in lease.paths))
+
     def _credential(
         self,
         path: pathlib.Path,
@@ -2483,6 +2846,119 @@ class CredentialStagingTest(unittest.TestCase):
                     )
 
             self.assertTrue(retargeted)
+            self.assertEqual(
+                (retained_home / ".claude" / ".credentials.json").read_bytes(),
+                original_payload,
+            )
+            self.assertEqual(
+                (home / ".claude" / ".credentials.json").read_bytes(),
+                replacement_payload,
+            )
+            self.assertEqual(list(helper.iterdir()), [])
+
+    def test_credential_ancestor_retarget_during_host_lock_wait_blocks_read(
+        self,
+    ) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            home = root / "home"
+            config_dir = home / ".claude"
+            config_dir.mkdir(parents=True, mode=0o700)
+            source = self._credential(
+                config_dir / ".credentials.json",
+                expires_at_ms=(now + 7200) * 1000,
+                access_token=self.SYNTH_ACCESS_A,
+                refresh_token=self.SYNTH_REFRESH_A,
+            )
+            original_payload = source.read_bytes()
+
+            replacement_home = root / "replacement-home"
+            replacement_config = replacement_home / ".claude"
+            replacement_config.mkdir(parents=True, mode=0o700)
+            replacement_source = self._credential(
+                replacement_config / ".credentials.json",
+                expires_at_ms=(now + 7200) * 1000,
+                access_token=self.SYNTH_ACCESS_B,
+                refresh_token=self.SYNTH_REFRESH_B,
+            )
+            replacement_payload = replacement_source.read_bytes()
+            retained_home = root / "retained-home"
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+            lock_wait_entered = threading.Event()
+            allow_lock_acquisition = threading.Event()
+            credential_exposed = threading.Event()
+            thread_errors: list[BaseException] = []
+            host_lease = mock.Mock(spec=["assert_held", "release"])
+
+            def acquire_refresh_lock(
+                config_path: os.PathLike[str] | str,
+                **kwargs: object,
+            ) -> mock.Mock:
+                self.assertEqual(pathlib.Path(config_path), source.parent)
+                lock_wait_entered.set()
+                if not allow_lock_acquisition.wait(timeout=3.0):
+                    raise TimeoutError("host lock wait fixture timed out")
+                owner = kwargs["owner"]
+                assert isinstance(
+                    owner,
+                    claude_refresh_lock.ClaudeRefreshLockOwner,
+                )
+                owner._publish(host_lease)
+                return host_lease
+
+            def stage_credential() -> None:
+                try:
+                    with claude_linux.stage_claude_credentials(
+                        source,
+                        helper,
+                        now=now,
+                        refresh_lock_protocol=self.PROTOCOL,
+                    ):
+                        credential_exposed.set()
+                except BaseException as error:
+                    thread_errors.append(error)
+
+            staging_thread = threading.Thread(
+                target=stage_credential,
+                name="retarget-during-host-lock-wait",
+                daemon=True,
+            )
+            with (
+                mock.patch.object(
+                    claude_linux,
+                    "acquire_claude_refresh_lock",
+                    side_effect=acquire_refresh_lock,
+                ),
+                mock.patch.object(
+                    claude_linux,
+                    "_read_valid_credential",
+                    wraps=claude_linux._read_valid_credential,
+                ) as read_credential,
+            ):
+                try:
+                    staging_thread.start()
+                    self.assertTrue(lock_wait_entered.wait(timeout=3.0))
+                    home.rename(retained_home)
+                    home.symlink_to(replacement_home, target_is_directory=True)
+                    allow_lock_acquisition.set()
+                    staging_thread.join(timeout=3.0)
+                finally:
+                    allow_lock_acquisition.set()
+                    staging_thread.join(timeout=3.0)
+
+            self.assertFalse(staging_thread.is_alive())
+            self.assertFalse(credential_exposed.is_set())
+            read_credential.assert_not_called()
+            self.assertEqual(len(thread_errors), 1)
+            self.assertIsInstance(
+                thread_errors[0],
+                claude_linux.LinuxCredentialInspectionInconclusive,
+            )
+            self.assertIn("ancestor changed", str(thread_errors[0]))
+            host_lease.assert_held.assert_called_once_with()
+            host_lease.release.assert_called_once_with()
             self.assertEqual(
                 (retained_home / ".claude" / ".credentials.json").read_bytes(),
                 original_payload,
@@ -2813,6 +3289,7 @@ class CredentialStagingTest(unittest.TestCase):
             persisted_b = threading.Event()
             persisted_a = threading.Event()
             real_writeback = claude_linux._writeback_refreshed_credential_impl
+            real_acquire = claude_linux.acquire_claude_refresh_lock
 
             def observe_writeback(*args: object, **kwargs: object) -> object:
                 result = real_writeback(*args, **kwargs)
@@ -2826,10 +3303,17 @@ class CredentialStagingTest(unittest.TestCase):
                         persisted_a.set()
                 return result
 
-            with mock.patch.object(
-                claude_linux,
-                "_writeback_refreshed_credential_impl",
-                side_effect=observe_writeback,
+            with (
+                mock.patch.object(
+                    claude_linux,
+                    "_writeback_refreshed_credential_impl",
+                    side_effect=observe_writeback,
+                ),
+                mock.patch.object(
+                    claude_linux,
+                    "acquire_claude_refresh_lock",
+                    wraps=real_acquire,
+                ) as acquire_refresh_lock,
             ):
                 with claude_linux.stage_claude_credentials(
                     source,
@@ -2864,6 +3348,14 @@ class CredentialStagingTest(unittest.TestCase):
                         value["claudeAiOauth"]["refreshToken"],
                         self.SYNTH_REFRESH_A,
                     )
+
+            self.assertEqual(
+                sum(
+                    pathlib.Path(call.args[0]) == source.parent
+                    for call in acquire_refresh_lock.call_args_list
+                ),
+                1,
+            )
 
             value = json.loads(source.read_text(encoding="utf-8"))
             self.assertEqual(
@@ -3083,13 +3575,13 @@ class CredentialStagingTest(unittest.TestCase):
             with (
                 mock.patch.object(
                     claude_linux,
-                    "STAGED_CREDENTIAL_POLL_SECONDS",
-                    60.0,
-                ),
+                    "_read_valid_credential",
+                    wraps=claude_linux._read_valid_credential,
+                ) as read_credential,
                 self.assertRaisesRegex(
-                    claude_linux.LinuxCredentialInspectionInconclusive,
+                    claude_linux.LinuxCredentialStaleRefreshLock,
                     "stale Claude refresh lock",
-                ) as raised,
+                ),
             ):
                 with claude_linux.stage_claude_credentials(
                     source,
@@ -3097,29 +3589,2353 @@ class CredentialStagingTest(unittest.TestCase):
                     now=now,
                     refresh_lock_protocol=self.PROTOCOL,
                     writer_quiescent=lambda: True,
-                ) as staged:
-                    refreshed = self._credential(
-                        staged.config_dir / "last-rotation.json",
-                        expires_at_ms=(now + 7200) * 1000,
-                        access_token=self.SYNTH_ACCESS_A,
-                        refresh_token=self.SYNTH_REFRESH_B,
-                    )
-                    refreshed.replace(staged.credential_path)
+                ):
+                    self.fail("stale host refresh lock must block staging")
 
             self.assertTrue(host_lock.is_dir())
-            self._assert_retained_recovery_carrier(
-                error=raised.exception,
-                staged=staged,
-                helper=helper,
-                expected_refresh_token=self.SYNTH_REFRESH_B,
-            )
+            read_credential.assert_not_called()
+            self.assertEqual(list(helper.iterdir()), [])
             host = json.loads(source.read_text(encoding="utf-8"))
             self.assertEqual(
                 host["claudeAiOauth"]["refreshToken"],
                 self.SYNTH_REFRESH_A,
             )
 
-    def test_unchanged_poll_does_not_take_any_refresh_lock(self) -> None:
+    def test_host_refresh_lock_contention_blocks_source_read(self) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+            source = self._credential(
+                root / ".credentials.json",
+                expires_at_ms=(now - 60) * 1000,
+            )
+
+            with (
+                mock.patch.object(
+                    claude_linux,
+                    "acquire_claude_refresh_lock",
+                    side_effect=claude_linux.ClaudeRefreshLockTimeout(
+                        "fixture host refresh lock contention"
+                    ),
+                ) as acquire_refresh_lock,
+                mock.patch.object(
+                    claude_linux,
+                    "_read_valid_credential",
+                    wraps=claude_linux._read_valid_credential,
+                ) as read_credential,
+                self.assertRaisesRegex(
+                    claude_linux.LinuxCredentialInspectionInconclusive,
+                    "cannot coordinate Claude credential refresh transaction",
+                ),
+            ):
+                with claude_linux.stage_claude_credentials(
+                    source,
+                    helper,
+                    now=now,
+                    refresh_lock_protocol=self.PROTOCOL,
+                ):
+                    self.fail("contended host refresh lock must block staging")
+
+            acquire_refresh_lock.assert_called_once_with(
+                source.parent,
+                protocol=self.PROTOCOL,
+                owner=mock.ANY,
+                config_dir_fd=mock.ANY,
+                legacy_parent_dir_fd=mock.ANY,
+            )
+            read_credential.assert_not_called()
+            self.assertEqual(list(helper.iterdir()), [])
+
+    def test_staged_read_assignment_interrupt_releases_owner_lease(
+        self,
+    ) -> None:
+        captured: list[claude_refresh_lock.ClaudeRefreshLockLease] = []
+        armed = [False]
+        interruption = KeyboardInterrupt(
+            "injected staged-read refresh-lock assignment interruption"
+        )
+        real_acquire = claude_linux.acquire_claude_refresh_lock
+
+        def acquire_and_arm(
+            *args: object,
+            **kwargs: object,
+        ) -> claude_refresh_lock.ClaudeRefreshLockLease:
+            lease = real_acquire(*args, **kwargs)
+            captured.append(lease)
+            armed[0] = True
+            return lease
+
+        with tempfile.TemporaryDirectory() as temporary:
+            carrier_root = pathlib.Path(temporary) / "carrier"
+            carrier_root.mkdir(mode=0o700)
+            config_dir = carrier_root / "config"
+            config_dir.mkdir(mode=0o700)
+            credential_path = self._credential(
+                config_dir / ".credentials.json",
+                expires_at_ms=(time.time() + 7200) * 1000,
+            )
+            staged = claude_linux.StagedCredential(
+                carrier_root,
+                config_dir,
+                credential_path,
+                0.0,
+            )
+            try:
+                with (
+                    mock.patch.object(
+                        claude_linux,
+                        "acquire_claude_refresh_lock",
+                        side_effect=acquire_and_arm,
+                    ),
+                    self._interrupt_acquire_assignment(
+                        claude_linux._read_staged_credential_under_lock,
+                        local_name="refresh_lock",
+                        armed=armed,
+                        error=interruption,
+                    ),
+                    self.assertRaises(KeyboardInterrupt) as raised,
+                ):
+                    claude_linux._read_staged_credential_under_lock(
+                        staged,
+                        owner_uid=os.getuid(),
+                        refresh_lock_protocol=self.PROTOCOL,
+                        timeout_seconds=0,
+                    )
+
+                self.assertIs(raised.exception, interruption)
+                self.assertEqual(len(captured), 1)
+                self._assert_assignment_interrupt_released_lock(captured[0])
+            finally:
+                for lease in captured:
+                    if not lease.released:
+                        lease._release(skip_abandoned=False)
+
+    def test_staged_read_release_entry_interrupt_releases_owner_lease(
+        self,
+    ) -> None:
+        captured: list[claude_refresh_lock.ClaudeRefreshLockLease] = []
+        armed = [True]
+        interruption = KeyboardInterrupt(
+            "injected staged-read refresh-lock release-entry interruption"
+        )
+        real_acquire = claude_linux.acquire_claude_refresh_lock
+
+        def capture_acquire(
+            *args: object,
+            **kwargs: object,
+        ) -> claude_refresh_lock.ClaudeRefreshLockLease:
+            lease = real_acquire(*args, **kwargs)
+            captured.append(lease)
+            return lease
+
+        with tempfile.TemporaryDirectory() as temporary:
+            carrier_root = pathlib.Path(temporary) / "carrier"
+            carrier_root.mkdir(mode=0o700)
+            config_dir = carrier_root / "config"
+            config_dir.mkdir(mode=0o700)
+            credential_path = self._credential(
+                config_dir / ".credentials.json",
+                expires_at_ms=(time.time() + 7200) * 1000,
+            )
+            staged = claude_linux.StagedCredential(
+                carrier_root,
+                config_dir,
+                credential_path,
+                0.0,
+            )
+            try:
+                with (
+                    mock.patch.object(
+                        claude_linux,
+                        "acquire_claude_refresh_lock",
+                        side_effect=capture_acquire,
+                    ),
+                    self._interrupt_release_call_entry(
+                        armed=armed,
+                        error=interruption,
+                        target_lease=captured,
+                    ),
+                    self.assertRaises(KeyboardInterrupt) as raised,
+                ):
+                    claude_linux._read_staged_credential_under_lock(
+                        staged,
+                        owner_uid=os.getuid(),
+                        refresh_lock_protocol=self.PROTOCOL,
+                        timeout_seconds=0,
+                    )
+
+                self.assertIs(raised.exception, interruption)
+                self.assertFalse(armed[0])
+                self.assertEqual(len(captured), 1)
+                self._assert_assignment_interrupt_released_lock(captured[0])
+            finally:
+                for lease in captured:
+                    if not lease.released:
+                        lease._release(skip_abandoned=False)
+
+    def test_staged_read_release_helper_entry_is_fail_closed(
+        self,
+    ) -> None:
+        captured: list[claude_refresh_lock.ClaudeRefreshLockLease] = []
+        interruption = KeyboardInterrupt(
+            "injected staged-read release-helper entry interruption"
+        )
+        real_acquire = claude_linux.acquire_claude_refresh_lock
+
+        def capture_acquire(
+            *args: object,
+            **kwargs: object,
+        ) -> claude_refresh_lock.ClaudeRefreshLockLease:
+            lease = real_acquire(*args, **kwargs)
+            captured.append(lease)
+            return lease
+
+        with tempfile.TemporaryDirectory() as temporary:
+            carrier_root = pathlib.Path(temporary) / "carrier"
+            carrier_root.mkdir(mode=0o700)
+            config_dir = carrier_root / "config"
+            config_dir.mkdir(mode=0o700)
+            credential_path = self._credential(
+                config_dir / ".credentials.json",
+                expires_at_ms=(time.time() + 7200) * 1000,
+            )
+            staged = claude_linux.StagedCredential(
+                carrier_root,
+                config_dir,
+                credential_path,
+                0.0,
+            )
+            try:
+                with (
+                    mock.patch.object(
+                        claude_linux,
+                        "acquire_claude_refresh_lock",
+                        side_effect=capture_acquire,
+                    ),
+                    self._interrupt_function_call_boundary(
+                        claude_linux._read_staged_credential_under_lock,
+                        callee_name=(
+                            "_release_owned_claude_refresh_lock"
+                        ),
+                        window="entry",
+                        target_lease=captured,
+                        error=interruption,
+                    ),
+                    self.assertRaises(KeyboardInterrupt) as raised,
+                ):
+                    claude_linux._read_staged_credential_under_lock(
+                        staged,
+                        owner_uid=os.getuid(),
+                        refresh_lock_protocol=self.PROTOCOL,
+                        timeout_seconds=0,
+                    )
+
+                self.assertIs(raised.exception, interruption)
+                self.assertEqual(len(captured), 1)
+                lease = captured[0]
+                heartbeat = lease._heartbeat_thread
+                self.assertIsNotNone(heartbeat)
+                assert heartbeat is not None
+                self.assertFalse(heartbeat.is_alive())
+                self.assertTrue(
+                    lease.released or lease._deletion_prohibited
+                )
+                if lease.released:
+                    self.assertTrue(
+                        all(not path.exists() for path in lease.paths)
+                    )
+                else:
+                    self.assertTrue(
+                        all(path.is_dir() for path in lease.paths)
+                    )
+                    self._assert_refresh_lock_descriptors_closed(lease)
+                    self.assertTrue(
+                        getattr(
+                            raised.exception,
+                            (
+                                "_codex_claude_refresh_lock_"
+                                "descriptor_bound"
+                            ),
+                            False,
+                        )
+                        or getattr(
+                            raised.exception,
+                            "_codex_claude_refresh_lock_paths",
+                            None,
+                        )
+                    )
+            finally:
+                for lease in captured:
+                    self._dispose_refresh_lock_fixture(lease)
+
+    def test_staged_read_release_return_interrupt_releases_owner_lease(
+        self,
+    ) -> None:
+        captured: list[claude_refresh_lock.ClaudeRefreshLockLease] = []
+        armed = [False]
+        interruption = KeyboardInterrupt(
+            "injected staged-read refresh-lock release-return interruption"
+        )
+        real_acquire = claude_linux.acquire_claude_refresh_lock
+
+        def acquire_and_arm(
+            *args: object,
+            **kwargs: object,
+        ) -> claude_refresh_lock.ClaudeRefreshLockLease:
+            lease = real_acquire(*args, **kwargs)
+            captured.append(lease)
+            armed[0] = True
+            return lease
+
+        with tempfile.TemporaryDirectory() as temporary:
+            carrier_root = pathlib.Path(temporary) / "carrier"
+            carrier_root.mkdir(mode=0o700)
+            config_dir = carrier_root / "config"
+            config_dir.mkdir(mode=0o700)
+            credential_path = self._credential(
+                config_dir / ".credentials.json",
+                expires_at_ms=(time.time() + 7200) * 1000,
+            )
+            staged = claude_linux.StagedCredential(
+                carrier_root,
+                config_dir,
+                credential_path,
+                0.0,
+            )
+            try:
+                with (
+                    mock.patch.object(
+                        claude_linux,
+                        "acquire_claude_refresh_lock",
+                        side_effect=acquire_and_arm,
+                    ),
+                    self._interrupt_acquire_assignment(
+                        claude_linux._read_staged_credential_under_lock,
+                        local_name="release_cleanup",
+                        armed=armed,
+                        error=interruption,
+                    ),
+                    self.assertRaises(KeyboardInterrupt) as raised,
+                ):
+                    claude_linux._read_staged_credential_under_lock(
+                        staged,
+                        owner_uid=os.getuid(),
+                        refresh_lock_protocol=self.PROTOCOL,
+                        timeout_seconds=0,
+                    )
+
+                self.assertIs(raised.exception, interruption)
+                self.assertFalse(armed[0])
+                self.assertEqual(len(captured), 1)
+                self._assert_assignment_interrupt_released_lock(captured[0])
+            finally:
+                for lease in captured:
+                    if not lease.released:
+                        lease._release(skip_abandoned=False)
+
+    def test_writeback_assignment_interrupt_releases_owner_lease(
+        self,
+    ) -> None:
+        captured: list[claude_refresh_lock.ClaudeRefreshLockLease] = []
+        armed = [False]
+        interruption = KeyboardInterrupt(
+            "injected writeback refresh-lock assignment interruption"
+        )
+        real_acquire = claude_linux.acquire_claude_refresh_lock
+
+        def acquire_and_arm(
+            *args: object,
+            **kwargs: object,
+        ) -> claude_refresh_lock.ClaudeRefreshLockLease:
+            lease = real_acquire(*args, **kwargs)
+            captured.append(lease)
+            armed[0] = True
+            return lease
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            source = self._credential(
+                root / ".credentials.json",
+                expires_at_ms=(time.time() - 60) * 1000,
+                access_token=self.SYNTH_ACCESS_EXPIRED,
+                refresh_token=self.SYNTH_REFRESH_A,
+            )
+            updated_path = self._credential(
+                root / "updated.json",
+                expires_at_ms=(time.time() + 7200) * 1000,
+                access_token=self.SYNTH_ACCESS_A,
+                refresh_token=self.SYNTH_REFRESH_B,
+            )
+            source_anchor = claude_linux._open_credential_directory_anchor(
+                source,
+                owner_uid=os.getuid(),
+            )
+            original_payload: bytearray | None = None
+            updated_payload = bytearray(updated_path.read_bytes())
+            try:
+                (
+                    original_payload,
+                    _expires_at_ms,
+                    original_identity,
+                ) = claude_linux._read_valid_credential(
+                    source,
+                    owner_uid=os.getuid(),
+                    now=0.0,
+                    required_validity_seconds=0.0,
+                    dir_fd=source_anchor.descriptor,
+                )
+                staged = claude_linux.StagedCredential(
+                    root,
+                    root,
+                    updated_path,
+                    0.0,
+                )
+                with (
+                    mock.patch.object(
+                        claude_linux,
+                        "acquire_claude_refresh_lock",
+                        side_effect=acquire_and_arm,
+                    ),
+                    self._interrupt_acquire_assignment(
+                        claude_linux._writeback_refreshed_credential_impl,
+                        local_name="refresh_lock",
+                        armed=armed,
+                        error=interruption,
+                    ),
+                    self.assertRaises(KeyboardInterrupt) as raised,
+                ):
+                    claude_linux._writeback_refreshed_credential_impl(
+                        source,
+                        source_anchor,
+                        staged,
+                        original_payload,
+                        original_identity,
+                        source_anchor.identity,
+                        owner_uid=os.getuid(),
+                        refresh_lock_protocol=self.PROTOCOL,
+                        staged_payload=updated_payload,
+                    )
+
+                self.assertIs(raised.exception, interruption)
+                self.assertEqual(len(captured), 1)
+                self._assert_assignment_interrupt_released_lock(captured[0])
+            finally:
+                if original_payload is not None:
+                    original_payload[:] = b"\x00" * len(original_payload)
+                updated_payload[:] = b"\x00" * len(updated_payload)
+                source_anchor.close_if_owned()
+                for lease in captured:
+                    if not lease.released:
+                        lease._release(skip_abandoned=False)
+
+    def test_writeback_release_entry_interrupt_releases_owner_lease(
+        self,
+    ) -> None:
+        captured: list[claude_refresh_lock.ClaudeRefreshLockLease] = []
+        armed = [True]
+        interruption = KeyboardInterrupt(
+            "injected writeback refresh-lock release-entry interruption"
+        )
+        real_acquire = claude_linux.acquire_claude_refresh_lock
+
+        def capture_acquire(
+            *args: object,
+            **kwargs: object,
+        ) -> claude_refresh_lock.ClaudeRefreshLockLease:
+            lease = real_acquire(*args, **kwargs)
+            captured.append(lease)
+            return lease
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            source = self._credential(
+                root / ".credentials.json",
+                expires_at_ms=(time.time() - 60) * 1000,
+                access_token=self.SYNTH_ACCESS_EXPIRED,
+                refresh_token=self.SYNTH_REFRESH_A,
+            )
+            updated_path = self._credential(
+                root / "updated.json",
+                expires_at_ms=(time.time() + 7200) * 1000,
+                access_token=self.SYNTH_ACCESS_A,
+                refresh_token=self.SYNTH_REFRESH_B,
+            )
+            source_anchor = claude_linux._open_credential_directory_anchor(
+                source,
+                owner_uid=os.getuid(),
+            )
+            original_payload: bytearray | None = None
+            updated_payload = bytearray(updated_path.read_bytes())
+            try:
+                (
+                    original_payload,
+                    _expires_at_ms,
+                    original_identity,
+                ) = claude_linux._read_valid_credential(
+                    source,
+                    owner_uid=os.getuid(),
+                    now=0.0,
+                    required_validity_seconds=0.0,
+                    dir_fd=source_anchor.descriptor,
+                )
+                staged = claude_linux.StagedCredential(
+                    root,
+                    root,
+                    updated_path,
+                    0.0,
+                )
+                with (
+                    mock.patch.object(
+                        claude_linux,
+                        "acquire_claude_refresh_lock",
+                        side_effect=capture_acquire,
+                    ),
+                    self._interrupt_release_call_entry(
+                        armed=armed,
+                        error=interruption,
+                        target_lease=captured,
+                    ),
+                    self.assertRaises(KeyboardInterrupt) as raised,
+                ):
+                    claude_linux._writeback_refreshed_credential_impl(
+                        source,
+                        source_anchor,
+                        staged,
+                        original_payload,
+                        original_identity,
+                        source_anchor.identity,
+                        owner_uid=os.getuid(),
+                        refresh_lock_protocol=self.PROTOCOL,
+                        staged_payload=updated_payload,
+                    )
+
+                self.assertIs(raised.exception, interruption)
+                self.assertFalse(armed[0])
+                self.assertEqual(len(captured), 1)
+                self._assert_assignment_interrupt_released_lock(captured[0])
+            finally:
+                if original_payload is not None:
+                    original_payload[:] = b"\x00" * len(original_payload)
+                updated_payload[:] = b"\x00" * len(updated_payload)
+                source_anchor.close_if_owned()
+                for lease in captured:
+                    if not lease.released:
+                        lease._release(skip_abandoned=False)
+
+    def test_writeback_release_helper_entry_is_fail_closed(self) -> None:
+        captured: list[claude_refresh_lock.ClaudeRefreshLockLease] = []
+        interruption = KeyboardInterrupt(
+            "injected writeback release-helper entry interruption"
+        )
+        real_acquire = claude_linux.acquire_claude_refresh_lock
+
+        def capture_acquire(
+            *args: object,
+            **kwargs: object,
+        ) -> claude_refresh_lock.ClaudeRefreshLockLease:
+            lease = real_acquire(*args, **kwargs)
+            captured.append(lease)
+            return lease
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            source = self._credential(
+                root / ".credentials.json",
+                expires_at_ms=(time.time() - 60) * 1000,
+                access_token=self.SYNTH_ACCESS_EXPIRED,
+                refresh_token=self.SYNTH_REFRESH_A,
+            )
+            updated_path = self._credential(
+                root / "updated.json",
+                expires_at_ms=(time.time() + 7200) * 1000,
+                access_token=self.SYNTH_ACCESS_A,
+                refresh_token=self.SYNTH_REFRESH_B,
+            )
+            source_anchor = claude_linux._open_credential_directory_anchor(
+                source,
+                owner_uid=os.getuid(),
+            )
+            original_payload: bytearray | None = None
+            updated_payload = bytearray(updated_path.read_bytes())
+            try:
+                (
+                    original_payload,
+                    _expires_at_ms,
+                    original_identity,
+                ) = claude_linux._read_valid_credential(
+                    source,
+                    owner_uid=os.getuid(),
+                    now=0.0,
+                    required_validity_seconds=0.0,
+                    dir_fd=source_anchor.descriptor,
+                )
+                staged = claude_linux.StagedCredential(
+                    root,
+                    root,
+                    updated_path,
+                    0.0,
+                )
+                with (
+                    mock.patch.object(
+                        claude_linux,
+                        "acquire_claude_refresh_lock",
+                        side_effect=capture_acquire,
+                    ),
+                    self._interrupt_function_call_boundary(
+                        claude_linux._writeback_refreshed_credential_impl,
+                        callee_name=(
+                            "_release_owned_claude_refresh_lock"
+                        ),
+                        window="entry",
+                        target_lease=captured,
+                        error=interruption,
+                    ),
+                    self.assertRaises(KeyboardInterrupt) as raised,
+                ):
+                    claude_linux._writeback_refreshed_credential_impl(
+                        source,
+                        source_anchor,
+                        staged,
+                        original_payload,
+                        original_identity,
+                        source_anchor.identity,
+                        owner_uid=os.getuid(),
+                        refresh_lock_protocol=self.PROTOCOL,
+                        staged_payload=updated_payload,
+                    )
+
+                self.assertIs(raised.exception, interruption)
+                self.assertEqual(len(captured), 1)
+                lease = captured[0]
+                heartbeat = lease._heartbeat_thread
+                self.assertIsNotNone(heartbeat)
+                assert heartbeat is not None
+                self.assertFalse(heartbeat.is_alive())
+                self.assertTrue(
+                    lease.released or lease._deletion_prohibited
+                )
+                if lease.released:
+                    self.assertTrue(
+                        all(not path.exists() for path in lease.paths)
+                    )
+                else:
+                    self.assertTrue(
+                        all(path.is_dir() for path in lease.paths)
+                    )
+                    self._assert_refresh_lock_descriptors_closed(lease)
+                    self.assertTrue(
+                        getattr(
+                            raised.exception,
+                            (
+                                "_codex_claude_refresh_lock_"
+                                "descriptor_bound"
+                            ),
+                            False,
+                        )
+                        or getattr(
+                            raised.exception,
+                            "_codex_claude_refresh_lock_paths",
+                            None,
+                        )
+                    )
+            finally:
+                if original_payload is not None:
+                    original_payload[:] = b"\x00" * len(original_payload)
+                updated_payload[:] = b"\x00" * len(updated_payload)
+                source_anchor.close_if_owned()
+                for lease in captured:
+                    self._dispose_refresh_lock_fixture(lease)
+
+    def test_writeback_release_return_interrupt_releases_owner_lease(
+        self,
+    ) -> None:
+        captured: list[claude_refresh_lock.ClaudeRefreshLockLease] = []
+        armed = [False]
+        interruption = KeyboardInterrupt(
+            "injected writeback refresh-lock release-return interruption"
+        )
+        real_acquire = claude_linux.acquire_claude_refresh_lock
+
+        def acquire_and_arm(
+            *args: object,
+            **kwargs: object,
+        ) -> claude_refresh_lock.ClaudeRefreshLockLease:
+            lease = real_acquire(*args, **kwargs)
+            captured.append(lease)
+            armed[0] = True
+            return lease
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            source = self._credential(
+                root / ".credentials.json",
+                expires_at_ms=(time.time() - 60) * 1000,
+                access_token=self.SYNTH_ACCESS_EXPIRED,
+                refresh_token=self.SYNTH_REFRESH_A,
+            )
+            updated_path = self._credential(
+                root / "updated.json",
+                expires_at_ms=(time.time() + 7200) * 1000,
+                access_token=self.SYNTH_ACCESS_A,
+                refresh_token=self.SYNTH_REFRESH_B,
+            )
+            source_anchor = claude_linux._open_credential_directory_anchor(
+                source,
+                owner_uid=os.getuid(),
+            )
+            original_payload: bytearray | None = None
+            updated_payload = bytearray(updated_path.read_bytes())
+            try:
+                (
+                    original_payload,
+                    _expires_at_ms,
+                    original_identity,
+                ) = claude_linux._read_valid_credential(
+                    source,
+                    owner_uid=os.getuid(),
+                    now=0.0,
+                    required_validity_seconds=0.0,
+                    dir_fd=source_anchor.descriptor,
+                )
+                staged = claude_linux.StagedCredential(
+                    root,
+                    root,
+                    updated_path,
+                    0.0,
+                )
+                with (
+                    mock.patch.object(
+                        claude_linux,
+                        "acquire_claude_refresh_lock",
+                        side_effect=acquire_and_arm,
+                    ),
+                    self._interrupt_acquire_assignment(
+                        claude_linux._writeback_refreshed_credential_impl,
+                        local_name="refresh_lock_cleanup",
+                        armed=armed,
+                        error=interruption,
+                    ),
+                    self.assertRaises(KeyboardInterrupt) as raised,
+                ):
+                    claude_linux._writeback_refreshed_credential_impl(
+                        source,
+                        source_anchor,
+                        staged,
+                        original_payload,
+                        original_identity,
+                        source_anchor.identity,
+                        owner_uid=os.getuid(),
+                        refresh_lock_protocol=self.PROTOCOL,
+                        staged_payload=updated_payload,
+                    )
+
+                self.assertIs(raised.exception, interruption)
+                self.assertFalse(armed[0])
+                self.assertEqual(len(captured), 1)
+                self._assert_assignment_interrupt_released_lock(captured[0])
+            finally:
+                if original_payload is not None:
+                    original_payload[:] = b"\x00" * len(original_payload)
+                updated_payload[:] = b"\x00" * len(updated_payload)
+                source_anchor.close_if_owned()
+                for lease in captured:
+                    if not lease.released:
+                        lease._release(skip_abandoned=False)
+
+    def test_host_transaction_assignment_interrupt_releases_owner_lease(
+        self,
+    ) -> None:
+        captured: list[claude_refresh_lock.ClaudeRefreshLockLease] = []
+        armed = [False]
+        interruption = KeyboardInterrupt(
+            "injected host refresh-lock assignment interruption"
+        )
+        real_acquire = claude_linux.acquire_claude_refresh_lock
+
+        def acquire_and_arm(
+            *args: object,
+            **kwargs: object,
+        ) -> claude_refresh_lock.ClaudeRefreshLockLease:
+            lease = real_acquire(*args, **kwargs)
+            captured.append(lease)
+            armed[0] = True
+            return lease
+
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config_dir = root / "config"
+            config_dir.mkdir(mode=0o700)
+            source = self._credential(
+                config_dir / ".credentials.json",
+                expires_at_ms=(now - 60) * 1000,
+            )
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+            generator = (
+                claude_linux._stage_claude_credentials_anchored.__wrapped__
+            )
+            try:
+                with (
+                    mock.patch.object(
+                        claude_linux,
+                        "acquire_claude_refresh_lock",
+                        side_effect=acquire_and_arm,
+                    ),
+                    self._interrupt_acquire_assignment(
+                        generator,
+                        local_name="host_refresh_lock",
+                        armed=armed,
+                        error=interruption,
+                    ),
+                    self.assertRaises(KeyboardInterrupt) as raised,
+                ):
+                    with claude_linux.stage_claude_credentials(
+                        source,
+                        helper,
+                        now=now,
+                        refresh_lock_protocol=self.PROTOCOL,
+                    ):
+                        self.fail(
+                            "assignment interruption reached staged credential"
+                        )
+
+                self.assertIs(raised.exception, interruption)
+                self.assertEqual(len(captured), 1)
+                self._assert_assignment_interrupt_released_lock(captured[0])
+                self.assertEqual(list(helper.iterdir()), [])
+            finally:
+                for lease in captured:
+                    if not lease.released:
+                        lease._release(skip_abandoned=False)
+
+    def test_host_transaction_release_entry_interrupt_releases_owner_lease(
+        self,
+    ) -> None:
+        captured: list[claude_refresh_lock.ClaudeRefreshLockLease] = []
+        armed = [True]
+        interruption = KeyboardInterrupt(
+            "injected host refresh-lock release-entry interruption"
+        )
+        real_acquire = claude_linux.acquire_claude_refresh_lock
+
+        def capture_acquire(
+            *args: object,
+            **kwargs: object,
+        ) -> claude_refresh_lock.ClaudeRefreshLockLease:
+            lease = real_acquire(*args, **kwargs)
+            if pathlib.Path(args[0]) == source.parent:
+                captured.append(lease)
+            return lease
+
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config_dir = root / "config"
+            config_dir.mkdir(mode=0o700)
+            source = self._credential(
+                config_dir / ".credentials.json",
+                expires_at_ms=(now - 60) * 1000,
+            )
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+            try:
+                with (
+                    mock.patch.object(
+                        claude_linux,
+                        "acquire_claude_refresh_lock",
+                        side_effect=capture_acquire,
+                    ),
+                    self._interrupt_release_call_entry(
+                        armed=armed,
+                        error=interruption,
+                        target_lease=captured,
+                    ),
+                    self.assertRaises(KeyboardInterrupt) as raised,
+                ):
+                    with claude_linux.stage_claude_credentials(
+                        source,
+                        helper,
+                        now=now,
+                        refresh_lock_protocol=self.PROTOCOL,
+                    ):
+                        pass
+
+                self.assertIs(raised.exception, interruption)
+                self.assertFalse(armed[0])
+                self.assertEqual(len(captured), 1)
+                self._assert_assignment_interrupt_released_lock(captured[0])
+                self.assertEqual(list(helper.iterdir()), [])
+            finally:
+                for lease in captured:
+                    if not lease.released:
+                        lease._release(skip_abandoned=False)
+
+    def test_host_transaction_release_helper_entry_is_fail_closed(
+        self,
+    ) -> None:
+        captured: list[claude_refresh_lock.ClaudeRefreshLockLease] = []
+        interruption = KeyboardInterrupt(
+            "injected host release-helper entry interruption"
+        )
+        real_acquire = claude_linux.acquire_claude_refresh_lock
+
+        def capture_acquire(
+            *args: object,
+            **kwargs: object,
+        ) -> claude_refresh_lock.ClaudeRefreshLockLease:
+            lease = real_acquire(*args, **kwargs)
+            if pathlib.Path(args[0]) == source.parent:
+                captured.append(lease)
+            return lease
+
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config_dir = root / "config"
+            config_dir.mkdir(mode=0o700)
+            source = self._credential(
+                config_dir / ".credentials.json",
+                expires_at_ms=(now - 60) * 1000,
+            )
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+            generator = (
+                claude_linux._stage_claude_credentials_anchored.__wrapped__
+            )
+            try:
+                with (
+                    mock.patch.object(
+                        claude_linux,
+                        "acquire_claude_refresh_lock",
+                        side_effect=capture_acquire,
+                    ),
+                    self._interrupt_function_call_boundary(
+                        generator,
+                        callee_name=(
+                            "_release_owned_claude_refresh_lock"
+                        ),
+                        window="entry",
+                        target_lease=captured,
+                        error=interruption,
+                    ),
+                    self.assertRaises(KeyboardInterrupt) as raised,
+                ):
+                    with claude_linux.stage_claude_credentials(
+                        source,
+                        helper,
+                        now=now,
+                        refresh_lock_protocol=self.PROTOCOL,
+                    ):
+                        pass
+
+                self.assertIs(raised.exception, interruption)
+                self.assertEqual(len(captured), 1)
+                lease = captured[0]
+                heartbeat = lease._heartbeat_thread
+                self.assertIsNotNone(heartbeat)
+                assert heartbeat is not None
+                self.assertFalse(heartbeat.is_alive())
+                self.assertTrue(
+                    lease.released or lease._deletion_prohibited
+                )
+                if lease.released:
+                    self.assertTrue(
+                        all(not path.exists() for path in lease.paths)
+                    )
+                else:
+                    self.assertTrue(
+                        all(path.is_dir() for path in lease.paths)
+                    )
+                    self._assert_refresh_lock_descriptors_closed(lease)
+                    self.assertTrue(
+                        getattr(
+                            raised.exception,
+                            (
+                                "_codex_claude_refresh_lock_"
+                                "descriptor_bound"
+                            ),
+                            False,
+                        )
+                        or getattr(
+                            raised.exception,
+                            "_codex_claude_refresh_lock_paths",
+                            None,
+                        )
+                    )
+                self.assertEqual(list(helper.iterdir()), [])
+            finally:
+                for lease in captured:
+                    self._dispose_refresh_lock_fixture(lease)
+
+    def test_host_transaction_release_return_interrupt_releases_owner_lease(
+        self,
+    ) -> None:
+        captured: list[claude_refresh_lock.ClaudeRefreshLockLease] = []
+        armed = [False]
+        interruption = KeyboardInterrupt(
+            "injected host refresh-lock release-return interruption"
+        )
+        real_acquire = claude_linux.acquire_claude_refresh_lock
+
+        def acquire_and_arm(
+            *args: object,
+            **kwargs: object,
+        ) -> claude_refresh_lock.ClaudeRefreshLockLease:
+            lease = real_acquire(*args, **kwargs)
+            if pathlib.Path(args[0]) == source.parent:
+                captured.append(lease)
+                armed[0] = True
+            return lease
+
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config_dir = root / "config"
+            config_dir.mkdir(mode=0o700)
+            source = self._credential(
+                config_dir / ".credentials.json",
+                expires_at_ms=(now - 60) * 1000,
+            )
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+            generator = (
+                claude_linux._stage_claude_credentials_anchored.__wrapped__
+            )
+            try:
+                with (
+                    mock.patch.object(
+                        claude_linux,
+                        "acquire_claude_refresh_lock",
+                        side_effect=acquire_and_arm,
+                    ),
+                    self._interrupt_acquire_assignment(
+                        generator,
+                        local_name="host_refresh_lock_cleanup",
+                        armed=armed,
+                        error=interruption,
+                    ),
+                    self.assertRaises(KeyboardInterrupt) as raised,
+                ):
+                    with claude_linux.stage_claude_credentials(
+                        source,
+                        helper,
+                        now=now,
+                        refresh_lock_protocol=self.PROTOCOL,
+                    ):
+                        pass
+
+                self.assertIs(raised.exception, interruption)
+                self.assertFalse(armed[0])
+                self.assertEqual(len(captured), 1)
+                self._assert_assignment_interrupt_released_lock(captured[0])
+                self.assertEqual(list(helper.iterdir()), [])
+            finally:
+                for lease in captured:
+                    if not lease.released:
+                        lease._release(skip_abandoned=False)
+
+    def test_release_retry_abandons_and_preserves_control_flow_recovery(
+        self,
+    ) -> None:
+        interruption = KeyboardInterrupt(
+            "injected refresh-lock release-entry interruption"
+        )
+        retry_error = claude_refresh_lock.ClaudeRefreshLockError(
+            "injected refresh-lock release retry failure"
+        )
+        recovery_path = "/fixture/config/.oauth_refresh.lock"
+        abandonment_diagnostic = (
+            claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+                "injected fail-closed refresh-lock abandonment"
+            )
+        )
+        setattr(
+            abandonment_diagnostic,
+            "_codex_claude_refresh_lock_paths",
+            (recovery_path,),
+        )
+        lease = mock.Mock(spec=["abandon", "release"])
+        lease.release.side_effect = [interruption, retry_error]
+        lease.abandon.return_value = abandonment_diagnostic
+        owner = claude_refresh_lock.ClaudeRefreshLockOwner()
+        owner._publish(lease)
+        owner.transfer(lease)
+
+        result = claude_linux._release_owned_claude_refresh_lock(
+            owner,
+            lease,
+            message="cannot release fixture Claude refresh lock",
+        )
+
+        self.assertTrue(result.terminal)
+        self.assertIs(result.error, interruption)
+        self.assertEqual(
+            getattr(
+                interruption,
+                "_codex_claude_refresh_lock_paths",
+            ),
+            (recovery_path,),
+        )
+        visible_diagnostics = [
+            *getattr(interruption, "__notes__", ()),
+        ]
+        chained: BaseException | None = interruption.__cause__
+        while chained is not None and len(visible_diagnostics) < 8:
+            visible_diagnostics.append(str(chained))
+            chained = chained.__cause__
+        self.assertIn(
+            "release retry failure",
+            "\n".join(visible_diagnostics),
+        )
+        self.assertEqual(lease.release.call_count, 2)
+        lease.abandon.assert_called_once_with(
+            "cannot release fixture Claude refresh lock; two release attempts "
+            "did not reach a terminal state"
+        )
+
+    def test_release_cleanup_accepts_settled_descriptor_residue_as_terminal(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config_dir = pathlib.Path(temporary) / "config"
+            config_dir.mkdir(mode=0o700)
+            owner = claude_refresh_lock.ClaudeRefreshLockOwner()
+            lease = claude_linux.acquire_claude_refresh_lock(
+                config_dir,
+                protocol=self.PROTOCOL,
+                owner=owner,
+            )
+            owner.transfer(lease)
+            descriptors = {
+                *(lock.descriptor for lock in lease._locks),
+                lease._legacy_parent_anchor.descriptor,
+                lease._config_anchor.descriptor,
+            }
+            failed_descriptor = next(iter(descriptors))
+            real_close = os.close
+            failed = False
+            close_attempts: dict[int, int] = {}
+
+            def fail_one_close(descriptor: int) -> None:
+                nonlocal failed
+                close_attempts[descriptor] = (
+                    close_attempts.get(descriptor, 0) + 1
+                )
+                if descriptor == failed_descriptor and not failed:
+                    failed = True
+                    raise OSError(errno.EIO, "injected descriptor close failure")
+                real_close(descriptor)
+
+            release_error = KeyboardInterrupt(
+                "injected refresh-lock release failure"
+            )
+            try:
+                with (
+                    mock.patch.object(
+                        lease,
+                        "release",
+                        side_effect=[release_error, release_error],
+                    ),
+                    mock.patch.object(
+                        claude_refresh_lock.os,
+                        "close",
+                        side_effect=fail_one_close,
+                    ),
+                ):
+                    result = claude_linux._release_owned_claude_refresh_lock(
+                        owner,
+                        lease,
+                        message="cannot release fixture Claude refresh lock",
+                    )
+
+                self.assertTrue(failed)
+                self.assertTrue(result.terminal)
+                self.assertIs(result.error, release_error)
+                self.assertFalse(lease.released)
+                self.assertTrue(all(path.is_dir() for path in lease.paths))
+                self.assertEqual(close_attempts[failed_descriptor], 1)
+                self.assertIn(
+                    failed_descriptor,
+                    lease._abandonment_descriptors_residue,
+                )
+                os.fstat(failed_descriptor)
+                with (
+                    mock.patch.object(
+                        claude_refresh_lock.os,
+                        "fstat",
+                        side_effect=AssertionError(
+                            "settled Linux cleanup rechecked descriptors"
+                        ),
+                    ),
+                    mock.patch.object(
+                        claude_refresh_lock.os,
+                        "close",
+                        side_effect=AssertionError(
+                            "settled Linux cleanup reclosed descriptors"
+                        ),
+                    ),
+                ):
+                    terminal, diagnostic = (
+                        claude_linux._claude_refresh_lock_retention_terminal(
+                            lease
+                        )
+                    )
+                self.assertTrue(terminal)
+                self.assertIs(
+                    diagnostic,
+                    lease._descriptor_bound_cleanup_fallback,
+                )
+            finally:
+                try:
+                    real_close(failed_descriptor)
+                except OSError:
+                    pass
+                for path in reversed(lease.paths):
+                    if path.exists():
+                        path.rmdir()
+
+    def test_abandon_helper_never_attaches_resumable_promoted_paths(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            home = root / "home"
+            home.mkdir(mode=0o700)
+            config_dir = home / "config"
+            config_dir.mkdir(mode=0o700)
+            owner = claude_refresh_lock.ClaudeRefreshLockOwner()
+            lease = claude_linux.acquire_claude_refresh_lock(
+                config_dir,
+                protocol=self.PROTOCOL,
+                owner=owner,
+            )
+            owner.transfer(lease)
+            lexical_paths = lease.paths
+            descriptors = {
+                *(lock.descriptor for lock in lease._locks),
+                lease._legacy_parent_anchor.descriptor,
+                lease._config_anchor.descriptor,
+            }
+            real_close = os.close
+            close_counts: dict[int, int] = {}
+            close_interruption = claude_refresh_lock.ForwardedSignal(
+                signal.SIGTERM
+            )
+            primary_error = claude_refresh_lock.ForwardedSignal(signal.SIGINT)
+            close_interrupted = False
+            abandon_calls = 0
+            retained_home = root / "retained-home"
+            replacement_primary = config_dir / ".oauth_refresh.lock"
+            replacement_legacy = pathlib.Path(str(config_dir) + ".lock")
+            live_marker = replacement_primary / "live-owner"
+            real_abandon = lease.abandon
+
+            def close_then_interrupt(descriptor: int) -> None:
+                nonlocal close_interrupted
+                close_counts[descriptor] = (
+                    close_counts.get(descriptor, 0) + 1
+                )
+                real_close(descriptor)
+                if not close_interrupted:
+                    close_interrupted = True
+                    raise close_interruption
+
+            def abandon_then_retarget(
+                reason: str,
+            ) -> claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive:
+                nonlocal abandon_calls
+                abandon_calls += 1
+                if abandon_calls != 1:
+                    return real_abandon(reason)
+                try:
+                    return real_abandon(reason)
+                finally:
+                    home.rename(retained_home)
+                    home.mkdir(mode=0o700)
+                    config_dir.mkdir(mode=0o700)
+                    replacement_primary.mkdir(mode=0o700)
+                    replacement_legacy.mkdir(mode=0o700)
+                    live_marker.write_text(
+                        "replacement\n",
+                        encoding="utf-8",
+                    )
+
+            with lease._state_lock:
+                lease._deletion_prohibited = True
+                lease._heartbeat_stop.set()
+            try:
+                with (
+                    mock.patch.object(
+                        lease,
+                        "abandon",
+                        side_effect=abandon_then_retarget,
+                    ),
+                    mock.patch.object(
+                        claude_refresh_lock.os,
+                        "close",
+                        side_effect=close_then_interrupt,
+                    ),
+                ):
+                    result = claude_linux._abandon_owned_claude_refresh_lock(
+                        lease,
+                        reason="fixture release could not complete",
+                        primary_error=primary_error,
+                        message="cannot abandon fixture Claude refresh lock",
+                    )
+
+                self.assertTrue(result.terminal)
+                self.assertIs(result.error, primary_error)
+                self.assertEqual(abandon_calls, 2)
+                self.assertTrue(close_interrupted)
+                self.assertEqual(set(close_counts), descriptors)
+                self.assertTrue(
+                    all(count == 1 for count in close_counts.values())
+                )
+                self.assertIs(
+                    lease._abandonment_cleanup_lifecycle,
+                    claude_refresh_lock._AbandonmentCleanupLifecycle.SETTLED,
+                )
+                diagnostic = lease._cleanup_inconclusive
+                self.assertIsNotNone(diagnostic)
+                assert diagnostic is not None
+                for error in (primary_error, close_interruption, diagnostic):
+                    self.assertTrue(
+                        claude_refresh_lock.
+                        _has_descriptor_bound_refresh_lock_cleanup(error)
+                    )
+                    self.assertFalse(
+                        hasattr(
+                            error,
+                            "_codex_claude_refresh_lock_paths",
+                        )
+                    )
+                    self.assertIsNone(
+                        claude_refresh_lock._refresh_lock_recovery_paths(error)
+                    )
+                    visible = [
+                        str(error),
+                        *getattr(error, "__notes__", ()),
+                    ]
+                    detail = getattr(error, "detail", None)
+                    if isinstance(detail, str):
+                        visible.append(detail)
+                    for path in lexical_paths:
+                        self.assertNotIn(str(path), "\n".join(visible))
+                retained_config = retained_home / "config"
+                self.assertTrue(
+                    (retained_config / ".oauth_refresh.lock").is_dir()
+                )
+                self.assertTrue(
+                    pathlib.Path(str(retained_config) + ".lock").is_dir()
+                )
+                self.assertEqual(
+                    live_marker.read_text(encoding="utf-8"),
+                    "replacement\n",
+                )
+            finally:
+                for descriptor in descriptors:
+                    try:
+                        real_close(descriptor)
+                    except OSError:
+                        pass
+
+    def test_abandon_helper_retry_hides_preexisting_promoted_paths(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            home = root / "home"
+            home.mkdir(mode=0o700)
+            config_dir = home / "config"
+            config_dir.mkdir(mode=0o700)
+            owner = claude_refresh_lock.ClaudeRefreshLockOwner()
+            lease = claude_linux.acquire_claude_refresh_lock(
+                config_dir,
+                protocol=self.PROTOCOL,
+                owner=owner,
+            )
+            owner.transfer(lease)
+            lexical_paths = lease.paths
+            descriptors = {
+                *(lock.descriptor for lock in lease._locks),
+                lease._legacy_parent_anchor.descriptor,
+                lease._config_anchor.descriptor,
+            }
+            retained_home = root / "retained-home"
+            replacement_primary = config_dir / ".oauth_refresh.lock"
+            replacement_legacy = pathlib.Path(str(config_dir) + ".lock")
+            live_marker = replacement_primary / "live-owner"
+            first = claude_refresh_lock.ForwardedSignal(signal.SIGTERM)
+            with lease._state_lock:
+                lease._publish_abandonment_state()
+            heartbeat = lease._heartbeat_thread
+            assert heartbeat is not None
+            heartbeat.join(timeout=2.0)
+            self.assertFalse(heartbeat.is_alive())
+            promoted = lease._cleanup_inconclusive_fallback
+            lease._promote_cleanup_inconclusive_paths(
+                promoted,
+                reason="legacy promoted recovery state",
+                authoritative_paths=tuple(str(path) for path in lexical_paths),
+            )
+            self.assertEqual(
+                claude_refresh_lock._refresh_lock_recovery_paths(promoted),
+                tuple(str(path) for path in lexical_paths),
+            )
+            self.assertIs(
+                lease._abandonment_cleanup_lifecycle,
+                claude_refresh_lock._AbandonmentCleanupLifecycle.RESUMABLE,
+            )
+
+            home.rename(retained_home)
+            home.mkdir(mode=0o700)
+            config_dir.mkdir(mode=0o700)
+            replacement_primary.mkdir(mode=0o700)
+            replacement_legacy.mkdir(mode=0o700)
+            live_marker.write_text("replacement\n", encoding="utf-8")
+            close_counts: dict[int, int] = {}
+            real_close = os.close
+
+            def record_close(descriptor: int) -> None:
+                close_counts[descriptor] = close_counts.get(descriptor, 0) + 1
+                real_close(descriptor)
+
+            try:
+                with mock.patch.object(
+                    claude_refresh_lock.os,
+                    "close",
+                    side_effect=record_close,
+                ):
+                    result = claude_linux._abandon_owned_claude_refresh_lock(
+                        lease,
+                        reason="resume after ancestor retarget",
+                        primary_error=first,
+                        message="cannot abandon fixture Claude refresh lock",
+                    )
+
+                self.assertTrue(result.terminal)
+                self.assertIs(result.error, first)
+                self.assertEqual(set(close_counts), descriptors)
+                self.assertTrue(
+                    all(count == 1 for count in close_counts.values())
+                )
+                retained_config = retained_home / "config"
+                for error in (first, lease._cleanup_inconclusive):
+                    self.assertIsNotNone(error)
+                    assert error is not None
+                    self.assertTrue(
+                        claude_refresh_lock.
+                        _has_descriptor_bound_refresh_lock_cleanup(error)
+                    )
+                    self.assertFalse(
+                        hasattr(error, "_codex_claude_refresh_lock_paths")
+                    )
+                    self.assertIsNone(
+                        claude_refresh_lock._refresh_lock_recovery_paths(error)
+                    )
+                    rendered = [
+                        str(error),
+                        *getattr(error, "__notes__", ()),
+                        *traceback.TracebackException.from_exception(
+                            error
+                        ).format(chain=True),
+                    ]
+                    detail = getattr(error, "detail", None)
+                    if isinstance(detail, str):
+                        rendered.append(detail)
+                    retained_paths = (
+                        retained_config / ".oauth_refresh.lock",
+                        pathlib.Path(str(retained_config) + ".lock"),
+                    )
+                    for path in (*lexical_paths, *retained_paths):
+                        self.assertNotIn(str(path), "\n".join(rendered))
+                self.assertTrue(
+                    (retained_config / ".oauth_refresh.lock").is_dir()
+                )
+                self.assertTrue(
+                    pathlib.Path(str(retained_config) + ".lock").is_dir()
+                )
+                self.assertEqual(
+                    live_marker.read_text(encoding="utf-8"),
+                    "replacement\n",
+                )
+            finally:
+                for descriptor in descriptors:
+                    try:
+                        real_close(descriptor)
+                    except OSError:
+                        pass
+
+    def test_recovery_evidence_reads_are_direct_and_bounded(self) -> None:
+        consumers = {
+            claude_linux._abandon_owned_claude_refresh_lock: 2,
+            claude_linux._release_owned_claude_refresh_lock: 1,
+            claude_linux._recover_prearmed_claude_refresh_lock_release: 1,
+            claude_linux._writeback_refreshed_credential_impl: 2,
+            claude_linux._read_staged_credential_under_lock: 1,
+            claude_linux._stage_claude_credentials_anchored.__wrapped__: 3,
+        }
+        source = pathlib.Path(claude_linux.__file__).read_text(encoding="utf-8")
+        self.assertEqual(source.count("_retention_recovery_evidence"), 10)
+        self.assertNotIn("_retention_recovery_evidence(", source)
+
+        total_reads = 0
+        for function, expected_reads in consumers.items():
+            with self.subTest(function=function.__name__):
+                instructions = tuple(dis.get_instructions(function))
+                read_indices = [
+                    index
+                    for index, instruction in enumerate(instructions)
+                    if instruction.argval == "_retention_recovery_evidence"
+                ]
+                read_lines: set[int] = set()
+                current_line = function.__code__.co_firstlineno
+                for instruction in instructions:
+                    positions = getattr(instruction, "positions", None)
+                    instruction_line = (
+                        positions.lineno
+                        if positions is not None
+                        else instruction.starts_line
+                    )
+                    if instruction_line is not None:
+                        current_line = instruction_line
+                    if instruction.argval == "_retention_recovery_evidence":
+                        read_lines.add(current_line)
+                self.assertEqual(len(read_lines), expected_reads)
+                total_reads += len(read_lines)
+                for index in read_indices:
+                    self.assertEqual(instructions[index].opname, "LOAD_ATTR")
+                    self.assertLess(index + 1, len(instructions))
+                    self.assertEqual(
+                        instructions[index + 1].opname,
+                        "STORE_FAST",
+                    )
+        self.assertEqual(total_reads, 10)
+
+    def test_release_retry_evidence_cannot_alias_promoted_fallback(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config_dir = pathlib.Path(temporary).resolve() / "config"
+            config_dir.mkdir(mode=0o700)
+            owner = claude_refresh_lock.ClaudeRefreshLockOwner()
+            lease = claude_linux.acquire_claude_refresh_lock(
+                config_dir,
+                protocol=self.PROTOCOL,
+                owner=owner,
+            )
+            owner.transfer(lease)
+            lexical_paths = tuple(str(path) for path in lease.paths)
+            initial_evidence = lease._retention_recovery_evidence
+            self.assertIs(
+                initial_evidence,
+                lease._descriptor_bound_cleanup_fallback,
+            )
+            release_calls = 0
+            abandon_calls = 0
+
+            def fail_release() -> None:
+                nonlocal release_calls
+                release_calls += 1
+                raise claude_refresh_lock.ClaudeRefreshLockError(
+                    f"injected release failure {release_calls}"
+                )
+
+            def promote_then_fail_abandon(
+                _lease: claude_refresh_lock.ClaudeRefreshLockLease,
+                **_kwargs: object,
+            ) -> claude_linux._ClaudeRefreshLockCleanupResult:
+                nonlocal abandon_calls
+                abandon_calls += 1
+                if abandon_calls == 1:
+                    fallback = lease._cleanup_inconclusive_fallback
+                    with lease._state_lock:
+                        lease._cleanup_inconclusive = fallback
+                    lease._promote_cleanup_inconclusive_paths(
+                        fallback,
+                        reason="promoted during helper retry",
+                        authoritative_paths=lexical_paths,
+                    )
+                raise claude_refresh_lock.ClaudeRefreshLockError(
+                    f"injected abandonment boundary failure {abandon_calls}"
+                )
+
+            try:
+                with (
+                    mock.patch.object(
+                        lease,
+                        "release",
+                        side_effect=fail_release,
+                    ),
+                    mock.patch.object(
+                        claude_linux,
+                        "_abandon_owned_claude_refresh_lock",
+                        side_effect=promote_then_fail_abandon,
+                    ),
+                ):
+                    result = claude_linux._release_owned_claude_refresh_lock(
+                        owner,
+                        lease,
+                        message="cannot release fixture Claude refresh lock",
+                    )
+
+                self.assertFalse(result.terminal)
+                self.assertIsNotNone(result.error)
+                assert result.error is not None
+                self.assertEqual(release_calls, 4)
+                self.assertEqual(abandon_calls, 2)
+                self.assertEqual(
+                    claude_refresh_lock._refresh_lock_recovery_paths(
+                        lease._cleanup_inconclusive_fallback
+                    ),
+                    lexical_paths,
+                )
+                self.assertTrue(
+                    claude_refresh_lock.
+                    _has_descriptor_bound_refresh_lock_cleanup(
+                        initial_evidence
+                    )
+                )
+                self.assertIsNone(
+                    claude_refresh_lock._refresh_lock_recovery_paths(
+                        initial_evidence
+                    )
+                )
+                self.assertIs(
+                    getattr(
+                        result.error,
+                        "_codex_claude_refresh_lock_cleanup_evidence",
+                        None,
+                    ),
+                    None,
+                )
+                self.assertTrue(
+                    claude_refresh_lock.
+                    _has_descriptor_bound_refresh_lock_cleanup(result.error)
+                )
+                self.assertFalse(
+                    hasattr(
+                        result.error,
+                        "_codex_claude_refresh_lock_paths",
+                    )
+                )
+                self.assertIsNone(
+                    claude_refresh_lock._refresh_lock_recovery_paths(
+                        result.error
+                    )
+                )
+                visible = [
+                    str(result.error),
+                    *getattr(result.error, "__notes__", ()),
+                ]
+                detail = getattr(result.error, "detail", None)
+                if isinstance(detail, str):
+                    visible.append(detail)
+                for path in lexical_paths:
+                    self.assertNotIn(path, "\n".join(visible))
+            finally:
+                self._dispose_refresh_lock_fixture(lease)
+
+    def test_released_lease_has_no_synthetic_none_recovery_diagnostic(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config_dir = pathlib.Path(temporary).resolve() / "config"
+            config_dir.mkdir(mode=0o700)
+            owner = claude_refresh_lock.ClaudeRefreshLockOwner()
+            lease = claude_linux.acquire_claude_refresh_lock(
+                config_dir,
+                protocol=self.PROTOCOL,
+                owner=owner,
+            )
+            owner.transfer(lease)
+            lease.release()
+            evidence = lease._retention_recovery_evidence
+            self.assertIsNone(evidence)
+            interruption = KeyboardInterrupt("released helper boundary")
+
+            claude_linux._attach_host_refresh_lock_recovery(
+                interruption,
+                evidence,
+            )
+
+            self.assertIsNone(interruption.__cause__)
+            self.assertIsNone(interruption.__context__)
+            self.assertFalse(hasattr(interruption, "__notes__"))
+            self.assertFalse(
+                hasattr(
+                    interruption,
+                    "_codex_claude_refresh_lock_descriptor_bound",
+                )
+            )
+            self.assertFalse(
+                hasattr(
+                    interruption,
+                    "_codex_claude_refresh_lock_paths",
+                )
+            )
+
+    def test_resumable_retention_is_not_terminal_after_descriptors_close(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config_dir = pathlib.Path(temporary) / "config"
+            config_dir.mkdir(mode=0o700)
+            owner = claude_refresh_lock.ClaudeRefreshLockOwner()
+            lease = claude_linux.acquire_claude_refresh_lock(
+                config_dir,
+                protocol=self.PROTOCOL,
+                owner=owner,
+            )
+            heartbeat = lease._heartbeat_thread
+            assert heartbeat is not None
+            lease._heartbeat_stop.set()
+            heartbeat.join(timeout=1.0)
+            self.assertFalse(heartbeat.is_alive())
+            with lease._state_lock:
+                lease._publish_abandonment_state()
+            descriptors = {
+                *(lock.descriptor for lock in lease._locks),
+                lease._legacy_parent_anchor.descriptor,
+                lease._config_anchor.descriptor,
+            }
+            for descriptor in descriptors:
+                os.close(descriptor)
+
+            with mock.patch.object(
+                claude_linux.os,
+                "fstat",
+                side_effect=AssertionError(
+                    "Linux retention state inferred from descriptor state"
+                ),
+            ):
+                terminal, diagnostic = (
+                    claude_linux._claude_refresh_lock_retention_terminal(lease)
+                )
+
+            self.assertFalse(terminal)
+            self.assertIs(
+                diagnostic,
+                lease._descriptor_bound_cleanup_fallback,
+            )
+            self.assertIs(
+                lease._abandonment_cleanup_lifecycle,
+                claude_refresh_lock._AbandonmentCleanupLifecycle.RESUMABLE,
+            )
+            for path in reversed(lease.paths):
+                path.rmdir()
+
+    def test_repeated_release_and_abandon_entry_interruptions_retain_lock(
+        self,
+    ) -> None:
+        release_interrupts = [
+            KeyboardInterrupt("injected first release-entry interruption"),
+            KeyboardInterrupt("injected second release-entry interruption"),
+        ]
+        abandon_interrupts = [
+            KeyboardInterrupt("injected first abandon-entry interruption"),
+            KeyboardInterrupt("injected second abandon-entry interruption"),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            config_dir = pathlib.Path(temporary) / "config"
+            config_dir.mkdir(mode=0o700)
+            owner = claude_refresh_lock.ClaudeRefreshLockOwner()
+            lease = claude_linux.acquire_claude_refresh_lock(
+                config_dir,
+                protocol=self.PROTOCOL,
+                owner=owner,
+            )
+            owner.transfer(lease)
+            real_release = lease.release
+
+            def interrupt_release_entry() -> None:
+                if release_interrupts:
+                    raise release_interrupts.pop(0)
+                real_release()
+
+            try:
+                first_interruption = release_interrupts[0]
+                with (
+                    mock.patch.object(
+                        lease,
+                        "release",
+                        side_effect=interrupt_release_entry,
+                    ),
+                    mock.patch.object(
+                        lease,
+                        "abandon",
+                        side_effect=abandon_interrupts,
+                    ),
+                ):
+                    result = (
+                        claude_linux._release_owned_claude_refresh_lock(
+                            owner,
+                            lease,
+                            message=(
+                                "cannot release fixture Claude refresh lock"
+                            ),
+                        )
+                    )
+
+                heartbeat = lease._heartbeat_thread
+                self.assertIsNotNone(heartbeat)
+                assert heartbeat is not None
+                self.assertTrue(result.terminal)
+                self.assertIs(result.error, first_interruption)
+                self.assertTrue(lease._deletion_prohibited)
+                self.assertFalse(heartbeat.is_alive())
+                self.assertTrue(all(path.is_dir() for path in lease.paths))
+                self._assert_refresh_lock_descriptors_closed(lease)
+                self.assertTrue(
+                    getattr(
+                        result.error,
+                        "_codex_claude_refresh_lock_descriptor_bound",
+                        False,
+                    )
+                )
+            finally:
+                self._dispose_refresh_lock_fixture(lease)
+
+    def test_repeated_release_return_interruptions_recognize_release(
+        self,
+    ) -> None:
+        release_interrupts = [
+            KeyboardInterrupt("injected first release-return interruption"),
+            KeyboardInterrupt("injected second release-return interruption"),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            config_dir = pathlib.Path(temporary) / "config"
+            config_dir.mkdir(mode=0o700)
+            owner = claude_refresh_lock.ClaudeRefreshLockOwner()
+            lease = claude_linux.acquire_claude_refresh_lock(
+                config_dir,
+                protocol=self.PROTOCOL,
+                owner=owner,
+            )
+            owner.transfer(lease)
+            real_release = lease.release
+
+            def release_then_interrupt() -> None:
+                real_release()
+                raise release_interrupts.pop(0)
+
+            try:
+                first_interruption = release_interrupts[0]
+                with mock.patch.object(
+                    lease,
+                    "release",
+                    side_effect=release_then_interrupt,
+                ):
+                    result = (
+                        claude_linux._release_owned_claude_refresh_lock(
+                            owner,
+                            lease,
+                            message=(
+                                "cannot release fixture Claude refresh lock"
+                            ),
+                        )
+                    )
+
+                self.assertTrue(result.terminal)
+                self.assertIs(result.error, first_interruption)
+                self.assertTrue(lease.released)
+                self.assertTrue(
+                    all(not path.exists() for path in lease.paths)
+                )
+            finally:
+                self._dispose_refresh_lock_fixture(lease)
+
+    def test_pending_operation_handoff_blocks_linux_terminal_fast_paths(
+        self,
+    ) -> None:
+        class InterruptedOperationLock:
+            def __init__(
+                self,
+                *interruptions: BaseException,
+            ) -> None:
+                self._lock = threading.RLock()
+                self._interruptions = interruptions
+                self.release_calls = 0
+
+            def _is_owned(self) -> bool:
+                return self._lock._is_owned()
+
+            def acquire(self, *, timeout: float = -1.0) -> bool:
+                return self._lock.acquire(timeout=timeout)
+
+            def release(self) -> None:
+                self.release_calls += 1
+                if self.release_calls <= len(self._interruptions):
+                    raise self._interruptions[self.release_calls - 1]
+                self._lock.release()
+
+        cases = (
+            "release-catch",
+            "release-exhausted",
+            "abandon-entry",
+            "prearmed-recovery",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                config_dir = pathlib.Path(temporary) / "config"
+                config_dir.mkdir(mode=0o700)
+                owner = claude_refresh_lock.ClaudeRefreshLockOwner()
+                lease = claude_linux.acquire_claude_refresh_lock(
+                    config_dir,
+                    protocol=self.PROTOCOL,
+                    owner=owner,
+                )
+                owner.transfer(lease)
+                heartbeat = lease._heartbeat_thread
+                assert heartbeat is not None
+                lease._heartbeat_stop.set()
+                heartbeat.join(timeout=2.0)
+                self.assertFalse(heartbeat.is_alive())
+                first = claude_refresh_lock.ForwardedSignal(signal.SIGTERM)
+                second = claude_refresh_lock.ForwardedSignal(signal.SIGINT)
+                third = claude_refresh_lock.ForwardedSignal(signal.SIGTERM)
+                fourth = claude_refresh_lock.ForwardedSignal(signal.SIGINT)
+                interruptions = (
+                    (first, second)
+                    if case == "release-catch"
+                    else (first, second, third, fourth)
+                )
+                operation_lock = InterruptedOperationLock(*interruptions)
+                lease._operation_lock = operation_lock
+
+                try:
+                    if case != "release-catch":
+                        with self.assertRaises(
+                            claude_refresh_lock.ForwardedSignal
+                        ) as released:
+                            lease.release()
+
+                        self.assertIs(released.exception, first)
+                        self.assertTrue(lease.released)
+                        self.assertEqual(operation_lock.release_calls, 4)
+                        self.assertIsNotNone(
+                            lease._pending_operation_handoff
+                        )
+
+                    if case == "release-catch":
+                        result = (
+                            claude_linux._release_owned_claude_refresh_lock(
+                                owner,
+                                lease,
+                                message=(
+                                    "cannot release pending fixture Claude "
+                                    "refresh lock"
+                                ),
+                            )
+                        )
+                    elif case == "release-exhausted":
+                        failures = [
+                            KeyboardInterrupt("first helper release failure"),
+                            KeyboardInterrupt("second helper release failure"),
+                        ]
+                        with mock.patch.object(
+                            lease,
+                            "release",
+                            side_effect=failures,
+                        ) as release_call:
+                            result = (
+                                claude_linux._release_owned_claude_refresh_lock(
+                                    owner,
+                                    lease,
+                                    message=(
+                                        "cannot release exhausted pending "
+                                        "fixture Claude refresh lock"
+                                    ),
+                                )
+                            )
+                        self.assertEqual(release_call.call_count, 2)
+                    elif case == "abandon-entry":
+                        with lease._state_lock:
+                            lease._deletion_prohibited = True
+                            lease._heartbeat_stop.set()
+                        result = (
+                            claude_linux._abandon_owned_claude_refresh_lock(
+                                lease,
+                                reason="resume released pending fixture",
+                                primary_error=first,
+                                message=(
+                                    "cannot abandon pending fixture Claude "
+                                    "refresh lock"
+                                ),
+                            )
+                        )
+                    else:
+                        with lease._state_lock:
+                            lease._deletion_prohibited = True
+                            lease._heartbeat_stop.set()
+                        result = (
+                            claude_linux.
+                            _recover_prearmed_claude_refresh_lock_release(
+                                owner,
+                                lease,
+                                boundary_error=first,
+                                message=(
+                                    "cannot recover pending fixture Claude "
+                                    "refresh lock"
+                                ),
+                            )
+                        )
+
+                    self.assertTrue(result.terminal)
+                    expected_release_calls = (
+                        3 if case == "release-catch" else 5
+                    )
+                    self.assertEqual(
+                        operation_lock.release_calls,
+                        expected_release_calls,
+                    )
+                    self.assertIsNone(lease._pending_operation_handoff)
+                    snapshot = lease.retention_snapshot()
+                    self.assertTrue(snapshot.terminal)
+                    self.assertTrue(snapshot.verified_closed)
+                finally:
+                    if operation_lock._is_owned():
+                        operation_lock._lock.release()
+                    self._dispose_refresh_lock_fixture(lease)
+
+    def test_repeated_abandon_return_interruptions_recognize_abandonment(
+        self,
+    ) -> None:
+        release_interrupts = [
+            KeyboardInterrupt("injected first release-entry interruption"),
+            KeyboardInterrupt("injected second release-entry interruption"),
+        ]
+        abandon_interrupts = [
+            KeyboardInterrupt("injected first abandon-return interruption"),
+            KeyboardInterrupt("injected second abandon-return interruption"),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            config_dir = pathlib.Path(temporary) / "config"
+            config_dir.mkdir(mode=0o700)
+            owner = claude_refresh_lock.ClaudeRefreshLockOwner()
+            lease = claude_linux.acquire_claude_refresh_lock(
+                config_dir,
+                protocol=self.PROTOCOL,
+                owner=owner,
+            )
+            owner.transfer(lease)
+            real_abandon = lease.abandon
+
+            def abandon_then_interrupt(reason: str) -> None:
+                real_abandon(reason)
+                raise abandon_interrupts.pop(0)
+
+            try:
+                first_interruption = release_interrupts[0]
+                with (
+                    mock.patch.object(
+                        lease,
+                        "release",
+                        side_effect=release_interrupts,
+                    ),
+                    mock.patch.object(
+                        lease,
+                        "abandon",
+                        side_effect=abandon_then_interrupt,
+                    ),
+                ):
+                    result = (
+                        claude_linux._release_owned_claude_refresh_lock(
+                            owner,
+                            lease,
+                            message=(
+                                "cannot release fixture Claude refresh lock"
+                            ),
+                        )
+                    )
+
+                heartbeat = lease._heartbeat_thread
+                self.assertIsNotNone(heartbeat)
+                assert heartbeat is not None
+                self.assertTrue(result.terminal)
+                self.assertIs(result.error, first_interruption)
+                self.assertTrue(lease._deletion_prohibited)
+                self.assertFalse(heartbeat.is_alive())
+                self.assertTrue(all(path.is_dir() for path in lease.paths))
+                self._assert_refresh_lock_descriptors_closed(lease)
+                self.assertTrue(
+                    getattr(
+                        result.error,
+                        "_codex_claude_refresh_lock_paths",
+                        None,
+                    )
+                    or getattr(
+                        result.error,
+                        "_codex_claude_refresh_lock_descriptor_bound",
+                        False,
+                    )
+                )
+            finally:
+                self._dispose_refresh_lock_fixture(lease)
+
+    def test_release_fallback_prearms_abandon_helper_boundaries(
+        self,
+    ) -> None:
+        release_helper = claude_linux._release_owned_claude_refresh_lock
+        abandon_helper = claude_linux._abandon_owned_claude_refresh_lock
+        for boundary in ("helper-entry", "helper-pre-latch"):
+            with self.subTest(boundary=boundary):
+                with tempfile.TemporaryDirectory() as temporary:
+                    config_dir = pathlib.Path(temporary) / "config"
+                    config_dir.mkdir(mode=0o700)
+                    owner = claude_refresh_lock.ClaudeRefreshLockOwner()
+                    lease = claude_linux.acquire_claude_refresh_lock(
+                        config_dir,
+                        protocol=self.PROTOCOL,
+                        owner=owner,
+                    )
+                    owner.transfer(lease)
+                    target_lease = [lease]
+                    release_failures = [
+                        claude_refresh_lock.ClaudeRefreshLockError(
+                            "injected first release failure"
+                        ),
+                        claude_refresh_lock.ClaudeRefreshLockError(
+                            "injected second release failure"
+                        ),
+                    ]
+                    real_release = lease.release
+
+                    def fail_then_resume_release() -> None:
+                        if release_failures:
+                            raise release_failures.pop(0)
+                        real_release()
+
+                    interruption = KeyboardInterrupt(
+                        "injected release fallback "
+                        f"{boundary} interruption"
+                    )
+                    if boundary == "helper-entry":
+                        interrupt_context = (
+                            self._interrupt_function_call_boundary(
+                                release_helper,
+                                callee_name=(
+                                    "_abandon_owned_claude_refresh_lock"
+                                ),
+                                window="entry",
+                                target_lease=target_lease,
+                                error=interruption,
+                            )
+                        )
+                    else:
+                        interrupt_context = self._interrupt_opcode(
+                            abandon_helper,
+                            opname="BEFORE_WITH",
+                            target_lease=target_lease,
+                            error=interruption,
+                        )
+                    try:
+                        with (
+                            mock.patch.object(
+                                lease,
+                                "release",
+                                side_effect=fail_then_resume_release,
+                            ),
+                            interrupt_context,
+                        ):
+                            result = release_helper(
+                                owner,
+                                lease,
+                                message=(
+                                    "cannot release fixture Claude refresh "
+                                    "lock"
+                                ),
+                            )
+
+                        heartbeat = lease._heartbeat_thread
+                        self.assertIsNotNone(heartbeat)
+                        assert heartbeat is not None
+                        self.assertTrue(result.terminal)
+                        self.assertIs(result.error, interruption)
+                        self.assertTrue(lease._deletion_prohibited)
+                        self.assertFalse(heartbeat.is_alive())
+                        self.assertTrue(
+                            all(path.is_dir() for path in lease.paths)
+                        )
+                        self._assert_refresh_lock_descriptors_closed(
+                            lease
+                        )
+                        self.assertTrue(
+                            getattr(
+                                result.error,
+                                (
+                                    "_codex_claude_refresh_lock_"
+                                    "descriptor_bound"
+                                ),
+                                False,
+                            )
+                            or getattr(
+                                result.error,
+                                "_codex_claude_refresh_lock_paths",
+                                None,
+                            )
+                        )
+                    finally:
+                        self._dispose_refresh_lock_fixture(lease)
+
+    def test_carrier_cleanup_abandon_call_boundaries_are_fail_closed(
+        self,
+    ) -> None:
+        abandon_helper = (
+            claude_linux._abandon_owned_claude_refresh_lock
+        )
+        generator = (
+            claude_linux._stage_claude_credentials_anchored.__wrapped__
+        )
+        boundaries = (
+            "abandon-entry",
+            "abandon-return",
+            "helper-entry",
+            "helper-return",
+            "helper-pre-latch",
+        )
+        for boundary in boundaries:
+            with self.subTest(boundary=boundary):
+                now = time.time()
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = pathlib.Path(temporary)
+                    config_dir = root / "host-config"
+                    config_dir.mkdir(mode=0o700)
+                    helper = root / "helper"
+                    helper.mkdir(mode=0o700)
+                    source = self._credential(
+                        config_dir / ".credentials.json",
+                        expires_at_ms=(now - 60) * 1000,
+                    )
+                    captured: list[
+                        claude_refresh_lock.ClaudeRefreshLockLease
+                    ] = []
+                    staged: claude_linux.StagedCredential | None = None
+                    real_acquire = (
+                        claude_linux.acquire_claude_refresh_lock
+                    )
+
+                    def capture_host_lock(
+                        *args: object,
+                        **kwargs: object,
+                    ) -> claude_refresh_lock.ClaudeRefreshLockLease:
+                        lease = real_acquire(*args, **kwargs)
+                        if pathlib.Path(args[0]) == source.parent:
+                            captured.append(lease)
+                        return lease
+
+                    interruption = KeyboardInterrupt(
+                        "injected carrier-cleanup "
+                        f"{boundary} interruption"
+                    )
+                    cleanup_failure = (
+                        claude_linux.LinuxCredentialInspectionInconclusive(
+                            "injected carrier cleanup failure"
+                        )
+                    )
+                    if boundary.startswith("abandon-"):
+                        interrupt_context = (
+                            self._interrupt_cleanup_call_boundaries(
+                                abandon_helper,
+                                target_lease=captured,
+                                injections=[
+                                    (
+                                        "abandon",
+                                        boundary.removeprefix(
+                                            "abandon-"
+                                        ),
+                                        [interruption],
+                                    )
+                                ],
+                            )
+                        )
+                    elif boundary.startswith("helper-") and boundary != (
+                        "helper-pre-latch"
+                    ):
+                        interrupt_context = (
+                            self._interrupt_function_call_boundary(
+                                generator,
+                                callee_name=(
+                                    "_abandon_owned_claude_refresh_lock"
+                                ),
+                                window=boundary.removeprefix("helper-"),
+                                target_lease=captured,
+                                error=interruption,
+                            )
+                        )
+                    else:
+                        interrupt_context = self._interrupt_opcode(
+                            abandon_helper,
+                            opname="BEFORE_WITH",
+                            target_lease=captured,
+                            error=interruption,
+                        )
+                    try:
+                        with (
+                            mock.patch.object(
+                                claude_linux,
+                                "acquire_claude_refresh_lock",
+                                side_effect=capture_host_lock,
+                            ),
+                            mock.patch.object(
+                                claude_linux,
+                                "_cleanup_staged_credential",
+                                return_value=cleanup_failure,
+                            ),
+                            interrupt_context,
+                            self.assertRaises(KeyboardInterrupt) as raised,
+                        ):
+                            with claude_linux.stage_claude_credentials(
+                                source,
+                                helper,
+                                now=now,
+                                refresh_lock_protocol=self.PROTOCOL,
+                            ) as staged:
+                                pass
+
+                        self.assertIs(raised.exception, interruption)
+                        self.assertEqual(len(captured), 1)
+                        lease = captured[0]
+                        heartbeat = lease._heartbeat_thread
+                        self.assertIsNotNone(heartbeat)
+                        assert heartbeat is not None
+                        self.assertTrue(lease._deletion_prohibited)
+                        self.assertFalse(heartbeat.is_alive())
+                        self.assertTrue(
+                            all(path.is_dir() for path in lease.paths)
+                        )
+                        self._assert_refresh_lock_descriptors_closed(
+                            lease
+                        )
+                        self.assertTrue(
+                            getattr(
+                                raised.exception,
+                                "_codex_claude_refresh_lock_paths",
+                                None,
+                            )
+                            or getattr(
+                                raised.exception,
+                                (
+                                    "_codex_claude_refresh_lock_"
+                                    "descriptor_bound"
+                                ),
+                                False,
+                            )
+                        )
+                    finally:
+                        for lease in captured:
+                            self._dispose_refresh_lock_fixture(lease)
+                        if staged is not None:
+                            self.assertIsNone(
+                                claude_linux._cleanup_staged_credential(
+                                    staged
+                                )
+                            )
+
+    def test_unchanged_poll_reuses_host_lock_without_staged_lock(self) -> None:
         now = time.time()
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -3162,8 +5978,26 @@ class CredentialStagingTest(unittest.TestCase):
                     refresh_lock_protocol=self.PROTOCOL,
                 ):
                     self.assertTrue(poll_observed.wait(timeout=3.0))
-                    acquire_lock.assert_not_called()
+                    self.assertEqual(
+                        acquire_lock.call_args_list,
+                        [
+                            mock.call(
+                                source.parent,
+                                protocol=self.PROTOCOL,
+                                owner=mock.ANY,
+                                config_dir_fd=mock.ANY,
+                                legacy_parent_dir_fd=mock.ANY,
+                            )
+                        ],
+                    )
 
+            self.assertEqual(
+                sum(
+                    pathlib.Path(call.args[0]) == source.parent
+                    for call in acquire_lock.call_args_list
+                ),
+                1,
+            )
             self.assertEqual(list(helper.iterdir()), [])
 
     def test_changed_credential_without_certified_protocol_is_inconclusive(
@@ -3230,6 +6064,630 @@ class CredentialStagingTest(unittest.TestCase):
             self.assertEqual(source.read_bytes(), original_payload)
             self.assertEqual(source.stat().st_ino, original_inode)
             self.assertEqual(list(helper.iterdir()), [])
+
+    def test_host_refresh_lock_precedes_source_read_and_spans_runtime(self) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+            source = self._credential(
+                root / ".credentials.json",
+                expires_at_ms=(now - 60) * 1000,
+            )
+            transaction_active = False
+            source_read = False
+            real_read = claude_linux._read_valid_credential
+            host_lease = mock.Mock(spec=["assert_held", "release"])
+            staged_lease = mock.Mock(spec=["assert_held", "release"])
+
+            def release_host_lease() -> None:
+                nonlocal transaction_active
+                self.assertTrue(transaction_active)
+                transaction_active = False
+
+            host_lease.release.side_effect = release_host_lease
+
+            def acquire_refresh_lock(
+                config_dir: os.PathLike[str] | str,
+                **kwargs: object,
+            ) -> mock.Mock:
+                nonlocal transaction_active
+                if pathlib.Path(config_dir) == source.parent:
+                    self.assertFalse(transaction_active)
+                    transaction_active = True
+                    lease = host_lease
+                else:
+                    lease = staged_lease
+                owner = kwargs["owner"]
+                assert isinstance(
+                    owner,
+                    claude_refresh_lock.ClaudeRefreshLockOwner,
+                )
+                owner._publish(lease)
+                return lease
+
+            def read_credential(
+                path: pathlib.Path,
+                *args: object,
+                **kwargs: object,
+            ) -> tuple[bytearray, float, object]:
+                nonlocal source_read
+                if pathlib.Path(path) == source and not source_read:
+                    self.assertTrue(
+                        transaction_active,
+                        "host refresh transaction must precede credential exposure",
+                    )
+                    source_read = True
+                return real_read(path, *args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    claude_linux,
+                    "acquire_claude_refresh_lock",
+                    side_effect=acquire_refresh_lock,
+                ) as acquire_lock,
+                mock.patch.object(
+                    claude_linux,
+                    "_read_valid_credential",
+                    side_effect=read_credential,
+                ),
+            ):
+                with claude_linux.stage_claude_credentials(
+                    source,
+                    helper,
+                    now=now,
+                    refresh_lock_protocol=self.PROTOCOL,
+                ):
+                    self.assertTrue(transaction_active)
+
+            self.assertTrue(source_read)
+            self.assertFalse(transaction_active)
+            host_lease.release.assert_called_once_with()
+            self.assertEqual(
+                sum(
+                    pathlib.Path(call.args[0]) == source.parent
+                    for call in acquire_lock.call_args_list
+                ),
+                1,
+            )
+
+    def test_carrier_cleanup_failure_abandons_host_refresh_lock(self) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config_dir = root / "host-config"
+            config_dir.mkdir(mode=0o700)
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+            source = self._credential(
+                config_dir / ".credentials.json",
+                expires_at_ms=(now - 60) * 1000,
+            )
+            primary_lock = config_dir / self.PROTOCOL.primary_lock_name
+            legacy_lock = root / "host-config.lock"
+            real_acquire = claude_linux.acquire_claude_refresh_lock
+            staged: claude_linux.StagedCredential | None = None
+
+            class ObservedHostLease:
+                def __init__(
+                    self,
+                    lease: claude_refresh_lock.ClaudeRefreshLockLease,
+                ) -> None:
+                    self._lease = lease
+                    self.release_count = 0
+                    self.abandon_results: list[
+                        claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive
+                    ] = []
+
+                def assert_held(self) -> None:
+                    self._lease.assert_held()
+
+                def release(self) -> None:
+                    self.release_count += 1
+                    self._lease.release()
+
+                def abandon(
+                    self,
+                    reason: str,
+                ) -> claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive:
+                    result = self._lease.abandon(reason)
+                    self.abandon_results.append(result)
+                    return result
+
+            host_leases: list[ObservedHostLease] = []
+
+            def acquire_refresh_lock(
+                config_dir: os.PathLike[str] | str,
+                **kwargs: object,
+            ) -> (
+                claude_refresh_lock.ClaudeRefreshLockLease
+                | ObservedHostLease
+            ):
+                caller_owner = kwargs["owner"]
+                assert isinstance(
+                    caller_owner,
+                    claude_refresh_lock.ClaudeRefreshLockOwner,
+                )
+                delegated_owner = (
+                    claude_refresh_lock.ClaudeRefreshLockOwner()
+                )
+                delegated_kwargs = dict(kwargs)
+                delegated_kwargs["owner"] = delegated_owner
+                lease = real_acquire(config_dir, **delegated_kwargs)
+                delegated_owner.transfer(lease)
+                if pathlib.Path(config_dir) == source.parent:
+                    result = ObservedHostLease(lease)
+                    host_leases.append(result)
+                else:
+                    result = lease
+                caller_owner._publish(result)
+                return result
+
+            cleanup_failure = (
+                claude_linux.LinuxCredentialInspectionInconclusive(
+                    "injected carrier cleanup failure"
+                )
+            )
+            with (
+                mock.patch.object(
+                    claude_linux,
+                    "acquire_claude_refresh_lock",
+                    side_effect=acquire_refresh_lock,
+                ),
+                mock.patch.object(
+                    claude_linux,
+                    "_cleanup_staged_credential",
+                    return_value=cleanup_failure,
+                ),
+                self.assertRaisesRegex(
+                    claude_linux.LinuxCredentialInspectionInconclusive,
+                    "injected carrier cleanup failure",
+                ) as raised,
+            ):
+                with claude_linux.stage_claude_credentials(
+                    source,
+                    helper,
+                    now=now,
+                    refresh_lock_protocol=self.PROTOCOL,
+                ) as staged:
+                    pass
+
+            assert staged is not None
+            self.assertEqual(len(host_leases), 1)
+            host_lease = host_leases[0]
+            self.assertEqual(host_lease.release_count, 0)
+            self.assertEqual(len(host_lease.abandon_results), 1)
+            abandonment_diagnostic = host_lease.abandon_results[0]
+            self.assertIs(
+                host_lease.abandon("terminal diagnostic must remain cached"),
+                abandonment_diagnostic,
+            )
+            self.assertTrue(
+                getattr(
+                    raised.exception,
+                    "_codex_claude_refresh_lock_descriptor_bound",
+                    False,
+                )
+            )
+            self.assertNotIn(str(primary_lock), str(raised.exception))
+            self.assertNotIn(str(legacy_lock), str(raised.exception))
+            self.assertTrue(primary_lock.is_dir())
+            self.assertTrue(legacy_lock.is_dir())
+            self.assertTrue(staged.credential_path.is_file())
+
+            self.assertIsNone(
+                claude_linux._cleanup_staged_credential(staged)
+            )
+            primary_lock.rmdir()
+            legacy_lock.rmdir()
+
+    def test_carrier_cleanup_control_flow_abandons_before_propagation(
+        self,
+    ) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config_dir = root / "host-config"
+            config_dir.mkdir(mode=0o700)
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+            source = self._credential(
+                config_dir / ".credentials.json",
+                expires_at_ms=(now - 60) * 1000,
+            )
+            primary_lock = config_dir / self.PROTOCOL.primary_lock_name
+            legacy_lock = root / "host-config.lock"
+            real_acquire = claude_linux.acquire_claude_refresh_lock
+            staged: claude_linux.StagedCredential | None = None
+
+            class ObservedHostLease:
+                def __init__(
+                    self,
+                    lease: claude_refresh_lock.ClaudeRefreshLockLease,
+                ) -> None:
+                    self._lease = lease
+                    self.release_count = 0
+                    self.abandon_results: list[
+                        claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive
+                    ] = []
+
+                def assert_held(self) -> None:
+                    self._lease.assert_held()
+
+                def release(self) -> None:
+                    self.release_count += 1
+                    self._lease.release()
+
+                def abandon(
+                    self,
+                    reason: str,
+                ) -> claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive:
+                    result = self._lease.abandon(reason)
+                    self.abandon_results.append(result)
+                    return result
+
+            host_leases: list[ObservedHostLease] = []
+
+            def acquire_refresh_lock(
+                config_dir: os.PathLike[str] | str,
+                **kwargs: object,
+            ) -> (
+                claude_refresh_lock.ClaudeRefreshLockLease
+                | ObservedHostLease
+            ):
+                caller_owner = kwargs["owner"]
+                assert isinstance(
+                    caller_owner,
+                    claude_refresh_lock.ClaudeRefreshLockOwner,
+                )
+                delegated_owner = (
+                    claude_refresh_lock.ClaudeRefreshLockOwner()
+                )
+                delegated_kwargs = dict(kwargs)
+                delegated_kwargs["owner"] = delegated_owner
+                lease = real_acquire(config_dir, **delegated_kwargs)
+                delegated_owner.transfer(lease)
+                if pathlib.Path(config_dir) == source.parent:
+                    result = ObservedHostLease(lease)
+                    host_leases.append(result)
+                else:
+                    result = lease
+                caller_owner._publish(result)
+                return result
+
+            cleanup_signal = claude_linux.ForwardedSignal(signal.SIGTERM)
+
+            def interrupt_cleanup(
+                _staged: claude_linux.StagedCredential,
+            ) -> BaseException | None:
+                raise cleanup_signal
+
+            with (
+                mock.patch.object(
+                    claude_linux,
+                    "acquire_claude_refresh_lock",
+                    side_effect=acquire_refresh_lock,
+                ),
+                mock.patch.object(
+                    claude_linux._StagedCredentialWatcher,
+                    "scrub",
+                    side_effect=OSError("injected payload scrub failure"),
+                ),
+                mock.patch.object(
+                    claude_linux,
+                    "_cleanup_staged_credential",
+                    side_effect=interrupt_cleanup,
+                ),
+                self.assertRaises(claude_linux.ForwardedSignal) as raised,
+            ):
+                with claude_linux.stage_claude_credentials(
+                    source,
+                    helper,
+                    now=now,
+                    refresh_lock_protocol=self.PROTOCOL,
+                ) as staged:
+                    pass
+
+            assert staged is not None
+            self.assertIs(raised.exception, cleanup_signal)
+            self.assertEqual(raised.exception.signum, signal.SIGTERM)
+            self.assertIn(
+                "refresh-lock cleanup is inconclusive",
+                raised.exception.detail or "",
+            )
+            self.assertEqual(len(host_leases), 1)
+            host_lease = host_leases[0]
+            self.assertEqual(host_lease.release_count, 0)
+            self.assertEqual(len(host_lease.abandon_results), 1)
+            abandonment_diagnostic = host_lease.abandon_results[0]
+            self.assertIs(
+                host_lease.abandon("terminal diagnostic must remain cached"),
+                abandonment_diagnostic,
+            )
+            self.assertTrue(primary_lock.is_dir())
+            self.assertTrue(legacy_lock.is_dir())
+            self.assertTrue(staged.credential_path.is_file())
+
+            self.assertIsNone(
+                claude_linux._cleanup_staged_credential(staged)
+            )
+            primary_lock.rmdir()
+            legacy_lock.rmdir()
+
+    def test_parallel_reviewers_read_source_after_host_lock_handoff(self) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            first_helper = root / "first-helper"
+            second_helper = root / "second-helper"
+            first_helper.mkdir(mode=0o700)
+            second_helper.mkdir(mode=0o700)
+            source = self._credential(
+                root / ".credentials.json",
+                expires_at_ms=(now - 60) * 1000,
+                access_token=self.SYNTH_ACCESS_EXPIRED,
+                refresh_token=self.SYNTH_REFRESH_A,
+            )
+            first_staged = threading.Event()
+            allow_first_writeback = threading.Event()
+            first_cleanup_started = threading.Event()
+            allow_first_cleanup = threading.Event()
+            first_cleanup_finished = threading.Event()
+            first_host_released = threading.Event()
+            first_finished = threading.Event()
+            second_contended = threading.Event()
+            second_retried_during_cleanup = threading.Event()
+            allow_second_retry = threading.Event()
+            second_host_acquired = threading.Event()
+            second_source_read = threading.Event()
+            second_finished = threading.Event()
+            thread_errors: list[BaseException] = []
+            second_refresh_tokens: list[str] = []
+            host_acquirers: list[str] = []
+            real_acquire = claude_linux.acquire_claude_refresh_lock
+            real_mkdir = claude_refresh_lock.os.mkdir
+            real_read = claude_linux._read_valid_credential
+            real_cleanup = claude_linux._cleanup_staged_credential
+
+            class ObservedFirstLease:
+                def __init__(
+                    self,
+                    lease: claude_refresh_lock.ClaudeRefreshLockLease,
+                ) -> None:
+                    self._lease = lease
+
+                def assert_held(self) -> None:
+                    self._lease.assert_held()
+
+                def release(self) -> None:
+                    self._lease.release()
+                    first_host_released.set()
+
+                def abandon(
+                    self,
+                    reason: str,
+                ) -> claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive:
+                    return self._lease.abandon(reason)
+
+            def observe_mkdir(
+                path: os.PathLike[str] | str,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> None:
+                try:
+                    real_mkdir(path, mode, dir_fd=dir_fd)
+                except FileExistsError:
+                    if (
+                        threading.current_thread().name == "second-reviewer"
+                        and os.fspath(path)
+                        == self.PROTOCOL.primary_lock_name
+                    ):
+                        if not second_contended.is_set():
+                            second_contended.set()
+                            if not allow_second_retry.wait(timeout=3.0):
+                                raise TimeoutError(
+                                    "second reviewer retry fixture timed out"
+                                )
+                        elif (
+                            first_cleanup_started.is_set()
+                            and not first_cleanup_finished.is_set()
+                        ):
+                            second_retried_during_cleanup.set()
+                    raise
+
+            def observe_acquire(
+                config_dir: os.PathLike[str] | str,
+                **kwargs: object,
+            ) -> (
+                claude_refresh_lock.ClaudeRefreshLockLease
+                | ObservedFirstLease
+            ):
+                caller_owner = kwargs["owner"]
+                assert isinstance(
+                    caller_owner,
+                    claude_refresh_lock.ClaudeRefreshLockOwner,
+                )
+                delegated_owner = (
+                    claude_refresh_lock.ClaudeRefreshLockOwner()
+                )
+                delegated_kwargs = dict(kwargs)
+                delegated_kwargs["owner"] = delegated_owner
+                lease = real_acquire(config_dir, **delegated_kwargs)
+                delegated_owner.transfer(lease)
+                result: (
+                    claude_refresh_lock.ClaudeRefreshLockLease
+                    | ObservedFirstLease
+                ) = lease
+                if pathlib.Path(config_dir) == source.parent:
+                    thread_name = threading.current_thread().name
+                    host_acquirers.append(thread_name)
+                    if thread_name == "first-reviewer":
+                        result = ObservedFirstLease(lease)
+                    elif thread_name == "second-reviewer":
+                        second_host_acquired.set()
+                caller_owner._publish(result)
+                return result
+
+            def observe_read(
+                path: pathlib.Path,
+                *args: object,
+                **kwargs: object,
+            ) -> tuple[bytearray, float, object]:
+                result = real_read(path, *args, **kwargs)
+                if (
+                    pathlib.Path(path) == source
+                    and threading.current_thread().name == "second-reviewer"
+                    and not second_source_read.is_set()
+                ):
+                    self.assertTrue(second_host_acquired.is_set())
+                    self.assertTrue(first_host_released.is_set())
+                    payload = json.loads(result[0])
+                    second_refresh_tokens.append(
+                        payload["claudeAiOauth"]["refreshToken"]
+                    )
+                    second_source_read.set()
+                return result
+
+            def observe_cleanup(
+                staged: claude_linux.StagedCredential,
+            ) -> BaseException | None:
+                if threading.current_thread().name != "first-reviewer":
+                    return real_cleanup(staged)
+                first_cleanup_started.set()
+                self.assertFalse(
+                    first_host_released.is_set(),
+                    "host transaction lock must span carrier cleanup",
+                )
+                if not allow_first_cleanup.wait(timeout=3.0):
+                    raise TimeoutError(
+                        "first reviewer cleanup fixture timed out"
+                    )
+                result = real_cleanup(staged)
+                first_cleanup_finished.set()
+                return result
+
+            def run_first_reviewer() -> None:
+                try:
+                    with claude_linux.stage_claude_credentials(
+                        source,
+                        first_helper,
+                        now=now,
+                        refresh_lock_protocol=self.PROTOCOL,
+                    ) as staged:
+                        first_staged.set()
+                        if not allow_first_writeback.wait(timeout=3.0):
+                            raise TimeoutError(
+                                "first reviewer writeback fixture timed out"
+                            )
+                        refreshed = self._credential(
+                            staged.config_dir / "refresh-b.json",
+                            expires_at_ms=(now + 7200) * 1000,
+                            access_token=self.SYNTH_ACCESS_A,
+                            refresh_token=self.SYNTH_REFRESH_B,
+                        )
+                        refreshed.replace(staged.credential_path)
+                except BaseException as error:
+                    thread_errors.append(error)
+                finally:
+                    first_finished.set()
+
+            def run_second_reviewer() -> None:
+                try:
+                    with claude_linux.stage_claude_credentials(
+                        source,
+                        second_helper,
+                        now=now,
+                        refresh_lock_protocol=self.PROTOCOL,
+                    ):
+                        pass
+                except BaseException as error:
+                    thread_errors.append(error)
+                finally:
+                    second_finished.set()
+
+            first_thread = threading.Thread(
+                target=run_first_reviewer,
+                name="first-reviewer",
+                daemon=True,
+            )
+            second_thread = threading.Thread(
+                target=run_second_reviewer,
+                name="second-reviewer",
+                daemon=True,
+            )
+            with (
+                mock.patch.object(
+                    claude_linux,
+                    "acquire_claude_refresh_lock",
+                    side_effect=observe_acquire,
+                ),
+                mock.patch.object(
+                    claude_refresh_lock.os,
+                    "mkdir",
+                    side_effect=observe_mkdir,
+                ),
+                mock.patch.object(
+                    claude_linux,
+                    "_read_valid_credential",
+                    side_effect=observe_read,
+                ),
+                mock.patch.object(
+                    claude_linux,
+                    "_cleanup_staged_credential",
+                    side_effect=observe_cleanup,
+                ),
+            ):
+                try:
+                    first_thread.start()
+                    self.assertTrue(first_staged.wait(timeout=3.0))
+                    second_thread.start()
+                    self.assertTrue(second_contended.wait(timeout=3.0))
+                    self.assertFalse(second_host_acquired.is_set())
+                    self.assertFalse(second_source_read.is_set())
+                    allow_first_writeback.set()
+                    self.assertTrue(first_cleanup_started.wait(timeout=3.0))
+                    self.assertFalse(first_host_released.is_set())
+                    self.assertFalse(second_host_acquired.is_set())
+                    self.assertFalse(second_source_read.is_set())
+                    allow_second_retry.set()
+                    self.assertTrue(
+                        second_retried_during_cleanup.wait(timeout=3.0)
+                    )
+                    self.assertFalse(first_host_released.is_set())
+                    self.assertFalse(second_host_acquired.is_set())
+                    self.assertFalse(second_source_read.is_set())
+                    allow_first_cleanup.set()
+                    self.assertTrue(first_cleanup_finished.wait(timeout=3.0))
+                    self.assertTrue(first_host_released.wait(timeout=3.0))
+                    self.assertTrue(first_finished.wait(timeout=3.0))
+                    self.assertTrue(second_source_read.wait(timeout=3.0))
+                    self.assertTrue(second_finished.wait(timeout=3.0))
+                finally:
+                    allow_first_writeback.set()
+                    allow_first_cleanup.set()
+                    allow_second_retry.set()
+                    first_thread.join(timeout=3.0)
+                    second_thread.join(timeout=3.0)
+
+            self.assertFalse(first_thread.is_alive())
+            self.assertFalse(second_thread.is_alive())
+            self.assertTrue(first_cleanup_finished.is_set())
+            self.assertTrue(second_retried_during_cleanup.is_set())
+            self.assertEqual(thread_errors, [])
+            self.assertEqual(
+                host_acquirers,
+                ["first-reviewer", "second-reviewer"],
+            )
+            self.assertEqual(second_refresh_tokens, [self.SYNTH_REFRESH_B])
+            host = json.loads(source.read_text(encoding="utf-8"))
+            self.assertEqual(
+                host["claudeAiOauth"]["refreshToken"],
+                self.SYNTH_REFRESH_B,
+            )
+            self.assertEqual(list(first_helper.iterdir()), [])
+            self.assertEqual(list(second_helper.iterdir()), [])
 
     def test_concurrent_source_change_makes_refresh_writeback_inconclusive(self) -> None:
         now = time.time()
@@ -3761,7 +7219,7 @@ class CredentialStagingTest(unittest.TestCase):
                 finally:
                     release_candidate.set()
 
-    def test_timeout_reports_admitted_background_writeback_ambiguity(
+    def test_timeout_abandons_lease_before_admitted_background_writeback(
         self,
     ) -> None:
         now = time.time()
@@ -3858,21 +7316,29 @@ class CredentialStagingTest(unittest.TestCase):
                         False,
                     )
                 )
+                self.assertTrue(
+                    getattr(
+                        raised.exception,
+                        "_codex_claude_refresh_lock_descriptor_bound",
+                        False,
+                    )
+                )
                 try:
                     release_writeback.set()
                     self.assertEqual(len(watchers), 1)
-                    deadline = time.monotonic() + 3.0
-                    while (
-                        watchers[0].is_alive()
-                        and time.monotonic() < deadline
-                    ):
-                        time.sleep(0.01)
+                    watchers[0]._thread.join(timeout=3.0)
                     self.assertFalse(watchers[0].is_alive())
                     host = json.loads(source.read_text(encoding="utf-8"))
                     self.assertEqual(
                         host["claudeAiOauth"]["refreshToken"],
-                        self.SYNTH_REFRESH_B,
+                        self.SYNTH_REFRESH_A,
                     )
+                    worker_failure = watchers[0].worker_failure()
+                    self.assertIsInstance(
+                        worker_failure,
+                        claude_linux.LinuxCredentialInspectionInconclusive,
+                    )
+                    self.assertIn("refresh lock changed", str(worker_failure))
                 finally:
                     release_writeback.set()
 
@@ -3888,12 +7354,13 @@ class CredentialStagingTest(unittest.TestCase):
             )
             child = "\n".join(
                 (
-                    "import os, pathlib, signal, sys, threading, time",
+                    "import os, pathlib, signal, sys, threading",
                     "sys.path.insert(0, sys.argv[1])",
                     "from review_runtime import claude_linux, claude_refresh_lock",
                     "source = pathlib.Path(sys.argv[2])",
                     "helper = pathlib.Path(sys.argv[3])",
                     "started = threading.Event()",
+                    "release_drain = threading.Event()",
                     "real_is_alive = claude_linux._StagedCredentialWatcher.is_alive",
                     "def forward_signal(signum, _frame):",
                     "    raise claude_linux.ForwardedSignal(signal.Signals(signum))",
@@ -3902,7 +7369,7 @@ class CredentialStagingTest(unittest.TestCase):
                     "    if final:",
                     "        return",
                     "    started.set()",
-                    "    time.sleep(0.2)",
+                    "    release_drain.wait()",
                     "def signal_during_branch(self):",
                     "    result = real_is_alive(self)",
                     "    os.kill(os.getpid(), signal.SIGTERM)",
@@ -4125,11 +7592,23 @@ class CredentialStagingTest(unittest.TestCase):
             0.0,
         )
 
+        def acquire_refresh_lock(
+            _config_dir: os.PathLike[str] | str,
+            **kwargs: object,
+        ) -> mock.Mock:
+            owner = kwargs["owner"]
+            assert isinstance(
+                owner,
+                claude_refresh_lock.ClaudeRefreshLockOwner,
+            )
+            owner._publish(refresh_lock)
+            return refresh_lock
+
         with (
             mock.patch.object(
                 claude_linux,
                 "acquire_claude_refresh_lock",
-                return_value=refresh_lock,
+                side_effect=acquire_refresh_lock,
             ),
             mock.patch.object(
                 claude_linux,
@@ -4475,16 +7954,48 @@ class CredentialStagingTest(unittest.TestCase):
             )
             original_payload = source.read_bytes()
             staged_refresh_lock = mock.Mock(spec=["release"])
-            host_refresh_lock = mock.Mock(spec=["assert_held", "release"])
-            host_refresh_lock.assert_held.side_effect = (
-                claude_linux.ClaudeRefreshLockError("fixture lock compromise")
+            host_refresh_lock = mock.Mock(
+                spec=["abandon", "assert_held", "release"]
             )
+            host_refresh_lock.assert_held.side_effect = [
+                None,
+                claude_linux.ClaudeRefreshLockError(
+                    "fixture lock compromise"
+                ),
+            ]
+            abandonment_diagnostic = (
+                claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+                    "fixture descriptor-bound host refresh-lock abandonment"
+                )
+            )
+            setattr(
+                abandonment_diagnostic,
+                "_codex_claude_refresh_lock_descriptor_bound",
+                True,
+            )
+            host_refresh_lock.abandon.return_value = abandonment_diagnostic
+            acquired_locks = iter(
+                (host_refresh_lock, staged_refresh_lock)
+            )
+
+            def acquire_refresh_lock(
+                _config_dir: os.PathLike[str] | str,
+                **kwargs: object,
+            ) -> mock.Mock:
+                lease = next(acquired_locks)
+                owner = kwargs["owner"]
+                assert isinstance(
+                    owner,
+                    claude_refresh_lock.ClaudeRefreshLockOwner,
+                )
+                owner._publish(lease)
+                return lease
 
             with (
                 mock.patch.object(
                     claude_linux,
                     "acquire_claude_refresh_lock",
-                    side_effect=[staged_refresh_lock, host_refresh_lock],
+                    side_effect=acquire_refresh_lock,
                 ) as acquire_refresh_lock,
                 mock.patch.object(
                     claude_linux,
@@ -4510,22 +8021,36 @@ class CredentialStagingTest(unittest.TestCase):
                     )
 
             staged_refresh_lock.release.assert_called_once_with()
-            host_refresh_lock.release.assert_called_once_with()
+            host_refresh_lock.release.assert_not_called()
+            host_refresh_lock.abandon.assert_called_once()
+            self.assertTrue(
+                getattr(
+                    raised.exception,
+                    "_codex_claude_refresh_lock_descriptor_bound",
+                    False,
+                )
+            )
+            self.assertIn(
+                "descriptor-bound lock directories may remain",
+                str(raised.exception),
+            )
             self.assertEqual(
                 acquire_refresh_lock.call_args_list,
                 [
                     mock.call(
+                        source.parent,
+                        protocol=self.PROTOCOL,
+                        owner=mock.ANY,
+                        config_dir_fd=mock.ANY,
+                        legacy_parent_dir_fd=mock.ANY,
+                    ),
+                    mock.call(
                         staged.config_dir,
                         protocol=self.PROTOCOL,
+                        owner=mock.ANY,
                         timeout_seconds=(
                             claude_linux.STAGED_CREDENTIAL_LOCK_TIMEOUT_SECONDS
                         ),
-                    ),
-                    mock.call(
-                        source.parent,
-                        protocol=self.PROTOCOL,
-                        config_dir_fd=mock.ANY,
-                        legacy_parent_dir_fd=mock.ANY,
                     ),
                 ],
             )
@@ -4810,6 +8335,45 @@ class CredentialStagingTest(unittest.TestCase):
         self.assertIn("credential cleanup also failed", str(diagnostic).lower())
         self.assertIn("cleanup failed", str(diagnostic))
         self.assertIs(diagnostic.__cause__, previous_cause)
+
+    def test_host_lock_recovery_is_visible_on_python_310_fallback(self) -> None:
+        class LegacyInterrupt(KeyboardInterrupt):
+            add_note = None
+
+        cleanup_interrupt = LegacyInterrupt("injected cleanup interruption")
+        abandonment_diagnostic = (
+            claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+                "descriptor-bound lock directories may remain"
+            )
+        )
+        setattr(
+            abandonment_diagnostic,
+            "_codex_claude_refresh_lock_descriptor_bound",
+            True,
+        )
+
+        claude_linux._attach_host_refresh_lock_recovery(
+            cleanup_interrupt,
+            abandonment_diagnostic,
+        )
+
+        self.assertTrue(
+            getattr(
+                cleanup_interrupt,
+                "_codex_claude_refresh_lock_descriptor_bound",
+                False,
+            )
+        )
+        diagnostic = cleanup_interrupt.__cause__
+        self.assertIsInstance(
+            diagnostic,
+            claude_linux.LinuxCredentialCleanupDiagnostic,
+        )
+        assert diagnostic is not None
+        self.assertIn(
+            "descriptor-bound lock directories may remain",
+            str(diagnostic),
+        )
 
     def test_source_close_failure_zeroes_successful_read(self) -> None:
         now = time.time()

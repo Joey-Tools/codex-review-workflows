@@ -44,6 +44,10 @@ class ReviewProcessLeakError(ReviewError):
     """A reviewer subprocess exited while descendants retained its process group."""
 
 
+class ReviewProcessSecondaryFailureDiagnostic(Exception):
+    """Python 3.10-visible diagnostic for a secondary process failure."""
+
+
 class ForwardedSignal(RuntimeError):
     """A termination signal forwarded to the active reviewer process group."""
 
@@ -54,6 +58,10 @@ class ForwardedSignal(RuntimeError):
         if detail:
             message += f"; {detail}"
         super().__init__(message)
+
+
+def _is_process_control_flow_error(error: BaseException) -> bool:
+    return not isinstance(error, Exception) or isinstance(error, ForwardedSignal)
 
 
 @dataclass(frozen=True)
@@ -191,6 +199,7 @@ def run(
     timeout_seconds: float | None = None,
     output_file_limit_bytes: int | None = None,
     on_process_started: Callable[[], None] | None = None,
+    on_process_quiescent: Callable[[], None] | None = None,
 ) -> Completed:
     command = tuple(str(item) for item in argv)
     if (stdout_path is None) != (stderr_path is None):
@@ -203,10 +212,12 @@ def run(
         raise ReviewError("output_file_limit_bytes requires timeout_seconds")
     if timeout_seconds is not None and (stdout_path is None or stderr_path is None):
         raise ReviewError("timeout_seconds requires logged output paths")
-    if on_process_started is not None and (
+    if on_process_started is not None and (stdout_path is None or stderr_path is None):
+        raise ReviewError("on_process_started requires logged output paths")
+    if on_process_quiescent is not None and (
         stdout_path is None or stderr_path is None
     ):
-        raise ReviewError("on_process_started requires logged output paths")
+        raise ReviewError("on_process_quiescent requires logged output paths")
     if output_file_limit_bytes is not None and output_file_limit_bytes <= 0:
         raise ReviewError("output_file_limit_bytes must be positive")
     try:
@@ -241,6 +252,7 @@ def run(
                     stdout_file_limit_bytes=output_file_limit_bytes,
                     stderr_file_limit_bytes=output_file_limit_bytes,
                     on_process_started=on_process_started,
+                    on_process_quiescent=on_process_quiescent,
                 )
             result = Completed(
                 command,
@@ -462,6 +474,7 @@ def _run_logged_process(
     stdout_file_limit_bytes: int | None = None,
     stderr_file_limit_bytes: int | None = None,
     on_process_started: Callable[[], None] | None = None,
+    on_process_quiescent: Callable[[], None] | None = None,
 ) -> int:
     process: subprocess.Popen[bytes] | None = None
     pending_signal: signal.Signals | None = None
@@ -469,6 +482,10 @@ def _run_logged_process(
     spawn_handoff_complete = False
     io_threads: list[threading.Thread] = []
     stop_io = threading.Event()
+    drain_errors: list[Exception] = []
+    process_cleanup_inconclusive = False
+    primary_error: BaseException | None = None
+    cleanup_failures: list[tuple[str, BaseException]] = []
 
     def forward_signal(signum: int, _frame: object) -> None:
         nonlocal forwarded_signal_sent, pending_signal
@@ -524,7 +541,6 @@ def _run_logged_process(
         assert process.stdout is not None
         assert process.stderr is not None
         output_overflow = threading.Event()
-        drain_errors: list[Exception] = []
 
         def drain_bounded(
             stream: BinaryIO,
@@ -600,7 +616,11 @@ def _run_logged_process(
                     args=(stream, destination, limit_bytes),
                     daemon=True,
                 )
-                thread.start()
+                try:
+                    thread.start()
+                except BaseException:
+                    process_cleanup_inconclusive = True
+                    raise
                 io_threads.append(thread)
             if stdin is not None:
                 assert process.stdin is not None
@@ -609,7 +629,11 @@ def _run_logged_process(
                     args=(process.stdin, stdin),
                     daemon=True,
                 )
-                thread.start()
+                try:
+                    thread.start()
+                except BaseException:
+                    process_cleanup_inconclusive = True
+                    raise
                 io_threads.append(thread)
         finally:
             restore_signal_mask(thread_start_mask)
@@ -624,22 +648,32 @@ def _run_logged_process(
                 break
             except subprocess.TimeoutExpired:
                 if output_overflow.is_set() or drain_errors:
-                    terminate_process_group(process)
+                    try:
+                        terminate_process_group(process)
+                    except BaseException as error:
+                        if isinstance(error, ForwardedSignal) or not isinstance(
+                            error, Exception
+                        ):
+                            raise
+                        cleanup_failures.append(
+                            ("terminating the supervised process group", error)
+                        )
                     break
         leftover_process_group = _process_group_exists(process.pid)
         if leftover_process_group:
             exit_deadline = time.monotonic() + PROCESS_GROUP_EXIT_GRACE_SECONDS
             while (
-                _process_group_exists(process.pid)
-                and time.monotonic() < exit_deadline
+                _process_group_exists(process.pid) and time.monotonic() < exit_deadline
             ):
                 time.sleep(PROCESS_GROUP_POLL_SECONDS)
             leftover_process_group = _process_group_exists(process.pid)
         if leftover_process_group:
+            process_cleanup_inconclusive = True
             terminate_process_group(process)
         for thread in io_threads:
             thread.join(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
         if any(thread.is_alive() for thread in io_threads):
+            process_cleanup_inconclusive = True
             stop_io.set()
             for thread in io_threads:
                 thread.join(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
@@ -648,47 +682,252 @@ def _run_logged_process(
                 f"{' '.join(command)}"
             )
         if drain_errors:
+            process_cleanup_inconclusive = True
             raise ReviewOutputDrainError(
                 f"command output drain failed: {' '.join(command)}"
             ) from drain_errors[0]
         if output_overflow.is_set():
             raise ReviewOutputLimitError(
-                "command output exceeded its bounded stream limit: "
-                f"{' '.join(command)}"
+                f"command output exceeded its bounded stream limit: {' '.join(command)}"
             )
         if leftover_process_group:
+            process_cleanup_inconclusive = True
             raise ReviewProcessLeakError(
                 f"command left descendant processes after exit: {' '.join(command)}"
             )
         return int(process.returncode)
-    except ForwardedSignal as error:
-        cleanup_signal = error.signum
+    except BaseException as error:
+        primary_error = error
+        if isinstance(error, ForwardedSignal):
+            cleanup_signal = error.signum
+        elif pending_signal is not None:
+            cleanup_signal = pending_signal
         raise
     finally:
-        previous_mask = block_forwarded_signals()
+        previous_mask: set[signal.Signals] | None = None
+        mask_blocked = False
         pending_cleanup_signal: signal.Signals | None = None
         try:
-            if process is not None:
-                terminate_process_group(
-                    process,
-                    initial_signal=cleanup_signal,
-                    signal_already_sent=forwarded_signal_sent,
+            try:
+                previous_mask = block_forwarded_signals()
+                mask_blocked = True
+            except BaseException as error:
+                cleanup_failures.append(
+                    ("blocking forwarded signals during process cleanup", error)
                 )
-            stop_io.set()
+            if process is not None:
+                try:
+                    terminate_process_group(
+                        process,
+                        initial_signal=cleanup_signal,
+                        signal_already_sent=forwarded_signal_sent,
+                    )
+                except BaseException as error:
+                    cleanup_failures.append(
+                        ("terminating the supervised process group", error)
+                    )
+            try:
+                stop_io.set()
+            except BaseException as error:
+                process_cleanup_inconclusive = True
+                cleanup_failures.append(("stopping command I/O workers", error))
             for thread in io_threads:
-                thread.join(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
+                try:
+                    thread.join(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
+                except BaseException as error:
+                    cleanup_failures.append(("joining a command I/O worker", error))
+            io_worker_alive = False
+            for thread in io_threads:
+                try:
+                    io_worker_alive = thread.is_alive() or io_worker_alive
+                except BaseException as error:
+                    io_worker_alive = True
+                    cleanup_failures.append(
+                        ("verifying command I/O worker shutdown", error)
+                    )
+            if io_worker_alive:
+                process_cleanup_inconclusive = True
+                if not isinstance(primary_error, ReviewProcessLeakError):
+                    cleanup_failures.append(
+                        (
+                            "quiescing command I/O workers",
+                            ReviewProcessLeakError(
+                                "command I/O streams remained open after bounded "
+                                f"cleanup: {' '.join(command)}"
+                            ),
+                        )
+                    )
+            if drain_errors:
+                process_cleanup_inconclusive = True
+                if not isinstance(primary_error, ReviewOutputDrainError):
+                    drain_failure = ReviewOutputDrainError(
+                        f"command output drain failed: {' '.join(command)}"
+                    )
+                    drain_failure.__cause__ = drain_errors[0]
+                    cleanup_failures.append(("draining command output", drain_failure))
             if process is not None and stdout_file_limit_bytes is not None:
-                for stream in (process.stdin, process.stdout, process.stderr):
+                for stream_name, stream in (
+                    ("stdin", process.stdin),
+                    ("stdout", process.stdout),
+                    ("stderr", process.stderr),
+                ):
                     if stream is not None:
-                        stream.close()
+                        try:
+                            stream.close()
+                        except BaseException as error:
+                            cleanup_failures.append(
+                                (f"closing command {stream_name}", error)
+                            )
             for forwarded, previous in previous_handlers.items():
-                signal.signal(forwarded, previous)
+                try:
+                    signal.signal(forwarded, previous)
+                except BaseException as error:
+                    cleanup_failures.append(
+                        (f"restoring the {forwarded.name} signal handler", error)
+                    )
             if previous_mask is not None:
-                pending_cleanup_signal = consume_pending_forwarded_signal()
+                try:
+                    pending_cleanup_signal = consume_pending_forwarded_signal()
+                except BaseException as error:
+                    cleanup_failures.append(
+                        ("consuming forwarded signals pending during cleanup", error)
+                    )
+            if process is not None and on_process_quiescent is not None:
+                try:
+                    process_reaped = process.poll() is not None
+                    process_group_absent = (
+                        os.name != "posix" or not _process_group_exists(process.pid)
+                    )
+                except BaseException as error:
+                    if isinstance(error, ForwardedSignal) or not isinstance(
+                        error, Exception
+                    ):
+                        cleanup_failures.append(
+                            ("proving supervised process-group quiescence", error)
+                        )
+                    else:
+                        proof_failure = ReviewProcessLeakError(
+                            "command process quiescence proof failed: "
+                            f"{' '.join(command)}"
+                        )
+                        proof_failure.__cause__ = error
+                        cleanup_failures.append(
+                            (
+                                "proving supervised process-group quiescence",
+                                proof_failure,
+                            )
+                        )
+                else:
+                    quiescence_proven = (
+                        process_reaped
+                        and process_group_absent
+                        and not process_cleanup_inconclusive
+                    )
+                    if quiescence_proven:
+                        try:
+                            on_process_quiescent()
+                        except BaseException as error:
+                            cleanup_failures.append(
+                                ("running the process quiescence callback", error)
+                            )
+                    else:
+                        cleanup_failures.append(
+                            (
+                                "proving supervised process-group quiescence",
+                                ReviewProcessLeakError(
+                                    "command process quiescence could not be proven: "
+                                    f"{' '.join(command)}"
+                                ),
+                            )
+                        )
         finally:
-            restore_signal_mask(previous_mask)
-        if pending_cleanup_signal is not None:
-            raise ForwardedSignal(pending_cleanup_signal)
+            if mask_blocked:
+                try:
+                    restore_signal_mask(previous_mask)
+                except BaseException as error:
+                    cleanup_failures.append(
+                        ("restoring the forwarded-signal mask", error)
+                    )
+
+        effective_pending_signal = pending_cleanup_signal or pending_signal
+        signal_error: ForwardedSignal | None = None
+        if effective_pending_signal is not None:
+            if (
+                isinstance(primary_error, ForwardedSignal)
+                and primary_error.signum == effective_pending_signal
+            ):
+                signal_error = primary_error
+            else:
+                signal_error = ForwardedSignal(effective_pending_signal)
+
+        cleanup_control_flow = next(
+            (
+                error
+                for _, error in cleanup_failures
+                if _is_process_control_flow_error(error)
+            ),
+            None,
+        )
+        primary_context: str | None = None
+        if signal_error is not None:
+            selected_error: BaseException | None = signal_error
+            primary_context = "process operation failed after a signal became pending"
+        elif primary_error is not None and _is_process_control_flow_error(
+            primary_error
+        ):
+            selected_error = primary_error
+        elif cleanup_control_flow is not None:
+            selected_error = cleanup_control_flow
+            primary_context = "process operation failed before cleanup control flow"
+        elif primary_error is not None:
+            selected_error = primary_error
+        elif cleanup_failures:
+            _, selected_error = cleanup_failures[0]
+        else:
+            selected_error = None
+
+        if selected_error is not None:
+            if primary_error is not None and primary_error is not selected_error:
+                assert primary_context is not None
+                _attach_process_secondary_failure(
+                    selected_error,
+                    primary_error,
+                    context=primary_context,
+                )
+            for context, error in cleanup_failures:
+                _attach_process_secondary_failure(
+                    selected_error,
+                    error,
+                    context=context,
+                )
+            if selected_error is not primary_error:
+                if selected_error.__cause__ is not None:
+                    raise selected_error from selected_error.__cause__
+                raise selected_error from None
+
+
+def _attach_process_secondary_failure(
+    primary: BaseException,
+    secondary: BaseException,
+    *,
+    context: str,
+) -> None:
+    if primary is secondary:
+        return
+    detail = str(secondary).strip()
+    diagnostic = f"{context} ({type(secondary).__name__})"
+    if detail:
+        diagnostic += f": {detail}"
+    add_note = getattr(primary, "add_note", None)
+    if callable(add_note):
+        add_note(diagnostic)
+        return
+    node = ReviewProcessSecondaryFailureDiagnostic(diagnostic)
+    if primary.__cause__ is not None:
+        node.__cause__ = primary.__cause__
+    elif primary.__context__ is not None:
+        node.__context__ = primary.__context__
+    primary.__cause__ = node
 
 
 def _read_bounded_bytes(path: pathlib.Path, limit: int) -> bytes:

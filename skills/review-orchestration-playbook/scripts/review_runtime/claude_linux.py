@@ -23,6 +23,8 @@ from typing import Protocol
 
 from .claude_refresh_lock import (
     ClaudeRefreshLockError,
+    ClaudeRefreshLockLease,
+    ClaudeRefreshLockOwner,
     ClaudeRefreshLockProtocol,
     ClaudeRefreshLockStale,
     ClaudeRefreshLockTimeout,
@@ -2126,6 +2128,23 @@ def _add_cleanup_note(error: BaseException, cleanup_error: BaseException) -> Non
     )
 
 
+def _attach_host_refresh_lock_recovery(
+    error: BaseException,
+    cleanup_error: BaseException | None,
+) -> None:
+    """Attach retained-lock recovery on every supported Python."""
+
+    if cleanup_error is None:
+        return
+    attach_claude_refresh_lock_recovery(error, cleanup_error)
+    if (
+        isinstance(error, (ForwardedSignal, ReviewError))
+        or callable(getattr(error, "add_note", None))
+    ):
+        return
+    _add_cleanup_note(error, cleanup_error)
+
+
 def _add_writeback_note(error: BaseException, writeback_error: BaseException) -> None:
     setattr(error, "_codex_claude_refresh_persistence_failed", True)
     retained_carrier = getattr(
@@ -2200,6 +2219,574 @@ def _primary_cleanup_error(
         if error is not primary:
             _add_cleanup_note(primary, error)
     return primary
+
+
+@dataclass(frozen=True)
+class _ClaudeRefreshLockCleanupResult:
+    error: BaseException | None
+    terminal: bool
+
+
+def _normalize_claude_refresh_lock_release_error(
+    error: BaseException,
+    *,
+    message: str,
+) -> BaseException:
+    if not isinstance(error, ClaudeRefreshLockError):
+        return error
+    wrapped = LinuxCredentialInspectionInconclusive(f"{message}: {error}")
+    attach_claude_refresh_lock_recovery(wrapped, error)
+    wrapped.__cause__ = error
+    return wrapped
+
+
+def _stateful_claude_refresh_lock_lease(
+    lease: ClaudeRefreshLockLease,
+) -> ClaudeRefreshLockLease | None:
+    if isinstance(lease, ClaudeRefreshLockLease):
+        return lease
+    delegated_lease = getattr(lease, "_lease", None)
+    if isinstance(delegated_lease, ClaudeRefreshLockLease):
+        return delegated_lease
+    return None
+
+
+def _claude_refresh_lock_retention_terminal(
+    lease: ClaudeRefreshLockLease,
+) -> tuple[bool, BaseException | None]:
+    snapshot = lease.retention_snapshot()
+    return snapshot.terminal, snapshot.diagnostic
+
+
+def _abandon_owned_claude_refresh_lock(
+    lease: ClaudeRefreshLockLease,
+    *,
+    reason: str,
+    primary_error: BaseException,
+    message: str,
+) -> _ClaudeRefreshLockCleanupResult:
+    """Finish an abandonment decision already published by the caller."""
+
+    stateful_lease = _stateful_claude_refresh_lock_lease(lease)
+    fallback_diagnostic: BaseException | None = None
+    if stateful_lease is not None:
+        terminal, fallback_diagnostic = (
+            _claude_refresh_lock_retention_terminal(stateful_lease)
+        )
+        if terminal:
+            _attach_host_refresh_lock_recovery(
+                primary_error,
+                fallback_diagnostic,
+            )
+            return _ClaudeRefreshLockCleanupResult(
+                error=primary_error,
+                terminal=True,
+            )
+        with stateful_lease._state_lock:
+            fallback_diagnostic = (
+                stateful_lease._retention_recovery_evidence
+            )
+            retention_prearmed = (
+                stateful_lease._deletion_prohibited
+                and stateful_lease._heartbeat_stop.is_set()
+            )
+        _attach_host_refresh_lock_recovery(
+            primary_error,
+            fallback_diagnostic,
+        )
+        if not retention_prearmed:
+            prearm_error = LinuxCredentialInspectionInconclusive(
+                "Claude refresh-lock abandonment helper was entered before "
+                "the caller published irreversible retention intent"
+            )
+            _attach_host_refresh_lock_recovery(
+                prearm_error,
+                fallback_diagnostic,
+            )
+            selected_error = _primary_cleanup_error(
+                [primary_error, prearm_error]
+            )
+            assert selected_error is not None
+            return _ClaudeRefreshLockCleanupResult(
+                error=selected_error,
+                terminal=False,
+            )
+
+    abandonment_errors: list[BaseException] = []
+    for _attempt in range(2):
+        try:
+            abandonment_diagnostic = lease.abandon(reason)
+        except BaseException as abandonment_error:
+            abandonment_errors.append(
+                _normalize_claude_refresh_lock_release_error(
+                    abandonment_error,
+                    message=message,
+                )
+            )
+            selected_error = _primary_cleanup_error(
+                [primary_error, *abandonment_errors]
+            )
+            assert selected_error is not None
+            if stateful_lease is not None:
+                terminal, cached_diagnostic = (
+                    _claude_refresh_lock_retention_terminal(
+                        stateful_lease
+                    )
+                )
+                if terminal:
+                    if cached_diagnostic is not None:
+                        _attach_host_refresh_lock_recovery(
+                            selected_error,
+                            cached_diagnostic,
+                        )
+                    return _ClaudeRefreshLockCleanupResult(
+                        error=selected_error,
+                        terminal=True,
+                    )
+                if cached_diagnostic is not None:
+                    _attach_host_refresh_lock_recovery(
+                        selected_error,
+                        cached_diagnostic,
+                    )
+        else:
+            selected_error = _primary_cleanup_error(
+                [primary_error, *abandonment_errors]
+            )
+            assert selected_error is not None
+            _attach_host_refresh_lock_recovery(
+                selected_error,
+                abandonment_diagnostic,
+            )
+            terminal = True
+            if stateful_lease is not None:
+                terminal, _cached_diagnostic = (
+                    _claude_refresh_lock_retention_terminal(
+                        stateful_lease
+                    )
+                )
+            return _ClaudeRefreshLockCleanupResult(
+                error=selected_error,
+                terminal=terminal,
+            )
+
+    selected_error = _primary_cleanup_error(
+        [primary_error, *abandonment_errors]
+    )
+    assert selected_error is not None
+    if stateful_lease is None:
+        return _ClaudeRefreshLockCleanupResult(
+            error=selected_error,
+            terminal=False,
+        )
+
+    terminal, terminal_diagnostic = (
+        _claude_refresh_lock_retention_terminal(stateful_lease)
+    )
+    if terminal:
+        if terminal_diagnostic is not None:
+            _attach_host_refresh_lock_recovery(
+                selected_error,
+                terminal_diagnostic,
+            )
+        return _ClaudeRefreshLockCleanupResult(
+            error=selected_error,
+            terminal=True,
+        )
+
+    resume_errors: list[BaseException] = []
+    for _attempt in range(2):
+        try:
+            stateful_lease.release()
+        except BaseException as resume_error:
+            resume_errors.append(
+                _normalize_claude_refresh_lock_release_error(
+                    resume_error,
+                    message=(
+                        f"{message}; cannot resume fail-closed abandonment"
+                    ),
+                )
+            )
+        terminal, terminal_diagnostic = (
+            _claude_refresh_lock_retention_terminal(stateful_lease)
+        )
+        if terminal:
+            selected_error = _primary_cleanup_error(
+                [selected_error, *resume_errors]
+            )
+            assert selected_error is not None
+            if terminal_diagnostic is not None:
+                _attach_host_refresh_lock_recovery(
+                    selected_error,
+                    terminal_diagnostic,
+                )
+            return _ClaudeRefreshLockCleanupResult(
+                error=selected_error,
+                terminal=True,
+            )
+
+    with stateful_lease._state_lock:
+        stateful_lease._deletion_prohibited = True
+        stateful_lease._heartbeat_stop.set()
+        heartbeat = stateful_lease._heartbeat_thread
+        shutdown_timeout = stateful_lease._shutdown_timeout_seconds()
+        fallback_diagnostic = stateful_lease._retention_recovery_evidence
+    selected_error = _primary_cleanup_error(
+        [selected_error, *resume_errors]
+    )
+    assert selected_error is not None
+    _attach_host_refresh_lock_recovery(selected_error, fallback_diagnostic)
+
+    heartbeat_error: BaseException | None = None
+    heartbeat_alive = False
+    if heartbeat is not None:
+        try:
+            heartbeat.join(timeout=shutdown_timeout)
+        except BaseException as error:
+            heartbeat_error = error
+        try:
+            heartbeat_alive = heartbeat.is_alive()
+        except BaseException as error:
+            heartbeat_alive = True
+            heartbeat_error = _primary_cleanup_error(
+                [
+                    candidate
+                    for candidate in (heartbeat_error, error)
+                    if candidate is not None
+                ]
+            )
+    if heartbeat_alive and heartbeat_error is None:
+        heartbeat_error = LinuxCredentialInspectionInconclusive(
+            "Claude refresh-lock heartbeat did not stop after irreversible "
+            "retention"
+        )
+    if heartbeat_error is not None:
+        selected_error = _primary_cleanup_error(
+            [selected_error, heartbeat_error]
+        )
+        assert selected_error is not None
+        _attach_host_refresh_lock_recovery(
+            selected_error,
+            fallback_diagnostic,
+        )
+    return _ClaudeRefreshLockCleanupResult(
+        error=selected_error,
+        terminal=False,
+    )
+
+
+def _release_owned_claude_refresh_lock(
+    owner: ClaudeRefreshLockOwner,
+    lease: ClaudeRefreshLockLease | None,
+    *,
+    message: str,
+) -> _ClaudeRefreshLockCleanupResult:
+    """Release a caller-owned lease across the acquire return boundary."""
+
+    cleanup_lease = lease if lease is not None else owner.lease
+    if cleanup_lease is None:
+        return _ClaudeRefreshLockCleanupResult(error=None, terminal=True)
+
+    release_errors: list[BaseException] = []
+    for _attempt in range(2):
+        try:
+            if owner.transferred:
+                cleanup_lease.release()
+            else:
+                cleanup_lease._release(skip_abandoned=False)
+        except BaseException as error:
+            release_errors.append(
+                _normalize_claude_refresh_lock_release_error(
+                    error,
+                    message=message,
+                )
+            )
+            stateful_lease = _stateful_claude_refresh_lock_lease(
+                cleanup_lease
+            )
+            if stateful_lease is not None:
+                terminal, terminal_diagnostic = (
+                    _claude_refresh_lock_retention_terminal(stateful_lease)
+                )
+                if terminal:
+                    selected_error = _primary_cleanup_error(release_errors)
+                    if (
+                        selected_error is not None
+                        and terminal_diagnostic is not None
+                    ):
+                        _attach_host_refresh_lock_recovery(
+                            selected_error,
+                            terminal_diagnostic,
+                        )
+                    return _ClaudeRefreshLockCleanupResult(
+                        error=selected_error,
+                        terminal=True,
+                    )
+        else:
+            return _ClaudeRefreshLockCleanupResult(
+                error=_primary_cleanup_error(release_errors),
+                terminal=True,
+            )
+
+    primary_error = _primary_cleanup_error(release_errors)
+    assert primary_error is not None
+    abandonment_reason = (
+        f"{message}; two release attempts did not reach a terminal state"
+    )
+    stateful_lease = _stateful_claude_refresh_lock_lease(cleanup_lease)
+    fallback_diagnostic: BaseException | None = None
+    if stateful_lease is not None:
+        terminal, fallback_diagnostic = (
+            _claude_refresh_lock_retention_terminal(stateful_lease)
+        )
+        if terminal:
+            _attach_host_refresh_lock_recovery(
+                primary_error,
+                fallback_diagnostic,
+            )
+            return _ClaudeRefreshLockCleanupResult(
+                error=primary_error,
+                terminal=True,
+            )
+        # This assignment is deliberately the first observable retention state
+        # before crossing any lock-entry or helper-call boundary.
+        stateful_lease._deletion_prohibited = True
+        stateful_lease._heartbeat_stop.set()
+        fallback_diagnostic = stateful_lease._retention_recovery_evidence
+        _attach_host_refresh_lock_recovery(
+            primary_error,
+            fallback_diagnostic,
+        )
+
+    boundary_errors: list[BaseException] = []
+    abandonment_cleanup: _ClaudeRefreshLockCleanupResult | None = None
+    for _attempt in range(2):
+        try:
+            abandonment_cleanup = _abandon_owned_claude_refresh_lock(
+                cleanup_lease,
+                reason=abandonment_reason,
+                primary_error=primary_error,
+                message=f"{message}; cannot abandon the retained lock",
+            )
+        except BaseException as boundary_error:
+            boundary_errors.append(
+                _normalize_claude_refresh_lock_release_error(
+                    boundary_error,
+                    message=(
+                        f"{message}; abandonment helper boundary failed"
+                    ),
+                )
+            )
+            selected_error = _primary_cleanup_error(
+                [primary_error, *boundary_errors]
+            )
+            assert selected_error is not None
+            if stateful_lease is not None:
+                terminal, terminal_diagnostic = (
+                    _claude_refresh_lock_retention_terminal(
+                        stateful_lease
+                    )
+                )
+                if terminal:
+                    if terminal_diagnostic is not None:
+                        _attach_host_refresh_lock_recovery(
+                            selected_error,
+                            terminal_diagnostic,
+                        )
+                    return _ClaudeRefreshLockCleanupResult(
+                        error=selected_error,
+                        terminal=True,
+                    )
+            primary_error = selected_error
+            continue
+
+        cleanup_errors = [primary_error, *boundary_errors]
+        if (
+            abandonment_cleanup.error is not None
+            and abandonment_cleanup.error is not primary_error
+        ):
+            cleanup_errors.append(abandonment_cleanup.error)
+        selected_error = _primary_cleanup_error(cleanup_errors)
+        assert selected_error is not None
+        if abandonment_cleanup.terminal:
+            return _ClaudeRefreshLockCleanupResult(
+                error=selected_error,
+                terminal=True,
+            )
+        primary_error = selected_error
+
+    selected_error = _primary_cleanup_error(
+        [primary_error, *boundary_errors]
+    )
+    assert selected_error is not None
+    if stateful_lease is None:
+        return _ClaudeRefreshLockCleanupResult(
+            error=selected_error,
+            terminal=False,
+        )
+    for _attempt in range(2):
+        try:
+            stateful_lease.release()
+        except BaseException as resume_error:
+            boundary_errors.append(
+                _normalize_claude_refresh_lock_release_error(
+                    resume_error,
+                    message=(
+                        f"{message}; cannot resume caller-prearmed abandonment"
+                    ),
+                )
+            )
+        terminal, terminal_diagnostic = (
+            _claude_refresh_lock_retention_terminal(stateful_lease)
+        )
+        if terminal:
+            selected_error = _primary_cleanup_error(
+                [selected_error, *boundary_errors]
+            )
+            assert selected_error is not None
+            if terminal_diagnostic is not None:
+                _attach_host_refresh_lock_recovery(
+                    selected_error,
+                    terminal_diagnostic,
+                )
+            return _ClaudeRefreshLockCleanupResult(
+                error=selected_error,
+                terminal=True,
+            )
+    if fallback_diagnostic is not None:
+        _attach_host_refresh_lock_recovery(
+            selected_error,
+            fallback_diagnostic,
+        )
+    return _ClaudeRefreshLockCleanupResult(
+        error=selected_error,
+        terminal=False,
+    )
+
+
+def _recover_prearmed_claude_refresh_lock_release(
+    owner: ClaudeRefreshLockOwner,
+    lease: ClaudeRefreshLockLease,
+    *,
+    boundary_error: BaseException,
+    message: str,
+) -> _ClaudeRefreshLockCleanupResult:
+    """Finish cleanup after the caller published irreversible retention."""
+
+    cleanup_errors = [
+        _normalize_claude_refresh_lock_release_error(
+            boundary_error,
+            message=f"{message}; release helper boundary failed",
+        )
+    ]
+    stateful_lease = _stateful_claude_refresh_lock_lease(lease)
+    if stateful_lease is not None:
+        terminal, terminal_diagnostic = (
+            _claude_refresh_lock_retention_terminal(stateful_lease)
+        )
+        if terminal:
+            selected_error = _primary_cleanup_error(cleanup_errors)
+            if (
+                selected_error is not None
+                and terminal_diagnostic is not None
+            ):
+                _attach_host_refresh_lock_recovery(
+                    selected_error,
+                    terminal_diagnostic,
+                )
+            return _ClaudeRefreshLockCleanupResult(
+                error=selected_error,
+                terminal=True,
+            )
+
+    for _attempt in range(2):
+        try:
+            cleanup = _release_owned_claude_refresh_lock(
+                owner,
+                lease,
+                message=message,
+            )
+        except BaseException as recovery_error:
+            cleanup_errors.append(
+                _normalize_claude_refresh_lock_release_error(
+                    recovery_error,
+                    message=f"{message}; release recovery boundary failed",
+                )
+            )
+        else:
+            if cleanup.error is not None:
+                cleanup_errors.append(cleanup.error)
+            selected_error = _primary_cleanup_error(cleanup_errors)
+            assert selected_error is not None
+            if cleanup.terminal:
+                return _ClaudeRefreshLockCleanupResult(
+                    error=selected_error,
+                    terminal=True,
+                )
+
+        if stateful_lease is not None:
+            terminal, terminal_diagnostic = (
+                _claude_refresh_lock_retention_terminal(stateful_lease)
+            )
+            if terminal:
+                selected_error = _primary_cleanup_error(cleanup_errors)
+                assert selected_error is not None
+                if terminal_diagnostic is not None:
+                    _attach_host_refresh_lock_recovery(
+                        selected_error,
+                        terminal_diagnostic,
+                    )
+                return _ClaudeRefreshLockCleanupResult(
+                    error=selected_error,
+                    terminal=True,
+                )
+
+    selected_error = _primary_cleanup_error(cleanup_errors)
+    assert selected_error is not None
+    if stateful_lease is None:
+        return _ClaudeRefreshLockCleanupResult(
+            error=selected_error,
+            terminal=False,
+        )
+
+    for _attempt in range(2):
+        try:
+            stateful_lease.release()
+        except BaseException as resume_error:
+            cleanup_errors.append(
+                _normalize_claude_refresh_lock_release_error(
+                    resume_error,
+                    message=(
+                        f"{message}; cannot resume caller-prearmed cleanup"
+                    ),
+                )
+            )
+        terminal, terminal_diagnostic = (
+            _claude_refresh_lock_retention_terminal(stateful_lease)
+        )
+        if terminal:
+            selected_error = _primary_cleanup_error(cleanup_errors)
+            assert selected_error is not None
+            if terminal_diagnostic is not None:
+                _attach_host_refresh_lock_recovery(
+                    selected_error,
+                    terminal_diagnostic,
+                )
+            return _ClaudeRefreshLockCleanupResult(
+                error=selected_error,
+                terminal=True,
+            )
+
+    selected_error = _primary_cleanup_error(cleanup_errors)
+    assert selected_error is not None
+    fallback_diagnostic = stateful_lease._retention_recovery_evidence
+    _attach_host_refresh_lock_recovery(
+        selected_error,
+        fallback_diagnostic,
+    )
+    return _ClaudeRefreshLockCleanupResult(
+        error=selected_error,
+        terminal=False,
+    )
 
 
 def _discard_private_file(
@@ -2583,6 +3170,7 @@ def _writeback_refreshed_credential_impl(
     owner_uid: int,
     refresh_lock_protocol: ClaudeRefreshLockProtocol | None,
     staged_payload: bytearray | None = None,
+    coordinated_refresh_lock: ClaudeRefreshLockLease | None = None,
 ) -> _CredentialFileIdentity:
     owns_updated_payload = staged_payload is None
     if staged_payload is None:
@@ -2605,6 +3193,10 @@ def _writeback_refreshed_credential_impl(
             ) from error
     else:
         updated_payload = staged_payload
+    refresh_lock_owner = ClaudeRefreshLockOwner()
+    refresh_lock = coordinated_refresh_lock
+    owns_refresh_lock = refresh_lock is None
+    refresh_lock_cleanup_completed = False
     try:
         if updated_payload == original_payload and refresh_lock_protocol is None:
             return original_identity
@@ -2612,22 +3204,26 @@ def _writeback_refreshed_credential_impl(
             raise LinuxCredentialInspectionInconclusive(
                 "Claude credential-lock protocol is unavailable for refresh writeback"
             )
-        try:
-            refresh_lock = acquire_claude_refresh_lock(
-                source.parent,
-                protocol=refresh_lock_protocol,
-                config_dir_fd=source_anchor.descriptor,
-                legacy_parent_dir_fd=source_anchor.legacy_parent_descriptor,
-            )
-        except ClaudeRefreshLockStale as error:
-            raise LinuxCredentialStaleRefreshLock(
-                "a stale Claude refresh lock requires controlled cleanup after "
-                "confirming that no Claude credential writer is active"
-            ) from error
-        except ClaudeRefreshLockError as error:
-            raise LinuxCredentialInspectionInconclusive(
-                f"cannot coordinate Claude credential refresh writeback: {error}"
-            ) from error
+        if refresh_lock is None:
+            try:
+                refresh_lock = acquire_claude_refresh_lock(
+                    source.parent,
+                    protocol=refresh_lock_protocol,
+                    owner=refresh_lock_owner,
+                    config_dir_fd=source_anchor.descriptor,
+                    legacy_parent_dir_fd=source_anchor.legacy_parent_descriptor,
+                )
+                refresh_lock_owner.transfer(refresh_lock)
+            except ClaudeRefreshLockStale as error:
+                raise LinuxCredentialStaleRefreshLock(
+                    "a stale Claude refresh lock requires controlled cleanup after "
+                    "confirming that no Claude credential writer is active"
+                ) from error
+            except ClaudeRefreshLockError as error:
+                raise LinuxCredentialInspectionInconclusive(
+                    "cannot coordinate Claude credential refresh writeback: "
+                    f"{error}"
+                ) from error
         parent_fd = source_anchor.descriptor
         parent_locked = False
         current_payload: bytearray | None = None
@@ -2771,15 +3367,59 @@ def _writeback_refreshed_credential_impl(
                     _unlock_credential_parent(source_anchor)
                 except BaseException as error:
                     unlock_error = error
-            try:
-                refresh_lock.release()
-            except ClaudeRefreshLockError as error:
-                refresh_lock_error = LinuxCredentialInspectionInconclusive(
-                    f"cannot release Claude credential refresh lock: {error}"
+            if owns_refresh_lock:
+                release_message = (
+                    "cannot release Claude credential refresh lock"
                 )
-                refresh_lock_error.__cause__ = error
-            except BaseException as error:
-                refresh_lock_error = error
+                try:
+                    refresh_lock_cleanup = (
+                        _release_owned_claude_refresh_lock(
+                            refresh_lock_owner,
+                            refresh_lock,
+                            message=release_message,
+                        )
+                    )
+                except BaseException as boundary_error:
+                    cleanup_lease = (
+                        refresh_lock
+                        if refresh_lock is not None
+                        else refresh_lock_owner.lease
+                    )
+                    if cleanup_lease is None:
+                        refresh_lock_cleanup = (
+                            _ClaudeRefreshLockCleanupResult(
+                                error=boundary_error,
+                                terminal=True,
+                            )
+                        )
+                    else:
+                        # These are deliberately the first observable cleanup
+                        # decisions after the interrupted helper boundary.
+                        cleanup_lease._deletion_prohibited = True
+                        cleanup_lease._heartbeat_stop.set()
+                        stateful_lease = (
+                            _stateful_claude_refresh_lock_lease(cleanup_lease)
+                        )
+                        if stateful_lease is not None:
+                            fallback_diagnostic = (
+                                stateful_lease._retention_recovery_evidence
+                            )
+                            _attach_host_refresh_lock_recovery(
+                                boundary_error,
+                                fallback_diagnostic,
+                            )
+                        refresh_lock_cleanup = (
+                            _recover_prearmed_claude_refresh_lock_release(
+                                refresh_lock_owner,
+                                cleanup_lease,
+                                boundary_error=boundary_error,
+                                message=release_message,
+                            )
+                        )
+                refresh_lock_error = refresh_lock_cleanup.error
+                refresh_lock_cleanup_completed = (
+                    refresh_lock_cleanup.terminal
+                )
             primary_error = _primary_cleanup_error(
                 [
                     error
@@ -2795,6 +3435,60 @@ def _writeback_refreshed_credential_impl(
             )
             if primary_error is not None:
                 raise primary_error
+    except BaseException as error:
+        if owns_refresh_lock and not refresh_lock_cleanup_completed:
+            release_message = "cannot release Claude credential refresh lock"
+            try:
+                refresh_lock_cleanup = _release_owned_claude_refresh_lock(
+                    refresh_lock_owner,
+                    refresh_lock,
+                    message=release_message,
+                )
+            except BaseException as boundary_error:
+                cleanup_lease = (
+                    refresh_lock
+                    if refresh_lock is not None
+                    else refresh_lock_owner.lease
+                )
+                if cleanup_lease is None:
+                    refresh_lock_cleanup = _ClaudeRefreshLockCleanupResult(
+                        error=boundary_error,
+                        terminal=True,
+                    )
+                else:
+                    # These are deliberately the first observable cleanup
+                    # decisions after the interrupted helper boundary.
+                    cleanup_lease._deletion_prohibited = True
+                    cleanup_lease._heartbeat_stop.set()
+                    stateful_lease = _stateful_claude_refresh_lock_lease(
+                        cleanup_lease
+                    )
+                    if stateful_lease is not None:
+                        fallback_diagnostic = (
+                            stateful_lease._retention_recovery_evidence
+                        )
+                        _attach_host_refresh_lock_recovery(
+                            boundary_error,
+                            fallback_diagnostic,
+                        )
+                    refresh_lock_cleanup = (
+                        _recover_prearmed_claude_refresh_lock_release(
+                            refresh_lock_owner,
+                            cleanup_lease,
+                            boundary_error=boundary_error,
+                            message=release_message,
+                        )
+                    )
+            refresh_lock_error = refresh_lock_cleanup.error
+            refresh_lock_cleanup_completed = refresh_lock_cleanup.terminal
+            if refresh_lock_error is not None:
+                selected_error = _primary_cleanup_error(
+                    [error, refresh_lock_error]
+                )
+                if selected_error is not error:
+                    assert selected_error is not None
+                    raise selected_error
+        raise
     finally:
         if owns_updated_payload:
             updated_payload[:] = b"\x00" * len(updated_payload)
@@ -2811,6 +3505,7 @@ def _writeback_refreshed_credential(
     owner_uid: int,
     refresh_lock_protocol: ClaudeRefreshLockProtocol | None,
     staged_payload: bytearray | None = None,
+    coordinated_refresh_lock: ClaudeRefreshLockLease | None = None,
 ) -> _CredentialFileIdentity:
     """Persist a runtime refresh without reclassifying writeback as login loss."""
 
@@ -2825,6 +3520,7 @@ def _writeback_refreshed_credential(
             owner_uid=owner_uid,
             refresh_lock_protocol=refresh_lock_protocol,
             staged_payload=staged_payload,
+            coordinated_refresh_lock=coordinated_refresh_lock,
         )
     except LinuxCredentialInspectionInconclusive:
         raise
@@ -2861,47 +3557,97 @@ def _read_staged_credential_under_lock(
 ) -> tuple[bytearray, _CredentialFileIdentity] | None:
     """Read one stable staged candidate without holding the host-side locks."""
 
-    try:
-        refresh_lock = acquire_claude_refresh_lock(
-            staged.config_dir,
-            protocol=refresh_lock_protocol,
-            timeout_seconds=timeout_seconds,
-        )
-    except ClaudeRefreshLockTimeout:
-        return None
-    except ClaudeRefreshLockStale as error:
-        raise LinuxStagedCredentialRefreshLockBlocked(
-            "a staged Claude refresh lock remained after the runtime writer "
-            "stopped"
-        ) from error
-    except ClaudeRefreshLockError as error:
-        raise LinuxCredentialInspectionInconclusive(
-            f"cannot coordinate staged Claude credential inspection: {error}"
-        ) from error
-
+    refresh_lock_owner = ClaudeRefreshLockOwner()
+    refresh_lock: ClaudeRefreshLockLease | None = None
+    lock_unavailable = False
     candidate: bytearray | None = None
     candidate_identity: _CredentialFileIdentity | None = None
     operation_error: BaseException | None = None
     release_error: BaseException | None = None
     try:
-        candidate, _expires_at_ms, candidate_identity = _read_valid_credential(
-            staged.credential_path,
-            owner_uid=owner_uid,
-            now=0.0,
-            required_validity_seconds=0.0,
-        )
-    except BaseException as error:
-        operation_error = error
-    finally:
         try:
-            refresh_lock.release()
-        except ClaudeRefreshLockError as error:
-            release_error = LinuxCredentialInspectionInconclusive(
-                f"cannot release staged Claude credential refresh lock: {error}"
-            )
-            release_error.__cause__ = error
+            try:
+                refresh_lock = acquire_claude_refresh_lock(
+                    staged.config_dir,
+                    protocol=refresh_lock_protocol,
+                    owner=refresh_lock_owner,
+                    timeout_seconds=timeout_seconds,
+                )
+                refresh_lock_owner.transfer(refresh_lock)
+            except ClaudeRefreshLockTimeout:
+                lock_unavailable = True
+            except ClaudeRefreshLockStale as error:
+                raise LinuxStagedCredentialRefreshLockBlocked(
+                    "a staged Claude refresh lock remained after the runtime "
+                    "writer stopped"
+                ) from error
+            except ClaudeRefreshLockError as error:
+                raise LinuxCredentialInspectionInconclusive(
+                    "cannot coordinate staged Claude credential inspection: "
+                    f"{error}"
+                ) from error
+            if not lock_unavailable:
+                candidate, _expires_at_ms, candidate_identity = (
+                    _read_valid_credential(
+                        staged.credential_path,
+                        owner_uid=owner_uid,
+                        now=0.0,
+                        required_validity_seconds=0.0,
+                    )
+                )
         except BaseException as error:
-            release_error = error
+            operation_error = error
+    finally:
+        release_message = (
+            "cannot release staged Claude credential refresh lock"
+        )
+        try:
+            release_cleanup = _release_owned_claude_refresh_lock(
+                refresh_lock_owner,
+                refresh_lock,
+                message=release_message,
+            )
+        except BaseException as boundary_error:
+            cleanup_lease = (
+                refresh_lock
+                if refresh_lock is not None
+                else refresh_lock_owner.lease
+            )
+            if cleanup_lease is None:
+                release_cleanup = _ClaudeRefreshLockCleanupResult(
+                    error=boundary_error,
+                    terminal=True,
+                )
+            else:
+                # These are deliberately the first observable cleanup
+                # decisions after the interrupted helper boundary.
+                cleanup_lease._deletion_prohibited = True
+                cleanup_lease._heartbeat_stop.set()
+                stateful_lease = _stateful_claude_refresh_lock_lease(
+                    cleanup_lease
+                )
+                if stateful_lease is not None:
+                    fallback_diagnostic = (
+                        stateful_lease._retention_recovery_evidence
+                    )
+                    _attach_host_refresh_lock_recovery(
+                        boundary_error,
+                        fallback_diagnostic,
+                    )
+                release_cleanup = (
+                    _recover_prearmed_claude_refresh_lock_release(
+                        refresh_lock_owner,
+                        cleanup_lease,
+                        boundary_error=boundary_error,
+                        message=release_message,
+                    )
+                )
+        release_error = release_cleanup.error
+        if not release_cleanup.terminal and release_error is None:
+            release_error = LinuxCredentialInspectionInconclusive(
+                "staged Claude credential refresh-lock cleanup did not reach "
+                "a released or abandoned terminal state"
+            )
     primary_error = _primary_cleanup_error(
         [
             error
@@ -2913,6 +3659,8 @@ def _read_staged_credential_under_lock(
         if candidate is not None:
             candidate[:] = b"\x00" * len(candidate)
         raise primary_error
+    if lock_unavailable:
+        return None
     assert candidate is not None
     assert candidate_identity is not None
     return candidate, candidate_identity
@@ -2932,6 +3680,7 @@ class _StagedCredentialWatcher:
         parent_identity: _CredentialParentIdentity,
         owner_uid: int,
         refresh_lock_protocol: ClaudeRefreshLockProtocol,
+        coordinated_refresh_lock: ClaudeRefreshLockLease | None = None,
     ) -> None:
         self._source = source
         self._source_anchor = source_anchor
@@ -2941,6 +3690,7 @@ class _StagedCredentialWatcher:
         self._parent_identity = parent_identity
         self._owner_uid = owner_uid
         self._refresh_lock_protocol = refresh_lock_protocol
+        self._coordinated_refresh_lock = coordinated_refresh_lock
         self._observed_identity = _staged_credential_observation(
             staged.credential_path
         )
@@ -3198,6 +3948,9 @@ class _StagedCredentialWatcher:
                         owner_uid=self._owner_uid,
                         refresh_lock_protocol=self._refresh_lock_protocol,
                         staged_payload=candidate,
+                        coordinated_refresh_lock=(
+                            self._coordinated_refresh_lock
+                        ),
                     )
                     if candidate != self._baseline_payload:
                         self._baseline_payload[:] = b"\x00" * len(
@@ -3387,13 +4140,11 @@ def _stage_claude_credentials_anchored(
     owner_uid = os.getuid()
     parent_identity = source_anchor.identity
     private_root = _validate_private_directory(helper_root, owner_uid=owner_uid)
-    payload, expires_at_ms, original_identity = _read_valid_credential(
-        source,
-        owner_uid=owner_uid,
-        now=time.time() if now is None else now,
-        required_validity_seconds=required_validity_seconds,
-        dir_fd=source_anchor.descriptor,
-    )
+    payload: bytearray | None = None
+    expires_at_ms = 0.0
+    original_identity: _CredentialFileIdentity | None = None
+    host_refresh_lock_owner = ClaudeRefreshLockOwner()
+    host_refresh_lock: ClaudeRefreshLockLease | None = None
     staged: StagedCredential | None = None
     carrier_root: pathlib.Path | None = None
     config_dir: pathlib.Path | None = None
@@ -3402,6 +4153,51 @@ def _stage_claude_credentials_anchored(
     watcher_started = False
     failure: BaseException | None = None
     try:
+        if refresh_lock_protocol is not None:
+            try:
+                # The lease heartbeat must inherit the forwarded-signal mask.
+                # Otherwise a process-directed signal can reach that thread
+                # while the main thread is aggregating cleanup, bypassing the
+                # deferred-signal path before retained-carrier diagnostics are
+                # attached.
+                refresh_lock_start_mask = block_forwarded_signals()
+                try:
+                    host_refresh_lock = acquire_claude_refresh_lock(
+                        source.parent,
+                        protocol=refresh_lock_protocol,
+                        owner=host_refresh_lock_owner,
+                        config_dir_fd=source_anchor.descriptor,
+                        legacy_parent_dir_fd=(
+                            source_anchor.legacy_parent_descriptor
+                        ),
+                    )
+                    host_refresh_lock_owner.transfer(host_refresh_lock)
+                finally:
+                    restore_signal_mask(refresh_lock_start_mask)
+            except ClaudeRefreshLockStale as error:
+                raise LinuxCredentialStaleRefreshLock(
+                    "a stale Claude refresh lock requires controlled cleanup "
+                    "after confirming that no Claude credential writer is active"
+                ) from error
+            except ClaudeRefreshLockError as error:
+                raise LinuxCredentialInspectionInconclusive(
+                    "cannot coordinate Claude credential refresh transaction: "
+                    f"{error}"
+                ) from error
+            try:
+                host_refresh_lock.assert_held()
+            except ClaudeRefreshLockError as error:
+                raise LinuxCredentialInspectionInconclusive(
+                    "Claude refresh lock changed before credential exposure"
+                ) from error
+            source_anchor.assert_stable(owner_uid=owner_uid)
+        payload, expires_at_ms, original_identity = _read_valid_credential(
+            source,
+            owner_uid=owner_uid,
+            now=time.time() if now is None else now,
+            required_validity_seconds=required_validity_seconds,
+            dir_fd=source_anchor.descriptor,
+        )
         carrier_root = pathlib.Path(
             tempfile.mkdtemp(prefix="claude-carrier-", dir=private_root)
         )
@@ -3427,6 +4223,7 @@ def _stage_claude_credentials_anchored(
                 parent_identity=parent_identity,
                 owner_uid=owner_uid,
                 refresh_lock_protocol=refresh_lock_protocol,
+                coordinated_refresh_lock=host_refresh_lock,
             )
             start_mask = block_forwarded_signals()
             try:
@@ -3444,6 +4241,7 @@ def _stage_claude_credentials_anchored(
             payload_error: BaseException | None = None
             cleanup_error: BaseException | None = None
             cleanup_is_safe = True
+            carrier_cleanup_proven = False
             retain_for_recovery = False
             if (
                 watcher is not None
@@ -3599,6 +4397,8 @@ def _stage_claude_credentials_anchored(
                             ]
                         )
             elif staged is not None:
+                assert payload is not None
+                assert original_identity is not None
                 try:
                     _writeback_refreshed_credential(
                         source,
@@ -3609,25 +4409,36 @@ def _stage_claude_credentials_anchored(
                         parent_identity,
                         owner_uid=owner_uid,
                         refresh_lock_protocol=refresh_lock_protocol,
+                        coordinated_refresh_lock=host_refresh_lock,
                     )
                 except BaseException as error:
                     writeback_error = error
-            try:
-                payload[:] = b"\x00" * len(payload)
-            except BaseException as error:
-                payload_error = _primary_cleanup_error(
-                    [
-                        candidate
-                        for candidate in (payload_error, error)
-                        if candidate is not None
-                    ]
-                )
+            if payload is not None:
+                try:
+                    payload[:] = b"\x00" * len(payload)
+                except BaseException as error:
+                    payload_error = _primary_cleanup_error(
+                        [
+                            candidate
+                            for candidate in (payload_error, error)
+                            if candidate is not None
+                        ]
+                    )
             if (
                 staged is not None
                 and cleanup_is_safe
                 and not retain_for_recovery
             ):
-                cleanup_error = _cleanup_staged_credential(staged)
+                try:
+                    cleanup_error = _cleanup_staged_credential(staged)
+                except BaseException as error:
+                    cleanup_error = error
+                carrier_cleanup_proven = cleanup_error is None
+            elif staged is not None and not retain_for_recovery:
+                cleanup_error = LinuxCredentialInspectionInconclusive(
+                    "cannot prove that staged Claude credential carrier "
+                    "cleanup is safe"
+                )
             elif staged is None and carrier_root is not None:
                 cleanup_errors: list[BaseException] = []
                 if credential_path is not None:
@@ -3644,6 +4455,338 @@ def _stage_claude_credentials_anchored(
                     except BaseException as error:
                         cleanup_errors.append(error)
                 cleanup_error = _primary_cleanup_error(cleanup_errors)
+                carrier_cleanup_proven = cleanup_error is None
+            elif staged is None and carrier_root is None:
+                carrier_cleanup_proven = True
+            cleanup_host_refresh_lock = (
+                host_refresh_lock
+                if host_refresh_lock is not None
+                else host_refresh_lock_owner.lease
+            )
+            if cleanup_host_refresh_lock is not None:
+                if not host_refresh_lock_owner.transferred:
+                    release_message = (
+                        "cannot release Claude credential refresh "
+                        "transaction lock"
+                    )
+                    try:
+                        host_refresh_lock_cleanup = (
+                            _release_owned_claude_refresh_lock(
+                                host_refresh_lock_owner,
+                                host_refresh_lock,
+                                message=release_message,
+                            )
+                        )
+                    except BaseException as boundary_error:
+                        # These are deliberately the first observable cleanup
+                        # decisions after the interrupted helper boundary.
+                        cleanup_host_refresh_lock._deletion_prohibited = True
+                        cleanup_host_refresh_lock._heartbeat_stop.set()
+                        stateful_host_refresh_lock = (
+                            _stateful_claude_refresh_lock_lease(
+                                cleanup_host_refresh_lock
+                            )
+                        )
+                        if stateful_host_refresh_lock is not None:
+                            fallback_diagnostic = (
+                                stateful_host_refresh_lock.
+                                _retention_recovery_evidence
+                            )
+                            _attach_host_refresh_lock_recovery(
+                                boundary_error,
+                                fallback_diagnostic,
+                            )
+                        host_refresh_lock_cleanup = (
+                            _recover_prearmed_claude_refresh_lock_release(
+                                host_refresh_lock_owner,
+                                cleanup_host_refresh_lock,
+                                boundary_error=boundary_error,
+                                message=release_message,
+                            )
+                        )
+                    host_refresh_lock_error = (
+                        host_refresh_lock_cleanup.error
+                    )
+                    if (
+                        not host_refresh_lock_cleanup.terminal
+                        and host_refresh_lock_error is None
+                    ):
+                        host_refresh_lock_error = (
+                            LinuxCredentialInspectionInconclusive(
+                                "Claude credential refresh transaction-lock "
+                                "cleanup did not reach a released or abandoned "
+                                "terminal state"
+                            )
+                        )
+                    if host_refresh_lock_error is not None:
+                        writeback_error = _primary_cleanup_error(
+                            [
+                                candidate
+                                for candidate in (
+                                    writeback_error,
+                                    host_refresh_lock_error,
+                                )
+                                if candidate is not None
+                            ]
+                        )
+                elif retain_for_recovery or not carrier_cleanup_proven:
+                    if retain_for_recovery:
+                        if writeback_error is None:
+                            writeback_error = (
+                                LinuxCredentialInspectionInconclusive(
+                                    "Claude credential refresh persistence was "
+                                    "not proven"
+                                )
+                            )
+                        abandonment_error = writeback_error
+                        abandonment_reason = (
+                            "Claude credential refresh persistence was not "
+                            f"proven: {writeback_error}"
+                        )
+                    else:
+                        if cleanup_error is None:
+                            cleanup_error = (
+                                LinuxCredentialInspectionInconclusive(
+                                    "staged Claude credential carrier cleanup "
+                                    "was not proven"
+                                )
+                            )
+                        abandonment_error = cleanup_error
+                        abandonment_reason = (
+                            "staged Claude credential carrier cleanup was not "
+                            f"proven: {cleanup_error}"
+                        )
+                    stateful_host_refresh_lock = (
+                        _stateful_claude_refresh_lock_lease(
+                            cleanup_host_refresh_lock
+                        )
+                    )
+                    fallback_diagnostic: BaseException | None = None
+                    if stateful_host_refresh_lock is not None:
+                        # Publish the irreversible decision before the first
+                        # helper or state-lock boundary can be interrupted.
+                        stateful_host_refresh_lock._deletion_prohibited = True
+                        stateful_host_refresh_lock._heartbeat_stop.set()
+                        fallback_diagnostic = (
+                            stateful_host_refresh_lock.
+                            _retention_recovery_evidence
+                        )
+                        _attach_host_refresh_lock_recovery(
+                            abandonment_error,
+                            fallback_diagnostic,
+                        )
+
+                    boundary_errors: list[BaseException] = []
+                    abandonment_cleanup: (
+                        _ClaudeRefreshLockCleanupResult | None
+                    ) = None
+                    selected_abandonment_error = abandonment_error
+                    for _attempt in range(2):
+                        try:
+                            abandonment_cleanup = (
+                                _abandon_owned_claude_refresh_lock(
+                                    cleanup_host_refresh_lock,
+                                    reason=abandonment_reason,
+                                    primary_error=(
+                                        selected_abandonment_error
+                                    ),
+                                    message=(
+                                        "cannot abandon Claude credential "
+                                        "refresh transaction lock"
+                                    ),
+                                )
+                            )
+                        except BaseException as boundary_error:
+                            boundary_errors.append(
+                                _normalize_claude_refresh_lock_release_error(
+                                    boundary_error,
+                                    message=(
+                                        "Claude credential refresh "
+                                        "transaction abandonment helper "
+                                        "boundary failed"
+                                    ),
+                                )
+                            )
+                            selected = _primary_cleanup_error(
+                                [
+                                    abandonment_error,
+                                    *boundary_errors,
+                                ]
+                            )
+                            assert selected is not None
+                            selected_abandonment_error = selected
+                            if stateful_host_refresh_lock is not None:
+                                terminal, terminal_diagnostic = (
+                                    _claude_refresh_lock_retention_terminal(
+                                        stateful_host_refresh_lock
+                                    )
+                                )
+                                if terminal:
+                                    if terminal_diagnostic is not None:
+                                        _attach_host_refresh_lock_recovery(
+                                            selected,
+                                            terminal_diagnostic,
+                                        )
+                                    abandonment_cleanup = (
+                                        _ClaudeRefreshLockCleanupResult(
+                                            error=selected,
+                                            terminal=True,
+                                        )
+                                    )
+                                    break
+                            continue
+                        if abandonment_cleanup.terminal:
+                            break
+                        if abandonment_cleanup.error is not None:
+                            selected_abandonment_error = (
+                                abandonment_cleanup.error
+                            )
+
+                    if (
+                        abandonment_cleanup is None
+                        or not abandonment_cleanup.terminal
+                    ):
+                        if stateful_host_refresh_lock is not None:
+                            for _attempt in range(2):
+                                try:
+                                    stateful_host_refresh_lock.release()
+                                except BaseException as resume_error:
+                                    boundary_errors.append(
+                                        _normalize_claude_refresh_lock_release_error(
+                                            resume_error,
+                                            message=(
+                                                "cannot resume caller-prearmed "
+                                                "Claude credential refresh "
+                                                "transaction abandonment"
+                                            ),
+                                        )
+                                    )
+                                terminal, terminal_diagnostic = (
+                                    _claude_refresh_lock_retention_terminal(
+                                        stateful_host_refresh_lock
+                                    )
+                                )
+                                if terminal:
+                                    selected = _primary_cleanup_error(
+                                        [
+                                            abandonment_error,
+                                            *boundary_errors,
+                                        ]
+                                    )
+                                    assert selected is not None
+                                    if terminal_diagnostic is not None:
+                                        _attach_host_refresh_lock_recovery(
+                                            selected,
+                                            terminal_diagnostic,
+                                        )
+                                    abandonment_cleanup = (
+                                        _ClaudeRefreshLockCleanupResult(
+                                            error=selected,
+                                            terminal=True,
+                                        )
+                                    )
+                                    break
+                    terminal_error = (
+                        abandonment_cleanup.error
+                        if abandonment_cleanup is not None
+                        else selected_abandonment_error
+                    )
+                    if (
+                        (
+                            abandonment_cleanup is None
+                            or not abandonment_cleanup.terminal
+                        )
+                        and terminal_error is None
+                    ):
+                        terminal_error = (
+                            LinuxCredentialInspectionInconclusive(
+                                "Claude credential refresh transaction-lock "
+                                "abandonment did not reach a fail-closed "
+                                "terminal state"
+                            )
+                        )
+                    assert terminal_error is not None
+                    if retain_for_recovery:
+                        if (
+                            terminal_error is not abandonment_error
+                            and _is_control_flow_error(terminal_error)
+                        ):
+                            _add_writeback_note(
+                                terminal_error,
+                                abandonment_error,
+                            )
+                        writeback_error = terminal_error
+                    else:
+                        cleanup_error = terminal_error
+                else:
+                    host_refresh_lock_error: BaseException | None = None
+                    release_message = (
+                        "cannot release Claude credential refresh "
+                        "transaction lock"
+                    )
+                    try:
+                        host_refresh_lock_cleanup = (
+                            _release_owned_claude_refresh_lock(
+                                host_refresh_lock_owner,
+                                host_refresh_lock,
+                                message=release_message,
+                            )
+                        )
+                        host_refresh_lock_error = (
+                            host_refresh_lock_cleanup.error
+                        )
+                        if (
+                            not host_refresh_lock_cleanup.terminal
+                            and host_refresh_lock_error is None
+                        ):
+                            host_refresh_lock_error = (
+                                LinuxCredentialInspectionInconclusive(
+                                    "Claude credential refresh transaction-lock "
+                                    "cleanup did not reach a released or "
+                                    "abandoned terminal state"
+                                )
+                            )
+                    except BaseException as error:
+                        # These are deliberately the first observable cleanup
+                        # decisions after the interrupted helper boundary.
+                        cleanup_host_refresh_lock._deletion_prohibited = True
+                        cleanup_host_refresh_lock._heartbeat_stop.set()
+                        stateful_host_refresh_lock = (
+                            _stateful_claude_refresh_lock_lease(
+                                cleanup_host_refresh_lock
+                            )
+                        )
+                        if stateful_host_refresh_lock is not None:
+                            fallback_diagnostic = (
+                                stateful_host_refresh_lock.
+                                _retention_recovery_evidence
+                            )
+                            _attach_host_refresh_lock_recovery(
+                                error,
+                                fallback_diagnostic,
+                            )
+                        host_refresh_lock_cleanup = (
+                            _recover_prearmed_claude_refresh_lock_release(
+                                host_refresh_lock_owner,
+                                cleanup_host_refresh_lock,
+                                boundary_error=error,
+                                message=release_message,
+                            )
+                        )
+                        host_refresh_lock_error = (
+                            host_refresh_lock_cleanup.error
+                        )
+                    if host_refresh_lock_error is not None:
+                        writeback_error = _primary_cleanup_error(
+                            [
+                                candidate
+                                for candidate in (
+                                    writeback_error,
+                                    host_refresh_lock_error,
+                                )
+                                if candidate is not None
+                            ]
+                        )
         control_flow_error = next(
             (
                 error

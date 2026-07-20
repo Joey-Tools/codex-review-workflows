@@ -1,5 +1,6 @@
 # Codex Review Workflows Guidelines
 
+- For catalogued Claude local-login artifacts, acquire the certified host refresh locks before the first credential read and hold one transaction lease through credential exposure, runtime refresh, process or broker quiescence, final drain, and verified host commit. Release only after a safe terminal state. If quiescence or persistence is unproven, abandon the lease, retain the shared lock directories as a stale fence, report the authoritative recovery identity, and pause without Copilot fallback or automatic lock deletion. An explicit API key bypasses this local-login transaction.
 - Use `$agile-delivery-workflow` when the user explicitly asks for an MVP, early usable product, quick iteration, agile delivery, scout work, or a similar first-slice delivery.
 - Use `$review-orchestration-playbook` as the only review entrypoint for local Codex review, double/triple review, and PR readiness.
 - Treat an unverified or incomplete macOS recovery temp as cleanup-only: if it cannot be removed or safely inspected, report its exact path only as `authentication.recovery_cleanup_artifact`, never as the current `authentication.recovery_artifact`. A pre-reported macOS recovery-root cleanup scope is cleanup metadata, not a current recovery credential.

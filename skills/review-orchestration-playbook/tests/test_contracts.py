@@ -798,7 +798,9 @@ class RepositoryContractTest(unittest.TestCase):
         validate_source = inspect.getsource(
             providers._validate_claude_local_credential
         )
-        macos_runtime_source = inspect.getsource(providers._claude_keychain_runtime)
+        macos_runtime_source = inspect.getsource(
+            providers._claude_keychain_runtime
+        ) + inspect.getsource(providers._claude_keychain_runtime_coordinated)
         macos_persist_source = inspect.getsource(
             providers._persist_claude_macos_refreshed_credential
         ) + inspect.getsource(
