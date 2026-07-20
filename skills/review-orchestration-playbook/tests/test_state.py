@@ -17,7 +17,7 @@ from unittest import mock
 SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from review_runtime import cleanup_worker, state  # noqa: E402
+from review_runtime import cleanup_worker, providers, state  # noqa: E402
 from review_runtime.common import (  # noqa: E402
     ReviewError,
     read_json,
@@ -116,18 +116,37 @@ class StatefulLifecycleTest(unittest.TestCase):
         (state_dir / state.EXIT_FILE).write_text("0\n", encoding="utf-8")
         (state_dir / "final.txt").write_text("No findings.\n", encoding="utf-8")
 
-    def test_claude_redactions_include_explicit_auth_and_proxy_transport(self) -> None:
+    def test_claude_redactions_include_auth_and_credential_proxy_transport(
+        self,
+    ) -> None:
+        credential_proxy = (
+            "http://reviewer:proxy-secret@proxy.example.invalid:8080/route"
+        )
         values = state._freeze_claude_redactions(
             {
                 "ANTHROPIC_API_KEY": "alpha",
                 "CLAUDE_CODE_OAUTH_TOKEN": "omega",
-                "HTTPS_PROXY": "http://proxy.example.invalid:8080",
+                "HTTPS_PROXY": credential_proxy,
+                "HTTP_PROXY": "http://proxy.example.invalid:8080",
+                "NO_PROXY": "*",
             }
         )
 
         self.assertEqual(
             set(values),
-            {"alpha", "omega", "http://proxy.example.invalid:8080"},
+            {"alpha", "omega", credential_proxy},
+        )
+        self.assertEqual(
+            values,
+            providers.claude_output_redact_values(
+                {
+                    "ANTHROPIC_API_KEY": "alpha",
+                    "CLAUDE_CODE_OAUTH_TOKEN": "omega",
+                    "HTTPS_PROXY": credential_proxy,
+                    "HTTP_PROXY": "http://proxy.example.invalid:8080",
+                    "NO_PROXY": "*",
+                }
+            ),
         )
 
     def test_start_passes_include_source_wip_to_workspace_preparation(self) -> None:

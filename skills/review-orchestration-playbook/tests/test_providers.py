@@ -1960,7 +1960,10 @@ class ProviderPolicyTest(unittest.TestCase):
     @mock.patch.object(
         providers,
         "child_environment",
-        return_value={"HOME": "/Users/reviewer"},
+        return_value={
+            "HOME": "/Users/reviewer",
+            "XDG_CONFIG_HOME": "/outside/real-home/config",
+        },
     )
     @mock.patch.object(
         providers,
@@ -2004,6 +2007,7 @@ class ProviderPolicyTest(unittest.TestCase):
             "ANTHROPIC_API_KEY",
             claude_attempt.call_args.kwargs["env"],
         )
+        self.assertNotIn("XDG_CONFIG_HOME", claude_attempt.call_args.kwargs["env"])
         copilot_attempt.assert_not_called()
 
     @mock.patch.object(providers, "child_environment", return_value={})
@@ -4300,6 +4304,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 "ANTHROPIC_API_KEY": "alpha",
                 "CLAUDE_CODE_OAUTH_TOKEN": "omega",
                 "HTTPS_PROXY": "http://proxy.example.invalid:8080",
+                "NO_PROXY": "*",
                 "HOME": str(self.claude_pwd_home),
             }
         )
@@ -4308,9 +4313,10 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", selected)
         self.assertEqual(
             redact_values,
-            ("alpha", "omega", "http://proxy.example.invalid:8080"),
+            ("alpha", "omega"),
         )
         self.assertEqual(selected["HTTPS_PROXY"], "http://proxy.example.invalid:8080")
+        self.assertEqual(selected["NO_PROXY"], "*")
         self.assertEqual(providers._claude_authentication_source(selected), "api-key")
 
         selected, redact_values = providers._select_claude_authentication(
@@ -4335,6 +4341,29 @@ class ProviderPolicyTest(unittest.TestCase):
             providers._claude_authentication_source(selected),
             "local-login",
         )
+
+    def test_claude_output_redaction_only_includes_credential_proxy_urls(self) -> None:
+        credential_proxy = (
+            "http://reviewer:proxy-secret@proxy.example.invalid:8080/route"
+        )
+        values = providers.claude_output_redact_values(
+            {
+                "HTTPS_PROXY": credential_proxy,
+                "HTTP_PROXY": "http://proxy.example.invalid:8080",
+                "NO_PROXY": "*",
+                "no_proxy": "e",
+            }
+        )
+
+        self.assertEqual(values, (credential_proxy,))
+        variants = common.output_redact_values(values)
+        self.assertIn(credential_proxy, variants)
+        self.assertIn(
+            json.dumps(credential_proxy, ensure_ascii=True)[1:-1],
+            variants,
+        )
+        self.assertNotIn("*", variants)
+        self.assertNotIn("e", variants)
 
     @mock.patch.object(providers, "_run_review_impl")
     @mock.patch.object(providers, "_review_environment")
@@ -4527,6 +4556,39 @@ class ProviderPolicyTest(unittest.TestCase):
                 requested_model="claude-opus-4-8",
                 authentication=auth,
             )[2]
+        )
+
+    def test_claude_stream_parser_does_not_materialize_the_event_iterable(self) -> None:
+        auth = providers.ClaudeAuthenticationEvidence(
+            requested_source="local-login",
+            api_provider="firstParty",
+            auth_method="claude.ai",
+            api_key_source=None,
+        )
+        events = providers._strict_jsonl_objects(claude_stream_fixture(self.review))
+        assert events is not None
+
+        class SinglePassEvents:
+            def __init__(self) -> None:
+                self._events = iter(events)
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                return next(self._events)
+
+            def __length_hint__(self) -> int:
+                raise AssertionError("Claude stream events must not be materialized")
+
+        self.assertEqual(
+            providers._parse_claude_stream_objects(
+                SinglePassEvents(),
+                review=self.review,
+                requested_model="claude-opus-4-8",
+                authentication=auth,
+            ),
+            ("No findings.", "claude-opus-4-8", True),
         )
 
     def test_claude_stream_rejects_duplicate_or_misordered_contract_events(

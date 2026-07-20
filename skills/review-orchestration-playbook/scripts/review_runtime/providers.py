@@ -9,7 +9,7 @@ import stat
 import sys
 import tempfile
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 from .claude_capabilities import (
     CLAUDE_REQUIRED_OPTIONS,
@@ -178,6 +178,14 @@ CLAUDE_PROXY_ENV_KEYS = (
     "https_proxy",
     "http_proxy",
     "no_proxy",
+)
+CLAUDE_PROXY_URL_ENV_KEYS = (
+    "ALL_PROXY",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "all_proxy",
+    "https_proxy",
+    "http_proxy",
 )
 CLAUDE_MODEL_SECRET_ENV_KEYS = (
     *CLAUDE_EXPLICIT_AUTH_ENV_KEYS,
@@ -673,18 +681,39 @@ def _review_scope_metadata(review: ReviewWorkspace) -> dict[str, str]:
     }
 
 
+def _proxy_url_has_userinfo(value: str) -> bool:
+    candidate = value.strip()
+    if not candidate:
+        return False
+    _scheme, separator, remainder = candidate.partition("://")
+    authority = remainder if separator else candidate
+    for delimiter in ("/", "?", "#"):
+        authority = authority.partition(delimiter)[0]
+    userinfo, separator, _host = authority.rpartition("@")
+    return bool(separator and userinfo)
+
+
+def claude_output_redact_values(environment: Mapping[str, str]) -> tuple[str, ...]:
+    """Select credentials that are safe to replace globally in Claude output."""
+    values = [
+        value
+        for key in CLAUDE_EXPLICIT_AUTH_ENV_KEYS
+        if (value := environment.get(key))
+    ]
+    values.extend(
+        value
+        for key in CLAUDE_PROXY_URL_ENV_KEYS
+        if (value := environment.get(key)) and _proxy_url_has_userinfo(value)
+    )
+    return tuple(dict.fromkeys(values))
+
+
 def _select_claude_authentication(
     env: dict[str, str],
 ) -> tuple[dict[str, str], tuple[str, ...]]:
     """Opaque-forward one explicit credential and redact its transport."""
     selected = dict(env)
-    redact_values = tuple(
-        dict.fromkeys(
-            value
-            for key in CLAUDE_MODEL_SECRET_ENV_KEYS
-            if (value := selected.get(key))
-        )
-    )
+    redact_values = claude_output_redact_values(selected)
     if selected.get("ANTHROPIC_API_KEY"):
         selected.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
     elif selected.get("CLAUDE_CODE_OAUTH_TOKEN"):
@@ -1408,31 +1437,40 @@ def _parse_claude_stream_objects(
     requested_model: str,
     authentication: ClaudeAuthenticationEvidence,
 ) -> tuple[str | None, str | None, bool]:
-    materialized = list(objects)
-    if len(materialized) < 2:
+    init_event: tuple[int, dict[str, Any]] | None = None
+    result_event: tuple[int, dict[str, Any]] | None = None
+    init_count = 0
+    result_count = 0
+    last_index = -1
+    structured_error = False
+    for index, item in enumerate(objects):
+        last_index = index
+        if item.get("type") == "system" and item.get("subtype") == "init":
+            init_count += 1
+            if init_event is None:
+                init_event = (index, item)
+        if item.get("type") == "result":
+            result_count += 1
+            if result_event is None:
+                result_event = (index, item)
+        structured_error = structured_error or bool(_structured_error_item_text(item))
+    if last_index < 1 or init_event is None or result_event is None:
         return None, None, False
-    init_events = [
-        item
-        for item in materialized
-        if item.get("type") == "system" and item.get("subtype") == "init"
-    ]
-    result_events = [item for item in materialized if item.get("type") == "result"]
     if (
-        len(init_events) != 1
-        or init_events[0] is not materialized[0]
-        or len(result_events) != 1
-        or result_events[0] is not materialized[-1]
+        init_count != 1
+        or init_event[0] != 0
+        or result_count != 1
+        or result_event[0] != last_index
     ):
         return None, None, False
     init_matches = _claude_init_contract_matches(
-        init_events[0],
+        init_event[1],
         review=review,
         requested_model=requested_model,
         authentication=authentication,
     )
-    structured_error = any(_structured_error_item_text(item) for item in materialized)
     final_text, effective_model = _parse_claude_result_object(
-        result_events[0],
+        result_event[1],
         requested_model=requested_model,
         structured_error=structured_error,
     )
@@ -2087,6 +2125,7 @@ def _resolve_validated_claude_executable(
             raise ClaudeExecutableInspectionInconclusive(str(error)) from error
     prepared_env = dict(env)
     prepared_env["HOME"] = str(_claude_pwd_home())
+    prepared_env.pop("XDG_CONFIG_HOME", None)
     claude_tmp = review.container_dir / "tmp"
     claude_tmp.mkdir(parents=True, exist_ok=True)
     prepared_env["TMPDIR"] = str(claude_tmp)

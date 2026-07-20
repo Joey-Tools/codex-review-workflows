@@ -359,6 +359,55 @@ class WorkspaceTest(unittest.TestCase):
         self.assertIn("Content variant: source-wip", prompt)
         self.assertIn("not an exact committed range", prompt)
 
+    def test_wip_case_only_rename_does_not_capture_deleted_alias(self) -> None:
+        original_path = pathlib.PurePosixPath("example.txt")
+        renamed_path = pathlib.PurePosixPath("EXAMPLE.txt")
+        git(self.repo, "mv", original_path.as_posix(), renamed_path.as_posix())
+        (self.repo / renamed_path).write_text("case-only rename\n", encoding="utf-8")
+        original_read = workspace_runtime._read_wip_entry
+        aliased_source_reads = 0
+
+        def emulate_case_insensitive_source(**kwargs):
+            nonlocal aliased_source_reads
+            if (
+                kwargs["source_root"] == self.repo
+                and kwargs["relative"] == original_path
+            ):
+                aliased_source_reads += 1
+                kwargs["relative"] = renamed_path
+            return original_read(**kwargs)
+
+        with mock.patch.object(
+            workspace_runtime,
+            "_read_wip_entry",
+            side_effect=emulate_case_insensitive_source,
+        ):
+            review = prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+                include_source_wip=True,
+            )
+        self.reviews.append(review)
+
+        tree_paths = set(
+            git(
+                review.workspace_root,
+                "ls-tree",
+                "-r",
+                "--name-only",
+                review.snapshot_tree_sha,
+            ).splitlines()
+        )
+        self.assertEqual(aliased_source_reads, 0)
+        self.assertNotIn(original_path.as_posix(), tree_paths)
+        self.assertIn(renamed_path.as_posix(), tree_paths)
+        self.assertEqual(
+            (review.workspace_root / renamed_path).read_text(encoding="utf-8"),
+            "case-only rename\n",
+        )
+        validate_external_workspace(review)
+
     def test_wip_requires_source_head_to_match_review_head(self) -> None:
         (self.repo / "example.txt").write_text("dirty\n", encoding="utf-8")
 

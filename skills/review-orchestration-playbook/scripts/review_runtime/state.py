@@ -35,7 +35,7 @@ from .common import (
     write_json,
     write_text_atomic,
 )
-from .providers import run_review
+from .providers import claude_output_redact_values, run_review
 from .workspace import (
     MAX_PREFLIGHT_JSON_BYTES,
     REVIEW_CONTAINER_PATTERN,
@@ -62,18 +62,6 @@ PRIMARY_DIFF_RELATIVE_PATH = ".codex-review/review.diff"
 SAFE_LEGACY_LOCK_MODES = frozenset({0o600, 0o604, 0o640, 0o644})
 PRIVATE_STATE_LEGACY_LOCK_MODES = SAFE_LEGACY_LOCK_MODES | {0o664}
 _STARTED_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
-_CLAUDE_REDACTION_ENV_KEYS = (
-    "ANTHROPIC_API_KEY",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "ALL_PROXY",
-    "HTTPS_PROXY",
-    "HTTP_PROXY",
-    "NO_PROXY",
-    "all_proxy",
-    "https_proxy",
-    "http_proxy",
-    "no_proxy",
-)
 _STATE_OWNED_TEXT_ARTIFACTS = (
     STATE_MARKER,
     STATE_FILE,
@@ -121,10 +109,7 @@ def _freeze_claude_redactions(
     environment: Mapping[str, str] | None = None,
 ) -> tuple[str, ...]:
     source = os.environ if environment is None else environment
-    values = {
-        value for key in _CLAUDE_REDACTION_ENV_KEYS if (value := source.get(key, ""))
-    }
-    return tuple(sorted(values, key=lambda value: (-len(value), value)))
+    return claude_output_redact_values(source)
 
 
 def _redact_claude_text(text: str, redact_values: tuple[str, ...]) -> str:

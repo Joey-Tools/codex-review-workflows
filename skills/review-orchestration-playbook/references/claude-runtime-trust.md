@@ -62,7 +62,7 @@ Submodules stay uninitialized and unfetched. Missing objects, unsafe links, conf
 
 ## Real HOME And Read-Only Model Tools
 
-After provenance and capability validation, the ordinary Claude CLI receives the current account's real home resolved from the operating-system account database. Caller-controlled `HOME` does not select it. The CLI may use supported local authentication and configuration from that home and may refresh ordinary login through Claude Code's own implementation.
+After provenance and capability validation, the ordinary Claude CLI receives the current account's real home resolved from the operating-system account database. Caller-controlled `HOME` does not select it, and inherited `XDG_CONFIG_HOME` is removed so alternate config discovery cannot escape the real-HOME boundary. The CLI may use supported local authentication and configuration from that home and may refresh ordinary login through Claude Code's own implementation.
 
 The final command uses Claude `dontAsk` mode and exposes only:
 
@@ -91,7 +91,7 @@ The caller environment is frozen once and reduced to exactly one selected explic
 2. otherwise non-empty `CLAUDE_CODE_OAUTH_TOKEN` wins;
 3. otherwise Claude Code uses ordinary local login from real HOME.
 
-Both explicit values and inherited proxy values are included in parent-side redaction inputs, but only the winning explicit variable enters the Claude control plane. The helper necessarily tests whether each explicit value is non-empty and copies the winner into the child environment as an opaque string; it never interprets the value as a credential. Raw values plus their JSON-escaped, Unicode-escaped, `repr`, and `ascii` output forms are redacted before streamed stdout/stderr reach disk. Authentication and proxy variables are requested removed from sandboxed Bash environments.
+Both explicit values and inherited credential-bearing proxy URLs are included in parent-side redaction inputs, but only the winning explicit variable enters the Claude control plane. Routing-only proxy endpoints and `NO_PROXY` values are not safe global replacement strings and are excluded from output redaction. The helper necessarily tests whether each explicit value is non-empty and copies the winner into the child environment as an opaque string; it never interprets the value as a credential. Raw values plus their JSON-escaped, Unicode-escaped, `repr`, and `ascii` output forms are redacted before streamed stdout/stderr reach disk. Authentication and all proxy variables remain requested removed from sandboxed Bash environments.
 
 The helper never:
 
@@ -112,13 +112,13 @@ A launched explicit API key, explicit OAuth token, or local login that Claude re
 
 ## Network And TLS
 
-The Claude control plane inherits the helper's standard proxy and CA environment so an ordinary supported installation can reach Anthropic through the user's configured network. The helper does not build a separate CONNECT proxy or copy CA material for the final review. Proxy values are included in parent-side output redaction and are requested removed from sandboxed Bash environments. Web tools are disabled; any Bash network attempt remains subject to `dontAsk` permission handling and the requested native-sandbox policy. Network, proxy, TLS, or routing failure never becomes authentication or entitlement evidence. Credential-free version/help bootstrap probes remain wrapped by the existing host probe sandbox; the authenticated, model-backed review itself launches the verified Claude executable directly.
+The Claude control plane inherits the helper's standard proxy and CA environment so an ordinary supported installation can reach Anthropic through the user's configured network. The helper does not build a separate CONNECT proxy or copy CA material for the final review. Credential-bearing proxy URLs are included in parent-side output redaction; routing-only proxy endpoints and `NO_PROXY` values are not globally replaced. All proxy variables are requested removed from sandboxed Bash environments. Web tools are disabled; any Bash network attempt remains subject to `dontAsk` permission handling and the requested native-sandbox policy. Network, proxy, TLS, or routing failure never becomes authentication or entitlement evidence. Credential-free version/help bootstrap probes remain wrapped by the existing host probe sandbox; the authenticated, model-backed review itself launches the verified Claude executable directly.
 
 ## Capability And Output Verification
 
 Credential-free capability probes verify the exact public flags the helper invokes and the accepted release's documented safe-mode/`dontAsk` contract, including tool visibility, setting-source suppression, streaming structured output, requested model, effort request, and session/export controls. The inline sandbox settings are requested fail-closed on the actual launch; no separate model-backed behavioral probe is claimed.
 
-Claude output is accepted only as strict JSONL with one `system/init` event first and one terminal result last. Duplicate/misordered contract events, duplicate JSON keys, non-standard constants, malformed errors, partial result text attached to errors, missing model evidence, model substitution, permission-mode changes, tool widening, or authentication-indicator changes fail closed. Additive non-security init metadata is ignored. The requested effort is recorded, but current Claude output does not provide an independently verified effective-effort field. Repository-controlled output never supplies authentication, entitlement, runtime-availability, or fallback evidence.
+Claude output is accepted only as strict JSONL with one `system/init` event first and one terminal result last. The bounded file is consumed in one pass while retaining only the two contract events and aggregate error state; a large number of small records cannot expand into an unbounded in-memory event list. Duplicate/misordered contract events, duplicate JSON keys, non-standard constants, malformed errors, partial result text attached to errors, missing model evidence, model substitution, permission-mode changes, tool widening, or authentication-indicator changes fail closed. Additive non-security init metadata is ignored. The requested effort is recorded, but current Claude output does not provide an independently verified effective-effort field. Repository-controlled output never supplies authentication, entitlement, runtime-availability, or fallback evidence.
 
 All launches use finite deadlines, bounded stdout/stderr artifacts, process containment, signal forwarding, descendant cleanup, and post-quiescence artifact checks. Timeout, overflow, drain failure, retained descendants, or missing terminal output is `inconclusive`.
 

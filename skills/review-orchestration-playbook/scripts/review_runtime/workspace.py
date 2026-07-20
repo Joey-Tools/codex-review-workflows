@@ -6542,7 +6542,7 @@ def _source_wip_paths(
     repo: pathlib.Path,
     head_sha: str,
     initial_status: bytes,
-) -> set[pathlib.PurePosixPath]:
+) -> tuple[set[pathlib.PurePosixPath], set[pathlib.PurePosixPath]]:
     _reject_hidden_index_entries(repo)
     tracked = _bounded_source_git_output(
         repo,
@@ -6560,11 +6560,34 @@ def _source_wip_paths(
         label="source WIP tracked paths",
     )
     tracked_paths = _nul_path_set(tracked, label="source WIP tracked paths")
+    deleted = _bounded_source_git_output(
+        repo,
+        "diff",
+        "--name-only",
+        "-z",
+        "--no-renames",
+        "--diff-filter=D",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--ignore-submodules=none",
+        head_sha,
+        "--",
+        byte_limit=MAX_SOURCE_TRACKED_PATH_BYTES,
+        record_limit=MAX_SOURCE_TRACKED_PATH_RECORDS,
+        label="source WIP deleted tracked paths",
+    )
+    deleted_paths = _nul_path_set(
+        deleted,
+        label="source WIP deleted tracked paths",
+    )
+    if not deleted_paths.issubset(tracked_paths):
+        raise ReviewError("source WIP tracked path metadata is inconsistent")
     untracked_paths = _initial_untracked_wip_paths(initial_status)
     paths = tracked_paths | untracked_paths
     if len(paths) > MAX_CHANGED_ENTRIES:
         raise ReviewError("source WIP exceeds the review entry-count limit")
-    return paths
+    capture_paths = (tracked_paths - deleted_paths) | untracked_paths
+    return paths, capture_paths
 
 
 def _read_wip_entry(
@@ -6734,6 +6757,7 @@ def _overlay_source_wip(
     head_sha: str,
     initial_status: bytes,
     paths: set[pathlib.PurePosixPath],
+    capture_paths: set[pathlib.PurePosixPath],
     entries: dict[pathlib.PurePosixPath, tuple[str, bytes]],
 ) -> str:
     for relative in sorted(paths, key=lambda item: len(item.parts), reverse=True):
@@ -6776,11 +6800,8 @@ def _overlay_source_wip(
     )
     if resolve_commit(source_root, "HEAD", label="source WIP HEAD") != head_sha:
         raise ReviewError("source HEAD changed while the WIP snapshot was prepared")
-    final_status = _source_status(source_root)
-    if final_status != initial_status:
-        raise ReviewError("source WIP changed while the review snapshot was prepared")
     recheck_remaining_bytes = MAX_SNAPSHOT_BYTES
-    for relative in sorted(paths, key=lambda item: item.as_posix()):
+    for relative in sorted(capture_paths, key=lambda item: item.as_posix()):
         rechecked = _read_wip_entry(
             source_root=source_root,
             relative=relative,
@@ -6792,6 +6813,9 @@ def _overlay_source_wip(
             )
         if rechecked is not None:
             recheck_remaining_bytes -= len(rechecked[1])
+    final_status = _source_status(source_root)
+    if final_status != initial_status:
+        raise ReviewError("source WIP changed while the review snapshot was prepared")
     return snapshot_tree_sha
 
 
@@ -7149,14 +7173,14 @@ def prepare_workspace(
             )
         source_status = _source_status(source_root)
         _parse_wip_status(source_status)
-        source_wip_paths = _source_wip_paths(
+        source_wip_paths, source_wip_capture_paths = _source_wip_paths(
             source_root,
             head_sha,
             source_status,
         )
         source_wip_entries = _capture_source_wip_entries(
             source_root=source_root,
-            paths=source_wip_paths,
+            paths=source_wip_capture_paths,
         )
         if resolve_commit(source_root, "HEAD", label="source WIP HEAD") != head_sha:
             raise ReviewError("source HEAD changed while the WIP snapshot was captured")
@@ -7166,6 +7190,7 @@ def prepare_workspace(
         _require_clean_source(source_root)
         source_status = b""
         source_wip_paths = set()
+        source_wip_capture_paths = set()
         source_wip_entries = {}
     catalog = load_catalog()
     validate_authoring_catalog_scanner_contract(catalog)
@@ -7247,6 +7272,7 @@ def prepare_workspace(
                 head_sha=head_sha,
                 initial_status=source_status,
                 paths=source_wip_paths,
+                capture_paths=source_wip_capture_paths,
                 entries=source_wip_entries,
             )
             content_variant = "source-wip"
