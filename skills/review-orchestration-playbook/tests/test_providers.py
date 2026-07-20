@@ -1750,23 +1750,29 @@ class ProviderPolicyTest(unittest.TestCase):
             providers.CODEX_ENV_KEYS,
         )
 
-    def test_prompt_projects_default_paths_to_host_absolutes(self) -> None:
+    def test_prompt_keeps_paths_within_workspace_read_rules(self) -> None:
         default_prompt = (
             b"- Workspace: .\n- Primary diff file: .codex-review/review.diff\n"
         )
+        absolute_prompt = (
+            b"- Workspace: "
+            + str(self.review.workspace_root).encode()
+            + b"\n- Primary diff file: "
+            + str(self.review.diff_file).encode()
+            + b"\n"
+        )
 
-        projected = providers._claude_review_prompt(
-            self.review,
+        self.assertEqual(
+            providers._claude_review_prompt(self.review, default_prompt),
+            default_prompt,
+        )
+        self.assertEqual(
+            providers._claude_review_prompt(self.review, absolute_prompt),
             default_prompt,
         )
 
-        self.assertIn(str(self.review.workspace_root).encode(), projected)
-        self.assertIn(str(self.review.diff_file).encode(), projected)
-        self.assertNotIn(b"Linux/WSL2 runtime tool boundary", projected)
-
     def test_prompt_projection_rechecks_size_limit(self) -> None:
-        prefix = b"- Workspace: .\n"
-        prompt = prefix + b"x" * (providers.MAX_REVIEW_PROMPT_BYTES - len(prefix))
+        prompt = b"x" * (providers.MAX_REVIEW_PROMPT_BYTES + 1)
         with self.assertRaisesRegex(ReviewError, "projected review prompt exceeds"):
             providers._claude_review_prompt(
                 self.review,

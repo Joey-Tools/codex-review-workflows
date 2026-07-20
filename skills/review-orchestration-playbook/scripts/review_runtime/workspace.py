@@ -1605,6 +1605,69 @@ def _create_detached_worktree(
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
         raise ReviewError("detached review worktree .git control is not a private file")
     git_pointer.chmod(0o600)
+    _ensure_detached_worktree_refs(
+        git_dir=git_dir,
+        workspace_root=workspace_root,
+    )
+
+
+def _ensure_detached_worktree_refs(
+    *,
+    git_dir: pathlib.Path,
+    workspace_root: pathlib.Path,
+) -> None:
+    refs_dir = git_dir / "worktrees" / workspace_root.name / "refs"
+    try:
+        refs_dir.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    except OSError as error:
+        raise ReviewError(
+            "cannot create detached review worktree refs directory"
+        ) from error
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    no_follow_flag = getattr(os, "O_NOFOLLOW", None)
+    if directory_flag is None or no_follow_flag is None:
+        raise ReviewError(
+            "host cannot securely inspect detached review worktree refs directory"
+        )
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | directory_flag | no_follow_flag
+    try:
+        descriptor = os.open(refs_dir, flags)
+    except OSError as error:
+        raise ReviewError(
+            "cannot securely open detached review worktree refs directory"
+        ) from error
+    try:
+        opened = os.fstat(descriptor)
+        current = os.lstat(refs_dir)
+        identity = (opened.st_dev, opened.st_ino, opened.st_uid)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or identity != (current.st_dev, current.st_ino, current.st_uid)
+        ):
+            raise ReviewError("detached review worktree refs directory is unsafe")
+        os.fchmod(descriptor, 0o700)
+        hardened = os.fstat(descriptor)
+        current = os.lstat(refs_dir)
+        if (
+            (hardened.st_dev, hardened.st_ino, hardened.st_uid) != identity
+            or (current.st_dev, current.st_ino, current.st_uid) != identity
+            or stat.S_IMODE(hardened.st_mode) != 0o700
+            or stat.S_IMODE(current.st_mode) != 0o700
+        ):
+            raise ReviewError(
+                "detached review worktree refs directory changed while hardening"
+            )
+    except ReviewError:
+        raise
+    except OSError as error:
+        raise ReviewError(
+            "cannot harden detached review worktree refs directory"
+        ) from error
+    finally:
+        os.close(descriptor)
 
 
 def _frozen_command(

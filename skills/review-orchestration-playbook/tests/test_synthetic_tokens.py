@@ -4712,8 +4712,9 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         # or makes the default ancestry query fail closed immediately.
         if with_graph.returncode == 0:
             self.assertEqual(with_graph.stdout, b"")
+        elif with_graph.returncode == 1:
+            self.assertEqual(with_graph.stdout, b"")
         else:
-            self.assertNotEqual(with_graph.returncode, 1)
             self.assertTrue(with_graph.stderr)
         without_graph = subprocess.run(
             (

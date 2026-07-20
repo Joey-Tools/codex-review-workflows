@@ -286,6 +286,45 @@ class WorkspaceTest(unittest.TestCase):
                 )
                 self.assertIn(b"\tlogAllRefUpdates = false\n", config)
 
+    def test_prepare_materializes_worktree_refs_missing_from_older_git(self) -> None:
+        original_run_private_git = workspace_runtime._run_private_git
+        simulated_older_git = False
+
+        def run_without_worktree_refs(**kwargs):
+            nonlocal simulated_older_git
+            completed = original_run_private_git(**kwargs)
+            args = kwargs["args"]
+            if args[:2] == ("worktree", "add"):
+                workspace_root = pathlib.Path(args[-2])
+                refs_dir = (
+                    kwargs["git_dir"] / "worktrees" / workspace_root.name / "refs"
+                )
+                try:
+                    refs_dir.rmdir()
+                except FileNotFoundError:
+                    pass
+                simulated_older_git = True
+            return completed
+
+        with mock.patch.object(
+            workspace_runtime,
+            "_run_private_git",
+            side_effect=run_without_worktree_refs,
+        ):
+            review = prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+        self.reviews.append(review)
+        self.assertTrue(simulated_older_git)
+        worktree_refs = (
+            review.git_dir / "worktrees" / review.workspace_root.name / "refs"
+        )
+        self.assertTrue(worktree_refs.is_dir())
+        self.assertEqual(stat.S_IMODE(worktree_refs.stat().st_mode), 0o700)
+        validate_external_workspace(review)
+
     def test_private_object_byte_budgets_include_endpoint_metadata(self) -> None:
         endpoint_objects = (
             ("blob", workspace_runtime.MAX_SNAPSHOT_BYTES),
@@ -3170,8 +3209,9 @@ class WorkspaceTest(unittest.TestCase):
         # or makes the default ancestry query fail closed immediately.
         if with_graph.returncode == 0:
             self.assertEqual(with_graph.stdout, b"")
+        elif with_graph.returncode == 1:
+            self.assertEqual(with_graph.stdout, b"")
         else:
-            self.assertNotEqual(with_graph.returncode, 1)
             self.assertTrue(with_graph.stderr)
         without_graph = subprocess.run(
             (

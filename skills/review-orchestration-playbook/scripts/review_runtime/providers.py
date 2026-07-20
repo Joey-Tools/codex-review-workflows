@@ -2688,11 +2688,11 @@ def _claude_review_prompt(
     workspace = str(review.workspace_root).encode("utf-8")
     diff_file = str(review.diff_file).encode("utf-8")
     projected = prompt.replace(
-        b"- Workspace: .\n",
-        b"- Workspace: " + workspace + b"\n",
+        diff_file,
+        b".codex-review/review.diff",
     ).replace(
-        b"- Primary diff file: .codex-review/review.diff\n",
-        b"- Primary diff file: " + diff_file + b"\n",
+        workspace,
+        b".",
     )
     if len(projected) > MAX_REVIEW_PROMPT_BYTES:
         raise ReviewError(
