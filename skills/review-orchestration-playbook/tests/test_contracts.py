@@ -1227,6 +1227,10 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("codex exec --ephemeral", readiness_active)
         self.assertNotIn("codex exec --ephemeral", contracts_active)
         self.assertNotIn("Parent-Process Output Budget", contracts_active)
+        self.assertIn("## Clean-Context Codex Fallback", contracts_active)
+        self.assertIn("same shared cleanup lease", contracts_active)
+        self.assertIn("complete streaming SHA-256 check", contracts_active)
+        self.assertNotIn("## Clean-Context Codex Fallback", contracts_deferred)
         self.assertIn("codex exec --ephemeral", readiness_deferred)
         self.assertIn("codex exec --ephemeral", contracts_deferred)
         self.assertLess(
