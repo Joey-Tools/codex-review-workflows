@@ -21,6 +21,14 @@ Use this contract for helper-backed review, a clean-context `reviewer` fallback,
 - If there are no actionable findings, reply exactly `No findings.`
 - Intermediate reasoning, file reads, progress, and keepalives are not final artifacts.
 
+## Active PR Readiness Codex Lane
+
+PR readiness reuses the fresh stateful helper-backed local Codex artifact for the exact frozen range. That process is the single independent local Codex lane. Helper retries and the clean-context fallback are implementations of the same lane. Do not require or launch a second offline, detached-worktree, or ephemeral Codex process merely to create another PR-readiness gate. Double review adds one Claude-family lane; triple review adds that lane plus current-head GitHub Codex when supported. The separate exact-secret admission result may block `merge-ready`, but a violation or inconclusive count never invalidates or suppresses this trusted reviewer lane.
+
+## Deferred Detached-Worktree Design Record
+
+The paragraphs below preserve the previously drafted detached-worktree/supervisor design for the later workspace decision. They are not active gates in the current workflow.
+
 ## Parent-Process Output Budget
 
 - Measure the 30-second supervisor exec/ownership handoff, 10-minute checkout, 30-second reviewer launch, and 30-minute reviewer-runtime deadlines with one host monotonic clock per stage; each deadline is distinct, begins only when its stage starts, and wall-clock changes never extend it.
@@ -98,8 +106,6 @@ The independent prompt binds the frozen range, preflight-attested length and SHA
 ## Clean-Context Codex Fallback
 
 If the helper-backed Codex reviewer runtime is deterministically unavailable after the helper has written a matching successful `preflight.json`, `stateful final` retains the immutable frozen workspace and reports it through `fallback_workspace_retained`. That flag is a bounded metadata-eligibility result, not a full content-digest result: `stateful status`, `wait`, and `final` must not synchronously hash the potentially 128 MiB primary diff. Before exposing any diff byte to the fallback reviewer, the parent must take the same shared cleanup lease, open the source no-follow, and supervise a complete streaming SHA-256 check against both the preflight and control attestations under its own bounded deadline; keep source custody through the reviewer read or seal an independently reverified private copy first. Use only that verified retained scope with the `reviewer` agent and the complete diff/evidence and output contracts, then run `stateful cleanup --state-dir <dir>`. If the helper cannot complete that preflight or the supervised digest is not exact, stop instead of bypassing it. The fallback's pinned configuration is `gpt-5.6-sol` with `xhigh`. Do not use an inherited-context/default coding agent. A `gpt-5.5` fallback is allowed only after explicit model entitlement/policy denial.
-
-## PR Readiness Codex Gates
 
 `independent-codex-pr-review` is a fresh ephemeral Codex CLI review-only process, separate from the helper. Launch it only after the offline helper has retained successful matching preflight evidence for the same frozen range and the preflight-attested primary diff has been sealed as `.codex-review/review.diff` inside the raw detached checkout. Its prompt must identify the parent PR readiness workflow, bind the exact PR/range/diff length/digest, include every rule in **Scope And Evidence Budget** and **Parent-Process Output Budget**, preserve normal user and tracked project instruction loading, make the sealed synthetic file its complete primary diff, forbid outside-checkout reads, and forbid PR actions, fixes, other reviewers, and CI waiting. Only its validated sealed final artifact is review evidence.
 

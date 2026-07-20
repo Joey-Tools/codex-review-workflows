@@ -65,8 +65,8 @@ def _add_review_arguments(parser: argparse.ArgumentParser) -> None:
         action="append",
         default=[],
         help=(
-            "Select one helper-defined legacy synthetic fixture envelope. "
-            "Repeat for multiple envelopes."
+            "Deprecated compatibility option. Known legacy IDs are validated, "
+            "but selection no longer changes secret-delta admission."
         ),
     )
 

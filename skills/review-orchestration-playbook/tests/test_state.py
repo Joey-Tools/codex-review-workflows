@@ -764,7 +764,7 @@ class StatefulLifecycleTest(unittest.TestCase):
 
         preflight_path = self.review.container_dir / "preflight.json"
         preflight = state.read_json(preflight_path)
-        preflight["status"] = "secret-delta and escaping-symlink checks passed"
+        preflight["status"] = "review workspace containment and integrity checks passed"
         write_json(preflight_path, preflight)
         self.assertFalse(
             state.status(self.review.container_dir)["fallback_workspace_retained"]
@@ -929,7 +929,7 @@ class StatefulLifecycleTest(unittest.TestCase):
         evidence: dict[str, object] = {
             "private_artifacts": "removed",
             "review_range": f"{self.base}..{self.head}",
-            "status": "secret-delta and escaping-symlink checks passed",
+            "status": "review workspace containment and integrity checks passed",
         }
         if primary_diff is not None:
             evidence["primary_diff"] = primary_diff
@@ -1029,7 +1029,7 @@ class StatefulLifecycleTest(unittest.TestCase):
         evidence: dict[str, object] = {
             "private_artifacts": "removed",
             "review_range": f"{self.base}..{self.head}",
-            "status": "secret-delta and escaping-symlink checks passed",
+            "status": "review workspace containment and integrity checks passed",
             "primary_diff": self.primary_diff_attestation(),
             "padding": "",
         }
@@ -1069,7 +1069,7 @@ class StatefulLifecycleTest(unittest.TestCase):
         evidence: dict[str, object] = {
             "private_artifacts": "removed",
             "review_range": f"{self.base}..{self.head}",
-            "status": "secret-delta and escaping-symlink checks passed",
+            "status": "review workspace containment and integrity checks passed",
             "primary_diff": self.primary_diff_attestation(),
         }
         encoded_prefix = json.dumps(evidence, sort_keys=True)[:-1]
@@ -1213,7 +1213,7 @@ class StatefulLifecycleTest(unittest.TestCase):
             self.review.container_dir / "preflight.json",
             {
                 "review_range": f"{self.base}..{self.head}",
-                "status": "secret-delta and escaping-symlink checks passed",
+                "status": "review workspace containment and integrity checks passed",
             },
         )
 

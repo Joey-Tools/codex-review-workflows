@@ -4,6 +4,7 @@ import ast
 import base64
 import binascii
 import hashlib
+import io
 import json
 import math
 import os
@@ -283,6 +284,7 @@ MAX_SECRET_SCAN_EVENTS = 1_000_000
 MAX_SECRET_REDUCTION_CANDIDATES = 128
 MAX_SECRET_REDUCTION_CANDIDATE_BYTES = 32 * 1024
 MAX_SECRET_REDUCTION_PROVENANCE_OCCURRENCES = 512
+MAX_SECRET_DELTA_ADDITION_LOCATIONS = 256
 MAX_LEGACY_OCCURRENCE_EVENTS = 1_000_000
 MAX_LEGACY_SEARCH_BYTES = 16 * 1024 * 1024 * 1024
 MAX_LEGACY_CONTAINMENT_CHECKS = 10_000_000
@@ -313,7 +315,7 @@ GIT_LFS_SIZE_PATTERN = re.compile(rb"[+-]?[0-9]+\Z")
 SYNTHETIC_MANIFEST_NAME = "synthetic-secret-manifest.json"
 SYNTHETIC_PRIVATE_MANIFEST_NAME = "synthetic-secret-state.json"
 SYNTHETIC_CHANGED_EVIDENCE_NAME = "synthetic-changed-evidence.json"
-SYNTHETIC_MANIFEST_SCHEMA_VERSION = 4
+SYNTHETIC_MANIFEST_SCHEMA_VERSION = 5
 SECRET_REDUCTION_PROVENANCE_SCHEME = "path-surface-offset-sha256-v1"
 CONTROL_ARTIFACT_STATE_NAME = "control-artifact-state.json"
 CONTROL_ARTIFACT_SCHEMA_VERSION = 5
@@ -339,6 +341,9 @@ CONTROL_ARTIFACT_SPECS: dict[str, tuple[int, int | None]] = {
 }
 LONG_ALPHANUMERIC_SECRET = re.compile(rb"[A-Za-z0-9]{24,512}")
 LONG_NUMERIC_SECRET = re.compile(rb"[0-9]{16,512}")
+UNIFIED_DIFF_HUNK_PATTERN = re.compile(
+    rb"^@@ -[0-9]+(?:,[0-9]+)? \+(?P<head_line>[0-9]+)(?:,[0-9]+)? @@"
+)
 
 
 def symlink_target_stays_within_workspace(
@@ -652,11 +657,13 @@ class _IncompleteSecretScanSuffix(Exception):
 
 
 _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE = "__incomplete-secret-scan-suffix__"
+_UNEXTRACTABLE_SECRET_CANDIDATE_END = -1
 
 
 @dataclass
 class SecretScanResult:
     blocking_rule: str | None
+    unextractable_rule: str | None
     accepted_counts: Counter[AcceptedSyntheticValue]
     accepted_candidates: dict[AcceptedSyntheticValue, set[bytes]]
     blocking_candidates: dict[bytes, set[str]]
@@ -672,6 +679,7 @@ class SecretScanResult:
     @classmethod
     def empty(cls) -> "SecretScanResult":
         return cls(
+            None,
             None,
             Counter(),
             {},
@@ -689,6 +697,8 @@ class SecretScanResult:
     def merge(self, other: "SecretScanResult") -> None:
         if self.blocking_rule is None:
             self.blocking_rule = other.blocking_rule
+        if self.unextractable_rule is None:
+            self.unextractable_rule = other.unextractable_rule
         self.accepted_counts.update(other.accepted_counts)
         self.raw_occurrence_counts.update(other.raw_occurrence_counts)
         self.unembedded_occurrence_counts.update(other.unembedded_occurrence_counts)
@@ -792,6 +802,15 @@ class SecretScanBudget:
             raise ReviewError("sensitive scanner budget transaction is invalid")
         self.remaining = transaction.remaining
         self.remaining_prefix_proof_bytes = transaction.remaining_prefix_proof_bytes
+
+
+@dataclass
+class _AssignmentPrefixContextCache:
+    """Cache the wrapper context shared by one assignment's RHS probes."""
+
+    assignment_prefix_end: int
+    loaded: bool = False
+    context: tuple[tuple[int, ...], bytes | None, tuple[int, ...]] | None = None
 
 
 @dataclass(frozen=True)
@@ -2963,10 +2982,10 @@ def _legacy_path_matcher(
             raise ReviewError(
                 "legacy path validation requires exact catalog-backed values"
             )
-        for needle in (descriptor.value, base64.b64encode(descriptor.value)):
-            previous = needles.get(needle)
-            if previous is None or descriptor.identifier < previous:
-                needles[needle] = descriptor.identifier
+        needle = descriptor.value
+        previous = needles.get(needle)
+        if previous is None or descriptor.identifier < previous:
+            needles[needle] = descriptor.identifier
     return _exact_path_matcher(needles)
 
 
@@ -2977,10 +2996,10 @@ def _secret_reduction_path_matcher(
     for descriptor in reduction_values:
         if descriptor.kind != "secret-reduction" or descriptor.value is None:
             raise ReviewError("secret-reduction path validation requires exact values")
-        for needle in (descriptor.value, base64.b64encode(descriptor.value)):
-            previous = needles.get(needle)
-            if previous is None or descriptor.identifier < previous:
-                needles[needle] = descriptor.identifier
+        needle = descriptor.value
+        previous = needles.get(needle)
+        if previous is None or descriptor.identifier < previous:
+            needles[needle] = descriptor.identifier
     return _exact_path_matcher(needles)
 
 
@@ -3921,20 +3940,16 @@ def _reject_raw_values_in_evidence(
     label: str,
 ) -> None:
     exact_values: list[bytes] = []
-    encoded_exact_values: list[bytes] = []
     digest_values: dict[int, set[str]] = {}
     for accepted in accepted_values:
         if accepted.value is not None:
             exact_values.append(accepted.value)
-            encoded_exact_values.append(base64.b64encode(accepted.value))
             continue
         digest_values.setdefault(accepted.value_length, set()).add(
             accepted.value_sha256
         )
     for metadata in set(_iter_evidence_strings(value)):
         if any(raw_value in metadata for raw_value in exact_values):
-            raise ReviewError(f"{label} would expose a raw synthetic value")
-        if any(encoded_value in metadata for encoded_value in encoded_exact_values):
             raise ReviewError(f"{label} would expose a raw synthetic value")
         for length, digests in digest_values.items():
             if length > len(metadata):
@@ -4003,6 +4018,7 @@ def _scan_batch_blob(
     event_budget: SecretScanBudget | None = None,
     exact_index: ExactValueIndex | None = None,
     occurrence_budget: LegacyOccurrenceBudget | None = None,
+    exact_only: bool = False,
     _continue_after_blocking: bool = False,
 ) -> tuple[SecretScanResult, int]:
     cat_input.write(object_id.encode("ascii") + b"\n")
@@ -4035,6 +4051,7 @@ def _scan_batch_blob(
         _event_budget=event_budget,
         _exact_index=exact_index,
         _occurrence_budget=occurrence_budget,
+        exact_only=exact_only,
         _continue_after_blocking=_continue_after_blocking,
     )
     if cat_output.read(1) != b"\n":
@@ -4111,6 +4128,7 @@ def _scan_frozen_tree_values(
     capture_blocking_candidates: bool = False,
     capture_reduction_identities: bool = False,
     reduced_secret_values: frozenset[bytes] = frozenset(),
+    exact_only: bool = False,
     _continue_after_blocking: bool = False,
 ) -> SecretScanResult:
     accepted = tuple(accepted_values)
@@ -4170,6 +4188,21 @@ def _scan_frozen_tree_values(
                     )
                 mode, object_type, object_id, _relative = _parse_tree_record(record)
                 _metadata, raw_path = record.split(b"\t", 1)
+                path_scan = _scan_secret_value(
+                    raw_path,
+                    accepted_values=accepted,
+                    raw_occurrence_values=raw_occurrences,
+                    capture_accepted_candidates=capture_accepted_candidates,
+                    capture_blocking_candidates=capture_blocking_candidates,
+                    reduced_secret_values=reduced_secret_values,
+                    _accepted_index=accepted_index,
+                    _event_budget=event_budget,
+                    _exact_index=exact_index,
+                    _occurrence_budget=occurrence_budget,
+                    exact_only=exact_only,
+                    _continue_after_blocking=_continue_after_blocking,
+                )
+                result.merge(path_scan)
                 if mode == "160000" and object_type == "commit":
                     continue
                 if object_type != "blob":
@@ -4191,6 +4224,7 @@ def _scan_frozen_tree_values(
                     event_budget=event_budget,
                     exact_index=exact_index,
                     occurrence_budget=occurrence_budget,
+                    exact_only=exact_only,
                     _continue_after_blocking=_continue_after_blocking,
                 )
                 if capture_reduction_identities:
@@ -4270,307 +4304,207 @@ def _secret_reduction_descriptor(
     )
 
 
-def _reject_unselected_legacy_reduction_candidates(
+def _read_frozen_path_diff(
     *,
-    catalog: SyntheticTokenCatalog,
-    exemptions: Iterable[LegacyExemption],
-    candidates: Mapping[bytes, Iterable[str]],
-) -> None:
-    selected_exemption_ids = frozenset(exemption.identifier for exemption in exemptions)
-    unselected_legacy_values: dict[bytes, str] = {}
-    for exemption in catalog.legacy_exemptions:
-        if exemption.identifier in selected_exemption_ids:
+    git_view: pathlib.Path,
+    object_directory: pathlib.Path,
+    base_sha: str,
+    head_sha: str,
+    raw_path: bytes,
+) -> bytes:
+    output = io.BytesIO()
+    with tempfile.TemporaryFile() as error_output:
+        environment = _git_environment(object_directory=object_directory)
+        environment["GIT_LITERAL_PATHSPECS"] = "1"
+        process = subprocess.Popen(
+            _frozen_command(
+                git_view=git_view,
+                args=(
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--no-renames",
+                    "--unified=0",
+                    base_sha,
+                    head_sha,
+                    "--",
+                    os.fsdecode(raw_path),
+                ),
+            ),
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=error_output,
+        )
+        if process.stdout is None:
+            _stop_process(process)
+            raise ReviewError("failed to create secret-delta line diff pipe")
+        try:
+            _copy_limited(
+                process.stdout,
+                output,
+                limit=MAX_DIFF_BYTES,
+                label="secret-delta line diff",
+            )
+            _close_pipe(process.stdout)
+            returncode = process.wait()
+        except BaseException:
+            _close_pipe(process.stdout)
+            _stop_process(process)
+            raise
+        if returncode != 0:
+            raise ReviewError(
+                "cannot generate secret-delta line diff: "
+                f"{_process_stderr(error_output)}"
+            )
+    return output.getvalue()
+
+
+def _added_line_occurrences(
+    patch: bytes,
+    descriptors: Iterable[AcceptedSyntheticValue],
+) -> tuple[dict[AcceptedSyntheticValue, Counter[int]], bool]:
+    additions: dict[AcceptedSyntheticValue, Counter[int]] = {}
+    head_line: int | None = None
+    block: list[tuple[int, bytes]] = []
+    saw_hunk = False
+
+    def flush_block() -> None:
+        if not block:
+            return
+        payload = b"".join(content for _line, content in block)
+        boundaries: list[tuple[int, int]] = []
+        consumed = 0
+        for line_number, content in block:
+            consumed += len(content)
+            boundaries.append((consumed, line_number))
+        for descriptor in descriptors:
+            candidate = descriptor.value
+            if not candidate:
+                continue
+            start = 0
+            while True:
+                offset = payload.find(candidate, start)
+                if offset < 0:
+                    break
+                for boundary, line_number in boundaries:
+                    if offset < boundary:
+                        additions.setdefault(descriptor, Counter())[line_number] += 1
+                        break
+                start = offset + 1
+        block.clear()
+
+    for line in patch.splitlines(keepends=True):
+        hunk_match = UNIFIED_DIFF_HUNK_PATTERN.match(line)
+        if hunk_match is not None:
+            flush_block()
+            head_line = int(hunk_match.group("head_line"))
+            saw_hunk = True
             continue
-        for token in exemption.values:
-            for representation in (token.value, base64.b64encode(token.value)):
-                previous = unselected_legacy_values.get(representation)
-                if previous is None or exemption.identifier < previous:
-                    unselected_legacy_values[representation] = exemption.identifier
-    unselected_legacy_matcher = _exact_path_matcher(unselected_legacy_values)
-    unselected_legacy_candidates = {
-        candidate: (tuple(rules), exemption_id)
-        for candidate, rules in candidates.items()
-        if (exemption_id := unselected_legacy_matcher.match(candidate)) is not None
-    }
-    if not unselected_legacy_candidates:
-        return
-    exemption_ids = sorted(
-        {exemption_id for _rules, exemption_id in unselected_legacy_candidates.values()}
-    )
-    scanner_rules = sorted(
-        rule
-        for rules, _exemption_id in unselected_legacy_candidates.values()
-        for rule in rules
-    )
-    raise ReviewError(
-        "unselected catalog legacy value requires an explicitly selected "
-        "synthetic secret exemption: "
-        f"{', '.join(exemption_ids)}; scanner rules: {', '.join(scanner_rules)}"
-    )
+        if head_line is None:
+            continue
+        if line.startswith(b"+"):
+            block.append((head_line, line[1:]))
+            head_line += 1
+            continue
+        flush_block()
+        if line.startswith(b" "):
+            head_line += 1
+        elif line.startswith(b"-") or line.startswith(b"\\ No newline"):
+            continue
+        else:
+            head_line = None
+    flush_block()
+    return additions, saw_hunk
 
 
-def _secret_count_manifests(
+def _removed_line_occurrence_counts(
+    patch: bytes,
+    descriptors: Iterable[AcceptedSyntheticValue],
+) -> Counter[AcceptedSyntheticValue]:
+    descriptor_values = tuple(
+        (descriptor, descriptor.value) for descriptor in descriptors if descriptor.value
+    )
+    removals: Counter[AcceptedSyntheticValue] = Counter()
+    block: list[bytes] = []
+    saw_hunk = False
+
+    def flush_block() -> None:
+        if not block:
+            return
+        payload = b"".join(block)
+        for descriptor, candidate in descriptor_values:
+            start = 0
+            while True:
+                offset = payload.find(candidate, start)
+                if offset < 0:
+                    break
+                removals[descriptor] += 1
+                start = offset + 1
+        block.clear()
+
+    for line in patch.splitlines(keepends=True):
+        if UNIFIED_DIFF_HUNK_PATTERN.match(line) is not None:
+            flush_block()
+            saw_hunk = True
+            continue
+        if not saw_hunk:
+            continue
+        if line.startswith(b"-"):
+            block.append(line[1:])
+            continue
+        flush_block()
+    flush_block()
+    return removals
+
+
+def _secret_delta_addition_locations(
     *,
     git_view: pathlib.Path,
     object_directory: pathlib.Path,
     base_sha: str,
     head_sha: str,
-    catalog: SyntheticTokenCatalog,
-    exemptions: tuple[LegacyExemption, ...],
-) -> tuple[
-    dict[str, Any],
-    dict[str, Any],
-    tuple[AcceptedSyntheticValue, ...],
-]:
-    legacy_accepted = accepted_legacy_values(catalog, exemptions)
-    authoring_accepted = accepted_authoring_values(catalog)
-    scan_accepted = authoring_accepted + legacy_accepted
-    discovery = _scan_frozen_tree_values(
-        git_view=git_view,
-        object_directory=object_directory,
-        commit=base_sha,
-        accepted_values=scan_accepted,
-        capture_blocking_candidates=True,
-        _continue_after_blocking=True,
-    )
-    discovery.merge(
-        _scan_frozen_tree_values(
-            git_view=git_view,
-            object_directory=object_directory,
-            commit=head_sha,
-            accepted_values=scan_accepted,
-            capture_blocking_candidates=True,
-            _continue_after_blocking=True,
-        )
-    )
-    if discovery.blocking_rule is not None:
-        raise ReviewError(
-            "secret-reduction proof cannot extract a stable exact candidate for "
-            f"scanner rule {discovery.blocking_rule}"
-        )
-    _reject_unselected_legacy_reduction_candidates(
-        catalog=catalog,
-        exemptions=exemptions,
-        candidates=discovery.blocking_candidates,
-    )
-    reduction_descriptors = tuple(
-        _secret_reduction_descriptor(candidate, rules)
-        for candidate, rules in sorted(
-            discovery.blocking_candidates.items(),
-            key=lambda item: (hashlib.sha256(item[0]).hexdigest(), item[0]),
-        )
-    )
-    _reject_secret_reduction_values_in_frozen_tree_paths(
-        git_view=git_view,
-        object_directory=object_directory,
-        commit=head_sha,
-        reduction_values=reduction_descriptors,
-    )
-    count_values = legacy_accepted + reduction_descriptors
-    discovered_values = frozenset(discovery.blocking_candidates)
-    if count_values:
-        base_scan = _scan_frozen_tree_values(
-            git_view=git_view,
-            object_directory=object_directory,
-            commit=base_sha,
-            accepted_values=scan_accepted,
-            raw_occurrence_values=count_values,
-            reduced_secret_values=discovered_values,
-            capture_reduction_identities=True,
-        )
-        head_scan = _scan_frozen_tree_values(
-            git_view=git_view,
-            object_directory=object_directory,
-            commit=head_sha,
-            accepted_values=scan_accepted,
-            raw_occurrence_values=count_values,
-            reduced_secret_values=discovered_values,
-            capture_reduction_identities=True,
-        )
-    else:
-        base_scan = SecretScanResult.empty()
-        head_scan = SecretScanResult.empty()
-    entries: list[dict[str, Any]] = []
-    for exemption in exemptions:
-        envelope_used = False
-        for token in exemption.values:
-            descriptor = next(
-                item
-                for item in legacy_accepted
-                if item.exemption_id == exemption.identifier
-                and item.identifier == token.identifier
-            )
-            base_count = base_scan.raw_occurrence_counts[descriptor]
-            head_count = head_scan.raw_occurrence_counts[descriptor]
-            base_unembedded_count = base_scan.unembedded_occurrence_counts[descriptor]
-            head_unembedded_count = head_scan.unembedded_occurrence_counts[descriptor]
-            envelope_used = envelope_used or base_count > 0 or head_count > 0
-            if head_count > base_count:
-                raise ReviewError(
-                    "legacy synthetic fixture count increased for "
-                    f"{token.identifier}: base={base_count}, head={head_count}"
-                )
-            if head_unembedded_count > base_unembedded_count:
-                raise ReviewError(
-                    "legacy synthetic fixture unembedded count increased for "
-                    f"{token.identifier}: base={base_unembedded_count}, "
-                    f"head={head_unembedded_count}"
-                )
-            entries.append(
-                {
-                    "base_count": base_count,
-                    "base_unembedded_count": base_unembedded_count,
-                    "exemption_id": exemption.identifier,
-                    "head_count": head_count,
-                    "head_unembedded_count": head_unembedded_count,
-                    "rule": token.rule,
-                    "token_id": token.identifier,
-                    "value_length": token.value_length,
-                    "value_sha256": token.value_sha256,
-                }
-            )
-        if not envelope_used:
-            raise ReviewError(
-                f"selected synthetic secret exemption is unused: {exemption.identifier}"
-            )
-    if len(entries) > MAX_SYNTHETIC_EVIDENCE_ENTRIES:
-        raise ReviewError("legacy synthetic fixture evidence has too many entries")
-    allowed_reductions: list[AcceptedSyntheticValue] = []
-    reduction_entries: list[dict[str, Any]] = []
-    for descriptor in reduction_descriptors:
-        base_count = base_scan.raw_occurrence_counts[descriptor]
-        head_count = head_scan.raw_occurrence_counts[descriptor]
-        base_unembedded_count = base_scan.unembedded_occurrence_counts[descriptor]
-        head_unembedded_count = head_scan.unembedded_occurrence_counts[descriptor]
-        rules = sorted(discovery.blocking_candidates[descriptor.value])
-        rule_label = ", ".join(rules)
-        base_occurrences = base_scan.reduction_occurrence_identities.get(
-            descriptor,
-            set(),
-        )
-        head_occurrences = head_scan.reduction_occurrence_identities.get(
-            descriptor,
-            set(),
-        )
-        base_unembedded_occurrences = base_scan.reduction_unembedded_identities.get(
-            descriptor, set()
-        )
-        head_unembedded_occurrences = head_scan.reduction_unembedded_identities.get(
-            descriptor, set()
-        )
-        if (
-            len(base_occurrences) != base_count
-            or len(head_occurrences) != head_count
-            or len(base_unembedded_occurrences) != base_unembedded_count
-            or len(head_unembedded_occurrences) != head_unembedded_count
-        ):
-            raise ReviewError(
-                "unregistered secret occurrence provenance does not match its "
-                f"complete-tree count for scanner rules {rule_label}"
-            )
-        if head_count >= base_count:
-            raise ReviewError(
-                "unregistered secret count did not strictly decrease for scanner "
-                f"rules {rule_label}: base={base_count}, head={head_count}"
-            )
-        if head_unembedded_count > base_unembedded_count:
-            raise ReviewError(
-                "unregistered secret unembedded count increased for scanner rules "
-                f"{rule_label}: base={base_unembedded_count}, "
-                f"head={head_unembedded_count}"
-            )
-        if not head_occurrences.issubset(base_occurrences):
-            raise ReviewError(
-                "unregistered secret has a head-side occurrence that was not "
-                "present at the same base path, surface kind, and byte offset for "
-                "scanner rules "
-                f"{rule_label}"
-            )
-        if not head_unembedded_occurrences.issubset(base_unembedded_occurrences):
-            raise ReviewError(
-                "unregistered secret has an unembedded head-side occurrence that "
-                "was not present at the same base path, surface kind, and byte offset "
-                f"for scanner rules {rule_label}"
-            )
-        allowed_reductions.append(descriptor)
-        reduction_entries.append(
-            {
-                "base_count": base_count,
-                "base_unembedded_count": base_unembedded_count,
-                "head_count": head_count,
-                "head_unembedded_count": head_unembedded_count,
-                "rules": rules,
-                "value_length": descriptor.value_length,
-                "value_sha256": descriptor.value_sha256,
-            }
-        )
-    if len(entries) + len(reduction_entries) > MAX_SYNTHETIC_EVIDENCE_ENTRIES:
-        raise ReviewError("secret count evidence has too many entries")
-    public_manifest = {
-        "base_ref": base_sha,
-        "catalog_schema_version": catalog.schema_version,
-        "entries": entries,
-        "head_ref": head_sha,
-        "pool_version": catalog.pool_version,
-        "schema_version": SYNTHETIC_MANIFEST_SCHEMA_VERSION,
-        "secret_reductions": reduction_entries,
-        "secret_reduction_provenance": {
-            "base_sha256": _secret_reduction_provenance_commitment(
-                base_scan.reduction_occurrence_identities,
-                base_scan.reduction_unembedded_identities,
-            ),
-            "head_sha256": _secret_reduction_provenance_commitment(
-                head_scan.reduction_occurrence_identities,
-                head_scan.reduction_unembedded_identities,
-            ),
-            "scheme": SECRET_REDUCTION_PROVENANCE_SCHEME,
-        },
-        "selected_exemptions": [item.identifier for item in exemptions],
+    violations: Mapping[AcceptedSyntheticValue, tuple[int, int]],
+) -> tuple[dict[AcceptedSyntheticValue, dict[str, Any]], bool]:
+    evidence: dict[AcceptedSyntheticValue, dict[str, Any]] = {
+        descriptor: {"locations": {}, "omitted_location_count": 0}
+        for descriptor in violations
     }
-    private_manifest = dict(public_manifest)
-    if allowed_reductions:
-        private_manifest["secret_reduction_values"] = [
-            {
-                "value_base64": base64.b64encode(descriptor.value).decode("ascii"),
-                "value_sha256": descriptor.value_sha256,
-            }
-            for descriptor in allowed_reductions
+    if not violations:
+        return evidence, True
+
+    descriptors = tuple(violations)
+    exact_index = _index_exact_values(descriptors)
+    occurrence_budget = LegacyOccurrenceBudget.default()
+    total_locations = 0
+    location_complete = True
+
+    def record(
+        descriptor: AcceptedSyntheticValue,
+        *,
+        raw_path: bytes,
+        line: int | None,
+        surface: str,
+        occurrence_count: int = 1,
+    ) -> None:
+        nonlocal location_complete, total_locations
+        location = (os.fsdecode(raw_path), line, surface)
+        locations: dict[tuple[str, int | None, str], int] = evidence[descriptor][
+            "locations"
         ]
-    return public_manifest, private_manifest, tuple(allowed_reductions)
+        if location not in locations:
+            if total_locations >= MAX_SECRET_DELTA_ADDITION_LOCATIONS:
+                evidence[descriptor]["omitted_location_count"] += 1
+                location_complete = False
+                return
+            total_locations += 1
+        locations[location] = locations.get(location, 0) + occurrence_count
 
-
-def _all_catalog_sensitive_values(
-    catalog: SyntheticTokenCatalog,
-) -> tuple[AcceptedSyntheticValue, ...]:
-    return accepted_authoring_values(catalog) + accepted_legacy_values(
-        catalog,
-        catalog.legacy_exemptions,
-    )
-
-
-def _write_changed_blob_findings(
-    *,
-    git_view: pathlib.Path,
-    object_directory: pathlib.Path,
-    base_sha: str,
-    head_sha: str,
-    destination: pathlib.Path,
-    accepted_destination: pathlib.Path,
-    accepted_values: Iterable[AcceptedSyntheticValue],
-    evidence_sensitive_values: Iterable[AcceptedSyntheticValue],
-    reduced_secret_values: frozenset[bytes] = frozenset(),
-) -> None:
-    accepted = tuple(accepted_values)
-    accepted_index = _index_accepted_values(accepted)
-    event_budget = SecretScanBudget.default()
-    accepted_evidence: Counter[tuple[AcceptedSyntheticValue, str, str]] = Counter()
-    finding_path_digests: set[str] = set()
     environment = _git_environment(object_directory=object_directory)
     with (
         tempfile.TemporaryFile() as raw_output,
         tempfile.TemporaryFile() as raw_error,
         tempfile.TemporaryFile() as cat_error,
-        _open_new_private_binary(destination) as findings_output,
     ):
         _write_limited_diff_metadata(
             git_view=git_view,
@@ -4586,7 +4520,7 @@ def _write_changed_blob_findings(
             ),
             output=raw_output,
             error_output=raw_error,
-            label="changed blob metadata",
+            label="secret-delta changed metadata",
             record_limit=MAX_CHANGED_ENTRIES * 2,
         )
         raw_output.seek(0)
@@ -4599,64 +4533,149 @@ def _write_changed_blob_findings(
         )
         if cat_process.stdin is None or cat_process.stdout is None:
             _stop_process(cat_process)
-            raise ReviewError("failed to create pipes for changed Git blob scanning")
+            raise ReviewError("failed to create pipes for secret-delta line evidence")
+        scanned_bytes = 0
         try:
             records = iter(_iter_nul_records(raw_output))
-            scanned_bytes = 0
             for metadata in records:
                 if not metadata.startswith(b":"):
-                    raise ReviewError(f"invalid raw Git diff record: {metadata!r}")
+                    raise ReviewError(
+                        f"invalid secret-delta raw Git record: {metadata!r}"
+                    )
                 fields = metadata[1:].split()
                 if len(fields) != 5:
-                    raise ReviewError(f"invalid raw Git diff metadata: {metadata!r}")
+                    raise ReviewError(
+                        f"invalid secret-delta raw Git metadata: {metadata!r}"
+                    )
                 old_mode, new_mode, old_object, new_object, _status = fields
                 try:
                     raw_path = next(records)
                 except StopIteration as error:
                     raise ReviewError(
-                        "raw Git diff is missing a changed path"
+                        "secret-delta raw Git diff is missing a changed path"
                     ) from error
-                path_sha256 = hashlib.sha256(raw_path).hexdigest()
-                for side, mode, raw_object in (
-                    ("base", old_mode, old_object),
-                    ("head", new_mode, new_object),
-                ):
-                    if mode in {b"000000", b"160000"}:
-                        continue
+
+                if old_mode == b"000000" and new_mode != b"000000":
+                    path_scan = _scan_secret_value(
+                        raw_path,
+                        raw_occurrence_values=descriptors,
+                        _exact_index=exact_index,
+                        _occurrence_budget=occurrence_budget,
+                        exact_only=True,
+                    )
+                    for descriptor, count in path_scan.raw_occurrence_counts.items():
+                        if count:
+                            record(
+                                descriptor,
+                                raw_path=raw_path,
+                                line=None,
+                                surface="path",
+                                occurrence_count=count,
+                            )
+
+                if new_mode in {b"000000", b"160000"}:
+                    continue
+
+                base_counts: Counter[AcceptedSyntheticValue] = Counter()
+                if old_mode not in {b"000000", b"160000"}:
                     try:
-                        object_id = raw_object.decode("ascii")
+                        base_object_id = old_object.decode("ascii")
                     except UnicodeDecodeError as error:
                         raise ReviewError(
-                            f"invalid changed Git object id: {raw_object!r}"
+                            f"invalid secret-delta Git object id: {old_object!r}"
                         ) from error
-                    scan, scanned_bytes = _scan_batch_blob(
+                    base_scan, scanned_bytes = _scan_batch_blob(
                         cat_input=cat_process.stdin,
                         cat_output=cat_process.stdout,
-                        object_id=object_id,
+                        object_id=base_object_id,
                         scanned_bytes=scanned_bytes,
-                        accepted_values=accepted,
-                        reduced_secret_values=reduced_secret_values,
-                        accepted_index=accepted_index,
-                        event_budget=event_budget,
+                        raw_occurrence_values=descriptors,
+                        exact_index=exact_index,
+                        occurrence_budget=occurrence_budget,
+                        exact_only=True,
                     )
-                    if scan.blocking_rule:
-                        finding_path_digests.add(path_sha256)
-                        findings_output.write(
-                            side.encode("ascii")
-                            + b"\0"
-                            + path_sha256.encode("ascii")
-                            + b"\0"
-                            + scan.blocking_rule.encode("ascii")
-                            + b"\0"
+                    base_counts.update(base_scan.raw_occurrence_counts)
+                try:
+                    object_id = new_object.decode("ascii")
+                except UnicodeDecodeError as error:
+                    raise ReviewError(
+                        f"invalid secret-delta Git object id: {new_object!r}"
+                    ) from error
+                scan, scanned_bytes = _scan_batch_blob(
+                    cat_input=cat_process.stdin,
+                    cat_output=cat_process.stdout,
+                    object_id=object_id,
+                    scanned_bytes=scanned_bytes,
+                    raw_occurrence_values=descriptors,
+                    capture_reduction_offsets=True,
+                    exact_index=exact_index,
+                    occurrence_budget=occurrence_budget,
+                    exact_only=True,
+                )
+                present = tuple(
+                    descriptor
+                    for descriptor in descriptors
+                    if scan.raw_occurrence_counts[descriptor] > base_counts[descriptor]
+                )
+                if not present:
+                    continue
+                if new_mode == b"120000":
+                    for descriptor in present:
+                        record(
+                            descriptor,
+                            raw_path=raw_path,
+                            line=1,
+                            surface="symlink-target",
+                            occurrence_count=(
+                                scan.raw_occurrence_counts[descriptor]
+                                - base_counts[descriptor]
+                            ),
                         )
-                    for accepted_value, count in scan.accepted_counts.items():
-                        _record_bounded_evidence_count(
-                            accepted_evidence,
-                            (accepted_value, side, path_sha256),
-                            count,
-                            reserved_entries=0,
-                            overflow_message=(
-                                "synthetic changed-blob evidence has too many entries"
+                    continue
+
+                patch = _read_frozen_path_diff(
+                    git_view=git_view,
+                    object_directory=object_directory,
+                    base_sha=base_sha,
+                    head_sha=head_sha,
+                    raw_path=raw_path,
+                )
+                line_occurrences, saw_hunk = _added_line_occurrences(patch, present)
+                removed_occurrences = _removed_line_occurrence_counts(patch, present)
+                for descriptor in present:
+                    local_growth = (
+                        scan.raw_occurrence_counts[descriptor] - base_counts[descriptor]
+                    )
+                    line_counts = line_occurrences.get(descriptor, {})
+                    if saw_hunk and (
+                        removed_occurrences[descriptor] > 0
+                        or sum(line_counts.values()) != local_growth
+                    ):
+                        # A retained occurrence on a replaced line or an exact
+                        # value crossing an unchanged/added boundary can make
+                        # an added-block match indistinguishable from retained
+                        # content. Preserve the count violation but do not
+                        # invent a location.
+                        location_complete = False
+                        continue
+                    for line_number, occurrence_count in sorted(line_counts.items()):
+                        record(
+                            descriptor,
+                            raw_path=raw_path,
+                            line=line_number,
+                            surface="blob",
+                            occurrence_count=occurrence_count,
+                        )
+                if not saw_hunk and old_object != new_object:
+                    for descriptor in present:
+                        record(
+                            descriptor,
+                            raw_path=raw_path,
+                            line=None,
+                            surface="binary",
+                            occurrence_count=(
+                                scan.raw_occurrence_counts[descriptor]
+                                - base_counts[descriptor]
                             ),
                         )
             _close_pipe(cat_process.stdin)
@@ -4669,33 +4688,303 @@ def _write_changed_blob_findings(
             raise
         if cat_returncode != 0:
             raise ReviewError(
-                f"cannot scan changed Git blobs: {_process_stderr(cat_error)}"
+                f"cannot scan secret-delta changed blobs: {_process_stderr(cat_error)}"
             )
-    _reject_raw_values_in_evidence(
-        sorted(finding_path_digests),
-        accepted_values=evidence_sensitive_values,
-        label="changed-blob finding path digest evidence",
+
+    for descriptor, item in evidence.items():
+        locations = item["locations"]
+        item["locations"] = [
+            {
+                "line": line,
+                "occurrence_count": count,
+                "path": path,
+                "surface": surface,
+            }
+            for (path, line, surface), count in sorted(
+                locations.items(),
+                key=lambda entry: (
+                    os.fsencode(entry[0][0]),
+                    -1 if entry[0][1] is None else entry[0][1],
+                    entry[0][2],
+                ),
+            )
+        ]
+    return evidence, location_complete
+
+
+def _secret_count_manifests(
+    *,
+    git_view: pathlib.Path,
+    object_directory: pathlib.Path,
+    base_sha: str,
+    head_sha: str,
+    catalog: SyntheticTokenCatalog,
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    tuple[AcceptedSyntheticValue, ...],
+]:
+    # Catalog-backed legacy values are automatic baselines. The deprecated
+    # selection flag no longer changes admission semantics.
+    legacy_accepted = accepted_legacy_values(catalog, catalog.legacy_exemptions)
+    authoring_accepted = accepted_authoring_values(catalog)
+    scan_accepted = authoring_accepted + legacy_accepted
+    base_discovery = _scan_frozen_tree_values(
+        git_view=git_view,
+        object_directory=object_directory,
+        commit=base_sha,
+        accepted_values=scan_accepted,
+        capture_blocking_candidates=True,
+        _continue_after_blocking=True,
     )
+    head_discovery = _scan_frozen_tree_values(
+        git_view=git_view,
+        object_directory=object_directory,
+        commit=head_sha,
+        accepted_values=scan_accepted,
+        capture_blocking_candidates=True,
+        _continue_after_blocking=True,
+    )
+    if head_discovery.unextractable_rule is not None:
+        raise ReviewError("an exact secret candidate could not be extracted completely")
+    discovery = base_discovery
+    discovery.merge(head_discovery)
+    # Non-exact expressions have no stable byte identity and intentionally do
+    # not enter the counter. Scanner resource failures still raise and are
+    # recorded by the caller as an inconclusive merge gate.
+    reduction_descriptors = tuple(
+        _secret_reduction_descriptor(candidate, rules)
+        for candidate, rules in sorted(
+            discovery.blocking_candidates.items(),
+            key=lambda item: (hashlib.sha256(item[0]).hexdigest(), item[0]),
+        )
+    )
+    count_values = legacy_accepted + reduction_descriptors
+    discovered_values = frozenset(discovery.blocking_candidates)
+    if count_values:
+        base_scan = _scan_frozen_tree_values(
+            git_view=git_view,
+            object_directory=object_directory,
+            commit=base_sha,
+            accepted_values=scan_accepted,
+            raw_occurrence_values=count_values,
+            reduced_secret_values=discovered_values,
+            exact_only=True,
+        )
+        head_scan = _scan_frozen_tree_values(
+            git_view=git_view,
+            object_directory=object_directory,
+            commit=head_sha,
+            accepted_values=scan_accepted,
+            raw_occurrence_values=count_values,
+            reduced_secret_values=discovered_values,
+            exact_only=True,
+        )
+    else:
+        base_scan = SecretScanResult.empty()
+        head_scan = SecretScanResult.empty()
+    entries: list[dict[str, Any]] = []
+    violations: dict[AcceptedSyntheticValue, tuple[int, int]] = {}
+    for exemption in catalog.legacy_exemptions:
+        for token in exemption.values:
+            descriptor = next(
+                item
+                for item in legacy_accepted
+                if item.exemption_id == exemption.identifier
+                and item.identifier == token.identifier
+            )
+            base_count = base_scan.raw_occurrence_counts[descriptor]
+            head_count = head_scan.raw_occurrence_counts[descriptor]
+            if head_count > base_count:
+                violations[descriptor] = (base_count, head_count)
+            entries.append(
+                {
+                    "base_count": base_count,
+                    "exemption_id": exemption.identifier,
+                    "head_count": head_count,
+                    "rule": token.rule,
+                    "token_id": token.identifier,
+                    "value_length": token.value_length,
+                    "value_sha256": token.value_sha256,
+                }
+            )
+    if len(entries) > MAX_SYNTHETIC_EVIDENCE_ENTRIES:
+        raise ReviewError("legacy synthetic fixture evidence has too many entries")
+    reduction_entries: list[dict[str, Any]] = []
+    for descriptor in reduction_descriptors:
+        base_count = base_scan.raw_occurrence_counts[descriptor]
+        head_count = head_scan.raw_occurrence_counts[descriptor]
+        rules = sorted(discovery.blocking_candidates[descriptor.value])
+        if head_count > base_count:
+            violations[descriptor] = (base_count, head_count)
+        reduction_entries.append(
+            {
+                "base_count": base_count,
+                "head_count": head_count,
+                "rules": rules,
+                "value_length": descriptor.value_length,
+                "value_sha256": descriptor.value_sha256,
+            }
+        )
+    if len(entries) + len(reduction_entries) > MAX_SYNTHETIC_EVIDENCE_ENTRIES:
+        raise ReviewError("secret count evidence has too many entries")
+    location_status = "complete"
+    try:
+        addition_evidence, locations_complete = _secret_delta_addition_locations(
+            git_view=git_view,
+            object_directory=object_directory,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            violations=violations,
+        )
+        if not locations_complete:
+            location_status = "inconclusive"
+    except ReviewError:
+        location_status = "inconclusive"
+        addition_evidence = {
+            descriptor: {"locations": [], "omitted_location_count": 0}
+            for descriptor in violations
+        }
+
+    violation_entries: list[dict[str, Any]] = []
+    for descriptor, (base_count, head_count) in sorted(
+        violations.items(),
+        key=lambda item: item[0].value_sha256,
+    ):
+        rules = (
+            [descriptor.rule]
+            if descriptor.kind == "legacy"
+            else sorted(discovery.blocking_candidates[descriptor.value])
+        )
+        violation_entries.append(
+            {
+                "additions": addition_evidence[descriptor]["locations"],
+                "base_count": base_count,
+                "delta": head_count - base_count,
+                "head_count": head_count,
+                "omitted_addition_location_count": addition_evidence[descriptor][
+                    "omitted_location_count"
+                ],
+                "rules": rules,
+                "value_length": descriptor.value_length,
+                "value_sha256": descriptor.value_sha256,
+            }
+        )
+
+    public_manifest = {
+        "base_ref": base_sha,
+        "catalog_schema_version": catalog.schema_version,
+        "entries": entries,
+        "head_ref": head_sha,
+        "pool_version": catalog.pool_version,
+        "schema_version": SYNTHETIC_MANIFEST_SCHEMA_VERSION,
+        "secret_delta": {
+            "location_status": location_status,
+            "status": "violations" if violation_entries else "clean",
+            "limitations": [
+                "Only exact raw byte values are compared; alternate encodings are not derived.",
+                "Dynamic expressions without a stable exact value are not counted.",
+            ],
+            "violations": violation_entries,
+        },
+        "secret_reductions": reduction_entries,
+        "selected_exemptions": [item.identifier for item in catalog.legacy_exemptions],
+    }
+    try:
+        _bounded_json_bytes(public_manifest, label="synthetic secret manifest")
+    except ReviewError:
+        public_manifest["secret_delta"]["location_status"] = "inconclusive"
+        for violation in public_manifest["secret_delta"]["violations"]:
+            violation["omitted_addition_location_count"] += len(violation["additions"])
+            violation["additions"] = []
+        _bounded_json_bytes(public_manifest, label="synthetic secret manifest")
+    private_manifest = dict(public_manifest)
+    if reduction_descriptors:
+        private_manifest["secret_reduction_values"] = [
+            {
+                "value_base64": base64.b64encode(descriptor.value).decode("ascii"),
+                "value_sha256": descriptor.value_sha256,
+            }
+            for descriptor in reduction_descriptors
+        ]
+    _bounded_json_bytes(
+        private_manifest,
+        label="synthetic secret helper-private state",
+    )
+    return public_manifest, private_manifest, reduction_descriptors
+
+
+def _all_catalog_sensitive_values(
+    catalog: SyntheticTokenCatalog,
+) -> tuple[AcceptedSyntheticValue, ...]:
+    return accepted_authoring_values(catalog) + accepted_legacy_values(
+        catalog,
+        catalog.legacy_exemptions,
+    )
+
+
+def _inconclusive_secret_count_manifests(
+    *,
+    base_sha: str,
+    head_sha: str,
+    catalog: SyntheticTokenCatalog,
+    failure_class: str,
+) -> tuple[dict[str, Any], dict[str, Any], tuple[AcceptedSyntheticValue, ...]]:
+    if re.fullmatch(r"[a-z][a-z0-9-]{0,63}", failure_class) is None:
+        raise ReviewError("secret scan failure class is invalid")
+    manifest = {
+        "base_ref": base_sha,
+        "catalog_schema_version": catalog.schema_version,
+        "entries": [],
+        "head_ref": head_sha,
+        "pool_version": catalog.pool_version,
+        "schema_version": SYNTHETIC_MANIFEST_SCHEMA_VERSION,
+        "secret_delta": {
+            "failure_class": failure_class,
+            "limitations": [
+                "The exact-value scan did not complete; merge admission is inconclusive."
+            ],
+            "location_status": "inconclusive",
+            "status": "inconclusive",
+            "violations": [],
+        },
+        "secret_reductions": [],
+        "selected_exemptions": [item.identifier for item in catalog.legacy_exemptions],
+    }
+    return manifest, dict(manifest), ()
+
+
+def _write_changed_blob_findings(
+    *,
+    git_view: pathlib.Path,
+    object_directory: pathlib.Path,
+    base_sha: str,
+    head_sha: str,
+    destination: pathlib.Path,
+    accepted_destination: pathlib.Path,
+    accepted_values: Iterable[AcceptedSyntheticValue],
+    evidence_sensitive_values: Iterable[AcceptedSyntheticValue],
+    reduced_secret_values: frozenset[bytes] = frozenset(),
+) -> None:
+    # Secret content is not a reviewer-egress gate. The complete base/head
+    # exact-value audit owns admission evidence, so this legacy control surface
+    # remains present only for artifact-layout compatibility and must not run a
+    # second scan that could suppress reviewer launch.
+    _ = (
+        git_view,
+        object_directory,
+        base_sha,
+        head_sha,
+        accepted_values,
+        evidence_sensitive_values,
+        reduced_secret_values,
+    )
+    with _open_new_private_binary(destination):
+        pass
     _write_bounded_json(
         accepted_destination,
         {
-            "entries": [
-                _accepted_evidence_entry(
-                    accepted_value,
-                    surface="changed-blob",
-                    side=side,
-                    path_sha256=path_sha256,
-                    occurrence_count=count,
-                )
-                for (accepted_value, side, path_sha256), count in sorted(
-                    accepted_evidence.items(),
-                    key=lambda item: (
-                        item[0][1],
-                        item[0][2],
-                        item[0][0].identifier,
-                    ),
-                )
-            ],
+            "entries": [],
             "schema_version": 1,
         },
         label="synthetic changed-blob evidence",
@@ -5453,7 +5742,7 @@ def _load_legacy_manifest(
     list[dict[str, Any]],
     tuple[AcceptedSyntheticValue, ...],
     dict[AcceptedSyntheticValue, tuple[int, int, int, int]],
-    str,
+    dict[str, Any],
     list[dict[str, Any]],
 ]:
     manifest_path = control_dir / SYNTHETIC_MANIFEST_NAME
@@ -5466,7 +5755,12 @@ def _load_legacy_manifest(
             [],
             (),
             {},
-            _secret_reduction_provenance_commitment({}, {}),
+            {
+                "limitations": [],
+                "location_status": "complete",
+                "status": "clean",
+                "violations": [],
+            },
             [],
         )
     if not manifest_path.exists() or not private_manifest_path.exists():
@@ -5494,8 +5788,8 @@ def _load_legacy_manifest(
         "head_ref",
         "pool_version",
         "schema_version",
+        "secret_delta",
         "secret_reductions",
-        "secret_reduction_provenance",
         "selected_exemptions",
     }:
         raise ReviewError("synthetic secret manifest fields are invalid")
@@ -5511,23 +5805,55 @@ def _load_legacy_manifest(
         raise ReviewError(
             "synthetic secret manifest version or review range is invalid"
         )
-    provenance = manifest["secret_reduction_provenance"]
+    secret_delta = manifest["secret_delta"]
+    secret_delta_fields = {"limitations", "location_status", "status", "violations"}
     if (
-        not isinstance(provenance, dict)
-        or set(provenance) != {"base_sha256", "head_sha256", "scheme"}
-        or provenance.get("scheme") != SECRET_REDUCTION_PROVENANCE_SCHEME
-        or not isinstance(provenance.get("base_sha256"), str)
-        or re.fullmatch(r"[0-9a-f]{64}", provenance["base_sha256"]) is None
-        or not isinstance(provenance.get("head_sha256"), str)
-        or re.fullmatch(r"[0-9a-f]{64}", provenance["head_sha256"]) is None
+        not isinstance(secret_delta, dict)
+        or not secret_delta_fields.issubset(secret_delta)
+        or not set(secret_delta).issubset(secret_delta_fields | {"failure_class"})
+        or secret_delta.get("location_status") not in {"complete", "inconclusive"}
+        or secret_delta.get("status") not in {"clean", "violations", "inconclusive"}
+        or not isinstance(secret_delta.get("limitations"), list)
+        or not all(
+            isinstance(item, str) for item in secret_delta.get("limitations", [])
+        )
+        or not isinstance(secret_delta.get("violations"), list)
+        or len(secret_delta.get("violations", [])) > MAX_SECRET_REDUCTION_CANDIDATES
     ):
-        raise ReviewError("secret-reduction occurrence provenance is invalid")
+        raise ReviewError("secret-delta evidence is invalid")
+    status = secret_delta["status"]
+    violations = secret_delta["violations"]
+    failure_class = secret_delta.get("failure_class")
+    if status == "inconclusive":
+        valid_state = (
+            set(secret_delta) == secret_delta_fields | {"failure_class"}
+            and secret_delta["location_status"] == "inconclusive"
+            and violations == []
+            and isinstance(failure_class, str)
+            and re.fullmatch(r"[a-z][a-z0-9-]{0,63}", failure_class) is not None
+        )
+    elif status == "clean":
+        valid_state = (
+            set(secret_delta) == secret_delta_fields
+            and secret_delta["location_status"] == "complete"
+            and violations == []
+        )
+    else:
+        valid_state = set(secret_delta) == secret_delta_fields and len(violations) > 0
+    if not valid_state:
+        raise ReviewError("secret-delta state is invalid")
     selected_ids = manifest["selected_exemptions"]
     if not isinstance(selected_ids, list) or not all(
         isinstance(item, str) for item in selected_ids
     ):
         raise ReviewError("synthetic secret manifest selection is invalid")
     exemptions = resolve_legacy_exemptions(catalog, selected_ids)
+    if tuple(item.identifier for item in exemptions) != tuple(
+        item.identifier for item in catalog.legacy_exemptions
+    ):
+        raise ReviewError(
+            "synthetic secret manifest does not cover every catalog legacy value"
+        )
     accepted = accepted_legacy_values(catalog, exemptions)
     expected = {(item.exemption_id, item.identifier): item for item in accepted}
     raw_entries = manifest["entries"]
@@ -5541,10 +5867,8 @@ def _load_legacy_manifest(
     for raw_entry in raw_entries:
         if not isinstance(raw_entry, dict) or set(raw_entry) != {
             "base_count",
-            "base_unembedded_count",
             "exemption_id",
             "head_count",
-            "head_unembedded_count",
             "rule",
             "token_id",
             "value_length",
@@ -5557,21 +5881,11 @@ def _load_legacy_manifest(
             raise ReviewError("synthetic secret manifest entry is unknown or duplicate")
         base_count = raw_entry["base_count"]
         head_count = raw_entry["head_count"]
-        base_unembedded_count = raw_entry["base_unembedded_count"]
-        head_unembedded_count = raw_entry["head_unembedded_count"]
         if (
             type(base_count) is not int
             or type(head_count) is not int
-            or type(base_unembedded_count) is not int
-            or type(head_unembedded_count) is not int
             or base_count < 0
             or head_count < 0
-            or base_unembedded_count < 0
-            or head_unembedded_count < 0
-            or head_count > base_count
-            or head_unembedded_count > base_unembedded_count
-            or base_unembedded_count > base_count
-            or head_unembedded_count > head_count
             or raw_entry["rule"] != descriptor.rule
             or raw_entry["value_sha256"] != descriptor.value_sha256
             or raw_entry["value_length"] != descriptor.value_length
@@ -5580,26 +5894,12 @@ def _load_legacy_manifest(
         counts[descriptor] = (
             base_count,
             head_count,
-            base_unembedded_count,
-            head_unembedded_count,
+            0,
+            0,
         )
         evidence.append(dict(raw_entry))
-    if set(counts) != set(accepted):
+    if secret_delta["status"] != "inconclusive" and set(counts) != set(accepted):
         raise ReviewError("synthetic secret manifest does not cover its selection")
-    for exemption in exemptions:
-        if not any(
-            base_count or head_count
-            for descriptor, (
-                base_count,
-                head_count,
-                _base_unembedded_count,
-                _head_unembedded_count,
-            ) in counts.items()
-            if descriptor.exemption_id == exemption.identifier
-        ):
-            raise ReviewError(
-                f"selected synthetic secret exemption is unused: {exemption.identifier}"
-            )
     raw_reductions = manifest["secret_reductions"]
     if (
         not isinstance(raw_reductions, list)
@@ -5652,9 +5952,7 @@ def _load_legacy_manifest(
     for raw_entry in raw_reductions:
         if not isinstance(raw_entry, dict) or set(raw_entry) != {
             "base_count",
-            "base_unembedded_count",
             "head_count",
-            "head_unembedded_count",
             "rules",
             "value_length",
             "value_sha256",
@@ -5665,8 +5963,6 @@ def _load_legacy_manifest(
         rules = raw_entry["rules"]
         base_count = raw_entry["base_count"]
         head_count = raw_entry["head_count"]
-        base_unembedded_count = raw_entry["base_unembedded_count"]
-        head_unembedded_count = raw_entry["head_unembedded_count"]
         if (
             not isinstance(digest, str)
             or re.fullmatch(r"[0-9a-f]{64}", digest) is None
@@ -5682,16 +5978,8 @@ def _load_legacy_manifest(
             )
             or type(base_count) is not int
             or type(head_count) is not int
-            or type(base_unembedded_count) is not int
-            or type(head_unembedded_count) is not int
-            or base_count <= 0
+            or base_count < 0
             or head_count < 0
-            or head_count >= base_count
-            or base_unembedded_count < 0
-            or head_unembedded_count < 0
-            or head_unembedded_count > base_unembedded_count
-            or base_unembedded_count > base_count
-            or head_unembedded_count > head_count
         ):
             raise ReviewError("secret-reduction manifest entry is inconsistent")
         seen_digests.add(digest)
@@ -5700,8 +5988,8 @@ def _load_legacy_manifest(
         reduction_counts[descriptor] = (
             base_count,
             head_count,
-            base_unembedded_count,
-            head_unembedded_count,
+            0,
+            0,
         )
         reduction_evidence.append(dict(raw_entry))
     if seen_digests != set(private_values):
@@ -5715,6 +6003,99 @@ def _load_legacy_manifest(
         raise ReviewError(
             "secret-reduction helper-private values exceed the byte limit"
         )
+    if secret_delta["status"] == "inconclusive" and (
+        raw_entries
+        or raw_reductions
+        or raw_reduction_values
+        or secret_delta["violations"]
+    ):
+        raise ReviewError("inconclusive secret-delta evidence must not claim counts")
+
+    expected_violations: dict[str, tuple[int, int, list[str], int]] = {}
+    for descriptor, (base_count, head_count, _unused_base, _unused_head) in list(
+        counts.items()
+    ) + list(reduction_counts.items()):
+        if head_count <= base_count:
+            continue
+        rules = [descriptor.rule]
+        if descriptor.kind == "secret-reduction":
+            rules = next(
+                entry["rules"]
+                for entry in reduction_evidence
+                if entry["value_sha256"] == descriptor.value_sha256
+            )
+        expected_violations[descriptor.value_sha256] = (
+            base_count,
+            head_count,
+            rules,
+            descriptor.value_length,
+        )
+    raw_violations = secret_delta["violations"]
+    seen_violation_digests: set[str] = set()
+    for raw_violation in raw_violations:
+        if not isinstance(raw_violation, dict) or set(raw_violation) != {
+            "additions",
+            "base_count",
+            "delta",
+            "head_count",
+            "omitted_addition_location_count",
+            "rules",
+            "value_length",
+            "value_sha256",
+        }:
+            raise ReviewError("secret-delta violation evidence is malformed")
+        digest = raw_violation["value_sha256"]
+        if not isinstance(digest, str):
+            raise ReviewError("secret-delta violation evidence is inconsistent")
+        expected_violation = expected_violations.get(digest)
+        if expected_violation is None or digest in seen_violation_digests:
+            raise ReviewError("secret-delta violation evidence is inconsistent")
+        base_count, head_count, rules, value_length = expected_violation
+        additions = raw_violation["additions"]
+        omitted = raw_violation["omitted_addition_location_count"]
+        if (
+            raw_violation["base_count"] != base_count
+            or raw_violation["head_count"] != head_count
+            or raw_violation["delta"] != head_count - base_count
+            or raw_violation["rules"] != rules
+            or raw_violation["value_length"] != value_length
+            or not isinstance(additions, list)
+            or len(additions) > MAX_SECRET_DELTA_ADDITION_LOCATIONS
+            or type(omitted) is not int
+            or omitted < 0
+        ):
+            raise ReviewError("secret-delta violation evidence is inconsistent")
+        for addition in additions:
+            if not isinstance(addition, dict) or set(addition) != {
+                "line",
+                "occurrence_count",
+                "path",
+                "surface",
+            }:
+                raise ReviewError("secret-delta addition evidence is malformed")
+            line = addition["line"]
+            occurrence_count = addition["occurrence_count"]
+            path = addition["path"]
+            if (
+                (line is not None and (type(line) is not int or line <= 0))
+                or type(occurrence_count) is not int
+                or occurrence_count <= 0
+                or not isinstance(path, str)
+                or not path
+                or "\x00" in path
+                or addition["surface"]
+                not in {"binary", "blob", "path", "symlink-target"}
+            ):
+                raise ReviewError("secret-delta addition evidence is inconsistent")
+        seen_violation_digests.add(digest)
+    if seen_violation_digests != set(expected_violations):
+        raise ReviewError("secret-delta evidence does not cover every violation")
+    expected_status = "violations" if expected_violations else "clean"
+    if (
+        secret_delta["status"] != "inconclusive"
+        and secret_delta["status"] != expected_status
+    ):
+        raise ReviewError("secret-delta status is inconsistent")
     return (
         exemptions,
         accepted,
@@ -5722,7 +6103,7 @@ def _load_legacy_manifest(
         evidence,
         tuple(reduction_values),
         reduction_counts,
-        provenance["head_sha256"],
+        dict(secret_delta),
         reduction_evidence,
     )
 
@@ -5823,19 +6204,16 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     control_dir = workspace_root / ".codex-review"
     catalog = load_catalog()
     validate_authoring_catalog_scanner_contract(catalog)
-    catalog_legacy_path_matcher = _legacy_path_matcher(
-        accepted_legacy_values(catalog, catalog.legacy_exemptions)
-    )
     _inspect_control_directory(control_dir, expected=control_state.directory)
     control_artifacts = control_state.artifacts
     (
-        exemptions,
+        _exemptions,
         legacy_values,
         legacy_counts,
         legacy_evidence,
         reduction_values,
         reduction_counts,
-        expected_head_reduction_provenance,
+        secret_delta_evidence,
         reduction_evidence,
     ) = _load_legacy_manifest(
         control_dir=control_dir,
@@ -5848,65 +6226,32 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
         expected_base_ref=review.base_ref,
         expected_head_ref=review.head_ref,
     )
-    _reject_unselected_legacy_reduction_candidates(
-        catalog=catalog,
-        exemptions=exemptions,
-        candidates={
-            descriptor.value: evidence["rules"]
-            for descriptor, evidence in zip(
-                reduction_values,
-                reduction_evidence,
-                strict=True,
-            )
-            if descriptor.value is not None
-        },
-    )
     authoring_values = accepted_authoring_values(catalog)
     accepted_values = authoring_values + legacy_values
     evidence_sensitive_values = (
         _all_catalog_sensitive_values(catalog) + reduction_values
     )
-    reduction_path_matcher = _secret_reduction_path_matcher(reduction_values)
-    reduced_secret_values = frozenset(
-        descriptor.value
-        for descriptor in reduction_values
-        if descriptor.value is not None
+    admission_counts_available = secret_delta_evidence["status"] != "inconclusive"
+    scan_values = (
+        accepted_values + reduction_values if admission_counts_available else ()
     )
-    counted_values = legacy_values + reduction_values
-    expected_counts = dict(legacy_counts)
-    expected_counts.update(reduction_counts)
+    expected_counts = dict(legacy_counts) if admission_counts_available else {}
+    if admission_counts_available:
+        expected_counts.update(reduction_counts)
     changed_accepted_evidence = _load_changed_synthetic_evidence(
         control_dir=control_dir,
         accepted_values=accepted_values,
         required=(control_dir / SYNTHETIC_MANIFEST_NAME).exists(),
         expected_artifact=control_artifacts[SYNTHETIC_CHANGED_EVIDENCE_NAME],
     )
-    accepted_index = _index_accepted_values(accepted_values)
-    counted_exact_index = _index_exact_values(counted_values)
-    base_only_path_discovery = SecretScanResult.empty()
-    base_only_path_matcher = _exact_path_matcher({})
-    event_budget = SecretScanBudget.default()
+    counted_exact_index = _index_exact_values(scan_values)
     occurrence_budget = LegacyOccurrenceBudget.default()
     snapshot_byte_budget = FileScanByteBudget.snapshot()
 
-    sensitive_findings: list[str] = []
-    sensitive_finding_count = 0
     accepted_evidence_counts: Counter[tuple[AcceptedSyntheticValue, str, str, str]] = (
         Counter()
     )
     frozen_head_counts: Counter[AcceptedSyntheticValue] = Counter()
-    frozen_head_unembedded_counts: Counter[AcceptedSyntheticValue] = Counter()
-    frozen_head_occurrences: dict[AcceptedSyntheticValue, set[str]] = {}
-    frozen_head_unembedded_occurrences: dict[
-        AcceptedSyntheticValue,
-        set[str],
-    ] = {}
-
-    def record_finding(value: str) -> None:
-        nonlocal sensitive_finding_count
-        sensitive_finding_count += 1
-        if len(sensitive_findings) < 10:
-            sensitive_findings.append(value)
 
     def record_scan(
         scan: SecretScanResult,
@@ -5914,48 +6259,12 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
         surface: str,
         side: str,
         path_bytes: bytes,
-        git_mode: str,
-        finding_label: str,
-        diagnostic_surface: str | None = None,
     ) -> None:
-        if scan.blocking_rule:
-            suffix = f"; {diagnostic_surface}" if diagnostic_surface is not None else ""
-            record_finding(f"{finding_label} ({scan.blocking_rule}{suffix})")
         path_sha256 = hashlib.sha256(path_bytes).hexdigest()
-        for descriptor, offsets in scan.reduction_occurrence_offsets.items():
-            occurrences = frozen_head_occurrences.setdefault(descriptor, set())
-            occurrences.update(
-                _secret_reduction_occurrence_identity(
-                    raw_path=path_bytes,
-                    git_mode=git_mode,
-                    offset=offset,
-                )
-                for offset in offsets
-            )
-        for descriptor, offsets in scan.reduction_unembedded_offsets.items():
-            occurrences = frozen_head_unembedded_occurrences.setdefault(
-                descriptor,
-                set(),
-            )
-            occurrences.update(
-                _secret_reduction_occurrence_identity(
-                    raw_path=path_bytes,
-                    git_mode=git_mode,
-                    offset=offset,
-                )
-                for offset in offsets
-            )
-        if (
-            sum(map(len, frozen_head_occurrences.values()))
-            > MAX_SECRET_REDUCTION_PROVENANCE_OCCURRENCES
-            or sum(map(len, frozen_head_unembedded_occurrences.values()))
-            > MAX_SECRET_REDUCTION_PROVENANCE_OCCURRENCES
-        ):
-            raise ReviewError(
-                "frozen head secret-reduction occurrence provenance exceeds "
-                "the entry limit"
-            )
-        for accepted, count in scan.accepted_counts.items():
+        for accepted in accepted_values:
+            count = scan.raw_occurrence_counts[accepted]
+            if not count:
+                continue
             _record_bounded_evidence_count(
                 accepted_evidence_counts,
                 (accepted, surface, side, path_sha256),
@@ -6019,51 +6328,8 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
                     "helper-private changed paths"
                 )
             changed_path_digest_evidence.append(expected_digest.decode("ascii"))
-            legacy_path_token_id = catalog_legacy_path_matcher.match(raw_path)
-            if legacy_path_token_id is not None:
-                record_finding(
-                    "<redacted changed path> "
-                    "(legacy-synthetic-value; changed-path-name)"
-                )
-                continue
             if side_tag == CHANGED_PATH_BASE_ONLY_TAG:
-                base_only_path_scan = _scan_secret_value(
-                    raw_path,
-                    accepted_values=accepted_values,
-                    capture_blocking_candidates=True,
-                    _accepted_index=accepted_index,
-                    _event_budget=event_budget,
-                    _continue_after_blocking=True,
-                )
-                if base_only_path_scan.blocking_rule is not None:
-                    record_finding(
-                        "<redacted changed path> "
-                        f"({base_only_path_scan.blocking_rule}; "
-                        "base-only-path-without-exact-deletion-proof)"
-                    )
-                base_only_path_discovery.merge(base_only_path_scan)
                 continue
-            reduction_path_token_id = reduction_path_matcher.match(raw_path)
-            if reduction_path_token_id is not None:
-                record_finding(
-                    "<redacted changed path> "
-                    "(secret-reduction-value; changed-path-name)"
-                )
-                continue
-            path_secret_rule = _value_secret_rule(
-                raw_path,
-                event_budget=event_budget,
-            )
-            if path_secret_rule:
-                record_finding(
-                    f"<redacted changed path> ({path_secret_rule}; changed-path-name)"
-                )
-                continue
-            changed_path = os.fsdecode(raw_path)
-            path_rule = _sensitive_path_rule(changed_path)
-            if path_rule:
-                path_display = _redact_secret_path(changed_path, "changed path")
-                record_finding(f"{path_display} ({path_rule}; changed-path)")
         if next(digest_records, None) is not None:
             raise ReviewError(
                 "external review changed path digests do not match "
@@ -6073,19 +6339,6 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
         raise ReviewError(
             "external review changed paths do not match helper-private record state"
         )
-    _reject_unselected_legacy_reduction_candidates(
-        catalog=catalog,
-        exemptions=exemptions,
-        candidates=base_only_path_discovery.blocking_candidates,
-    )
-    base_only_path_values = tuple(
-        _secret_reduction_descriptor(candidate, rules)
-        for candidate, rules in sorted(
-            base_only_path_discovery.blocking_candidates.items()
-        )
-    )
-    base_only_path_matcher = _secret_reduction_path_matcher(base_only_path_values)
-    evidence_sensitive_values += base_only_path_values
     _reject_raw_values_in_evidence(
         changed_path_digest_evidence,
         accepted_values=evidence_sensitive_values,
@@ -6126,7 +6379,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
                 raise ReviewError("external review changed-blob findings are malformed")
             changed_blob_path_digest_evidence.append(path_digest)
             changed_blob_record_count += 3
-            record_finding(f"<redacted changed blob path> ({rule}; {side}-blob)")
+            _ = (rule, side)
     if changed_blob_record_count != changed_blob_artifact.record_count:
         raise ReviewError(
             "external review changed-blob findings do not match "
@@ -6152,48 +6405,39 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
             raise ReviewError("frozen workspace exceeds the review entry-count limit")
         relative = relative_path.as_posix()
         raw_relative = os.fsencode(relative)
-        legacy_path_token_id = catalog_legacy_path_matcher.match(raw_relative)
-        reduction_path_token_id = reduction_path_matcher.match(raw_relative)
-        base_only_path_token_id = base_only_path_matcher.match(raw_relative)
-        if legacy_path_token_id is not None:
-            record_finding(
-                "<redacted snapshot path> (legacy-synthetic-value; path-name)"
+        try:
+            candidate_status = os.lstat(candidate)
+        except OSError as error:
+            raise ReviewError(
+                f"cannot inspect external review path {relative}"
+            ) from error
+        is_symlink = stat.S_ISLNK(candidate_status.st_mode)
+        is_directory = stat.S_ISDIR(candidate_status.st_mode)
+        materialized_gitlink = False
+        if is_directory:
+            try:
+                with os.scandir(candidate) as entries:
+                    materialized_gitlink = next(entries, None) is None
+            except OSError as error:
+                raise ReviewError(
+                    f"cannot inspect external review directory {relative}"
+                ) from error
+        if is_symlink or not is_directory or materialized_gitlink:
+            path_count_scan = _scan_secret_value(
+                raw_relative,
+                raw_occurrence_values=scan_values,
+                _exact_index=counted_exact_index,
+                _occurrence_budget=occurrence_budget,
+                exact_only=True,
             )
-        if reduction_path_token_id is not None:
-            record_finding(
-                "<redacted snapshot path> (secret-reduction-value; path-name)"
-            )
-        if base_only_path_token_id is not None:
-            record_finding(
-                "<redacted snapshot path> (base-only-path-secret-retained; path-name)"
-            )
-        path_secret_rule = _value_secret_rule(
-            raw_relative,
-            event_budget=event_budget,
-        )
-        if path_secret_rule:
-            record_finding(f"<redacted snapshot path> ({path_secret_rule}; path-name)")
-        path_display = (
-            "<redacted snapshot path>"
-            if legacy_path_token_id is not None
-            or reduction_path_token_id is not None
-            or base_only_path_token_id is not None
-            else _redact_secret_path(relative, "snapshot path")
-        )
-        path_rule = _sensitive_path_rule(relative)
-        if path_rule:
-            record_finding(f"{path_display} ({path_rule})")
-        if candidate.is_symlink():
+            frozen_head_counts.update(path_count_scan.raw_occurrence_counts)
+        path_display = relative
+        if is_symlink:
             try:
                 initial_link = os.lstat(candidate)
                 target = os.readlink(candidate)
                 raw_target = os.fsencode(target)
                 resolved_target = (candidate.parent / target).resolve(strict=False)
-                raw_resolved_target = os.fsencode(os.fspath(resolved_target))
-                target_contains_base_only_path_secret = (
-                    base_only_path_matcher.match(raw_target) is not None
-                    or base_only_path_matcher.match(raw_resolved_target) is not None
-                )
                 final_link = os.lstat(candidate)
                 if target != os.readlink(candidate) or (
                     initial_link.st_dev,
@@ -6223,17 +6467,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
                     f"cannot inspect external review symlink {path_display}{error_code}"
                 ) from error
             if not is_relative_to(resolved_target, workspace_root):
-                target_display = (
-                    "<redacted symlink target>"
-                    if catalog_legacy_path_matcher.match(raw_target) is not None
-                    or catalog_legacy_path_matcher.match(raw_resolved_target)
-                    is not None
-                    or target_contains_base_only_path_secret
-                    else _redact_secret_path(
-                        os.fspath(resolved_target),
-                        "symlink target",
-                    )
-                )
+                target_display = os.fspath(resolved_target)
                 raise ReviewError(
                     "external review symlink escapes the frozen workspace: "
                     f"{path_display} -> {target_display}"
@@ -6241,69 +6475,44 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
             snapshot_byte_budget.consume(len(raw_target))
             target_scan = _scan_secret_value(
                 raw_target,
-                accepted_values=accepted_values,
-                raw_occurrence_values=counted_values,
-                reduced_secret_values=reduced_secret_values,
-                capture_reduction_offsets=True,
-                _accepted_index=accepted_index,
-                _event_budget=event_budget,
+                raw_occurrence_values=scan_values,
                 _exact_index=counted_exact_index,
                 _occurrence_budget=occurrence_budget,
+                exact_only=True,
             )
-            if (
-                target_contains_base_only_path_secret
-                and target_scan.blocking_rule is None
-            ):
-                target_scan.blocking_rule = "base-only-path-secret-retained"
             record_scan(
                 target_scan,
                 surface="symlink-target",
                 side="head",
                 path_bytes=raw_relative,
-                git_mode="120000",
-                finding_label=f"{path_display} -> <redacted symlink target>",
-                diagnostic_surface="symlink-target",
             )
             frozen_head_counts.update(target_scan.raw_occurrence_counts)
-            frozen_head_unembedded_counts.update(
-                target_scan.unembedded_occurrence_counts
-            )
             continue
-        if candidate.is_dir():
+        if is_directory:
             continue
-        candidate_status = os.lstat(candidate)
-        git_mode = "100755" if candidate_status.st_mode & 0o111 else "100644"
         scan = _file_secret_scan(
             candidate,
-            accepted_values=accepted_values,
-            raw_occurrence_values=counted_values,
-            reduced_secret_values=reduced_secret_values,
-            capture_reduction_offsets=True,
-            accepted_index=accepted_index,
-            event_budget=event_budget,
+            raw_occurrence_values=scan_values,
             exact_index=counted_exact_index,
             occurrence_budget=occurrence_budget,
-            blocking_exact_matcher=base_only_path_matcher,
             max_bytes=MAX_SNAPSHOT_BLOB_BYTES,
             byte_budget=snapshot_byte_budget,
             diagnostic_path=path_display,
+            exact_only=True,
         )
         record_scan(
             scan,
             surface="frozen-head",
             side="head",
             path_bytes=raw_relative,
-            git_mode=git_mode,
-            finding_label=path_display,
         )
         frozen_head_counts.update(scan.raw_occurrence_counts)
-        frozen_head_unembedded_counts.update(scan.unembedded_occurrence_counts)
 
     for accepted, (
         _base_count,
         expected_head_count,
-        _base_unembedded_count,
-        expected_head_unembedded_count,
+        _unused_base,
+        _unused_head,
     ) in expected_counts.items():
         actual_head_count = frozen_head_counts[accepted]
         if actual_head_count != expected_head_count:
@@ -6311,14 +6520,6 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
                 "frozen head secret count changed after preparation "
                 f"for {accepted.identifier}: expected={expected_head_count}, "
                 f"actual={actual_head_count}"
-            )
-        actual_head_unembedded_count = frozen_head_unembedded_counts[accepted]
-        if actual_head_unembedded_count != expected_head_unembedded_count:
-            raise ReviewError(
-                "frozen head secret unembedded count changed "
-                f"after preparation for {accepted.identifier}: "
-                f"expected={expected_head_unembedded_count}, "
-                f"actual={actual_head_unembedded_count}"
             )
 
     primary_diff_artifact = control_artifacts["review.diff"]
@@ -6338,25 +6539,6 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     ) as (prompt_handle, _prompt_metadata):
         while prompt_handle.read(64 * 1024):
             pass
-    if sensitive_finding_count:
-        summary = ", ".join(sensitive_findings)
-        if sensitive_finding_count > len(sensitive_findings):
-            summary += f", and {sensitive_finding_count - len(sensitive_findings)} more"
-        raise ReviewError(
-            "sensitive content preflight blocked external review; remove or narrow "
-            f"these paths before egress: {summary}"
-        )
-
-    actual_head_reduction_provenance = _secret_reduction_provenance_commitment(
-        frozen_head_occurrences,
-        frozen_head_unembedded_occurrences,
-    )
-    if actual_head_reduction_provenance != expected_head_reduction_provenance:
-        raise ReviewError(
-            "frozen head secret-reduction occurrence provenance changed after "
-            "preparation"
-        )
-
     accepted_evidence = list(changed_accepted_evidence)
     accepted_evidence.extend(
         _accepted_evidence_entry(
@@ -6384,6 +6566,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
             "sha256": primary_diff_artifact.sha256,
             "size": primary_diff_artifact.size,
         },
+        "secret_delta": secret_delta_evidence,
         "synthetic_tokens": {
             "accepted": accepted_evidence,
             "catalog_schema_version": catalog.schema_version,
@@ -6395,11 +6578,6 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     _encode_synthetic_evidence_json(evidence)
     complete_preflight_evidence = build_preflight_evidence(review, evidence)
     encode_preflight_json(complete_preflight_evidence)
-    _reject_raw_values_in_evidence(
-        complete_preflight_evidence,
-        accepted_values=evidence_sensitive_values,
-        label="synthetic-token preflight evidence",
-    )
     _inspect_control_directory(control_dir, expected=control_state.directory)
     return evidence
 
@@ -6412,7 +6590,7 @@ def build_preflight_evidence(
         "review_range": f"{review.base_ref}..{review.head_ref}",
         "private_artifacts": "removed",
         "scope": "frozen tracked workspace, diff, and review prompt",
-        "status": "secret-delta and escaping-symlink checks passed",
+        "status": "review workspace containment and integrity checks passed",
     }
     overlap = set(fixed_evidence).intersection(synthetic_evidence)
     if overlap:
@@ -6484,6 +6662,7 @@ def _file_secret_scan(
     byte_budget: FileScanByteBudget | None = None,
     expected_artifact: ControlArtifactEvidence | None = None,
     diagnostic_path: str | None = None,
+    exact_only: bool = False,
     _continue_after_blocking: bool = False,
 ) -> SecretScanResult:
     path_display = (
@@ -6514,6 +6693,7 @@ def _file_secret_scan(
             _exact_index=exact_index,
             _occurrence_budget=occurrence_budget,
             _blocking_exact_matcher=blocking_exact_matcher,
+            exact_only=exact_only,
             _continue_after_blocking=_continue_after_blocking,
         )
 
@@ -6662,6 +6842,9 @@ def _secret_assignment_rhs_is_closed(
     ):
         raise ReviewError("sensitive scanner produced an invalid RHS proof range")
     proof_suffix_context_complete = suffix_context_complete and proof_end == len(value)
+    prefix_context_cache = _AssignmentPrefixContextCache(
+        assignment_prefix_end=assignment_end,
+    )
     cursor = assignment_end
     inspected_end = cursor
     wrapper_closers: list[int] = []
@@ -6730,6 +6913,7 @@ def _secret_assignment_rhs_is_closed(
                 event_budget=event_budget,
                 maximum_end=proof_end,
                 inspection_recorder=record_tail_inspected,
+                prefix_context_cache=prefix_context_cache,
             )
         except _IncompleteSecretScanSuffix:
             return False
@@ -6747,6 +6931,7 @@ def _secret_assignment_rhs_is_closed(
                 event_budget=event_budget,
                 maximum_end=closer_start + 1,
                 matching_external_closer_only=True,
+                prefix_context_cache=prefix_context_cache,
             )
         except _IncompleteSecretScanSuffix:
             return False
@@ -7129,6 +7314,7 @@ def _quoted_assignment_may_accept(
     maximum_end: int | None = None,
     inspection_recorder: Callable[[int], None] | None = None,
     matching_external_closer_only: bool = False,
+    prefix_context_cache: _AssignmentPrefixContextCache | None = None,
 ) -> bool:
     logical_end = len(value) if maximum_end is None else min(len(value), maximum_end)
     if not (
@@ -7136,6 +7322,12 @@ def _quoted_assignment_may_accept(
     ):
         raise ReviewError(
             "sensitive scanner produced an invalid assignment proof range"
+        )
+    if prefix_context_cache is not None and not (
+        assignment_start <= prefix_context_cache.assignment_prefix_end <= assignment_end
+    ):
+        raise ReviewError(
+            "sensitive scanner produced an invalid cached assignment prefix"
         )
     suffix_context_complete = suffix_context_complete and logical_end == len(value)
     cursor = assignment_end
@@ -7579,6 +7771,11 @@ def _quoted_assignment_may_accept(
             0x7B: 0x7D,
         }
         closers: list[int] = []
+        mapping_key_end = (
+            prefix_context_cache.assignment_prefix_end
+            if prefix_context_cache is not None
+            else assignment_end
+        )
 
         def quote_starts_mapping_key(
             prefix_value: bytes,
@@ -7595,17 +7792,17 @@ def _quoted_assignment_may_accept(
                 delimiter=delimiter,
                 start=assignment_start,
                 diff_side=match_diff_side,
-                maximum_end=assignment_end,
+                maximum_end=mapping_key_end,
             )
-            if key_quote_end is None or key_quote_end >= assignment_end:
+            if key_quote_end is None or key_quote_end >= mapping_key_end:
                 return False
             key_separator = key_quote_end + len(delimiter)
-            while key_separator < assignment_end and value[
+            while key_separator < mapping_key_end and value[
                 key_separator : key_separator + 1
             ] in (b" ", b"\t"):
                 key_separator += 1
             return (
-                key_separator < assignment_end
+                key_separator < mapping_key_end
                 and value[key_separator : key_separator + 1] == b":"
             )
 
@@ -7783,7 +7980,13 @@ def _quoted_assignment_may_accept(
         nonlocal outer_delimiter, outer_quote_pending, source_wrapper_closers
         if external_wrapper_context_loaded:
             return True
-        external_wrapper_context = wrapper_context_before_assignment()
+        if prefix_context_cache is not None and prefix_context_cache.loaded:
+            external_wrapper_context = prefix_context_cache.context
+        else:
+            external_wrapper_context = wrapper_context_before_assignment()
+            if prefix_context_cache is not None:
+                prefix_context_cache.context = external_wrapper_context
+                prefix_context_cache.loaded = True
         if external_wrapper_context is None:
             return False
         physical_closers, outer_delimiter, logical_closers = external_wrapper_context
@@ -8603,7 +8806,14 @@ def _iter_secret_events(
         if not end_is_committable(event_end):
             continue
         event_budget.consume()
-        yield rule, None, event_end, False, None, None
+        yield (
+            rule,
+            None,
+            event_end,
+            False,
+            None,
+            _UNEXTRACTABLE_SECRET_CANDIDATE_END,
+        )
     for rule, pattern in SECRET_PATTERNS:
         markers = SECRET_PATTERN_MARKERS.get(rule)
         marker_surface = value.lower() if rule == "aws-secret-key" else value
@@ -8633,7 +8843,14 @@ def _iter_secret_events(
                     for end in long_specific_candidate_ends.get(start, ())
                 ):
                     continue
-                yield rule, None, match.end(), False, None, None
+                yield (
+                    rule,
+                    None,
+                    match.end(),
+                    False,
+                    None,
+                    _UNEXTRACTABLE_SECRET_CANDIDATE_END,
+                )
             else:
                 yield rule, candidate, match.end(), True, start, candidate_end
     specific_ranges = sorted(
@@ -8653,7 +8870,14 @@ def _iter_secret_events(
         if specific_max_end_by_start.get(match.start(), -1) > match.end():
             continue
         event_budget.consume()
-        yield "jwt", None, match.end(), False, None, None
+        yield (
+            "jwt",
+            None,
+            match.end(),
+            False,
+            None,
+            _UNEXTRACTABLE_SECRET_CANDIDATE_END,
+        )
     for rule, pattern in (
         ("aws-secret-key", OVERSIZED_AWS_SECRET_KEY_GAP),
         ("jwt", OVERSIZED_JWT_PATTERN),
@@ -8663,7 +8887,14 @@ def _iter_secret_events(
             if not match_is_committable(match):
                 continue
             event_budget.consume()
-            yield rule, None, match.end(), False, None, None
+            yield (
+                rule,
+                None,
+                match.end(),
+                False,
+                None,
+                _UNEXTRACTABLE_SECRET_CANDIDATE_END,
+            )
     for pattern, quoted in (
         (OVERSIZED_QUOTED_SECRET_ASSIGNMENT, True),
         (OVERSIZED_UNQUOTED_SECRET_ASSIGNMENT, False),
@@ -8708,7 +8939,7 @@ def _iter_secret_events(
                 match.end(),
                 False,
                 None,
-                None,
+                _UNEXTRACTABLE_SECRET_CANDIDATE_END,
             )
     pending_specific_ranges = tuple(
         specific_range
@@ -8770,7 +9001,7 @@ def _iter_secret_events(
                     quoted_proof_limit,
                     False,
                     match.start(),
-                    None,
+                    _UNEXTRACTABLE_SECRET_CANDIDATE_END,
                 )
             continue
         closing_start = _find_unescaped_delimiter(
@@ -8802,7 +9033,7 @@ def _iter_secret_events(
                     quoted_proof_limit,
                     False,
                     match.start(),
-                    None,
+                    _UNEXTRACTABLE_SECRET_CANDIDATE_END,
                 )
                 continue
             yield (
@@ -9992,6 +10223,7 @@ def _scan_secret_value(
     _event_budget: SecretScanBudget | None = None,
     _exact_index: ExactValueIndex | None = None,
     _occurrence_budget: LegacyOccurrenceBudget | None = None,
+    exact_only: bool = False,
     _continue_after_blocking: bool = False,
     _capture_only_legacy_evidence: bool = False,
 ) -> SecretScanResult:
@@ -10029,6 +10261,8 @@ def _scan_secret_value(
     result.unembedded_occurrence_counts.update(unembedded_counts)
     result.reduction_occurrence_offsets.update(reduction_offsets)
     result.reduction_unembedded_offsets.update(reduction_unembedded_offsets)
+    if exact_only:
+        return result
     upper = len(value) if maximum_end is None else maximum_end
     accepted_index = _accepted_index or _index_accepted_values(accepted_values)
     event_budget = _event_budget or SecretScanBudget.default()
@@ -10114,8 +10348,15 @@ def _scan_secret_value(
                 raise ReviewError(
                     "external review secret-reduction candidates exceed the byte limit"
                 )
-        elif result.blocking_rule is None:
-            result.blocking_rule = rule
+        else:
+            if (
+                candidate is None
+                and candidate_end == _UNEXTRACTABLE_SECRET_CANDIDATE_END
+                and result.unextractable_rule is None
+            ):
+                result.unextractable_rule = rule
+            if result.blocking_rule is None:
+                result.blocking_rule = rule
             if not _continue_after_blocking:
                 return result
     return result
@@ -10162,6 +10403,7 @@ def _stream_secret_scan(
     _exact_index: ExactValueIndex | None = None,
     _occurrence_budget: LegacyOccurrenceBudget | None = None,
     _blocking_exact_matcher: LegacyPathMatcher | None = None,
+    exact_only: bool = False,
     _continue_after_blocking: bool = False,
 ) -> SecretScanResult:
     if size is not None and size < 0:
@@ -10286,6 +10528,10 @@ def _stream_secret_scan(
             )
             exact_pending = exact_pending[retain_exact_from - exact_pending_offset :]
             exact_pending_offset = retain_exact_from
+        if exact_only:
+            if at_end:
+                break
+            continue
         if blocked:
             if at_end:
                 break
@@ -10526,10 +10772,6 @@ def audit_legacy_exemption(
     if catalog.legacy_exemption(exemption.identifier) != exemption:
         raise ReviewError("legacy exemption changed while the audit was prepared")
     accepted = accepted_legacy_values(catalog, (exemption,))
-    catalog_legacy_values = accepted_legacy_values(
-        catalog,
-        catalog.legacy_exemptions,
-    )
     authoring_accepted = accepted_authoring_values(catalog)
     scan_accepted = authoring_accepted + accepted
     descriptors = {item.identifier: item for item in accepted}
@@ -10558,13 +10800,6 @@ def audit_legacy_exemption(
                 )
             by_commit.setdefault(token.containing_commit, []).append(
                 descriptors[token.identifier]
-            )
-        for commit in sorted({tip, *by_commit}):
-            _reject_legacy_values_in_frozen_tree_paths(
-                git_view=git_view,
-                object_directory=object_directory,
-                commit=commit,
-                legacy_values=catalog_legacy_values,
             )
         for commit, commit_descriptors in sorted(by_commit.items()):
             scan = _scan_frozen_tree_values(
@@ -10651,19 +10886,15 @@ def prepare_workspace(
     )
     catalog = load_catalog()
     validate_authoring_catalog_scanner_contract(catalog)
-    selected_exemptions = resolve_legacy_exemptions(
-        catalog,
-        synthetic_secret_exemptions,
-    )
+    # Keep validating the deprecated option for typo detection, but every
+    # catalog legacy value now participates automatically.
+    resolve_legacy_exemptions(catalog, synthetic_secret_exemptions)
+    selected_exemptions = catalog.legacy_exemptions
     accepted_values = accepted_authoring_values(catalog) + accepted_legacy_values(
         catalog,
         selected_exemptions,
     )
-    catalog_legacy_values = accepted_legacy_values(
-        catalog,
-        catalog.legacy_exemptions,
-    )
-    catalog_legacy_value_matcher = _legacy_path_matcher(catalog_legacy_values)
+    catalog_legacy_value_matcher = _exact_path_matcher({})
     evidence_sensitive_values = _all_catalog_sensitive_values(catalog)
     (
         container,
@@ -10736,24 +10967,29 @@ def prepare_workspace(
                 raise ReviewError(
                     f"the frozen {label} uses the reserved top-level .codex-review path"
                 )
-            _reject_legacy_values_in_frozen_tree_paths(
+        try:
+            (
+                synthetic_manifest,
+                private_synthetic_manifest,
+                secret_reductions,
+            ) = _secret_count_manifests(
                 git_view=git_view,
                 object_directory=object_directory,
-                commit=commit,
-                legacy_values=catalog_legacy_values,
+                base_sha=base_sha,
+                head_sha=head_sha,
+                catalog=catalog,
             )
-        (
-            synthetic_manifest,
-            private_synthetic_manifest,
-            secret_reductions,
-        ) = _secret_count_manifests(
-            git_view=git_view,
-            object_directory=object_directory,
-            base_sha=base_sha,
-            head_sha=head_sha,
-            catalog=catalog,
-            exemptions=selected_exemptions,
-        )
+        except ReviewError:
+            (
+                synthetic_manifest,
+                private_synthetic_manifest,
+                secret_reductions,
+            ) = _inconclusive_secret_count_manifests(
+                base_sha=base_sha,
+                head_sha=head_sha,
+                catalog=catalog,
+                failure_class="exact-value-scan-incomplete",
+            )
         manifest_sensitive_values = evidence_sensitive_values + secret_reductions
         _materialize_frozen_tree(
             git_view=git_view,
@@ -10781,13 +11017,11 @@ def prepare_workspace(
             control_dir / SYNTHETIC_MANIFEST_NAME,
             synthetic_manifest,
             label="synthetic secret manifest",
-            accepted_values=manifest_sensitive_values,
         )
         _write_private_bounded_json(
             container / SYNTHETIC_PRIVATE_MANIFEST_NAME,
             private_synthetic_manifest,
             label="synthetic secret helper-private state",
-            accepted_values=evidence_sensitive_values,
             expected_identity=private_artifact_identities[
                 SYNTHETIC_PRIVATE_MANIFEST_NAME
             ],

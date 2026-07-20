@@ -12426,7 +12426,7 @@ def run_review(
                 "review_range": f"{review.base_ref}..{review.head_ref}",
                 "included": [
                     "tracked blobs materialized from the frozen head commit",
-                    "the generated frozen diff, including proven secret reductions",
+                    "the complete generated frozen diff without secret redaction",
                     "the review prompt and result",
                 ],
                 "excluded": [
@@ -12434,7 +12434,10 @@ def run_review(
                     "unrelated repositories",
                     "broad workspace or home-directory content",
                 ],
-                "preflight": "secret-delta and escaping-symlink checks passed",
+                "merge_gate": "secret-delta status is evaluated separately",
+                "preflight": (
+                    "review workspace containment and integrity checks passed"
+                ),
             },
         )
 

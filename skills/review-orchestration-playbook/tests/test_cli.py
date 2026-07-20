@@ -289,7 +289,7 @@ class ForegroundCleanupTest(unittest.TestCase):
                     cli,
                     "run_review",
                     side_effect=review_with_live_cleanup_probe,
-                ),
+                ) as run_review,
                 mock.patch.object(
                     cli,
                     "cleanup_workspace",
@@ -300,6 +300,11 @@ class ForegroundCleanupTest(unittest.TestCase):
                 returncode = cli._run_foreground(args)
 
             self.assertEqual(returncode, 0)
+            run_review.assert_called_once_with(
+                review=review,
+                reviewer="codex",
+                egress_consent=None,
+            )
             self.assertFalse(review.container_dir.exists())
 
     def test_handoff_signal_cleans_workspace_owned_by_caller(self) -> None:

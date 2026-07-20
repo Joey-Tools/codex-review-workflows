@@ -1469,7 +1469,7 @@ def _should_retain_fallback_workspace(
         if (
             preflight.get("private_artifacts") != "removed"
             or preflight.get("status")
-            != "secret-delta and escaping-symlink checks passed"
+            != "review workspace containment and integrity checks passed"
         ):
             return False
         primary_diff = preflight.get("primary_diff")

@@ -195,20 +195,36 @@ class WorkspaceTest(unittest.TestCase):
             )
         self.assertNotIn(b"<redacted", diff)
 
-    def assert_external_review_blocked(
+    def assert_secret_delta_status(self, review, expected: str) -> dict:
+        evidence = validate_external_workspace(review)
+        secret_delta = evidence["secret_delta"]
+        self.assertEqual(secret_delta["status"], expected)
+        self.assertIn(
+            secret_delta["location_status"],
+            {"complete", "inconclusive"},
+        )
+        return secret_delta
+
+    def assert_secret_violation(
         self,
+        review,
+        raw_value: bytes,
         *,
-        base_ref: str,
-        head_ref: str,
-        rule: str,
-    ) -> None:
-        try:
-            review = self.prepare_range(base_ref, head_ref)
-        except ReviewError as error:
-            self.assertRegex(str(error), rule)
-            return
-        with self.assertRaisesRegex(ReviewError, rule):
-            validate_external_workspace(review)
+        base_count: int,
+        head_count: int,
+    ) -> dict:
+        secret_delta = self.assert_secret_delta_status(review, "violations")
+        matching = [
+            violation
+            for violation in secret_delta["violations"]
+            if violation["value_sha256"] == hashlib.sha256(raw_value).hexdigest()
+        ]
+        self.assertEqual(len(matching), 1)
+        violation = matching[0]
+        self.assertEqual(violation["base_count"], base_count)
+        self.assertEqual(violation["head_count"], head_count)
+        self.assertEqual(violation["delta"], head_count - base_count)
+        return violation
 
     def test_git_environment_disables_lazy_fetch_and_prompts(self) -> None:
         environment = workspace_runtime._git_environment()
@@ -466,6 +482,18 @@ class WorkspaceTest(unittest.TestCase):
 
         evidence = validate_external_workspace(review)
 
+        manifest = json.loads(
+            (
+                review.workspace_root
+                / ".codex-review"
+                / workspace_runtime.SYNTHETIC_MANIFEST_NAME
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(manifest["schema_version"], 5)
+        self.assertEqual(
+            set(manifest["secret_delta"]),
+            {"limitations", "location_status", "status", "violations"},
+        )
         self.assertEqual(
             evidence["primary_diff"],
             {
@@ -477,6 +505,10 @@ class WorkspaceTest(unittest.TestCase):
         encoded_evidence = json.dumps(evidence, sort_keys=True)
         self.assertNotIn(str(review.workspace_root), encoded_evidence)
         self.assertNotIn("+two", encoded_evidence)
+        self.assertEqual(
+            workspace_runtime.build_preflight_evidence(review, evidence)["status"],
+            "review workspace containment and integrity checks passed",
+        )
 
         tampered_diff = bytearray(diff_bytes)
         tampered_diff[0] ^= 1
@@ -935,7 +967,9 @@ class WorkspaceTest(unittest.TestCase):
             [],
         )
 
-    def test_snapshot_rejects_oversized_changed_blob_metadata(self) -> None:
+    def test_oversized_changed_blob_finding_metadata_does_not_block_validation(
+        self,
+    ) -> None:
         def write_empty_changed_paths(**kwargs) -> None:
             kwargs["destination"].touch()
             status = kwargs["private_destination"].stat()
@@ -954,19 +988,18 @@ class WorkspaceTest(unittest.TestCase):
                 side_effect=write_empty_changed_paths,
             ),
             mock.patch.object(workspace_runtime, "MAX_CHANGED_METADATA_BYTES", 1),
-            self.assertRaisesRegex(ReviewError, "changed blob metadata exceeds"),
         ):
-            prepare_workspace(
-                repo=self.repo,
+            review = self.prepare_range(
                 base_ref=self.base,
                 head_ref=self.head,
             )
-        self.assertEqual(
-            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
-            [],
-        )
+        secret_delta = self.assert_secret_delta_status(review, "clean")
+        self.assertEqual(secret_delta["location_status"], "complete")
+        self.assertIn(b"+two", review.diff_file.read_bytes())
 
-    def test_snapshot_rejects_excessive_changed_blob_entries(self) -> None:
+    def test_excessive_changed_blob_finding_entries_do_not_block_validation(
+        self,
+    ) -> None:
         def write_empty_changed_paths(**kwargs) -> None:
             kwargs["destination"].touch()
             status = kwargs["private_destination"].stat()
@@ -985,32 +1018,32 @@ class WorkspaceTest(unittest.TestCase):
                 side_effect=write_empty_changed_paths,
             ),
             mock.patch.object(workspace_runtime, "MAX_CHANGED_ENTRIES", 0),
-            self.assertRaisesRegex(ReviewError, "changed blob metadata exceeds"),
         ):
-            prepare_workspace(
-                repo=self.repo,
+            review = self.prepare_range(
                 base_ref=self.base,
                 head_ref=self.head,
             )
-        self.assertEqual(
-            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
-            [],
-        )
+        secret_delta = self.assert_secret_delta_status(review, "clean")
+        self.assertEqual(secret_delta["location_status"], "complete")
+        self.assertIn(b"+two", review.diff_file.read_bytes())
 
-    def test_snapshot_rejects_oversized_changed_blob_scan(self) -> None:
-        with (
-            mock.patch.object(workspace_runtime, "MAX_CHANGED_BLOB_SCAN_BYTES", 1),
-            self.assertRaisesRegex(ReviewError, "total review scan limit"),
+    def test_oversized_changed_blob_scan_marks_secret_delta_inconclusive(self) -> None:
+        with mock.patch.object(
+            workspace_runtime,
+            "MAX_CHANGED_BLOB_SCAN_BYTES",
+            1,
         ):
-            prepare_workspace(
-                repo=self.repo,
+            review = self.prepare_range(
                 base_ref=self.base,
                 head_ref=self.head,
             )
+        secret_delta = self.assert_secret_delta_status(review, "inconclusive")
         self.assertEqual(
-            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
-            [],
+            secret_delta["failure_class"],
+            "exact-value-scan-incomplete",
         )
+        self.assertEqual(secret_delta["location_status"], "inconclusive")
+        self.assertIn(b"+two", review.diff_file.read_bytes())
 
     def test_materialization_os_error_redacts_secret_path(self) -> None:
         secret = "AKIA" + "B" * 16
@@ -3331,7 +3364,7 @@ class WorkspaceTest(unittest.TestCase):
             )
         self.assertNotIn(secret, str(raised.exception))
 
-    def test_unchanged_sensitive_path_symlink_blocks_external_review(self) -> None:
+    def test_unchanged_sensitive_path_symlink_is_available_to_reviewer(self) -> None:
         (self.repo / "public.txt").write_text("ordinary content\n", encoding="utf-8")
         credentials = self.repo / "fixtures"
         credentials.mkdir()
@@ -3350,10 +3383,16 @@ class WorkspaceTest(unittest.TestCase):
             head_ref=unrelated_head,
         )
         self.reviews.append(review)
-        with self.assertRaisesRegex(ReviewError, r"fixtures/\.netrc.*credential-path"):
-            validate_external_workspace(review)
+        secret_delta = self.assert_secret_delta_status(review, "clean")
 
-    def test_unchanged_secret_in_path_name_blocks_external_review(self) -> None:
+        self.assertEqual(secret_delta["violations"], [])
+        self.assertTrue((review.workspace_root / "fixtures/.netrc").is_symlink())
+        self.assertEqual(
+            os.readlink(review.workspace_root / "fixtures/.netrc"),
+            "../public.txt",
+        )
+
+    def test_unchanged_secret_in_path_name_is_available_to_reviewer(self) -> None:
         secret = "sk-" + "A" * 40
         secret_path = self.repo / "fixtures" / secret
         secret_path.parent.mkdir()
@@ -3372,14 +3411,17 @@ class WorkspaceTest(unittest.TestCase):
             head_ref=unrelated_head,
         )
         self.reviews.append(review)
-        with self.assertRaisesRegex(
-            ReviewError,
-            r"<redacted snapshot path>.*openai-key.*path-name",
-        ) as raised:
-            validate_external_workspace(review)
-        self.assertNotIn(secret, str(raised.exception))
+        secret_delta = self.assert_secret_delta_status(review, "clean")
 
-    def test_secret_in_sensitive_changed_path_is_redacted(self) -> None:
+        self.assertEqual(secret_delta["violations"], [])
+        self.assertEqual(
+            (review.workspace_root / "fixtures" / secret).read_text(encoding="utf-8"),
+            "ordinary content\n",
+        )
+
+    def test_secret_in_sensitive_changed_path_is_raw_with_violation_evidence(
+        self,
+    ) -> None:
         secret = "sk-" + "A" * 40
         secret_path = self.repo / secret / ".netrc"
         secret_path.parent.mkdir()
@@ -3394,14 +3436,23 @@ class WorkspaceTest(unittest.TestCase):
         )
         self.reviews.append(review)
 
-        with self.assertRaisesRegex(
-            ReviewError,
-            r"<redacted changed path>.*openai-key.*changed-path-name",
-        ) as raised:
-            validate_external_workspace(review)
-        self.assertNotIn(secret, str(raised.exception))
+        secret_delta = self.assert_secret_delta_status(review, "violations")
+        self.assertEqual(secret_delta["location_status"], "complete")
+        self.assertEqual(len(secret_delta["violations"]), 1)
+        violation = secret_delta["violations"][0]
+        self.assertEqual(
+            (violation["base_count"], violation["head_count"], violation["delta"]),
+            (0, 1, 1),
+        )
+        self.assertEqual(violation["additions"][0]["surface"], "path")
+        self.assertEqual(violation["additions"][0]["path"], f"{secret}/.netrc")
+        self.assertEqual(
+            (review.workspace_root / secret / ".netrc").read_text(encoding="utf-8"),
+            "ordinary content\n",
+        )
+        self.assertIn(secret.encode(), review.diff_file.read_bytes())
 
-    def test_unchanged_secret_in_symlink_target_blocks_external_review(self) -> None:
+    def test_unchanged_secret_in_symlink_target_is_available_to_reviewer(self) -> None:
         secret = "sk-" + "A" * 40
         (self.repo / "artifact").symlink_to(secret)
         git(self.repo, "add", "artifact")
@@ -3412,46 +3463,39 @@ class WorkspaceTest(unittest.TestCase):
         git(self.repo, "commit", "-m", "Change unrelated content")
         unrelated_head = git(self.repo, "rev-parse", "HEAD")
 
-        with self.assertRaisesRegex(ReviewError, "openai-key") as raised:
-            prepare_workspace(
-                repo=self.repo,
-                base_ref=sensitive_base,
-                head_ref=unrelated_head,
-            )
-        self.assertNotIn(secret, str(raised.exception))
+        review = self.prepare_range(sensitive_base, unrelated_head)
+        secret_delta = self.assert_secret_delta_status(review, "clean")
 
-    def test_secret_findings_escape_control_characters_in_snapshot_paths(self) -> None:
-        secret = "AKIA" + "C" * 16
+        self.assertEqual(secret_delta["violations"], [])
+        self.assertEqual(os.readlink(review.workspace_root / "artifact"), secret)
+
+    def test_secret_content_in_control_character_paths_remains_raw(self) -> None:
+        file_secret = "AKIA" + "C" * 16
+        link_secret = "sk-" + "D" * 40
         file_name = "file\n\x1bname"
         symlink_name = "link\n\x1bname"
-        (self.repo / "example.txt").write_text("three\n", encoding="utf-8")
-        git(self.repo, "add", "example.txt")
-        git(self.repo, "commit", "-m", "Prepare clean review range")
-        clean_head = git(self.repo, "rev-parse", "HEAD")
+        (self.repo / file_name).write_text(file_secret + "\n", encoding="utf-8")
+        (self.repo / symlink_name).symlink_to(link_secret)
+        git(self.repo, "add", file_name, symlink_name)
+        git(self.repo, "commit", "-m", "Add raw tracked secret content")
+        secret_head = git(self.repo, "rev-parse", "HEAD")
 
-        review = prepare_workspace(
-            repo=self.repo,
-            base_ref=self.head,
-            head_ref=clean_head,
-        )
-        self.reviews.append(review)
-        (review.workspace_root / file_name).write_text(
-            secret + "\n",
-            encoding="utf-8",
-        )
-        (review.workspace_root / symlink_name).symlink_to("sk-" + "D" * 40)
+        review = self.prepare_range(self.head, secret_head)
+        secret_delta = self.assert_secret_delta_status(review, "violations")
 
-        with self.assertRaises(ReviewError) as raised:
-            validate_external_workspace(review)
-
-        diagnostic = str(raised.exception)
-        self.assertNotIn("\n", diagnostic)
-        self.assertNotIn("\x1b", diagnostic)
-        self.assertIn("file\\x0a\\x1bname (aws-access-key)", diagnostic)
-        self.assertIn(
-            "link\\x0a\\x1bname -> <redacted symlink target>",
-            diagnostic,
+        self.assertEqual(secret_delta["location_status"], "complete")
+        self.assertEqual(
+            (review.workspace_root / file_name).read_text(encoding="utf-8"),
+            file_secret + "\n",
         )
+        self.assertEqual(
+            os.readlink(review.workspace_root / symlink_name),
+            link_secret,
+        )
+        diff = review.diff_file.read_bytes()
+        self.assertIn(file_secret.encode(), diff)
+        self.assertIn(link_secret.encode(), diff)
+        self.assertNotIn(b"<redacted", diff)
 
     def test_deleted_binary_secret_is_allowed_without_control_evidence_leak(
         self,
@@ -3472,6 +3516,158 @@ class WorkspaceTest(unittest.TestCase):
         diff = review.diff_file.read_bytes()
         self.assertIn(b"GIT binary patch", diff)
         self.assert_control_evidence_omits(review, secret)
+
+    def test_binary_secret_growth_reports_only_the_new_occurrence(self) -> None:
+        secret = unregistered_provider_credential()
+        base_payload = b"\0binary\0" + secret + b"\0"
+        head_payload = base_payload + secret + b"\0"
+        secret_base = self.commit_bytes(
+            "growing-opaque.bin",
+            base_payload,
+            "Add one binary credential",
+        )
+        secret_head = self.commit_bytes(
+            "growing-opaque.bin",
+            head_payload,
+            "Add a second binary credential",
+        )
+
+        review = self.prepare_range(secret_base, secret_head)
+        violation = self.assert_secret_violation(
+            review,
+            secret,
+            base_count=1,
+            head_count=2,
+        )
+
+        self.assertEqual(
+            violation["additions"],
+            [
+                {
+                    "line": None,
+                    "occurrence_count": 1,
+                    "path": "growing-opaque.bin",
+                    "surface": "binary",
+                }
+            ],
+        )
+        self.assertEqual(
+            (review.workspace_root / "growing-opaque.bin").read_bytes(),
+            head_payload,
+        )
+
+    def test_symlink_target_secret_growth_reports_only_the_new_occurrence(
+        self,
+    ) -> None:
+        secret = "sk-" + "I" * 40
+        link_path = self.repo / "growing-link"
+        base_target = f"{secret}/target"
+        head_target = f"{secret}/{secret}/target"
+        link_path.symlink_to(base_target)
+        git(self.repo, "add", "growing-link")
+        git(self.repo, "commit", "-m", "Add one symlink credential")
+        secret_base = git(self.repo, "rev-parse", "HEAD")
+        link_path.unlink()
+        link_path.symlink_to(head_target)
+        git(self.repo, "add", "growing-link")
+        git(self.repo, "commit", "-m", "Add a second symlink credential")
+        secret_head = git(self.repo, "rev-parse", "HEAD")
+
+        review = self.prepare_range(secret_base, secret_head)
+        violation = self.assert_secret_violation(
+            review,
+            secret.encode("ascii"),
+            base_count=1,
+            head_count=2,
+        )
+
+        self.assertEqual(
+            violation["additions"],
+            [
+                {
+                    "line": 1,
+                    "occurrence_count": 1,
+                    "path": "growing-link",
+                    "surface": "symlink-target",
+                }
+            ],
+        )
+        self.assertEqual(
+            os.readlink(review.workspace_root / "growing-link"), head_target
+        )
+
+    def test_ambiguous_replaced_secret_line_marks_locations_inconclusive(
+        self,
+    ) -> None:
+        secret = "sk-" + "J" * 40
+        secret_base = self.commit_bytes(
+            "ambiguous.txt",
+            f"key={secret} old\n".encode("ascii"),
+            "Add one text credential",
+        )
+        secret_head = self.commit_bytes(
+            "ambiguous.txt",
+            (f"key={secret} edited\nsecond={secret}\n").encode("ascii"),
+            "Edit one credential line and add another",
+        )
+
+        review = self.prepare_range(secret_base, secret_head)
+        secret_delta = self.assert_secret_delta_status(review, "violations")
+        self.assertEqual(secret_delta["location_status"], "inconclusive")
+        matching = [
+            violation
+            for violation in secret_delta["violations"]
+            if violation["value_sha256"]
+            == hashlib.sha256(secret.encode("ascii")).hexdigest()
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(
+            (
+                matching[0]["base_count"],
+                matching[0]["head_count"],
+                matching[0]["delta"],
+                matching[0]["additions"],
+            ),
+            (1, 2, 1, []),
+        )
+
+    def test_replaced_multiline_match_cannot_mask_cross_boundary_addition(
+        self,
+    ) -> None:
+        secret = b"CriticalCredential\nAlpha9!"
+        self.commit_bytes(
+            "multiline-seed.txt",
+            b'password = """CriticalCredential\nAlpha9!"""\n',
+            "Add an exact multiline credential seed",
+        )
+        secret_base = self.commit_bytes(
+            "cross-boundary.txt",
+            b"old=CriticalCredential\nAlpha9! old\nAlpha9! stable\n",
+            "Add one multiline credential",
+        )
+        secret_head = self.commit_bytes(
+            "cross-boundary.txt",
+            (
+                b"edited=CriticalCredential\n"
+                b"Alpha9! edited\n"
+                b"note=CriticalCredential\n"
+                b"Alpha9! stable\n"
+            ),
+            "Retain one credential and add a cross-boundary copy",
+        )
+
+        review = self.prepare_range(secret_base, secret_head)
+        violation = self.assert_secret_violation(
+            review,
+            secret,
+            base_count=2,
+            head_count=3,
+        )
+        self.assertEqual(violation["additions"], [])
+        self.assertEqual(
+            self.assert_secret_delta_status(review, "violations")["location_status"],
+            "inconclusive",
+        )
 
     def test_frozen_diff_keeps_initialized_submodule_metadata_only(self) -> None:
         subrepo = pathlib.Path(self.temporary.name) / "external-repo"
@@ -3528,6 +3724,71 @@ class WorkspaceTest(unittest.TestCase):
         self.assertNotIn(marker.rstrip(), diff)
         self.assertNotIn(b"diff --git a/vendor/external/foreign.txt", diff)
         validate_external_workspace(review)
+
+    def test_new_secret_shaped_gitlink_path_is_an_admission_violation(self) -> None:
+        secret = "sk-" + "G" * 40
+        gitlink_path = f"vendor/{secret}"
+        git(
+            self.repo,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{self.head},{gitlink_path}",
+        )
+        git(self.repo, "commit", "-m", "Add secret-shaped gitlink path")
+        gitlink_head = git(self.repo, "rev-parse", "HEAD")
+
+        review = self.prepare_range(self.head, gitlink_head)
+        violation = self.assert_secret_violation(
+            review,
+            secret.encode("ascii"),
+            base_count=0,
+            head_count=1,
+        )
+
+        self.assertEqual(
+            violation["additions"],
+            [
+                {
+                    "line": None,
+                    "occurrence_count": 1,
+                    "path": gitlink_path,
+                    "surface": "path",
+                }
+            ],
+        )
+        materialized = review.workspace_root / gitlink_path
+        self.assertTrue(materialized.is_dir())
+        self.assertEqual(list(materialized.iterdir()), [])
+        self.assertIn(secret.encode("ascii"), review.diff_file.read_bytes())
+
+    def test_unchanged_secret_shaped_gitlink_path_has_clean_global_delta(
+        self,
+    ) -> None:
+        secret = "sk-" + "H" * 40
+        gitlink_path = f"vendor/{secret}"
+        git(
+            self.repo,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{self.head},{gitlink_path}",
+        )
+        git(self.repo, "commit", "-m", "Add retained secret-shaped gitlink")
+        gitlink_base = git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "example.txt").write_text("unrelated\n", encoding="utf-8")
+        git(self.repo, "add", "example.txt")
+        git(self.repo, "commit", "-m", "Change unrelated tracked file")
+        unrelated_head = git(self.repo, "rev-parse", "HEAD")
+
+        review = self.prepare_range(gitlink_base, unrelated_head)
+        secret_delta = self.assert_secret_delta_status(review, "clean")
+
+        self.assertEqual(secret_delta["violations"], [])
+        materialized = review.workspace_root / gitlink_path
+        self.assertTrue(materialized.is_dir())
+        self.assertEqual(list(materialized.iterdir()), [])
+        self.assertNotIn(secret.encode("ascii"), review.diff_file.read_bytes())
 
     def test_oauth_refresh_token_is_detected_in_head_content(self) -> None:
         credential = pathlib.Path(self.temporary.name) / "oauth.json"
@@ -3631,48 +3892,165 @@ class WorkspaceTest(unittest.TestCase):
                     f"Clean up remaining {name} credential",
                 )
 
-    def test_unregistered_secret_addition_is_blocked(self) -> None:
+    def test_inconclusive_secret_delta_does_not_block_workspace_validation(
+        self,
+    ) -> None:
+        with mock.patch.object(
+            workspace_runtime,
+            "_secret_count_manifests",
+            side_effect=ReviewError("injected incomplete exact-value scan"),
+        ):
+            review = self.prepare_range(self.base, self.head)
+
+        secret_delta = self.assert_secret_delta_status(review, "inconclusive")
+        self.assertEqual(
+            secret_delta["failure_class"],
+            "exact-value-scan-incomplete",
+        )
+        self.assertEqual(secret_delta["location_status"], "inconclusive")
+        self.assertEqual(secret_delta["violations"], [])
+        self.assertIn(b"+two", review.diff_file.read_bytes())
+        self.assertEqual(
+            (review.workspace_root / "example.txt").read_text(encoding="utf-8"),
+            "one\ntwo\n",
+        )
+        evidence = validate_external_workspace(review)
+        self.assertEqual(
+            evidence["secret_delta"]["failure_class"],
+            "exact-value-scan-incomplete",
+        )
+
+    def test_unextractable_secret_shape_marks_admission_inconclusive(self) -> None:
+        payload = b'password = "' + b"D" * 513 + b'"\n'
+        oversized_head = self.commit_bytes(
+            "oversized-secret.txt",
+            payload,
+            "Add an unextractable credential shape",
+        )
+
+        review = self.prepare_range(self.head, oversized_head)
+        secret_delta = self.assert_secret_delta_status(review, "inconclusive")
+        self.assertEqual(
+            secret_delta["failure_class"],
+            "exact-value-scan-incomplete",
+        )
+        self.assertEqual(secret_delta["location_status"], "inconclusive")
+        self.assertEqual(secret_delta["violations"], [])
+        self.assertIn(payload.rstrip(b"\n"), review.diff_file.read_bytes())
+        evidence = validate_external_workspace(review)
+        self.assertEqual(evidence["secret_delta"], secret_delta)
+
+    def test_unregistered_secret_addition_is_raw_with_violation_evidence(
+        self,
+    ) -> None:
         raw_value = unregistered_generic_credential()
+        payload = b'password = "' + raw_value + b'"\n'
         added_head = self.commit_bytes(
             "added-secret.txt",
-            b'password = "' + raw_value + b'"\n',
+            payload,
             "Add unregistered credential",
         )
 
-        self.assert_external_review_blocked(
-            base_ref=self.head,
-            head_ref=added_head,
-            rule="generic-secret-assignment",
+        review = self.prepare_range(self.head, added_head)
+        violation = self.assert_secret_violation(
+            review,
+            raw_value,
+            base_count=0,
+            head_count=1,
         )
+        self.assertEqual(violation["additions"][0]["path"], "added-secret.txt")
+        self.assertEqual(violation["additions"][0]["surface"], "blob")
+        self.assertEqual(
+            (review.workspace_root / "added-secret.txt").read_bytes(),
+            payload,
+        )
+        self.assertIn(raw_value, review.diff_file.read_bytes())
 
-    def test_wrapped_unregistered_secret_addition_is_blocked(self) -> None:
+    def test_wrapped_unregistered_secret_addition_is_raw_with_violation_evidence(
+        self,
+    ) -> None:
         raw_value = unregistered_generic_credential()
+        payload = b'password = ("""' + raw_value + b'""")\n'
         added_head = self.commit_bytes(
             "added-wrapped-secret.txt",
-            b'password = ("""' + raw_value + b'""")\n',
+            payload,
             "Add wrapped unregistered credential",
         )
 
-        self.assert_external_review_blocked(
-            base_ref=self.head,
-            head_ref=added_head,
-            rule="generic-secret-assignment",
+        review = self.prepare_range(self.head, added_head)
+        violation = self.assert_secret_violation(
+            review,
+            raw_value,
+            base_count=0,
+            head_count=1,
         )
+        self.assertEqual(
+            violation["additions"],
+            [
+                {
+                    "line": 1,
+                    "occurrence_count": 1,
+                    "path": "added-wrapped-secret.txt",
+                    "surface": "blob",
+                }
+            ],
+        )
+        self.assertEqual(
+            self.assert_secret_delta_status(review, "violations")["location_status"],
+            "complete",
+        )
+        self.assertEqual(
+            (review.workspace_root / "added-wrapped-secret.txt").read_bytes(),
+            payload,
+        )
+        self.assertIn(raw_value, review.diff_file.read_bytes())
 
-    def test_multiline_generic_secret_addition_fails_closed(self) -> None:
+    def test_multiline_generic_secret_addition_is_raw_with_violation_evidence(
+        self,
+    ) -> None:
+        raw_value = b"CriticalCredential\nAlpha9!"
+        payload = b'password = """' + raw_value + b'"""\n'
         added_head = self.commit_bytes(
             "added-multiline-secret.txt",
-            b'password = """CriticalCredential\nAlpha9!"""\n',
+            payload,
             "Add multiline unregistered credential",
         )
 
-        self.assert_external_review_blocked(
-            base_ref=self.head,
-            head_ref=added_head,
-            rule="generic-secret-assignment",
+        review = self.prepare_range(self.head, added_head)
+        violation = self.assert_secret_violation(
+            review,
+            raw_value,
+            base_count=0,
+            head_count=1,
         )
+        self.assertEqual(
+            violation["additions"],
+            [
+                {
+                    "line": 1,
+                    "occurrence_count": 1,
+                    "path": "added-multiline-secret.txt",
+                    "surface": "blob",
+                }
+            ],
+        )
+        self.assertEqual(
+            self.assert_secret_delta_status(review, "violations")["location_status"],
+            "complete",
+        )
+        self.assertEqual(
+            (review.workspace_root / "added-multiline-secret.txt").read_bytes(),
+            payload,
+        )
+        added_lines = [
+            line
+            for line in review.diff_file.read_bytes().splitlines()
+            if line.startswith(b"+")
+        ]
+        for line in raw_value.splitlines():
+            self.assertTrue(any(line in added_line for added_line in added_lines))
 
-    def test_unchanged_unregistered_secret_with_unrelated_change_is_blocked(
+    def test_unchanged_unregistered_secret_is_raw_with_clean_delta(
         self,
     ) -> None:
         raw_value = unregistered_generic_credential()
@@ -3687,13 +4065,15 @@ class WorkspaceTest(unittest.TestCase):
             "Make unrelated change",
         )
 
-        self.assert_external_review_blocked(
-            base_ref=secret_base,
-            head_ref=unrelated_head,
-            rule="generic-secret-assignment",
+        review = self.prepare_range(secret_base, unrelated_head)
+        secret_delta = self.assert_secret_delta_status(review, "clean")
+        self.assertEqual(secret_delta["violations"], [])
+        self.assertIn(
+            raw_value,
+            (review.workspace_root / "retained-secret.txt").read_bytes(),
         )
 
-    def test_moved_unregistered_secret_is_blocked(self) -> None:
+    def test_moved_unregistered_secret_is_raw_with_clean_delta(self) -> None:
         raw_value = unregistered_generic_credential()
         old_path = "old-secret.txt"
         new_path = "new-secret.txt"
@@ -3706,13 +4086,15 @@ class WorkspaceTest(unittest.TestCase):
         git(self.repo, "commit", "-m", "Move credential")
         moved_head = git(self.repo, "rev-parse", "HEAD")
 
-        self.assert_external_review_blocked(
-            base_ref=secret_base,
-            head_ref=moved_head,
-            rule="generic-secret-assignment",
+        review = self.prepare_range(secret_base, moved_head)
+        secret_delta = self.assert_secret_delta_status(review, "clean")
+        self.assertEqual(secret_delta["violations"], [])
+        self.assertIn(
+            raw_value,
+            (review.workspace_root / new_path).read_bytes(),
         )
 
-    def test_copied_unregistered_secret_count_increase_is_blocked(self) -> None:
+    def test_copied_unregistered_secret_count_increase_is_raw_violation(self) -> None:
         raw_value = unregistered_generic_credential()
         rendered = b'password = "' + raw_value + b'"\n'
         secret_base = self.commit_bytes(
@@ -3726,13 +4108,20 @@ class WorkspaceTest(unittest.TestCase):
             "Copy credential",
         )
 
-        self.assert_external_review_blocked(
-            base_ref=secret_base,
-            head_ref=copied_head,
-            rule="generic-secret-assignment",
+        review = self.prepare_range(secret_base, copied_head)
+        violation = self.assert_secret_violation(
+            review,
+            raw_value,
+            base_count=1,
+            head_count=2,
+        )
+        self.assertEqual(violation["additions"][0]["path"], "copied-secret.txt")
+        self.assertIn(
+            raw_value,
+            (review.workspace_root / "copied-secret.txt").read_bytes(),
         )
 
-    def test_replacing_two_secret_occurrences_with_a_new_secret_is_blocked(
+    def test_replacing_secret_occurrences_reports_only_the_new_value(
         self,
     ) -> None:
         first = unregistered_generic_credential()
@@ -3749,10 +4138,27 @@ class WorkspaceTest(unittest.TestCase):
             "Replace credential",
         )
 
-        self.assert_external_review_blocked(
-            base_ref=secret_base,
-            head_ref=replaced_head,
-            rule="generic-secret-assignment",
+        review = self.prepare_range(secret_base, replaced_head)
+        violation = self.assert_secret_violation(
+            review,
+            second,
+            base_count=0,
+            head_count=1,
+        )
+        self.assertEqual(
+            len(self.assert_secret_delta_status(review, "violations")["violations"]), 1
+        )
+        self.assertEqual(
+            violation["value_sha256"],
+            hashlib.sha256(second).hexdigest(),
+        )
+        self.assertNotEqual(
+            violation["value_sha256"],
+            hashlib.sha256(first).hexdigest(),
+        )
+        self.assertIn(
+            second,
+            (review.workspace_root / "replaced-secret.txt").read_bytes(),
         )
 
     def test_deleted_credential_path_is_allowed(self) -> None:
@@ -3790,7 +4196,7 @@ class WorkspaceTest(unittest.TestCase):
             ).read_bytes(),
         )
 
-    def test_renamed_base_only_secret_path_retention_is_blocked(self) -> None:
+    def test_renamed_secret_path_is_raw_with_clean_global_delta(self) -> None:
         cases = (
             ("head-before-base", "B", lambda secret: "a" + secret),
             ("base-before-head", "C", lambda secret: "x" + secret),
@@ -3816,18 +4222,17 @@ class WorkspaceTest(unittest.TestCase):
                 retained_head = git(self.repo, "rev-parse", "HEAD")
                 review = self.prepare_range(secret_base, retained_head)
 
-                with self.assertRaisesRegex(
-                    ReviewError,
-                    "base-only-path-secret-retained",
-                ) as caught:
-                    validate_external_workspace(review)
+                secret_delta = self.assert_secret_delta_status(review, "clean")
+                self.assertEqual(secret_delta["violations"], [])
+                self.assertEqual(
+                    (review.workspace_root / destination).read_bytes(),
+                    b"ordinary content\n",
+                )
+                diff = review.diff_file.read_bytes()
+                self.assertIn(os.fsencode(source), diff)
+                self.assertIn(os.fsencode(destination), diff)
 
-                diagnostic = str(caught.exception)
-                self.assertNotIn(secret, diagnostic)
-                self.assertNotIn(source, diagnostic)
-                self.assertNotIn(destination, diagnostic)
-
-    def test_base_only_path_secret_moved_into_blob_is_blocked(self) -> None:
+    def test_path_secret_moved_into_blob_is_raw_with_clean_global_delta(self) -> None:
         secret = "sk-" + "E" * 40
         source = f"fixtures/{secret}"
         secret_base = self.commit_bytes(
@@ -3849,15 +4254,17 @@ class WorkspaceTest(unittest.TestCase):
         retained_head = git(self.repo, "rev-parse", "HEAD")
         review = self.prepare_range(secret_base, retained_head)
 
-        with self.assertRaisesRegex(
-            ReviewError,
-            "base-only-path-secret-retained",
-        ) as caught:
-            validate_external_workspace(review)
+        secret_delta = self.assert_secret_delta_status(review, "clean")
+        self.assertEqual(secret_delta["violations"], [])
+        self.assertIn(
+            secret.encode("ascii"),
+            (review.workspace_root / "retained.txt").read_bytes(),
+        )
+        self.assertIn(secret.encode("ascii"), review.diff_file.read_bytes())
 
-        self.assertNotIn(secret, str(caught.exception))
-
-    def test_base_only_path_secret_moved_into_symlink_target_is_blocked(self) -> None:
+    def test_path_secret_moved_into_symlink_is_raw_with_clean_global_delta(
+        self,
+    ) -> None:
         secret = "sk-" + "F" * 40
         source = f"fixtures/{secret}"
         secret_base = self.commit_bytes(
@@ -3873,13 +4280,10 @@ class WorkspaceTest(unittest.TestCase):
         retained_head = git(self.repo, "rev-parse", "HEAD")
         review = self.prepare_range(secret_base, retained_head)
 
-        with self.assertRaisesRegex(
-            ReviewError,
-            "base-only-path-secret-retained",
-        ) as caught:
-            validate_external_workspace(review)
-
-        self.assertNotIn(secret, str(caught.exception))
+        secret_delta = self.assert_secret_delta_status(review, "clean")
+        self.assertEqual(secret_delta["violations"], [])
+        self.assertEqual(os.readlink(review.workspace_root / "retained-link"), target)
+        self.assertIn(secret.encode("ascii"), review.diff_file.read_bytes())
 
     def test_base_only_cleanup_quarantine_path_is_allowed(self) -> None:
         deleted_path = "nested/.codex-review-cleanup-deleted-marker/tracked.txt"
@@ -3900,17 +4304,19 @@ class WorkspaceTest(unittest.TestCase):
         )
         self.assertIn(os.fsencode(deleted_path), review.diff_file.read_bytes())
 
-    def test_new_and_retained_credential_paths_are_blocked(self) -> None:
+    def test_new_and_retained_credential_paths_are_available_to_reviewer(self) -> None:
         added_head = self.commit_bytes(
             "fixtures/.netrc",
             b"machine example.invalid login reviewer\n",
             "Add credential-shaped path",
         )
         with self.subTest(transition="new-sensitive-path"):
-            self.assert_external_review_blocked(
-                base_ref=self.head,
-                head_ref=added_head,
-                rule="credential-path",
+            review = self.prepare_range(self.head, added_head)
+            secret_delta = self.assert_secret_delta_status(review, "clean")
+            self.assertEqual(secret_delta["violations"], [])
+            self.assertEqual(
+                (review.workspace_root / "fixtures/.netrc").read_bytes(),
+                b"machine example.invalid login reviewer\n",
             )
 
         retained_head = self.commit_bytes(
@@ -3919,13 +4325,15 @@ class WorkspaceTest(unittest.TestCase):
             "Make unrelated change with retained credential path",
         )
         with self.subTest(transition="retained-sensitive-path"):
-            self.assert_external_review_blocked(
-                base_ref=added_head,
-                head_ref=retained_head,
-                rule="credential-path",
+            review = self.prepare_range(added_head, retained_head)
+            secret_delta = self.assert_secret_delta_status(review, "clean")
+            self.assertEqual(secret_delta["violations"], [])
+            self.assertEqual(
+                (review.workspace_root / "fixtures/.netrc").read_bytes(),
+                b"machine example.invalid login reviewer\n",
             )
 
-    def test_non_extractable_secret_deletions_fail_closed(self) -> None:
+    def test_non_extractable_secret_deletions_remain_raw_and_launchable(self) -> None:
         oversized_provider = b"".join((b"sk", b"-", b"O" * 513))
         private_key_label = b"".join((b"PRIVATE", b" KEY"))
         incomplete_private_key = b"".join(
@@ -3942,7 +4350,7 @@ class WorkspaceTest(unittest.TestCase):
             ("incomplete-private-key", incomplete_private_key, "private-key"),
         )
 
-        for name, raw_value, rule in fixtures:
+        for name, raw_value, _rule in fixtures:
             with self.subTest(secret_kind=name):
                 relative = f"non-extractable-{name}.txt"
                 secret_base = self.commit_bytes(
@@ -3954,11 +4362,10 @@ class WorkspaceTest(unittest.TestCase):
                     relative,
                     f"Remove {name} credential",
                 )
-                self.assert_external_review_blocked(
-                    base_ref=secret_base,
-                    head_ref=clean_head,
-                    rule=rule,
-                )
+                review = self.prepare_range(secret_base, clean_head)
+                secret_delta = self.assert_secret_delta_status(review, "clean")
+                self.assertEqual(secret_delta["violations"], [])
+                self.assert_diff_retains_raw_deletion(review, raw_value)
 
     def test_function_call_assignment_is_not_treated_as_literal_secret(self) -> None:
         source = pathlib.Path(self.temporary.name) / "source.py"

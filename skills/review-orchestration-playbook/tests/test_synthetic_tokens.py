@@ -546,6 +546,7 @@ class PublicPoolScannerTest(unittest.TestCase):
             accepted_values=(accepted,),
         )
         self.assertIsNone(scan.blocking_rule)
+        self.assertIsNone(scan.unextractable_rule)
         self.assertEqual(scan.accepted_counts[accepted], 1)
 
         adjacent = workspace._scan_secret_value(
@@ -2865,6 +2866,7 @@ class PublicPoolScannerTest(unittest.TestCase):
                     _continue_after_blocking=True,
                 )
                 self.assertEqual(scan.blocking_rule, expected_rule)
+                self.assertEqual(scan.unextractable_rule, expected_rule)
                 self.assertFalse(scan.blocking_candidates)
 
     def test_dense_unclosed_pem_markers_use_the_preindexed_end_markers(self) -> None:
@@ -6715,6 +6717,324 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         with mock.patch.object(workspace, "load_catalog", return_value=catalog):
             return workspace.validate_external_workspace(review)
 
+    def manifest(self, review: workspace.ReviewWorkspace) -> dict[str, object]:
+        manifest_path = (
+            review.workspace_root / ".codex-review" / workspace.SYNTHETIC_MANIFEST_NAME
+        )
+        return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    def test_exact_legacy_counts_allow_unchanged_move_offset_and_delete(
+        self,
+    ) -> None:
+        catalog = legacy_catalog(values=(LEGACY_A,))
+        cases = (
+            ("unchanged", 1),
+            ("move", 1),
+            ("offset", 1),
+            ("delete", 0),
+        )
+        for transition, expected_head_count in cases:
+            with self.subTest(transition=transition):
+                repo, base = self.new_repo({"fixture.txt": LEGACY_A + "\n"})
+                if transition == "unchanged":
+                    (repo / "README.md").write_text("head\n", encoding="utf-8")
+                elif transition == "move":
+                    (repo / "fixture.txt").rename(repo / "moved.txt")
+                elif transition == "offset":
+                    (repo / "fixture.txt").write_text(
+                        "first\nsecond\n" + LEGACY_A + "\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    (repo / "fixture.txt").unlink()
+                head = self.commit(repo)
+
+                review = self.prepare(
+                    repo=repo,
+                    base=base,
+                    head=head,
+                    catalog=catalog,
+                )
+                manifest = self.manifest(review)
+                self.assertEqual(manifest["schema_version"], 5)
+                self.assertEqual(
+                    manifest["selected_exemptions"],
+                    ["historical-fixtures"],
+                )
+                self.assertEqual(
+                    (
+                        manifest["entries"][0]["base_count"],
+                        manifest["entries"][0]["head_count"],
+                    ),
+                    (1, expected_head_count),
+                )
+                self.assertEqual(manifest["secret_delta"]["status"], "clean")
+                evidence = self.validate(review, catalog=catalog)
+                self.assertEqual(evidence["secret_delta"], manifest["secret_delta"])
+
+    def test_exact_count_growth_is_a_manifest_violation_with_added_line(
+        self,
+    ) -> None:
+        catalog = legacy_catalog(values=(LEGACY_A,))
+        repo, base = self.new_repo({"fixture.txt": "header\n" + LEGACY_A + "\n"})
+        (repo / "fixture.txt").write_text(
+            "header\n" + LEGACY_A + "\nextra\n" + LEGACY_A + "\n",
+            encoding="utf-8",
+        )
+        head = self.commit(repo)
+
+        review = self.prepare(repo=repo, base=base, head=head, catalog=catalog)
+        manifest = self.manifest(review)
+        delta = manifest["secret_delta"]
+        self.assertEqual(delta["status"], "violations")
+        self.assertEqual(delta["location_status"], "complete")
+        self.assertEqual(len(delta["violations"]), 1)
+        violation = delta["violations"][0]
+        self.assertEqual(
+            (violation["base_count"], violation["head_count"], violation["delta"]),
+            (1, 2, 1),
+        )
+        self.assertEqual(
+            violation["additions"],
+            [
+                {
+                    "line": 4,
+                    "occurrence_count": 1,
+                    "path": "fixture.txt",
+                    "surface": "blob",
+                }
+            ],
+        )
+
+        self.assertIn(LEGACY_A, review.diff_file.read_text(encoding="utf-8"))
+        self.assertIn(
+            LEGACY_A,
+            (review.workspace_root / "fixture.txt").read_text(encoding="utf-8"),
+        )
+        evidence = self.validate(review, catalog=catalog)
+        self.assertEqual(evidence["secret_delta"], delta)
+
+    def test_secret_delta_paths_only_report_new_tracked_paths(self) -> None:
+        catalog = legacy_catalog(values=(LEGACY_A,))
+        deleted_path = f"deleted-{LEGACY_A}.txt"
+        modified_path = f"modified-{LEGACY_A}.txt"
+        added_path = f"new-{LEGACY_A}-{LEGACY_A}.txt"
+        repo, base = self.new_repo(
+            {
+                "blob.txt": "before\n",
+                deleted_path: "deleted\n",
+                modified_path: "before\n",
+            }
+        )
+        (repo / deleted_path).unlink()
+        (repo / modified_path).write_text("after\n", encoding="utf-8")
+        (repo / "blob.txt").write_text(
+            "header\n" + LEGACY_A + "\n",
+            encoding="utf-8",
+        )
+        (repo / added_path).write_text("added\n", encoding="utf-8")
+        head = self.commit(repo)
+
+        review = self.prepare(repo=repo, base=base, head=head, catalog=catalog)
+        manifest = self.manifest(review)
+        self.assertEqual(
+            (
+                manifest["entries"][0]["base_count"],
+                manifest["entries"][0]["head_count"],
+            ),
+            (2, 4),
+        )
+        violation = manifest["secret_delta"]["violations"][0]
+        self.assertEqual(
+            violation["additions"],
+            [
+                {
+                    "line": 2,
+                    "occurrence_count": 1,
+                    "path": "blob.txt",
+                    "surface": "blob",
+                },
+                {
+                    "line": None,
+                    "occurrence_count": 2,
+                    "path": added_path,
+                    "surface": "path",
+                },
+            ],
+        )
+        self.assertFalse(
+            any(
+                item["surface"] == "path"
+                and item["path"] in {deleted_path, modified_path}
+                for item in violation["additions"]
+            )
+        )
+        evidence = self.validate(review, catalog=catalog)
+        self.assertEqual(evidence["secret_delta"], manifest["secret_delta"])
+
+    def test_catalog_legacy_selection_flag_is_deprecated_but_validated(
+        self,
+    ) -> None:
+        catalog = legacy_catalog(values=(LEGACY_A, LEGACY_B))
+        repo, base = self.new_repo(
+            {
+                "a.txt": LEGACY_A + "\n",
+                "b.txt": LEGACY_B + "\n",
+            }
+        )
+        (repo / "b.txt").unlink()
+        head = self.commit(repo)
+
+        review = self.prepare(repo=repo, base=base, head=head, catalog=catalog)
+        manifest = self.manifest(review)
+        self.assertEqual(
+            manifest["selected_exemptions"],
+            ["historical-fixtures"],
+        )
+        self.assertEqual(
+            {
+                (entry["token_id"], entry["base_count"], entry["head_count"])
+                for entry in manifest["entries"]
+            },
+            {("historical-1", 1, 1), ("historical-2", 1, 0)},
+        )
+        selected_review = self.prepare(
+            repo=repo,
+            base=base,
+            head=head,
+            catalog=catalog,
+            exemptions=("historical-fixtures",),
+        )
+        selected_manifest = self.manifest(selected_review)
+        self.assertEqual(selected_manifest["entries"], manifest["entries"])
+        self.assertEqual(
+            selected_manifest["secret_delta"],
+            manifest["secret_delta"],
+        )
+        self.validate(review, catalog=catalog)
+        self.validate(selected_review, catalog=catalog)
+
+        for selection, message in (
+            (("missing",), "unknown synthetic secret exemption"),
+            (
+                ("historical-fixtures", "historical-fixtures"),
+                "duplicate synthetic secret exemption",
+            ),
+        ):
+            with self.subTest(selection=selection):
+                with self.assertRaisesRegex(ReviewError, message):
+                    self.prepare(
+                        repo=repo,
+                        base=base,
+                        head=head,
+                        catalog=catalog,
+                        exemptions=selection,
+                    )
+
+    def test_base64_variants_are_not_derived_for_exact_counting_or_evidence(
+        self,
+    ) -> None:
+        catalog = legacy_catalog(values=(LEGACY_A,))
+        encoded = legacy_value_base64(LEGACY_A)
+        repo, base = self.new_repo({"fixture.txt": LEGACY_A + "\n"})
+        (repo / "fixture.txt").unlink()
+        (repo / f"encoded-{encoded}.txt").write_text(
+            encoded + "\n",
+            encoding="utf-8",
+        )
+        head = self.commit(repo)
+
+        review = self.prepare(repo=repo, base=base, head=head, catalog=catalog)
+        manifest = self.manifest(review)
+        self.assertEqual(
+            (
+                manifest["entries"][0]["base_count"],
+                manifest["entries"][0]["head_count"],
+            ),
+            (1, 0),
+        )
+        self.assertEqual(manifest["secret_delta"]["status"], "clean")
+        self.validate(review, catalog=catalog)
+
+        accepted = synthetic_tokens.accepted_legacy_values(
+            catalog,
+            catalog.legacy_exemptions,
+        )
+        workspace._reject_raw_values_in_evidence(
+            {"encoded": encoded},
+            accepted_values=accepted,
+            label="test evidence",
+        )
+
+        unregistered = b"CriticalCredentialAlpha9!"
+        encoded_unregistered = base64.b64encode(unregistered).decode("ascii")
+        dynamic_repo, dynamic_base = self.new_repo(
+            {"fixture.cfg": f'password = "{unregistered.decode("ascii")}"\n'}
+        )
+        (dynamic_repo / "fixture.cfg").unlink()
+        (dynamic_repo / "encoded.txt").write_text(
+            encoded_unregistered + "\n",
+            encoding="utf-8",
+        )
+        dynamic_head = self.commit(dynamic_repo)
+
+        dynamic_review = self.prepare(
+            repo=dynamic_repo,
+            base=dynamic_base,
+            head=dynamic_head,
+        )
+        dynamic_manifest = self.manifest(dynamic_review)
+        dynamic_entry = next(
+            entry
+            for entry in dynamic_manifest["secret_reductions"]
+            if entry["value_sha256"] == hashlib.sha256(unregistered).hexdigest()
+        )
+        self.assertEqual(
+            (dynamic_entry["base_count"], dynamic_entry["head_count"]),
+            (1, 0),
+        )
+        self.assertEqual(dynamic_manifest["secret_delta"]["status"], "clean")
+        self.validate(dynamic_review)
+
+    def test_non_exact_dynamic_expression_is_ignored_by_admission(self) -> None:
+        candidate = reduction_secret("generic-secret-assignment", b"Q")
+        expression = (b'password = ) "' + candidate + b'"\n').decode("ascii")
+        repo, base = self.new_repo({"README.md": "base\n"})
+        (repo / "fixture.cfg").write_text(expression, encoding="utf-8")
+        head = self.commit(repo)
+
+        review = self.prepare(repo=repo, base=base, head=head)
+        manifest = self.manifest(review)
+        self.assertEqual(manifest["secret_reductions"], [])
+        self.assertEqual(manifest["secret_delta"]["status"], "clean")
+        self.assertIn(candidate.decode("ascii"), review.diff_file.read_text("utf-8"))
+        evidence = self.validate(review)
+        self.assertEqual(evidence["secret_delta"]["status"], "clean")
+
+    def test_escaping_symlink_target_is_unredacted_but_still_rejected(
+        self,
+    ) -> None:
+        catalog = legacy_catalog(values=(LEGACY_A,))
+        repo, base = self.new_repo({"README.md": "base\n"})
+        (repo / "artifact").symlink_to("../" + LEGACY_A)
+        head = self.commit(repo)
+        with self.assertRaisesRegex(ReviewError, re.escape(LEGACY_A)):
+            self.prepare(repo=repo, base=base, head=head, catalog=catalog)
+
+    def test_tampered_symlink_target_is_unredacted_but_still_rejected(
+        self,
+    ) -> None:
+        catalog = legacy_catalog(values=(LEGACY_A,))
+        repo, base = self.new_repo({"target.txt": "safe\n"})
+        (repo / "artifact").symlink_to("target.txt")
+        head = self.commit(repo)
+        review = self.prepare(repo=repo, base=base, head=head, catalog=catalog)
+        frozen_link = review.workspace_root / "artifact"
+        frozen_link.unlink()
+        frozen_link.symlink_to("../../../../" + LEGACY_A)
+        with self.assertRaisesRegex(ReviewError, re.escape(LEGACY_A)):
+            self.validate(review, catalog=catalog)
+
     def test_authoring_value_passes_and_evidence_never_contains_raw_value(self) -> None:
         repo, base = self.new_repo({"README.md": "base\n"})
         (repo / "fixture.cfg").write_text(
@@ -6730,299 +7050,6 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         self.assertTrue(accepted)
         self.assertTrue(all("value_sha256" in entry for entry in accepted))
         self.assertTrue(any(entry["token_id"] == "access-a" for entry in accepted))
-
-    def test_prepared_range_allows_only_strict_secret_count_reductions(self) -> None:
-        for rule in (
-            "generic-secret-assignment",
-            "jwt",
-            "github-token",
-        ):
-            for transition, head_count in (("delete", 0), ("partial", 1)):
-                with self.subTest(rule=rule, transition=transition):
-                    fixture = reduction_fixture(rule)
-                    repo, base = self.new_repo({"fixture.cfg": fixture * 2})
-                    if head_count:
-                        (repo / "fixture.cfg").write_text(
-                            fixture,
-                            encoding="utf-8",
-                        )
-                    else:
-                        (repo / "fixture.cfg").unlink()
-                    head = self.commit(repo)
-
-                    review = self.prepare(repo=repo, base=base, head=head)
-                    manifest_path = (
-                        review.workspace_root
-                        / ".codex-review"
-                        / workspace.SYNTHETIC_MANIFEST_NAME
-                    )
-                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                    self.assertEqual(manifest["schema_version"], 4)
-                    self.assertEqual(len(manifest["secret_reductions"]), 1)
-                    reduction = manifest["secret_reductions"][0]
-                    self.assertEqual(
-                        (reduction["base_count"], reduction["head_count"]),
-                        (2, head_count),
-                    )
-                    self.assertEqual(reduction["rules"], [rule])
-
-                    evidence = self.validate(review)
-                    self.assertEqual(
-                        evidence["synthetic_tokens"]["secret_reductions"],
-                        manifest["secret_reductions"],
-                    )
-
-    def test_malformed_literal_rhs_cannot_enter_or_justify_a_reduction(
-        self,
-    ) -> None:
-        candidate = reduction_secret("generic-secret-assignment")
-
-        unmatched = (b'password = ) "' + candidate + b'"\n').decode("ascii")
-        addition_repo, addition_base = self.new_repo({"README.md": "base\n"})
-        (addition_repo / "fixture.cfg").write_text(unmatched, encoding="utf-8")
-        addition_head = self.commit(addition_repo)
-        with self.assertRaisesRegex(ReviewError, "generic-secret-assignment"):
-            self.prepare(
-                repo=addition_repo,
-                base=addition_base,
-                head=addition_head,
-            )
-
-        mismatched = (b'password = (] "' + candidate + b'")\n').decode("ascii")
-        reduction_repo, reduction_base = self.new_repo({"fixture.cfg": mismatched * 2})
-        (reduction_repo / "fixture.cfg").write_text(
-            mismatched,
-            encoding="utf-8",
-        )
-        reduction_head = self.commit(reduction_repo)
-        with self.assertRaisesRegex(ReviewError, "generic-secret-assignment"):
-            self.prepare(
-                repo=reduction_repo,
-                base=reduction_base,
-                head=reduction_head,
-            )
-
-        wrapped = (b'password = ("' + candidate + b'")\n').decode("ascii")
-        safe_repo, safe_base = self.new_repo({"fixture.cfg": wrapped * 2})
-        (safe_repo / "fixture.cfg").write_text(wrapped, encoding="utf-8")
-        safe_head = self.commit(safe_repo)
-
-        review = self.prepare(repo=safe_repo, base=safe_base, head=safe_head)
-        evidence = self.validate(review)
-        reductions = evidence["synthetic_tokens"]["secret_reductions"]
-        self.assertEqual(len(reductions), 1)
-        self.assertEqual(reductions[0]["rules"], ["generic-secret-assignment"])
-        self.assertEqual(
-            (reductions[0]["base_count"], reductions[0]["head_count"]),
-            (2, 1),
-        )
-
-    def test_closed_wrapper_before_literal_cannot_justify_a_reduction(
-        self,
-    ) -> None:
-        candidate = reduction_secret("generic-secret-assignment", b"K")
-        invalid_cases = (
-            (
-                "closed-then-fresh-wrapper",
-                b'password = () ("' + candidate + b'")\n',
-            ),
-            (
-                "inner-wrapper-closed",
-                b'password = ([] "' + candidate + b'")\n',
-            ),
-            (
-                "closed-then-fresh-nested-wrapper",
-                b'password = ([] ("' + candidate + b'"))\n',
-            ),
-        )
-        for label, raw_fixture in invalid_cases:
-            with self.subTest(case=label):
-                fixture = raw_fixture.decode("ascii")
-                repo, base = self.new_repo({"fixture.cfg": fixture * 2})
-                (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
-                head = self.commit(repo)
-
-                with self.assertRaisesRegex(
-                    ReviewError,
-                    "generic-secret-assignment",
-                ):
-                    self.prepare(repo=repo, base=base, head=head)
-
-        safe_cases = (
-            (
-                "nested-opens",
-                b'password = (("' + candidate + b'"))\n',
-            ),
-            (
-                "heterogeneous-nested-opens",
-                b'password = ([{"' + candidate + b'"}])\n',
-            ),
-        )
-        for label, raw_fixture in safe_cases:
-            with self.subTest(case=label):
-                fixture = raw_fixture.decode("ascii")
-                repo, base = self.new_repo({"fixture.cfg": fixture * 2})
-                (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
-                head = self.commit(repo)
-
-                review = self.prepare(repo=repo, base=base, head=head)
-                evidence = self.validate(review)
-                reductions = evidence["synthetic_tokens"]["secret_reductions"]
-                self.assertEqual(len(reductions), 1)
-                self.assertEqual(
-                    reductions[0]["rules"],
-                    ["generic-secret-assignment"],
-                )
-                self.assertEqual(
-                    (reductions[0]["base_count"], reductions[0]["head_count"]),
-                    (2, 1),
-                )
-
-    def test_opposite_quote_literal_only_allows_strict_reductions(self) -> None:
-        cases = (
-            (
-                "outer-double",
-                reduction_secret("generic-secret-assignment", b"H") + b"'segment",
-                lambda candidate: b'password = "' + candidate + b'"\n',
-            ),
-            (
-                "outer-single",
-                reduction_secret("generic-secret-assignment", b"I") + b'"segment',
-                lambda candidate: b"password = '" + candidate + b"'\n",
-            ),
-        )
-        for label, candidate, literal in cases:
-            with self.subTest(case=label, transition="addition"):
-                fixture = literal(candidate).decode("ascii")
-                repo, base = self.new_repo({"README.md": "base\n"})
-                (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
-                head = self.commit(repo)
-
-                with self.assertRaisesRegex(
-                    ReviewError,
-                    "generic-secret-assignment",
-                ):
-                    self.prepare(repo=repo, base=base, head=head)
-
-            with self.subTest(case=label, transition="reduction"):
-                repo, base = self.new_repo({"fixture.cfg": fixture * 2})
-                (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
-                head = self.commit(repo)
-
-                review = self.prepare(repo=repo, base=base, head=head)
-                evidence = self.validate(review)
-                reductions = evidence["synthetic_tokens"]["secret_reductions"]
-                self.assertEqual(len(reductions), 1)
-                self.assertEqual(
-                    reductions[0]["rules"],
-                    ["generic-secret-assignment"],
-                )
-                self.assertEqual(
-                    (reductions[0]["base_count"], reductions[0]["head_count"]),
-                    (2, 1),
-                )
-
-    def test_opposite_quote_provider_literal_allows_only_strict_reductions(
-        self,
-    ) -> None:
-        provider = reduction_secret("github-token", b"J")
-        cases = (
-            (
-                "outer-double",
-                b"wrap/" + provider + b"'segment",
-                lambda candidate: b'api_token = "' + candidate + b'"\n',
-            ),
-            (
-                "outer-single",
-                b"wrap/" + provider + b'"segment',
-                lambda candidate: b"api_token = '" + candidate + b"'\n",
-            ),
-        )
-        for label, full_candidate, literal in cases:
-            fixture = literal(full_candidate).decode("ascii")
-            with self.subTest(case=label, transition="addition"):
-                repo, base = self.new_repo({"README.md": "base\n"})
-                (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
-                head = self.commit(repo)
-
-                with self.assertRaisesRegex(
-                    ReviewError,
-                    "generic-secret-assignment",
-                ):
-                    self.prepare(repo=repo, base=base, head=head)
-
-            with self.subTest(case=label, transition="reduction"):
-                repo, base = self.new_repo({"fixture.cfg": fixture * 2})
-                (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
-                head = self.commit(repo)
-
-                review = self.prepare(repo=repo, base=base, head=head)
-                manifest_path = (
-                    review.workspace_root
-                    / ".codex-review"
-                    / workspace.SYNTHETIC_MANIFEST_NAME
-                )
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                reductions = manifest["secret_reductions"]
-                self.assertEqual(
-                    {tuple(entry["rules"]) for entry in reductions},
-                    {
-                        ("generic-secret-assignment",),
-                        ("github-token",),
-                    },
-                )
-                self.assertTrue(
-                    all(
-                        (entry["base_count"], entry["head_count"]) == (2, 1)
-                        for entry in reductions
-                    )
-                )
-                evidence = self.validate(review)
-                self.assertEqual(
-                    evidence["synthetic_tokens"]["secret_reductions"],
-                    reductions,
-                )
-
-    def test_prepared_range_rejects_an_escaped_quoted_reduction_candidate(
-        self,
-    ) -> None:
-        candidate = reduction_secret("generic-secret-assignment") + b"\\"
-        fixture = (b'password = "' + candidate + b'"\n').decode("ascii")
-        repo, base = self.new_repo(
-            {
-                "secret-a.cfg": fixture,
-                "secret-b.cfg": fixture,
-            }
-        )
-        (repo / "secret-b.cfg").unlink()
-        head = self.commit(repo)
-
-        with self.assertRaisesRegex(
-            ReviewError,
-            "cannot extract a stable exact candidate",
-        ):
-            self.prepare(repo=repo, base=base, head=head)
-
-    def test_final_preflight_fields_cannot_reintroduce_a_reduced_value(
-        self,
-    ) -> None:
-        preflight_key = "private_" + "artifacts"
-        fixture = assignment_text("password", preflight_key)
-        repo, base = self.new_repo(
-            {
-                "secret-a.cfg": fixture,
-                "secret-b.cfg": fixture,
-            }
-        )
-        (repo / "secret-b.cfg").unlink()
-        head = self.commit(repo)
-        review = self.prepare(repo=repo, base=base, head=head)
-
-        with self.assertRaisesRegex(
-            ReviewError,
-            "preflight evidence would expose a raw synthetic value",
-        ):
-            self.validate(review)
 
     def test_changed_path_public_evidence_contains_only_digests(self) -> None:
         fixture = reduction_fixture("generic-secret-assignment")
@@ -7060,97 +7087,6 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         )
         self.validate(review)
 
-    def test_dynamic_secret_in_head_path_blocks_before_handoff(self) -> None:
-        raw_value = reduction_secret("generic-secret-assignment").decode("ascii")
-        fixture = assignment_text("password", raw_value)
-        cases = (
-            ("raw", raw_value),
-            (
-                "storage",
-                base64.b64encode(raw_value.encode("ascii")).decode("ascii"),
-            ),
-        )
-        for label, path_value in cases:
-            with self.subTest(case=label):
-                repo, base = self.new_repo({"fixture.cfg": fixture * 2})
-                (repo / "fixture.cfg").rename(repo / path_value)
-                (repo / path_value).write_text(fixture, encoding="utf-8")
-                head = self.commit(repo)
-
-                with self.assertRaisesRegex(
-                    ReviewError,
-                    "frozen head paths",
-                ) as caught:
-                    self.prepare(repo=repo, base=base, head=head)
-                self.assertNotIn(raw_value, str(caught.exception))
-                self.assertNotIn(path_value, str(caught.exception))
-
-    def test_overlong_dynamic_secret_path_blocks_before_materialization(self) -> None:
-        raw_value = reduction_secret("generic-secret-assignment").decode("ascii")
-        fixture = assignment_text("password", raw_value)
-        repo, base = self.new_repo(
-            {
-                "secret-a.cfg": fixture,
-                "secret-b.cfg": fixture,
-            }
-        )
-        secret_blob = git(repo, "rev-parse", f"{base}:secret-a.cfg")
-        overlong_path = raw_value + "-" + "x" * (300 - len(raw_value) - 1)
-        self.assertGreater(len(os.fsencode(overlong_path)), 255)
-        git(repo, "read-tree", base)
-        git(repo, "update-index", "--force-remove", "secret-a.cfg", "secret-b.cfg")
-        git(
-            repo,
-            "update-index",
-            "--add",
-            "--cacheinfo",
-            "100644",
-            secret_blob,
-            overlong_path,
-        )
-        tree = git(repo, "write-tree")
-        head = git(repo, "commit-tree", tree, "-p", base, "-m", "Head")
-        handoffs: list[workspace.ReviewWorkspace] = []
-        materialize_frozen_tree = workspace._materialize_frozen_tree
-
-        with (
-            mock.patch.object(
-                workspace,
-                "_materialize_frozen_tree",
-                wraps=materialize_frozen_tree,
-            ) as materialize,
-            self.assertRaisesRegex(ReviewError, "frozen head paths") as caught,
-        ):
-            workspace.prepare_workspace(
-                repo=repo,
-                base_ref=base,
-                head_ref=head,
-                ownership_handoff=handoffs.append,
-            )
-
-        materialize.assert_not_called()
-        self.assertEqual(handoffs, [])
-        self.assertNotIn(raw_value, str(caught.exception))
-        self.assertNotIn(overlong_path, str(caught.exception))
-
-    def test_materialized_head_path_cannot_add_a_reduced_dynamic_secret(self) -> None:
-        raw_value = reduction_secret("generic-secret-assignment").decode("ascii")
-        fixture = assignment_text("password", raw_value)
-        repo, base = self.new_repo({"fixture.cfg": fixture * 2})
-        (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
-        head = self.commit(repo)
-        review = self.prepare(repo=repo, base=base, head=head)
-        (review.workspace_root / "fixture.cfg").rename(
-            review.workspace_root / raw_value
-        )
-
-        with self.assertRaisesRegex(
-            ReviewError,
-            "secret-reduction-value",
-        ) as caught:
-            self.validate(review)
-        self.assertNotIn(raw_value, str(caught.exception))
-
     def test_deleted_dynamic_secret_path_remains_reviewable_in_raw_diff(self) -> None:
         raw_value = reduction_secret("generic-secret-assignment").decode("ascii")
         fixture = assignment_text("password", raw_value)
@@ -7181,56 +7117,6 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             workspace.CHANGED_PATH_BASE_ONLY_TAG + raw_value.encode("ascii") + b"\0",
         )
         self.validate(review)
-
-    def test_deleted_dynamic_secret_path_blocks_encoded_head_retention(self) -> None:
-        raw_value = reduction_secret("github-token").decode("ascii")
-        fixture = reduction_fixture("github-token")
-        encoded_value = base64.b64encode(raw_value.encode("ascii")).decode("ascii")
-        repo, base = self.new_repo(
-            {
-                "fixture.cfg": fixture,
-                raw_value: fixture,
-            }
-        )
-        (repo / raw_value).unlink()
-        (repo / "encoded.txt").write_text(encoded_value + "\n", encoding="utf-8")
-        head = self.commit(repo)
-        review = self.prepare(repo=repo, base=base, head=head)
-
-        with self.assertRaisesRegex(
-            ReviewError,
-            "base-only-path-secret-retained",
-        ) as caught:
-            self.validate(review)
-
-        diagnostic = str(caught.exception)
-        self.assertNotIn(raw_value, diagnostic)
-        self.assertNotIn(encoded_value, diagnostic)
-
-    def test_path_only_jwt_requires_complete_head_removal(self) -> None:
-        raw_value = reduction_secret("jwt").decode("ascii")
-        for transition in ("delete", "prefix-retention"):
-            with self.subTest(transition=transition):
-                repo, base = self.new_repo({raw_value: "ordinary content\n"})
-                if transition == "delete":
-                    (repo / raw_value).unlink()
-                else:
-                    (repo / raw_value).rename(repo / f"x{raw_value}")
-                head = self.commit(repo)
-                review = self.prepare(repo=repo, base=base, head=head)
-
-                if transition == "delete":
-                    self.assertIn(
-                        raw_value.encode("ascii"), review.diff_file.read_bytes()
-                    )
-                    self.validate(review)
-                else:
-                    with self.assertRaisesRegex(
-                        ReviewError,
-                        "base-only-path-secret-retained",
-                    ) as caught:
-                        self.validate(review)
-                    self.assertNotIn(raw_value, str(caught.exception))
 
     def test_dynamic_value_matching_changed_path_digest_fails_closed(self) -> None:
         relative = "fixture.cfg"
@@ -7382,293 +7268,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         ):
             workspace.cleanup_workspace(review, keep_container=True)
 
-    def test_jwt_base64url_suffix_extraction_does_not_count_as_reduction(self) -> None:
-        shorter = reduction_secret("jwt").decode("ascii")
-        longer = shorter + "-"
-        repo, base = self.new_repo({"fixture.txt": (longer + "!\n") * 2})
-        (repo / "fixture.txt").write_text(shorter + "!\n", encoding="utf-8")
-        head = self.commit(repo)
-
-        with self.assertRaisesRegex(
-            ReviewError,
-            "unregistered secret unembedded count increased",
-        ):
-            self.prepare(repo=repo, base=base, head=head)
-
-    def test_jwe_shared_prefix_replacement_does_not_count_as_reduction(self) -> None:
-        shared_prefix = "eyJ" + "A" * 12 + ".." + "C" * 12
-
-        def jwe(fourth: str, fifth: str) -> str:
-            return f"{shared_prefix}.{fourth * 12}.{fifth * 12}"
-
-        repo, base = self.new_repo(
-            {"fixture.txt": f"{jwe('D', 'E')}\n{jwe('F', 'G')}\n"}
-        )
-        (repo / "fixture.txt").write_text(
-            f"{jwe('H', 'I')}\n",
-            encoding="utf-8",
-        )
-        head = self.commit(repo)
-
-        with self.assertRaisesRegex(ReviewError, "jwt"):
-            self.prepare(repo=repo, base=base, head=head)
-
-    def test_google_api_key_suffix_replacement_does_not_count_as_reduction(
-        self,
-    ) -> None:
-        cases = (
-            ("hyphen-to-word", "-", ("X", "Y", "Z")),
-            ("underscore-to-hyphen", "_", ("-X", "-Y", "-Z")),
-        )
-        for label, terminal, suffixes in cases:
-            with self.subTest(case=label):
-                truncated = "AIza" + "A" * 34 + terminal
-                repo, base = self.new_repo(
-                    {
-                        "fixture.txt": (
-                            f"{truncated}{suffixes[0]}\n{truncated}{suffixes[1]}\n"
-                        )
-                    }
-                )
-                (repo / "fixture.txt").write_text(
-                    f"{truncated}{suffixes[2]}\n",
-                    encoding="utf-8",
-                )
-                head = self.commit(repo)
-
-                with self.assertRaisesRegex(ReviewError, "google-api-key"):
-                    self.prepare(repo=repo, base=base, head=head)
-
-    def test_unsafe_long_provider_rhs_does_not_count_as_reduction(self) -> None:
-        candidate = b"sk-" + b"proj-B1" + b"B" * 506
-
-        def unsafe_assignment(marker: bytes) -> str:
-            return (
-                b"api_" + b"token = " + candidate + b" \\" + b"\n" + marker + b"\n"
-            ).decode("ascii")
-
-        repo, base = self.new_repo(
-            {
-                "fixture.txt": unsafe_assignment(b"continued-a")
-                + unsafe_assignment(b"continued-b")
-            }
-        )
-        (repo / "fixture.txt").write_text(
-            unsafe_assignment(b"continued-c"),
-            encoding="utf-8",
-        )
-        head = self.commit(repo)
-
-        with self.assertRaisesRegex(ReviewError, "generic-secret-assignment"):
-            self.prepare(repo=repo, base=base, head=head)
-
-    def test_unsafe_short_provider_rhs_does_not_count_as_reduction(self) -> None:
-        candidate = b"ghp_" + b"A" * 36
-
-        def unsafe_assignment(marker: bytes) -> str:
-            return (
-                b"api_" + b"token = " + candidate + b" \\" + b"\n" + marker + b"\n"
-            ).decode("ascii")
-
-        repo, base = self.new_repo(
-            {
-                "fixture.txt": unsafe_assignment(b"continued-a")
-                + unsafe_assignment(b"continued-b")
-            }
-        )
-        (repo / "fixture.txt").write_text(
-            unsafe_assignment(b"continued-c"),
-            encoding="utf-8",
-        )
-        head = self.commit(repo)
-
-        with self.assertRaisesRegex(ReviewError, "generic-secret-assignment"):
-            self.prepare(repo=repo, base=base, head=head)
-
-    def test_provider_rhs_beyond_proof_cap_does_not_count_as_reduction(self) -> None:
-        proof_bytes = 256
-        candidate = b"ghp_" + b"A" * 36
-        assignment_prefix = b"api_token = ("
-        candidate_start = proof_bytes + 16
-        wrapper_count = candidate_start - len(assignment_prefix)
-        fixture = (
-            assignment_prefix
-            + b"(" * wrapper_count
-            + candidate
-            + b")" * (wrapper_count + 1)
-            + b"\n"
-        ).decode("ascii")
-        repo, base = self.new_repo({"fixture.txt": fixture * 2})
-        (repo / "fixture.txt").write_text(fixture, encoding="utf-8")
-        head = self.commit(repo)
-
-        with (
-            mock.patch.object(
-                workspace,
-                "MAX_SECRET_PREFIX_PROOF_BYTES",
-                proof_bytes,
-            ),
-            self.assertRaisesRegex(ReviewError, "generic-secret-assignment"),
-        ):
-            self.prepare(repo=repo, base=base, head=head)
-
-    def test_delayed_provider_in_open_rhs_does_not_count_as_reduction(self) -> None:
-        proof_bytes = 256
-        overlap = 32
-        _candidate, unsafe, _safe, _ordinary = rhs_proof_boundary_payloads()
-        fixture = unsafe.decode("ascii")
-        repo, base = self.new_repo({"fixture.txt": fixture * 2})
-        (repo / "fixture.txt").write_text(fixture, encoding="utf-8")
-        head = self.commit(repo)
-
-        with (
-            mock.patch.object(
-                workspace,
-                "MAX_SECRET_PREFIX_PROOF_BYTES",
-                proof_bytes,
-            ),
-            mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", overlap),
-            mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 64),
-            self.assertRaisesRegex(ReviewError, "generic-secret-assignment"),
-        ):
-            self.prepare(repo=repo, base=base, head=head)
-
-    def test_remote_provider_after_closed_rhs_keeps_reduction_semantics(
-        self,
-    ) -> None:
-        proof_bytes = 256
-        overlap = 32
-        _candidate, _unsafe, safe, _ordinary = rhs_proof_boundary_payloads()
-        fixture = safe.decode("ascii")
-        repo, base = self.new_repo(
-            {
-                "fixture-a.txt": fixture,
-                "fixture-b.txt": fixture,
-            }
-        )
-        (repo / "fixture-b.txt").unlink()
-        head = self.commit(repo)
-
-        with (
-            mock.patch.object(
-                workspace,
-                "MAX_SECRET_PREFIX_PROOF_BYTES",
-                proof_bytes,
-            ),
-            mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", overlap),
-            mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 64),
-        ):
-            review = self.prepare(repo=repo, base=base, head=head)
-            evidence = self.validate(review)
-
-        reductions = evidence["synthetic_tokens"]["secret_reductions"]
-        self.assertEqual(len(reductions), 1)
-        self.assertEqual(reductions[0]["rules"], ["github-token"])
-        self.assertEqual(
-            (
-                reductions[0]["base_count"],
-                reductions[0]["head_count"],
-            ),
-            (2, 1),
-        )
-        self.assertEqual(
-            (
-                reductions[0]["base_unembedded_count"],
-                reductions[0]["head_unembedded_count"],
-            ),
-            (2, 1),
-        )
-
-    def test_incomplete_quoted_short_provider_does_not_count_as_reduction(
-        self,
-    ) -> None:
-        candidate = b"ghp_" + b"A" * 36
-
-        def incomplete_assignment(marker: bytes) -> str:
-            return (
-                b"api_" + b'token = "' + candidate + b"\\" + b"\n" + marker + b'"\n'
-            ).decode("ascii")
-
-        repo, base = self.new_repo(
-            {
-                "fixture.txt": incomplete_assignment(b"continued-a")
-                + incomplete_assignment(b"continued-b")
-            }
-        )
-        (repo / "fixture.txt").write_text(
-            incomplete_assignment(b"continued-c"),
-            encoding="utf-8",
-        )
-        head = self.commit(repo)
-
-        with self.assertRaisesRegex(ReviewError, "generic-secret-assignment"):
-            self.prepare(repo=repo, base=base, head=head)
-
-    def test_incomplete_rhs_wrapper_does_not_count_as_reduction(self) -> None:
-        candidate = b"ghp_" + b"A" * 36
-        cases = (
-            ("unclosed-unquoted", b"api_token = (" + candidate + b"\n"),
-            ("mismatched-unquoted", b"api_token = ([" + candidate + b")\n"),
-            ("unclosed-quoted", b'api_token = ("' + candidate + b'"\n'),
-            (
-                "external-function-mismatch",
-                b'configure(api_token = "' + candidate + b'"]\n',
-            ),
-            (
-                "external-json-mismatch",
-                b'[{"api_token": "' + candidate + b'")]\n',
-            ),
-            (
-                "external-function-missing",
-                b'configure(api_token = "' + candidate + b'"\n',
-            ),
-            (
-                "external-json-missing",
-                b'[{"api_token": "' + candidate + b'"}\n',
-            ),
-            (
-                "external-function-missing-after-sibling",
-                b'configure(api_token = "' + candidate + b'", state = "expired"\n',
-            ),
-            (
-                "external-json-missing-after-sibling",
-                b'[{"api_token": "' + candidate + b'", "state": "expired"}\n',
-            ),
-        )
-        for label, raw_fixture in cases:
-            with self.subTest(case=label):
-                fixture = raw_fixture.decode("ascii")
-                repo, base = self.new_repo({"fixture.txt": fixture * 2})
-                (repo / "fixture.txt").write_text(fixture, encoding="utf-8")
-                head = self.commit(repo)
-
-                with self.assertRaisesRegex(
-                    ReviewError,
-                    "generic-secret-assignment",
-                ):
-                    self.prepare(repo=repo, base=base, head=head)
-
-    def test_extended_short_provider_value_does_not_count_as_prefix_reduction(
-        self,
-    ) -> None:
-        candidate = b"ghp_" + b"A" * 36
-
-        def assignment(suffix: bytes) -> str:
-            return (b"api_" + b"token = " + candidate + suffix + b"\n").decode("ascii")
-
-        repo, base = self.new_repo(
-            {"fixture.txt": assignment(b"+alpha") + assignment(b"+bravo")}
-        )
-        (repo / "fixture.txt").write_text(
-            assignment(b"+charlie"),
-            encoding="utf-8",
-        )
-        head = self.commit(repo)
-
-        with self.assertRaisesRegex(ReviewError, "generic-secret-assignment"):
-            self.prepare(repo=repo, base=base, head=head)
-
-    def test_extended_short_provider_value_can_strictly_reduce_when_exact(
+    def test_extended_short_provider_exact_value_count_decreases(
         self,
     ) -> None:
         candidate = b"ghp_" + b"A" * 36
@@ -7692,7 +7292,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             )
         )
 
-    def test_wrapped_provider_literal_can_strictly_reduce_full_identity(self) -> None:
+    def test_wrapped_provider_literal_exact_value_count_decreases(self) -> None:
         provider = reduction_secret("github-token", b"G")
         full_candidate = b"wrap/\n" + provider + b"\n+alpha"
         cases = (
@@ -7731,37 +7331,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                     )
                 )
 
-    def test_fixed_length_provider_suffix_does_not_count_as_prefix_reduction(
-        self,
-    ) -> None:
-        cases = (
-            ("aws-access-key", b"AKIA" + b"A" * 16),
-            ("npm-token", b"npm_" + b"A" * 36),
-        )
-        for rule, candidate in cases:
-            with self.subTest(rule=rule):
-
-                def assignment(suffix: bytes) -> str:
-                    return (b"api_" + b"token = " + candidate + suffix + b"\n").decode(
-                        "ascii"
-                    )
-
-                repo, base = self.new_repo(
-                    {"fixture.txt": assignment(b"_alpha") + assignment(b"_bravo")}
-                )
-                (repo / "fixture.txt").write_text(
-                    assignment(b"_charlie"),
-                    encoding="utf-8",
-                )
-                head = self.commit(repo)
-
-                with self.assertRaisesRegex(
-                    ReviewError,
-                    "generic-secret-assignment",
-                ):
-                    self.prepare(repo=repo, base=base, head=head)
-
-    def test_fixed_length_provider_suffix_can_strictly_reduce_when_exact(
+    def test_fixed_length_provider_suffix_exact_value_count_decreases(
         self,
     ) -> None:
         cases = (
@@ -7792,155 +7362,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                     )
                 )
 
-    def test_prepared_range_rejects_non_decreasing_secret_transitions(self) -> None:
-        cases = (
-            ("equal", "generic-secret-assignment"),
-            ("move", "jwt"),
-            ("copy", "github-token"),
-            ("add", "generic-secret-assignment"),
-            ("replace", "github-token"),
-        )
-        for transition, rule in cases:
-            with self.subTest(transition=transition, rule=rule):
-                fixture_a = reduction_fixture(rule, b"A")
-                fixture_b = reduction_fixture(rule, b"B")
-                base_files = (
-                    {"README.md": "base\n"}
-                    if transition == "add"
-                    else {"fixture.cfg": fixture_a}
-                )
-                repo, base = self.new_repo(base_files)
-                if transition == "equal":
-                    (repo / "README.md").write_text("head\n", encoding="utf-8")
-                elif transition == "move":
-                    (repo / "moved.cfg").write_text(fixture_a, encoding="utf-8")
-                    (repo / "fixture.cfg").unlink()
-                elif transition == "copy":
-                    (repo / "copied.cfg").write_text(fixture_a, encoding="utf-8")
-                elif transition == "add":
-                    (repo / "fixture.cfg").write_text(fixture_a, encoding="utf-8")
-                else:
-                    (repo / "fixture.cfg").write_text(fixture_b, encoding="utf-8")
-                head = self.commit(repo)
-
-                with self.assertRaisesRegex(ReviewError, rule):
-                    self.prepare(repo=repo, base=base, head=head)
-
-    def test_wrapped_unquoted_assignment_uses_reduction_policy(self) -> None:
-        candidate = reduction_secret("generic-secret-assignment").decode("ascii")
-        fixture = f"password = ({candidate})\n"
-
-        addition_repo, addition_base = self.new_repo({"README.md": "base\n"})
-        (addition_repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
-        addition_head = self.commit(addition_repo)
-        with self.assertRaisesRegex(
-            ReviewError,
-            "generic-secret-assignment",
-        ):
-            self.prepare(
-                repo=addition_repo,
-                base=addition_base,
-                head=addition_head,
-            )
-
-        invalid_fixture = f"password = (not {candidate})\n"
-        invalid_repo, invalid_base = self.new_repo({"README.md": "base\n"})
-        (invalid_repo / "fixture.cfg").write_text(
-            invalid_fixture,
-            encoding="utf-8",
-        )
-        invalid_head = self.commit(invalid_repo)
-        with self.assertRaisesRegex(
-            ReviewError,
-            "generic-secret-assignment",
-        ):
-            self.prepare(
-                repo=invalid_repo,
-                base=invalid_base,
-                head=invalid_head,
-            )
-
-        reduction_repo, reduction_base = self.new_repo({"fixture.cfg": fixture * 2})
-        (reduction_repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
-        reduction_head = self.commit(reduction_repo)
-        review = self.prepare(
-            repo=reduction_repo,
-            base=reduction_base,
-            head=reduction_head,
-        )
-        evidence = self.validate(review)
-        reductions = evidence["synthetic_tokens"]["secret_reductions"]
-        self.assertEqual(len(reductions), 1)
-        self.assertEqual(
-            (
-                reductions[0]["rules"],
-                reductions[0]["base_count"],
-                reductions[0]["head_count"],
-            ),
-            (["generic-secret-assignment"], 2, 1),
-        )
-
-    def test_prepared_range_rejects_net_reduction_with_new_occurrence_provenance(
-        self,
-    ) -> None:
-        fixture = reduction_fixture("generic-secret-assignment")
-        cases = ("path", "offset", "mode")
-        for transition in cases:
-            with self.subTest(transition=transition):
-                if transition == "path":
-                    repo, base = self.new_repo(
-                        {"first.cfg": fixture, "second.cfg": fixture}
-                    )
-                    (repo / "first.cfg").unlink()
-                    (repo / "second.cfg").unlink()
-                    (repo / "relocated.cfg").write_text(fixture, encoding="utf-8")
-                elif transition == "offset":
-                    repo, base = self.new_repo(
-                        {"fixture.cfg": fixture + "# padding\n" + fixture}
-                    )
-                    (repo / "fixture.cfg").write_text(
-                        "# shifted\n" + fixture,
-                        encoding="utf-8",
-                    )
-                else:
-                    mode_value = reduction_secret("github-token").decode("ascii")
-                    repo, base = self.new_repo(
-                        {"fixture.cfg": mode_value, "extra.cfg": mode_value}
-                    )
-                    (repo / "extra.cfg").unlink()
-                    (repo / "fixture.cfg").unlink()
-                    (repo / "fixture.cfg").symlink_to(mode_value)
-                head = self.commit(repo)
-
-                with self.assertRaisesRegex(
-                    ReviewError,
-                    "head-side occurrence",
-                ):
-                    self.prepare(repo=repo, base=base, head=head)
-
-    def test_prepared_range_rejects_new_unembedded_occurrence_at_stable_offset(
-        self,
-    ) -> None:
-        short = reduction_secret("generic-secret-assignment").decode("ascii")
-        prefix = "Prefix"
-        longer = prefix + short + "Suffix"
-        assignment_prefix = "access_token = "
-        base_first = assignment_prefix + '"' + longer + '"\n'
-        head_first = assignment_prefix + " " * len(prefix) + '"' + short + '"\n'
-        self.assertEqual(base_first.index(short), head_first.index(short))
-        repo, base = self.new_repo(
-            {"fixture.cfg": base_first + assignment_text("refresh_token", short)}
-        )
-        (repo / "fixture.cfg").write_text(head_first, encoding="utf-8")
-        head = self.commit(repo)
-
-        with self.assertRaisesRegex(
-            ReviewError,
-            "unembedded head-side occurrence",
-        ):
-            self.prepare(repo=repo, base=base, head=head)
-
-    def test_dynamic_reduction_provenance_covers_binary_and_symlink_modes(
+    def test_exact_counts_cover_binary_symlink_and_mode_changes(
         self,
     ) -> None:
         candidate = reduction_secret("github-token")
@@ -7975,34 +7397,6 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                     (2, 1),
                 )
 
-    def test_preparation_rejects_two_to_one_shared_provider_prefix_replacement(
-        self,
-    ) -> None:
-        shared_prefix = b"glpat-" + b"D" * 512
-        base_fixture = b"\n".join(
-            (shared_prefix + b"-suffix-a", shared_prefix + b"-suffix-b")
-        )
-        head_fixture = shared_prefix + b"-suffix-c\n"
-        repo, base = self.new_repo({"fixture.txt": base_fixture.decode("ascii") + "\n"})
-        (repo / "fixture.txt").write_bytes(head_fixture)
-        head = self.commit(repo)
-
-        with self.assertRaisesRegex(ReviewError, "gitlab-token"):
-            self.prepare(repo=repo, base=base, head=head)
-
-    def test_pem_reduction_uses_the_complete_block_as_candidate_identity(self) -> None:
-        base_fixture = reduction_fixture("private-key", b"A") + reduction_fixture(
-            "private-key", b"B"
-        )
-        head_fixture = reduction_fixture("private-key", b"C")
-        repo, base = self.new_repo({"fixture.pem": base_fixture})
-        (repo / "fixture.pem").write_text(head_fixture, encoding="utf-8")
-        head = self.commit(repo)
-
-        with self.assertRaisesRegex(ReviewError, "private-key"):
-            review = self.prepare(repo=repo, base=base, head=head)
-            self.validate(review)
-
     def test_dynamic_path_digest_cannot_expose_an_authoring_value(self) -> None:
         relative = "fixture.cfg"
         raw_value = hashlib.sha256(
@@ -8028,139 +7422,6 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         ) as caught:
             self.prepare(repo=repo, base=base, head=head, catalog=catalog)
         self.assertNotIn(raw_value, str(caught.exception))
-
-    def test_dynamic_path_digest_cannot_expose_a_legacy_value(self) -> None:
-        relative = "fixture.cfg"
-        raw_value = hashlib.sha256(relative.encode("ascii")).hexdigest()[:24]
-        catalog = legacy_catalog(values=(raw_value,))
-        repo, base = self.new_repo(
-            {relative: assignment_text("access_token", raw_value)}
-        )
-        (repo / "README.md").write_text("head\n", encoding="utf-8")
-        head = self.commit(repo)
-        review = self.prepare(
-            repo=repo,
-            base=base,
-            head=head,
-            catalog=catalog,
-            exemptions=("historical-fixtures",),
-        )
-        with self.assertRaisesRegex(
-            ReviewError,
-            "would expose a raw synthetic value",
-        ) as caught:
-            self.validate(review, catalog=catalog)
-        self.assertNotIn(raw_value, str(caught.exception))
-
-    def test_escaping_legacy_symlink_target_is_redacted_during_materialization(
-        self,
-    ) -> None:
-        catalog = legacy_catalog(values=(LEGACY_A,))
-        for label, sensitive_target in (
-            ("raw", LEGACY_A),
-            ("storage", legacy_value_base64(LEGACY_A)),
-        ):
-            with self.subTest(target=label):
-                repo, base = self.new_repo({"README.md": "base\n"})
-                (repo / "artifact").symlink_to("../" + sensitive_target)
-                head = self.commit(repo)
-                with self.assertRaisesRegex(
-                    ReviewError,
-                    "<redacted symlink target>",
-                ) as caught:
-                    self.prepare(repo=repo, base=base, head=head, catalog=catalog)
-                message = str(caught.exception)
-                self.assertNotIn(LEGACY_A, message)
-                self.assertNotIn(legacy_value_base64(LEGACY_A), message)
-
-    def test_tampered_escaping_legacy_symlink_target_is_redacted_during_validation(
-        self,
-    ) -> None:
-        catalog = legacy_catalog(values=(LEGACY_A,))
-        for label, sensitive_target in (
-            ("raw", LEGACY_A),
-            ("storage", legacy_value_base64(LEGACY_A)),
-        ):
-            with self.subTest(target=label):
-                repo, base = self.new_repo({"target.txt": "safe\n"})
-                (repo / "artifact").symlink_to("target.txt")
-                head = self.commit(repo)
-                review = self.prepare(
-                    repo=repo,
-                    base=base,
-                    head=head,
-                    catalog=catalog,
-                )
-                frozen_link = review.workspace_root / "artifact"
-                frozen_link.unlink()
-                frozen_link.symlink_to("../../../../" + sensitive_target)
-                with self.assertRaisesRegex(
-                    ReviewError,
-                    "<redacted symlink target>",
-                ) as caught:
-                    self.validate(review, catalog=catalog)
-                message = str(caught.exception)
-                self.assertNotIn(LEGACY_A, message)
-                self.assertNotIn(legacy_value_base64(LEGACY_A), message)
-
-    def test_evidence_cannot_expose_legacy_storage_encoding(self) -> None:
-        raw_value = "jgajgajgajgajgajga"
-        catalog = legacy_catalog(values=(raw_value,))
-        accepted = synthetic_tokens.accepted_legacy_values(
-            catalog,
-            catalog.legacy_exemptions,
-        )
-        with self.assertRaisesRegex(
-            ReviewError,
-            "would expose a raw synthetic value",
-        ) as caught:
-            workspace._reject_raw_values_in_evidence(
-                {"dynamic": legacy_value_base64(raw_value)},
-                accepted_values=accepted,
-                label="test evidence",
-            )
-        self.assertNotIn(raw_value, str(caught.exception))
-        self.assertNotIn(legacy_value_base64(raw_value), str(caught.exception))
-
-    def test_evidence_cannot_expose_dynamic_secret_storage_encoding(self) -> None:
-        raw_value = reduction_secret("generic-secret-assignment")
-        encoded_value = base64.b64encode(raw_value).decode("ascii")
-        accepted = (
-            workspace._secret_reduction_descriptor(
-                raw_value,
-                {"generic-secret-assignment"},
-            ),
-        )
-        evidence = {"dynamic": encoded_value}
-
-        with self.assertRaisesRegex(
-            ReviewError,
-            "would expose a raw synthetic value",
-        ) as caught:
-            workspace._reject_raw_values_in_evidence(
-                evidence,
-                accepted_values=accepted,
-                label="test evidence",
-            )
-        message = str(caught.exception)
-        self.assertNotIn(raw_value.decode("ascii"), message)
-        self.assertNotIn(encoded_value, message)
-
-        destination = self.root / "dynamic-secret-evidence.json"
-        with self.assertRaisesRegex(
-            ReviewError,
-            "would expose a raw synthetic value",
-        ) as caught:
-            workspace._write_bounded_json(
-                destination,
-                evidence,
-                label="test evidence",
-                accepted_values=accepted,
-            )
-        message = str(caught.exception)
-        self.assertNotIn(raw_value.decode("ascii"), message)
-        self.assertNotIn(encoded_value, message)
-        self.assertFalse(destination.exists())
 
     def test_evidence_cannot_expose_a_numeric_synthetic_value(self) -> None:
         integer_raw = "12345678" + "90123456"
@@ -8232,62 +7493,6 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             {"enabled": True, "missing": None},
         )
 
-    def test_review_range_cannot_expose_an_unused_authoring_value(self) -> None:
-        repo, base = self.new_repo({"README.md": "base\n"})
-        (repo / "README.md").write_text("head\n", encoding="utf-8")
-        head = self.commit(repo)
-        raw_value = f"{base}..{head}"
-        payload = catalog_payload()
-        payload["authoring_pool"]["tokens"][0]["value"] = raw_value
-        catalog = synthetic_tokens.parse_catalog_bytes(
-            json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        )
-        review = self.prepare(repo=repo, base=base, head=head, catalog=catalog)
-        with self.assertRaisesRegex(
-            ReviewError,
-            "would expose a raw synthetic value",
-        ) as caught:
-            self.validate(review, catalog=catalog)
-        self.assertNotIn(raw_value, str(caught.exception))
-
-    def test_review_range_cannot_expose_an_unselected_legacy_value(self) -> None:
-        repo, base = self.new_repo({"README.md": "base\n"})
-        (repo / "README.md").write_text("head\n", encoding="utf-8")
-        head = self.commit(repo)
-        raw_value = f"{base}..{head}"
-        catalog = legacy_catalog(values=(raw_value,))
-        review = self.prepare(repo=repo, base=base, head=head, catalog=catalog)
-        with self.assertRaisesRegex(
-            ReviewError,
-            "would expose a raw synthetic value",
-        ) as caught:
-            self.validate(review, catalog=catalog)
-        self.assertNotIn(raw_value, str(caught.exception))
-
-    def test_pool_value_in_credential_path_remains_blocked(self) -> None:
-        repo, base = self.new_repo({"README.md": "base\n"})
-        (repo / "auth.json").write_text(
-            json.dumps({"access_token": AUTHORING_VALUES[0]}),
-            encoding="utf-8",
-        )
-        head = self.commit(repo)
-        review = self.prepare(repo=repo, base=base, head=head)
-        with self.assertRaisesRegex(ReviewError, "credential-path"):
-            self.validate(review)
-
-    def test_non_pool_synthetic_looking_value_in_unchanged_head_is_blocked(
-        self,
-    ) -> None:
-        unknown = "codex_public_synth_v1_access_unknown"
-        repo, base = self.new_repo(
-            {"fixture.cfg": f'access_token = "{unknown}"\n', "README.md": "base\n"}
-        )
-        (repo / "README.md").write_text("head\n", encoding="utf-8")
-        head = self.commit(repo)
-        with self.assertRaisesRegex(ReviewError, "generic-secret-assignment") as raised:
-            self.prepare(repo=repo, base=base, head=head)
-        self.assertNotIn(unknown, str(raised.exception))
-
     def test_multi_value_legacy_unchanged_and_deleted_counts_pass(self) -> None:
         catalog = legacy_catalog()
         cases = {
@@ -8320,403 +7525,6 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                 self.assertEqual(len(legacy_counts), 2)
                 self.assertNotIn(LEGACY_A, json.dumps(evidence, sort_keys=True))
                 self.assertNotIn(LEGACY_B, json.dumps(evidence, sort_keys=True))
-
-    def test_printable_legacy_value_passes_only_when_selected(self) -> None:
-        catalog = legacy_catalog(values=(LEGACY_PRINTABLE,))
-        repo, base = self.new_repo(
-            {"fixture.cfg": assignment_text("access_token", LEGACY_PRINTABLE)}
-        )
-        (repo / "README.md").write_text("head\n", encoding="utf-8")
-        head = self.commit(repo)
-
-        review = self.prepare(
-            repo=repo,
-            base=base,
-            head=head,
-            catalog=catalog,
-            exemptions=("historical-fixtures",),
-        )
-        evidence = self.validate(review, catalog=catalog)
-        counts = evidence["synthetic_tokens"]["legacy_counts"]
-        self.assertEqual(
-            (counts[0]["base_count"], counts[0]["head_count"]),
-            (1, 1),
-        )
-        serialized = json.dumps(evidence, sort_keys=True)
-        self.assertNotIn(LEGACY_PRINTABLE, serialized)
-        self.assertNotIn(legacy_value_base64(LEGACY_PRINTABLE), serialized)
-
-        with self.assertRaisesRegex(ReviewError, "generic-secret-assignment"):
-            self.prepare(
-                repo=repo,
-                base=base,
-                head=head,
-                catalog=catalog,
-            )
-
-    def test_unselected_legacy_reduction_requires_explicit_exemption(self) -> None:
-        catalog = legacy_catalog(values=(LEGACY_A,))
-        fixture = assignment_text("access_token", LEGACY_A)
-        repo, base = self.new_repo({"fixture.cfg": fixture * 2})
-        (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
-        head = self.commit(repo)
-
-        with mock.patch.object(
-            workspace,
-            "_secret_reduction_descriptor",
-            wraps=workspace._secret_reduction_descriptor,
-        ) as descriptor:
-            with self.assertRaisesRegex(
-                ReviewError,
-                "explicitly selected synthetic secret exemption",
-            ) as raised:
-                self.prepare(
-                    repo=repo,
-                    base=base,
-                    head=head,
-                    catalog=catalog,
-                )
-        descriptor.assert_not_called()
-        self.assertNotIn(LEGACY_A, str(raised.exception))
-
-        review = self.prepare(
-            repo=repo,
-            base=base,
-            head=head,
-            catalog=catalog,
-            exemptions=("historical-fixtures",),
-        )
-        evidence = self.validate(review, catalog=catalog)
-        counts = evidence["synthetic_tokens"]["legacy_counts"]
-        self.assertEqual(len(counts), 1)
-        self.assertEqual(
-            (counts[0]["base_count"], counts[0]["head_count"]),
-            (2, 1),
-        )
-        self.assertEqual(evidence["synthetic_tokens"]["secret_reductions"], [])
-
-    def test_unselected_legacy_substring_reduction_requires_explicit_exemption(
-        self,
-    ) -> None:
-        catalog = legacy_catalog(values=(LEGACY_A,))
-        embedded_value = "Prefix" + LEGACY_A + "Suffix"
-        fixture = assignment_text("access_token", embedded_value)
-        repo, base = self.new_repo({"fixture.cfg": fixture * 2})
-        (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
-        head = self.commit(repo)
-
-        with mock.patch.object(
-            workspace,
-            "_secret_reduction_descriptor",
-            wraps=workspace._secret_reduction_descriptor,
-        ) as descriptor:
-            with self.assertRaisesRegex(
-                ReviewError,
-                "explicitly selected synthetic secret exemption",
-            ) as raised:
-                self.prepare(
-                    repo=repo,
-                    base=base,
-                    head=head,
-                    catalog=catalog,
-                )
-        descriptor.assert_not_called()
-        self.assertNotIn(LEGACY_A, str(raised.exception))
-        self.assertNotIn(embedded_value, str(raised.exception))
-
-        review = self.prepare(
-            repo=repo,
-            base=base,
-            head=head,
-            catalog=catalog,
-            exemptions=("historical-fixtures",),
-        )
-        evidence = self.validate(review, catalog=catalog)
-        counts = evidence["synthetic_tokens"]["legacy_counts"]
-        reductions = evidence["synthetic_tokens"]["secret_reductions"]
-        self.assertEqual(len(counts), 1)
-        self.assertEqual(
-            (counts[0]["base_count"], counts[0]["head_count"]),
-            (2, 1),
-        )
-        self.assertEqual(len(reductions), 1)
-        self.assertEqual(
-            (reductions[0]["base_count"], reductions[0]["head_count"]),
-            (2, 1),
-        )
-
-    def test_unselected_legacy_storage_reduction_requires_explicit_exemption(
-        self,
-    ) -> None:
-        catalog = legacy_catalog(values=(LEGACY_A,))
-        storage = legacy_value_base64(LEGACY_A)
-        for label, candidate in (
-            ("exact", storage),
-            ("substring", "Prefix" + storage + "Suffix"),
-        ):
-            with self.subTest(case=label):
-                fixture = assignment_text("access_token", candidate)
-                repo, base = self.new_repo(
-                    {
-                        "fixture.cfg": fixture * 2,
-                        "legacy.txt": LEGACY_A + "\n",
-                    }
-                )
-                (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
-                head = self.commit(repo)
-
-                with mock.patch.object(
-                    workspace,
-                    "_secret_reduction_descriptor",
-                    wraps=workspace._secret_reduction_descriptor,
-                ) as descriptor:
-                    with self.assertRaisesRegex(
-                        ReviewError,
-                        "explicitly selected synthetic secret exemption",
-                    ) as raised:
-                        self.prepare(
-                            repo=repo,
-                            base=base,
-                            head=head,
-                            catalog=catalog,
-                        )
-                descriptor.assert_not_called()
-                message = str(raised.exception)
-                self.assertNotIn(LEGACY_A, message)
-                self.assertNotIn(storage, message)
-                self.assertNotIn(candidate, message)
-
-                review = self.prepare(
-                    repo=repo,
-                    base=base,
-                    head=head,
-                    catalog=catalog,
-                    exemptions=("historical-fixtures",),
-                )
-                evidence = self.validate(review, catalog=catalog)
-                counts = evidence["synthetic_tokens"]["legacy_counts"]
-                reductions = evidence["synthetic_tokens"]["secret_reductions"]
-                self.assertEqual(
-                    (counts[0]["base_count"], counts[0]["head_count"]),
-                    (1, 1),
-                )
-                self.assertEqual(
-                    (reductions[0]["base_count"], reductions[0]["head_count"]),
-                    (2, 1),
-                )
-
-    def test_runtime_catalog_rechecks_unselected_legacy_reduction_overlap(
-        self,
-    ) -> None:
-        catalog = synthetic_tokens.load_catalog()
-        candidate = reduction_secret("generic-secret-assignment")
-        legacy_substring = candidate[4:-4].decode("ascii")
-        fixture = reduction_fixture("generic-secret-assignment")
-        repo, base = self.new_repo({"fixture.cfg": fixture * 2})
-        (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
-        head = self.commit(repo)
-        review = self.prepare(
-            repo=repo,
-            base=base,
-            head=head,
-            catalog=catalog,
-        )
-        mutated_catalog = legacy_catalog(values=(legacy_substring,))
-        self.assertEqual(mutated_catalog.schema_version, catalog.schema_version)
-        self.assertEqual(mutated_catalog.pool_version, catalog.pool_version)
-
-        with self.assertRaisesRegex(
-            ReviewError,
-            "explicitly selected synthetic secret exemption",
-        ) as raised:
-            self.validate(review, catalog=mutated_catalog)
-        self.assertNotIn(candidate.decode("ascii"), str(raised.exception))
-        self.assertNotIn(legacy_substring, str(raised.exception))
-
-    def test_runtime_catalog_rechecks_unselected_legacy_storage_overlap(
-        self,
-    ) -> None:
-        catalog = synthetic_tokens.load_catalog()
-        raw_value = "RuntimeCatalogLegacyA9Z8Y7"
-        storage = legacy_value_base64(raw_value)
-        candidate = "Prefix" + storage + "Suffix"
-        fixture = assignment_text("access_token", candidate)
-        repo, base = self.new_repo({"fixture.cfg": fixture * 2})
-        (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
-        head = self.commit(repo)
-        review = self.prepare(
-            repo=repo,
-            base=base,
-            head=head,
-            catalog=catalog,
-        )
-        mutated_catalog = legacy_catalog(values=(raw_value,))
-        self.assertEqual(mutated_catalog.schema_version, catalog.schema_version)
-        self.assertEqual(mutated_catalog.pool_version, catalog.pool_version)
-
-        with self.assertRaisesRegex(
-            ReviewError,
-            "explicitly selected synthetic secret exemption",
-        ) as raised:
-            self.validate(review, catalog=mutated_catalog)
-        message = str(raised.exception)
-        self.assertNotIn(raw_value, message)
-        self.assertNotIn(storage, message)
-        self.assertNotIn(candidate, message)
-
-    def test_runtime_catalog_rechecks_base_only_legacy_paths(self) -> None:
-        catalog = synthetic_tokens.load_catalog()
-        raw_value = "RuntimeCatalogLegacyPathA9Z8Y7"
-        mutated_catalog = legacy_catalog(values=(raw_value,))
-        self.assertEqual(mutated_catalog.schema_version, catalog.schema_version)
-        self.assertEqual(mutated_catalog.pool_version, catalog.pool_version)
-        cases = {
-            "deleted-raw": (raw_value, None),
-            "renamed-storage": (
-                legacy_value_base64(raw_value),
-                "safe-destination.txt",
-            ),
-        }
-
-        for label, (path_value, destination) in cases.items():
-            with self.subTest(case=label):
-                source = f"fixture-{path_value}.txt"
-                repo, base = self.new_repo({source: "base\n"})
-                if destination is None:
-                    (repo / source).unlink()
-                else:
-                    (repo / source).rename(repo / destination)
-                head = self.commit(repo)
-                review = self.prepare(
-                    repo=repo,
-                    base=base,
-                    head=head,
-                    catalog=catalog,
-                )
-
-                with self.assertRaisesRegex(
-                    ReviewError,
-                    "legacy-synthetic-value",
-                ) as raised:
-                    self.validate(review, catalog=mutated_catalog)
-                self.assertNotIn(raw_value, str(raised.exception))
-                self.assertNotIn(path_value, str(raised.exception))
-
-    def test_runtime_catalog_rechecks_changed_path_digest_evidence(self) -> None:
-        catalog = synthetic_tokens.load_catalog()
-        relative = "fixture.txt"
-        cases = {
-            "head": workspace.CHANGED_PATH_HEAD_TAG,
-            "base-only": workspace.CHANGED_PATH_BASE_ONLY_TAG,
-        }
-
-        for label, side_tag in cases.items():
-            with self.subTest(side=label):
-                repo, base = self.new_repo({relative: "base\n"})
-                if side_tag == workspace.CHANGED_PATH_HEAD_TAG:
-                    (repo / relative).write_text("head\n", encoding="utf-8")
-                else:
-                    (repo / relative).unlink()
-                head = self.commit(repo)
-                review = self.prepare(
-                    repo=repo,
-                    base=base,
-                    head=head,
-                    catalog=catalog,
-                )
-                digest = workspace._changed_path_digest(
-                    side_tag,
-                    relative.encode("ascii"),
-                ).decode("ascii")
-                raw_value = digest[8:32]
-                mutated_catalog = legacy_catalog(values=(raw_value,))
-                self.assertEqual(mutated_catalog.schema_version, catalog.schema_version)
-                self.assertEqual(mutated_catalog.pool_version, catalog.pool_version)
-
-                with self.assertRaisesRegex(
-                    ReviewError,
-                    "frozen changed path digest evidence would expose",
-                ) as raised:
-                    self.validate(review, catalog=mutated_catalog)
-                self.assertNotIn(raw_value, str(raised.exception))
-
-    def test_runtime_catalog_rechecks_changed_blob_path_digest_evidence(
-        self,
-    ) -> None:
-        catalog = synthetic_tokens.load_catalog()
-        relative = "fixture.txt"
-        repo, base = self.new_repo({relative: "base\n"})
-        (repo / relative).write_text("head\n", encoding="utf-8")
-        head = self.commit(repo)
-        review = self.prepare(
-            repo=repo,
-            base=base,
-            head=head,
-            catalog=catalog,
-        )
-        path_digest = hashlib.sha256(relative.encode("ascii")).hexdigest()
-        control_dir = review.workspace_root / ".codex-review"
-        (control_dir / "changed-blob-findings.z").write_bytes(
-            b"head\0" + path_digest.encode("ascii") + b"\0generic-secret-assignment\0"
-        )
-        control_state = workspace._build_control_artifact_state(
-            control_dir=control_dir,
-            private_cleanup=review.private_cleanup,
-        )
-        (review.container_dir / workspace.CONTROL_ARTIFACT_STATE_NAME).write_text(
-            json.dumps(control_state),
-            encoding="utf-8",
-        )
-        raw_value = path_digest[8:32]
-        mutated_catalog = legacy_catalog(values=(raw_value,))
-        self.assertEqual(mutated_catalog.schema_version, catalog.schema_version)
-        self.assertEqual(mutated_catalog.pool_version, catalog.pool_version)
-
-        with self.assertRaisesRegex(
-            ReviewError,
-            "changed-blob finding path digest evidence would expose",
-        ) as raised:
-            self.validate(review, catalog=mutated_catalog)
-        self.assertNotIn(raw_value, str(raised.exception))
-
-    def test_legacy_counts_accept_authoring_values_but_not_unknown_secrets(
-        self,
-    ) -> None:
-        catalog = legacy_catalog(values=(LEGACY_A,))
-        fixture = assignment_text(
-            "access_token", AUTHORING_VALUES[0]
-        ) + assignment_text("refresh_token", LEGACY_A)
-        repo, base = self.new_repo({"fixture.cfg": fixture})
-        (repo / "README.md").write_text("head\n", encoding="utf-8")
-        head = self.commit(repo)
-        review = self.prepare(
-            repo=repo,
-            base=base,
-            head=head,
-            catalog=catalog,
-            exemptions=("historical-fixtures",),
-        )
-        evidence = self.validate(review, catalog=catalog)
-        counts = evidence["synthetic_tokens"]["legacy_counts"]
-        self.assertEqual(len(counts), 1)
-        self.assertEqual((counts[0]["base_count"], counts[0]["head_count"]), (1, 1))
-
-        unknown_repo, unknown_base = self.new_repo(
-            {
-                "fixture.cfg": fixture
-                + assignment_text("id_token", "UnknownSecretValueA9Z8Y7")
-            }
-        )
-        (unknown_repo / "README.md").write_text("head\n", encoding="utf-8")
-        unknown_head = self.commit(unknown_repo)
-        with self.assertRaisesRegex(ReviewError, "generic-secret-assignment"):
-            self.prepare(
-                repo=unknown_repo,
-                base=unknown_base,
-                head=unknown_head,
-                catalog=catalog,
-                exemptions=("historical-fixtures",),
-            )
 
     def test_github_legacy_assignment_uses_the_provider_specific_exemption(
         self,
@@ -8770,187 +7578,6 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             )
         )
 
-    def test_selected_legacy_value_cannot_move_from_content_into_a_path(self) -> None:
-        catalog = legacy_catalog(values=(LEGACY_A,))
-        repo, base = self.new_repo(
-            {"fixture.cfg": assignment_text("access_token", LEGACY_A)}
-        )
-        (repo / "fixture.cfg").unlink()
-        (repo / f"moved-{LEGACY_A}.txt").write_text("head\n", encoding="utf-8")
-        head = self.commit(repo)
-
-        with self.assertRaisesRegex(
-            ReviewError,
-            "not allowed in repository paths",
-        ) as caught:
-            self.prepare(
-                repo=repo,
-                base=base,
-                head=head,
-                catalog=catalog,
-                exemptions=("historical-fixtures",),
-            )
-        self.assertNotIn(LEGACY_A, str(caught.exception))
-
-    def test_selected_legacy_value_cannot_be_copied_from_content_into_a_path(
-        self,
-    ) -> None:
-        catalog = legacy_catalog(values=(LEGACY_A,))
-        repo, base = self.new_repo(
-            {"fixture.cfg": assignment_text("access_token", LEGACY_A)}
-        )
-        (repo / f"copied-{LEGACY_A}.txt").write_text("head\n", encoding="utf-8")
-        head = self.commit(repo)
-
-        with self.assertRaisesRegex(
-            ReviewError,
-            "not allowed in repository paths",
-        ) as caught:
-            self.prepare(
-                repo=repo,
-                base=base,
-                head=head,
-                catalog=catalog,
-                exemptions=("historical-fixtures",),
-            )
-        self.assertNotIn(LEGACY_A, str(caught.exception))
-
-    def test_legacy_storage_encoding_cannot_appear_in_a_path(self) -> None:
-        catalog = legacy_catalog(values=(LEGACY_A,))
-        storage = legacy_value_base64(LEGACY_A)
-        repo, base = self.new_repo({"README.md": "base\n"})
-        (repo / f"fixture-{storage}.txt").write_text("head\n", encoding="utf-8")
-        head = self.commit(repo)
-
-        with self.assertRaisesRegex(
-            ReviewError,
-            "not allowed in repository paths",
-        ) as caught:
-            self.prepare(repo=repo, base=base, head=head, catalog=catalog)
-        message = str(caught.exception)
-        self.assertNotIn(storage, message)
-        self.assertNotIn(LEGACY_A, message)
-
-    def test_unselected_legacy_value_cannot_appear_in_a_path(self) -> None:
-        catalog = legacy_catalog(values=(LEGACY_A,))
-        repo, base = self.new_repo({"README.md": "base\n"})
-        (repo / f"fixture-{LEGACY_A}.txt").write_text("head\n", encoding="utf-8")
-        head = self.commit(repo)
-
-        with self.assertRaisesRegex(
-            ReviewError,
-            "not allowed in repository paths",
-        ) as caught:
-            self.prepare(repo=repo, base=base, head=head, catalog=catalog)
-        self.assertNotIn(LEGACY_A, str(caught.exception))
-
-    def test_deleted_or_renamed_base_legacy_path_remains_blocked(self) -> None:
-        catalog = legacy_catalog(values=(LEGACY_A,))
-        storage = legacy_value_base64(LEGACY_A)
-        cases = {
-            "deleted-raw": (LEGACY_A, None),
-            "renamed-storage": (storage, "safe-name.txt"),
-        }
-        for label, (path_value, destination) in cases.items():
-            with self.subTest(case=label):
-                source = f"fixture-{path_value}.txt"
-                repo, base = self.new_repo({source: "base\n"})
-                if destination is None:
-                    (repo / source).unlink()
-                else:
-                    (repo / source).rename(repo / destination)
-                head = self.commit(repo)
-
-                with self.assertRaisesRegex(
-                    ReviewError,
-                    "not allowed in repository paths",
-                ) as caught:
-                    self.prepare(repo=repo, base=base, head=head, catalog=catalog)
-                self.assertNotIn(path_value, str(caught.exception))
-
-    def test_legacy_add_and_copy_fail_count_gate(self) -> None:
-        catalog = legacy_catalog(values=(LEGACY_A,))
-        cases = {
-            "add": ({"README.md": "base\n"}, {"fixture.cfg": LEGACY_A}),
-            "copy": (
-                {"fixture.cfg": f'access_token = "{LEGACY_A}"\n'},
-                {
-                    "fixture.cfg": f'access_token = "{LEGACY_A}"\n',
-                    "copy.cfg": f'access_token = "{LEGACY_A}"\n',
-                },
-            ),
-        }
-        for label, (base_files, head_files) in cases.items():
-            with self.subTest(case=label):
-                repo, base = self.new_repo(base_files)
-                for relative, value in head_files.items():
-                    path = repo / relative
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    if label == "add":
-                        value = f'access_token = "{value}"\n'
-                    path.write_text(value, encoding="utf-8")
-                head = self.commit(repo)
-                with self.assertRaisesRegex(ReviewError, "count increased"):
-                    self.prepare(
-                        repo=repo,
-                        base=base,
-                        head=head,
-                        catalog=catalog,
-                        exemptions=("historical-fixtures",),
-                    )
-
-    def test_legacy_plain_text_and_binary_copies_fail_global_raw_count_gate(
-        self,
-    ) -> None:
-        catalog = legacy_catalog(values=(LEGACY_A,))
-        for label, copied_bytes in (
-            ("plain", b"note: " + LEGACY_A.encode("ascii") + b"\n"),
-            ("binary", b"\x00prefix\x00" + LEGACY_A.encode("ascii") + b"\x00suffix"),
-        ):
-            with self.subTest(case=label):
-                repo, base = self.new_repo(
-                    {"fixture.cfg": assignment_text("access_token", LEGACY_A)}
-                )
-                (repo / f"{label}.bin").write_bytes(copied_bytes)
-                head = self.commit(repo)
-                with self.assertRaisesRegex(ReviewError, "count increased"):
-                    self.prepare(
-                        repo=repo,
-                        base=base,
-                        head=head,
-                        catalog=catalog,
-                        exemptions=("historical-fixtures",),
-                    )
-
-    def test_legacy_value_can_move_from_assignment_to_plain_text(self) -> None:
-        catalog = legacy_catalog(values=(LEGACY_A,))
-        repo, base = self.new_repo(
-            {"fixture.cfg": assignment_text("access_token", LEGACY_A)}
-        )
-        (repo / "fixture.cfg").unlink()
-        (repo / "notes.txt").write_text(
-            f"historical fixture: {LEGACY_A}\n",
-            encoding="utf-8",
-        )
-        head = self.commit(repo)
-        review = self.prepare(
-            repo=repo,
-            base=base,
-            head=head,
-            catalog=catalog,
-            exemptions=("historical-fixtures",),
-        )
-        evidence = self.validate(review, catalog=catalog)
-        counts = evidence["synthetic_tokens"]["legacy_counts"]
-        self.assertEqual((counts[0]["base_count"], counts[0]["head_count"]), (1, 1))
-        self.assertEqual(
-            (
-                counts[0]["base_unembedded_count"],
-                counts[0]["head_unembedded_count"],
-            ),
-            (1, 1),
-        )
-
     def test_frozen_head_plain_text_tampering_fails_raw_count_revalidation(
         self,
     ) -> None:
@@ -8977,100 +7604,6 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             "count changed after preparation",
         ):
             self.validate(review, catalog=catalog)
-
-    def test_snapshot_path_rename_to_legacy_value_fails_revalidation(self) -> None:
-        catalog = legacy_catalog(values=(LEGACY_A,))
-        repo, base = self.new_repo(
-            {
-                "fixture.cfg": assignment_text("access_token", LEGACY_A),
-                "safe.txt": "safe\n",
-            }
-        )
-        (repo / "README.md").write_text("head\n", encoding="utf-8")
-        head = self.commit(repo)
-        review = self.prepare(
-            repo=repo,
-            base=base,
-            head=head,
-            catalog=catalog,
-            exemptions=("historical-fixtures",),
-        )
-        (review.workspace_root / "safe.txt").rename(
-            review.workspace_root / f"moved-{LEGACY_A}.txt"
-        )
-
-        with self.assertRaisesRegex(
-            ReviewError,
-            "legacy-synthetic-value",
-        ) as caught:
-            self.validate(review, catalog=catalog)
-        self.assertNotIn(LEGACY_A, str(caught.exception))
-
-    def test_catalog_legacy_paths_stay_redacted_in_file_reader_errors(self) -> None:
-        raw_value = "archived_" + "fixture_0001"
-        catalog = legacy_catalog(values=(raw_value,))
-        representations = (raw_value, legacy_value_base64(raw_value))
-        variants = ["hardlink", "open-error", "writable"]
-        if hasattr(os, "mkfifo"):
-            variants.append("fifo")
-
-        for representation in representations:
-            for variant in variants:
-                with self.subTest(representation=representation, variant=variant):
-                    repo, base = self.new_repo(
-                        {
-                            "fixture.cfg": assignment_text(
-                                "access_token",
-                                raw_value,
-                            ),
-                            "safe.txt": "safe\n",
-                        }
-                    )
-                    (repo / "README.md").write_text("head\n", encoding="utf-8")
-                    head = self.commit(repo)
-                    review = self.prepare(
-                        repo=repo,
-                        base=base,
-                        head=head,
-                        catalog=catalog,
-                        exemptions=("historical-fixtures",),
-                    )
-                    target = review.workspace_root / f"moved-{representation}.txt"
-                    (review.workspace_root / "safe.txt").rename(target)
-                    patch_open = contextlib.nullcontext()
-                    if variant == "hardlink":
-                        os.link(
-                            target,
-                            review.workspace_root / f"peer-{representation}.txt",
-                        )
-                    elif variant == "open-error":
-                        real_open = os.open
-
-                        def fail_target_open(path, flags, *args, **kwargs):
-                            if os.fspath(path) == os.fspath(target):
-                                raise OSError(
-                                    errno.EIO,
-                                    f"synthetic failure at {target}",
-                                )
-                            return real_open(path, flags, *args, **kwargs)
-
-                        patch_open = mock.patch.object(
-                            workspace.os,
-                            "open",
-                            side_effect=fail_target_open,
-                        )
-                    elif variant == "writable":
-                        target.chmod(0o664)
-                    else:
-                        target.unlink()
-                        os.mkfifo(target, mode=0o600)
-
-                    with patch_open, self.assertRaises(ReviewError) as caught:
-                        self.validate(review, catalog=catalog)
-                    message = str(caught.exception)
-                    self.assertIn("<redacted snapshot path>", message)
-                    self.assertNotIn(raw_value, message)
-                    self.assertNotIn(legacy_value_base64(raw_value), message)
 
     def test_catalog_legacy_path_stays_redacted_after_a_read_error(self) -> None:
         raw_value = "archived_" + "fixture_0001"
@@ -9116,7 +7649,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             "changed-blob-findings.z": (b"head\0tampered.txt\0private-key\0"),
             workspace.SYNTHETIC_MANIFEST_NAME: b'{"entries":[]}\n',
             workspace.SYNTHETIC_CHANGED_EVIDENCE_NAME: (
-                b'{"entries":[],"schema_version":1}\n'
+                b'{"entries":[{}],"schema_version":1}\n'
             ),
             "review.diff": b"",
             "review.prompt": b"Review the frozen range.\n",
@@ -9342,7 +7875,6 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             ("range", "version or review range"),
             ("digest", "helper-private entry is inconsistent"),
             ("count", "count changed after preparation"),
-            ("occurrence-commitment", "occurrence provenance changed"),
             ("private-base64", "not canonical Base64"),
         )
         for tamper, expected_message in cases:
@@ -9359,8 +7891,8 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                 )
                 public = json.loads(public_path.read_text(encoding="utf-8"))
                 private = json.loads(private_path.read_text(encoding="utf-8"))
-                self.assertEqual(public["schema_version"], 4)
-                self.assertEqual(private["schema_version"], 4)
+                self.assertEqual(public["schema_version"], 5)
+                self.assertEqual(private["schema_version"], 5)
                 self.assertEqual(len(private["secret_reduction_values"]), 1)
 
                 if tamper == "range":
@@ -9374,11 +7906,6 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                     for manifest in (public, private):
                         manifest["secret_reductions"][0]["base_count"] = 3
                         manifest["secret_reductions"][0]["head_count"] = 2
-                elif tamper == "occurrence-commitment":
-                    for manifest in (public, private):
-                        manifest["secret_reduction_provenance"]["head_sha256"] = (
-                            "0" * 64
-                        )
                 else:
                     private["secret_reduction_values"][0]["value_base64"] = "***"
 
@@ -9423,153 +7950,6 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         with self.assertRaisesRegex(ReviewError, "count changed after preparation"):
             self.validate(review)
 
-    def test_materialized_head_cannot_relocate_a_residual_reduced_secret(
-        self,
-    ) -> None:
-        fixture = reduction_fixture("generic-secret-assignment")
-        repo, base = self.new_repo({"fixture.cfg": fixture * 2})
-        (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
-        head = self.commit(repo)
-        review = self.prepare(repo=repo, base=base, head=head)
-
-        (review.workspace_root / "fixture.cfg").write_text(
-            "# shifted\n" + fixture,
-            encoding="utf-8",
-        )
-        with self.assertRaisesRegex(ReviewError, "occurrence provenance changed"):
-            self.validate(review)
-
-    def test_overlapping_legacy_values_are_counted_independently(self) -> None:
-        longer = LEGACY_A + "Suffix"
-        catalog = legacy_catalog(values=(LEGACY_A, longer))
-        repo, base = self.new_repo(
-            {
-                "fixture.cfg": (
-                    assignment_text("access_token", LEGACY_A)
-                    + assignment_text("refresh_token", longer)
-                )
-            }
-        )
-        (repo / "README.md").write_text("head\n", encoding="utf-8")
-        head = self.commit(repo)
-        review = self.prepare(
-            repo=repo,
-            base=base,
-            head=head,
-            catalog=catalog,
-            exemptions=("historical-fixtures",),
-        )
-        evidence = self.validate(review, catalog=catalog)
-        counts = {
-            entry["token_id"]: (
-                entry["base_count"],
-                entry["head_count"],
-                entry["base_unembedded_count"],
-                entry["head_unembedded_count"],
-            )
-            for entry in evidence["synthetic_tokens"]["legacy_counts"]
-        }
-        self.assertEqual(counts["historical-1"], (2, 2, 1, 1))
-        self.assertEqual(counts["historical-2"], (1, 1, 1, 1))
-
-    def test_embedded_legacy_value_cannot_become_standalone(self) -> None:
-        longer = LEGACY_A + "Suffix"
-        catalog = legacy_catalog(values=(LEGACY_A, longer))
-        cases = {
-            "assignment": (
-                assignment_text("refresh_token", longer),
-                assignment_text("access_token", LEGACY_A),
-            ),
-            "plain": (
-                f"historical fixture: {longer}\n",
-                f"historical fixture: {LEGACY_A}\n",
-            ),
-        }
-        for label, (base_fixture, head_fixture) in cases.items():
-            with self.subTest(case=label):
-                repo, base = self.new_repo({"fixture.cfg": base_fixture})
-                (repo / "fixture.cfg").write_text(
-                    head_fixture,
-                    encoding="utf-8",
-                )
-                head = self.commit(repo)
-                with self.assertRaisesRegex(
-                    ReviewError,
-                    "unembedded count increased",
-                ):
-                    self.prepare(
-                        repo=repo,
-                        base=base,
-                        head=head,
-                        catalog=catalog,
-                        exemptions=("historical-fixtures",),
-                    )
-
-    def test_reduced_dynamic_container_does_not_change_legacy_embedding(self) -> None:
-        catalog = legacy_catalog(values=(LEGACY_A,))
-        dynamic = "DynamicPrefixA9Z8" + LEGACY_A + "DynamicSuffixQ7W6"
-        repo, base = self.new_repo(
-            {"fixture.cfg": assignment_text("password", dynamic)}
-        )
-        (repo / "fixture.cfg").write_text(
-            assignment_text("access_token", LEGACY_A),
-            encoding="utf-8",
-        )
-        head = self.commit(repo)
-
-        review = self.prepare(
-            repo=repo,
-            base=base,
-            head=head,
-            catalog=catalog,
-            exemptions=("historical-fixtures",),
-        )
-        evidence = self.validate(review, catalog=catalog)
-        legacy = evidence["synthetic_tokens"]["legacy_counts"]
-        reductions = evidence["synthetic_tokens"]["secret_reductions"]
-        self.assertEqual(len(legacy), 1)
-        self.assertEqual(
-            (
-                legacy[0]["base_count"],
-                legacy[0]["head_count"],
-                legacy[0]["base_unembedded_count"],
-                legacy[0]["head_unembedded_count"],
-            ),
-            (1, 1, 1, 1),
-        )
-        self.assertEqual(len(reductions), 1)
-        self.assertEqual(
-            (
-                reductions[0]["base_count"],
-                reductions[0]["head_count"],
-                reductions[0]["base_unembedded_count"],
-                reductions[0]["head_unembedded_count"],
-            ),
-            (1, 0, 1, 0),
-        )
-
-    def test_valid_long_provider_assignment_can_strictly_reduce(self) -> None:
-        candidate = "sk-proj-B1" + "B" * 506
-        fixture = assignment_text("api_token", candidate)
-        repo, base = self.new_repo({"fixture.cfg": fixture * 2})
-        (repo / "fixture.cfg").write_text(fixture, encoding="utf-8")
-        head = self.commit(repo)
-
-        review = self.prepare(repo=repo, base=base, head=head)
-        evidence = self.validate(review)
-        reductions = evidence["synthetic_tokens"]["secret_reductions"]
-        self.assertEqual(len(reductions), 1)
-        self.assertEqual(reductions[0]["rules"], ["openai-key"])
-        self.assertEqual(
-            (
-                reductions[0]["base_count"],
-                reductions[0]["head_count"],
-                reductions[0]["base_unembedded_count"],
-                reductions[0]["head_unembedded_count"],
-            ),
-            (2, 1, 2, 1),
-        )
-
     def test_observed_legacy_value_must_not_overlap_authoring_pool(self) -> None:
         overlapping = AUTHORING_VALUES[0] + "_suffix"
         with self.assertRaisesRegex(ReviewError, "overlapping values"):
@@ -9581,41 +7961,6 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ReviewError, "exact ASCII"):
             legacy_catalog(values=(non_ascii,))
-
-    def test_unknown_duplicate_unused_and_unselected_legacy_fail_closed(self) -> None:
-        catalog = legacy_catalog(values=(LEGACY_A,))
-        repo, base = self.new_repo({"README.md": "base\n"})
-        (repo / "README.md").write_text("head\n", encoding="utf-8")
-        head = self.commit(repo)
-        for selection, message in (
-            (("missing",), "unknown synthetic secret exemption"),
-            (("historical-fixtures",) * 2, "duplicate synthetic secret exemption"),
-            (("historical-fixtures",), "unused"),
-        ):
-            with (
-                self.subTest(selection=selection),
-                self.assertRaisesRegex(ReviewError, message),
-            ):
-                self.prepare(
-                    repo=repo,
-                    base=base,
-                    head=head,
-                    catalog=catalog,
-                    exemptions=selection,
-                )
-
-        secret_repo, secret_base = self.new_repo(
-            {"fixture.cfg": f'access_token = "{LEGACY_A}"\n'}
-        )
-        (secret_repo / "README.md").write_text("head\n", encoding="utf-8")
-        secret_head = self.commit(secret_repo)
-        with self.assertRaisesRegex(ReviewError, "generic-secret-assignment"):
-            self.prepare(
-                repo=secret_repo,
-                base=secret_base,
-                head=secret_head,
-                catalog=catalog,
-            )
 
     def test_prompt_only_generic_secret_is_trusted_review_input(self) -> None:
         repo, base = self.new_repo({"README.md": "base\n"})
@@ -9673,7 +8018,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             review.prompt_file.read_text(encoding="utf-8"),
         )
 
-    def test_prompt_with_selected_legacy_value_is_trusted_input(self) -> None:
+    def test_prompt_with_catalog_legacy_value_is_trusted_input(self) -> None:
         catalog = legacy_catalog(values=(LEGACY_A,))
         repo, base = self.new_repo(
             {"fixture.cfg": assignment_text("access_token", LEGACY_A)}
@@ -9702,7 +8047,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             )
         )
 
-    def test_strictly_reduced_tracked_secret_is_allowed_in_prompt(
+    def test_exact_count_reduced_tracked_secret_is_allowed_in_prompt(
         self,
     ) -> None:
         fixture = reduction_fixture("generic-secret-assignment")
@@ -9734,162 +8079,6 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             )
         )
 
-    def test_audit_master_cli_verifies_pinned_provenance_without_raw_value(
-        self,
-    ) -> None:
-        unrelated = "sk-" + "Q" * 40
-        repo, first_commit = self.new_repo(
-            {
-                "fixture.cfg": (
-                    assignment_text("password", unrelated)
-                    + assignment_text("access_token", AUTHORING_VALUES[0])
-                    + assignment_text("refresh_token", LEGACY_PRINTABLE)
-                ),
-                "notes.txt": f"historical literal: {LEGACY_PRINTABLE}\n",
-            }
-        )
-        (repo / "fixture.cfg").write_text(
-            assignment_text("password", unrelated)
-            + assignment_text("access_token", AUTHORING_VALUES[0])
-            + assignment_text("refresh_token", LEGACY_PRINTABLE)
-            + assignment_text("id_token", LEGACY_B),
-            encoding="utf-8",
-        )
-        tip = self.commit(repo)
-        git(repo, "remote", "add", "origin", "https://github.com/example/project.git")
-        payload = catalog_payload()
-        payload["legacy_exemptions"] = [
-            {
-                "id": "historical-fixtures",
-                "repository": "example/project",
-                "verified_master_tip": tip,
-                "match": "non-increasing-global-count",
-                "values": [
-                    {
-                        "id": "historical-1",
-                        "rule": "generic-secret-assignment",
-                        "value_base64": legacy_value_base64(LEGACY_PRINTABLE),
-                        "containing_commit": first_commit,
-                        "source_occurrences": 2,
-                    },
-                    {
-                        "id": "historical-2",
-                        "rule": "generic-secret-assignment",
-                        "value_base64": legacy_value_base64(LEGACY_B),
-                        "containing_commit": tip,
-                        "source_occurrences": 1,
-                    },
-                ],
-            }
-        ]
-        catalog = synthetic_tokens.parse_catalog_bytes(
-            json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        )
-        stdout = io.StringIO()
-        stderr = io.StringIO()
-        with (
-            mock.patch.object(cli, "load_catalog", return_value=catalog),
-            mock.patch.object(workspace, "load_catalog", return_value=catalog),
-            contextlib.redirect_stdout(stdout),
-            contextlib.redirect_stderr(stderr),
-        ):
-            returncode = cli.main(
-                [
-                    "synthetic-tokens",
-                    "audit-master",
-                    "--repo",
-                    str(repo),
-                    "--ref",
-                    tip,
-                    "--exemption",
-                    "historical-fixtures",
-                ]
-            )
-        self.assertEqual((returncode, stderr.getvalue()), (0, ""))
-        evidence = json.loads(stdout.getvalue())
-        self.assertEqual(evidence["status"], "verified")
-        self.assertEqual(evidence["values"][0]["source_occurrences"], 2)
-        self.assertEqual(len(evidence["values"]), 2)
-        self.assertNotIn(LEGACY_PRINTABLE, stdout.getvalue())
-        self.assertNotIn(legacy_value_base64(LEGACY_PRINTABLE), stdout.getvalue())
-        self.assertNotIn(LEGACY_B, stdout.getvalue())
-        self.assertNotIn(unrelated, stdout.getvalue())
-
-        (repo / "README.md").write_text("review head\n", encoding="utf-8")
-        review_head = self.commit(repo, "Review head")
-        with self.assertRaisesRegex(ReviewError, "openai-key"):
-            self.prepare(
-                repo=repo,
-                base=tip,
-                head=review_head,
-                catalog=catalog,
-                exemptions=("historical-fixtures",),
-            )
-
-        bad_payload = json.loads(json.dumps(payload))
-        bad_payload["legacy_exemptions"][0]["values"][0]["source_occurrences"] = 1
-        bad_catalog = synthetic_tokens.parse_catalog_bytes(
-            json.dumps(bad_payload, separators=(",", ":")).encode("utf-8")
-        )
-        with (
-            mock.patch.object(workspace, "load_catalog", return_value=bad_catalog),
-            self.assertRaisesRegex(ReviewError, "occurrence evidence does not match"),
-        ):
-            workspace.audit_legacy_exemption(
-                repo=repo,
-                ref=tip,
-                exemption=bad_catalog.legacy_exemption("historical-fixtures"),
-            )
-
-    def test_audit_master_counts_overlapping_provenance_values_independently(
-        self,
-    ) -> None:
-        longer = LEGACY_A + "Suffix"
-        repo, tip = self.new_repo(
-            {
-                "fixture.cfg": (
-                    assignment_text("access_token", LEGACY_A)
-                    + assignment_text("refresh_token", longer)
-                )
-            }
-        )
-        git(repo, "remote", "add", "origin", "https://github.com/example/project.git")
-        payload = catalog_payload()
-        payload["legacy_exemptions"] = [
-            {
-                "id": "historical-fixtures",
-                "repository": "example/project",
-                "verified_master_tip": tip,
-                "match": "non-increasing-global-count",
-                "values": [
-                    {
-                        "id": f"historical-{index}",
-                        "rule": "generic-secret-assignment",
-                        "value_base64": legacy_value_base64(value),
-                        "containing_commit": tip,
-                        "source_occurrences": 2 if index == 1 else 1,
-                    }
-                    for index, value in enumerate((LEGACY_A, longer), start=1)
-                ],
-            }
-        ]
-        catalog = synthetic_tokens.parse_catalog_bytes(
-            json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        )
-        with mock.patch.object(workspace, "load_catalog", return_value=catalog):
-            evidence = workspace.audit_legacy_exemption(
-                repo=repo,
-                ref=tip,
-                exemption=catalog.legacy_exemption("historical-fixtures"),
-            )
-        counts = {
-            entry["token_id"]: entry["source_occurrences"]
-            for entry in evidence["values"]
-        }
-        self.assertEqual(counts, {"historical-1": 2, "historical-2": 1})
-        self.assertNotIn(LEGACY_A, json.dumps(evidence, sort_keys=True))
-        self.assertNotIn(longer, json.dumps(evidence, sort_keys=True))
-
     def test_evidence_budget_rejects_a_new_key_before_insertion(self) -> None:
         counts: Counter[tuple[object, ...]] = Counter()
         for index in range(workspace.MAX_SYNTHETIC_EVIDENCE_ENTRIES):
@@ -9919,39 +8108,6 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         self.assertEqual(len(counts), workspace.MAX_SYNTHETIC_EVIDENCE_ENTRIES)
         self.assertEqual(counts[(0,)], 2)
         self.assertNotIn(rejected_key, counts)
-
-    def test_changed_blob_evidence_budget_fails_during_insertion(self) -> None:
-        repo, base = self.new_repo({"README.md": "base\n"})
-        for index in range(3):
-            (repo / f"fixture-{index}.cfg").write_text(
-                assignment_text("access_token", AUTHORING_VALUES[0]),
-                encoding="utf-8",
-            )
-        head = self.commit(repo)
-        with (
-            mock.patch.object(workspace, "MAX_SYNTHETIC_EVIDENCE_ENTRIES", 2),
-            self.assertRaisesRegex(ReviewError, "changed-blob evidence has too many"),
-        ):
-            self.prepare(repo=repo, base=base, head=head)
-
-    def test_external_evidence_budget_reserves_changed_blob_entries(self) -> None:
-        repo, base = self.new_repo(
-            {
-                "deleted.cfg": assignment_text("access_token", AUTHORING_VALUES[0]),
-                "unchanged.cfg": assignment_text("access_token", AUTHORING_VALUES[0]),
-            }
-        )
-        (repo / "deleted.cfg").unlink()
-        head = self.commit(repo)
-        review = self.prepare(repo=repo, base=base, head=head)
-        with (
-            mock.patch.object(workspace, "MAX_SYNTHETIC_EVIDENCE_ENTRIES", 1),
-            self.assertRaisesRegex(
-                ReviewError,
-                "accepted synthetic-token evidence has too many entries",
-            ),
-        ):
-            self.validate(review)
 
     def test_tampered_or_oversized_evidence_fails_closed(self) -> None:
         repo, base = self.new_repo({"README.md": "base\n"})

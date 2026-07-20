@@ -248,17 +248,19 @@ class ProviderPolicyTest(unittest.TestCase):
             "head_ref": head_ref,
             "pool_version": catalog.pool_version,
             "schema_version": workspace_runtime.SYNTHETIC_MANIFEST_SCHEMA_VERSION,
-            "secret_reductions": [],
-            "secret_reduction_provenance": {
-                "base_sha256": workspace_runtime._secret_reduction_provenance_commitment(
-                    {}, {}
-                ),
-                "head_sha256": workspace_runtime._secret_reduction_provenance_commitment(
-                    {}, {}
-                ),
-                "scheme": workspace_runtime.SECRET_REDUCTION_PROVENANCE_SCHEME,
+            "secret_delta": {
+                "failure_class": "exact-value-scan-incomplete",
+                "limitations": [
+                    "The exact-value scan did not complete; merge admission is inconclusive."
+                ],
+                "location_status": "inconclusive",
+                "status": "inconclusive",
+                "violations": [],
             },
-            "selected_exemptions": [],
+            "secret_reductions": [],
+            "selected_exemptions": [
+                item.identifier for item in catalog.legacy_exemptions
+            ],
         }
         workspace_runtime._write_bounded_json(
             control / workspace_runtime.SYNTHETIC_MANIFEST_NAME,
@@ -17732,59 +17734,259 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
         )
 
-    @mock.patch.object(providers, "resolve_reviewer_executable")
-    def test_sensitive_content_blocks_external_reviewer_before_launch(
+    def test_secret_delta_schema_rejects_impossible_status_combinations(
         self,
-        resolve: mock.Mock,
+    ) -> None:
+        public_path = (
+            self.review.workspace_root
+            / ".codex-review"
+            / workspace_runtime.SYNTHETIC_MANIFEST_NAME
+        )
+        private_path = (
+            self.review.container_dir
+            / workspace_runtime.SYNTHETIC_PRIVATE_MANIFEST_NAME
+        )
+        template = json.loads(public_path.read_text(encoding="utf-8"))
+        limitations = template["secret_delta"]["limitations"]
+        invalid_deltas = (
+            (
+                "missing-failure-class",
+                {
+                    "limitations": limitations,
+                    "location_status": "inconclusive",
+                    "status": "inconclusive",
+                    "violations": [],
+                },
+            ),
+            (
+                "clean-with-null-failure-class",
+                {
+                    "failure_class": None,
+                    "limitations": limitations,
+                    "location_status": "complete",
+                    "status": "clean",
+                    "violations": [],
+                },
+            ),
+            (
+                "inconclusive-with-complete-locations",
+                {
+                    "failure_class": "exact-value-scan-incomplete",
+                    "limitations": limitations,
+                    "location_status": "complete",
+                    "status": "inconclusive",
+                    "violations": [],
+                },
+            ),
+            (
+                "violations-without-a-violation",
+                {
+                    "limitations": limitations,
+                    "location_status": "complete",
+                    "status": "violations",
+                    "violations": [],
+                },
+            ),
+        )
+
+        for label, secret_delta in invalid_deltas:
+            with self.subTest(case=label):
+                manifest = json.loads(json.dumps(template))
+                manifest["secret_delta"] = secret_delta
+                encoded = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+                public_path.write_text(encoded, encoding="utf-8")
+                private_path.write_text(encoded, encoding="utf-8")
+                private_path.chmod(0o600)
+                self._refresh_control_artifact_state()
+
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "secret-delta state is invalid",
+                ):
+                    workspace_runtime.validate_external_workspace(self.review)
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        return_value=(pathlib.Path("/bin/claude"), {}),
+    )
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_sensitive_content_reaches_external_reviewer_in_raw_form(
+        self,
+        run_model_chain: mock.Mock,
+        _resolve_claude: mock.Mock,
+        environment: mock.Mock,
     ) -> None:
         secret = "AKIA" + "A" * 16
-        (self.review.workspace_root / "secret.txt").write_text(
+        secret_file = self.review.workspace_root / "secret.txt"
+        secret_file.write_text(
             secret + "\n",
             encoding="utf-8",
         )
+        self.review.diff_file.write_text(
+            "diff --git a/secret.txt b/secret.txt\n+" + secret + "\n",
+            encoding="utf-8",
+        )
+        self._refresh_control_artifact_state()
+        run_model_chain.return_value = ("success", "No findings.")
+
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
             egress_consent="double-review",
         )
-        self.assertEqual(outcome.returncode, 2)
-        resolve.assert_not_called()
-        self.assertFalse((self.review.container_dir / "egress.json").exists())
-        self.assertFalse((self.review.container_dir / "preflight.json").exists())
+
+        self.assertEqual(outcome.returncode, 0)
+        self.assertEqual(outcome.final_text, "No findings.")
+        run_model_chain.assert_called_once()
+        environment.assert_called_once()
+        self.assertEqual(secret_file.read_text(encoding="utf-8"), secret + "\n")
+        self.assertIn(secret, self.review.diff_file.read_text(encoding="utf-8"))
+        preflight = json.loads(
+            (self.review.container_dir / "preflight.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            preflight["status"],
+            "review workspace containment and integrity checks passed",
+        )
+        self.assertEqual(preflight["secret_delta"]["status"], "inconclusive")
+        self.assertNotIn(secret, json.dumps(preflight, sort_keys=True))
+        egress = json.loads(
+            (self.review.container_dir / "egress.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            egress["preflight"],
+            "review workspace containment and integrity checks passed",
+        )
+        self.assertEqual(
+            egress["merge_gate"],
+            "secret-delta status is evaluated separately",
+        )
+        self.assertIn(
+            "the complete generated frozen diff without secret redaction",
+            egress["included"],
+        )
         self.assertFalse(
             any(
                 (self.review.container_dir / name).exists()
                 for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
             )
         )
-        error = (self.review.container_dir / "runner-error.txt").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("sensitive content preflight", error)
-        self.assertNotIn(secret, error)
 
-    @mock.patch.object(providers, "_codex_attempt")
-    def test_sensitive_content_blocks_codex_before_launch(
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_sensitive_content_reaches_codex_in_raw_form(
         self,
-        codex_attempt: mock.Mock,
+        run_model_chain: mock.Mock,
+        environment: mock.Mock,
     ) -> None:
         secret = "AKIA" + "B" * 16
-        (self.review.workspace_root / "config").write_text(
+        config = self.review.workspace_root / "config"
+        config.write_text(
             "AWS_KEY=" + secret + "\n",
             encoding="utf-8",
         )
+        self.review.diff_file.write_text(
+            "diff --git a/config b/config\n+AWS_KEY=" + secret + "\n",
+            encoding="utf-8",
+        )
+        self._refresh_control_artifact_state()
+        run_model_chain.return_value = ("success", "No findings.")
+
         outcome = providers.run_review(
             review=self.review,
             reviewer="codex",
         )
-        self.assertEqual(outcome.returncode, 2)
-        codex_attempt.assert_not_called()
-        self.assertFalse((self.review.container_dir / "preflight.json").exists())
-        error = (self.review.container_dir / "runner-error.txt").read_text(
-            encoding="utf-8"
+
+        self.assertEqual(outcome.returncode, 0)
+        self.assertEqual(outcome.final_text, "No findings.")
+        run_model_chain.assert_called_once()
+        environment.assert_called_once()
+        self.assertIn(secret, config.read_text(encoding="utf-8"))
+        self.assertIn(secret, self.review.diff_file.read_text(encoding="utf-8"))
+        preflight = json.loads(
+            (self.review.container_dir / "preflight.json").read_text(encoding="utf-8")
         )
-        self.assertIn("sensitive content preflight", error)
-        self.assertNotIn(secret, error)
+        self.assertEqual(
+            preflight["status"],
+            "review workspace containment and integrity checks passed",
+        )
+        self.assertEqual(preflight["secret_delta"]["status"], "inconclusive")
+        self.assertNotIn(secret, json.dumps(preflight, sort_keys=True))
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_secret_delta_violation_does_not_add_a_codex_launch_gate(
+        self,
+        run_model_chain: mock.Mock,
+        environment: mock.Mock,
+    ) -> None:
+        repo = pathlib.Path(self.temporary.name) / "prepared-source"
+        repo.mkdir(mode=0o700)
+
+        def git(*args: str) -> bytes:
+            completed = common.run(("git", *args), cwd=repo, check=True)
+            return completed.stdout.strip()
+
+        git("init", "-q")
+        git("config", "user.name", "Codex Test")
+        git("config", "user.email", "codex-test@example.invalid")
+        git("config", "commit.gpgSign", "false")
+        (repo / "README.md").write_text("base\n", encoding="utf-8")
+        git("add", "README.md")
+        git("commit", "-q", "-m", "Base")
+        base = git("rev-parse", "HEAD").decode("ascii")
+
+        secret = b"RuntimeOpaque" + b"Q" * 16 + b"9!"
+        payload = b'password = "' + secret + b'"\n'
+        (repo / "config.txt").write_bytes(payload)
+        git("add", "config.txt")
+        git("commit", "-q", "-m", "Add credential")
+        head = git("rev-parse", "HEAD").decode("ascii")
+
+        review = workspace_runtime.prepare_workspace(
+            repo=repo,
+            base_ref=base,
+            head_ref=head,
+            ownership_handoff=lambda _review: None,
+        )
+        run_model_chain.return_value = ("success", "No findings.")
+
+        outcome = providers.run_review(
+            review=review,
+            reviewer="codex",
+        )
+
+        self.assertEqual(outcome.returncode, 0)
+        self.assertEqual(outcome.final_text, "No findings.")
+        run_model_chain.assert_called_once()
+        environment.assert_called_once()
+        self.assertEqual(
+            (review.workspace_root / "config.txt").read_bytes(),
+            payload,
+        )
+        self.assertIn(secret, review.diff_file.read_bytes())
+        preflight = json.loads(
+            (review.container_dir / "preflight.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            preflight["status"],
+            "review workspace containment and integrity checks passed",
+        )
+        self.assertEqual(preflight["secret_delta"]["status"], "violations")
+        self.assertEqual(
+            preflight["secret_delta"]["violations"][0]["additions"],
+            [
+                {
+                    "line": 1,
+                    "occurrence_count": 1,
+                    "path": "config.txt",
+                    "surface": "blob",
+                }
+            ],
+        )
+        self.assertNotIn(secret.decode("ascii"), json.dumps(preflight, sort_keys=True))
 
     @mock.patch.object(providers, "_review_environment", return_value={})
     @mock.patch.object(providers, "_run_model_chain")
@@ -18247,6 +18449,14 @@ class ProviderPolicyTest(unittest.TestCase):
                 f"{self.review.base_ref}..{self.review.head_ref}",
             )
             self.assertEqual(evidence["private_artifacts"], "removed")
+            self.assertEqual(
+                evidence["status"],
+                "review workspace containment and integrity checks passed",
+            )
+            self.assertEqual(
+                evidence["secret_delta"]["status"],
+                "inconclusive",
+            )
             self.assertFalse(
                 any(
                     (self.review.container_dir / name).exists()
@@ -18273,6 +18483,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertEqual(outcome.returncode, 0)
         self.assertEqual(outcome.final_text, "No findings.")
+        run_model_chain.assert_called_once()
 
     @mock.patch.object(providers, "resolve_reviewer_executable")
     def test_tampered_deleted_generic_token_diff_blocks_external_reviewer(
@@ -18300,12 +18511,28 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         self.assertNotIn(token, error)
 
-    @mock.patch.object(providers, "resolve_reviewer_executable")
-    def test_head_side_sensitive_path_record_blocks_external_reviewer(
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        return_value=(pathlib.Path("/bin/claude"), {}),
+    )
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_head_side_sensitive_path_record_reaches_external_reviewer(
         self,
-        resolve: mock.Mock,
+        run_model_chain: mock.Mock,
+        _resolve_claude: mock.Mock,
+        environment: mock.Mock,
     ) -> None:
         raw_path = b"config/.env.production"
+        sensitive_path = self.review.workspace_root / os.fsdecode(raw_path)
+        sensitive_path.parent.mkdir(parents=True)
+        sensitive_path.write_text("TRACKED_VALUE=raw\n", encoding="utf-8")
+        self.review.diff_file.write_text(
+            "diff --git a/config/.env.production b/config/.env.production\n"
+            "+TRACKED_VALUE=raw\n",
+            encoding="utf-8",
+        )
         (
             self.review.workspace_root
             / ".codex-review"
@@ -18321,37 +18548,67 @@ class ProviderPolicyTest(unittest.TestCase):
             self.review.container_dir / workspace_runtime.PRIVATE_CHANGED_PATHS_NAME
         ).write_bytes(workspace_runtime.CHANGED_PATH_HEAD_TAG + raw_path + b"\0")
         self._refresh_control_artifact_state()
+        run_model_chain.return_value = ("success", "No findings.")
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
             egress_consent="double-review",
         )
-        self.assertEqual(outcome.returncode, 2)
-        resolve.assert_not_called()
-        error = (self.review.container_dir / "runner-error.txt").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn(".env.production (environment-file; changed-path)", error)
 
-    @mock.patch.object(providers, "resolve_reviewer_executable")
-    def test_nested_credential_basename_blocks_external_reviewer(
+        self.assertEqual(outcome.returncode, 0)
+        self.assertEqual(outcome.final_text, "No findings.")
+        run_model_chain.assert_called_once()
+        environment.assert_called_once()
+        self.assertEqual(
+            sensitive_path.read_text(encoding="utf-8"),
+            "TRACKED_VALUE=raw\n",
+        )
+        self.assertIn(
+            "config/.env.production",
+            self.review.diff_file.read_text(encoding="utf-8"),
+        )
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        return_value=(pathlib.Path("/bin/claude"), {}),
+    )
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_nested_credential_basename_reaches_external_reviewer(
         self,
-        resolve: mock.Mock,
+        run_model_chain: mock.Mock,
+        _resolve_claude: mock.Mock,
+        environment: mock.Mock,
     ) -> None:
         credential = self.review.workspace_root / "fixtures/home/.netrc"
         credential.parent.mkdir(parents=True)
         credential.write_text("machine example.invalid\n", encoding="utf-8")
+        self.review.diff_file.write_text(
+            "diff --git a/fixtures/home/.netrc b/fixtures/home/.netrc\n"
+            "+machine example.invalid\n",
+            encoding="utf-8",
+        )
+        self._refresh_control_artifact_state()
+        run_model_chain.return_value = ("success", "No findings.")
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
             egress_consent="double-review",
         )
-        self.assertEqual(outcome.returncode, 2)
-        resolve.assert_not_called()
-        error = (self.review.container_dir / "runner-error.txt").read_text(
-            encoding="utf-8"
+
+        self.assertEqual(outcome.returncode, 0)
+        self.assertEqual(outcome.final_text, "No findings.")
+        run_model_chain.assert_called_once()
+        environment.assert_called_once()
+        self.assertEqual(
+            credential.read_text(encoding="utf-8"),
+            "machine example.invalid\n",
         )
-        self.assertIn("fixtures/home/.netrc (credential-path)", error)
+        self.assertIn(
+            "fixtures/home/.netrc",
+            self.review.diff_file.read_text(encoding="utf-8"),
+        )
 
     @mock.patch.object(
         providers,

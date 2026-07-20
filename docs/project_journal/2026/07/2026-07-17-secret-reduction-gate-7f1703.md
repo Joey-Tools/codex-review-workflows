@@ -1,118 +1,147 @@
 ---
 id: 20260717-7f1703
-title: Permit Review of Verified Secret-Reduction Ranges
-status: completed
+title: Trust Reviewers and Gate Exact-Secret Growth
+status: active
 created: 2026-07-17
-updated: 2026-07-19
+updated: 2026-07-20
 branch: codex/secret-reduction-review
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/60
 supersedes: []
 superseded_by:
 ---
 
-# Permit Review of Verified Secret-Reduction Ranges
+# Trust Reviewers and Gate Exact-Secret Growth
 
 ## Summary
 
-- Treats Codex, Claude Code, and the consent-gated Copilot fallback as trusted processors inside the isolated-review workflow boundary.
-- Allows the frozen tracked diff and necessary tracked context to reach the reviewer in their original form, including secret material, only when the range proves a real reduction or an existing catalog rule applies.
-- Keeps PR/master protection as the primary control against introducing secrets; the local gate exists to make a remediation range reviewable.
+- Codex, Claude Code, and the consent-gated Copilot fallback are trusted processors for the frozen tracked review scope.
+- Tracked secret deltas do not block reviewer launch or trigger reviewer-input rewriting.
+- PR/master admission allows every existing exact raw secret whose global tracked count does not grow and blocks only first appearance or growth.
 
 ## Decision
 
-For every unregistered dynamic secret candidate, preflight extracts one exact byte value and counts it across every blob and symlink target in the complete base and head trees. Review is eligible only when both conditions hold:
+### Trusted Reviewer Boundary
+
+After the consented egress boundary passes, the reviewer receives the frozen tracked diff, necessary tracked context, and explicitly supplied prompt in their original form, including repository secrets. Secret scanning is not an egress filter. A secret-admission violation or inconclusive count must not prevent the reviewer from starting or invalidate its terminal artifact.
+
+This authorization remains scoped. It does not permit automatic discovery or collection of reviewer/runtime authentication credential sources, untracked private files, unrelated repositories, broad workspace dumps, or unrelated host-local artifacts.
+
+### Unified Exact Raw Counter
+
+Every tracked exact secret outside the approved authoring pool uses one rule, whether it was previously cataloged as legacy or discovered dynamically:
 
 ```text
-head_raw_count < base_raw_count
-head_unembedded_count <= base_unembedded_count
+head_count <= base_count
 ```
 
-An occurrence is unembedded only when no strictly longer candidate completely contains it. This second count prevents a change from deleting a longer secret while leaving or creating its captured substring as a standalone value.
+Count one exact raw byte value globally over each actual tracked surface in the complete base and head Git trees:
 
-Counts alone are insufficient. Occurrence provenance (the base location from which a residual head occurrence is allowed to survive) must also prove that every raw and unembedded head occurrence existed at the same raw Git path, normalized surface kind, and absolute byte offset in the base tree. Regular blobs use one surface kind across `100644` and `100755`; symlink targets use a distinct surface kind. A new path, offset, copy, or regular-blob/symlink-target transition therefore blocks even when the global count decreases.
+- raw Git path bytes, including gitlink/submodule entry paths without reading submodule content;
+- regular-file blob bytes, including executable blobs; and
+- symlink-target bytes.
 
-| Range outcome | Decision |
+The rendered diff and prompt are reviewer input, not additional count surfaces.
+
+| Range outcome | PR/master admission |
 | --- | --- |
-| Exact raw count strictly decreases, unembedded count does not increase, and every residual occurrence has matching base provenance | Eligible after the rest of preflight passes |
-| Residual count is equal | Block |
-| Candidate first appears at head | Block |
-| Move, rename, or copy without strict global reduction | Block |
-| Raw or unembedded count grows | Block |
-| Candidate bytes are ambiguous, unsafe to represent, outside budgets, or otherwise uncountable | Block |
+| `head_count < base_count` | Pass |
+| `head_count = base_count` | Pass |
+| Value moves across path, content, blob/symlink surface, mode, or offset without global growth | Pass |
+| Copy is balanced by another removal | Pass |
+| `base_count = 0` and `head_count > 0` | Block |
+| `head_count > base_count` | Block |
+| Complete bounded scanning or count integrity cannot be established | Inconclusive |
 
-Path findings are independent of content counts. A sensitive changed path is eligible only when it is deleted and no sensitive path exists anywhere in the complete head snapshot. A renamed, moved, copied, or retained sensitive path at head blocks review.
+There is no unembedded counter, per-occurrence provenance requirement, path-specific absolute deny, or separate stricter legacy policy. Occurrences are intentionally fungible across paths, surfaces, and offsets.
 
-## Trust Boundary
+### Exactness And Scan Completeness
 
-The reviewer is a trusted processor for the scoped repository data authorized by the review request. After preflight passes, it receives the frozen tracked diff, necessary tracked context, and explicitly supplied review prompt as recorded so it can assess the security-sensitive change accurately. Those reviewer inputs remain size-, identity-, and integrity-bound but are intentionally not secret-scanned, redacted, or made subject to an additional prompt-secret authorization gate. The helper does not automatically discover or collect reviewer/runtime authentication credential sources, other untracked private files, unrelated repositories, broad workspace dumps, or host-local artifacts. Explicitly supplied prompt or tracked-review bytes are not compared against runtime credential values; byte equality does not remove them from the trusted reviewer input. PR/master admission remains the primary secret-introduction control.
+The counter consumes exact raw candidates only. It does not derive canonical Base64, URL encoding, hexadecimal, escaping, hashing, or any other representation.
 
-Diagnostic and preflight evidence remain bounded audit surfaces. They use stable finding metadata, digests, and counts where applicable; this evidence contract does not require changing the tracked review content sent to the reviewer. Complete changed paths are published only as ordered, side-bound SHA-256 commitments, while matching `H` (head-present) and `B` (base-only) raw records remain helper-private and ephemeral. Changed-blob findings likewise use path digests.
+This creates a deliberate limitation: an encoded or transformed form is not linked to the raw secret unless that byte string independently becomes an exact scanner candidate. Evidence must state this limitation without generating the missing variants.
 
-## Catalog Compatibility
+A dynamic expression that cannot produce one stable exact byte value does not enter the counter and is not itself an admission violation. This is not the same as an incomplete scan. A scanner-recognized shape that is unextractable only in base is treated as a permitted deletion; an unextractable head-side shape is `inconclusive`. If the helper cannot completely enumerate or read the bounded base/head trees, loses counter integrity, or otherwise cannot finish counting an exact candidate, admission is also `inconclusive` and records a bounded failure class without exposing the raw diagnostic.
 
-- Authoring entries keep their exact catalog-declared scanner-rule acceptance behavior.
-- Explicit legacy envelopes keep the existing non-increasing raw and unembedded count policy, including equal-count moves between safe paths when all other legacy checks pass.
-- Dynamic reduction does not create catalog entries, select a legacy envelope, weaken catalog validation, or relax sensitive-path checks. A dynamic candidate that equals or contains either a raw value or its canonical Base64 storage encoding from an unselected legacy envelope must use explicit legacy selection and cannot reclassify that catalog value as part of an unregistered deletion.
-- New fixtures must still use the authoring pool, and master-proven historical fixtures must still use explicit legacy selection.
+### Violation Reporting
+
+A violation report contains only detectable additions for a candidate whose global count grows. Text evidence carries raw path plus one-based head line; new tracked paths and binary fallbacks use `line: null`; symlink targets use line `1`. It does not enumerate unchanged residual or base-only occurrences. If bounded diff evidence cannot map every detected local growth to a line, `location_status` is `inconclusive` rather than inventing one.
+
+### Catalog Compatibility
+
+Approved authoring-catalog values remain exact safe-fixture exceptions under their declared scanner rule.
+
+Historical `legacy_exemptions` no longer select a different admission policy. Their exact raw values receive the same complete-tree baseline automatically, without explicit selection, unembedded counts, provenance, encoded-variant checks, or path denial. `--synthetic-secret-exemption`, `list-exemptions`, and `audit-master` may remain temporarily for CLI compatibility, but they are deprecated and must not alter admission.
+
+### Review Lanes
+
+The fresh local Codex CLI review is the independent local lane:
+
+- single review: fresh local Codex;
+- double review: fresh local Codex plus one Claude-family lane;
+- triple review: double review plus current-head GitHub Codex.
+
+PR readiness reuses that Codex artifact. It does not add separate `offline-frozen-diff-review` or `independent-codex-pr-review` gates. Retries, helper implementations, and the clean-context fallback remain one logical Codex lane.
+
+### Workspace Scope
+
+This decision does not redesign the frozen workspace, materialization, symlink handling, control artifacts, process supervision, cleanup, retention, or accounting. Do not import a separate detached-worktree or supervisor design as part of this policy update.
 
 ## Current State
 
-- Runtime preflight exhaustively captures bounded exact candidates across complete base and head trees, performs raw and unembedded counting, and binds every dynamic occurrence to raw Git path, normalized blob/symlink surface, and absolute byte offset. Public manifest schema version 4 stores only fixed-size base/head provenance commitments; raw paths, offsets, occurrence identities, and candidate bytes are not published. Helper-private state retains only the exact candidate bytes needed for stateful head recounting, and materialized-head validation must reproduce the public head commitment exactly.
-- Complete PEM blocks and AWS secret values have stable candidate identities; oversized provider prefixes, oversized assignments/JWTs, incomplete PEM blocks, and other uncountable events remain fail closed. PEM end markers are indexed once by label and matched with bounded binary searches, so dense unmatched begin markers cannot amplify into overlapping 32-KiB scans.
-- Dynamic candidates that do not satisfy the reduction inequalities are rejected during preparation, before a mutable materialized head or reviewer process exists.
-- Variable-length provider candidates prove their terminating byte against the provider body alphabet, select the longest actual prefix for the 513-byte fail-closed branch, and retain provider-specific spans across stream commit boundaries.
-- Fixed-length AWS access-key and npm-token candidates use provider-body termination rather than a generic word boundary. A following underscore or other non-body byte therefore preserves both the exact provider span and the complete longer RHS identity.
-- Google API-key candidates capture the complete 35-to-512-byte provider body; a 513-byte prefix remains fail closed, so Base64url punctuation cannot truncate distinct longer values into one reduction candidate.
-- Three-part JWT candidates require a stable non-dot boundary, while bounded five-part compact JWE candidates are captured as one complete identity, including empty encrypted-key or ciphertext segments. Four-part, six-or-more-part, and oversized continuations remain fail closed instead of being reduced through a shared three-part prefix. The scanner builds its complete-candidate range index once and resolves each JWE continuation by an O(1) `start -> max_end` lookup, avoiding quadratic work on dense inputs.
-- A generic oversized-assignment event is suppressed only when its 513-byte prefix is proven to be the beginning of one complete provider-specific candidate that exactly fills the quoted or unquoted right-hand side, including across stream commit boundaries; any trailing generic value byte still blocks.
-- The oversized-assignment exemption reuses the ordinary quoted or unquoted logical-RHS parser, so whitespace, operators, shell continuations, quote transitions, backslashes, backticks, and unsafe diff continuations remain fail closed after a long provider candidate.
-- Exact provider-specific spans still pass through generic quoted or unquoted RHS validation when their short values fall below the generic entropy heuristic. A safe exact RHS is deduplicated only after the parser accepts it; operators, shell continuations, unsafe diff continuations, and other rejected tails remain generic-assignment blockers.
-- A quoted generic assignment is eligible only when its apparent closing quote is not escaped by an odd backslash run. An escaped quote remains a blocker and cannot supply a dynamic reduction candidate, including across complete-tree counting.
-- A complete generic literal RHS remains an exact dynamic candidate when balanced wrappers or triple quotes enclose it, including embedded newlines. Ordinary single- and double-quoted literals may contain the opposite quote and still retain one complete identity; provider-shaped substrings inside those literals do not leave a truncated prefix blocker. This permits strict `1 -> 0` and `2 -> 1` remediation for those forms; unsupported, unclosed, oversized, backtick, or ambiguous forms remain blocking.
-- A complete wrapper-only unquoted generic RHS also retains its exact 16-to-512-byte candidate identity and participates in the same strict reduction proof. After any other local RHS token taints exact-candidate eligibility, the same bounded parser continues through the local logical RHS and fail-closes on a later secret-like or oversized token without granting reduction status. Proven named siblings and a matching external container closer end attribution to the current secret key, while local wrappers, tuples, operators, CRLF continuations, and stream-frontier replays remain part of its RHS. Placeholders and low-entropy ordinary values remain nonblocking.
-- A complete provider-specific span nested inside a longer low-entropy unquoted assignment retains the complete generic RHS identity, including an attached suffix or nonzero offset. This prevents distinct longer values from being collapsed into one shorter reduction candidate. AWS credential assignments use the same fail-closed complete-RHS treatment.
-- Short provider-specific spans inside incomplete, multiline, prefixed, escaped, triple-quoted, adjacent-literal, wrapped, or expression-based assignments retain a generic blocker until the full logical RHS is proven to be that exact candidate. Operators and comments preserve continuation across stream boundaries and blank lines; opposite unified-diff record sides cannot supply a false closing delimiter.
-- Wrapped exact-RHS proof uses a type-aware last-in-first-out delimiter stack. Missing, crossed, mismatched, or extra delimiters block when the suffix is complete, while a structurally valid partial wrapper remains deferred at an incomplete stream frontier. Any closer consumed before the candidate literal permanently invalidates that wrapper-only prefix, so a completed expression followed by a fresh wrapper cannot regain exact-candidate status.
-- Exact quoted-RHS proof also validates containers opened before the assignment. A missing external function, array, or object closer blocks at EOF or before a new unseparated statement; comma-delimited sibling assignments remain valid. Mapping-key quotes nested inside a source literal are recognized only when their same-side, unescaped closer is followed by horizontal whitespace and `:` before the assignment value.
-- A structural closure proof never advances the reusable assignment frontier across another secret-key assignment. If a short accepted value and a later sibling secret assignment share one outer wrapper, the later assignment is re-proven with the complete wrapper context and its exact candidate identity is retained. Reproof remains bounded by the existing per-assignment and total proof-byte budgets and therefore fails closed instead of creating unbounded quadratic work.
-- Secondary RHS discovery retains OPEN (not yet proven complete) and unknown assignments across stream windows even before a provider span is visible, and releases only a CLOSED (proven complete) RHS. The absolute per-assignment proof cap includes the candidate, delimiters, trailing bytes, wrapper state, and external source context inspected for that decision. Line starts and diff-source context advance monotonically, so repeated secret-key prefixes remain linear or fail closed within the scanner budget.
-- Incomplete stream scans carry separate commit and retention frontiers. Complete assignments before the deferred suffix are committed exactly once, while earlier diff-hunk or PEM proof bytes remain available until the deferred candidate is resolved.
-- Exhaustive provenance audit may retain assignment-local evidence for an exact catalog legacy value after an earlier stream window has already committed a blocker and external prefix context is no longer available. This capture-only evidence never suppresses that generic blocker, never applies to authoring or dynamic reduction values, and never broadens ordinary preflight.
-- Complete-catalog legacy raw values and canonical Base64 storage encodings remain forbidden in both frozen base and head paths, including when a marked base path is deleted or renamed away at head.
-- Exact dynamic reduction raw values and canonical Base64 encodings are forbidden in every frozen and materialized head path. Candidate discovery and the frozen-head path gate run before materialization, so a case-colliding or overlong secret-bearing path cannot escape through a materialization diagnostic. Validation also repeats the unselected-legacy overlap check against the catalog reloaded immediately before egress. A deleted base-only path remains reviewable through the trusted raw diff and a helper-private `B` record; only the complete-catalog legacy matcher applies to that record, so generic dynamic or sensitive-path deletion does not regress.
-- A base-only changed path that contains a stable exact unregistered candidate now supplies an ephemeral deletion witness. Validation collects every bounded `B`-side candidate before examining the complete materialized head, then requires both its raw bytes and canonical Base64 encoding to be absent from every head path, regular blob, and symlink target. This proves that a path-only secret was actually removed instead of renamed with a scanner-boundary prefix or moved into content, while the original deleted path remains available to the trusted reviewer in `review.diff`. Complete provider tokens and bounded three- or five-part JWTs therefore support pure deletion without catalog registration; truncated, oversized, unpaired, or otherwise non-extractable events remain fail closed because they cannot supply an exact zero-retention witness.
-- Exact unembedded counting uses separate containment domains for each legacy envelope and for dynamic reductions, so a longer dynamic candidate cannot change legacy count semantics while dynamic candidates still contain one another normally.
-- Reviewer-visible diff and prompt artifacts are integrity-bound but are not secret-egress filters. They retain deliberately supplied reviewer input, including deleted or prompt-contained secret bytes, in original form.
-- Gitlink changes use metadata-only `--submodule=short` output. Even an initialized source checkout cannot inline nested submodule logs, diffs, or content from a repository outside the authorized review scope.
-- Deleted sensitive paths are omitted from head-side changed-path findings and are allowed only when the complete materialized head remains free of sensitive paths.
-- Public changed-path evidence contains ordered, domain-separated SHA-256 commitments for every `H` and `B` record. The helper validates those records lockstep against an owner-only private raw-path stream, binds the side tag into each digest, applies the runtime complete catalog to both sides, and checks all public audit evidence against catalog and dynamic sensitive values. Runtime validation also rechecks every verified changed-path and changed-blob path digest against the freshly reloaded complete catalog plus dynamic reduction values before egress. The raw-path stream and Base64 raw-bearing dynamic-reduction manifest must remain exact owner-only `0600` regular files throughout validation; a permission drift fails closed, while identity-bound cleanup can still remove an owner-controlled read-only drift without leaving secret material behind. After preflight consumes those files, it removes both through owner-, mode-, and identity-checked no-follow parent/container descriptors before publishing preflight evidence or launching a reviewer; failed preflight and later cleanup paths retry that scrub. After the descriptor-bound scrub succeeds, the helper reopens the canonical container path and revalidates the preparation-bound container identity, control state, and complete removal receipts before any reviewer artifact is written or reviewer process is launched. An explicitly retained or fallback workspace therefore keeps only the frozen workspace and durable bounded evidence. Changed-blob findings identify paths by digest as well.
-- Workspace and container cleanup traverses content only through already-opened verified directory descriptors. Each ordinary file is atomically moved to a fresh quarantine name before unlink, and each generic child or retained-workspace directory is quarantined and identity-checked before recursive traversal; the outer helper-owned container keeps its stable retry path until traversal succeeds. Every head snapshot reserves the helper-owned `.codex-review-cleanup-*` component namespace so tracked content cannot masquerade as retained quarantine state; base-only deleted paths remain permitted in the trusted raw diff. The two helper-private artifacts use a stronger lifecycle binding: preparation precreates both as empty exact-`0600` slots, captures their container and file identities from creation descriptors, syncs both files and the container directory, and publishes the complete binding before workspace materialization or sensitive bytes. Payload writers reopen only the bound inode without create or truncate and revalidate the file/path identity after the synced write. The review workspace/state marker and control state carry matching immutable copies. Cleanup accepts only those identities, quarantines and revalidates each private file, removes it, and records a monotonic per-file removal receipt through the same container descriptor. A missing preparation-bound container, missing or replacement objects without receipts, and unresolvable corrupted-state layout paths fail closed; a valid independent marker still permits the bounded scrub after a layout-resolution failure. A recorded name that reappears is preserved, and one invalid identity does not skip the other valid scrub. The receipt-bearing control state remains until other tree content is removed so ordinary cleanup errors remain retryable. A crash or forced termination after quarantine begins but before receipt persistence is deliberately ambiguous and fails closed; it may retain a quarantine entry or require manual recovery for a missing-name ambiguity rather than weakening the preparation identity proof. Directory depth and cross-filesystem child traversal are explicitly bounded. As elsewhere in the local helper, malicious current-user processes are part of the host TCB; portable POSIX cannot find an inode moved away before cleanup or provide fd-only unlink/rmdir after the final quarantine identity check.
-- Stateful preparation acquires `runner.lock` for one complete private-cleanup identity handoff and holds that same descriptor through child launch. Before workspace materialization or helper-private secret bytes, it durably records a schema-v3 `preparing` marker bound to a canonical source root, the exact `source_root/.codex-tmp/isolated-review-*` container, and both precreated empty-slot identities; a pre-marker crash can therefore leave only empty files, while every later partial payload is recoverable from the full marker. The marker advances to `ready` after complete ownership handoff. Marker JSON and durable attempts metadata are atomically replaced relative to the already-open preparation-bound container descriptor, exactly read back, directory-synced, and followed by canonical parent/container identity revalidation. A container or parent swap therefore cannot redirect either artifact into a replacement path. If `state.json` was never published, either marker phase can recover and remove the entire identity-bound container once the runner lock is released. Marker recovery opens the marker relative to a verified state-directory descriptor with no-follow and nonblocking flags, rejects non-regular, multiply linked, wrong-owner, writable-by-group/other, oversized, or metadata-unstable objects, and reads at most 64 KiB. A `ready` marker without `state.json` uses the receipt-aware private-artifact cleanup path, so a crash after private-file removal but before state publication can finish only when the bound removal receipts prove that transition. Exact historical schema-v1 state and marker layouts remain supported for status, wait, finalization, retention, and cleanup, but the legacy format did not record preparation identities: compatibility cleanup validates the canonical layout and then uses current-object identities under the documented same-user host TCB instead of asserting unavailable provenance.
-- Foreground review uses the same preparation guard as stateful review: it acquires the secure `runner.lock`, durably advances the v3 marker from `preparing` to `ready`, and holds the runner plus bound modern/compatibility cleanup locks across preparation, reviewer execution, and final cleanup. It deliberately does not fabricate `state.json`; a crash or `SIGKILL` before or after ownership handoff is recovered through the marker-only cleanup path, while a live foreground review rejects concurrent cleanup with the existing runner-active status.
-- After a modern container identity mismatch is detected, runtime, terminal, and cleanup diagnostics are persisted or removed only through the preparation-bound container descriptor; if that binding is unavailable, the helper reports to stderr and does not recreate, follow, or mutate the missing, replacement, or symlink-selected path. Cleanup serialization first locks the bound container directory descriptor, then securely opens and locks the historical `cleanup.lock` through that descriptor. New processes therefore serialize with each other without a leaf-creation race while remaining mutually exclusive with an already-running pre-upgrade cleanup worker that holds the legacy file lock; bounded workers inherit both descriptors.
-- Full-container cleanup removes and syncs all potentially secret-bearing content while the canonical marker and both lock paths remain reachable. It then atomically quarantines the top-level container and syncs the parent directory before retiring control state, `cleanup.lock`, `runner.lock`, and the recovery marker in that order. After the quarantined container is removed, a second parent-directory sync must succeed before cleanup reports success. A pre-retirement sync failure preserves every protocol entry inside the quarantine; a post-removal sync failure reports that durable removal is unconfirmed instead of claiming success or promising that evidence remains at the now-absent canonical path. A legacy path-only cleaner therefore cannot recreate a lock inode under the canonical name, while a quarantine failure leaves the canonical protocol files intact for retry; a concurrent replacement container is preserved and the already-open original descriptor is used only to retire its non-sensitive protocol entries.
-- The complete prospective retained `preflight.json`, including the final `private_artifacts: removed` field, is assembled through the same shared builder used for publication and checked against every catalog and dynamic value before private-artifact removal or reviewer launch.
-- Catalog authoring and explicitly selected legacy behavior remains unchanged.
+This note supersedes its earlier strict-reduction design, which required raw-count decrease, unembedded non-growth, same-location provenance, encoded-variant denial, and two extra Codex PR-readiness gates. Those requirements are no longer the target contract.
 
-## Validation
+Implementation and local validation now match this decision. The workstream remains `active` only while the fixed-range review and PR delivery gates are in progress. Historical test counts and prior fixed-range review claims in earlier revisions of this note are not validation evidence for the new semantics.
 
-- Post-integration frozen-range review found and fixed scope/scanner gaps: initialized submodule content can no longer enter `review.diff`; wrapped/triple/multiline and opposite-quote generic literals now participate in exact reduction proof; malformed closer prefixes remain blockers instead of disappearing or producing a reduction candidate; provider-specific and PEM events are charged exactly once regardless of later accepted/blocking classification; unselected legacy overlap covers raw and canonical Base64 representations during preparation and runtime catalog reload. Later exact-range reviews found and fixed the sibling-assignment frontier skip, a canonical-container replacement during the private-artifact scrub, wrapper-only unquoted generic assignments bypassing the addition gate, tainted-prefix variants of that bypass, and over-broad attribution across proven sibling or external-container boundaries. Final preflight reviews additionally found and fixed path-based state-marker and attempts writes, a parent-directory replacement variant of the same race, missing fresh-catalog checks for reviewer-visible changed-path and changed-blob digests, a base-only path candidate retained behind a scanner-boundary prefix, permissive helper-private read modes, and missing parent-directory durability checks around top-level cleanup quarantine. The last independent pass found two further gaps: a base-only path candidate was skipped when the same bytes already belonged to the content-reduction set, and fixed-name private files could be created before their identities reached the preparing marker. The final implementation keeps the path-deletion witness independent, precreates and syncs two empty private slots before one full marker handoff, reopens without create/truncate, and rechecks identity after each synced payload write. `PublicPoolScannerTest`: 100 passed. Synthetic-token module: 226 passed.
-- Focused complete-path, catalog-reload, side-binding, quarantine-before-recursion, cleanup/handoff/durability, state-start, and missing-to-concurrent-create race regressions passed.
-- Independent frozen-range review exposed and fixed a retained-workspace cleanup retry gap: an unknown top-level cleanup quarantine now fails closed and preserves the cleanup error for manual recovery instead of treating a missing `workspace` name as success. An explicit rename integration test also confirms that `--no-renames` records the base source as `B` and the head destination as `H`; the existing runtime catalog-reload test proves the base-only renamed path remains enforced.
-- Offline frozen-range review exposed and fixed state-marker recovery risks: FIFO, symlink, hardlink, ownership, mode, size, and read-time mutation regressions now prove bounded fail-closed marker loading, while a receipt-backed integration test proves safe recovery from a `ready` marker after private artifacts were already removed.
-- A later offline fixed-range review exposed the missing foreground crash-recovery handoff; the shared preparation guard, marker-only recovery, live-cleanup exclusion, bound cleanup-lock handoff, and successful zero-residue path now have direct regressions. Follow-up concurrency review also verified that top-level quarantine precedes any protocol-lock unlink and that a second fd cannot acquire a replacement lock inode.
-- Latest `master` (`473e5d5`) was merged without rewriting history. Its Claude authentication, recovery-carrier, refresh-lock, and lightweight ephemeral independent-review supervision policies remain intact; authentication failure is not a Copilot fallback reason.
-- The provider-specific attempts-victim regression and all marker/container/parent swap regressions passed and are covered by both full suites.
-- Python 3.13 full suite: 1311 tests run, 4 skipped.
-- Python 3.10.19 full suite: 1311 tests run, 4 skipped.
-- `ruff check` and `ruff format --check` on all 11 Python files changed from the refreshed `master`: passed.
-- `git diff --check`: passed.
-- Fixed-range Codex review and PR readiness evidence are recorded in the delivery thread and PR.
+## Validation Criteria
+
+- Trusted reviewer launch succeeds with unchanged, moved, newly added, and growing tracked exact secrets when the egress boundary itself is valid.
+- PR/master admission passes unchanged counts, reductions, and cross-path/surface/offset moves.
+- PR/master admission blocks first appearance and global growth.
+- Former legacy values receive the same baseline without explicit exemption selection.
+- Authoring-catalog safe fixtures retain exact declared-rule acceptance.
+- Base64 and other encoded variants are neither derived nor scanned as aliases.
+- Non-exact dynamic expressions are excluded from the counter.
+- Base-only unextractable shapes may be deleted, while head-side or otherwise genuinely incomplete scans report `inconclusive`.
+- Violation diagnostics include only newly added `path:line` locations.
+- Single/double/triple review counting remains Codex / Codex+Claude / Codex+Claude+GitHub Codex.
+- PR readiness has no additional offline/independent Codex double gate.
+- Existing workspace behavior remains unchanged.
+- Skill and journal validation pass.
+
+## Next Steps
+
+- Commit the validated whole-range review anchor.
+- Run one fresh local Codex review over the fixed base/head range and resolve actionable findings.
+- Deliver PR #60 through current-head CI/review, squash merge, private-overlay release, installation sync, and remote-task handoff.
+- Mark this journal `completed` once the reviewed implementation and its verified evidence are final in this change.
+
+## Delivery TODO
+
+- [x] Align the exact-secret policy, reviewer trust boundary, lane model, and encoded-form limitation.
+- [x] Update the canonical design and workflow contracts.
+- [x] Finish the exact raw counter, added-line evidence, and reviewer-egress separation.
+- [x] Update focused scanner, workspace, provider, state, CLI, and contract tests.
+- [x] Run Python 3.13 validation, contract checks, skill validation, and journal validation.
+- [ ] Run one fresh local Codex review over the fixed whole range and resolve actionable findings.
+- [ ] Push the branch, update PR #60, and wait for current-head CI and review completion.
+- [ ] Squash-merge PR #60 after every merge-readiness gate is clean.
+- [ ] Trigger and verify the private-overlay sync/release, then update the local and `BL-mac-mini-m4-hoteng` installations with the installed synchronizer.
+- [ ] Notify Codex task `019f17fc-5756-7fb2-8d9f-34c0330bd59b` on `BL-mac-mini-m4-hoteng` to resume its Claude Code review with the updated personal review skill.
+
+The detached-worktree versus reflinked snapshot workspace design is intentionally deferred until every item above completes.
 
 ## Evidence
 
 - `AGENTS.md`
 - `skills/review-orchestration-playbook/SKILL.md`
-- `skills/review-orchestration-playbook/references/helper-contract.md`
 - `skills/review-orchestration-playbook/references/egress-consent.md`
+- `skills/review-orchestration-playbook/references/helper-contract.md`
+- `skills/review-orchestration-playbook/references/pr-readiness.md`
+- `skills/review-orchestration-playbook/references/review-lane-contracts.md`
 - `skills/review-orchestration-playbook/references/synthetic-token-fixtures.md`
+- Python 3.13.0: `1260 tests`, `OK (skipped=4)`, 327.283 seconds.
+- Focused contract suite: `41 tests`, `OK`.
+- Focused base-only deletion and head-side incomplete-scan boundary: `2 tests`, `OK`.
+- Ruff checks, changed-file format checks, and `git diff --check`: passed.
+- Official skill validator: `Skill is valid!`.
+- Project journal validator: `Project journal validation passed.`.

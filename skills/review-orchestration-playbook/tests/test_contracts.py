@@ -1018,8 +1018,10 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("_finish_claude_auth_required", run_review_source)
         self.assertIn("validate_external_workspace", run_review_source)
         self.assertIn(
-            "secret-delta and escaping-symlink checks passed", run_review_source
+            "review workspace containment and integrity checks passed",
+            run_review_source,
         )
+        self.assertIn("secret-delta status is evaluated separately", run_review_source)
 
         current_policy = "\n".join(
             (
@@ -1203,22 +1205,38 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("tomli==2.2.1", workflow)
         self.assertIn("requires Python 3.10 or later", readme)
 
-    def test_full_pr_readiness_retains_both_local_codex_gates(self) -> None:
+    def test_full_pr_readiness_uses_one_local_codex_lane(self) -> None:
         readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
             encoding="utf-8"
         )
         contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
             encoding="utf-8"
         )
-        for value in (readiness, contracts):
-            self.assertIn("independent-codex-pr-review", value)
-            self.assertIn("offline-frozen-diff-review", value)
-        self.assertIn("standalone double/triple-review", readiness)
-        self.assertLess(
-            readiness.index("3. Run `offline-frozen-diff-review` first"),
-            readiness.index("4. After the helper preflight passes"),
+        self.assertIn("### Active Review Sequence", readiness)
+        self.assertIn("single independent local Codex lane", readiness)
+        self.assertIn("There are no separate active", readiness)
+        self.assertIn("## Active PR Readiness Codex Lane", contracts)
+        self.assertIn("single independent local Codex lane", contracts)
+        self.assertIn("Do not require or launch a second", contracts)
+        readiness_active, readiness_deferred = readiness.split(
+            "### Deferred Detached-Worktree Design Record", 1
         )
-        self.assertIn("Require its retained `preflight.json`", readiness)
+        contracts_active, contracts_deferred = contracts.split(
+            "## Deferred Detached-Worktree Design Record", 1
+        )
+        self.assertNotIn("codex exec --ephemeral", readiness_active)
+        self.assertNotIn("codex exec --ephemeral", contracts_active)
+        self.assertNotIn("Parent-Process Output Budget", contracts_active)
+        self.assertIn("codex exec --ephemeral", readiness_deferred)
+        self.assertIn("codex exec --ephemeral", contracts_deferred)
+        self.assertLess(
+            readiness.index("### Active Review Sequence"),
+            readiness.index("### Deferred Detached-Worktree Design Record"),
+        )
+        self.assertLess(
+            contracts.index("## Active PR Readiness Codex Lane"),
+            contracts.index("## Deferred Detached-Worktree Design Record"),
+        )
 
     def test_independent_codex_process_is_ephemeral_lightweight_and_bounded(
         self,
@@ -1444,12 +1462,11 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertIn("`blocked-retention`", readiness)
 
-        self.assertIn("`codex exec --ephemeral`", skill)
-        self.assertIn("independent ephemeral gate", skill)
-        self.assertIn("intentionally does not persist", skill)
-        self.assertIn("persisted rollout verifies", skill)
-        self.assertIn("full instruction/process isolation", skill)
-        self.assertIn("proof against silent model substitution", skill)
+        self.assertIn("single independent local lane", skill)
+        self.assertIn("Do not create a second detached-worktree Codex gate", skill)
+        self.assertIn(
+            "does not change the helper's existing frozen-workspace design", skill
+        )
 
         self.assertIn(
             "codex exec --ephemeral --strict-config --json --sandbox read-only",
@@ -3150,14 +3167,6 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("without a shell or PATH lookup", readiness)
         self.assertNotIn("Pass the pinned model and effort explicitly", readiness)
         self.assertNotIn("Reject observed structured runtime metadata", readiness)
-        self.assertIn(
-            "configuration conflict before reviewer execution, classify the attempt as prelaunch `blocked` / `not-run`",
-            skill,
-        )
-        self.assertIn(
-            "once launch is possible, or whenever hook/notify execution is observed, the attempt is `inconclusive`",
-            skill,
-        )
 
         for removed in (
             "references/independent-codex-runtime-policy.json",
@@ -4235,15 +4244,16 @@ class RepositoryContractTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn(
-            "secure Claude runtime is deterministically absent/unavailable",
+            "secure Claude Code runtime is deterministically absent/unavailable",
             consent,
         )
         self.assertIn(
-            "both pinned Claude Opus models are entitlement-blocked",
+            "all pinned Claude models are entitlement-blocked",
             consent,
         )
         self.assertIn(
-            "Claude authentication failure pauses as `blocked-authentication`",
+            "Authentication failure is `blocked-authentication` and never "
+            "authorizes fallback",
             consent,
         )
         self.assertNotIn("has no usable local/API authentication", consent)
