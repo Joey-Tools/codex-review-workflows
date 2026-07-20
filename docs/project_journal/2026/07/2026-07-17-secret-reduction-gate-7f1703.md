@@ -1,7 +1,7 @@
 ---
 id: 20260717-7f1703
 title: Trust Reviewers and Gate Exact-Secret Growth
-status: active
+status: completed
 created: 2026-07-17
 updated: 2026-07-20
 branch: codex/secret-reduction-review
@@ -90,7 +90,7 @@ This decision does not redesign the frozen workspace, materialization, symlink h
 
 This note supersedes its earlier strict-reduction design, which required raw-count decrease, unembedded non-growth, same-location provenance, encoded-variant denial, and two extra Codex PR-readiness gates. Those requirements are no longer the target contract.
 
-Implementation and local validation now match this decision. The workstream remains `active` only while the fixed-range review and PR delivery gates are in progress. Historical test counts and prior fixed-range review claims in earlier revisions of this note are not validation evidence for the new semantics.
+Implementation, local validation, and the fresh local Codex review now match this decision. This tracked implementation workstream is `completed`; PR merge, private-overlay release, installation sync, and remote-task notification remain delivery operations tracked by the active PR/task rather than transient project state. Historical test counts and prior fixed-range review claims in earlier revisions of this note are not validation evidence for the new semantics.
 
 ## Validation Criteria
 
@@ -110,10 +110,8 @@ Implementation and local validation now match this decision. The workstream rema
 
 ## Next Steps
 
-- Commit the validated whole-range review anchor.
-- Run one fresh local Codex review over the fixed base/head range and resolve actionable findings.
 - Deliver PR #60 through current-head CI/review, squash merge, private-overlay release, installation sync, and remote-task handoff.
-- Mark this journal `completed` once the reviewed implementation and its verified evidence are final in this change.
+- Keep the detached-worktree versus reflinked snapshot redesign out of this delivery and revisit it only after the operational checklist completes.
 
 ## Delivery TODO
 
@@ -122,13 +120,15 @@ Implementation and local validation now match this decision. The workstream rema
 - [x] Finish the exact raw counter, added-line evidence, and reviewer-egress separation.
 - [x] Update focused scanner, workspace, provider, state, CLI, and contract tests.
 - [x] Run Python 3.13 validation, contract checks, skill validation, and journal validation.
-- [ ] Run one fresh local Codex review over the fixed whole range and resolve actionable findings.
+- [x] Run one fresh local Codex review over the fixed whole range and resolve actionable findings.
 - [ ] Push the branch, update PR #60, and wait for current-head CI and review completion.
 - [ ] Squash-merge PR #60 after every merge-readiness gate is clean.
 - [ ] Trigger and verify the private-overlay sync/release, then update the local and `BL-mac-mini-m4-hoteng` installations with the installed synchronizer.
 - [ ] Notify Codex task `019f17fc-5756-7fb2-8d9f-34c0330bd59b` on `BL-mac-mini-m4-hoteng` to resume its Claude Code review with the updated personal review skill.
 
 The detached-worktree versus reflinked snapshot workspace design is intentionally deferred until every item above completes.
+
+The remaining unchecked items are post-commit delivery operations. They are intentionally not pre-marked in tracked history before they occur; their current state belongs in PR/task coordination.
 
 ## Evidence
 
@@ -145,3 +145,4 @@ The detached-worktree versus reflinked snapshot workspace design is intentionall
 - Ruff checks, changed-file format checks, and `git diff --check`: passed.
 - Official skill validator: `Skill is valid!`.
 - Project journal validator: `Project journal validation passed.`.
+- Fresh local Codex CLI review over `473e5d54c4bb506388bb8e2993e2a2e9453309d8..c22708328157fdd78a76e97f3dede2ee370b3da1`: `No findings.`.
