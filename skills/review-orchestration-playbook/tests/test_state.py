@@ -92,6 +92,54 @@ def write_preparing_marker(
     )
 
 
+@contextlib.contextmanager
+def held_runner_lock(review):
+    lock_path = review.container_dir / state.LOCK_FILE
+    with state.open_private_lock_file(
+        lock_path,
+        label="test review runner lock",
+    ) as handle:
+        state.fcntl.flock(handle.fileno(), state.fcntl.LOCK_EX | state.fcntl.LOCK_NB)
+        metadata = os.fstat(handle.fileno())
+        state._write_state_marker(
+            review,
+            CleanupIdentity(metadata.st_dev, metadata.st_ino),
+        )
+        try:
+            yield handle
+        finally:
+            state.fcntl.flock(handle.fileno(), state.fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def held_cleanup_worker_locks(review):
+    container_fd = os.open(
+        review.container_dir,
+        os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0),
+    )
+    compatibility = None
+    try:
+        compatibility = state.open_private_lock_file(
+            review.container_dir / state.CLEANUP_LOCK_FILE,
+            label="test cleanup compatibility lock",
+        )
+        descriptors = (container_fd, compatibility.fileno())
+        for descriptor in descriptors:
+            state.fcntl.flock(
+                descriptor,
+                state.fcntl.LOCK_EX | state.fcntl.LOCK_NB,
+            )
+        try:
+            yield descriptors
+        finally:
+            for descriptor in reversed(descriptors):
+                state.fcntl.flock(descriptor, state.fcntl.LOCK_UN)
+    finally:
+        if compatibility is not None:
+            compatibility.close()
+        os.close(container_fd)
+
+
 class StatefulLifecycleTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -144,8 +192,86 @@ class StatefulLifecycleTest(unittest.TestCase):
             state_dir / "attempts.json",
             [{"runtime": "claude", "requested_model": "claude-opus-4-8"}],
         )
-        (state_dir / state.EXIT_FILE).write_text("0\n", encoding="utf-8")
-        (state_dir / "final.txt").write_text("No findings.\n", encoding="utf-8")
+        write_text_atomic(state_dir / state.EXIT_FILE, "0\n")
+        write_text_atomic(state_dir / "final.txt", "No findings.\n")
+
+    def write_preflight(
+        self,
+        secret_delta: dict[str, object],
+        *,
+        review_range: str | None = None,
+    ) -> None:
+        write_json(
+            self.review.container_dir / state.PREFLIGHT_FILE,
+            {
+                "private_artifacts": state.PREFLIGHT_PRIVATE_ARTIFACTS,
+                "review_range": review_range or f"{self.base}..{self.head}",
+                "scope": state.PREFLIGHT_SCOPE,
+                "secret_delta": secret_delta,
+                "status": state.PREFLIGHT_STATUS,
+            },
+        )
+
+    def clean_secret_delta(self) -> dict[str, object]:
+        return {
+            "limitations": [],
+            "location_status": "complete",
+            "status": "clean",
+            "violations": [],
+        }
+
+    def violating_secret_delta(
+        self,
+        *,
+        location_status: str = "complete",
+    ) -> dict[str, object]:
+        return {
+            "limitations": [],
+            "location_status": location_status,
+            "status": "violations",
+            "violations": [
+                {
+                    "additions": [
+                        {
+                            "line": 1,
+                            "occurrence_count": 1,
+                            "path": "example.txt",
+                            "surface": "blob",
+                        }
+                    ],
+                    "base_count": 0,
+                    "delta": 1,
+                    "head_count": 1,
+                    "omitted_addition_location_count": 0,
+                    "rules": ["generic-secret-assignment"],
+                    "value_length": 16,
+                    "value_sha256": "a" * 64,
+                }
+            ],
+        }
+
+    def inconclusive_secret_delta(self) -> dict[str, object]:
+        return {
+            "failure_class": "secret-count-incomplete",
+            "limitations": [],
+            "location_status": "inconclusive",
+            "status": "inconclusive",
+            "violations": [],
+        }
+
+    def read_final_without_cleanup(self) -> tuple[int, str]:
+        summary = {
+            "running": False,
+            "exit_code": 0,
+            "runner_error": "",
+            "stderr_tail": "",
+            "fallback_workspace_retained": False,
+        }
+        with (
+            mock.patch.object(state, "status", return_value=summary),
+            mock.patch.object(state, "wait", return_value=0),
+        ):
+            return state.final(self.review.container_dir)
 
     def legacy_workspace_json(self) -> dict[str, str]:
         workspace = self.review.to_json()
@@ -1021,6 +1147,137 @@ class StatefulLifecycleTest(unittest.TestCase):
         )
         self.assertFalse(self.review.workspace_root.exists())
 
+    def test_final_rejects_non_private_artifact_mode(self) -> None:
+        self.write_completed_state()
+        (self.review.container_dir / "final.txt").chmod(0o640)
+
+        with self.assertRaisesRegex(ReviewError, "mode must be exactly 0600"):
+            self.read_final_without_cleanup()
+
+    def test_final_rejects_hard_linked_artifact(self) -> None:
+        self.write_completed_state()
+        final_path = self.review.container_dir / "final.txt"
+        os.link(final_path, self.review.container_dir / "final-copy.txt")
+
+        with self.assertRaisesRegex(ReviewError, "exactly one hard link"):
+            self.read_final_without_cleanup()
+
+    def test_final_rejects_symlink_artifact(self) -> None:
+        self.write_completed_state()
+        final_path = self.review.container_dir / "final.txt"
+        target = pathlib.Path(self.temporary.name) / "outside-final.txt"
+        write_text_atomic(target, "forged\n")
+        final_path.unlink()
+        final_path.symlink_to(target)
+
+        with self.assertRaisesRegex(ReviewError, "regular file"):
+            self.read_final_without_cleanup()
+
+    def test_final_rejects_fifo_without_blocking(self) -> None:
+        self.write_completed_state()
+        final_path = self.review.container_dir / "final.txt"
+        final_path.unlink()
+        os.mkfifo(final_path, 0o600)
+
+        started = time.monotonic()
+        with self.assertRaisesRegex(ReviewError, "regular file"):
+            self.read_final_without_cleanup()
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_final_rejects_oversized_artifact(self) -> None:
+        self.write_completed_state()
+
+        with (
+            mock.patch.object(state, "MAX_FINAL_ARTIFACT_BYTES", 4),
+            self.assertRaisesRegex(ReviewError, "size limit"),
+        ):
+            self.read_final_without_cleanup()
+
+    def test_final_rejects_path_swap_while_opening(self) -> None:
+        self.write_completed_state()
+        final_path = self.review.container_dir / "final.txt"
+        replacement = self.review.container_dir / "replacement-final.txt"
+        write_text_atomic(replacement, "forged\n")
+        original_open = state.os.open
+        swapped = False
+
+        def swap_before_open(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal swapped
+            if path == pathlib.Path("final.txt") and dir_fd is not None:
+                swapped = True
+                os.replace(replacement, final_path)
+            return original_open(path, flags, mode, dir_fd=dir_fd)
+
+        with (
+            mock.patch.object(state.os, "open", side_effect=swap_before_open),
+            self.assertRaisesRegex(ReviewError, "changed while opening"),
+        ):
+            self.read_final_without_cleanup()
+        self.assertTrue(swapped)
+
+    def test_final_rejects_length_change_while_reading(self) -> None:
+        self.write_completed_state()
+        final_path = self.review.container_dir / "final.txt"
+        expected = os.stat(final_path, follow_symlinks=False)
+        original_read = state.os.read
+        mutated = False
+
+        def append_after_read(descriptor, count):
+            nonlocal mutated
+            payload = original_read(descriptor, count)
+            metadata = os.fstat(descriptor)
+            if not mutated and (metadata.st_dev, metadata.st_ino) == (
+                expected.st_dev,
+                expected.st_ino,
+            ):
+                mutated = True
+                with final_path.open("ab") as handle:
+                    handle.write(b"late mutation\n")
+            return payload
+
+        with (
+            mock.patch.object(state.os, "read", side_effect=append_after_read),
+            self.assertRaisesRegex(ReviewError, "changed while reading"),
+        ):
+            self.read_final_without_cleanup()
+        self.assertTrue(mutated)
+
+    def test_final_rejects_container_swap_while_opening(self) -> None:
+        self.write_completed_state()
+        state_dir = self.review.container_dir
+        moved_state_dir = state_dir.with_name(f"{state_dir.name}-final-bound")
+        original_open = state.os.open
+        swapped = False
+
+        def swap_container_after_open(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal swapped
+            descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+            if path == pathlib.Path("final.txt") and dir_fd is not None:
+                swapped = True
+                state_dir.rename(moved_state_dir)
+                state_dir.mkdir(mode=0o700)
+            return descriptor
+
+        try:
+            with (
+                mock.patch.object(
+                    state.os,
+                    "open",
+                    side_effect=swap_container_after_open,
+                ),
+                self.assertRaisesRegex(
+                    ReviewError,
+                    "state directory path does not match its open descriptor",
+                ),
+            ):
+                self.read_final_without_cleanup()
+            self.assertTrue(swapped)
+        finally:
+            if state_dir.is_dir():
+                state_dir.rmdir()
+            if moved_state_dir.is_dir():
+                moved_state_dir.rename(state_dir)
+
     def test_codex_unavailable_retains_preflight_workspace_until_cleanup(self) -> None:
         self.write_codex_unavailable_state()
         private_artifacts = (
@@ -1281,6 +1538,160 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.assertTrue(summary["attempts"][0]["final_available"])
         self.assertNotIn(artifact, str(summary))
 
+    def test_admission_maps_clean_blocked_and_inconclusive_evidence(self) -> None:
+        self.write_completed_state()
+        cases = (
+            (self.clean_secret_delta(), "clean", 0, None),
+            (self.violating_secret_delta(), "blocked", 1, None),
+            (
+                self.violating_secret_delta(location_status="inconclusive"),
+                "blocked",
+                1,
+                None,
+            ),
+            (
+                self.inconclusive_secret_delta(),
+                "inconclusive",
+                75,
+                "secret-count-incomplete",
+            ),
+        )
+        for secret_delta, expected_status, expected_exit, failure_class in cases:
+            with self.subTest(expected_status=expected_status, delta=secret_delta):
+                self.write_preflight(secret_delta)
+                exit_code, summary = state.admission(self.review.container_dir)
+                self.assertEqual(exit_code, expected_exit)
+                self.assertEqual(summary["status"], expected_status)
+                self.assertEqual(summary["failure_class"], failure_class)
+                self.assertEqual(summary["secret_delta"], secret_delta)
+                self.assertEqual(summary["schema_version"], 1)
+                self.assertEqual(summary["review_range"], f"{self.base}..{self.head}")
+                self.assertEqual(
+                    summary["evidence_path"],
+                    str(self.review.container_dir / state.PREFLIGHT_FILE),
+                )
+
+    def test_admission_missing_evidence_is_pending_only_while_runner_is_held(
+        self,
+    ) -> None:
+        self.write_completed_state()
+        terminal = state.admission_status(self.review.container_dir)
+        self.assertEqual(terminal["status"], "inconclusive")
+        self.assertEqual(terminal["exit_code"], 75)
+        self.assertEqual(terminal["failure_class"], "preflight-missing")
+
+        lock_path = self.review.container_dir / state.LOCK_FILE
+        with lock_path.open("r+b") as runner_lock:
+            state.fcntl.flock(runner_lock.fileno(), state.fcntl.LOCK_EX)
+            pending = state.admission_status(self.review.container_dir)
+
+        self.assertEqual(pending["status"], "pending")
+        self.assertEqual(pending["exit_code"], 3)
+        self.assertEqual(pending["failure_class"], "preflight-not-ready")
+
+    def test_admission_rejects_malformed_range_and_symlink_evidence(self) -> None:
+        self.write_completed_state()
+        preflight_path = self.review.container_dir / state.PREFLIGHT_FILE
+
+        write_text_atomic(preflight_path, "not-json\n")
+        malformed = state.admission_status(self.review.container_dir)
+        self.assertEqual(malformed["failure_class"], "preflight-invalid")
+        self.assertEqual(malformed["exit_code"], 75)
+
+        self.write_preflight(
+            self.clean_secret_delta(),
+            review_range=f"{'b' * 40}..{'c' * 40}",
+        )
+        mismatch = state.admission_status(self.review.container_dir)
+        self.assertEqual(mismatch["failure_class"], "preflight-range-mismatch")
+
+        outside = pathlib.Path(self.temporary.name) / "outside-preflight.json"
+        write_json(outside, {"secret_delta": self.clean_secret_delta()})
+        preflight_path.unlink()
+        preflight_path.symlink_to(outside)
+        symlink = state.admission_status(self.review.container_dir)
+        self.assertEqual(symlink["failure_class"], "preflight-invalid")
+        self.assertIsNone(symlink["secret_delta"])
+
+    def test_admission_rejects_container_swap_during_bound_read(self) -> None:
+        self.write_completed_state()
+        self.write_preflight(self.clean_secret_delta())
+        state_dir = self.review.container_dir
+        moved_state_dir = state_dir.with_name(f"{state_dir.name}-admission-bound")
+        original_reader = state._read_bounded_json_at
+        swapped = False
+
+        def swap_then_read(directory_descriptor, name, **kwargs):
+            nonlocal swapped
+            swapped = True
+            state_dir.rename(moved_state_dir)
+            state_dir.mkdir(mode=0o700)
+            return original_reader(directory_descriptor, name, **kwargs)
+
+        try:
+            with mock.patch.object(
+                state,
+                "_read_bounded_json_at",
+                side_effect=swap_then_read,
+            ):
+                summary = state.admission_status(state_dir)
+            self.assertTrue(swapped)
+            self.assertEqual(summary["failure_class"], "preflight-invalid")
+            self.assertEqual(summary["exit_code"], 75)
+        finally:
+            if state_dir.is_dir():
+                state_dir.rmdir()
+            if moved_state_dir.is_dir():
+                moved_state_dir.rename(state_dir)
+
+    def test_status_admission_matches_standalone_result(self) -> None:
+        self.write_completed_state()
+        self.write_preflight(self.violating_secret_delta())
+
+        standalone = state.admission_status(self.review.container_dir)
+        status_summary = state.status(self.review.container_dir)
+
+        self.assertEqual(status_summary["admission"], standalone)
+        self.assertEqual(status_summary["admission"]["status"], "blocked")
+
+    def test_final_success_is_independent_of_nonclean_admission(self) -> None:
+        self.write_completed_state()
+        with mock.patch.object(state, "wait", return_value=0):
+            for secret_delta in (
+                self.violating_secret_delta(),
+                self.inconclusive_secret_delta(),
+            ):
+                with self.subTest(secret_delta=secret_delta):
+                    self.write_preflight(secret_delta)
+                    exit_code, text = state.final(self.review.container_dir)
+                    self.assertEqual((exit_code, text), (0, "No findings."))
+
+    def test_malformed_unhashable_admission_does_not_block_final(self) -> None:
+        self.write_completed_state()
+        malformed = self.violating_secret_delta()
+        malformed["violations"][0]["rules"] = [
+            {},
+            "generic-secret-assignment",
+        ]
+        self.write_preflight(malformed)
+
+        summary = state.admission_status(self.review.container_dir)
+        self.assertEqual(summary["status"], "inconclusive")
+        self.assertEqual(summary["exit_code"], 75)
+        self.assertEqual(summary["failure_class"], "preflight-invalid")
+        with mock.patch.object(state, "wait", return_value=0):
+            exit_code, text = state.final(self.review.container_dir)
+        self.assertEqual((exit_code, text), (0, "No findings."))
+
+    def test_legacy_admission_is_inconclusive(self) -> None:
+        self.write_legacy_state()
+
+        summary = state.admission_status(self.review.container_dir)
+
+        self.assertEqual(summary["status"], "inconclusive")
+        self.assertEqual(summary["exit_code"], 75)
+        self.assertEqual(summary["failure_class"], "legacy-state-no-admission")
+
     def test_concurrent_wait_serializes_workspace_cleanup(self) -> None:
         self.write_completed_state()
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -1377,15 +1788,147 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.write_completed_state()
         cleanup_error_path = self.review.container_dir / "cleanup-error.txt"
         cleanup_error_path.write_text("previous cleanup failed\n", encoding="utf-8")
-        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
-        with lock_path.open("a+b") as cleanup_lock:
+        with held_cleanup_worker_locks(self.review) as lock_fds:
             exit_code = cleanup_worker.main(
-                [str(self.review.container_dir), str(cleanup_lock.fileno())]
+                [
+                    str(self.review.container_dir),
+                    *(str(descriptor) for descriptor in lock_fds),
+                ]
             )
 
         self.assertEqual(exit_code, 0)
         self.assertFalse(self.review.workspace_root.exists())
         self.assertFalse(cleanup_error_path.exists())
+
+    def test_cleanup_worker_lock_validator_accepts_exact_inherited_leases(
+        self,
+    ) -> None:
+        self.write_completed_state()
+        with held_cleanup_worker_locks(self.review) as lock_fds:
+            for descriptor in lock_fds:
+                os.set_inheritable(descriptor, True)
+
+            state.validate_cleanup_worker_lock_leases(
+                self.review.container_dir,
+                lock_fds,
+            )
+
+            self.assertTrue(
+                all(not os.get_inheritable(descriptor) for descriptor in lock_fds)
+            )
+
+    def test_cleanup_worker_lock_validator_rejects_role_swap(self) -> None:
+        self.write_completed_state()
+        with held_cleanup_worker_locks(self.review) as lock_fds:
+            with self.assertRaisesRegex(ReviewError, "container lock"):
+                state.validate_cleanup_worker_lock_leases(
+                    self.review.container_dir,
+                    tuple(reversed(lock_fds)),
+                )
+
+    def test_cleanup_worker_lock_validator_rejects_unlocked_exact_fds(self) -> None:
+        self.write_completed_state()
+        container_fd = os.open(
+            self.review.container_dir,
+            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            with state.open_private_lock_file(
+                self.review.container_dir / state.CLEANUP_LOCK_FILE,
+                label="test unlocked cleanup compatibility lock",
+            ) as compatibility:
+                with self.assertRaisesRegex(ReviewError, "not an inherited-held lease"):
+                    state.validate_cleanup_worker_lock_leases(
+                        self.review.container_dir,
+                        (container_fd, compatibility.fileno()),
+                    )
+        finally:
+            os.close(container_fd)
+
+    def test_cleanup_worker_lock_validator_rejects_independent_descriptions(
+        self,
+    ) -> None:
+        self.write_completed_state()
+        with held_cleanup_worker_locks(self.review):
+            container_fd = os.open(
+                self.review.container_dir,
+                os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                with state.open_private_lock_file(
+                    self.review.container_dir / state.CLEANUP_LOCK_FILE,
+                    label="test independent cleanup compatibility lock",
+                ) as compatibility:
+                    with self.assertRaisesRegex(
+                        ReviewError,
+                        "does not share the inherited-held lock description",
+                    ):
+                        state.validate_cleanup_worker_lock_leases(
+                            self.review.container_dir,
+                            (container_fd, compatibility.fileno()),
+                        )
+            finally:
+                os.close(container_fd)
+
+    def test_cleanup_worker_lock_validator_rejects_replaced_lock_path(self) -> None:
+        self.write_completed_state()
+        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+        stale_path = self.review.container_dir / "stale-cleanup.lock"
+        with held_cleanup_worker_locks(self.review) as lock_fds:
+            lock_path.rename(stale_path)
+            os.mkfifo(lock_path, 0o600)
+
+            started = time.monotonic()
+            with self.assertRaisesRegex(
+                ReviewError,
+                "path does not match its open file descriptor",
+            ):
+                state.validate_cleanup_worker_lock_leases(
+                    self.review.container_dir,
+                    lock_fds,
+                )
+            self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_cleanup_worker_lock_validator_rejects_closed_fds(self) -> None:
+        self.write_completed_state()
+        with held_cleanup_worker_locks(self.review) as lock_fds:
+            closed_fds = lock_fds
+
+        with self.assertRaisesRegex(ReviewError, "lock descriptor"):
+            state.validate_cleanup_worker_lock_leases(
+                self.review.container_dir,
+                closed_fds,
+            )
+
+    def test_cleanup_worker_rejects_missing_extra_and_duplicate_fds(self) -> None:
+        self.write_completed_state()
+        state_dir = str(self.review.container_dir)
+        for arguments in (
+            [state_dir],
+            [state_dir, "3", "4", "5"],
+            [state_dir, "3", "3"],
+        ):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(cleanup_worker.main(arguments), 2)
+        self.assertTrue(self.review.workspace_root.exists())
+
+    def test_cleanup_worker_rejects_legacy_automatic_execution(self) -> None:
+        self.write_legacy_state()
+        stderr = io.StringIO()
+        with (
+            held_cleanup_worker_locks(self.review) as lock_fds,
+            contextlib.redirect_stderr(stderr),
+        ):
+            exit_code = cleanup_worker.main(
+                [
+                    str(self.review.container_dir),
+                    *(str(descriptor) for descriptor in lock_fds),
+                ]
+            )
+
+        self.assertEqual(exit_code, 1)
+        self.assertTrue(self.review.workspace_root.exists())
+        self.assertIn("modern v4 ready state marker", stderr.getvalue())
 
     def test_private_lock_creation_has_fixed_mode_with_permissive_umask(self) -> None:
         lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
@@ -2012,7 +2555,9 @@ import time
 
 state_dir = Path(sys.argv[sys.argv.index("--state-dir") + 1])
 time.sleep(0.2)
-(state_dir / "final.txt").write_text("No findings.\\n", encoding="utf-8")
+final_path = state_dir / "final.txt"
+final_path.write_text("No findings.\\n", encoding="utf-8")
+final_path.chmod(0o600)
 (state_dir / "attempts.json").write_text("[]\\n", encoding="utf-8")
 (state_dir / "exit-code").write_text("0\\n", encoding="utf-8")
 """,
@@ -2041,7 +2586,9 @@ time.sleep(0.2)
 import sys
 
 state_dir = Path(sys.argv[sys.argv.index("--state-dir") + 1])
-(state_dir / "final.txt").write_text("No findings.\\n", encoding="utf-8")
+final_path = state_dir / "final.txt"
+final_path.write_text("No findings.\\n", encoding="utf-8")
+final_path.chmod(0o600)
 (state_dir / "attempts.json").write_text("[]\\n", encoding="utf-8")
 (state_dir / "exit-code").write_text("0\\n", encoding="utf-8")
 """,
@@ -2283,24 +2830,29 @@ state_dir = Path(sys.argv[sys.argv.index("--state-dir") + 1])
         self.write_completed_state()
         state_dir = self.review.container_dir
         moved_state_dir = state_dir.with_name(f"{state_dir.name}-moved")
-        state_dir.rename(moved_state_dir)
-        state_dir.mkdir(mode=0o700)
         sentinel = state_dir / "sentinel"
-        sentinel.write_text("keep me\n", encoding="utf-8")
-        shutil.copy2(
-            moved_state_dir / state.STATE_MARKER, state_dir / state.STATE_MARKER
-        )
-        shutil.copy2(moved_state_dir / state.STATE_FILE, state_dir / state.STATE_FILE)
         stderr = io.StringIO()
-        lock_path = moved_state_dir / "handoff.lock"
         try:
-            with (
-                lock_path.open("a+b") as cleanup_lock,
-                contextlib.redirect_stderr(stderr),
-            ):
-                exit_code = cleanup_worker.main(
-                    [str(state_dir), str(cleanup_lock.fileno())]
+            with held_cleanup_worker_locks(self.review) as lock_fds:
+                state_dir.rename(moved_state_dir)
+                state_dir.mkdir(mode=0o700)
+                sentinel = state_dir / "sentinel"
+                sentinel.write_text("keep me\n", encoding="utf-8")
+                shutil.copy2(
+                    moved_state_dir / state.STATE_MARKER,
+                    state_dir / state.STATE_MARKER,
                 )
+                shutil.copy2(
+                    moved_state_dir / state.STATE_FILE,
+                    state_dir / state.STATE_FILE,
+                )
+                with contextlib.redirect_stderr(stderr):
+                    exit_code = cleanup_worker.main(
+                        [
+                            str(state_dir),
+                            *(str(descriptor) for descriptor in lock_fds),
+                        ]
+                    )
 
             self.assertEqual(exit_code, 1)
             self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep me\n")
@@ -2308,7 +2860,8 @@ state_dir = Path(sys.argv[sys.argv.index("--state-dir") + 1])
             self.assertFalse((moved_state_dir / "cleanup-error.txt").exists())
             self.assertIn("cleanup worker failed", stderr.getvalue())
             self.assertIn(
-                "container does not match preparation identity", stderr.getvalue()
+                "container lock path does not match its open descriptor",
+                stderr.getvalue(),
             )
         finally:
             sentinel.unlink(missing_ok=True)
@@ -3004,6 +3557,125 @@ with pathlib.Path(sys.argv[1]).open("a+b") as handle:
 
     def test_terminal_runner_keeps_signals_blocked_through_process_exit(self) -> None:
         state_dir = self.review.container_dir
+        with held_runner_lock(self.review) as runner_lock:
+            write_json(
+                state_dir / state.STATE_FILE,
+                {
+                    "version": state.STATE_SCHEMA_VERSION,
+                    "reviewer": "codex",
+                    "workspace": self.review.to_json(),
+                },
+            )
+            with (
+                mock.patch.object(
+                    state,
+                    "run_review",
+                    return_value=mock.Mock(returncode=0),
+                ),
+                mock.patch.object(
+                    state,
+                    "block_forwarded_signals",
+                    return_value={signal.SIGTERM},
+                ) as block,
+                mock.patch.object(
+                    state,
+                    "consume_pending_forwarded_signal",
+                    return_value=None,
+                ),
+                mock.patch.object(state, "restore_signal_mask") as restore,
+            ):
+                exit_code = state.run_state(
+                    state_dir=state_dir,
+                    lock_fd=runner_lock.fileno(),
+                    terminal_process=True,
+                )
+
+        self.assertEqual(exit_code, 0)
+        block.assert_called_once_with()
+        restore.assert_not_called()
+        self.assertEqual(
+            (state_dir / state.EXIT_FILE).read_text(encoding="utf-8").strip(),
+            "0",
+        )
+
+    def test_runner_lock_validator_accepts_exact_inherited_lease(self) -> None:
+        with held_runner_lock(self.review) as runner_lock:
+            os.set_inheritable(runner_lock.fileno(), True)
+
+            state.validate_inherited_runner_lock_lease(
+                self.review.container_dir,
+                runner_lock.fileno(),
+            )
+
+            self.assertFalse(os.get_inheritable(runner_lock.fileno()))
+
+    def test_runner_lock_validator_rejects_unlocked_exact_fd(self) -> None:
+        write_ready_marker(self.review)
+        with state.open_private_lock_file(
+            self.review.container_dir / state.LOCK_FILE,
+            label="test unlocked runner lock",
+        ) as runner_lock:
+            with self.assertRaisesRegex(ReviewError, "not an inherited-held lease"):
+                state.validate_inherited_runner_lock_lease(
+                    self.review.container_dir,
+                    runner_lock.fileno(),
+                )
+
+    def test_runner_lock_validator_rejects_independent_description(self) -> None:
+        with held_runner_lock(self.review):
+            with state.open_private_lock_file(
+                self.review.container_dir / state.LOCK_FILE,
+                label="test independent runner lock",
+            ) as runner_lock:
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "does not share the inherited-held lock description",
+                ):
+                    state.validate_inherited_runner_lock_lease(
+                        self.review.container_dir,
+                        runner_lock.fileno(),
+                    )
+
+    def test_runner_lock_validator_rejects_replaced_path(self) -> None:
+        lock_path = self.review.container_dir / state.LOCK_FILE
+        stale_path = self.review.container_dir / "stale-runner.lock"
+        with held_runner_lock(self.review) as runner_lock:
+            lock_path.rename(stale_path)
+            write_text_atomic(lock_path, "")
+
+            with self.assertRaisesRegex(
+                ReviewError,
+                "path does not match its open file descriptor",
+            ):
+                state.validate_inherited_runner_lock_lease(
+                    self.review.container_dir,
+                    runner_lock.fileno(),
+                )
+
+    def test_runner_lock_validator_rejects_arbitrary_and_closed_fds(self) -> None:
+        with held_runner_lock(self.review):
+            arbitrary_path = self.review.container_dir / "arbitrary.lock"
+            write_text_atomic(arbitrary_path, "")
+            with arbitrary_path.open("r+b") as arbitrary:
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "path does not match its open file descriptor",
+                ):
+                    state.validate_inherited_runner_lock_lease(
+                        self.review.container_dir,
+                        arbitrary.fileno(),
+                    )
+
+            closed_fd = os.open(arbitrary_path, os.O_RDWR | os.O_CLOEXEC)
+            os.close(closed_fd)
+            with self.assertRaisesRegex(ReviewError, "cannot validate"):
+                state.validate_inherited_runner_lock_lease(
+                    self.review.container_dir,
+                    closed_fd,
+                )
+
+    def test_terminal_runner_rejects_missing_lock_before_provider_launch(self) -> None:
+        state_dir = self.review.container_dir
         write_ready_marker(self.review)
         write_json(
             state_dir / state.STATE_FILE,
@@ -3014,35 +3686,21 @@ with pathlib.Path(sys.argv[1]).open("a+b") as handle:
             },
         )
         with (
+            mock.patch.object(state, "run_review") as run_review,
             mock.patch.object(
-                state,
-                "run_review",
-                return_value=mock.Mock(returncode=0),
+                state.signal,
+                "signal",
+                return_value=signal.SIG_DFL,
             ),
-            mock.patch.object(
-                state,
-                "block_forwarded_signals",
-                return_value={signal.SIGTERM},
-            ) as block,
-            mock.patch.object(
-                state,
-                "consume_pending_forwarded_signal",
-                return_value=None,
-            ),
-            mock.patch.object(state, "restore_signal_mask") as restore,
+            mock.patch.object(state, "block_forwarded_signals", return_value=None),
         ):
             exit_code = state.run_state(
                 state_dir=state_dir,
                 terminal_process=True,
             )
 
-        self.assertEqual(exit_code, 0)
-        block.assert_called_once_with()
-        restore.assert_not_called()
-        self.assertEqual(
-            (state_dir / state.EXIT_FILE).read_text(encoding="utf-8").strip(),
-            "0",
-        )
+        self.assertEqual(exit_code, 1)
+        run_review.assert_not_called()
 
     def test_final_reports_cleanup_failure_instead_of_clean_result(self) -> None:
         self.write_completed_state()

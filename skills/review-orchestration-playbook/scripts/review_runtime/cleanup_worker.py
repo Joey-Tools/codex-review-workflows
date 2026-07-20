@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import pathlib
 import sys
 
@@ -8,12 +7,14 @@ import sys
 SCRIPTS = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
 
-from review_runtime.common import write_text_atomic  # noqa: E402
-from review_runtime.state import load_review_state  # noqa: E402
+from review_runtime.common import ReviewError, write_text_atomic  # noqa: E402
+from review_runtime.state import (  # noqa: E402
+    load_review_state,
+    validate_cleanup_worker_lock_leases,
+)
 from review_runtime.workspace import (  # noqa: E402
     LegacyReviewWorkspace,
     ReviewWorkspace,
-    cleanup_legacy_workspace,
     cleanup_workspace,
     remove_bound_review_text,
     write_bound_review_text,
@@ -22,20 +23,23 @@ from review_runtime.workspace import (  # noqa: E402
 
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if len(arguments) < 2:
+    if len(arguments) != 3:
+        return 2
+    try:
+        lock_fds = tuple(int(argument) for argument in arguments[1:])
+    except ValueError:
+        return 2
+    if any(descriptor < 0 for descriptor in lock_fds) or len(set(lock_fds)) != 2:
         return 2
     state_dir = pathlib.Path(arguments[0]).expanduser().resolve()
     cleanup_error_path = state_dir / "cleanup-error.txt"
     review: ReviewWorkspace | LegacyReviewWorkspace | None = None
     try:
-        lock_fds = tuple(int(argument) for argument in arguments[1:])
-        for lock_fd in lock_fds:
-            os.fstat(lock_fd)
+        validate_cleanup_worker_lock_leases(state_dir, lock_fds)
         _state, review = load_review_state(state_dir)
         if isinstance(review, LegacyReviewWorkspace):
-            cleanup_error = cleanup_legacy_workspace(review, keep_container=True)
-        else:
-            cleanup_error = cleanup_workspace(review, keep_container=True)
+            raise ReviewError("legacy review state cannot run automatic cleanup worker")
+        cleanup_error = cleanup_workspace(review, keep_container=True)
         if not cleanup_error:
             if isinstance(review, ReviewWorkspace):
                 remove_error = remove_bound_review_text(

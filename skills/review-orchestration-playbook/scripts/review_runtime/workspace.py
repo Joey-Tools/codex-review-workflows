@@ -5233,6 +5233,7 @@ def _read_bounded_json_at(
     name: str,
     *,
     label: str,
+    max_bytes: int = MAX_SYNTHETIC_EVIDENCE_BYTES,
 ) -> dict[str, Any]:
     flags = (
         os.O_RDONLY
@@ -5251,11 +5252,11 @@ def _read_bounded_json_at(
             raise ReviewError(f"{label} has an unexpected owner")
         if initial.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
             raise ReviewError(f"{label} must not be group or other writable")
-        if initial.st_size > MAX_SYNTHETIC_EVIDENCE_BYTES:
-            raise ReviewError(f"{label} exceeds the audit evidence size limit")
+        if initial.st_size > max_bytes:
+            raise ReviewError(f"{label} exceeds its review size limit")
         handle = os.fdopen(descriptor, "rb")
         descriptor = None
-        encoded = handle.read(MAX_SYNTHETIC_EVIDENCE_BYTES + 1)
+        encoded = handle.read(max_bytes + 1)
         if len(encoded) != initial.st_size:
             raise ReviewError(f"{label} changed while it was read")
         final = os.fstat(handle.fileno())
@@ -5756,6 +5757,129 @@ def _write_control_artifact_state_at(
             pass
 
 
+def validate_secret_delta_summary(
+    value: Any,
+    *,
+    label: str = "secret-delta evidence",
+) -> dict[str, Any]:
+    required_fields = {"limitations", "location_status", "status", "violations"}
+    if (
+        not isinstance(value, dict)
+        or not required_fields.issubset(value)
+        or not set(value).issubset(required_fields | {"failure_class"})
+        or value.get("location_status") not in {"complete", "inconclusive"}
+        or value.get("status") not in {"clean", "violations", "inconclusive"}
+        or not isinstance(value.get("limitations"), list)
+        or not all(isinstance(item, str) for item in value.get("limitations", []))
+        or not isinstance(value.get("violations"), list)
+        or len(value.get("violations", [])) > MAX_SECRET_REDUCTION_CANDIDATES
+    ):
+        raise ReviewError(f"{label} is invalid")
+
+    allowed_rules = {rule for rule, _pattern in SECRET_PATTERNS} | {
+        "generic-secret-assignment",
+        "pgp-private-key",
+        "private-key",
+    }
+    seen_digests: set[str] = set()
+    total_additions = 0
+    violations = value["violations"]
+    for violation in violations:
+        if not isinstance(violation, dict) or set(violation) != {
+            "additions",
+            "base_count",
+            "delta",
+            "head_count",
+            "omitted_addition_location_count",
+            "rules",
+            "value_length",
+            "value_sha256",
+        }:
+            raise ReviewError(f"{label} violation is malformed")
+        base_count = violation["base_count"]
+        head_count = violation["head_count"]
+        delta = violation["delta"]
+        omitted = violation["omitted_addition_location_count"]
+        rules = violation["rules"]
+        value_length = violation["value_length"]
+        digest = violation["value_sha256"]
+        additions = violation["additions"]
+        if (
+            type(base_count) is not int
+            or type(head_count) is not int
+            or type(delta) is not int
+            or base_count < 0
+            or head_count <= base_count
+            or delta != head_count - base_count
+            or type(omitted) is not int
+            or omitted < 0
+            or not isinstance(rules, list)
+            or not rules
+            or len(rules) > len(allowed_rules)
+            or not all(
+                isinstance(rule, str) and rule in allowed_rules for rule in rules
+            )
+            or rules != sorted(set(rules))
+            or type(value_length) is not int
+            or not 0 < value_length <= MAX_PEM_SECRET_BYTES
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or digest in seen_digests
+            or not isinstance(additions, list)
+            or len(additions) > MAX_SECRET_DELTA_ADDITION_LOCATIONS
+        ):
+            raise ReviewError(f"{label} violation is inconsistent")
+        total_additions += len(additions)
+        if total_additions > MAX_SECRET_DELTA_ADDITION_LOCATIONS:
+            raise ReviewError(f"{label} has too many addition locations")
+        for addition in additions:
+            if not isinstance(addition, dict) or set(addition) != {
+                "line",
+                "occurrence_count",
+                "path",
+                "surface",
+            }:
+                raise ReviewError(f"{label} addition is malformed")
+            line = addition["line"]
+            occurrence_count = addition["occurrence_count"]
+            path = addition["path"]
+            surface = addition["surface"]
+            if (
+                (line is not None and (type(line) is not int or line <= 0))
+                or type(occurrence_count) is not int
+                or occurrence_count <= 0
+                or not isinstance(path, str)
+                or not path
+                or "\x00" in path
+                or not isinstance(surface, str)
+                or surface not in {"binary", "blob", "path", "symlink-target"}
+            ):
+                raise ReviewError(f"{label} addition is inconsistent")
+        seen_digests.add(digest)
+
+    status = value["status"]
+    failure_class = value.get("failure_class")
+    if status == "inconclusive":
+        valid_state = (
+            set(value) == required_fields | {"failure_class"}
+            and value["location_status"] == "inconclusive"
+            and violations == []
+            and isinstance(failure_class, str)
+            and re.fullmatch(r"[a-z][a-z0-9-]{0,63}", failure_class) is not None
+        )
+    elif status == "clean":
+        valid_state = (
+            set(value) == required_fields
+            and value["location_status"] == "complete"
+            and violations == []
+        )
+    else:
+        valid_state = set(value) == required_fields and len(violations) > 0
+    if not valid_state:
+        raise ReviewError(f"{label} state is invalid")
+    return dict(value)
+
+
 def _load_legacy_manifest(
     *,
     control_dir: pathlib.Path,
@@ -5835,43 +5959,7 @@ def _load_legacy_manifest(
         raise ReviewError(
             "synthetic secret manifest version or review range is invalid"
         )
-    secret_delta = manifest["secret_delta"]
-    secret_delta_fields = {"limitations", "location_status", "status", "violations"}
-    if (
-        not isinstance(secret_delta, dict)
-        or not secret_delta_fields.issubset(secret_delta)
-        or not set(secret_delta).issubset(secret_delta_fields | {"failure_class"})
-        or secret_delta.get("location_status") not in {"complete", "inconclusive"}
-        or secret_delta.get("status") not in {"clean", "violations", "inconclusive"}
-        or not isinstance(secret_delta.get("limitations"), list)
-        or not all(
-            isinstance(item, str) for item in secret_delta.get("limitations", [])
-        )
-        or not isinstance(secret_delta.get("violations"), list)
-        or len(secret_delta.get("violations", [])) > MAX_SECRET_REDUCTION_CANDIDATES
-    ):
-        raise ReviewError("secret-delta evidence is invalid")
-    status = secret_delta["status"]
-    violations = secret_delta["violations"]
-    failure_class = secret_delta.get("failure_class")
-    if status == "inconclusive":
-        valid_state = (
-            set(secret_delta) == secret_delta_fields | {"failure_class"}
-            and secret_delta["location_status"] == "inconclusive"
-            and violations == []
-            and isinstance(failure_class, str)
-            and re.fullmatch(r"[a-z][a-z0-9-]{0,63}", failure_class) is not None
-        )
-    elif status == "clean":
-        valid_state = (
-            set(secret_delta) == secret_delta_fields
-            and secret_delta["location_status"] == "complete"
-            and violations == []
-        )
-    else:
-        valid_state = set(secret_delta) == secret_delta_fields and len(violations) > 0
-    if not valid_state:
-        raise ReviewError("secret-delta state is invalid")
+    secret_delta = validate_secret_delta_summary(manifest["secret_delta"])
     selected_ids = manifest["selected_exemptions"]
     if not isinstance(selected_ids, list) or not all(
         isinstance(item, str) for item in selected_ids

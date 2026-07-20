@@ -710,6 +710,62 @@ class RepositoryContractTest(unittest.TestCase):
             "do not end the task merely because one wait window expires", skill
         )
 
+    def test_stateful_secret_admission_is_a_separate_current_head_gate(self) -> None:
+        policy = {
+            "AGENTS.md": (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8"),
+            "SKILL.md": (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8"),
+            "helper-contract.md": (
+                SKILL_ROOT / "references/helper-contract.md"
+            ).read_text(encoding="utf-8"),
+            "pr-readiness.md": (SKILL_ROOT / "references/pr-readiness.md").read_text(
+                encoding="utf-8"
+            ),
+            "project journal": (
+                REPO_ROOT
+                / "docs/project_journal/2026/07/"
+                / "2026-07-17-secret-reduction-gate-7f1703.md"
+            ).read_text(encoding="utf-8"),
+        }
+        for name, text in policy.items():
+            with self.subTest(policy=name):
+                self.assertIn("stateful final", text)
+                self.assertIn("stateful admission", text)
+                self.assertLess(
+                    text.index("stateful final"),
+                    text.index("stateful admission"),
+                )
+                self.assertIn("exit `0`", text)
+                self.assertIn("exit `1`", text)
+                self.assertIn("exit `3`", text)
+                self.assertIn("exit `75`", text)
+                self.assertRegex(
+                    text.lower(), r"foreground .{0,40}(?:not|never) .{0,40}admission"
+                )
+                self.assertRegex(
+                    text.lower(),
+                    r"head change(?:s)?[, ]+.{0,100}(?:invalidates both|both .{0,60}(?:stale|invalid))",
+                )
+
+        skill = policy["SKILL.md"]
+        helper_contract = policy["helper-contract.md"]
+        readiness = policy["pr-readiness.md"]
+        journal = policy["project journal"]
+        self.assertIn("Only admission exit `0`", skill)
+        self.assertIn(
+            "the only status that permits PR/master/merge-ready", helper_contract
+        )
+        self.assertIn("the only result that permits PR/master/merge-ready", readiness)
+        self.assertIn("is the only permitting result", journal)
+        self.assertIn("two terminal checks are independent", skill)
+        self.assertIn("final may succeed when admission", helper_contract)
+        self.assertIn("`stateful final` remains independent", readiness)
+        self.assertIn("reviewer final is independent", journal)
+        for text in (skill, helper_contract, readiness, journal):
+            self.assertRegex(text.lower(), r"reviewer launch")
+            self.assertRegex(
+                text.lower(), r"(never|does not|does not) .{0,80}(gate|suppress|delay)"
+            )
+
     def test_frozen_diff_contract_keeps_submodules_metadata_only(self) -> None:
         helper_contract = (SKILL_ROOT / "references/helper-contract.md").read_text(
             encoding="utf-8"

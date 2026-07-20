@@ -33,6 +33,7 @@ isolated_review stateful start \
 isolated_review stateful status --state-dir <state_dir>
 isolated_review stateful wait --state-dir <state_dir>
 isolated_review stateful final --state-dir <state_dir>
+isolated_review stateful admission --state-dir <state_dir>
 isolated_review stateful cleanup --state-dir <state_dir>
 ```
 
@@ -49,6 +50,8 @@ isolated_review synthetic-tokens audit-master --repo <path> --ref <sha> --exempt
 Review commands retain repeatable `--synthetic-secret-exemption <id>` only as deprecated compatibility syntax. Known IDs may still be validated, but selection must not change the scanner, counter, path rules, or admission outcome. Read [synthetic-token-fixtures.md](synthetic-token-fixtures.md) before changing the catalog or removing this compatibility surface.
 
 Always pass `--state-dir`; it is not positional. `stateful wait --timeout-seconds` accepts only a non-negative finite value, bounds the caller's wait, and does not kill or downgrade a healthy reviewer. `stateful cleanup` explicitly removes a workspace retained by `--keep-workspace` or for a clean-context fallback while preserving state artifacts.
+
+For PR/master admission or a `merge-ready` decision, first collect the reviewer artifact with `stateful final --state-dir <state_dir>`, then run `stateful admission --state-dir <state_dir>` against that exact state and current head. `stateful final` and admission are independent: final may succeed when admission later reports violations or an inconclusive bounded audit. Admission exit `0` means `clean` and is the only status that permits PR/master/merge-ready; exit `1` means violations, exit `3` means pending, and exit `75` means inconclusive. Foreground mode produces no admission evidence. A head change invalidates both the final artifact and admission result and requires a new current-head state. Secret admission never delays, suppresses, redacts, or gates reviewer launch; the reviewer continues to receive the original consented tracked scope.
 
 The parent acquires an exclusive runner lock at the first preparation cleanup handoff, before any helper-private secret bytes are written, and passes that same file descriptor to the child for the child's full lifetime. Cross-process `status` / `wait` trusts that lock, not PID existence, so a reused PID cannot masquerade as the review runner or race cleanup during preparation.
 
@@ -161,12 +164,23 @@ directories as completed cleanup.
 
 ## Terminal States
 
+### Reviewer Final
+
 - exit `0`: a non-empty terminal final artifact exists
 - exit `75`: transient/capacity failure; retry only the same runtime/model if the parent policy permits
 - other nonzero: blocked or failed; inspect `stateful status`, `attempts.json`, and bounded logs
 - `stateful final` prints only the saved terminal artifact on success
 - exit `127` with `fallback_workspace_retained: true` means preflight succeeded but the Codex executable was deterministically unavailable; use only that retained scope for the clean-context fallback, then run `stateful cleanup`
 - workspace cleanup failure is terminal nonzero even when the reviewer produced a clean artifact; the error and retained state directory remain visible for recovery
+
+### Secret Admission
+
+- Run `stateful admission --state-dir <state_dir>` only as the second current-head check after harvesting the reviewer artifact with `stateful final`.
+- exit `0`: the bounded public `secret_delta` summary is valid and `clean`; this is the only PR/master/merge-ready admission success.
+- exit `1`: the valid bounded summary reports one or more violations.
+- exit `3`: the state is still pending and has no terminal admission evidence yet.
+- exit `75`: the valid bounded summary reports an inconclusive audit, or safe bounded admission evidence cannot be established.
+- A successful reviewer final remains valid review evidence when admission exits `1` or `75`; neither result may be reclassified as reviewer failure. Foreground output is not admission evidence, and any head change invalidates both checks.
 
 Each attempt records runtime, requested/effective model, requested/effective effort when observable, category, exit status, and log paths. Claude entitlement evidence comes only from a launched final-review invocation with strict structured-error and requested/effective-model verification. For Codex, the helper resolves the emitted thread ID to its persisted rollout and requires matching `turn_context` model and effort before accepting the final artifact. Missing verification on a successful result is `runtime-unverified`; any observed model, effort, or permission mismatch overrides even an otherwise entitlement-shaped failed attempt and stops the lane. None of those conditions is entitlement evidence, so none enters the fallback path.
 

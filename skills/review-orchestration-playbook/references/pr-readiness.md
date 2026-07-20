@@ -17,11 +17,11 @@ Use this reference after the local delivery gate has produced a reviewable commi
 
 ### Active Review Sequence
 
-3. Run one fresh local Codex CLI review for that exact frozen range through the stateful pinned helper. This is the single independent local Codex lane. Helper retries and the clean-context fallback are implementations of the same lane, not extra gates. A tracked secret violation or inconclusive secret count does not suppress this trusted reviewer; only the existing scope, containment, artifact-integrity, runtime, or sandbox checks may stop launch.
+3. Run one fresh local Codex CLI review for that exact frozen range through the stateful pinned helper and harvest its reviewer artifact with `stateful final --state-dir <state_dir>`. This is the single independent local Codex lane. Helper retries and the clean-context fallback are implementations of the same lane, not extra gates. A tracked secret violation or inconclusive secret count does not suppress this trusted reviewer; only the existing scope, containment, artifact-integrity, runtime, or sandbox checks may stop launch. Foreground review is not secret-admission evidence.
 4. Add only the reviewer families requested by the review shape: single stops after local Codex; double adds one Claude-family lane; triple adds the Claude-family lane plus current-head GitHub Codex when supported.
-5. Process actionable findings, unresolved conversations, and required CI. After a fix changes the head, freeze the new range, rerun affected tests, and rerun each invalidated requested logical lane.
-6. Evaluate exact-secret PR/master admission separately. Count each exact raw value globally across tracked path bytes (including gitlink paths without submodule content), regular blobs, and symlink targets. Require `head_count <= base_count`; do not derive Base64 or other encodings. A genuine count failure is `inconclusive`. For positive-delta candidates, text additions use raw path plus one-based head line, new-path and binary fallbacks use `line: null`, symlink targets use line `1`, and incomplete mapping sets `location_status=inconclusive`.
-7. Recheck the current PR head/base, every requested logical lane, required checks, required conversations, and the separate secret-admission result before reporting `merge-ready`.
+5. Process actionable findings, unresolved conversations, and required CI. After a fix changes the head, freeze the new range, rerun affected tests, and rerun each invalidated requested logical lane. The head change invalidates both the prior `stateful final` artifact and its admission result.
+6. Evaluate exact-secret PR/master admission separately by running `stateful admission --state-dir <state_dir>` on the same current-head state used by `stateful final`. Count each exact raw value globally across tracked path bytes (including gitlink paths without submodule content), regular blobs, and symlink targets. Require `head_count <= base_count`; do not derive Base64 or other encodings. Admission exit `0` means `clean` and is the only result that permits PR/master/merge-ready; exit `1` means violations, exit `3` means pending, and exit `75` means inconclusive. A genuine count failure is `inconclusive`. For positive-delta candidates, text additions use raw path plus one-based head line, new-path and binary fallbacks use `line: null`, symlink targets use line `1`, and incomplete mapping sets `location_status=inconclusive`. `stateful final` remains independent and may succeed when admission is blocked or inconclusive.
+7. Recheck the current PR head/base, every requested logical lane, required checks, required conversations, and a same-state current-head admission exit `0` before reporting `merge-ready`.
 
 There are no separate active `offline-frozen-diff-review` or `independent-codex-pr-review` evidence gates.
 
@@ -79,6 +79,7 @@ Report:
 - GitHub Codex trigger/head/status when requested, already present, or required
 - required CI and conversation-resolution status
 - branch/base state
+- stateful admission status and exit code for the same current-head state
 - `merge-ready`, `blocked`, or `inconclusive`
 
 Stop before merge unless Joey explicitly asks to merge.

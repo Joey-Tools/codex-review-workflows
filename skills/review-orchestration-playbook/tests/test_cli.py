@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import json
 import os
 import pathlib
 import signal
@@ -52,6 +53,68 @@ def private_cleanup_evidence(container: pathlib.Path) -> PrivateCleanupEvidence:
 
 
 class ForegroundCleanupTest(unittest.TestCase):
+    def test_stateful_admission_always_prints_json_and_returns_embedded_code(
+        self,
+    ) -> None:
+        state_dir = pathlib.Path("/tmp/isolated-review-state")
+        summary = {
+            "schema_version": 1,
+            "status": "inconclusive",
+            "exit_code": 75,
+            "review_range": f"{'a' * 40}..{'b' * 40}",
+            "evidence_path": str(state_dir / "preflight.json"),
+            "failure_class": "secret-count-incomplete",
+            "secret_delta": None,
+        }
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(cli, "admission", return_value=(75, summary)),
+            contextlib.redirect_stdout(stdout),
+        ):
+            returncode = cli.main(
+                ["stateful", "admission", "--state-dir", str(state_dir)]
+            )
+
+        self.assertEqual(returncode, 75)
+        self.assertEqual(json.loads(stdout.getvalue()), summary)
+
+    def test_stateful_status_stays_success_when_admission_is_blocked(self) -> None:
+        state_dir = pathlib.Path("/tmp/isolated-review-state")
+        summary = {"admission": {"status": "blocked", "exit_code": 1}}
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(cli, "status", return_value=summary),
+            contextlib.redirect_stdout(stdout),
+        ):
+            returncode = cli.main(["stateful", "status", "--state-dir", str(state_dir)])
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), summary)
+
+    def test_internal_runner_forwards_inherited_lock_fd(self) -> None:
+        state_dir = pathlib.Path("/tmp/isolated-review-state")
+        with (
+            mock.patch.object(cli, "run_state", return_value=17) as run_state,
+            mock.patch.object(cli.os, "_exit", side_effect=SystemExit(17)),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            cli.main(
+                [
+                    "_run-state",
+                    "--state-dir",
+                    str(state_dir),
+                    "--lock-fd",
+                    "41",
+                ]
+            )
+
+        self.assertEqual(raised.exception.code, 17)
+        run_state.assert_called_once_with(
+            state_dir=state_dir,
+            lock_fd=41,
+            terminal_process=True,
+        )
+
     def test_stateful_cleanup_dispatches_bounded_cleanup(self) -> None:
         state_dir = pathlib.Path("/tmp/isolated-review-state")
         with mock.patch.object(cli, "cleanup_state", return_value=0) as cleanup:

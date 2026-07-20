@@ -8032,7 +8032,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         head = self.commit(repo)
         prompt = self.root / "prompt-selected-legacy.txt"
         prompt.write_text(
-            f'Review {{review_range}}\naccess_token = "{LEGACY_A}"\n',
+            "Review {review_range}\n" + assignment_text("access_token", LEGACY_A),
             encoding="utf-8",
         )
         review = self.prepare(

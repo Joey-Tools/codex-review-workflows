@@ -17,6 +17,7 @@ superseded_by:
 - Codex, Claude Code, and the consent-gated Copilot fallback are trusted processors for the frozen tracked review scope.
 - Tracked secret deltas do not block reviewer launch or trigger reviewer-input rewriting.
 - PR/master admission allows every existing exact raw secret whose global tracked count does not grow and blocks only first appearance or growth.
+- Stateful review evidence and secret admission are separate current-head checks: harvest `stateful final` first, then run `stateful admission` on the same state.
 - The frozen reviewer launch boundary uses safe modes, prepared runner-lock identity checks, and descriptor-bound workspace, prompt, sandbox, attempt-output, and verdict/control I/O.
 
 ## Decision
@@ -83,6 +84,10 @@ The fresh local Codex CLI review is the independent local lane:
 
 PR readiness reuses that Codex artifact. It does not add separate `offline-frozen-diff-review` or `independent-codex-pr-review` gates. Retries, helper implementations, and the clean-context fallback remain one logical Codex lane.
 
+### Stateful Admission Evidence
+
+PR/master/merge-ready evaluation first harvests the terminal reviewer artifact with `stateful final --state-dir <state_dir>`, then evaluates the bounded public secret summary with `stateful admission --state-dir <state_dir>` on that same current-head state. Admission exit `0` means `clean` and is the only permitting result; exit `1` means violations, exit `3` means pending, and exit `75` means inconclusive. The reviewer final is independent and may remain successful when admission blocks or is inconclusive. Foreground review never supplies admission evidence. A head change invalidates both checks and requires a new frozen current-head state. None of these admission outcomes may delay, suppress, or redact the trusted reviewer launch.
+
 ### Workspace Scope
 
 Targeted launch-boundary hardening is part of this delivery: frozen workspace and control artifacts use safe owner-only modes, cleanup is bound to the prepared runner-lock identity, and reviewer workspace, prompt, sandbox mount, attempt output, and verdict/control I/O remain attached to validated descriptors. This does not adopt a detached-worktree or reflinked-snapshot architecture; that broader redesign remains deferred.
@@ -91,7 +96,7 @@ Targeted launch-boundary hardening is part of this delivery: frozen workspace an
 
 This note supersedes its earlier strict-reduction design, which required raw-count decrease, unembedded non-growth, same-location provenance, encoded-variant denial, and two extra Codex PR-readiness gates. Those requirements are no longer the target contract.
 
-Implementation and final-head local validation now match this decision. This tracked implementation workstream is `completed`; the final fixed-range Codex review, PR merge, private-overlay release, installation sync, and remote-task notification remain delivery operations tracked by the active PR/task rather than transient project state. Historical test counts and prior fixed-range review claims in earlier revisions of this note are not validation evidence for the new semantics.
+Implementation and current focused validation now match this decision, including the explicit stateful final-then-admission split. This tracked implementation workstream is `completed`; the final fixed-range Codex review, PR merge, private-overlay release, installation sync, and remote-task notification remain delivery operations tracked by the active PR/task rather than transient project state. Historical test counts and prior fixed-range review claims in earlier revisions of this note are not validation evidence for the new semantics.
 
 ## Validation Criteria
 
@@ -106,6 +111,8 @@ Implementation and final-head local validation now match this decision. This tra
 - Violation diagnostics include only newly added `path:line` locations.
 - Single/double/triple review counting remains Codex / Codex+Claude / Codex+Claude+GitHub Codex.
 - PR readiness has no additional offline/independent Codex double gate.
+- PR/master/merge-ready requires `stateful final` followed by same-state, current-head `stateful admission`; only admission exit `0` is permitting.
+- Admission exits `1`, `3`, and `75` remain distinct violations, pending, and inconclusive outcomes; reviewer final success is independent, foreground output is insufficient, and a head change invalidates both checks.
 - Frozen workspace/control creation and runner-lock cleanup fail closed under permissive umasks, symlinks/FIFOs, path swaps, and identity/mode/link-count/owner mismatches.
 - Reviewer cwd, frozen prompt, Linux sandbox workspace mount, attempt output, and terminal verdict/control artifacts remain bound to the prepared container across pathname swaps; descriptor handoff and close failures surface before a result is accepted.
 - Skill and journal validation pass.
@@ -122,6 +129,7 @@ Implementation and final-head local validation now match this decision. This tra
 - [x] Finish the exact raw counter, added-line evidence, and reviewer-egress separation.
 - [x] Harden frozen review launch modes, runner-lock cleanup identity, and descriptor-bound workspace, sandbox, prompt, attempt, and verdict I/O.
 - [x] Update focused scanner, workspace, provider, state, CLI, descriptor-launch, and contract tests.
+- [x] Separate current-head reviewer final evidence from the explicit stateful secret-admission decision and document its exit-code contract.
 - [x] Run Python 3.13 validation, contract checks, skill validation, and journal validation.
 - [ ] Run one fresh local Codex review over the final signed fixed range and resolve actionable findings.
 - [ ] Push the branch, update PR #60, and wait for current-head CI and review completion.
@@ -142,11 +150,11 @@ The remaining unchecked items are post-commit delivery operations. They are inte
 - `skills/review-orchestration-playbook/references/pr-readiness.md`
 - `skills/review-orchestration-playbook/references/review-lane-contracts.md`
 - `skills/review-orchestration-playbook/references/synthetic-token-fixtures.md`
-- Python 3.13.0: `1285 tests`, `OK (skipped=4)`, 252.878 seconds.
+- Python 3.13.0 pre-admission anchor: `1285 tests`, `OK (skipped=4)`, 252.878 seconds.
+- Post-admission focused suites: state plus CLI `153 tests`; workspace `135 tests`; synthetic-token `165 tests`; contracts `42 tests`; all passed.
 - Focused runtime suites: `test_common.py` 38 tests; `test_claude_linux.py` 153 tests with 3 skipped; `test_providers.py` 479 tests with 3 skipped; all passed.
-- Focused contract suite: `41 tests`, `OK`.
-- Focused CLI suite: `8 tests`, `OK`.
 - Descriptor-bound runtime patch review: two actionable findings were fixed; follow-up result `No findings.`.
+- Admission/final follow-up review: one malformed-JSON fail-closed finding was fixed; follow-up result `No findings.`.
 - Ruff checks, changed-file format checks, and `git diff --check`: passed.
 - Official skill validator: `Skill is valid!`.
 - Project journal validator: `Project journal validation passed.`.

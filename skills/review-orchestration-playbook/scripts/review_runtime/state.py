@@ -47,6 +47,7 @@ from .workspace import (
     _inspect_control_directory,
     _load_control_artifact_state,
     _read_bounded_json,
+    _read_bounded_json_at,
     cleanup_legacy_workspace,
     cleanup_workspace,
     load_bound_private_cleanup_state,
@@ -59,6 +60,7 @@ from .workspace import (
     remove_private_review_artifacts,
     remove_ready_review_container,
     open_bound_review_lock,
+    validate_secret_delta_summary,
     validate_workspace_layout,
     write_bound_review_json,
     write_bound_review_text,
@@ -74,6 +76,12 @@ COMPATIBLE_STATE_MARKER_SCHEMA_VERSION = 2
 PREVIOUS_STATE_MARKER_SCHEMA_VERSION = 3
 STATE_MARKER_SCHEMA_VERSION = 4
 MAX_STATE_MARKER_BYTES = 64 * 1024
+MAX_FINAL_ARTIFACT_BYTES = 64 * 1024 * 1024
+ADMISSION_SCHEMA_VERSION = 1
+PREFLIGHT_FILE = "preflight.json"
+PREFLIGHT_STATUS = "review workspace containment and integrity checks passed"
+PREFLIGHT_PRIVATE_ARTIFACTS = "removed"
+PREFLIGHT_SCOPE = "frozen tracked workspace, diff, and review prompt"
 LEGACY_STATE_REQUIRED_FIELDS = frozenset(
     {
         "attempts_path",
@@ -940,6 +948,171 @@ def _load_state_marker(state_dir: pathlib.Path) -> LoadedStateMarker:
     )
 
 
+def _require_modern_ready_marker(
+    marker: LoadedStateMarker,
+    *,
+    purpose: str,
+) -> PrivateCleanupEvidence:
+    if (
+        marker.version != STATE_MARKER_SCHEMA_VERSION
+        or marker.phase != "ready"
+        or marker.private_cleanup is None
+    ):
+        raise ReviewError(
+            f"{purpose} requires a modern v{STATE_MARKER_SCHEMA_VERSION} ready "
+            "state marker"
+        )
+    return marker.private_cleanup
+
+
+def _validate_bound_state_artifact_metadata(
+    metadata: os.stat_result,
+    *,
+    label: str,
+    max_bytes: int,
+) -> None:
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ReviewError(f"{label} must be a regular file")
+    if metadata.st_uid != os.geteuid():
+        raise ReviewError(f"{label} must be owned by the current user")
+    if metadata.st_nlink != 1:
+        raise ReviewError(f"{label} must have exactly one hard link")
+    if stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise ReviewError(f"{label} mode must be exactly 0600")
+    if metadata.st_size > max_bytes:
+        raise ReviewError(f"{label} exceeds the {max_bytes}-byte size limit")
+
+
+def _read_modern_bound_state_artifact(
+    state_dir: pathlib.Path,
+    *,
+    name: str,
+    max_bytes: int,
+) -> bytes | None:
+    """Read a v4 state artifact without following a mutable path component."""
+
+    if (
+        not name
+        or pathlib.PurePath(name).name != name
+        or name in {".", ".."}
+        or max_bytes < 0
+    ):
+        raise ReviewError("bound review state artifact request is invalid")
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    nonblock = getattr(os, "O_NONBLOCK", None)
+    if nofollow is None or nonblock is None:
+        raise ReviewError("secure bound review state artifact loading is unavailable")
+
+    resolved_state_dir = state_dir.expanduser().resolve(strict=False)
+    marker = _load_state_marker(resolved_state_dir)
+    expected = _require_modern_ready_marker(
+        marker,
+        purpose="bound review state artifact loading",
+    )
+    artifact_name = pathlib.Path(name)
+    flags = os.O_RDONLY | os.O_CLOEXEC | nofollow | nonblock
+    descriptor: int | None = None
+    label = f"review state artifact {name}"
+    try:
+        with _open_private_cleanup_state_directory(resolved_state_dir) as (
+            state_dir_fd,
+            revalidate_state_directory,
+        ):
+            initial_container_key = _directory_identity(os.fstat(state_dir_fd))
+
+            def revalidate_container() -> None:
+                revalidate_state_directory()
+                metadata = os.fstat(state_dir_fd)
+                if (
+                    CleanupIdentity(metadata.st_dev, metadata.st_ino)
+                    != expected.container
+                ):
+                    raise ReviewError(
+                        f"{label} container does not match preparation identity"
+                    )
+                if _directory_identity(metadata) != initial_container_key:
+                    raise ReviewError(f"{label} container changed while reading")
+
+            revalidate_container()
+            try:
+                before = os.stat(
+                    artifact_name,
+                    dir_fd=state_dir_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                revalidate_container()
+                return None
+            _validate_bound_state_artifact_metadata(
+                before,
+                label=label,
+                max_bytes=max_bytes,
+            )
+            initial_key = _state_marker_metadata_key(before)
+            revalidate_container()
+
+            descriptor = os.open(artifact_name, flags, dir_fd=state_dir_fd)
+            opened = os.fstat(descriptor)
+            current = os.stat(
+                artifact_name,
+                dir_fd=state_dir_fd,
+                follow_symlinks=False,
+            )
+            for metadata in (opened, current):
+                _validate_bound_state_artifact_metadata(
+                    metadata,
+                    label=label,
+                    max_bytes=max_bytes,
+                )
+            if any(
+                _state_marker_metadata_key(metadata) != initial_key
+                for metadata in (opened, current)
+            ):
+                raise ReviewError(f"{label} changed while opening")
+            revalidate_container()
+
+            chunks: list[bytes] = []
+            remaining = max_bytes + 1
+            while remaining:
+                chunk = os.read(descriptor, min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            payload = b"".join(chunks)
+            if len(payload) > max_bytes:
+                raise ReviewError(f"{label} exceeds the {max_bytes}-byte size limit")
+
+            final_metadata = os.fstat(descriptor)
+            path_final = os.stat(
+                artifact_name,
+                dir_fd=state_dir_fd,
+                follow_symlinks=False,
+            )
+            for metadata in (final_metadata, path_final):
+                _validate_bound_state_artifact_metadata(
+                    metadata,
+                    label=label,
+                    max_bytes=max_bytes,
+                )
+            if len(payload) != opened.st_size or any(
+                _state_marker_metadata_key(metadata) != initial_key
+                for metadata in (final_metadata, path_final)
+            ):
+                raise ReviewError(f"{label} changed while reading")
+            revalidate_container()
+            return payload
+    except ReviewError:
+        raise
+    except OSError as error:
+        raise ReviewError(
+            f"cannot read {label} {resolved_state_dir / name} safely: {error}"
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def _load_state_marker_cleanup(
     state_dir: pathlib.Path,
 ) -> PrivateCleanupEvidence:
@@ -1080,6 +1253,153 @@ def _require_bound_runner_lock(marker: LoadedStateMarker) -> CleanupIdentity:
             "manual recovery is required for legacy v1/v2/v3 review state"
         )
     return marker.runner_lock
+
+
+def _require_flock_probe_blocked(descriptor: int, *, label: str) -> None:
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return
+    except OSError as error:
+        raise ReviewError(f"cannot probe {label} lease: {error}") from error
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    except OSError as error:
+        raise ReviewError(
+            f"{label} was not inherited-held and its probe could not be released: "
+            f"{error}"
+        ) from error
+    raise ReviewError(f"{label} is not an inherited-held lease")
+
+
+def _prove_inherited_flock_lease(
+    inherited_descriptor: int,
+    independent_descriptor: int,
+    *,
+    label: str,
+    revalidate: Callable[[], None],
+) -> None:
+    revalidate()
+    _require_flock_probe_blocked(independent_descriptor, label=label)
+    revalidate()
+    try:
+        fcntl.flock(
+            inherited_descriptor,
+            fcntl.LOCK_EX | fcntl.LOCK_NB,
+        )
+    except BlockingIOError as error:
+        raise ReviewError(
+            f"{label} does not share the inherited-held lock description"
+        ) from error
+    except OSError as error:
+        raise ReviewError(
+            f"cannot validate inherited {label} lease: {error}"
+        ) from error
+    revalidate()
+    _require_flock_probe_blocked(independent_descriptor, label=label)
+    revalidate()
+
+
+def validate_inherited_runner_lock_lease(
+    state_dir: pathlib.Path,
+    lock_fd: int,
+) -> None:
+    if type(lock_fd) is not int or lock_fd < 0:
+        raise ReviewError("review runner lock descriptor is invalid")
+    try:
+        os.fstat(lock_fd)
+    except OSError as error:
+        raise ReviewError(
+            f"cannot validate inherited review runner lock descriptor: {error}"
+        ) from error
+    resolved_state_dir = state_dir.expanduser().resolve(strict=False)
+    marker = _load_state_marker(resolved_state_dir)
+    expected_cleanup = _require_modern_ready_marker(
+        marker,
+        purpose="review runner execution",
+    )
+    expected_lock = _require_bound_runner_lock(marker)
+    lock_name = pathlib.Path(LOCK_FILE)
+    flags = os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+    independent_fd: int | None = None
+    try:
+        with _open_private_cleanup_state_directory(resolved_state_dir) as (
+            state_dir_fd,
+            revalidate_state_directory,
+        ):
+
+            def validate_container() -> None:
+                revalidate_state_directory()
+                metadata = os.fstat(state_dir_fd)
+                if (
+                    CleanupIdentity(metadata.st_dev, metadata.st_ino)
+                    != expected_cleanup.container
+                ):
+                    raise ReviewError(
+                        "review runner lock container does not match preparation "
+                        "identity"
+                    )
+                revalidate_state_directory()
+
+            validate_container()
+            inherited_metadata = _validate_regular_file_path_identity(
+                lock_name,
+                lock_fd,
+                label="review runner lock",
+                expected_mode=0o600,
+                dir_fd=state_dir_fd,
+            )
+            if (
+                CleanupIdentity(
+                    inherited_metadata.st_dev,
+                    inherited_metadata.st_ino,
+                )
+                != expected_lock
+            ):
+                raise ReviewError(
+                    "review runner lock does not match preparation identity"
+                )
+            validate_container()
+            independent_fd = os.open(lock_name, flags, dir_fd=state_dir_fd)
+
+            def revalidate_lock() -> None:
+                validate_container()
+                for descriptor in (lock_fd, independent_fd):
+                    metadata = _validate_regular_file_path_identity(
+                        lock_name,
+                        descriptor,
+                        label="review runner lock",
+                        expected_mode=0o600,
+                        dir_fd=state_dir_fd,
+                    )
+                    if (
+                        CleanupIdentity(metadata.st_dev, metadata.st_ino)
+                        != expected_lock
+                    ):
+                        raise ReviewError(
+                            "review runner lock does not match preparation identity"
+                        )
+                validate_container()
+
+            _prove_inherited_flock_lease(
+                lock_fd,
+                independent_fd,
+                label="review runner lock",
+                revalidate=revalidate_lock,
+            )
+            os.set_inheritable(lock_fd, False)
+            if os.get_inheritable(lock_fd):
+                raise ReviewError("review runner lock descriptor remained inheritable")
+            revalidate_lock()
+    except ReviewError:
+        raise
+    except OSError as error:
+        raise ReviewError(
+            f"cannot validate inherited review runner lock safely: {error}"
+        ) from error
+    finally:
+        if independent_fd is not None:
+            os.close(independent_fd)
 
 
 def _probe_bound_runner_lock(
@@ -1390,6 +1710,7 @@ def start(
 def run_state(
     *,
     state_dir: pathlib.Path,
+    lock_fd: int | None = None,
     terminal_process: bool = False,
 ) -> int:
     exit_code = 1
@@ -1411,6 +1732,16 @@ def run_state(
             signal.signal(forwarded, record_signal)
 
     try:
+        if terminal_process:
+            if lock_fd is None:
+                raise ReviewError(
+                    "terminal review runner has no inherited preparation lock"
+                )
+            validate_inherited_runner_lock_lease(state_dir, lock_fd)
+        elif lock_fd is not None:
+            raise ReviewError(
+                "review runner lock descriptor is valid only for terminal execution"
+            )
         state, review = load_review_state(state_dir)
         state_loaded = True
         if isinstance(review, LegacyReviewWorkspace):
@@ -1548,6 +1879,12 @@ def status(state_dir: pathlib.Path) -> dict[str, Any]:
         review=review,
         exit_code=exit_code,
     )
+    admission_summary = _admission_status_for_loaded_state(
+        state_dir=state_dir,
+        review=review,
+        marker=marker,
+        running=running,
+    )
     attempts: list[Any] = []
     attempts_path = state_dir / "attempts.json"
     if attempts_path.is_file():
@@ -1581,7 +1918,198 @@ def status(state_dir: pathlib.Path) -> dict[str, Any]:
         "stderr_tail": tail_text(state_dir / "runner.stderr.log"),
         "runner_error": tail_text(state_dir / "runner-error.txt"),
         "cleanup_error": tail_text(state_dir / "cleanup-error.txt"),
+        "admission": admission_summary,
     }
+
+
+def _admission_result(
+    *,
+    state_dir: pathlib.Path,
+    review_range: str,
+    status: str,
+    exit_code: int,
+    failure_class: str | None,
+    secret_delta: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": ADMISSION_SCHEMA_VERSION,
+        "status": status,
+        "exit_code": exit_code,
+        "review_range": review_range,
+        "evidence_path": str(state_dir / PREFLIGHT_FILE),
+        "failure_class": failure_class,
+        "secret_delta": secret_delta,
+    }
+
+
+def _read_bound_preflight(
+    state_dir: pathlib.Path,
+    *,
+    marker: LoadedStateMarker,
+) -> tuple[dict[str, Any] | None, bool]:
+    expected = _require_modern_ready_marker(
+        marker,
+        purpose="secret admission",
+    )
+    try:
+        with _open_private_cleanup_state_directory(state_dir) as (
+            state_dir_fd,
+            revalidate_state_directory,
+        ):
+            revalidate_state_directory()
+            metadata = os.fstat(state_dir_fd)
+            if CleanupIdentity(metadata.st_dev, metadata.st_ino) != expected.container:
+                raise ReviewError(
+                    "secret admission container does not match preparation identity"
+                )
+            try:
+                os.stat(
+                    PREFLIGHT_FILE,
+                    dir_fd=state_dir_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                revalidate_state_directory()
+                return None, True
+            preflight = _read_bounded_json_at(
+                state_dir_fd,
+                PREFLIGHT_FILE,
+                label="secret admission preflight evidence",
+                max_bytes=MAX_PREFLIGHT_JSON_BYTES,
+            )
+            revalidate_state_directory()
+            metadata = os.fstat(state_dir_fd)
+            if CleanupIdentity(metadata.st_dev, metadata.st_ino) != expected.container:
+                raise ReviewError(
+                    "secret admission container changed while evidence was read"
+                )
+            return preflight, False
+    except ReviewError:
+        raise
+    except OSError as error:
+        raise ReviewError(
+            "secret admission evidence could not be read safely"
+        ) from error
+
+
+def _admission_status_for_loaded_state(
+    *,
+    state_dir: pathlib.Path,
+    review: ReviewWorkspace | LegacyReviewWorkspace,
+    marker: LoadedStateMarker,
+    running: bool,
+) -> dict[str, Any]:
+    review_range = f"{review.base_ref}..{review.head_ref}"
+    if isinstance(review, LegacyReviewWorkspace) or (
+        marker.version != STATE_MARKER_SCHEMA_VERSION or marker.phase != "ready"
+    ):
+        return _admission_result(
+            state_dir=state_dir,
+            review_range=review_range,
+            status="inconclusive",
+            exit_code=75,
+            failure_class="legacy-state-no-admission",
+            secret_delta=None,
+        )
+    try:
+        preflight, missing = _read_bound_preflight(state_dir, marker=marker)
+    except ReviewError:
+        return _admission_result(
+            state_dir=state_dir,
+            review_range=review_range,
+            status="inconclusive",
+            exit_code=75,
+            failure_class="preflight-invalid",
+            secret_delta=None,
+        )
+    if missing or preflight is None:
+        return _admission_result(
+            state_dir=state_dir,
+            review_range=review_range,
+            status="pending" if running else "inconclusive",
+            exit_code=3 if running else 75,
+            failure_class="preflight-not-ready" if running else "preflight-missing",
+            secret_delta=None,
+        )
+    if preflight.get("review_range") != review_range:
+        return _admission_result(
+            state_dir=state_dir,
+            review_range=review_range,
+            status="inconclusive",
+            exit_code=75,
+            failure_class="preflight-range-mismatch",
+            secret_delta=None,
+        )
+    if (
+        preflight.get("status") != PREFLIGHT_STATUS
+        or preflight.get("private_artifacts") != PREFLIGHT_PRIVATE_ARTIFACTS
+        or preflight.get("scope") != PREFLIGHT_SCOPE
+    ):
+        return _admission_result(
+            state_dir=state_dir,
+            review_range=review_range,
+            status="inconclusive",
+            exit_code=75,
+            failure_class="preflight-invalid",
+            secret_delta=None,
+        )
+    try:
+        secret_delta = validate_secret_delta_summary(
+            preflight.get("secret_delta"),
+            label="secret admission delta evidence",
+        )
+    except ReviewError:
+        return _admission_result(
+            state_dir=state_dir,
+            review_range=review_range,
+            status="inconclusive",
+            exit_code=75,
+            failure_class="preflight-invalid",
+            secret_delta=None,
+        )
+    delta_status = secret_delta["status"]
+    if delta_status == "clean":
+        status_value, exit_code, failure_class = "clean", 0, None
+    elif delta_status == "violations":
+        status_value, exit_code, failure_class = "blocked", 1, None
+    else:
+        status_value, exit_code, failure_class = (
+            "inconclusive",
+            75,
+            secret_delta["failure_class"],
+        )
+    return _admission_result(
+        state_dir=state_dir,
+        review_range=review_range,
+        status=status_value,
+        exit_code=exit_code,
+        failure_class=failure_class,
+        secret_delta=secret_delta,
+    )
+
+
+def admission_status(state_dir: pathlib.Path) -> dict[str, Any]:
+    state_dir = state_dir.expanduser().resolve()
+    _state, review = load_review_state(state_dir)
+    marker = _load_state_marker(state_dir)
+    running = False
+    if (
+        not isinstance(review, LegacyReviewWorkspace)
+        and marker.version == STATE_MARKER_SCHEMA_VERSION
+        and marker.phase == "ready"
+    ):
+        running = _runner_lock_held(state_dir, marker=marker)
+    return _admission_status_for_loaded_state(
+        state_dir=state_dir,
+        review=review,
+        marker=marker,
+        running=running,
+    )
+
+
+def admission(state_dir: pathlib.Path) -> tuple[int, dict[str, Any]]:
+    summary = admission_status(state_dir)
+    return int(summary["exit_code"]), summary
 
 
 def _should_retain_fallback_workspace(
@@ -1770,6 +2298,132 @@ def _open_cleanup_locks(
                 )
         finally:
             container_lock.close()
+
+
+def validate_cleanup_worker_lock_leases(
+    state_dir: pathlib.Path,
+    lock_fds: tuple[int, ...],
+) -> None:
+    if (
+        len(lock_fds) != 2
+        or any(type(descriptor) is not int or descriptor < 0 for descriptor in lock_fds)
+        or lock_fds[0] == lock_fds[1]
+    ):
+        raise ReviewError(
+            "cleanup worker requires two distinct role-ordered lock descriptors"
+        )
+    try:
+        for descriptor in lock_fds:
+            os.fstat(descriptor)
+    except OSError as error:
+        raise ReviewError(
+            f"cannot validate inherited cleanup worker lock descriptor: {error}"
+        ) from error
+
+    container_lock_fd, compatibility_lock_fd = lock_fds
+    resolved_state_dir = state_dir.expanduser().resolve(strict=False)
+    marker = _load_state_marker(resolved_state_dir)
+    expected = _require_modern_ready_marker(
+        marker,
+        purpose="automatic cleanup worker execution",
+    )
+    compatibility_name = pathlib.Path(CLEANUP_LOCK_FILE)
+    compatibility_flags = (
+        os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+    )
+    compatibility_probe_fd: int | None = None
+    try:
+        with _open_private_cleanup_state_directory(resolved_state_dir) as (
+            state_dir_fd,
+            revalidate_state_directory,
+        ):
+
+            def validate_container_lock() -> None:
+                revalidate_state_directory()
+                _validate_private_directory_path_identity(
+                    resolved_state_dir,
+                    container_lock_fd,
+                    label="cleanup worker container lock",
+                    expected_mode=0o700,
+                )
+                opened_metadata = os.fstat(state_dir_fd)
+                inherited_metadata = os.fstat(container_lock_fd)
+                if _directory_identity(opened_metadata) != _directory_identity(
+                    inherited_metadata
+                ):
+                    raise ReviewError(
+                        "cleanup worker container lock does not match its exact path"
+                    )
+                if (
+                    CleanupIdentity(
+                        inherited_metadata.st_dev,
+                        inherited_metadata.st_ino,
+                    )
+                    != expected.container
+                ):
+                    raise ReviewError(
+                        "cleanup worker container lock does not match preparation "
+                        "identity"
+                    )
+                revalidate_state_directory()
+
+            validate_container_lock()
+            _validate_regular_file_path_identity(
+                compatibility_name,
+                compatibility_lock_fd,
+                label="cleanup worker compatibility lock",
+                expected_mode=0o600,
+                dir_fd=state_dir_fd,
+            )
+            compatibility_probe_fd = os.open(
+                compatibility_name,
+                compatibility_flags,
+                dir_fd=state_dir_fd,
+            )
+
+            def revalidate_all() -> None:
+                validate_container_lock()
+                for descriptor in (
+                    compatibility_lock_fd,
+                    compatibility_probe_fd,
+                ):
+                    _validate_regular_file_path_identity(
+                        compatibility_name,
+                        descriptor,
+                        label="cleanup worker compatibility lock",
+                        expected_mode=0o600,
+                        dir_fd=state_dir_fd,
+                    )
+                revalidate_state_directory()
+
+            _prove_inherited_flock_lease(
+                container_lock_fd,
+                state_dir_fd,
+                label="cleanup worker container lock",
+                revalidate=revalidate_all,
+            )
+            _prove_inherited_flock_lease(
+                compatibility_lock_fd,
+                compatibility_probe_fd,
+                label="cleanup worker compatibility lock",
+                revalidate=revalidate_all,
+            )
+            for descriptor in lock_fds:
+                os.set_inheritable(descriptor, False)
+                if os.get_inheritable(descriptor):
+                    raise ReviewError(
+                        "cleanup worker lock descriptor remained inheritable"
+                    )
+            revalidate_all()
+    except ReviewError:
+        raise
+    except OSError as error:
+        raise ReviewError(
+            f"cannot validate inherited cleanup worker locks safely: {error}"
+        ) from error
+    finally:
+        if compatibility_probe_fd is not None:
+            os.close(compatibility_probe_fd)
 
 
 def _cleanup_terminal_workspace(
@@ -2064,9 +2718,17 @@ def final(state_dir: pathlib.Path) -> tuple[int, str]:
         return 1, f"review completed but workspace cleanup failed: {cleanup_error}"
     summary = status(state_dir)
     exit_code = summary["exit_code"]
-    final_path = state_dir.expanduser().resolve() / "final.txt"
-    if exit_code == 0 and final_path.is_file():
-        text = final_path.read_text(encoding="utf-8", errors="replace").strip()
+    if exit_code == 0:
+        payload = _read_modern_bound_state_artifact(
+            state_dir,
+            name="final.txt",
+            max_bytes=MAX_FINAL_ARTIFACT_BYTES,
+        )
+        text = (
+            payload.decode("utf-8", errors="replace").strip()
+            if payload is not None
+            else ""
+        )
         if text:
             return 0, text
     details = (

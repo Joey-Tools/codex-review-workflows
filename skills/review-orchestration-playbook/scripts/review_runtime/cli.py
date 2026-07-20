@@ -18,7 +18,7 @@ from .common import (
 from .providers import CLAUDE_EGRESS_CONSENTS, run_review
 from .state import FINAL_CLEANUP_TIMEOUT_SECONDS, ReviewPreparationGuard
 from .state import cleanup as cleanup_state
-from .state import final, run_state, start, status, wait
+from .state import admission, final, run_state, start, status, wait
 from .synthetic_tokens import (
     authoring_metadata,
     legacy_metadata,
@@ -97,7 +97,7 @@ def _build_stateful_parser() -> argparse.ArgumentParser:
     actions = parser.add_subparsers(dest="action", required=True)
     start_parser = actions.add_parser("start")
     _add_review_arguments(start_parser)
-    for action in ("status", "final", "cleanup"):
+    for action in ("status", "final", "cleanup", "admission"):
         action_parser = actions.add_parser(action)
         action_parser.add_argument("--state-dir", required=True)
     wait_parser = actions.add_parser("wait")
@@ -316,6 +316,10 @@ def _run_stateful(argv: list[str], *, script_path: pathlib.Path) -> int:
     if args.action == "status":
         print(json.dumps(status(state_dir), indent=2, sort_keys=True))
         return 0
+    if args.action == "admission":
+        exit_code, summary = admission(state_dir)
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        return exit_code
     if args.action == "wait":
         return wait(state_dir, timeout_seconds=args.timeout_seconds)
     if args.action == "final":
@@ -342,6 +346,7 @@ def main(argv: list[str] | None = None) -> int:
             parsed = internal.parse_args(arguments)
             exit_code = run_state(
                 state_dir=pathlib.Path(parsed.state_dir),
+                lock_fd=parsed.lock_fd,
                 terminal_process=True,
             )
             os._exit(exit_code)

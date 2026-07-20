@@ -634,6 +634,178 @@ class WorkspaceTest(unittest.TestCase):
         ):
             workspace_runtime._read_bounded_json(path, label="nested evidence")
 
+    def test_descriptor_relative_json_reader_honors_caller_bound(self) -> None:
+        directory = pathlib.Path(self.temporary.name) / "descriptor-json"
+        directory.mkdir()
+        path = directory / "evidence.json"
+        value = {"padding": "x" * workspace_runtime.MAX_SYNTHETIC_EVIDENCE_BYTES}
+        encoded = json.dumps(value).encode("utf-8")
+        path.write_bytes(encoded)
+        descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            with self.assertRaisesRegex(ReviewError, "exceeds its review size limit"):
+                workspace_runtime._read_bounded_json_at(
+                    descriptor,
+                    path.name,
+                    label="descriptor evidence",
+                )
+            self.assertEqual(
+                workspace_runtime._read_bounded_json_at(
+                    descriptor,
+                    path.name,
+                    label="descriptor evidence",
+                    max_bytes=len(encoded),
+                ),
+                value,
+            )
+        finally:
+            os.close(descriptor)
+
+    def test_descriptor_relative_json_reader_keeps_strict_json_checks(self) -> None:
+        directory = pathlib.Path(self.temporary.name) / "strict-descriptor-json"
+        directory.mkdir()
+        path = directory / "evidence.json"
+        descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            path.write_text('{"outer":{"key":1,"key":2}}', encoding="utf-8")
+            with self.assertRaisesRegex(ReviewError, "duplicate key"):
+                workspace_runtime._read_bounded_json_at(
+                    descriptor,
+                    path.name,
+                    label="descriptor evidence",
+                )
+
+            nested: object = None
+            for _ in range(workspace_runtime.MAX_BOUNDED_JSON_DEPTH + 1):
+                nested = [nested]
+            path.write_text(json.dumps({"padding": nested}), encoding="utf-8")
+            with self.assertRaisesRegex(ReviewError, "nesting depth limit"):
+                workspace_runtime._read_bounded_json_at(
+                    descriptor,
+                    path.name,
+                    label="descriptor evidence",
+                )
+        finally:
+            os.close(descriptor)
+
+    def test_secret_delta_summary_accepts_only_valid_status_combinations(
+        self,
+    ) -> None:
+        violation = {
+            "additions": [
+                {
+                    "line": 3,
+                    "occurrence_count": 1,
+                    "path": "example.txt",
+                    "surface": "blob",
+                }
+            ],
+            "base_count": 1,
+            "delta": 1,
+            "head_count": 2,
+            "omitted_addition_location_count": 0,
+            "rules": ["generic-secret-assignment"],
+            "value_length": 16,
+            "value_sha256": "a" * 64,
+        }
+        valid = (
+            {
+                "limitations": [],
+                "location_status": "complete",
+                "status": "clean",
+                "violations": [],
+            },
+            {
+                "limitations": [],
+                "location_status": "complete",
+                "status": "violations",
+                "violations": [violation],
+            },
+            {
+                "limitations": [],
+                "location_status": "inconclusive",
+                "status": "violations",
+                "violations": [violation],
+            },
+            {
+                "failure_class": "secret-count-incomplete",
+                "limitations": [],
+                "location_status": "inconclusive",
+                "status": "inconclusive",
+                "violations": [],
+            },
+        )
+        for summary in valid:
+            with self.subTest(summary=summary["status"]):
+                self.assertEqual(
+                    workspace_runtime.validate_secret_delta_summary(summary),
+                    summary,
+                )
+
+        invalid = (
+            {**valid[0], "location_status": "inconclusive"},
+            {**valid[0], "failure_class": "unexpected"},
+            {**valid[1], "violations": []},
+            {**valid[1], "failure_class": "unexpected"},
+            {**valid[3], "location_status": "complete"},
+            {**valid[3], "failure_class": "INVALID"},
+            {**valid[3], "violations": [violation]},
+        )
+        for summary in invalid:
+            with self.subTest(summary=summary):
+                with self.assertRaisesRegex(ReviewError, "state is invalid"):
+                    workspace_runtime.validate_secret_delta_summary(summary)
+
+    def test_secret_delta_summary_bounds_violation_structure(self) -> None:
+        def violation(digest: str, additions: list[dict[str, object]]):
+            return {
+                "additions": additions,
+                "base_count": 0,
+                "delta": 1,
+                "head_count": 1,
+                "omitted_addition_location_count": 0,
+                "rules": ["generic-secret-assignment"],
+                "value_length": 16,
+                "value_sha256": digest,
+            }
+
+        addition = {
+            "line": None,
+            "occurrence_count": 1,
+            "path": "example.bin",
+            "surface": "binary",
+        }
+        too_many = workspace_runtime.MAX_SECRET_DELTA_ADDITION_LOCATIONS
+        summary = {
+            "limitations": [],
+            "location_status": "inconclusive",
+            "status": "violations",
+            "violations": [
+                violation("a" * 64, [dict(addition) for _ in range(too_many)]),
+                violation("b" * 64, [dict(addition)]),
+            ],
+        }
+        with self.assertRaisesRegex(ReviewError, "too many addition locations"):
+            workspace_runtime.validate_secret_delta_summary(summary)
+
+        malformed = dict(violation("c" * 64, [dict(addition)]))
+        malformed["delta"] = 2
+        summary["violations"] = [malformed]
+        with self.assertRaisesRegex(ReviewError, "violation is inconsistent"):
+            workspace_runtime.validate_secret_delta_summary(summary)
+
+        unhashable_rules = dict(violation("d" * 64, [dict(addition)]))
+        unhashable_rules["rules"] = [{}, "generic-secret-assignment"]
+        summary["violations"] = [unhashable_rules]
+        with self.assertRaisesRegex(ReviewError, "violation is inconsistent"):
+            workspace_runtime.validate_secret_delta_summary(summary)
+
+        unhashable_surface = dict(addition)
+        unhashable_surface["surface"] = []
+        summary["violations"] = [violation("e" * 64, [unhashable_surface])]
+        with self.assertRaisesRegex(ReviewError, "addition is inconsistent"):
+            workspace_runtime.validate_secret_delta_summary(summary)
+
     def test_prompt_override_replaces_only_review_scope_placeholders(self) -> None:
         template = pathlib.Path(self.temporary.name) / "prompt.txt"
         template.write_text(
