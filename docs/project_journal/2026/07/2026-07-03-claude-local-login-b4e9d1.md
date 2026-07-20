@@ -29,7 +29,7 @@ superseded_by: 20260717-c17a11
 - The parent helper honors the original `NO_PROXY` / `no_proxy` list when choosing direct versus corporate-proxy routing for each pinned Anthropic target.
 - HTTPS corporate proxy tunnels drain OpenSSL's already-decrypted pending data before waiting on the underlying socket.
 - HTTPS corporate proxy validation honors a copied `GIT_SSL_CAINFO` bundle when it is the configured trust source.
-- Missing Claude authentication can fall back to GitHub Copilot only for explicitly authorized double or triple reviews.
+- Historical helper-only behavior allowed a supplemental GitHub Copilot attempt only under separate explicit Copilot consent. It never satisfied a named double or triple review; current named shapes require actual Claude Code and are defined by `20260720-7f2001`.
 - A transient or unclassified authentication-warmup failure is inconclusive and cannot trigger Copilot fallback; only a classified authentication failure is treated as unavailable local login.
 - A missing/non-native trusted `rg` or automatically discovered non-native Claude candidate is treated as Claude runtime unavailability and follows the authorized Copilot fallback rule; an invalid explicit Claude path remains a configuration error.
 - Trusted `rg` discovery skips invalid or non-native candidates and continues to the next pinned path.

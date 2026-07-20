@@ -10,7 +10,7 @@ supersedes:
   - 20260703-b4e9d1
   - 20260715-7c1501
   - 20260716-662f2c
-superseded_by:
+superseded_by: 20260720-7f2001
 ---
 
 # Trust Claude Authentication Carriers
@@ -33,7 +33,7 @@ superseded_by:
 - Refresh-lock shutdown publishes the stop transition without waiting for heartbeat filesystem I/O, retries one transient heartbeat join or operation-quiescence timeout once, and acquires a bounded operation gate before touching lock paths or descriptors. Two timeouts, or an interruption after cleanup starts, permanently mark that lease cleanup-inconclusive: exact helper-owned paths remain visible through combined operation errors and forwarded signals, later release calls cannot silently delete them, and only controlled operator cleanup after writer-quiescence proof is allowed.
 - Missing, malformed, unsafe, refresh-token-less, `Login expired`, HTTP 401, or refresh failure is terminal `blocked-authentication`. A Keychain client that disappears after initial capability validation is credential-inspection-inconclusive rather than runtime-unavailable, and a completed authentication rejection remains primary if final credential inspection also fails. If that final inspection retained a verified recovery carrier, authentication remains primary while both the runtime report and operator-facing error preserve its recovery diagnostic; a report-write failure inherits the same metadata instead of obscuring the carrier. Across the Keychain broker and both TCP and Unix CONNECT proxies, only an explicit OS policy or socket-capability bind errno is deterministic runtime unavailability; unknown/resource/address-contention errors, Unix-socket permissioning failure, thread/serve-start uncertainty, and post-ready serve-loop failure are inspection-inconclusive. The workflow pauses and instructs the operator to run `claude auth login` for local login, or unset/replace an explicit `ANTHROPIC_API_KEY`, as applicable; authentication and credential-inspection uncertainty never authorize Copilot fallback.
 - Only stderr and structured primary errors are classified. Partial result text is repository-controlled and can never authorize authentication, model, or Copilot fallback, so a partial review cannot forge a backend switch.
-- With existing `double-review` or `triple-review` consent, Copilot fallback remains limited to deterministic secure-runtime absence/unavailability or a strictly verified Claude model-entitlement path.
+- Historical helper-only Copilot fallback required separate explicit Copilot consent and remained limited to deterministic secure-runtime absence/unavailability or a strictly verified Claude model-entitlement path. It never satisfied named double or triple review; the superseding `20260720-7f2001` policy requires actual Claude Code.
 - The Keychain update transport-size limit is enforced only when the selected source or same-login synchronization will write Keychain; a distinct, unselected Keychain login remains validated and snapshotted but cannot block an independently usable file login on that transport-only limit.
 
 ## Next Steps

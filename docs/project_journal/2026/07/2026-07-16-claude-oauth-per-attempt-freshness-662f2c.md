@@ -40,9 +40,10 @@ capabilities workstreams.
   earlier model-attempt evidence. This remains true if the warmup happened to
   refresh the credential before returning a transient result, and it never
   enters Copilot fallback.
-- Explicit authentication unavailability and model entitlement keep the
-  existing fallback policy: only prior `double-review` or `triple-review`
-  consent may authorize Copilot.
+- Historical helper-only authentication or model fallback required separate
+  explicit Copilot consent. Named-review wording alone never authorizes that
+  provider substitution, and a Copilot result never satisfies named double or
+  triple review under the superseding `20260720-7f2001` policy.
 - A fixed-input warmup's explicit entitlement becomes model-chain evidence only
   when strict structured output verifies the exact requested effective model.
   It has no final text, does not start the final broker or repository-review
