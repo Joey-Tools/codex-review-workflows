@@ -1722,7 +1722,9 @@ class StatefulLifecycleTest(unittest.TestCase):
             return metadata
 
         try:
-            with mock.patch.object(state.os, "stat", side_effect=stat_then_create_child):
+            with mock.patch.object(
+                state.os, "stat", side_effect=stat_then_create_child
+            ):
                 state._validate_private_directory_path_identity(
                     state_dir,
                     descriptor,

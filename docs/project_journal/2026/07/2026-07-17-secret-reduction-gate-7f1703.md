@@ -96,7 +96,7 @@ Targeted launch-boundary hardening is part of this delivery: frozen workspace an
 
 This note supersedes its earlier strict-reduction design, which required raw-count decrease, unembedded non-growth, same-location provenance, encoded-variant denial, and two extra Codex PR-readiness gates. Those requirements are no longer the target contract.
 
-Implementation and current focused validation now match this decision, including the explicit stateful final-then-admission split. This tracked implementation workstream is `completed`; the final fixed-range Codex review, PR merge, private-overlay release, installation sync, and remote-task notification remain delivery operations tracked by the active PR/task rather than transient project state. Historical test counts and prior fixed-range review claims in earlier revisions of this note are not validation evidence for the new semantics.
+Implementation and final combined code validation now match this decision, including the explicit stateful final-then-admission split. This tracked implementation workstream is `completed`; the final fixed-range Codex review, PR merge, private-overlay release, installation sync, and remote-task notification remain delivery operations tracked by the active PR/task rather than transient project state. Historical test counts and prior fixed-range review claims in earlier revisions of this note are not validation evidence for the new semantics.
 
 ## Validation Criteria
 
@@ -151,10 +151,12 @@ The remaining unchecked items are post-commit delivery operations. They are inte
 - `skills/review-orchestration-playbook/references/review-lane-contracts.md`
 - `skills/review-orchestration-playbook/references/synthetic-token-fixtures.md`
 - Python 3.13.0 pre-admission anchor: `1285 tests`, `OK (skipped=4)`, 252.878 seconds.
+- Python 3.13.0 final merged code anchor `95b34b7`: `1325 tests`, `OK (skipped=4)`, 270.621 seconds.
 - Post-admission focused suites: state plus CLI `153 tests`; workspace `135 tests`; synthetic-token `165 tests`; contracts `42 tests`; all passed.
 - Focused runtime suites: `test_common.py` 38 tests; `test_claude_linux.py` 153 tests with 3 skipped; `test_providers.py` 479 tests with 3 skipped; all passed.
 - Descriptor-bound runtime patch review: two actionable findings were fixed; follow-up result `No findings.`.
 - Admission/final follow-up review: one malformed-JSON fail-closed finding was fixed; follow-up result `No findings.`.
+- Latest `master` cleanup-directory identity fix `202ef98` was merged; the stable directory identity and descriptor-bound runtime-artifact contracts were both retained, and their focused concurrency/path-replacement regressions passed.
 - Ruff checks, changed-file format checks, and `git diff --check`: passed.
 - Official skill validator: `Skill is valid!`.
 - Project journal validator: `Project journal validation passed.`.
