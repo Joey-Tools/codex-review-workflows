@@ -118,6 +118,7 @@ class _ElfProgramSegment:
 @dataclass(frozen=True)
 class NativeToolchain:
     bwrap: pathlib.Path
+    socat: pathlib.Path
 
 
 @dataclass(frozen=True)
@@ -221,6 +222,7 @@ _TRUSTED_TOOL_ROOTS = (
 )
 _TOOL_CANDIDATES: Mapping[str, tuple[pathlib.Path, ...]] = {
     "bwrap": (pathlib.Path("/usr/bin/bwrap"), pathlib.Path("/bin/bwrap")),
+    "socat": (pathlib.Path("/usr/bin/socat"), pathlib.Path("/bin/socat")),
 }
 _TRUSTED_LDD_CANDIDATES = (pathlib.Path("/usr/bin/ldd"), pathlib.Path("/bin/ldd"))
 _CANONICAL_GLIBC_LOADERS: Mapping[str, pathlib.PurePosixPath] = {
@@ -1272,13 +1274,20 @@ def _run_tool_probe(
 
 
 def _probe_identity(name: str, executable: pathlib.Path, runner: Runner) -> None:
-    if name != "bwrap":
+    arguments = {
+        "bwrap": ("--version",),
+        "socat": ("-V",),
+    }.get(name)
+    if arguments is None:
         raise LinuxRuntimeError(f"unsupported native tool probe: {name}")
-    arguments = ("--version",)
     result = _run_tool_probe(runner, (str(executable), *arguments))
     output = bytes(result.stdout) + b"\n" + bytes(result.stderr)
     normalized = output.decode("utf-8", errors="replace").lower()
-    if result.returncode != 0 or "bubblewrap " not in normalized:
+    marker = {
+        "bwrap": "bubblewrap ",
+        "socat": "socat version ",
+    }[name]
+    if result.returncode != 0 or marker not in normalized:
         raise LinuxIsolationUnavailable(
             f"{name} failed its bounded native identity probe: {executable}"
         )
@@ -1297,7 +1306,7 @@ def discover_native_toolchain(
     require_supported_host(host)
     selected: dict[str, pathlib.Path] = {}
     configured = candidates if candidates is not None else _TOOL_CANDIDATES
-    for name in ("bwrap",):
+    for name in ("bwrap", "socat"):
         failures: list[str] = []
         unsafe_failures: list[LinuxRuntimeUnsafe] = []
         inspection_failures: list[LinuxRuntimeInspectionInconclusive] = []
@@ -1316,7 +1325,7 @@ def discover_native_toolchain(
                     candidate,
                     trusted_roots=trusted_roots,
                     trusted_owner_uids=trusted_owner_uids,
-                    allow_setuid=True,
+                    allow_setuid=name == "bwrap",
                 )
                 info = inspect_elf(executable)
                 if info.arch != host.arch:
@@ -1346,7 +1355,10 @@ def discover_native_toolchain(
             raise LinuxHostDependencyUnavailable(
                 f"no trusted native {name} executable is available{detail}"
             )
-    toolchain = NativeToolchain(bwrap=selected["bwrap"])
+    toolchain = NativeToolchain(
+        bwrap=selected["bwrap"],
+        socat=selected["socat"],
+    )
     probe_bwrap(host, toolchain, runner=runner)
     return toolchain
 

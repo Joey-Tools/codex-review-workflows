@@ -606,6 +606,237 @@ class WorkspaceTest(unittest.TestCase):
             [],
         )
 
+    def test_wip_symlink_targets_share_aggregate_snapshot_budget(self) -> None:
+        first = pathlib.PurePosixPath("alpha-link")
+        second = pathlib.PurePosixPath("beta-link")
+        (self.repo / first).symlink_to("one")
+        (self.repo / second).symlink_to("two")
+
+        with (
+            mock.patch.object(workspace_runtime, "MAX_SNAPSHOT_BYTES", 5),
+            self.assertRaisesRegex(
+                ReviewError,
+                "symlink exceeds the review snapshot limit",
+            ),
+        ):
+            workspace_runtime._capture_source_wip_entries(
+                source_root=self.repo,
+                paths={first, second},
+            )
+
+    def test_wip_overlay_batches_raw_paths_without_per_path_git_processes(
+        self,
+    ) -> None:
+        raw_name = (
+            b"raw-\n-\t.txt" if sys.platform == "darwin" else b"raw-\xff-\n-\t.txt"
+        )
+        relative = pathlib.PurePosixPath(os.fsdecode(raw_name))
+        payload = b"raw WIP path content\n"
+        self.repo.joinpath(*relative.parts).write_bytes(payload)
+        (self.repo / "second-wip.txt").write_text("second\n", encoding="utf-8")
+        original_run = workspace_runtime._run_worktree_git
+        commands: list[tuple[str, ...]] = []
+
+        def record_worktree_git(workspace_root, *args, **kwargs):
+            commands.append(tuple(args))
+            return original_run(workspace_root, *args, **kwargs)
+
+        with mock.patch.object(
+            workspace_runtime,
+            "_run_worktree_git",
+            side_effect=record_worktree_git,
+        ):
+            review = prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+                include_source_wip=True,
+            )
+        self.reviews.append(review)
+
+        self.assertEqual(
+            review.workspace_root.joinpath(*relative.parts).read_bytes(), payload
+        )
+        tree = subprocess.run(
+            (
+                "git",
+                "-C",
+                str(review.workspace_root),
+                "ls-tree",
+                "-rz",
+                "--name-only",
+                review.snapshot_tree_sha,
+            ),
+            check=True,
+            env=test_git_environment(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).stdout
+        self.assertIn(raw_name + b"\0", tree)
+        self.assertEqual(
+            [command for command in commands if command[:1] == ("fast-import",)],
+            [("fast-import", "--quiet", "--done")],
+        )
+        self.assertEqual(
+            [command for command in commands if command[:1] == ("update-index",)],
+            [("update-index", "-z", "--index-info")],
+        )
+        self.assertFalse(any(command[:1] == ("hash-object",) for command in commands))
+        validate_external_workspace(review)
+
+    def test_wip_blob_import_batches_duplicate_payloads_to_same_object(self) -> None:
+        payload = b"shared WIP content\n"
+        entries = {
+            pathlib.PurePosixPath("first.txt"): ("100644", payload),
+            pathlib.PurePosixPath("second.txt"): ("100755", payload),
+        }
+        original_run = workspace_runtime._run_worktree_git
+        commands: list[tuple[str, ...]] = []
+
+        def record_worktree_git(workspace_root, *args, **kwargs):
+            commands.append(tuple(args))
+            return original_run(workspace_root, *args, **kwargs)
+
+        with mock.patch.object(
+            workspace_runtime,
+            "_run_worktree_git",
+            side_effect=record_worktree_git,
+        ):
+            object_format, object_ids = workspace_runtime._import_source_wip_blobs(
+                workspace_root=self.repo,
+                entries=entries,
+            )
+
+        digest = hashlib.new(object_format)
+        digest.update(f"blob {len(payload)}\0".encode("ascii"))
+        digest.update(payload)
+        expected_id = digest.hexdigest()
+        self.assertEqual(
+            object_ids,
+            {relative: expected_id for relative in entries},
+        )
+        self.assertEqual(
+            [command for command in commands if command[:1] == ("fast-import",)],
+            [("fast-import", "--quiet", "--done")],
+        )
+
+    def test_deletion_only_wip_uses_one_nul_index_batch_without_fast_import(
+        self,
+    ) -> None:
+        (self.repo / "example.txt").unlink()
+        object_format = git(self.repo, "rev-parse", "--show-object-format")
+        object_id_length = {"sha1": 40, "sha256": 64}[object_format]
+        original_run = workspace_runtime._run_worktree_git
+        commands: list[tuple[str, ...]] = []
+        index_batches: list[bytes] = []
+
+        def record_worktree_git(workspace_root, *args, **kwargs):
+            commands.append(tuple(args))
+            if args == ("update-index", "-z", "--index-info"):
+                input_handle = kwargs["input_handle"]
+                position = input_handle.tell()
+                index_batches.append(input_handle.read())
+                input_handle.seek(position)
+            return original_run(workspace_root, *args, **kwargs)
+
+        with mock.patch.object(
+            workspace_runtime,
+            "_run_worktree_git",
+            side_effect=record_worktree_git,
+        ):
+            review = prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+                include_source_wip=True,
+            )
+        self.reviews.append(review)
+
+        self.assertFalse((review.workspace_root / "example.txt").exists())
+        self.assertFalse(any(command[:1] == ("fast-import",) for command in commands))
+        self.assertEqual(
+            [command for command in commands if command[:1] == ("update-index",)],
+            [("update-index", "-z", "--index-info")],
+        )
+        self.assertEqual(
+            index_batches,
+            [b"0 " + b"0" * object_id_length + b"\texample.txt\0"],
+        )
+        validate_external_workspace(review)
+
+    def test_wip_blob_import_rejects_mismatched_fast_import_mark(self) -> None:
+        relative = pathlib.PurePosixPath("mismatch.txt")
+
+        def fake_worktree_git(_workspace_root, *args, **kwargs):
+            if args == ("rev-parse", "--show-object-format"):
+                return subprocess.CompletedProcess(args, 0, b"sha1\n", b"")
+            self.assertEqual(args, ("fast-import", "--quiet", "--done"))
+            self.assertIsNotNone(kwargs.get("input_handle"))
+            self.assertEqual(kwargs.get("record_limit"), 1)
+            return subprocess.CompletedProcess(args, 0, b"0" * 40 + b"\n", b"")
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "_run_worktree_git",
+                side_effect=fake_worktree_git,
+            ),
+            self.assertRaisesRegex(ReviewError, "mismatched object metadata"),
+        ):
+            workspace_runtime._import_source_wip_blobs(
+                workspace_root=self.repo,
+                entries={relative: ("100644", b"captured WIP\n")},
+            )
+
+    def test_wip_blob_import_rejects_malformed_fast_import_metadata(self) -> None:
+        cases = (
+            (
+                "truncated",
+                {pathlib.PurePosixPath("truncated.txt"): ("100644", b"one\n")},
+                b"0" * 40,
+                "truncated object metadata",
+            ),
+            (
+                "incomplete",
+                {
+                    pathlib.PurePosixPath("first.txt"): ("100644", b"one\n"),
+                    pathlib.PurePosixPath("second.txt"): ("100644", b"two\n"),
+                },
+                b"0" * 40 + b"\n",
+                "incomplete object metadata",
+            ),
+            (
+                "invalid-hex",
+                {pathlib.PurePosixPath("invalid.txt"): ("100644", b"one\n")},
+                b"g" * 40 + b"\n",
+                "invalid object metadata",
+            ),
+        )
+
+        for name, entries, output, error_pattern in cases:
+            with self.subTest(name=name):
+
+                def fake_worktree_git(_workspace_root, *args, **kwargs):
+                    if args == ("rev-parse", "--show-object-format"):
+                        return subprocess.CompletedProcess(args, 0, b"sha1\n", b"")
+                    self.assertEqual(args, ("fast-import", "--quiet", "--done"))
+                    self.assertIsNotNone(kwargs.get("input_handle"))
+                    self.assertEqual(kwargs.get("record_limit"), len(entries))
+                    return subprocess.CompletedProcess(args, 0, output, b"")
+
+                with (
+                    mock.patch.object(
+                        workspace_runtime,
+                        "_run_worktree_git",
+                        side_effect=fake_worktree_git,
+                    ),
+                    self.assertRaisesRegex(ReviewError, error_pattern),
+                ):
+                    workspace_runtime._import_source_wip_blobs(
+                        workspace_root=self.repo,
+                        entries=entries,
+                    )
+
     def test_wip_symlink_to_directory_transition_preserves_aliased_content(
         self,
     ) -> None:
@@ -3236,19 +3467,30 @@ class WorkspaceTest(unittest.TestCase):
         git(sha256_repo, "commit", "-m", "Update")
         head = git(sha256_repo, "rev-parse", "HEAD")
         self.assertEqual(len(head), 64)
+        content.write_text("base\nhead\nwip\n", encoding="utf-8")
+        (sha256_repo / "untracked.txt").write_text(
+            "sha256 WIP\n",
+            encoding="utf-8",
+        )
 
         review = prepare_workspace(
             repo=sha256_repo,
             base_ref=base,
             head_ref=head,
+            include_source_wip=True,
         )
         self.reviews.append(review)
         self.assertEqual(review.head_ref, head)
         self.assertEqual(
             (review.workspace_root / "content.txt").read_text(encoding="utf-8"),
-            "base\nhead\n",
+            "base\nhead\nwip\n",
+        )
+        self.assertEqual(
+            (review.workspace_root / "untracked.txt").read_text(encoding="utf-8"),
+            "sha256 WIP\n",
         )
         self.assertIn("+head", review.diff_file.read_text(encoding="utf-8"))
+        self.assertIn("+wip", review.diff_file.read_text(encoding="utf-8"))
         self.assertIsNone(cleanup_workspace(review, keep_container=False))
         self.reviews.remove(review)
         workspace_runtime._review_root_for_source(sha256_repo).rmdir()

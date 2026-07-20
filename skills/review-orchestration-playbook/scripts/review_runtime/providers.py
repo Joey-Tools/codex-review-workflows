@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import stat
 import sys
 import tempfile
@@ -36,6 +37,7 @@ from .claude_linux import (
     LinuxRuntimeInspectionInconclusive,
     LinuxRuntimeUnsafe,
     LinuxUnsupportedHost,
+    NativeToolchain,
     build_probe_command as build_claude_linux_probe_command,
     detect_host as detect_claude_linux_host,
     discover_native_toolchain as discover_claude_linux_toolchain,
@@ -902,16 +904,70 @@ def _with_executable_path(
     return result
 
 
+def _with_claude_linux_toolchain_path(
+    env: dict[str, str],
+    toolchain: NativeToolchain,
+) -> dict[str, str]:
+    result = dict(env)
+    entries: list[str] = []
+    for path in (toolchain.bwrap, toolchain.socat):
+        parent = str(path.parent)
+        if parent not in entries:
+            entries.append(parent)
+    for entry in result.get("PATH", "").split(os.pathsep):
+        if entry and entry not in entries:
+            entries.append(entry)
+    result["PATH"] = os.pathsep.join(entries)
+
+    for name, expected in (
+        ("bwrap", toolchain.bwrap),
+        ("socat", toolchain.socat),
+    ):
+        discovered = shutil.which(name, path=result["PATH"])
+        if discovered is None:
+            raise ReviewError(
+                f"Claude Code native sandbox PATH cannot resolve validated {name}"
+            )
+        try:
+            resolved = pathlib.Path(discovered).resolve(strict=True)
+            expected_resolved = expected.resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise ReviewError(
+                f"cannot resolve validated Claude Code native sandbox {name}"
+            ) from error
+        if resolved != expected_resolved:
+            raise ReviewError(
+                "Claude Code native sandbox PATH resolved "
+                f"{name} to {resolved}, not validated {expected_resolved}"
+            )
+    return result
+
+
+def _discover_claude_linux_native_toolchain(host: LinuxHost) -> NativeToolchain:
+    try:
+        return discover_claude_linux_toolchain(host)
+    except (LinuxUnsupportedHost, LinuxIsolationUnavailable) as error:
+        raise ClaudeProbeSandboxUnavailable(str(error)) from error
+    except LinuxRuntimeInspectionInconclusive as error:
+        raise ClaudeExecutableInspectionInconclusive(str(error)) from error
+    except LinuxRuntimeUnsafe:
+        raise
+    except LinuxRuntimeError as error:
+        raise InvalidReviewerExecutable(str(error)) from error
+
+
 def _claude_probe_command(
     executable: pathlib.Path,
     probe_cwd: pathlib.Path,
     *args: str,
+    linux_host: LinuxHost | None = None,
+    linux_toolchain: NativeToolchain | None = None,
 ) -> tuple[str, ...]:
-    if _is_claude_linux_host():
+    if linux_host is not None or _is_claude_linux_host():
         try:
-            host = _claude_linux_host()
+            host = linux_host if linux_host is not None else _claude_linux_host()
             info = validate_claude_linux_executable(executable, host)
-            toolchain = discover_claude_linux_toolchain(host)
+            toolchain = linux_toolchain or _discover_claude_linux_native_toolchain(host)
             return build_claude_linux_probe_command(
                 host,
                 toolchain,
@@ -1058,12 +1114,27 @@ def _run_claude_probe(
     executable: pathlib.Path,
     env: dict[str, str],
     *args: str,
+    linux_host: LinuxHost | None = None,
+    linux_toolchain: NativeToolchain | None = None,
 ) -> Completed:
     probe_cwd = _claude_probe_cwd(env)
+    linux_options = (
+        {
+            "linux_host": linux_host,
+            "linux_toolchain": linux_toolchain,
+        }
+        if linux_host is not None or linux_toolchain is not None
+        else {}
+    )
     with tempfile.TemporaryDirectory(prefix=".claude-probe-", dir=probe_cwd) as raw:
         output_dir = pathlib.Path(raw)
         return run(
-            _claude_probe_command(executable, probe_cwd, *args),
+            _claude_probe_command(
+                executable,
+                probe_cwd,
+                *args,
+                **linux_options,
+            ),
             cwd=probe_cwd,
             env=env,
             stdout_path=output_dir / "stdout.log",
@@ -1077,8 +1148,24 @@ def _run_claude_probe(
 def _require_claude_identity(
     executable: pathlib.Path,
     env: dict[str, str],
+    *,
+    linux_host: LinuxHost | None = None,
+    linux_toolchain: NativeToolchain | None = None,
 ) -> ClaudeVersion:
-    completed = _run_claude_probe(executable, env, "--version")
+    linux_options = (
+        {
+            "linux_host": linux_host,
+            "linux_toolchain": linux_toolchain,
+        }
+        if linux_host is not None or linux_toolchain is not None
+        else {}
+    )
+    completed = _run_claude_probe(
+        executable,
+        env,
+        "--version",
+        **linux_options,
+    )
     output = (completed.stdout + b"\n" + completed.stderr).decode(
         "utf-8", errors="replace"
     )
@@ -1095,8 +1182,24 @@ def _require_claude_identity(
 def _require_claude_safe_mode(
     executable: pathlib.Path,
     env: dict[str, str],
+    *,
+    linux_host: LinuxHost | None = None,
+    linux_toolchain: NativeToolchain | None = None,
 ) -> None:
-    completed = _run_claude_probe(executable, env, "--help")
+    linux_options = (
+        {
+            "linux_host": linux_host,
+            "linux_toolchain": linux_toolchain,
+        }
+        if linux_host is not None or linux_toolchain is not None
+        else {}
+    )
+    completed = _run_claude_probe(
+        executable,
+        env,
+        "--help",
+        **linux_options,
+    )
     help_text = (completed.stdout + b"\n" + completed.stderr).decode(
         "utf-8", errors="replace"
     )
@@ -2148,8 +2251,10 @@ def _resolve_validated_claude_executable(
     probe_home.chmod(0o700)
     runtime_reports: dict[str, dict[str, object]] = {}
     runtime_executables: dict[str, pathlib.Path] = {}
+    linux_toolchain: NativeToolchain | None = None
 
     def validate_candidate(candidate: pathlib.Path) -> None:
+        nonlocal linux_toolchain
         if linux_host is not None:
             try:
                 linux_info = validate_claude_linux_executable(
@@ -2165,6 +2270,8 @@ def _resolve_validated_claude_executable(
             except LinuxRuntimeError as error:
                 raise InvalidReviewerExecutable(str(error)) from error
             platform_key = linux_info.manifest_platform_key
+            if linux_toolchain is None:
+                linux_toolchain = _discover_claude_linux_native_toolchain(linux_host)
         elif _is_claude_macos_host():
             _native_macho_dependencies(candidate, label="Claude Code")
             platform_key = _claude_macos_platform_key(candidate)
@@ -2177,7 +2284,15 @@ def _resolve_validated_claude_executable(
             home=probe_home,
             tmp=claude_tmp,
         )
-        version = _require_claude_identity(candidate, candidate_env)
+        linux_options = (
+            {
+                "linux_host": linux_host,
+                "linux_toolchain": linux_toolchain,
+            }
+            if linux_host is not None
+            else {}
+        )
+        version = _require_claude_identity(candidate, candidate_env, **linux_options)
         verified = _require_trusted_claude_release(
             candidate,
             version=version.text,
@@ -2198,7 +2313,11 @@ def _resolve_validated_claude_executable(
             home=probe_home,
             tmp=claude_tmp,
         )
-        _require_claude_safe_mode(verified_executable, candidate_env)
+        _require_claude_safe_mode(
+            verified_executable,
+            candidate_env,
+            **linux_options,
+        )
         runtime_executables[str(candidate.absolute())] = verified_executable
         if isinstance(verified, VerifiedClaudeExecutable):
             authentication_source = _claude_authentication_source(prepared_env)
@@ -2248,10 +2367,20 @@ def _resolve_validated_claude_executable(
         str(executable.absolute()),
         executable,
     )
-    return runtime_executable, _with_executable_path(
+    runtime_env = _with_executable_path(
         prepared_env,
         runtime_executable,
     )
+    if linux_host is not None:
+        if linux_toolchain is None:
+            raise ReviewError(
+                "Claude Code Linux validation did not preserve its native toolchain"
+            )
+        runtime_env = _with_claude_linux_toolchain_path(
+            runtime_env,
+            linux_toolchain,
+        )
+    return runtime_executable, runtime_env
 
 
 def _claude_review_arguments(

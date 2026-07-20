@@ -977,7 +977,10 @@ def _run_worktree_git(
     workspace_root: pathlib.Path,
     *args: str,
     input_bytes: bytes | None = None,
+    input_handle: BinaryIO | int | None = None,
     check: bool = True,
+    byte_limit: int = MAX_PRIVATE_OBJECT_LIST_BYTES,
+    record_limit: int | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     command = (
         str(resolve_git()),
@@ -995,8 +998,11 @@ def _run_worktree_git(
     return _run_bounded_git_capture(
         command,
         input_bytes=input_bytes,
+        input_handle=input_handle,
         check=check,
         label="detached review worktree Git command",
+        byte_limit=byte_limit,
+        record_limit=record_limit,
     )
 
 
@@ -1004,26 +1010,35 @@ def _run_bounded_git_capture(
     command: tuple[str, ...],
     *,
     input_bytes: bytes | None,
+    input_handle: BinaryIO | int | None = None,
     check: bool,
     label: str,
     byte_limit: int = MAX_PRIVATE_OBJECT_LIST_BYTES,
+    record_limit: int | None = None,
     timeout_seconds: float = PRIVATE_GIT_TIMEOUT_SECONDS,
     timeout_label: str = "private Git",
     environment: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as input_file:
-        input_handle: BinaryIO | int = subprocess.DEVNULL
+        if input_bytes is not None and input_handle is not None:
+            raise ReviewError(
+                "bounded Git input must use bytes or one handle, not both"
+            )
+        selected_input: BinaryIO | int = subprocess.DEVNULL
         if input_bytes is not None:
             input_file.write(input_bytes)
             input_file.seek(0)
-            input_handle = input_file
+            selected_input = input_file
+        elif input_handle is not None:
+            selected_input = input_handle
         result = _run_bounded_process_to_file(
             command,
             environment=_git_environment() if environment is None else environment,
             destination=output,
             label=label,
             byte_limit=byte_limit,
-            input_handle=input_handle,
+            record_limit=record_limit,
+            input_handle=selected_input,
             timeout_seconds=timeout_seconds,
             timeout_label=timeout_label,
             check=check,
@@ -6816,6 +6831,10 @@ def _read_wip_entry(
             raw_target = os.fsencode(target)
             if len(raw_target) > 16 * 1024:
                 raise ReviewError(f"oversized symlink target in source WIP: {display}")
+            if len(raw_target) > remaining_bytes:
+                raise ReviewError(
+                    f"source WIP symlink exceeds the review snapshot limit: {display}"
+                )
             if not symlink_target_stays_within_workspace(relative, target):
                 raise ReviewError(
                     f"source WIP symlink escapes review workspace: {display}"
@@ -6907,6 +6926,123 @@ def _capture_source_wip_entries(
     return entries
 
 
+def _import_source_wip_blobs(
+    *,
+    workspace_root: pathlib.Path,
+    entries: dict[pathlib.PurePosixPath, tuple[str, bytes]],
+) -> tuple[str, dict[pathlib.PurePosixPath, str]]:
+    """Import captured WIP blobs with one bounded Git process."""
+
+    object_format = (
+        _run_worktree_git(workspace_root, "rev-parse", "--show-object-format")
+        .stdout.decode("ascii")
+        .strip()
+    )
+    if object_format not in {"sha1", "sha256"}:
+        raise ReviewError(f"unsupported Git object format: {object_format!r}")
+    object_ids: dict[pathlib.PurePosixPath, str] = {}
+    if not entries:
+        return object_format, object_ids
+
+    object_id_length = {"sha1": 40, "sha256": 64}[object_format]
+    sorted_entries = sorted(entries.items(), key=lambda item: item[0].as_posix())
+    expected_ids: list[str] = []
+    with tempfile.TemporaryFile() as stream:
+        stream.write(b"feature get-mark\n")
+        for mark, (_relative, (_mode, data)) in enumerate(sorted_entries, start=1):
+            digest = hashlib.new(object_format)
+            digest.update(f"blob {len(data)}\0".encode("ascii"))
+            digest.update(data)
+            expected_ids.append(digest.hexdigest())
+            stream.write(b"blob\n")
+            stream.write(f"mark :{mark}\n".encode("ascii"))
+            stream.write(f"data {len(data)}\n".encode("ascii"))
+            stream.write(data)
+            stream.write(b"\n")
+        for mark in range(1, len(sorted_entries) + 1):
+            stream.write(f"get-mark :{mark}\n".encode("ascii"))
+        stream.write(b"done\n")
+        stream.seek(0)
+        completed = _run_worktree_git(
+            workspace_root,
+            "fast-import",
+            "--quiet",
+            "--done",
+            input_handle=stream,
+            byte_limit=len(sorted_entries) * (object_id_length + 1),
+            record_limit=len(sorted_entries),
+        )
+    output = completed.stdout
+    if not output.endswith(b"\n"):
+        raise ReviewError("source WIP blob import produced truncated object metadata")
+    actual_ids = output[:-1].split(b"\n")
+    if len(actual_ids) != len(sorted_entries):
+        raise ReviewError("source WIP blob import produced incomplete object metadata")
+    lowercase_hex = b"0123456789abcdef"
+    for (relative, _entry), expected_id, raw_actual in zip(
+        sorted_entries,
+        expected_ids,
+        actual_ids,
+        strict=True,
+    ):
+        if len(raw_actual) != object_id_length or any(
+            byte not in lowercase_hex for byte in raw_actual
+        ):
+            raise ReviewError("source WIP blob import produced invalid object metadata")
+        actual_id = raw_actual.decode("ascii")
+        if actual_id != expected_id:
+            raise ReviewError(
+                "source WIP blob import produced mismatched object metadata"
+            )
+        object_ids[relative] = actual_id
+    return object_format, object_ids
+
+
+def _apply_source_wip_index_overlay(
+    *,
+    workspace_root: pathlib.Path,
+    paths: set[pathlib.PurePosixPath],
+    entries: dict[pathlib.PurePosixPath, tuple[str, bytes]],
+    object_format: str,
+    object_ids: dict[pathlib.PurePosixPath, str],
+) -> None:
+    """Apply all WIP removals and additions with one NUL-delimited index update."""
+
+    object_id_length = {"sha1": 40, "sha256": 64}.get(object_format)
+    if object_id_length is None:
+        raise ReviewError(f"unsupported Git object format: {object_format!r}")
+    zero_object_id = b"0" * object_id_length
+    with tempfile.TemporaryFile() as index_info:
+        for relative in sorted(
+            paths,
+            key=lambda item: (len(item.parts), item.as_posix()),
+            reverse=True,
+        ):
+            index_info.write(b"0 " + zero_object_id + b"\t")
+            index_info.write(os.fsencode(relative.as_posix()))
+            index_info.write(b"\0")
+        for relative, (mode, _data) in sorted(
+            entries.items(), key=lambda item: (len(item[0].parts), item[0].as_posix())
+        ):
+            object_id = object_ids.get(relative)
+            if object_id is None or len(object_id) != object_id_length:
+                raise ReviewError(
+                    "source WIP blob import produced invalid object metadata"
+                )
+            index_info.write(mode.encode("ascii") + b" ")
+            index_info.write(object_id.encode("ascii") + b"\t")
+            index_info.write(os.fsencode(relative.as_posix()))
+            index_info.write(b"\0")
+        index_info.seek(0)
+        _run_worktree_git(
+            workspace_root,
+            "update-index",
+            "-z",
+            "--index-info",
+            input_handle=index_info,
+        )
+
+
 def _overlay_source_wip(
     *,
     source_root: pathlib.Path,
@@ -6917,36 +7053,17 @@ def _overlay_source_wip(
     capture_paths: set[pathlib.PurePosixPath],
     entries: dict[pathlib.PurePosixPath, tuple[str, bytes]],
 ) -> str:
-    for relative in sorted(paths, key=lambda item: len(item.parts), reverse=True):
-        _run_worktree_git(
-            workspace_root,
-            "update-index",
-            "--force-remove",
-            "--",
-            relative.as_posix(),
-        )
-    for relative, (mode, data) in sorted(
-        entries.items(), key=lambda item: (len(item[0].parts), item[0].as_posix())
-    ):
-        object_id = (
-            _run_worktree_git(
-                workspace_root,
-                "hash-object",
-                "-w",
-                "--no-filters",
-                "--stdin",
-                input_bytes=data,
-            )
-            .stdout.decode("ascii")
-            .strip()
-        )
-        _run_worktree_git(
-            workspace_root,
-            "update-index",
-            "--add",
-            "--cacheinfo",
-            f"{mode},{object_id},{relative.as_posix()}",
-        )
+    object_format, object_ids = _import_source_wip_blobs(
+        workspace_root=workspace_root,
+        entries=entries,
+    )
+    _apply_source_wip_index_overlay(
+        workspace_root=workspace_root,
+        paths=paths,
+        entries=entries,
+        object_format=object_format,
+        object_ids=object_ids,
+    )
     snapshot_tree_sha = (
         _run_worktree_git(
             workspace_root,

@@ -1157,15 +1157,22 @@ class ToolchainDiscoveryTest(unittest.TestCase):
         def runner(argv, **kwargs):
             command = tuple(argv)
             calls.append((command, kwargs["env"]))
-            self.assertEqual(pathlib.Path(command[0]).name, "bwrap")
-            return _capture(stdout=b"bubblewrap 0.11.0\n")
+            name = pathlib.Path(command[0]).name
+            outputs = {
+                "bwrap": b"bubblewrap 0.11.0\n",
+                "socat": b"socat version 1.8.0.0\n",
+            }
+            return _capture(stdout=outputs[name])
 
         with tempfile.TemporaryDirectory(
             dir=pathlib.Path(__file__).parent
         ) as temporary:
             root = pathlib.Path(temporary)
             root.chmod(0o700)
-            candidates = {"bwrap": (_write_elf(root / "bwrap"),)}
+            candidates = {
+                "bwrap": (_write_elf(root / "bwrap"),),
+                "socat": (_write_elf(root / "socat"),),
+            }
 
             with mock.patch.dict(os.environ, _AMBIENT_TOOL_ENV_POISON, clear=False):
                 toolchain = claude_linux.discover_native_toolchain(
@@ -1177,6 +1184,7 @@ class ToolchainDiscoveryTest(unittest.TestCase):
                 )
 
         self.assertEqual(toolchain.bwrap.name, "bwrap")
+        self.assertEqual(toolchain.socat.name, "socat")
         expected_env = claude_linux.fixed_host_tool_environment()
         self.assertTrue(calls)
         for _command, environment in calls:
@@ -1200,12 +1208,75 @@ class ToolchainDiscoveryTest(unittest.TestCase):
             bwrap_probe[-2:],
             (str(toolchain.bwrap), "--version"),
         )
+        socat_probe = next(
+            call for call, _env in calls if pathlib.Path(call[0]).name == "socat"
+        )
+        self.assertEqual(socat_probe, (str(toolchain.socat), "-V"))
+
+    def test_fails_closed_when_trusted_socat_is_missing(self) -> None:
+        host = claude_linux.LinuxHost(claude_linux.LinuxHostKind.LINUX, "x64", "6.8")
+
+        with tempfile.TemporaryDirectory(
+            dir=pathlib.Path(__file__).parent
+        ) as temporary:
+            root = pathlib.Path(temporary)
+            root.chmod(0o700)
+            candidates = {"bwrap": (_write_elf(root / "bwrap"),)}
+
+            with self.assertRaisesRegex(
+                claude_linux.LinuxHostDependencyUnavailable,
+                "no trusted native socat executable",
+            ):
+                claude_linux.discover_native_toolchain(
+                    host,
+                    runner=lambda *_args, **_kwargs: _capture(
+                        stdout=b"bubblewrap 0.11.0\n"
+                    ),
+                    candidates=candidates,
+                    trusted_roots=(root,),
+                    trusted_owner_uids=frozenset({os.getuid()}),
+                )
+
+    def test_fails_closed_when_socat_identity_probe_is_rejected(self) -> None:
+        host = claude_linux.LinuxHost(claude_linux.LinuxHostKind.LINUX, "x64", "6.8")
+
+        def runner(argv, **_kwargs):
+            command = tuple(argv)
+            name = pathlib.Path(command[0]).name
+            if name == "socat":
+                return _capture(stdout=b"not the required proxy tool\n")
+            return _capture(stdout=b"bubblewrap 0.11.0\n")
+
+        with tempfile.TemporaryDirectory(
+            dir=pathlib.Path(__file__).parent
+        ) as temporary:
+            root = pathlib.Path(temporary)
+            root.chmod(0o700)
+            candidates = {
+                "bwrap": (_write_elf(root / "bwrap"),),
+                "socat": (_write_elf(root / "socat"),),
+            }
+
+            with self.assertRaisesRegex(
+                claude_linux.LinuxHostDependencyUnavailable,
+                "socat failed its bounded native identity probe",
+            ):
+                claude_linux.discover_native_toolchain(
+                    host,
+                    runner=runner,
+                    candidates=candidates,
+                    trusted_roots=(root,),
+                    trusted_owner_uids=frozenset({os.getuid()}),
+                )
 
     def test_fails_closed_when_bwrap_namespace_probe_fails(self) -> None:
         host = claude_linux.LinuxHost(
             claude_linux.LinuxHostKind.WSL2, "x64", "microsoft-standard-WSL2"
         )
-        tools = claude_linux.NativeToolchain(pathlib.Path("/usr/bin/bwrap"))
+        tools = claude_linux.NativeToolchain(
+            pathlib.Path("/usr/bin/bwrap"),
+            pathlib.Path("/usr/bin/socat"),
+        )
 
         with self.assertRaisesRegex(
             claude_linux.LinuxIsolationUnavailable, "cannot create"
@@ -1934,7 +2005,10 @@ class ProbeCommandTest(unittest.TestCase):
             home = root / "home"
             home.mkdir(mode=0o700)
             claude = _write_elf(root / "claude")
-            tools = claude_linux.NativeToolchain(_write_elf(root / "bwrap"))
+            tools = claude_linux.NativeToolchain(
+                _write_elf(root / "bwrap"),
+                _write_elf(root / "socat"),
+            )
             command = claude_linux.build_probe_command(
                 host,
                 tools,

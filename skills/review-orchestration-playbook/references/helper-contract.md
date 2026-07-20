@@ -100,6 +100,7 @@ The helper places the detached worktree, private Git database, control artifacts
 
 - `--include-source-wip` requires the source `HEAD` to equal the resolved head and rejects conflicts, unsafe submodule state, or capture races.
 - Capture staged changes, unstaged changes, deletions, mode changes, symlinks, and every non-ignored untracked file into the helper-owned worktree.
+- Charge regular-file contents and symlink-target bytes against one aggregate snapshot budget. Import all captured blobs through one bounded object-format-aware Git process, verify every returned object ID against a helper-computed digest, and apply all removals/additions through one NUL-delimited raw-path index update. Per-path Git subprocess loops are not an acceptable WIP capture implementation.
 - Exclude ignored files. Resolve only the effective `core.excludesFile` path through the current user's Git configuration, then apply that path as a single command-line override while the capture command continues to suppress system/global Git configuration. This preserves repository, info-exclude, configured global-exclude, and default `$XDG_CONFIG_HOME/git/ignore` or `$HOME/.config/git/ignore` semantics without enabling unrelated user hooks, aliases, filters, or diff commands.
 - Apply the same file, entry-count, byte, symlink, and secret-scan budgets used for clean evidence.
 - Bind the result to a deterministic WIP digest plus the base/head/tree identity and source-state observations before and after capture.
@@ -126,6 +127,7 @@ Only Claude Code `2.1.212` is eligible, and only after the fixed Anthropic signi
 Every Claude review then uses one combined runtime:
 
 - on WSL2, mount provenance must prove both the source checkout and external review container use supported local native Linux filesystems; Windows-backed provenance is blocked and unprovable provenance is inconclusive;
+- on Linux and WSL2, both `bubblewrap` and `socat` must pass fixed-path ownership, mode, native-ELF, architecture, and bounded identity validation; the selected directories are then placed before all other host-tool directories in Claude's final `PATH`, and resolution of both names must reproduce the exact selected executables before authentication or review launch;
 - cwd is the helper-owned detached review worktree;
 - `HOME` is the current account's real home resolved from the operating-system account database, not a caller-controlled override;
 - helper-owned temporary paths are used for CLI scratch and bounded artifacts;

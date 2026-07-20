@@ -3881,6 +3881,23 @@ class ProviderPolicyTest(unittest.TestCase):
         host = mock.Mock()
         info = mock.Mock(path=candidate, manifest_platform_key="linux-x64")
         snapshot = self.review.container_dir / "verified-claude"
+        shadow_dir = self.review.container_dir / "shadow-bin"
+        bwrap_dir = self.review.container_dir / "native-bwrap-bin"
+        socat_dir = self.review.container_dir / "native-socat-bin"
+        for directory in (shadow_dir, bwrap_dir, socat_dir):
+            directory.mkdir()
+        for path in (
+            shadow_dir / "bwrap",
+            shadow_dir / "socat",
+            bwrap_dir / "bwrap",
+            socat_dir / "socat",
+        ):
+            path.write_bytes(b"fixture")
+            path.chmod(0o700)
+        toolchain = claude_linux.NativeToolchain(
+            bwrap=bwrap_dir / "bwrap",
+            socat=socat_dir / "socat",
+        )
         self.trusted_release.return_value = providers.VerifiedClaudeExecutable(
             executable=snapshot,
             artifact=claude_provenance.ClaudeReleaseArtifact(
@@ -3909,9 +3926,14 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
             mock.patch.object(
                 providers,
+                "discover_claude_linux_toolchain",
+                return_value=toolchain,
+            ) as discover_toolchain,
+            mock.patch.object(
+                providers,
                 "_require_claude_identity",
                 return_value=providers.ClaudeVersion("2.1.212", (2, 1, 202)),
-            ),
+            ) as require_identity,
             mock.patch.object(
                 providers,
                 "_require_claude_safe_mode",
@@ -3922,16 +3944,52 @@ class ProviderPolicyTest(unittest.TestCase):
                 side_effect=resolve_and_validate,
             ),
         ):
-            executable, _env = providers._resolve_validated_claude_executable(
+            executable, runtime_env = providers._resolve_validated_claude_executable(
                 review=self.review,
-                env={},
+                env={
+                    "PATH": os.pathsep.join(
+                        (
+                            str(shadow_dir),
+                            str(bwrap_dir),
+                            str(shadow_dir),
+                            str(socat_dir),
+                            str(bwrap_dir),
+                        )
+                    )
+                },
             )
 
         self.assertEqual(executable, snapshot)
-        require_safe_mode.assert_called_once_with(snapshot, mock.ANY)
+        discover_toolchain.assert_called_once_with(host)
+        require_identity.assert_called_once_with(
+            candidate,
+            mock.ANY,
+            linux_host=host,
+            linux_toolchain=toolchain,
+        )
+        require_safe_mode.assert_called_once_with(
+            snapshot,
+            mock.ANY,
+            linux_host=host,
+            linux_toolchain=toolchain,
+        )
         preflight_env = require_safe_mode.call_args.args[1]
         self.assertNotIn("ANTHROPIC_API_KEY", preflight_env)
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", preflight_env)
+        path_entries = runtime_env["PATH"].split(os.pathsep)
+        self.assertEqual(path_entries[:2], [str(bwrap_dir), str(socat_dir)])
+        self.assertEqual(path_entries.count(str(bwrap_dir)), 1)
+        self.assertEqual(path_entries.count(str(socat_dir)), 1)
+        self.assertEqual(path_entries.count(str(shadow_dir)), 1)
+        self.assertGreater(path_entries.index(str(shadow_dir)), 1)
+        resolved_bwrap = shutil.which("bwrap", path=runtime_env["PATH"])
+        resolved_socat = shutil.which("socat", path=runtime_env["PATH"])
+        self.assertIsNotNone(resolved_bwrap)
+        self.assertIsNotNone(resolved_socat)
+        assert resolved_bwrap is not None
+        assert resolved_socat is not None
+        self.assertEqual(pathlib.Path(resolved_bwrap).resolve(), toolchain.bwrap)
+        self.assertEqual(pathlib.Path(resolved_socat).resolve(), toolchain.socat)
         self.trusted_release.assert_called_once_with(
             candidate,
             version="2.1.212",
@@ -3965,6 +4023,32 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(report["head_ref"], self.review.head_ref)
         self.assertEqual(report["snapshot_tree_sha"], self.review.snapshot_tree_sha)
         self.assertEqual(report["scope_identity"], self.review.scope_identity)
+
+    def test_claude_linux_toolchain_path_fails_closed_on_shadowed_tool(self) -> None:
+        bwrap_dir = self.review.container_dir / "native-bwrap-bin"
+        socat_dir = self.review.container_dir / "native-socat-bin"
+        bwrap_dir.mkdir()
+        socat_dir.mkdir()
+        for path in (
+            bwrap_dir / "bwrap",
+            bwrap_dir / "socat",
+            socat_dir / "socat",
+        ):
+            path.write_bytes(b"fixture")
+            path.chmod(0o700)
+        toolchain = claude_linux.NativeToolchain(
+            bwrap=bwrap_dir / "bwrap",
+            socat=socat_dir / "socat",
+        )
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "socat.*not validated",
+        ):
+            providers._with_claude_linux_toolchain_path(
+                {"PATH": str(socat_dir)},
+                toolchain,
+            )
 
     def test_claude_linux_candidate_mountinfo_failure_is_inconclusive(self) -> None:
         candidate = self.review.source_root / "claude"
@@ -4648,6 +4732,8 @@ class ProviderPolicyTest(unittest.TestCase):
         )
 
         parsed = json.loads(settings)
+        self.assertNotIn("bwrapPath", settings)
+        self.assertNotIn("socatPath", settings)
         sandbox = parsed["sandbox"]
         self.assertEqual(
             {

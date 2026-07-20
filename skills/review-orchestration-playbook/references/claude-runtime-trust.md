@@ -36,7 +36,7 @@ The fixed-path native GPG source remains a separately validated host-trust depen
 ## Supported Platforms
 
 - macOS: official thin arm64 or x64 Mach-O, including x64 through Rosetta on Apple Silicon; native Claude sandbox backed by Seatbelt.
-- Linux: native matching-architecture ELF and libc; native Claude sandbox backed by `bubblewrap` and its required relay dependency.
+- Linux: native matching-architecture ELF and libc; native Claude sandbox backed by separately identity-verified `bubblewrap` and `socat` executables. Their verified directories are bound ahead of every other host-tool directory in the final Claude `PATH`, because Claude's absolute `bwrapPath` and `socatPath` overrides are managed-settings-only inputs.
 - WSL2: the matching Linux runtime only after positive WSL2 kernel identity and `/proc/self/mountinfo` proves both the source checkout and external review container use supported local native Linux filesystems.
 - WSL1 and native Windows: unsupported.
 
@@ -54,7 +54,7 @@ The helper always launches Claude with cwd set to its own detached Git worktree.
 
 The worktree, private Git database, control artifacts, logs, and state share one external per-run container. The fixed `/tmp` base is resolved to a canonical real directory and accepted only when it is root-owned with exact mode `01777`. The helper then creates current-user-owned exact-`0700` namespaces for the effective UID and SHA-256 of the canonical source path before the generated per-run container. It never selects this root from caller `TMPDIR` or source-repository content.
 
-Clean mode is the default and requires a clean source checkout. Explicit `--include-source-wip` captures staged changes, unstaged changes, deletions, mode/symlink changes, and non-ignored untracked files into the same kind of detached worktree. Capture must be race-checked and digest-bound, and every diff, inventory, scanner, prompt, and reviewer read must use the captured artifact. A WIP digest is review-only artifact evidence and cannot satisfy a formal PR-readiness or merge-ready exact-commit gate.
+Clean mode is the default and requires a clean source checkout. Explicit `--include-source-wip` captures staged changes, unstaged changes, deletions, mode/symlink changes, and non-ignored untracked files into the same kind of detached worktree. Regular-file and symlink-target bytes share the aggregate snapshot budget. Captured blobs are imported in one bounded Git process and the complete raw-path overlay is applied through one NUL-delimited index update, avoiding per-path process amplification without weakening object-format, object-ID, path-byte, or source-race validation. Capture must be race-checked and digest-bound, and every diff, inventory, scanner, prompt, and reviewer read must use the captured artifact. A WIP digest is review-only artifact evidence and cannot satisfy a formal PR-readiness or merge-ready exact-commit gate.
 
 Source `.codex-tmp` content is never filtered as helper state. Ordinary Git ignore/status semantics apply, any reported record makes clean mode dirty, and WIP capture rejects `.codex-tmp` as a reserved helper path. Stateful artifacts retained under `/tmp` may survive helper workspace cleanup but can be lost on reboot or host temporary-file cleanup, so they are operational evidence rather than durable storage.
 

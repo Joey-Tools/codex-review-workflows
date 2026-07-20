@@ -32,11 +32,11 @@ jobs:
       - name: Install Python test dependencies
         run: |
           python3 -m pip install --disable-pip-version-check --no-input 'tomli==2.2.1; python_version < "3.11"'
-      - name: Install Linux executable-probe dependency
+      - name: Install Linux sandbox prerequisites
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes bubblewrap
+          sudo apt-get install --yes bubblewrap socat
       - name: Compile synced review helper
         run: |
           python3 -m py_compile \
