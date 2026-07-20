@@ -145,8 +145,143 @@ class ForwardedSignalMaskTest(unittest.TestCase):
         self.assertFalse(armed)
         self.assertEqual(current_mask, original_mask)
 
+    def test_owner_retains_mask_when_restore_fails(self) -> None:
+        previous_mask = {signal.SIGUSR1}
+        owner = common.ForwardedSignalMaskOwner()
+        owner.publish(previous_mask)
+        first_failure = OSError("injected mask restore failure")
+        restore = mock.Mock(side_effect=first_failure)
+
+        with self.assertRaises(OSError) as raised:
+            owner.restore(restore)
+
+        self.assertIs(raised.exception, first_failure)
+        self.assertTrue(owner.active)
+        self.assertTrue(owner.restore_attempted)
+        self.assertIs(owner.previous_mask, previous_mask)
+        restore.assert_called_once_with(previous_mask)
+
+    def test_bounded_owner_restore_retries_once_until_success(self) -> None:
+        previous_mask = {signal.SIGUSR1}
+        owner = common.ForwardedSignalMaskOwner()
+        owner.publish(previous_mask)
+        first_failure = OSError("injected mask restore failure")
+        restore = mock.Mock(side_effect=(first_failure, None))
+
+        failures = common._restore_forwarded_signal_mask_owner_bounded(
+            owner,
+            restore=restore,
+        )
+
+        self.assertEqual(failures, (first_failure,))
+        self.assertFalse(owner.active)
+        self.assertTrue(owner.restore_attempted)
+        self.assertIs(owner.previous_mask, previous_mask)
+        self.assertEqual(restore.call_args_list, [mock.call(previous_mask)] * 2)
+
 
 class ChildEnvironmentTest(unittest.TestCase):
+    def test_logged_process_mask_handoffs_survive_call_result_interruptions(
+        self,
+    ) -> None:
+        instructions = list(dis.get_instructions(common._run_logged_process))
+        call_result_offsets_by_line: dict[int, set[int]] = {}
+        for index, instruction in enumerate(instructions):
+            if instruction.argval != "block_forwarded_signals":
+                continue
+            for candidate_index in range(index + 1, len(instructions) - 1):
+                if not instructions[candidate_index].opname.startswith("CALL"):
+                    continue
+                line = instruction.positions.lineno
+                assert line is not None
+                call_result_offsets_by_line.setdefault(line, set()).add(
+                    instructions[candidate_index + 1].offset
+                )
+                break
+        self.assertEqual(len(call_result_offsets_by_line), 2)
+
+        for target_index, target_offsets in enumerate(
+            call_result_offsets_by_line[line]
+            for line in sorted(call_result_offsets_by_line)
+        ):
+            with (
+                self.subTest(target_index=target_index),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = pathlib.Path(temporary)
+                original_mask = {signal.SIGUSR1}
+                current_mask = set(original_mask)
+                owners: list[common.ForwardedSignalMaskOwner] = []
+                interruption = common.ForwardedSignal(signal.SIGTERM)
+                armed = True
+
+                def block(
+                    *,
+                    signal_mask_owner: common.ForwardedSignalMaskOwner | None = None,
+                ) -> set[signal.Signals]:
+                    previous_mask = set(current_mask)
+                    current_mask.update(common.forwarded_signals())
+                    if signal_mask_owner is not None:
+                        signal_mask_owner.publish(previous_mask)
+                        owners.append(signal_mask_owner)
+                    return previous_mask
+
+                def restore(previous_mask: set[signal.Signals] | None) -> None:
+                    if previous_mask is None:
+                        return
+                    current_mask.clear()
+                    current_mask.update(previous_mask)
+
+                def trace(frame, event, _arg):
+                    nonlocal armed
+                    if frame.f_code is common._run_logged_process.__code__:
+                        frame.f_trace_opcodes = True
+                        if (
+                            event == "opcode"
+                            and armed
+                            and frame.f_lasti in target_offsets
+                        ):
+                            armed = False
+                            raise interruption
+                    return trace
+
+                previous_trace = sys.gettrace()
+                with (
+                    mock.patch.object(
+                        common,
+                        "block_forwarded_signals",
+                        side_effect=block,
+                    ),
+                    mock.patch.object(
+                        common,
+                        "restore_signal_mask",
+                        side_effect=restore,
+                    ),
+                    mock.patch.object(
+                        common,
+                        "consume_pending_forwarded_signal",
+                        return_value=None,
+                    ),
+                ):
+                    sys.settrace(trace)
+                    try:
+                        with self.assertRaises(common.ForwardedSignal) as raised:
+                            common.run(
+                                (sys.executable, "-c", "pass"),
+                                stdout_path=root / "stdout.log",
+                                stderr_path=root / "stderr.log",
+                                timeout_seconds=5,
+                                output_file_limit_bytes=4096,
+                            )
+                    finally:
+                        sys.settrace(previous_trace)
+
+                self.assertIs(raised.exception, interruption)
+                self.assertFalse(armed)
+                self.assertEqual(current_mask, original_mask)
+                self.assertEqual(len(owners), 2)
+                self.assertTrue(all(not owner.active for owner in owners))
+
     def test_tail_text_reads_only_a_bounded_suffix(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = pathlib.Path(temporary) / "review.log"

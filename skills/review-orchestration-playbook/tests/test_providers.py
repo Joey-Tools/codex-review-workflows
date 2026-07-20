@@ -1869,7 +1869,7 @@ class ProviderPolicyTest(unittest.TestCase):
         with mock.patch.object(
             providers.signal,
             "pthread_sigmask",
-            side_effect=(set(), previous_mask, restore_error),
+            side_effect=(set(), previous_mask, restore_error, set()),
             create=True,
         ) as pthread_sigmask:
             interrupted = (
@@ -1914,6 +1914,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     providers.forwarded_signals(),
                 ),
                 mock.call(signal.SIG_SETMASK, previous_mask),
+                mock.call(signal.SIG_SETMASK, previous_mask),
             ],
         )
 
@@ -1921,7 +1922,7 @@ class ProviderPolicyTest(unittest.TestCase):
         with mock.patch.object(
             providers.signal,
             "pthread_sigmask",
-            side_effect=(set(), previous_mask, restore_error),
+            side_effect=(set(), previous_mask, restore_error, set()),
             create=True,
         ):
             restored = (
@@ -2428,8 +2429,13 @@ class ProviderPolicyTest(unittest.TestCase):
             for index, instruction in enumerate(instructions)
             if instruction.opname.startswith("CALL")
             and any(
-                candidate.opname in {"LOAD_ATTR", "LOAD_METHOD"}
-                and candidate.argval == "restore_previous_signal_mask"
+                candidate.opname
+                in {"LOAD_ATTR", "LOAD_GLOBAL", "LOAD_METHOD"}
+                and candidate.argval
+                in {
+                    "restore_previous_signal_mask",
+                    "_restore_claude_signal_mask_owner_bounded",
+                }
                 for candidate in instructions[max(0, index - 3) : index]
             )
         ]
@@ -21374,6 +21380,49 @@ class ProviderPolicyTest(unittest.TestCase):
                     previous.intersection(pending).isdisjoint(observed_waits)
                 )
 
+    def test_macos_terminal_handoff_retries_mask_restore_and_keeps_first_error(
+        self,
+    ) -> None:
+        prior_mask = {signal.SIGINT}
+        first_restore_error = providers.ForwardedSignal(signal.SIGTERM)
+        handoff = providers._ClaudeMacOSTerminalHandoff()
+        handoff.publish_previous_signal_mask(prior_mask)
+
+        with (
+            mock.patch.object(
+                providers,
+                "_consume_claude_macos_owned_pending_forwarded_signal",
+                return_value=None,
+            ),
+            mock.patch.object(
+                providers,
+                "_bind_claude_macos_terminal_handoff_recovery",
+                return_value=[],
+            ),
+            mock.patch.object(
+                providers,
+                "restore_signal_mask",
+                side_effect=(first_restore_error, None),
+            ) as restore,
+            self.assertRaises(providers.ForwardedSignal) as raised,
+        ):
+            providers._complete_claude_macos_terminal_handoff(
+                self.review,
+                handoff,
+                None,
+            )
+
+        self.assertIs(raised.exception, first_restore_error)
+        self.assertEqual(
+            restore.call_args_list,
+            [mock.call(prior_mask), mock.call(prior_mask)],
+        )
+        self.assertFalse(handoff.signal_mask_owner_active)
+        self.assertIs(
+            handoff.signal_mask_owner_state,
+            providers._ClaudeSignalMaskOwnerState.RESTORE_ATTEMPTED,
+        )
+
     def test_begin_handoff_control_flow_inherits_saved_persistence_state(
         self,
     ) -> None:
@@ -29475,6 +29524,61 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertFalse(mask_blocked)
         restore.assert_called_once_with(prior_mask)
 
+    def test_macos_coordination_retries_restore_before_lock_context_entry(
+        self,
+    ) -> None:
+        prior_mask = {signal.SIGINT}
+        pre_entry_signal = providers.ForwardedSignal(signal.SIGTERM)
+        first_restore_error = OSError("fixture first pre-entry restore failure")
+
+        def block_signals(
+            *,
+            signal_mask_owner: providers._ClaudeSignalMaskOwner | None = None,
+        ) -> set[signal.Signals]:
+            assert signal_mask_owner is not None
+            signal_mask_owner.publish_previous_signal_mask(prior_mask)
+            return prior_mask
+
+        with (
+            mock.patch.object(
+                providers,
+                "_claude_credential_update_lock",
+                side_effect=lambda _label: contextlib.nullcontext(),
+            ),
+            mock.patch.object(
+                providers,
+                "block_forwarded_signals",
+                side_effect=block_signals,
+            ),
+            mock.patch.object(
+                providers,
+                "claude_refresh_lock",
+                side_effect=pre_entry_signal,
+            ),
+            mock.patch.object(
+                providers,
+                "restore_signal_mask",
+                side_effect=(first_restore_error, None),
+            ) as restore,
+            self.assertRaises(providers.ForwardedSignal) as raised,
+        ):
+            with self.claude_macos_carrier_coordination(
+                self.claude_refresh_lock_protocol
+            ):
+                self.fail("pre-entry interruption unexpectedly yielded")
+
+        self.assertIs(raised.exception, pre_entry_signal)
+        self.assertEqual(
+            restore.call_args_list,
+            [mock.call(prior_mask), mock.call(prior_mask)],
+        )
+        self.assertTrue(
+            any(
+                "cleanup failure" in note
+                for note in getattr(pre_entry_signal, "__notes__", ())
+            )
+        )
+
     def test_macos_coordination_masks_heartbeat_start_signal_until_cleanup(
         self,
     ) -> None:
@@ -29559,6 +29663,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 "heartbeat-started",
                 "main-mask-restored",
                 "refresh-lock-cleanup",
+                "main-mask-restored",
             ],
         )
         self.assertEqual(
@@ -31201,6 +31306,218 @@ class ProviderPolicyTest(unittest.TestCase):
                 self.assertIs(raised.exception, interruption)
                 self.assertFalse(mask_blocked)
                 restore.assert_called_once_with(prior_mask)
+
+    def test_claude_quiescence_keeps_body_signal_across_restore_retry(
+        self,
+    ) -> None:
+        completed = Completed(
+            argv=("claude",),
+            returncode=0,
+            stdout=b"{}",
+            stderr=b"",
+        )
+        executable = pathlib.Path("/verified/claude")
+        prior_mask = {signal.SIGINT}
+
+        class FixtureEvent:
+            def __init__(self, set_error: BaseException | None = None) -> None:
+                self._set = False
+                self._set_error = set_error
+
+            def is_set(self) -> bool:
+                return self._set
+
+            def set(self) -> None:
+                if self._set_error is not None:
+                    raise self._set_error
+                self._set = True
+
+        restore_error_factories: tuple[
+            tuple[str, Callable[[], BaseException]], ...
+        ] = (
+            (
+                "forwarded-signal",
+                lambda: providers.ForwardedSignal(signal.SIGINT),
+            ),
+            ("ordinary", lambda: OSError("fixture transient restore failure")),
+        )
+
+        for linux in (True, False):
+            for restore_label, restore_error_factory in (
+                restore_error_factories
+            ):
+                with self.subTest(
+                    platform="linux" if linux else "macos",
+                    restore_error=restore_label,
+                ):
+                    primary_signal = providers.ForwardedSignal(signal.SIGTERM)
+                    restore_error = restore_error_factory()
+                    started_event = FixtureEvent()
+                    quiescent_event = FixtureEvent(primary_signal)
+                    observed_owners: list[
+                        providers._ClaudeSignalMaskOwner
+                    ] = []
+
+                    def block_signals(
+                        *,
+                        signal_mask_owner: (
+                            providers._ClaudeSignalMaskOwner | None
+                        ) = None,
+                    ) -> set[signal.Signals]:
+                        assert signal_mask_owner is not None
+                        signal_mask_owner.publish_previous_signal_mask(
+                            prior_mask
+                        )
+                        observed_owners.append(signal_mask_owner)
+                        return prior_mask
+
+                    @contextlib.contextmanager
+                    def linux_runtime(*_args: object, **_kwargs: object):
+                        yield mock.Mock(argv=("sandbox",), env={})
+
+                    @contextlib.contextmanager
+                    def keychain_runtime(
+                        _review: ReviewWorkspace,
+                        env: dict[str, str],
+                        *_args: object,
+                        **_kwargs: object,
+                    ):
+                        yield dict(env)
+
+                    with contextlib.ExitStack() as stack:
+                        stack.enter_context(
+                            mock.patch.object(
+                                providers,
+                                "_is_claude_linux_host",
+                                return_value=linux,
+                            )
+                        )
+                        for name, side_effect in (
+                            (
+                                "_with_claude_review_tool_path",
+                                lambda _review, env: dict(env),
+                            ),
+                            (
+                                "_prepare_claude_tls_environment",
+                                lambda _review, env: dict(env),
+                            ),
+                        ):
+                            stack.enter_context(
+                                mock.patch.object(
+                                    providers,
+                                    name,
+                                    side_effect=side_effect,
+                                )
+                            )
+                        stack.enter_context(
+                            mock.patch.object(
+                                providers,
+                                "_update_claude_runtime_report",
+                            )
+                        )
+                        stack.enter_context(
+                            mock.patch.object(
+                                providers,
+                                (
+                                    "_record_claude_secondary_"
+                                    "persistence_failure"
+                                ),
+                            )
+                        )
+                        stack.enter_context(
+                            mock.patch.object(
+                                providers,
+                                "run",
+                                return_value=completed,
+                            )
+                        )
+                        stack.enter_context(
+                            mock.patch.object(
+                                providers.threading,
+                                "Event",
+                                side_effect=(
+                                    started_event,
+                                    quiescent_event,
+                                ),
+                            )
+                        )
+                        stack.enter_context(
+                            mock.patch.object(
+                                providers,
+                                "block_forwarded_signals",
+                                side_effect=block_signals,
+                            )
+                        )
+                        restore = stack.enter_context(
+                            mock.patch.object(
+                                providers,
+                                "restore_signal_mask",
+                                side_effect=(restore_error, None),
+                            )
+                        )
+                        if linux:
+                            stack.enter_context(
+                                mock.patch.object(
+                                    providers,
+                                    "_claude_linux_review_runtime",
+                                    side_effect=linux_runtime,
+                                )
+                            )
+                        else:
+                            stack.enter_context(
+                                mock.patch.object(
+                                    providers,
+                                    "_claude_keychain_runtime",
+                                    side_effect=keychain_runtime,
+                                )
+                            )
+                            stack.enter_context(
+                                mock.patch.object(
+                                    providers,
+                                    "_claude_connect_proxy",
+                                    return_value=contextlib.nullcontext(43210),
+                                )
+                            )
+                            stack.enter_context(
+                                mock.patch.object(
+                                    providers,
+                                    "_claude_review_sandbox_profile",
+                                    return_value="(version 1)",
+                                )
+                            )
+                        raised = stack.enter_context(
+                            self.assertRaises(providers.ForwardedSignal)
+                        )
+                        providers._claude_attempt(
+                            review=self.review,
+                            model=providers.CLAUDE_MODELS[0],
+                            index=1,
+                            env={"ANTHROPIC_API_KEY": "fixture"},
+                            executable=executable,
+                            refresh_lock_protocol=(
+                                self.claude_refresh_lock_protocol
+                            ),
+                        )
+
+                    self.assertIs(raised.exception, primary_signal)
+                    self.assertEqual(
+                        restore.call_args_list,
+                        [mock.call(prior_mask), mock.call(prior_mask)],
+                    )
+                    self.assertEqual(len(observed_owners), 1)
+                    self.assertFalse(
+                        observed_owners[0].signal_mask_owner_active
+                    )
+                    self.assertTrue(
+                        any(
+                            "cleanup failure" in note
+                            for note in getattr(
+                                primary_signal,
+                                "__notes__",
+                                (),
+                            )
+                        )
+                    )
 
     def test_claude_post_run_auth_rejection_precedes_inspection_failure(
         self,

@@ -346,11 +346,9 @@ class ForwardedSignalMaskOwner:
             return
         if restore is None:
             restore = restore_signal_mask
-        try:
-            restore(self.previous_mask)
-        finally:
-            self.active = False
-            self.restore_attempted = True
+        self.restore_attempted = True
+        restore(self.previous_mask)
+        self.active = False
 
 
 def block_forwarded_signals(
@@ -394,6 +392,46 @@ def block_forwarded_signals(
 def restore_signal_mask(previous: set[signal.Signals] | None) -> None:
     if previous is not None:
         signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def _restore_forwarded_signal_mask_owner_bounded(
+    signal_mask_owner: ForwardedSignalMaskOwner,
+    *,
+    restore: Callable[[set[signal.Signals] | None], None] | None = None,
+) -> tuple[BaseException, ...]:
+    failures: list[BaseException] = []
+    for _attempt in range(2):
+        if not signal_mask_owner.active:
+            break
+        try:
+            signal_mask_owner.restore(restore)
+        except BaseException as error:
+            failures.append(error)
+    return tuple(failures)
+
+
+def _propagate_signal_mask_restore_failures(
+    primary_error: BaseException | None,
+    failures: tuple[BaseException, ...],
+) -> None:
+    if not failures:
+        return
+    candidates = (
+        ((primary_error,) if primary_error is not None else ()) + failures
+    )
+    selected = next(
+        (error for error in candidates if _is_process_control_flow_error(error)),
+        primary_error if primary_error is not None else failures[0],
+    )
+    for error in candidates:
+        if error is selected:
+            continue
+        context = "restoring the forwarded-signal mask"
+        if error is primary_error:
+            context = "process operation failed before mask restoration"
+        _attach_process_secondary_failure(selected, error, context=context)
+    if selected is not primary_error:
+        raise selected
 
 
 def unblock_forwarded_signals() -> None:
@@ -663,38 +701,59 @@ def _run_logged_process(
             finally:
                 view.release()
 
-        thread_start_mask = block_forwarded_signals()
+        thread_start_mask_owner = ForwardedSignalMaskOwner()
+        thread_start_error: BaseException | None = None
         try:
-            for stream, destination, limit_bytes in (
-                (process.stdout, stdout_handle, stdout_file_limit_bytes),
-                (process.stderr, stderr_handle, stderr_file_limit_bytes),
-            ):
-                thread = threading.Thread(
-                    target=drain_bounded,
-                    args=(stream, destination, limit_bytes),
-                    daemon=True,
+            try:
+                thread_start_mask = block_forwarded_signals(
+                    signal_mask_owner=thread_start_mask_owner,
                 )
-                try:
-                    thread.start()
-                except BaseException:
-                    process_cleanup_inconclusive = True
-                    raise
-                io_threads.append(thread)
-            if stdin is not None:
-                assert process.stdin is not None
-                thread = threading.Thread(
-                    target=write_stdin_bounded,
-                    args=(process.stdin, stdin),
-                    daemon=True,
-                )
-                try:
-                    thread.start()
-                except BaseException:
-                    process_cleanup_inconclusive = True
-                    raise
-                io_threads.append(thread)
+                if (
+                    not thread_start_mask_owner.active
+                    and thread_start_mask is not None
+                ):
+                    thread_start_mask_owner.publish(thread_start_mask)
+                for stream, destination, limit_bytes in (
+                    (process.stdout, stdout_handle, stdout_file_limit_bytes),
+                    (process.stderr, stderr_handle, stderr_file_limit_bytes),
+                ):
+                    thread = threading.Thread(
+                        target=drain_bounded,
+                        args=(stream, destination, limit_bytes),
+                        daemon=True,
+                    )
+                    try:
+                        thread.start()
+                    except BaseException:
+                        process_cleanup_inconclusive = True
+                        raise
+                    io_threads.append(thread)
+                if stdin is not None:
+                    assert process.stdin is not None
+                    thread = threading.Thread(
+                        target=write_stdin_bounded,
+                        args=(process.stdin, stdin),
+                        daemon=True,
+                    )
+                    try:
+                        thread.start()
+                    except BaseException:
+                        process_cleanup_inconclusive = True
+                        raise
+                    io_threads.append(thread)
+            except BaseException as error:
+                thread_start_error = error
+                raise
         finally:
-            restore_signal_mask(thread_start_mask)
+            thread_start_restore_failures = (
+                _restore_forwarded_signal_mask_owner_bounded(
+                    thread_start_mask_owner,
+                )
+            )
+            _propagate_signal_mask_restore_failures(
+                thread_start_error,
+                thread_start_restore_failures,
+            )
         assert timeout_seconds is not None
         deadline = time.monotonic() + timeout_seconds
         while True:
@@ -762,13 +821,18 @@ def _run_logged_process(
             cleanup_signal = pending_signal
         raise
     finally:
-        previous_mask: set[signal.Signals] | None = None
-        mask_blocked = False
+        cleanup_signal_mask_owner = ForwardedSignalMaskOwner()
         pending_cleanup_signal: signal.Signals | None = None
         try:
             try:
-                previous_mask = block_forwarded_signals()
-                mask_blocked = True
+                previous_mask = block_forwarded_signals(
+                    signal_mask_owner=cleanup_signal_mask_owner,
+                )
+                if (
+                    not cleanup_signal_mask_owner.active
+                    and previous_mask is not None
+                ):
+                    cleanup_signal_mask_owner.publish(previous_mask)
             except BaseException as error:
                 cleanup_failures.append(
                     ("blocking forwarded signals during process cleanup", error)
@@ -843,7 +907,7 @@ def _run_logged_process(
                     cleanup_failures.append(
                         (f"restoring the {forwarded.name} signal handler", error)
                     )
-            if previous_mask is not None:
+            if cleanup_signal_mask_owner.active:
                 try:
                     pending_cleanup_signal = consume_pending_forwarded_signal()
                 except BaseException as error:
@@ -899,13 +963,12 @@ def _run_logged_process(
                             )
                         )
         finally:
-            if mask_blocked:
-                try:
-                    restore_signal_mask(previous_mask)
-                except BaseException as error:
-                    cleanup_failures.append(
-                        ("restoring the forwarded-signal mask", error)
-                    )
+            for error in _restore_forwarded_signal_mask_owner_bounded(
+                cleanup_signal_mask_owner,
+            ):
+                cleanup_failures.append(
+                    ("restoring the forwarded-signal mask", error)
+                )
 
         effective_pending_signal = pending_cleanup_signal or pending_signal
         signal_error: ForwardedSignal | None = None

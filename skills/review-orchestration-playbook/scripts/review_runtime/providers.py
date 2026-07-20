@@ -2450,6 +2450,8 @@ def _claude_macos_carrier_coordination(
         with _claude_credential_update_lock("keychain"):
             with _claude_credential_update_lock("credential-file"):
                 signal_mask_owner = _ClaudeSignalMaskOwner()
+                first_restore_error: BaseException | None = None
+                coordination_error: BaseException | None = None
                 try:
                     refresh_lock_start_mask = block_forwarded_signals(
                         signal_mask_owner=signal_mask_owner,
@@ -2472,10 +2474,55 @@ def _claude_macos_carrier_coordination(
                         )
                     )
                     with refresh_lock_context as coordinated_refresh_lock:
-                        signal_mask_owner.restore_previous_signal_mask()
+                        try:
+                            signal_mask_owner.restore_previous_signal_mask()
+                        except BaseException as restore_error:
+                            first_restore_error = restore_error
+                            raise
                         yield coordinated_refresh_lock
+                except BaseException as error:
+                    coordination_error = error
+                    raise
                 finally:
-                    signal_mask_owner.restore_previous_signal_mask()
+                    if first_restore_error is None:
+                        restore_error = (
+                            _restore_claude_signal_mask_owner_bounded(
+                                signal_mask_owner
+                            )
+                        )
+                        if restore_error is not None:
+                            selected_error = (
+                                _select_claude_thread_start_related_error(
+                                    coordination_error,
+                                    restore_error,
+                                )
+                            )
+                            assert selected_error is not None
+                            raise selected_error
+                    else:
+                        try:
+                            signal_mask_owner.restore_previous_signal_mask()
+                        except BaseException as retry_error:
+                            selected_error = (
+                                _select_claude_thread_start_related_error(
+                                    first_restore_error,
+                                    retry_error,
+                                )
+                            )
+                            if (
+                                coordination_error is not None
+                                and coordination_error is not selected_error
+                            ):
+                                selected_error = (
+                                    _select_claude_thread_start_related_error(
+                                        coordination_error,
+                                        selected_error,
+                                    )
+                                )
+                            assert selected_error is not None
+                            if selected_error is retry_error:
+                                raise
+                            raise selected_error
     except ClaudeRefreshLockError as error:
         raise _claude_macos_refresh_lock_coordination_failure(error) from error
 
@@ -4955,12 +5002,10 @@ class _ClaudeSignalMaskOwner:
     def restore_previous_signal_mask(self) -> None:
         if not self.signal_mask_owner_active:
             return
-        try:
-            restore_signal_mask(self.previous_signal_mask)
-        finally:
-            self.signal_mask_owner_state = (
-                _ClaudeSignalMaskOwnerState.RESTORE_ATTEMPTED
-            )
+        restore_signal_mask(self.previous_signal_mask)
+        self.signal_mask_owner_state = (
+            _ClaudeSignalMaskOwnerState.RESTORE_ATTEMPTED
+        )
 
 
 @dataclass
@@ -5045,6 +5090,23 @@ def _select_claude_thread_start_related_error(
         diagnostic.__suppress_context__ = False
         selected.__cause__ = diagnostic
     return selected
+
+
+def _restore_claude_signal_mask_owner_bounded(
+    signal_mask_owner: _ClaudeSignalMaskOwner,
+) -> BaseException | None:
+    selected_error: BaseException | None = None
+    for _attempt in range(2):
+        try:
+            signal_mask_owner.restore_previous_signal_mask()
+        except BaseException as restore_error:
+            selected_error = _select_claude_thread_start_related_error(
+                selected_error,
+                restore_error,
+            )
+            continue
+        break
+    return selected_error
 
 
 def _acquire_claude_forwarded_signal_mask(
@@ -5190,10 +5252,10 @@ def _start_claude_thread_inheriting_forwarded_signal_mask(
                 error=outcome_error,
             )
     finally:
-        try:
-            signal_mask_owner.restore_previous_signal_mask()
-        except BaseException as error:
-            restore_error = error
+        restore_error = _restore_claude_signal_mask_owner_bounded(
+            signal_mask_owner
+        )
+        if restore_error is not None:
             conservative_state = (
                 _ClaudeThreadStartState.NOT_STARTED
                 if state is _ClaudeThreadStartState.NOT_STARTED
@@ -7117,9 +7179,8 @@ def _complete_claude_macos_terminal_handoff(
                 selected_error,
                 selected_binding_errors,
             )
-    try:
-        handoff.restore_previous_signal_mask()
-    except BaseException as restore_error:
+    restore_error = _restore_claude_signal_mask_owner_bounded(handoff)
+    if restore_error is not None:
         restore_binding_errors = (
             _bind_claude_macos_terminal_handoff_recovery(
                 review,
@@ -13838,6 +13899,7 @@ def _claude_attempt(
                     on_process_quiescent=writer_quiescent.set,
                 )
                 quiescence_signal_mask_owner = _ClaudeSignalMaskOwner()
+                quiescence_error: BaseException | None = None
                 try:
                     quiescence_mask = block_forwarded_signals(
                         signal_mask_owner=quiescence_signal_mask_owner,
@@ -13851,8 +13913,24 @@ def _claude_attempt(
                             quiescence_mask
                         )
                     writer_quiescent.set()
+                except BaseException as error:
+                    quiescence_error = error
+                    raise
                 finally:
-                    quiescence_signal_mask_owner.restore_previous_signal_mask()
+                    restore_error = (
+                        _restore_claude_signal_mask_owner_bounded(
+                            quiescence_signal_mask_owner
+                        )
+                    )
+                    if restore_error is not None:
+                        selected_error = (
+                            _select_claude_thread_start_related_error(
+                                quiescence_error,
+                                restore_error,
+                            )
+                        )
+                        assert selected_error is not None
+                        raise selected_error
         except LinuxCredentialInspectionInconclusive as error:
             _update_claude_runtime_report_preserving_persistence(
                 review,
@@ -14062,6 +14140,7 @@ def _claude_attempt(
                     on_process_quiescent=process_quiescent.set,
                 )
                 quiescence_signal_mask_owner = _ClaudeSignalMaskOwner()
+                quiescence_error: BaseException | None = None
                 try:
                     quiescence_mask = block_forwarded_signals(
                         signal_mask_owner=quiescence_signal_mask_owner,
@@ -14075,8 +14154,24 @@ def _claude_attempt(
                             quiescence_mask
                         )
                     process_quiescent.set()
+                except BaseException as error:
+                    quiescence_error = error
+                    raise
                 finally:
-                    quiescence_signal_mask_owner.restore_previous_signal_mask()
+                    restore_error = (
+                        _restore_claude_signal_mask_owner_bounded(
+                            quiescence_signal_mask_owner
+                        )
+                    )
+                    if restore_error is not None:
+                        selected_error = (
+                            _select_claude_thread_start_related_error(
+                                quiescence_error,
+                                restore_error,
+                            )
+                        )
+                        assert selected_error is not None
+                        raise selected_error
         except ClaudeCredentialInspectionInconclusive as error:
             persistence_failed = completed is not None
             _update_claude_runtime_report_preserving_persistence(

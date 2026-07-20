@@ -11,6 +11,7 @@ import pathlib
 import platform
 import re
 import secrets
+import signal
 import stat
 import struct
 import tempfile
@@ -38,6 +39,7 @@ from .common import (
     ReviewError,
     block_forwarded_signals,
     consume_pending_forwarded_signal,
+    forwarded_signals,
     restore_signal_mask,
     run_bounded_capture,
 )
@@ -2183,9 +2185,24 @@ def _is_control_flow_error(error: BaseException) -> bool:
     return not isinstance(error, Exception) or isinstance(error, ForwardedSignal)
 
 
+@dataclass
+class _DeferredCleanupSignals:
+    errors: list[BaseException]
+    mask_established: bool
+    fail_closed_error: BaseException | None = None
+
+
+class _SkipUnmaskedCredentialCleanup(Exception):
+    """Stop before destructive cleanup after fail-closed retention."""
+
+
 @contextlib.contextmanager
 def _defer_forwarded_signals_during_cleanup(
-) -> Iterator[list[BaseException]]:
+    *,
+    retain_unmasked_cleanup: Callable[
+        [list[BaseException]], BaseException
+    ],
+) -> Iterator[_DeferredCleanupSignals]:
     signal_mask_owner = ForwardedSignalMaskOwner()
     deferred_signals: list[BaseException] = []
     for _attempt in range(2):
@@ -2201,8 +2218,31 @@ def _defer_forwarded_signals_during_cleanup(
                 break
             continue
         break
+    fail_closed_error: BaseException | None = None
+    if not signal_mask_owner.active:
+        while fail_closed_error is None:
+            try:
+                fail_closed_error = retain_unmasked_cleanup(
+                    deferred_signals
+                )
+            except BaseException as error:
+                deferred_signals.append(error)
+                continue
+    cleanup_signals = _DeferredCleanupSignals(
+        errors=deferred_signals,
+        mask_established=signal_mask_owner.active,
+        fail_closed_error=fail_closed_error,
+    )
     try:
-        yield deferred_signals
+        try:
+            yield cleanup_signals
+        except _SkipUnmaskedCredentialCleanup:
+            if cleanup_signals.mask_established:
+                raise
+        except BaseException as error:
+            if cleanup_signals.mask_established:
+                raise
+            deferred_signals.append(error)
     finally:
         try:
             pending_signal = None
@@ -2212,24 +2252,52 @@ def _defer_forwarded_signals_during_cleanup(
                 deferred_signals.append(ForwardedSignal(pending_signal))
         except BaseException as error:
             deferred_signals.append(error)
-        try:
-            signal_mask_owner.restore(restore_signal_mask)
-        except BaseException as error:
-            deferred_signals.append(error)
+        for _attempt in range(2):
+            try:
+                signal_mask_owner.restore(restore_signal_mask)
+            except BaseException as error:
+                deferred_signals.append(error)
+                if signal_mask_owner.active:
+                    continue
+            break
 
 
 def _restore_forwarded_signal_mask_owner(
     signal_mask_owner: ForwardedSignalMaskOwner,
     primary_error: BaseException | None,
 ) -> None:
-    try:
-        signal_mask_owner.restore(restore_signal_mask)
-    except BaseException as restore_error:
-        if primary_error is None:
-            raise
-        selected = _primary_cleanup_error([primary_error, restore_error])
+    restore_errors: list[BaseException] = []
+    for _attempt in range(2):
+        try:
+            signal_mask_owner.restore(restore_signal_mask)
+        except BaseException as restore_error:
+            restore_errors.append(restore_error)
+            if signal_mask_owner.active:
+                continue
+        break
+    if restore_errors:
+        selected = _primary_cleanup_error(
+            [
+                error
+                for error in (primary_error, *restore_errors)
+                if error is not None
+            ]
+        )
         assert selected is not None
         raise selected
+
+
+def _require_forwarded_signal_mask_owner(
+    signal_mask_owner: ForwardedSignalMaskOwner,
+    *,
+    operation: str,
+) -> None:
+    if signal_mask_owner.active:
+        return
+    raise LinuxCredentialInspectionInconclusive(
+        "cannot establish a caller-owned forwarded-signal mask before "
+        f"{operation}"
+    )
 
 
 def _primary_cleanup_error(
@@ -4052,6 +4120,495 @@ def _retained_staged_credential_error(
     return retained
 
 
+class _HostRefreshLockCleanupDecision(enum.Enum):
+    OPEN = enum.auto()
+    NORMAL_RELEASE = enum.auto()
+    RETAIN = enum.auto()
+    CANCEL = enum.auto()
+
+
+class _HostRefreshLockCleanupCoordinator:
+    """Own terminal host-lock cleanup on a signal-masked worker."""
+
+    def __init__(
+        self,
+        source_anchor: _CredentialDirectoryAnchor,
+    ) -> None:
+        self.owner = ClaudeRefreshLockOwner()
+        self._source_anchor = source_anchor
+        self._condition = threading.Condition()
+        self._decision = _HostRefreshLockCleanupDecision.OPEN
+        self._retention_reason = ""
+        self._watcher: _StagedCredentialWatcher | None = None
+        self._staged: StagedCredential | None = None
+        self._errors: list[BaseException] = []
+        self._retaining = False
+        self._source_terminal = False
+        self._worker_entered = threading.Event()
+        self._thread_unavailable = False
+        self._ready = threading.Event()
+        self._terminal = threading.Event()
+        self._worker_signal_mask: set[signal.Signals] | None = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name="codex-claude-host-lock-cleanup",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        try:
+            self._thread.start()
+        except BaseException:
+            if (
+                self._thread.ident is None
+                and not self._worker_entered.is_set()
+            ):
+                with self._condition:
+                    self._thread_unavailable = True
+                    self._ready.set()
+                    self._terminal.set()
+            raise
+        while not self._ready.wait(timeout=0.1):
+            pass
+        worker_mask = self._worker_signal_mask
+        if worker_mask is None or not set(forwarded_signals()).issubset(
+            worker_mask
+        ):
+            raise LinuxCredentialInspectionInconclusive(
+                "host refresh-lock cleanup coordinator did not inherit the "
+                "forwarded-signal mask"
+            )
+
+    def publish_watcher(
+        self,
+        staged: StagedCredential,
+        watcher: _StagedCredentialWatcher,
+    ) -> None:
+        with self._condition:
+            if self._decision is not _HostRefreshLockCleanupDecision.OPEN:
+                raise LinuxCredentialInspectionInconclusive(
+                    "cannot publish a staged watcher after host cleanup started"
+                )
+            self._staged = staged
+            self._watcher = watcher
+
+    def retain(
+        self,
+        *,
+        reason: str,
+    ) -> tuple[BaseException, ...]:
+        self._decide(
+            _HostRefreshLockCleanupDecision.RETAIN,
+            retention_reason=reason,
+        )
+        self._wait_until_terminal()
+        lease = self.owner.lease
+        if lease is not None and not lease.retention_snapshot().terminal:
+            raise LinuxCredentialInspectionInconclusive(
+                "host refresh-lock retention coordinator returned before "
+                "descriptor cleanup became terminal"
+            )
+        return tuple(self._errors)
+
+    def release_after_proven_cleanup(
+        self,
+    ) -> _ClaudeRefreshLockCleanupResult:
+        self._decide(_HostRefreshLockCleanupDecision.NORMAL_RELEASE)
+        self._wait_until_terminal()
+        lease = self.owner.lease
+        terminal = (
+            lease is None or lease.retention_snapshot().terminal
+        )
+        return _ClaudeRefreshLockCleanupResult(
+            error=_primary_cleanup_error(list(self._errors)),
+            terminal=terminal,
+        )
+
+    def cancel_without_lease(self) -> None:
+        self._decide(_HostRefreshLockCleanupDecision.CANCEL)
+        self._wait_until_terminal()
+
+    def _decide(
+        self,
+        decision: _HostRefreshLockCleanupDecision,
+        *,
+        retention_reason: str = "",
+    ) -> None:
+        with self._condition:
+            if self._thread_unavailable and (
+                decision is not _HostRefreshLockCleanupDecision.CANCEL
+            ):
+                raise LinuxCredentialInspectionInconclusive(
+                    "cannot assign host refresh-lock cleanup to a worker "
+                    "that failed before thread entry"
+                )
+            if self._decision is _HostRefreshLockCleanupDecision.OPEN:
+                self._decision = decision
+                self._retention_reason = retention_reason
+                self._condition.notify_all()
+                return
+            if self._decision is decision:
+                return
+            raise LinuxCredentialInspectionInconclusive(
+                "conflicting Claude host refresh-lock cleanup decisions"
+            )
+
+    def _wait_until_terminal(self) -> None:
+        while not self._terminal.wait(timeout=0.1):
+            pass
+
+    def _wait_for_decision(self) -> _HostRefreshLockCleanupDecision:
+        with self._condition:
+            while self._decision is _HostRefreshLockCleanupDecision.OPEN:
+                self._condition.wait(timeout=0.1)
+            return self._decision
+
+    def _retain_source_anchor(self) -> None:
+        watcher = self._watcher
+        watcher_started = False
+        if watcher is not None:
+            while True:
+                try:
+                    watcher_started = watcher.has_started()
+                except BaseException as error:
+                    self._errors.append(error)
+                    continue
+                break
+        if watcher is None or not watcher_started:
+            self._source_anchor.detach_to_watcher()
+            self._source_anchor.close_if_detached()
+            self._source_terminal = True
+            return
+
+        while True:
+            try:
+                stop_error = watcher.request_stop()
+            except BaseException as error:
+                self._errors.append(error)
+                continue
+            if stop_error is not None:
+                self._errors.append(stop_error)
+            break
+        watcher_stopped = False
+        completed_waits = 0
+        while completed_waits < 2:
+            try:
+                watcher_stopped = watcher.wait_until_stopped()
+            except BaseException as error:
+                self._errors.append(error)
+                continue
+            if watcher_stopped:
+                break
+            completed_waits += 1
+        while True:
+            try:
+                watcher.retain_source_anchor_after_timeout()
+            except BaseException as error:
+                self._errors.append(error)
+                continue
+            break
+        if not self._source_anchor.detached_to_watcher:
+            raise LinuxCredentialInspectionInconclusive(
+                "host cleanup coordinator did not transfer the source anchor"
+            )
+        self._source_terminal = True
+        if not watcher_stopped:
+            self._errors.append(
+                LinuxStagedCredentialWatcherUnstopped(
+                    "staged Claude credential watcher remained active after "
+                    "its source descriptor was handed off"
+                )
+            )
+
+    def _retain_lease(self, lease: ClaudeRefreshLockLease) -> None:
+        lease._deletion_prohibited = True
+        lease._heartbeat_stop.set()
+        while not lease.retention_snapshot().terminal:
+            try:
+                lease.abandon(self._retention_reason)
+            except BaseException as error:
+                self._errors.append(error)
+            if lease.retention_snapshot().terminal:
+                break
+            try:
+                lease.release()
+            except BaseException as error:
+                self._errors.append(error)
+
+    def _run(self) -> None:
+        self._worker_entered.set()
+        try:
+            self._worker_signal_mask = signal.pthread_sigmask(
+                signal.SIG_BLOCK,
+                set(),
+            )
+        except BaseException as error:
+            self._errors.append(error)
+        finally:
+            self._ready.set()
+        while True:
+            try:
+                decision = self._wait_for_decision()
+            except BaseException as error:
+                self._errors.append(error)
+                continue
+            break
+        lease = self.owner.lease
+        try:
+            if decision is _HostRefreshLockCleanupDecision.CANCEL:
+                if lease is not None:
+                    self._retaining = True
+                    self._retention_reason = (
+                        "host refresh-lock acquisition was cancelled after "
+                        "publishing lease ownership"
+                    )
+                    self._retain_source_anchor()
+                    self._retain_lease(lease)
+                return
+            if decision is _HostRefreshLockCleanupDecision.NORMAL_RELEASE:
+                if lease is not None:
+                    try:
+                        # Explicit leases are destructively released only after
+                        # the masked coordinator accepts proven carrier cleanup.
+                        lease._release(skip_abandoned=False)
+                    except BaseException as error:
+                        self._errors.append(error)
+                        self._retaining = True
+                        self._retention_reason = (
+                            "proven host refresh-lock release became "
+                            "inconclusive"
+                        )
+                        self._retain_source_anchor()
+                        self._retain_lease(lease)
+                return
+            assert decision is _HostRefreshLockCleanupDecision.RETAIN
+            self._retaining = True
+            self._retain_source_anchor()
+            if lease is not None:
+                self._retain_lease(lease)
+        except BaseException as error:
+            self._errors.append(error)
+            if self._retaining:
+                while not self._source_terminal:
+                    try:
+                        self._retain_source_anchor()
+                    except BaseException as retry_error:
+                        self._errors.append(retry_error)
+            if lease is not None:
+                self._retention_reason = (
+                    self._retention_reason
+                    or "host cleanup coordinator failed closed"
+                )
+                while not lease.retention_snapshot().terminal:
+                    try:
+                        self._retain_lease(lease)
+                    except BaseException as retry_error:
+                        self._errors.append(retry_error)
+        finally:
+            lease = self.owner.lease
+            source_terminal = (
+                not self._retaining or self._source_terminal
+            )
+            if source_terminal and (
+                lease is None or lease.retention_snapshot().terminal
+            ):
+                self._terminal.set()
+
+
+def _retain_unmasked_credential_cleanup(
+    *,
+    mask_errors: list[BaseException],
+    staged: StagedCredential | None,
+    carrier_root: pathlib.Path | None,
+    watcher: _StagedCredentialWatcher | None,
+    watcher_started: bool,
+    host_refresh_lock_owner: ClaudeRefreshLockOwner,
+    host_refresh_lock: ClaudeRefreshLockLease | None,
+    host_refresh_lock_coordinator: (
+        _HostRefreshLockCleanupCoordinator | None
+    ),
+) -> BaseException:
+    """Retain credentials and abandon the host lease before yielding unmasked."""
+
+    cleanup_host_refresh_lock = (
+        host_refresh_lock
+        if host_refresh_lock is not None
+        else host_refresh_lock_owner.lease
+    )
+    stateful_host_refresh_lock = (
+        _stateful_claude_refresh_lock_lease(cleanup_host_refresh_lock)
+        if cleanup_host_refresh_lock is not None
+        else None
+    )
+    fallback_diagnostic: BaseException | None = None
+    if stateful_host_refresh_lock is not None:
+        fallback_diagnostic = (
+            stateful_host_refresh_lock._retention_recovery_evidence
+        )
+        if host_refresh_lock_coordinator is None:
+            # Coordinator-backed leases publish this state only on their
+            # signal-masked worker. This fallback is limited to legacy callers
+            # that never started a host coordinator.
+            stateful_host_refresh_lock._deletion_prohibited = True
+            stateful_host_refresh_lock._heartbeat_stop.set()
+
+    mask_error = _primary_cleanup_error(mask_errors)
+    if mask_error is None:
+        mask_error = LinuxCredentialInspectionInconclusive(
+            "cannot establish a forwarded-signal mask for Claude credential "
+            "cleanup"
+        )
+    if staged is not None:
+        retention_error: BaseException = _retained_staged_credential_error(
+            staged,
+            mask_error,
+        )
+    else:
+        retained_location = (
+            f" at {carrier_root}" if carrier_root is not None else ""
+        )
+        retention_error = LinuxCredentialInspectionInconclusive(
+            "cannot establish a forwarded-signal mask; partial Claude "
+            f"credential carrier state was retained{retained_location}"
+        )
+        retention_error.__cause__ = mask_error
+        if carrier_root is not None:
+            setattr(
+                retention_error,
+                "_codex_claude_retained_credential_carrier",
+                str(carrier_root),
+            )
+            setattr(
+                retention_error,
+                "_codex_claude_refresh_persistence_failed",
+                True,
+            )
+    _attach_host_refresh_lock_recovery(
+        retention_error,
+        fallback_diagnostic,
+    )
+
+    if host_refresh_lock_coordinator is not None:
+        coordinator_errors = host_refresh_lock_coordinator.retain(
+            reason=(
+                "forwarded-signal masking failed before Claude credential "
+                "cleanup; retaining the private carrier and shared refresh "
+                "locks"
+            )
+        )
+        mask_errors.extend(coordinator_errors)
+        cleanup_host_refresh_lock = host_refresh_lock_coordinator.owner.lease
+        if cleanup_host_refresh_lock is not None:
+            terminal_diagnostic = (
+                cleanup_host_refresh_lock.retention_snapshot().diagnostic
+            )
+            _attach_host_refresh_lock_recovery(
+                retention_error,
+                terminal_diagnostic,
+            )
+        return retention_error
+
+    watcher_is_started = watcher_started
+    if watcher is not None and not watcher_is_started:
+        try:
+            watcher_is_started = watcher.has_started()
+        except BaseException as error:
+            mask_errors.append(error)
+            watcher_is_started = True
+    if watcher is not None and watcher_is_started:
+        while True:
+            try:
+                stop_error = watcher.request_stop()
+            except BaseException as error:
+                mask_errors.append(error)
+                continue
+            if stop_error is not None:
+                mask_errors.append(stop_error)
+            break
+        watcher_stopped = False
+        completed_waits = 0
+        while completed_waits < 2:
+            try:
+                watcher_stopped = watcher.wait_until_stopped()
+            except BaseException as error:
+                mask_errors.append(error)
+                continue
+            if watcher_stopped:
+                break
+            completed_waits += 1
+        if not watcher_stopped:
+            while True:
+                try:
+                    watcher.retain_source_anchor_after_timeout()
+                except BaseException as error:
+                    mask_errors.append(error)
+                    continue
+                break
+            unstopped = LinuxStagedCredentialWatcherUnstopped(
+                "staged Claude credential watcher did not stop during "
+                "fail-closed unmasked cleanup; the private recovery carrier "
+                "was retained"
+            )
+            _add_writeback_note(retention_error, unstopped)
+
+    if cleanup_host_refresh_lock is None:
+        return retention_error
+    assert stateful_host_refresh_lock is not None
+
+    abandonment_reason = (
+        "forwarded-signal masking failed before Claude credential cleanup; "
+        "retaining the private carrier and shared refresh locks"
+    )
+    while True:
+        try:
+            abandonment_cleanup = _abandon_owned_claude_refresh_lock(
+                cleanup_host_refresh_lock,
+                reason=abandonment_reason,
+                primary_error=retention_error,
+                message=(
+                    "cannot abandon Claude credential refresh transaction "
+                    "lock after signal-mask failure"
+                ),
+            )
+        except BaseException as error:
+            mask_errors.append(error)
+            _add_cleanup_note(retention_error, error)
+        else:
+            if abandonment_cleanup.error is not None and (
+                abandonment_cleanup.error is not retention_error
+            ):
+                mask_errors.append(abandonment_cleanup.error)
+                _add_cleanup_note(
+                    retention_error,
+                    abandonment_cleanup.error,
+                )
+            if abandonment_cleanup.terminal:
+                terminal_diagnostic = (
+                    stateful_host_refresh_lock.retention_snapshot().diagnostic
+                )
+                _attach_host_refresh_lock_recovery(
+                    retention_error,
+                    terminal_diagnostic,
+                )
+                return retention_error
+        terminal, terminal_diagnostic = (
+            _claude_refresh_lock_retention_terminal(
+                stateful_host_refresh_lock
+            )
+        )
+        if terminal:
+            _attach_host_refresh_lock_recovery(
+                retention_error,
+                terminal_diagnostic,
+            )
+            return retention_error
+        try:
+            stateful_host_refresh_lock.release()
+        except BaseException as error:
+            mask_errors.append(error)
+            _add_cleanup_note(retention_error, error)
+
+
 def _final_drain_with_staged_lock_recovery(
     watcher: _StagedCredentialWatcher,
     staged: StagedCredential,
@@ -4174,6 +4731,9 @@ def _stage_claude_credentials_anchored(
     expires_at_ms = 0.0
     original_identity: _CredentialFileIdentity | None = None
     host_refresh_lock_owner = ClaudeRefreshLockOwner()
+    host_refresh_lock_coordinator: (
+        _HostRefreshLockCleanupCoordinator | None
+    ) = None
     host_refresh_lock: ClaudeRefreshLockLease | None = None
     staged: StagedCredential | None = None
     carrier_root: pathlib.Path | None = None
@@ -4196,6 +4756,19 @@ def _stage_claude_credentials_anchored(
                     block_forwarded_signals(
                         signal_mask_owner=refresh_lock_signal_mask_owner,
                     )
+                    _require_forwarded_signal_mask_owner(
+                        refresh_lock_signal_mask_owner,
+                        operation=(
+                            "starting the Claude refresh-lock heartbeat"
+                        ),
+                    )
+                    host_refresh_lock_coordinator = (
+                        _HostRefreshLockCleanupCoordinator(source_anchor)
+                    )
+                    host_refresh_lock_owner = (
+                        host_refresh_lock_coordinator.owner
+                    )
+                    host_refresh_lock_coordinator.start()
                     host_refresh_lock = acquire_claude_refresh_lock(
                         source.parent,
                         protocol=refresh_lock_protocol,
@@ -4204,6 +4777,7 @@ def _stage_claude_credentials_anchored(
                         legacy_parent_dir_fd=(
                             source_anchor.legacy_parent_descriptor
                         ),
+                        require_explicit_context_release=True,
                     )
                     host_refresh_lock_owner.transfer(host_refresh_lock)
                 except BaseException as error:
@@ -4265,11 +4839,19 @@ def _stage_claude_credentials_anchored(
                 refresh_lock_protocol=refresh_lock_protocol,
                 coordinated_refresh_lock=host_refresh_lock,
             )
+            assert host_refresh_lock_coordinator is not None
+            host_refresh_lock_coordinator.publish_watcher(staged, watcher)
             watcher_signal_mask_owner = ForwardedSignalMaskOwner()
             watcher_start_error: BaseException | None = None
             try:
                 block_forwarded_signals(
                     signal_mask_owner=watcher_signal_mask_owner,
+                )
+                _require_forwarded_signal_mask_owner(
+                    watcher_signal_mask_owner,
+                    operation=(
+                        "starting the staged Claude credential watcher"
+                    ),
                 )
                 watcher.start()
                 watcher_started = True
@@ -4286,10 +4868,36 @@ def _stage_claude_credentials_anchored(
         failure = error
         raise
     finally:
-        with _defer_forwarded_signals_during_cleanup() as deferred_signals:
-            writeback_error: BaseException | None = None
-            payload_error: BaseException | None = None
-            cleanup_error: BaseException | None = None
+        writeback_error: BaseException | None = None
+        payload_error: BaseException | None = None
+        cleanup_error: BaseException | None = None
+        deferred_signals: list[BaseException] = []
+
+        def retain_unmasked_cleanup(
+            mask_errors: list[BaseException],
+        ) -> BaseException:
+            return _retain_unmasked_credential_cleanup(
+                mask_errors=mask_errors,
+                staged=staged,
+                carrier_root=carrier_root,
+                watcher=watcher,
+                watcher_started=watcher_started,
+                host_refresh_lock_owner=host_refresh_lock_owner,
+                host_refresh_lock=host_refresh_lock,
+                host_refresh_lock_coordinator=(
+                    host_refresh_lock_coordinator
+                ),
+            )
+
+        with _defer_forwarded_signals_during_cleanup(
+            retain_unmasked_cleanup=retain_unmasked_cleanup,
+        ) as cleanup_signals:
+            deferred_signals = cleanup_signals.errors
+            writeback_error = cleanup_signals.fail_closed_error
+            payload_error = None
+            cleanup_error = None
+            if not cleanup_signals.mask_established:
+                raise _SkipUnmaskedCredentialCleanup
             cleanup_is_safe = True
             carrier_cleanup_proven = False
             retain_for_recovery = False
@@ -4513,6 +5121,105 @@ def _stage_claude_credentials_anchored(
                 if host_refresh_lock is not None
                 else host_refresh_lock_owner.lease
             )
+            if host_refresh_lock_coordinator is not None:
+                if cleanup_host_refresh_lock is None:
+                    host_refresh_lock_coordinator.cancel_without_lease()
+                elif not host_refresh_lock_owner.transferred:
+                    coordinator_error = (
+                        LinuxCredentialInspectionInconclusive(
+                            "host refresh-lock ownership transfer did not "
+                            "complete; retaining the shared locks"
+                        )
+                    )
+                    coordinator_errors = (
+                        host_refresh_lock_coordinator.retain(
+                            reason=str(coordinator_error),
+                        )
+                    )
+                    writeback_error = _primary_cleanup_error(
+                        [coordinator_error, *coordinator_errors]
+                    )
+                    terminal_diagnostic = (
+                        cleanup_host_refresh_lock.retention_snapshot().diagnostic
+                    )
+                    _attach_host_refresh_lock_recovery(
+                        writeback_error,
+                        terminal_diagnostic,
+                    )
+                elif retain_for_recovery or not carrier_cleanup_proven:
+                    if retain_for_recovery:
+                        if writeback_error is None:
+                            writeback_error = (
+                                LinuxCredentialInspectionInconclusive(
+                                    "Claude credential refresh persistence "
+                                    "was not proven"
+                                )
+                            )
+                        coordinator_error = writeback_error
+                    else:
+                        if cleanup_error is None:
+                            cleanup_error = (
+                                LinuxCredentialInspectionInconclusive(
+                                    "staged Claude credential carrier cleanup "
+                                    "was not proven"
+                                )
+                            )
+                        coordinator_error = cleanup_error
+                    coordinator_errors = (
+                        host_refresh_lock_coordinator.retain(
+                            reason=str(coordinator_error),
+                        )
+                    )
+                    selected_coordinator_error = _primary_cleanup_error(
+                        [coordinator_error, *coordinator_errors]
+                    )
+                    terminal_diagnostic = (
+                        cleanup_host_refresh_lock.retention_snapshot().diagnostic
+                    )
+                    _attach_host_refresh_lock_recovery(
+                        selected_coordinator_error,
+                        terminal_diagnostic,
+                    )
+                    if retain_for_recovery:
+                        writeback_error = selected_coordinator_error
+                    else:
+                        cleanup_error = selected_coordinator_error
+                else:
+                    host_refresh_lock_cleanup = (
+                        host_refresh_lock_coordinator.release_after_proven_cleanup()
+                    )
+                    host_refresh_lock_error = (
+                        host_refresh_lock_cleanup.error
+                    )
+                    if (
+                        not host_refresh_lock_cleanup.terminal
+                        and host_refresh_lock_error is None
+                    ):
+                        host_refresh_lock_error = (
+                            LinuxCredentialInspectionInconclusive(
+                                "masked host refresh-lock coordinator did not "
+                                "reach a terminal release state"
+                            )
+                        )
+                    if host_refresh_lock_error is not None:
+                        terminal_diagnostic = (
+                            cleanup_host_refresh_lock.retention_snapshot().diagnostic
+                        )
+                        _attach_host_refresh_lock_recovery(
+                            host_refresh_lock_error,
+                            terminal_diagnostic,
+                        )
+                        writeback_error = _primary_cleanup_error(
+                            [
+                                candidate
+                                for candidate in (
+                                    writeback_error,
+                                    host_refresh_lock_error,
+                                )
+                                if candidate is not None
+                            ]
+                        )
+                cleanup_host_refresh_lock = None
             if cleanup_host_refresh_lock is not None:
                 if not host_refresh_lock_owner.transferred:
                     release_message = (
@@ -4837,6 +5544,12 @@ def _stage_claude_credentials_anchored(
                                 if candidate is not None
                             ]
                         )
+        deferred_signals = cleanup_signals.errors
+        if (
+            writeback_error is None
+            and cleanup_signals.fail_closed_error is not None
+        ):
+            writeback_error = cleanup_signals.fail_closed_error
         control_flow_error = next(
             (
                 error
