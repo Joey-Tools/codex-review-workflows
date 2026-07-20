@@ -71,7 +71,8 @@ LEGACY_STATE_SCHEMA_VERSION = 1
 STATE_SCHEMA_VERSION = 2
 LEGACY_STATE_MARKER = b"isolated-review-state-v1\n"
 COMPATIBLE_STATE_MARKER_SCHEMA_VERSION = 2
-STATE_MARKER_SCHEMA_VERSION = 3
+PREVIOUS_STATE_MARKER_SCHEMA_VERSION = 3
+STATE_MARKER_SCHEMA_VERSION = 4
 MAX_STATE_MARKER_BYTES = 64 * 1024
 LEGACY_STATE_REQUIRED_FIELDS = frozenset(
     {
@@ -144,6 +145,7 @@ class LoadedStateMarker:
     version: int
     phase: str
     private_cleanup: PrivateCleanupEvidence | None
+    runner_lock: CleanupIdentity | None
     source_root: pathlib.Path | None
 
 
@@ -426,11 +428,15 @@ def _state_path(state_dir: pathlib.Path) -> pathlib.Path:
     return state_dir / STATE_FILE
 
 
-def _state_marker_payload(review: ReviewWorkspace) -> dict[str, Any]:
+def _state_marker_payload(
+    review: ReviewWorkspace,
+    runner_lock: CleanupIdentity,
+) -> dict[str, Any]:
     return {
         "container_dir": str(review.container_dir),
         "phase": "ready",
         "private_cleanup": review.private_cleanup.to_json(),
+        "runner_lock": runner_lock.to_json(),
         "source_root": str(review.source_root),
         "version": STATE_MARKER_SCHEMA_VERSION,
     }
@@ -439,11 +445,13 @@ def _state_marker_payload(review: ReviewWorkspace) -> dict[str, Any]:
 def _preparing_state_marker_payload(
     container: pathlib.Path,
     private_cleanup: PrivateCleanupEvidence,
+    runner_lock: CleanupIdentity,
 ) -> dict[str, Any]:
     return {
         "container_dir": str(container),
         "phase": "preparing",
         "private_cleanup": private_cleanup.to_json(),
+        "runner_lock": runner_lock.to_json(),
         "source_root": str(container.parent.parent),
         "version": STATE_MARKER_SCHEMA_VERSION,
     }
@@ -470,18 +478,22 @@ def _write_state_marker_payload(
 def _write_preparing_state_marker(
     container: pathlib.Path,
     private_cleanup: PrivateCleanupEvidence,
+    runner_lock: CleanupIdentity,
 ) -> None:
     _write_state_marker_payload(
         container,
-        _preparing_state_marker_payload(container, private_cleanup),
+        _preparing_state_marker_payload(container, private_cleanup, runner_lock),
         expected=private_cleanup,
     )
 
 
-def _write_state_marker(review: ReviewWorkspace) -> None:
+def _write_state_marker(
+    review: ReviewWorkspace,
+    runner_lock: CleanupIdentity,
+) -> None:
     _write_state_marker_payload(
         review.container_dir,
-        _state_marker_payload(review),
+        _state_marker_payload(review, runner_lock),
         expected=review.private_cleanup,
     )
 
@@ -500,18 +512,16 @@ class ReviewPreparationGuard:
                 raise ReviewError(
                     "workspace preparation lock container changed during handoff"
                 )
-            opened = os.fstat(self._lock_handle.fileno())
             try:
-                current = os.lstat(lock_path)
-            except OSError as error:
+                validate_private_lock_file(
+                    lock_path,
+                    self._lock_handle,
+                    label="workspace preparation lock",
+                )
+            except ReviewError as error:
                 raise ReviewError(
                     f"workspace preparation lock changed during handoff: {error}"
                 ) from error
-            if CleanupIdentity(opened.st_dev, opened.st_ino) != CleanupIdentity(
-                current.st_dev,
-                current.st_ino,
-            ):
-                raise ReviewError("workspace preparation lock changed during handoff")
             return
 
         flags = (
@@ -525,19 +535,14 @@ class ReviewPreparationGuard:
         candidate = None
         try:
             descriptor = os.open(lock_path, flags, 0o600)
+            os.fchmod(descriptor, 0o600)
             candidate = os.fdopen(descriptor, "w+b")
             descriptor = None
-            opened = os.fstat(candidate.fileno())
-            current = os.lstat(lock_path)
-            if (
-                not stat.S_ISREG(opened.st_mode)
-                or opened.st_nlink != 1
-                or opened.st_uid != os.geteuid()
-                or opened.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-                or CleanupIdentity(opened.st_dev, opened.st_ino)
-                != CleanupIdentity(current.st_dev, current.st_ino)
-            ):
-                raise ReviewError("workspace preparation lock is invalid")
+            validate_private_lock_file(
+                lock_path,
+                candidate,
+                label="workspace preparation lock",
+            )
             fcntl.flock(candidate.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             self._lock_handle = candidate
             self._lock_container = container
@@ -558,7 +563,11 @@ class ReviewPreparationGuard:
         private_cleanup: PrivateCleanupEvidence,
     ) -> None:
         self._ensure_lock(container)
-        _write_preparing_state_marker(container, private_cleanup)
+        _write_preparing_state_marker(
+            container,
+            private_cleanup,
+            self._runner_lock_identity(),
+        )
 
     def accept_workspace(self, prepared: ReviewWorkspace) -> None:
         if self._lock_handle is None:
@@ -568,8 +577,14 @@ class ReviewPreparationGuard:
             )
         else:
             self._ensure_lock(prepared.container_dir)
-        _write_state_marker(prepared)
+        _write_state_marker(prepared, self._runner_lock_identity())
         self._review = prepared
+
+    def _runner_lock_identity(self) -> CleanupIdentity:
+        if self._lock_handle is None:
+            raise ReviewError("workspace preparation lock handoff did not complete")
+        metadata = os.fstat(self._lock_handle.fileno())
+        return CleanupIdentity(metadata.st_dev, metadata.st_ino)
 
     @property
     def review(self) -> ReviewWorkspace | None:
@@ -718,6 +733,19 @@ def _validate_v3_marker_layout(
     return source_root
 
 
+def _parse_runner_lock_identity(value: Any) -> CleanupIdentity:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"device", "inode"}
+        or type(value["device"]) is not int
+        or type(value["inode"]) is not int
+        or value["device"] < 0
+        or value["inode"] <= 0
+    ):
+        raise ReviewError("isolated-review state marker runner lock is invalid")
+    return CleanupIdentity(value["device"], value["inode"])
+
+
 def _state_marker_metadata_key(metadata: os.stat_result) -> tuple[int, ...]:
     return (
         metadata.st_dev,
@@ -841,6 +869,7 @@ def _load_state_marker(state_dir: pathlib.Path) -> LoadedStateMarker:
             version=LEGACY_STATE_SCHEMA_VERSION,
             phase="legacy",
             private_cleanup=None,
+            runner_lock=None,
             source_root=None,
         )
     try:
@@ -866,17 +895,24 @@ def _load_state_marker(state_dir: pathlib.Path) -> LoadedStateMarker:
             version=version,
             phase="ready",
             private_cleanup=parse_private_cleanup_evidence(marker["private_cleanup"]),
+            runner_lock=None,
             source_root=None,
         )
-    if version != STATE_MARKER_SCHEMA_VERSION:
+    if version not in {
+        PREVIOUS_STATE_MARKER_SCHEMA_VERSION,
+        STATE_MARKER_SCHEMA_VERSION,
+    }:
         raise ReviewError("isolated-review state marker version is invalid")
-    if set(marker) != {
+    expected_fields = {
         "container_dir",
         "phase",
         "private_cleanup",
         "source_root",
         "version",
-    }:
+    }
+    if version == STATE_MARKER_SCHEMA_VERSION:
+        expected_fields.add("runner_lock")
+    if set(marker) != expected_fields:
         raise ReviewError("isolated-review state marker fields are invalid")
     source_root = _validate_v3_marker_layout(
         marker["source_root"],
@@ -895,6 +931,11 @@ def _load_state_marker(state_dir: pathlib.Path) -> LoadedStateMarker:
         version=version,
         phase=phase,
         private_cleanup=cleanup_parser(marker["private_cleanup"]),
+        runner_lock=(
+            _parse_runner_lock_identity(marker["runner_lock"])
+            if version == STATE_MARKER_SCHEMA_VERSION
+            else None
+        ),
         source_root=source_root,
     )
 
@@ -981,6 +1022,7 @@ def load_review_state(
             marker.version
             not in {
                 COMPATIBLE_STATE_MARKER_SCHEMA_VERSION,
+                PREVIOUS_STATE_MARKER_SCHEMA_VERSION,
                 STATE_MARKER_SCHEMA_VERSION,
             }
             or marker.phase != "ready"
@@ -1031,33 +1073,129 @@ def _read_exit_code(state_dir: pathlib.Path) -> int | None:
         raise ReviewError(f"invalid exit code in {path}: {text!r}")
 
 
-def _runner_lock_held(lock_path: pathlib.Path) -> bool:
-    try:
-        handle = lock_path.open("rb")
-    except FileNotFoundError:
-        return False
-    except OSError as error:
+def _require_bound_runner_lock(marker: LoadedStateMarker) -> CleanupIdentity:
+    if marker.version != STATE_MARKER_SCHEMA_VERSION or marker.runner_lock is None:
         raise ReviewError(
-            f"cannot open review runner lock {lock_path}: {error}"
-        ) from error
+            "review state marker has no preparation-bound runner lock identity; "
+            "manual recovery is required for legacy v1/v2/v3 review state"
+        )
+    return marker.runner_lock
+
+
+def _probe_bound_runner_lock(
+    *,
+    state_dir: pathlib.Path,
+    state_dir_fd: int,
+    revalidate_state_directory: Callable[[], None],
+    marker: LoadedStateMarker,
+) -> bool:
+    expected = _require_bound_runner_lock(marker)
+    marker_cleanup = marker.private_cleanup
+    if marker_cleanup is None:
+        raise ReviewError(
+            "review state marker has no preparation-bound container identity"
+        )
+    container_metadata = os.fstat(state_dir_fd)
+    if (
+        CleanupIdentity(
+            container_metadata.st_dev,
+            container_metadata.st_ino,
+        )
+        != marker_cleanup.container
+    ):
+        raise ReviewError(
+            "review runner lock container does not match preparation identity"
+        )
+
+    lock_name = pathlib.Path(LOCK_FILE)
+    flags = os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+    descriptor: int | None = None
+    handle: BinaryIO | None = None
+    acquired = False
     try:
+        revalidate_state_directory()
+        descriptor = os.open(lock_name, flags, dir_fd=state_dir_fd)
+        handle = os.fdopen(descriptor, "r+b", buffering=0)
+        descriptor = None
+
+        def validate() -> None:
+            revalidate_state_directory()
+            metadata = _validate_regular_file_path_identity(
+                lock_name,
+                handle.fileno(),
+                label="review runner lock",
+                expected_mode=0o600,
+                dir_fd=state_dir_fd,
+            )
+            if CleanupIdentity(metadata.st_dev, metadata.st_ino) != expected:
+                raise ReviewError(
+                    "review runner lock does not match preparation identity"
+                )
+            revalidate_state_directory()
+
+        validate()
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
         except BlockingIOError:
+            validate()
             return True
         except OSError as error:
             raise ReviewError(
-                f"cannot probe review runner lock {lock_path}: {error}"
+                f"cannot probe review runner lock {state_dir / LOCK_FILE}: {error}"
             ) from error
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except OSError as error:
-            raise ReviewError(
-                f"cannot release review runner lock probe {lock_path}: {error}"
-            ) from error
+        validate()
         return False
+    except ReviewError:
+        raise
+    except OSError as error:
+        raise ReviewError(
+            f"cannot open review runner lock {state_dir / LOCK_FILE} safely: {error}"
+        ) from error
     finally:
-        handle.close()
+        if acquired and handle is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError as error:
+                if sys.exc_info()[0] is None:
+                    raise ReviewError(
+                        "cannot release review runner lock probe "
+                        f"{state_dir / LOCK_FILE}: {error}"
+                    ) from error
+        if handle is not None:
+            handle.close()
+        elif descriptor is not None:
+            os.close(descriptor)
+
+
+def _runner_lock_held(
+    state_dir: pathlib.Path,
+    *,
+    marker: LoadedStateMarker | None = None,
+    state_dir_fd: int | None = None,
+    revalidate_state_directory: Callable[[], None] | None = None,
+) -> bool:
+    marker = _load_state_marker(state_dir) if marker is None else marker
+    _require_bound_runner_lock(marker)
+    if state_dir_fd is not None:
+        if revalidate_state_directory is None:
+            raise ReviewError("bound review runner lock probe has no revalidator")
+        return _probe_bound_runner_lock(
+            state_dir=state_dir,
+            state_dir_fd=state_dir_fd,
+            revalidate_state_directory=revalidate_state_directory,
+            marker=marker,
+        )
+    with _open_private_cleanup_state_directory(state_dir) as (
+        opened_state_dir_fd,
+        revalidate,
+    ):
+        return _probe_bound_runner_lock(
+            state_dir=state_dir,
+            state_dir_fd=opened_state_dir_fd,
+            revalidate_state_directory=revalidate,
+            marker=marker,
+        )
 
 
 def _reap_started_process(pid: int) -> None:
@@ -1279,6 +1417,11 @@ def run_state(
             raise ReviewError(
                 "legacy v1 review state cannot be resumed; start a new review"
             )
+        marker = _load_state_marker(state_dir)
+        if marker.version != STATE_MARKER_SCHEMA_VERSION:
+            raise ReviewError(
+                "legacy v2/v3 review state cannot be resumed safely; start a new review"
+            )
         unblock_forwarded_signals()
         reviewer = state.get("reviewer")
         if not isinstance(reviewer, str):
@@ -1369,9 +1512,10 @@ def run_state(
 def status(state_dir: pathlib.Path) -> dict[str, Any]:
     state_dir = state_dir.expanduser().resolve()
     state, review = load_review_state(state_dir)
+    marker = _load_state_marker(state_dir)
     pid_value = state.get("pid")
     pid = pid_value if isinstance(pid_value, int) else 0
-    process_running = _runner_lock_held(state_dir / LOCK_FILE)
+    process_running = _runner_lock_held(state_dir, marker=marker)
     running = process_running
     if running:
         exit_code = None
@@ -1568,7 +1712,8 @@ def cleanup(state_dir: pathlib.Path, *, timeout_seconds: float | None) -> int:
     _validate_timeout(timeout_seconds)
     state_dir = state_dir.expanduser().resolve()
     _state_path(state_dir)
-    if _runner_lock_held(state_dir / LOCK_FILE):
+    marker = _load_state_marker(state_dir)
+    if _runner_lock_held(state_dir, marker=marker):
         return 3
     deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
     return _cleanup_terminal_workspace(state_dir, deadline=deadline, force=True)
@@ -1667,7 +1812,12 @@ def _cleanup_terminal_workspace(
                 dir_fd=state_dir_fd,
             )
             revalidate_state_directory()
-            if force and _runner_lock_held(state_dir / LOCK_FILE):
+            if _runner_lock_held(
+                state_dir,
+                marker=marker,
+                state_dir_fd=state_dir_fd,
+                revalidate_state_directory=revalidate_state_directory,
+            ):
                 return 3
             try:
                 state, review = load_review_state(state_dir)
