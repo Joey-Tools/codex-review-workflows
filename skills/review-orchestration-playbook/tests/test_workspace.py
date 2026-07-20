@@ -39,6 +39,7 @@ def test_git_environment() -> dict[str, str]:
     for name in (
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
         "GIT_DIR",
+        "GIT_GRAFT_FILE",
         "GIT_INDEX_FILE",
         "GIT_NO_LAZY_FETCH",
         "GIT_NO_REPLACE_OBJECTS",
@@ -2739,7 +2740,7 @@ class WorkspaceTest(unittest.TestCase):
             )
         self.assertFalse(review_root.exists())
 
-    def test_diverged_range_reports_merge_base_before_creating_container(self) -> None:
+    def test_diverged_range_reports_merge_base_and_cleans_container(self) -> None:
         git(self.repo, "switch", "-c", "diverged", self.base)
         (self.repo / "side.txt").write_text("side\n", encoding="utf-8")
         git(self.repo, "add", "side.txt")
@@ -2755,7 +2756,7 @@ class WorkspaceTest(unittest.TestCase):
                 base_ref=diverged,
                 head_ref=self.head,
             )
-        self.assertFalse(workspace_runtime._review_root_for_source(self.repo).exists())
+        self.assert_no_review_containers()
 
     def test_ancestor_check_ignores_local_replace_refs(self) -> None:
         git(self.repo, "switch", "-c", "replace-diverged", self.base)
@@ -2791,7 +2792,108 @@ class WorkspaceTest(unittest.TestCase):
                 base_ref=diverged,
                 head_ref=self.head,
             )
-        self.assertFalse(workspace_runtime._review_root_for_source(self.repo).exists())
+        self.assert_no_review_containers()
+
+    def test_ancestor_check_ignores_local_grafts(self) -> None:
+        git(self.repo, "switch", "-c", "graft-diverged", self.base)
+        (self.repo / "graft-side.txt").write_text("side\n", encoding="utf-8")
+        git(self.repo, "add", "graft-side.txt")
+        git(self.repo, "commit", "-m", "Graft diverge")
+        diverged = git(self.repo, "rev-parse", "HEAD")
+        grafts = self.repo / ".git" / "info" / "grafts"
+        grafts.write_text(f"{self.head} {diverged}\n", encoding="ascii")
+
+        self.assertEqual(
+            git(
+                self.repo,
+                "merge-base",
+                "--is-ancestor",
+                diverged,
+                self.head,
+            ),
+            "",
+        )
+        with self.assertRaisesRegex(ReviewError, "not an ancestor"):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=diverged,
+                head_ref=self.head,
+            )
+        self.assert_no_review_containers()
+
+    def test_ancestor_check_ignores_stale_commit_graph(self) -> None:
+        (self.repo / "middle.txt").write_text("middle\n", encoding="utf-8")
+        git(self.repo, "add", "middle.txt")
+        git(self.repo, "commit", "-m", "Middle")
+        middle = git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "final.txt").write_text("final\n", encoding="utf-8")
+        git(self.repo, "add", "final.txt")
+        git(self.repo, "commit", "-m", "Final")
+        final = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "commit-graph", "write", "--reachable")
+
+        middle_object = self.repo / ".git" / "objects" / middle[:2] / middle[2:]
+        self.assertTrue(middle_object.is_file())
+        middle_object.unlink()
+        self.assertEqual(
+            git(
+                self.repo,
+                "merge-base",
+                "--is-ancestor",
+                self.base,
+                final,
+            ),
+            "",
+        )
+        without_graph = subprocess.run(
+            (
+                "git",
+                "-c",
+                "core.commitGraph=false",
+                "-C",
+                str(self.repo),
+                "merge-base",
+                "--is-ancestor",
+                self.base,
+                final,
+            ),
+            check=False,
+            env=test_git_environment(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertNotEqual(without_graph.returncode, 0)
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "cannot verify that the frozen base is an ancestor of head",
+        ):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=final,
+            )
+        self.assert_no_review_containers()
+
+    def test_ancestor_check_fails_closed_when_merge_base_cannot_run(self) -> None:
+        responses = (
+            subprocess.CompletedProcess(("git",), 1, b"", b""),
+            subprocess.CompletedProcess(("git",), 128, b"", b"missing object"),
+        )
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "_run_sanitized_git_query",
+                side_effect=responses,
+            ),
+            self.assertRaisesRegex(ReviewError, "cannot determine the merge base"),
+        ):
+            workspace_runtime._require_ancestor_range(
+                git_view=self.repo / ".git",
+                object_directory=self.repo / ".git" / "objects",
+                base_sha="a" * 40,
+                head_sha="b" * 40,
+            )
 
     def test_keyboard_interrupt_cleans_partial_review_container(self) -> None:
         with (

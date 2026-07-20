@@ -1563,11 +1563,33 @@ def _frozen_command(
         "-c",
         "core.fsmonitor=false",
         "-c",
+        "core.commitGraph=false",
+        "-c",
         f"core.hooksPath={os.devnull}",
         "-c",
         "diff.external=",
         f"--git-dir={git_view}",
         *args,
+    )
+
+
+def _run_sanitized_git_query(
+    *,
+    git_view: pathlib.Path,
+    object_directory: pathlib.Path,
+    args: tuple[str, ...],
+    label: str,
+    check: bool = True,
+) -> subprocess.CompletedProcess[bytes]:
+    return _run_bounded_git_capture(
+        _frozen_command(git_view=git_view, args=args),
+        input_bytes=None,
+        check=check,
+        label=label,
+        byte_limit=MAX_SOURCE_GIT_QUERY_BYTES,
+        timeout_seconds=SOURCE_GIT_TIMEOUT_SECONDS,
+        timeout_label="source Git",
+        environment=_git_environment(object_directory=object_directory),
     )
 
 
@@ -1631,29 +1653,37 @@ def resolve_commit(repo: pathlib.Path, ref: str, *, label: str) -> str:
 
 
 def _require_ancestor_range(
-    repo: pathlib.Path,
     *,
+    git_view: pathlib.Path,
+    object_directory: pathlib.Path,
     base_sha: str,
     head_sha: str,
 ) -> None:
-    ancestor = _git(
-        repo,
-        "merge-base",
-        "--is-ancestor",
-        base_sha,
-        head_sha,
+    ancestor = _run_sanitized_git_query(
+        git_view=git_view,
+        object_directory=object_directory,
+        args=("merge-base", "--is-ancestor", base_sha, head_sha),
+        label="sanitized ancestry Git query",
         check=False,
     )
     if ancestor.returncode == 0:
         return
     if ancestor.returncode != 1:
         raise ReviewError("cannot verify that the frozen base is an ancestor of head")
-    merge_base = _git(repo, "merge-base", base_sha, head_sha, check=False)
+    merge_base = _run_sanitized_git_query(
+        git_view=git_view,
+        object_directory=object_directory,
+        args=("merge-base", base_sha, head_sha),
+        label="sanitized merge-base Git query",
+        check=False,
+    )
     if merge_base.returncode == 0 and merge_base.stdout.strip():
         suggestion = merge_base.stdout.decode("ascii").strip()
         detail = f"; use merge base {suggestion} as --base-ref"
-    else:
+    elif merge_base.returncode == 1:
         detail = "; the commits have no merge base"
+    else:
+        raise ReviewError("cannot determine the merge base for the frozen range")
     raise ReviewError(
         f"frozen base {base_sha} is not an ancestor of head {head_sha}{detail}"
     )
@@ -7336,12 +7366,16 @@ def audit_legacy_exemption(
         )
         by_commit: dict[str, list[AcceptedSyntheticValue]] = {}
         for token in exemption.values:
-            ancestor = _git(
-                source_root,
-                "merge-base",
-                "--is-ancestor",
-                token.containing_commit,
-                tip,
+            ancestor = _run_sanitized_git_query(
+                git_view=git_view,
+                object_directory=object_directory,
+                args=(
+                    "merge-base",
+                    "--is-ancestor",
+                    token.containing_commit,
+                    tip,
+                ),
+                label="sanitized legacy ancestry Git query",
                 check=False,
             )
             if ancestor.returncode != 0:
@@ -7435,11 +7469,6 @@ def prepare_workspace(
     source_root = resolve_repo_root(repo)
     base_sha = resolve_commit(source_root, base_ref, label="base ref")
     head_sha = resolve_commit(source_root, head_ref, label="head ref")
-    _require_ancestor_range(
-        source_root,
-        base_sha=base_sha,
-        head_sha=head_sha,
-    )
     if include_source_wip:
         if resolve_commit(source_root, "HEAD", label="source HEAD") != head_sha:
             raise ReviewError(
@@ -7492,6 +7521,12 @@ def prepare_workspace(
         source_git_view, source_object_directory = _create_sanitized_git_view(
             source_root=source_root,
             container=container,
+        )
+        _require_ancestor_range(
+            git_view=source_git_view,
+            object_directory=source_object_directory,
+            base_sha=base_sha,
+            head_sha=head_sha,
         )
         git_dir = _create_private_review_repository(
             container=container,

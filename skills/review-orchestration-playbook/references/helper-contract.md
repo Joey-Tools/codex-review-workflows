@@ -90,7 +90,7 @@ The helper places the detached worktree, private Git database, control artifacts
 
 ### Clean Content
 
-- Resolve `--base-ref` and `--head-ref` to commits and require base to be an ancestor of head.
+- Resolve `--base-ref` and `--head-ref` to commits and require base to be an ancestor of head. Both range admission and legacy-provenance ancestry queries run through a helper-owned sanitized Git view that reads only the source object directory with commit-graph acceleration disabled; source configuration, replacement refs, `.git/info/grafts`, and cached commit-graph parent edges cannot rewrite the accepted graph.
 - Require the source checkout to have no staged changes, unstaged changes, conflicts, dirty submodules, or non-ignored untracked files.
 - Create a helper-owned literal detached Git worktree at the exact head commit.
 - Back it with a helper-owned minimal Git database. Never run `git worktree add` against the source repository/common Git directory, register there, update a source ref, execute a source hook/filter, or write review objects into the source object database. A detached worktree owned solely by the helper-private Git database is required.

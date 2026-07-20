@@ -4320,6 +4320,128 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         self.assertNotIn(LEGACY_A, json.dumps(evidence, sort_keys=True))
         self.assertNotIn(longer, json.dumps(evidence, sort_keys=True))
 
+    def test_audit_master_ignores_local_grafts(self) -> None:
+        repo, base = self.new_repo({"README.md": "base\n"})
+        (repo / "README.md").write_text("tip\n", encoding="utf-8")
+        tip = self.commit(repo, "Tip")
+        git(repo, "remote", "add", "origin", "https://github.com/example/project.git")
+        git(repo, "switch", "-c", "graft-side", base)
+        (repo / "fixture.cfg").write_text(
+            assignment_text("access_token", LEGACY_A),
+            encoding="utf-8",
+        )
+        diverged = self.commit(repo, "Graft side")
+        (repo / ".git" / "info" / "grafts").write_text(
+            f"{tip} {diverged}\n",
+            encoding="ascii",
+        )
+        self.assertEqual(
+            git(repo, "merge-base", "--is-ancestor", diverged, tip),
+            "",
+        )
+
+        payload = catalog_payload()
+        payload["legacy_exemptions"] = [
+            {
+                "id": "historical-fixtures",
+                "repository": "example/project",
+                "verified_master_tip": tip,
+                "match": "non-increasing-global-count",
+                "values": [
+                    {
+                        "id": "historical-1",
+                        "rule": "generic-secret-assignment",
+                        "value_base64": legacy_value_base64(LEGACY_A),
+                        "containing_commit": diverged,
+                        "source_occurrences": 1,
+                    }
+                ],
+            }
+        ]
+        catalog = synthetic_tokens.parse_catalog_bytes(
+            json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        )
+        with (
+            mock.patch.object(workspace, "load_catalog", return_value=catalog),
+            self.assertRaisesRegex(ReviewError, "not an ancestor"),
+        ):
+            workspace.audit_legacy_exemption(
+                repo=repo,
+                ref=tip,
+                exemption=catalog.legacy_exemption("historical-fixtures"),
+            )
+
+    def test_audit_master_ignores_stale_commit_graph(self) -> None:
+        repo, containing = self.new_repo(
+            {"fixture.cfg": assignment_text("access_token", LEGACY_A)}
+        )
+        git(repo, "config", "gc.auto", "0")
+        git(repo, "remote", "add", "origin", "https://github.com/example/project.git")
+        git(repo, "commit", "--allow-empty", "-m", "Middle")
+        middle = git(repo, "rev-parse", "HEAD")
+        git(repo, "commit", "--allow-empty", "-m", "Tip")
+        tip = git(repo, "rev-parse", "HEAD")
+        git(repo, "commit-graph", "write", "--reachable")
+        git(repo, "commit-graph", "verify")
+
+        objects = repo / ".git" / "objects"
+        middle_object = objects / middle[:2] / middle[2:]
+        self.assertTrue(middle_object.is_file())
+        self.assertEqual(list((objects / "pack").glob("*.pack")), [])
+        middle_object.unlink()
+        self.assertEqual(
+            git(repo, "merge-base", "--is-ancestor", containing, tip),
+            "",
+        )
+        without_graph = subprocess.run(
+            (
+                "git",
+                "-c",
+                "core.commitGraph=false",
+                "-C",
+                str(repo),
+                "merge-base",
+                "--is-ancestor",
+                containing,
+                tip,
+            ),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertNotEqual(without_graph.returncode, 0)
+
+        payload = catalog_payload()
+        payload["legacy_exemptions"] = [
+            {
+                "id": "historical-fixtures",
+                "repository": "example/project",
+                "verified_master_tip": tip,
+                "match": "non-increasing-global-count",
+                "values": [
+                    {
+                        "id": "historical-1",
+                        "rule": "generic-secret-assignment",
+                        "value_base64": legacy_value_base64(LEGACY_A),
+                        "containing_commit": containing,
+                        "source_occurrences": 1,
+                    }
+                ],
+            }
+        ]
+        catalog = synthetic_tokens.parse_catalog_bytes(
+            json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        )
+        with (
+            mock.patch.object(workspace, "load_catalog", return_value=catalog),
+            self.assertRaisesRegex(ReviewError, "not an ancestor"),
+        ):
+            workspace.audit_legacy_exemption(
+                repo=repo,
+                ref=tip,
+                exemption=catalog.legacy_exemption("historical-fixtures"),
+            )
+
     def test_evidence_budget_rejects_a_new_key_before_insertion(self) -> None:
         counts: Counter[tuple[object, ...]] = Counter()
         for index in range(workspace.MAX_SYNTHETIC_EVIDENCE_ENTRIES):
