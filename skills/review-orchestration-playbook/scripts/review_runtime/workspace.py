@@ -188,15 +188,31 @@ MAX_SNAPSHOT_BYTES = 512 * 1024 * 1024
 MAX_SNAPSHOT_ENTRIES = 100_000
 MAX_TREE_METADATA_BYTES = 128 * 1024 * 1024
 MAX_PRIVATE_OBJECT_LIST_BYTES = 128 * 1024 * 1024
-# Each of base, head, and a WIP snapshot can contain one content object and one
-# tree object per entry, plus endpoint commits and a fixed metadata margin.
-MAX_PRIVATE_OBJECT_ENTRIES = 6 * MAX_SNAPSHOT_ENTRIES + 16
-MAX_PRIVATE_OBJECT_BYTES = 2 * MAX_SNAPSHOT_BYTES + 1024 * 1024
-MAX_PRIVATE_PACK_BYTES = MAX_PRIVATE_OBJECT_BYTES
-MAX_PRIVATE_STORAGE_BYTES = (
-    MAX_PRIVATE_PACK_BYTES + MAX_SNAPSHOT_BYTES + 2 * MAX_PRIVATE_OBJECT_LIST_BYTES
-)
 MAX_ENDPOINT_COMMIT_BYTES = 4 * 1024 * 1024
+# Each of base, head, and a WIP snapshot can contain one content object and one
+# tree object per entry, plus endpoint commits and a fixed entry margin.
+MAX_PRIVATE_OBJECT_ENTRIES = 6 * MAX_SNAPSHOT_ENTRIES + 16
+MAX_PRIVATE_OBJECT_BYTES = 2 * (
+    MAX_SNAPSHOT_BYTES + MAX_TREE_METADATA_BYTES + MAX_ENDPOINT_COMMIT_BYTES
+)
+# Bound pack framing, per-object compression expansion, and checksums separately
+# from the uncompressed endpoint objects.
+MAX_PRIVATE_PACK_OVERHEAD_BYTES = MAX_PRIVATE_OBJECT_LIST_BYTES
+MAX_PRIVATE_PACK_BYTES = MAX_PRIVATE_OBJECT_BYTES + MAX_PRIVATE_PACK_OVERHEAD_BYTES
+# WIP capture can add one snapshot of blobs plus tree objects. Its encoding
+# margin and the generated endpoint/WIP pack sidecars remain separately bounded.
+MAX_PRIVATE_WIP_STORAGE_BYTES = (
+    MAX_SNAPSHOT_BYTES + MAX_TREE_METADATA_BYTES + MAX_PRIVATE_PACK_OVERHEAD_BYTES
+)
+MAX_PRIVATE_PACK_SIDECAR_BYTES = 2 * MAX_PRIVATE_OBJECT_LIST_BYTES
+MAX_PRIVATE_STORAGE_BYTES = (
+    MAX_PRIVATE_PACK_BYTES
+    + MAX_PRIVATE_WIP_STORAGE_BYTES
+    + MAX_PRIVATE_PACK_SIDECAR_BYTES
+)
+MAX_PRIVATE_LOOSE_OBJECT_BYTES = (
+    MAX_TREE_METADATA_BYTES + MAX_PRIVATE_PACK_OVERHEAD_BYTES
+)
 # Signature scan material adds strict decoded bytes to content already bounded by
 # MAX_ENDPOINT_COMMIT_BYTES. Base64 decoding can add at most three bytes per four
 # joined body bytes, so twice the endpoint limit is a conservative total bound.
@@ -3805,7 +3821,7 @@ def _validate_private_object_storage_topology(
                             )
                         consume_storage(
                             metadata.st_size,
-                            per_file_limit=MAX_PRIVATE_OBJECT_BYTES,
+                            per_file_limit=MAX_PRIVATE_LOOSE_OBJECT_BYTES,
                             label="loose object",
                         )
     except ReviewError:

@@ -286,6 +286,78 @@ class WorkspaceTest(unittest.TestCase):
                 )
                 self.assertIn(b"\tlogAllRefUpdates = false\n", config)
 
+    def test_private_object_byte_budgets_include_endpoint_metadata(self) -> None:
+        endpoint_objects = (
+            ("blob", workspace_runtime.MAX_SNAPSHOT_BYTES),
+            ("tree", workspace_runtime.MAX_TREE_METADATA_BYTES),
+            ("commit", workspace_runtime.MAX_ENDPOINT_COMMIT_BYTES),
+        ) * 2
+        endpoint_bytes = sum(size for _object_type, size in endpoint_objects)
+        self.assertEqual(
+            workspace_runtime.MAX_PRIVATE_OBJECT_BYTES,
+            endpoint_bytes,
+        )
+        self.assertEqual(
+            workspace_runtime.MAX_PRIVATE_PACK_BYTES,
+            endpoint_bytes + workspace_runtime.MAX_PRIVATE_PACK_OVERHEAD_BYTES,
+        )
+        self.assertEqual(
+            workspace_runtime.MAX_PRIVATE_WIP_STORAGE_BYTES,
+            workspace_runtime.MAX_SNAPSHOT_BYTES
+            + workspace_runtime.MAX_TREE_METADATA_BYTES
+            + workspace_runtime.MAX_PRIVATE_PACK_OVERHEAD_BYTES,
+        )
+        self.assertEqual(
+            workspace_runtime.MAX_PRIVATE_STORAGE_BYTES,
+            workspace_runtime.MAX_PRIVATE_PACK_BYTES
+            + workspace_runtime.MAX_PRIVATE_WIP_STORAGE_BYTES
+            + workspace_runtime.MAX_PRIVATE_PACK_SIDECAR_BYTES,
+        )
+        self.assertLess(
+            workspace_runtime.MAX_PRIVATE_LOOSE_OBJECT_BYTES,
+            workspace_runtime.MAX_PRIVATE_OBJECT_BYTES,
+        )
+
+        metadata = b"".join(
+            f"{index:040x} {object_type} {size}\n".encode("ascii")
+            for index, (object_type, size) in enumerate(endpoint_objects, start=1)
+        )
+
+        def emit_metadata(*_args, destination, **_kwargs):
+            destination.write(metadata)
+
+        for limit, error_pattern in (
+            (endpoint_bytes, None),
+            (endpoint_bytes - 1, "endpoint objects exceed the byte limit"),
+        ):
+            with (
+                self.subTest(limit=limit),
+                tempfile.TemporaryFile() as object_ids,
+                mock.patch.object(
+                    workspace_runtime,
+                    "MAX_PRIVATE_OBJECT_BYTES",
+                    limit,
+                ),
+                mock.patch.object(
+                    workspace_runtime,
+                    "_run_bounded_process_to_file",
+                    side_effect=emit_metadata,
+                ),
+            ):
+                if error_pattern is None:
+                    workspace_runtime._validate_private_object_sizes(
+                        git_view=self.repo / "git-view",
+                        source_object_directory=self.repo / "objects",
+                        object_ids=object_ids,
+                    )
+                else:
+                    with self.assertRaisesRegex(ReviewError, error_pattern):
+                        workspace_runtime._validate_private_object_sizes(
+                            git_view=self.repo / "git-view",
+                            source_object_directory=self.repo / "objects",
+                            object_ids=object_ids,
+                        )
+
     def test_partial_clone_missing_blob_fails_without_transport(self) -> None:
         git(self.repo, "config", "uploadpack.allowFilter", "true")
         partial = pathlib.Path(self.temporary.name) / "partial"
@@ -1329,6 +1401,88 @@ class WorkspaceTest(unittest.TestCase):
         ):
             validate_external_workspace(review)
 
+    def test_private_object_storage_category_limits_accept_exact_sizes(self) -> None:
+        wip_directory = self.repo / "wip-budget"
+        wip_directory.mkdir()
+        (wip_directory / "entry.txt").write_text(
+            "WIP private object budget\n",
+            encoding="utf-8",
+        )
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+            include_source_wip=True,
+        )
+        self.reviews.append(review)
+
+        objects = review.git_dir / "objects"
+        pack_files = list((objects / "pack").glob("*.pack"))
+        sidecar_files = [
+            *list((objects / "pack").glob("*.idx")),
+            *list((objects / "pack").glob("*.rev")),
+        ]
+        loose_files = [
+            path for path in objects.glob("[0-9a-f][0-9a-f]/*") if path.is_file()
+        ]
+        self.assertTrue(pack_files)
+        self.assertTrue(sidecar_files)
+        self.assertTrue(loose_files)
+
+        pack_limit = max(path.stat().st_size for path in pack_files)
+        sidecar_limit = max(path.stat().st_size for path in sidecar_files)
+        loose_limit = max(path.stat().st_size for path in loose_files)
+        storage_limit = sum(
+            path.stat().st_size for path in (*pack_files, *sidecar_files, *loose_files)
+        )
+
+        def validate_limits(
+            *,
+            pack: int = pack_limit,
+            sidecar: int = sidecar_limit,
+            loose: int = loose_limit,
+            storage: int = storage_limit,
+        ) -> None:
+            with (
+                mock.patch.object(workspace_runtime, "MAX_PRIVATE_PACK_BYTES", pack),
+                mock.patch.object(
+                    workspace_runtime,
+                    "MAX_PRIVATE_OBJECT_LIST_BYTES",
+                    sidecar,
+                ),
+                mock.patch.object(
+                    workspace_runtime,
+                    "MAX_PRIVATE_LOOSE_OBJECT_BYTES",
+                    loose,
+                ),
+                mock.patch.object(
+                    workspace_runtime,
+                    "MAX_PRIVATE_STORAGE_BYTES",
+                    storage,
+                ),
+            ):
+                workspace_runtime._validate_private_object_storage_topology(
+                    review.git_dir,
+                    object_id_length=len(review.head_ref),
+                )
+
+        validate_limits()
+        for label, overrides, error_pattern in (
+            ("pack", {"pack": pack_limit - 1}, "pack file exceeds"),
+            ("sidecar", {"sidecar": sidecar_limit - 1}, "pack file exceeds"),
+            ("loose", {"loose": loose_limit - 1}, "loose object exceeds"),
+            (
+                "aggregate",
+                {"storage": storage_limit - 1},
+                "object storage exceeds",
+            ),
+        ):
+            with (
+                self.subTest(limit=label),
+                self.assertRaisesRegex(ReviewError, error_pattern),
+            ):
+                validate_limits(**overrides)
+
     def test_external_preflight_rejects_unexpected_private_ref(self) -> None:
         review = prepare_workspace(
             repo=self.repo,
@@ -2067,6 +2221,35 @@ class WorkspaceTest(unittest.TestCase):
             stat.S_IMODE((review.workspace_root / "example.txt").stat().st_mode),
             0o755,
         )
+
+    def test_nonowner_execute_bits_follow_git_filemode_semantics(self) -> None:
+        for source_mode in (0o654, 0o645):
+            with self.subTest(source_mode=oct(source_mode)):
+                (self.repo / "example.txt").write_text(
+                    f"WIP mode {source_mode:o}\n",
+                    encoding="utf-8",
+                )
+                (self.repo / "example.txt").chmod(source_mode)
+                review = prepare_workspace(
+                    repo=self.repo,
+                    base_ref=self.base,
+                    head_ref=self.head,
+                    include_source_wip=True,
+                )
+                self.reviews.append(review)
+                snapshot_entry = git(
+                    review.workspace_root,
+                    "ls-tree",
+                    review.snapshot_tree_sha,
+                    "example.txt",
+                )
+                self.assertEqual(snapshot_entry.split(maxsplit=1)[0], "100644")
+                self.assertEqual(
+                    stat.S_IMODE(
+                        (review.workspace_root / "example.txt").stat().st_mode
+                    ),
+                    0o644,
+                )
 
     def test_wip_rejects_collapsed_untracked_nested_repository(self) -> None:
         nested = self.repo / "nested"
