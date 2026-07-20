@@ -3920,6 +3920,27 @@ class WorkspaceTest(unittest.TestCase):
             "exact-value-scan-incomplete",
         )
 
+    def test_secret_delta_os_error_does_not_block_workspace_validation(
+        self,
+    ) -> None:
+        with mock.patch.object(
+            workspace_runtime,
+            "_secret_count_manifests",
+            side_effect=OSError("injected secret-count subprocess failure"),
+        ):
+            review = self.prepare_range(self.base, self.head)
+
+        secret_delta = self.assert_secret_delta_status(review, "inconclusive")
+        self.assertEqual(
+            secret_delta["failure_class"],
+            "exact-value-scan-incomplete",
+        )
+        self.assertEqual(secret_delta["location_status"], "inconclusive")
+        self.assertEqual(secret_delta["violations"], [])
+        self.assertIn(b"+two", review.diff_file.read_bytes())
+        evidence = validate_external_workspace(review)
+        self.assertEqual(evidence["secret_delta"], secret_delta)
+
     def test_unextractable_secret_shape_marks_admission_inconclusive(self) -> None:
         payload = b'password = "' + b"D" * 513 + b'"\n'
         oversized_head = self.commit_bytes(

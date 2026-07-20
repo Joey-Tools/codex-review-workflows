@@ -10983,7 +10983,7 @@ def prepare_workspace(
                 head_sha=head_sha,
                 catalog=catalog,
             )
-        except ReviewError:
+        except (OSError, ReviewError):
             (
                 synthetic_manifest,
                 private_synthetic_manifest,
