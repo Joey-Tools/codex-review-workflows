@@ -6421,18 +6421,27 @@ def _claude_keychain_credential_server(
                 errors=(),
             )
             if serve_admitted and thread is not None:
-                shutdown = _bounded_claude_keychain_server_shutdown(
-                    server,
-                    thread,
-                    serve_thread_state=thread_start_state,
-                    abandon_callback=(
-                        quiescence_callbacks.abandon
-                        if runtime_exposed
-                        and quiescence_callbacks is not None
-                        else None
-                    ),
-                )
-                shutdown_errors.extend(shutdown.errors)
+                try:
+                    shutdown = _bounded_claude_keychain_server_shutdown(
+                        server,
+                        thread,
+                        serve_thread_state=thread_start_state,
+                        abandon_callback=(
+                            quiescence_callbacks.abandon
+                            if runtime_exposed
+                            and quiescence_callbacks is not None
+                            else None
+                        ),
+                    )
+                except BaseException as error:
+                    shutdown_errors.append(error)
+                    shutdown = _ClaudeKeychainServerShutdown(
+                        quiescent=False,
+                        pending_update=None,
+                        errors=(),
+                    )
+                else:
+                    shutdown_errors.extend(shutdown.errors)
             else:
                 try:
                     server.server_close()

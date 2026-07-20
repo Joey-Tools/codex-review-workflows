@@ -4573,6 +4573,9 @@ def _retain_unmasked_credential_cleanup(
     )
 
     if host_refresh_lock_coordinator is not None:
+        if cleanup_host_refresh_lock is None:
+            host_refresh_lock_coordinator.cancel_without_lease()
+            return retention_error
         coordinator_errors = host_refresh_lock_coordinator.retain(
             reason=(
                 "forwarded-signal masking failed before Claude credential "

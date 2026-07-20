@@ -8465,6 +8465,81 @@ class CredentialStagingTest(unittest.TestCase):
                     cancel_thread.join(timeout=1.0)
                 source_anchor.close_if_owned()
 
+    def test_unmasked_cleanup_cancels_start_failed_coordinator_without_lease(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            source = self._credential(
+                root / ".credentials.json",
+                expires_at_ms=(time.time() - 60) * 1000,
+            )
+            source_anchor = claude_linux._open_credential_directory_anchor(
+                source,
+                owner_uid=os.getuid(),
+            )
+            coordinator = claude_linux._HostRefreshLockCleanupCoordinator(
+                source_anchor
+            )
+            start_failure = OSError(
+                errno.EAGAIN,
+                "injected cleanup coordinator start failure",
+            )
+            mask_failure = OSError(
+                errno.EPERM,
+                "injected forwarded-signal mask failure",
+            )
+            try:
+                with (
+                    mock.patch.object(
+                        coordinator._thread,
+                        "start",
+                        side_effect=start_failure,
+                    ),
+                    self.assertRaises(OSError) as raised,
+                ):
+                    coordinator.start()
+                self.assertIs(raised.exception, start_failure)
+
+                with (
+                    mock.patch.object(
+                        coordinator,
+                        "cancel_without_lease",
+                        wraps=coordinator.cancel_without_lease,
+                    ) as cancel,
+                    mock.patch.object(
+                        coordinator,
+                        "retain",
+                        wraps=coordinator.retain,
+                    ) as retain,
+                ):
+                    result = claude_linux._retain_unmasked_credential_cleanup(
+                        mask_errors=[mask_failure],
+                        staged=None,
+                        carrier_root=None,
+                        watcher=None,
+                        watcher_started=False,
+                        host_refresh_lock_owner=coordinator.owner,
+                        host_refresh_lock=None,
+                        host_refresh_lock_coordinator=coordinator,
+                    )
+
+                self.assertIsInstance(
+                    result,
+                    claude_linux.LinuxCredentialInspectionInconclusive,
+                )
+                self.assertIs(result.__cause__, mask_failure)
+                cancel.assert_called_once_with()
+                retain.assert_not_called()
+                self.assertIs(
+                    coordinator._decision,
+                    claude_linux._HostRefreshLockCleanupDecision.CANCEL,
+                )
+                self.assertTrue(coordinator._terminal.is_set())
+                self.assertIsNone(coordinator.owner.lease)
+            finally:
+                source_anchor.close_if_owned()
+
     def test_cleanup_coordinator_retries_decision_wait_before_acquire(
         self,
     ) -> None:

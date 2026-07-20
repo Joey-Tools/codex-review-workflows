@@ -4564,6 +4564,64 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(credential, bytearray(len(credential)))
 
     @unittest.skipUnless(hasattr(signal, "SIGTERM"), "requires SIGTERM")
+    def test_keychain_broker_teardown_signal_runs_fail_closed_recovery(
+        self,
+    ) -> None:
+        credential = bytearray(b"fixture-value")
+        forwarded = providers.ForwardedSignal(signal.SIGTERM)
+        server = mock.Mock()
+        server.server_address = ("127.0.0.1", 43211)
+        server.wait_until_serving.return_value = True
+        server.try_abandon_and_detach_pending_update.return_value = (
+            True,
+            None,
+        )
+        abandon = mock.Mock()
+        recover = mock.Mock(return_value=None)
+        timeout_failure = RuntimeError("fixture recovery timeout")
+        fail_closed_failure = RuntimeError("fixture fail-closed snapshot")
+        callbacks = providers._ClaudeKeychainQuiescenceCallbacks(
+            abandon=abandon,
+            recover=recover,
+            timeout_error=mock.Mock(return_value=timeout_failure),
+            fail_closed_error=mock.Mock(return_value=fail_closed_failure),
+        )
+
+        with (
+            mock.patch.object(
+                providers,
+                "_ClaudeKeychainCredentialServer",
+                return_value=server,
+            ),
+            mock.patch.object(
+                providers,
+                "_bounded_claude_keychain_server_shutdown",
+                side_effect=forwarded,
+            ),
+            self.assertRaises(providers.ForwardedSignal) as raised,
+        ):
+            with providers._claude_keychain_credential_server(
+                credential,
+                bytes.fromhex("01" * 32),
+                quiescence_callbacks=callbacks,
+            ):
+                pass
+
+        self.assertIs(raised.exception, forwarded)
+        self.assertTrue(
+            getattr(
+                raised.exception,
+                "_codex_claude_keychain_handler_quiescence_unproven",
+                False,
+            )
+        )
+        abandon.assert_called()
+        recover.assert_called_once_with(None)
+        server.try_abandon_and_detach_pending_update.assert_called_once()
+        server.scrub_initial_credential.assert_not_called()
+        self.assertEqual(credential, bytearray(len(credential)))
+
+    @unittest.skipUnless(hasattr(signal, "SIGTERM"), "requires SIGTERM")
     def test_blocked_keychain_handler_preserves_timeout_and_signal(self) -> None:
         context = multiprocessing.get_context("spawn")
         for mode, expected_error, recovery_completed in (
