@@ -960,8 +960,9 @@ def _create_sanitized_git_view(
         raise ReviewError(f"unsupported Git object format: {object_format!r}")
 
     git_view = container / "git-view"
-    (git_view / "objects").mkdir(parents=True)
-    (git_view / "refs").mkdir()
+    git_view.mkdir(mode=0o755)
+    (git_view / "objects").mkdir(mode=0o755)
+    (git_view / "refs").mkdir(mode=0o755)
     write_text_atomic(git_view / "HEAD", "ref: refs/heads/unused\n")
     format_version = 1 if object_format == "sha256" else 0
     config = f"[core]\n\trepositoryformatversion = {format_version}\n\tbare = true\n"
@@ -3227,6 +3228,31 @@ def _copy_limited(
     return copied
 
 
+def _mkdir_frozen_tree_parents(
+    workspace_root: pathlib.Path,
+    directory: pathlib.Path,
+) -> None:
+    try:
+        relative = directory.relative_to(workspace_root)
+    except ValueError as error:
+        raise ReviewError("frozen Git tree parent escapes workspace") from error
+    current = workspace_root
+    for component in relative.parts:
+        current /= component
+        try:
+            current.mkdir(mode=0o755)
+        except FileExistsError:
+            pass
+        metadata = os.lstat(current)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise ReviewError("frozen Git tree parent directory is unsafe")
+
+
 def _materialize_blob(
     *,
     cat_input: BinaryIO,
@@ -3288,7 +3314,7 @@ def _materialize_blob(
                 f"{destination_display}"
             )
 
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    _mkdir_frozen_tree_parents(workspace_root, destination.parent)
 
     if mode == "120000":
         if size > 16 * 1024:
@@ -3386,7 +3412,7 @@ def _materialize_frozen_tree(
     workspace_root: pathlib.Path,
     legacy_value_matcher: LegacyPathMatcher,
 ) -> None:
-    workspace_root.mkdir()
+    workspace_root.mkdir(mode=0o755)
     environment = _git_environment(object_directory=object_directory)
     with (
         tempfile.TemporaryFile() as tree_stderr,
@@ -3458,7 +3484,11 @@ def _materialize_frozen_tree(
                                 "frozen Git tree path escapes workspace: "
                                 f"{path_display}"
                             )
-                        destination.mkdir(parents=True, exist_ok=False)
+                        _mkdir_frozen_tree_parents(
+                            workspace_root,
+                            destination.parent,
+                        )
+                        destination.mkdir(mode=0o755, exist_ok=False)
                         continue
                     if object_type != "blob":
                         raise ReviewError(

@@ -399,6 +399,20 @@ class WorkspaceTest(unittest.TestCase):
         self.assertEqual((review.workspace_root / "asset.bin").read_bytes(), payload)
 
     def test_prepare_uses_private_control_modes_under_permissive_umask(self) -> None:
+        nested_file = self.repo / "nested" / "deeper" / "payload.txt"
+        nested_file.parent.mkdir(parents=True)
+        nested_file.write_text("nested\n", encoding="utf-8")
+        git(self.repo, "add", str(nested_file.relative_to(self.repo)))
+        git(
+            self.repo,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{self.head},nested/vendor/external",
+        )
+        git(self.repo, "commit", "-m", "Add nested frozen tree entries")
+        self.head = git(self.repo, "rev-parse", "HEAD")
+
         for mask in (0o002, 0o000):
             with self.subTest(mask=oct(mask)):
                 previous = os.umask(mask)
@@ -414,6 +428,14 @@ class WorkspaceTest(unittest.TestCase):
 
                 control_dir = review.workspace_root / ".codex-review"
                 self.assertEqual(review.container_dir.stat().st_mode & 0o777, 0o700)
+                self.assertEqual(review.workspace_root.stat().st_mode & 0o777, 0o755)
+                for directory in (
+                    review.workspace_root / "nested",
+                    review.workspace_root / "nested" / "deeper",
+                    review.workspace_root / "nested" / "vendor",
+                    review.workspace_root / "nested" / "vendor" / "external",
+                ):
+                    self.assertEqual(directory.stat().st_mode & 0o777, 0o755)
                 self.assertEqual(control_dir.stat().st_mode & 0o777, 0o700)
                 for name in workspace_runtime.CONTROL_ARTIFACT_SPECS:
                     self.assertEqual(
@@ -436,6 +458,8 @@ class WorkspaceTest(unittest.TestCase):
                     0o644,
                 )
                 validate_external_workspace(review)
+                self.assertIsNone(cleanup_workspace(review, keep_container=False))
+                self.assertFalse(review.container_dir.exists())
 
     def test_external_workspace_rejects_group_writable_control_artifact(self) -> None:
         review = prepare_workspace(
