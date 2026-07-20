@@ -5297,25 +5297,26 @@ class ProviderPolicyTest(unittest.TestCase):
         staging = parent / ".cc-writes"
         staging.mkdir(mode=0o700)
         moved_parent = pathlib.Path(self.temporary.name) / "mid-cleanup-parent"
-        real_rmdir = os.rmdir
+        real_rename = os.rename
         replaced = False
 
-        def replace_parent_before_staging_removal(
-            path: str,
+        def replace_parent_before_staging_quarantine(
+            source: str,
+            destination: str,
             *args: object,
             **kwargs: object,
         ) -> None:
             nonlocal replaced
-            if path == ".cc-writes" and not replaced:
-                parent.rename(moved_parent)
+            if source == ".cc-writes" and destination == "staging" and not replaced:
+                real_rename(parent, moved_parent)
                 parent.mkdir(mode=0o755)
                 replaced = True
-            real_rmdir(path, *args, **kwargs)
+            real_rename(source, destination, *args, **kwargs)
 
         with mock.patch.object(
             providers.os,
-            "rmdir",
-            side_effect=replace_parent_before_staging_removal,
+            "rename",
+            side_effect=replace_parent_before_staging_quarantine,
         ):
             with self.assertRaisesRegex(ReviewError, "changed during cleanup"):
                 providers._remove_claude_bash_staging_directory(
@@ -5327,6 +5328,84 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertTrue(moved_parent.is_dir())
         self.assertFalse((moved_parent / ".cc-writes").exists())
         self.assertTrue(parent.is_dir())
+        parent.rmdir()
+        workspace_runtime.validate_external_workspace(self.review)
+
+    def test_claude_bash_staging_cleanup_rejects_staging_swap_before_quarantine(
+        self,
+    ) -> None:
+        baseline = providers._claude_bash_staging_baseline(self.review)
+        parent = self.review.workspace_root / ".claude"
+        parent.mkdir(mode=0o755)
+        staging = parent / ".cc-writes"
+        staging.mkdir(mode=0o700)
+        original = staging.stat()
+        moved_staging = pathlib.Path(self.temporary.name) / "verified-staging"
+        real_rename = os.rename
+        real_stat = os.stat
+        staging_validations = 0
+        replacement_identity: tuple[int, int] | None = None
+
+        def replace_staging_after_final_identity_validation(
+            path: str | os.PathLike[str],
+            *args: object,
+            **kwargs: object,
+        ) -> os.stat_result:
+            nonlocal staging_validations, replacement_identity
+            result = real_stat(path, *args, **kwargs)
+            if (
+                path == ".cc-writes"
+                and kwargs.get("dir_fd") is not None
+                and kwargs.get("follow_symlinks") is False
+            ):
+                staging_validations += 1
+                if staging_validations == 1:
+                    real_rename(staging, moved_staging)
+                    staging.mkdir(mode=stat.S_IMODE(original.st_mode))
+                    replacement = real_stat(staging, follow_symlinks=False)
+                    replacement_identity = (
+                        replacement.st_dev,
+                        replacement.st_ino,
+                    )
+            return result
+
+        with mock.patch.object(
+            providers.os,
+            "stat",
+            side_effect=replace_staging_after_final_identity_validation,
+        ):
+            with self.assertRaisesRegex(
+                ReviewError,
+                "changed before quarantine removal",
+            ):
+                providers._remove_claude_bash_staging_directory(
+                    self.review,
+                    baseline=baseline,
+                )
+
+        self.assertEqual(staging_validations, 1)
+        self.assertIsNotNone(replacement_identity)
+        moved = moved_staging.stat()
+        self.assertEqual(
+            (moved.st_dev, moved.st_ino),
+            (original.st_dev, original.st_ino),
+        )
+        self.assertFalse(staging.exists())
+        quarantine_roots = list(
+            self.review.container_dir.glob(".claude-bash-entry-quarantine-*")
+        )
+        self.assertEqual(len(quarantine_roots), 1)
+        quarantined_replacement = quarantine_roots[0] / "staging"
+        quarantined = quarantined_replacement.stat()
+        self.assertEqual(
+            (quarantined.st_dev, quarantined.st_ino),
+            replacement_identity,
+        )
+        self.assertEqual(stat.S_IMODE(quarantined.st_mode), 0o700)
+
+        moved_staging.rmdir()
+        quarantined_replacement.rmdir()
+        quarantine_roots[0].rmdir()
         parent.rmdir()
         workspace_runtime.validate_external_workspace(self.review)
 

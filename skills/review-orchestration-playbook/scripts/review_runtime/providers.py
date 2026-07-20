@@ -2533,6 +2533,68 @@ def _remove_empty_claude_bash_staging_parent(
             pass
 
 
+def _remove_empty_claude_bash_staging_entry(
+    review: ReviewWorkspace,
+    *,
+    parent_descriptor: int,
+    staging_descriptor: int,
+    opened: os.stat_result,
+) -> None:
+    """Quarantine and remove only the exact opened empty staging directory."""
+
+    quarantine_root = pathlib.Path(
+        tempfile.mkdtemp(
+            prefix=".claude-bash-entry-quarantine-",
+            dir=review.container_dir,
+        )
+    )
+    quarantine_descriptor: int | None = None
+    try:
+        quarantine_descriptor = os.open(
+            quarantine_root,
+            _claude_directory_open_flags(),
+        )
+        try:
+            os.rename(
+                ".cc-writes",
+                "staging",
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=quarantine_descriptor,
+            )
+        except OSError as error:
+            raise ReviewError(
+                "cannot quarantine empty Claude Bash staging directory"
+            ) from error
+        quarantined = os.stat(
+            "staging",
+            dir_fd=quarantine_descriptor,
+            follow_symlinks=False,
+        )
+        if _claude_directory_identity(quarantined) != _claude_directory_identity(
+            opened
+        ):
+            raise ReviewError(
+                "Claude Bash staging directory changed before quarantine removal"
+            )
+        final = os.fstat(staging_descriptor)
+        if (
+            _claude_directory_identity(final) != _claude_directory_identity(opened)
+            or final.st_nlink != opened.st_nlink
+            or final.st_mtime_ns != opened.st_mtime_ns
+        ):
+            raise ReviewError("Claude Bash staging directory changed during quarantine")
+        if os.listdir(staging_descriptor):
+            raise ReviewError("Claude Bash staging directory changed after quarantine")
+        os.rmdir("staging", dir_fd=quarantine_descriptor)
+    finally:
+        if quarantine_descriptor is not None:
+            os.close(quarantine_descriptor)
+        try:
+            quarantine_root.rmdir()
+        except OSError:
+            pass
+
+
 def _remove_claude_bash_staging_directory(
     review: ReviewWorkspace,
     *,
@@ -2651,7 +2713,12 @@ def _remove_claude_bash_staging_directory(
             raise ReviewError(
                 "Claude Bash staging parent changed before staging removal"
             )
-        os.rmdir(".cc-writes", dir_fd=parent_descriptor)
+        _remove_empty_claude_bash_staging_entry(
+            review,
+            parent_descriptor=parent_descriptor,
+            staging_descriptor=staging_descriptor,
+            opened=opened,
+        )
         try:
             current_parent_identity = _claude_directory_identity(
                 os.stat(
