@@ -9375,7 +9375,11 @@ def _iter_secret_events(
                         proof_end,
                         False,
                         assignment_match.start(),
-                        None,
+                        (
+                            _UNEXTRACTABLE_SECRET_CANDIDATE_END
+                            if candidate_end is None
+                            else None
+                        ),
                     )
                 continue
             if recorded_unquoted_rhs and proof_suffix_context_complete:

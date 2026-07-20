@@ -2851,6 +2851,11 @@ class PublicPoolScannerTest(unittest.TestCase):
                 "generic-secret-assignment",
                 assignment_bytes(b"password", b"D" * 513),
             ),
+            (
+                "unclosed-generic-at-eof",
+                "generic-secret-assignment",
+                b'password = "' + b"G" * 32,
+            ),
             ("unclosed-pem", "private-key", pem_begin + b"E" * 64),
             (
                 "oversized-pem",

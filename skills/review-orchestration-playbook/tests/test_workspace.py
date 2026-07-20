@@ -3940,6 +3940,28 @@ class WorkspaceTest(unittest.TestCase):
         evidence = validate_external_workspace(review)
         self.assertEqual(evidence["secret_delta"], secret_delta)
 
+    def test_unclosed_secret_assignment_at_eof_marks_admission_inconclusive(
+        self,
+    ) -> None:
+        payload = b'password = "' + b"E" * 32
+        unclosed_head = self.commit_bytes(
+            "unclosed-secret.txt",
+            payload,
+            "Add an unclosed credential assignment",
+        )
+
+        review = self.prepare_range(self.head, unclosed_head)
+        secret_delta = self.assert_secret_delta_status(review, "inconclusive")
+        self.assertEqual(
+            secret_delta["failure_class"],
+            "exact-value-scan-incomplete",
+        )
+        self.assertEqual(secret_delta["location_status"], "inconclusive")
+        self.assertEqual(secret_delta["violations"], [])
+        self.assertIn(payload, review.diff_file.read_bytes())
+        evidence = validate_external_workspace(review)
+        self.assertEqual(evidence["secret_delta"], secret_delta)
+
     def test_unregistered_secret_addition_is_raw_with_violation_evidence(
         self,
     ) -> None:
