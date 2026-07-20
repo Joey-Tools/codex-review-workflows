@@ -202,6 +202,15 @@ class WorkspaceTest(unittest.TestCase):
         self.assertEqual(environment["GIT_ASKPASS"], "/usr/bin/false")
         self.assertEqual(environment["SSH_ASKPASS"], "/usr/bin/false")
 
+    def test_git_environment_ignores_ambient_global_config_override(self) -> None:
+        with mock.patch.dict(
+            workspace_runtime.os.environ,
+            {"GIT_CONFIG_GLOBAL": str(self.repo / "ambient-global-config")},
+        ):
+            environment = workspace_runtime._git_environment()
+
+        self.assertEqual(environment["GIT_CONFIG_GLOBAL"], os.devnull)
+
     def test_partial_clone_missing_blob_fails_without_transport(self) -> None:
         git(self.repo, "config", "uploadpack.allowFilter", "true")
         partial = pathlib.Path(self.temporary.name) / "partial"
@@ -398,6 +407,135 @@ class WorkspaceTest(unittest.TestCase):
         prompt = review.prompt_file.read_text(encoding="utf-8")
         self.assertIn("Content variant: source-wip", prompt)
         self.assertIn("not an exact committed range", prompt)
+
+    def test_clean_and_wip_respect_user_global_git_ignores(self) -> None:
+        configured_home = pathlib.Path(self.temporary.name) / "configured-home"
+        configured_home.mkdir()
+        configured_ignore = configured_home / "global-ignore"
+        configured_ignored_name = "configured-ignored.json"
+        configured_ignore.write_text(
+            f"/{configured_ignored_name}\n",
+            encoding="utf-8",
+        )
+        (configured_home / ".gitconfig").write_text(
+            f"[core]\n\texcludesFile = {configured_ignore}\n",
+            encoding="utf-8",
+        )
+
+        default_home = pathlib.Path(self.temporary.name) / "default-home"
+        default_ignore = default_home / ".config" / "git" / "ignore"
+        default_ignore.parent.mkdir(parents=True)
+        default_ignored_name = "default-ignored.json"
+        default_ignore.write_text(
+            f"/{default_ignored_name}\n",
+            encoding="utf-8",
+        )
+
+        xdg_home = pathlib.Path(self.temporary.name) / "xdg-home"
+        xdg_home.mkdir()
+        xdg_config_home = pathlib.Path(self.temporary.name) / "xdg-config"
+        xdg_ignore = xdg_config_home / "git" / "ignore"
+        xdg_ignore.parent.mkdir(parents=True)
+        xdg_ignored_name = "xdg-ignored.json"
+        xdg_ignore.write_text(
+            f"/{xdg_ignored_name}\n",
+            encoding="utf-8",
+        )
+
+        ambient_ignore = pathlib.Path(self.temporary.name) / "ambient-ignore"
+        ambient_ignore.write_text("/ambient-only-*.txt\n", encoding="utf-8")
+        ambient_global_config = (
+            pathlib.Path(self.temporary.name) / "ambient-global-config"
+        )
+        ambient_global_config.write_text(
+            f"[core]\n\texcludesFile = {ambient_ignore}\n",
+            encoding="utf-8",
+        )
+        ignored_payload = (
+            json.dumps({"refresh_token": oauth_refresh_credential()}) + "\n"
+        )
+
+        scenarios = (
+            (
+                "configured-core-excludes-file",
+                configured_home,
+                "",
+                configured_ignored_name,
+            ),
+            ("default-home-ignore", default_home, "", default_ignored_name),
+            (
+                "default-xdg-ignore",
+                xdg_home,
+                str(xdg_config_home),
+                xdg_ignored_name,
+            ),
+        )
+        for label, source_home, xdg_value, ignored_name in scenarios:
+            ignored_path = self.repo / ignored_name
+            visible_name = f"ambient-only-{label}.txt"
+            visible_path = self.repo / visible_name
+            try:
+                ignored_path.write_text(ignored_payload, encoding="utf-8")
+                with (
+                    self.subTest(ignore_source=label),
+                    mock.patch.object(
+                        workspace_runtime,
+                        "_source_git_home",
+                        return_value=source_home,
+                    ),
+                    mock.patch.dict(
+                        workspace_runtime.os.environ,
+                        {
+                            "GIT_CONFIG_GLOBAL": str(ambient_global_config),
+                            "XDG_CONFIG_HOME": xdg_value,
+                        },
+                    ),
+                ):
+                    clean_review = prepare_workspace(
+                        repo=self.repo,
+                        base_ref=self.base,
+                        head_ref=self.head,
+                    )
+                    self.reviews.append(clean_review)
+                    self.assertFalse(
+                        (clean_review.workspace_root / ignored_name).exists()
+                    )
+
+                    visible_path.write_text("capture this WIP file\n", encoding="utf-8")
+                    with self.assertRaisesRegex(
+                        ReviewError,
+                        "nonignored untracked changes",
+                    ):
+                        prepare_workspace(
+                            repo=self.repo,
+                            base_ref=self.base,
+                            head_ref=self.head,
+                        )
+
+                    wip_review = prepare_workspace(
+                        repo=self.repo,
+                        base_ref=self.base,
+                        head_ref=self.head,
+                        include_source_wip=True,
+                    )
+                    self.reviews.append(wip_review)
+                    self.assertEqual(
+                        (wip_review.workspace_root / visible_name).read_text(
+                            encoding="utf-8"
+                        ),
+                        "capture this WIP file\n",
+                    )
+                    self.assertFalse(
+                        (wip_review.workspace_root / ignored_name).exists()
+                    )
+                    diff = wip_review.diff_file.read_text(encoding="utf-8")
+                    self.assertIn(visible_name, diff)
+                    self.assertNotIn(ignored_name, diff)
+                    self.assertNotIn(oauth_refresh_credential(), diff)
+                    validate_external_workspace(wip_review)
+            finally:
+                ignored_path.unlink(missing_ok=True)
+                visible_path.unlink(missing_ok=True)
 
     def test_wip_case_only_rename_does_not_capture_deleted_alias(self) -> None:
         original_path = pathlib.PurePosixPath("example.txt")

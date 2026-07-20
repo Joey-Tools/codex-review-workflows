@@ -100,7 +100,8 @@ The helper places the detached worktree, private Git database, control artifacts
 
 - `--include-source-wip` requires the source `HEAD` to equal the resolved head and rejects conflicts, unsafe submodule state, or capture races.
 - Capture staged changes, unstaged changes, deletions, mode changes, symlinks, and every non-ignored untracked file into the helper-owned worktree.
-- Exclude ignored files. Apply the same file, entry-count, byte, symlink, and secret-scan budgets used for clean evidence.
+- Exclude ignored files. Resolve only the effective `core.excludesFile` path through the current user's Git configuration, then apply that path as a single command-line override while the capture command continues to suppress system/global Git configuration. This preserves repository, info-exclude, configured global-exclude, and default `$XDG_CONFIG_HOME/git/ignore` or `$HOME/.config/git/ignore` semantics without enabling unrelated user hooks, aliases, filters, or diff commands.
+- Apply the same file, entry-count, byte, symlink, and secret-scan budgets used for clean evidence.
 - Bind the result to a deterministic WIP digest plus the base/head/tree identity and source-state observations before and after capture.
 - Drive the rendered diff, changed-path inventory, blob scan, prompt, and reviewer-visible files from that same captured artifact. Never scan one tree while reviewing another.
 - Preserve the original source `HEAD` in the helper-private Git database and additionally scan its `HEAD`-to-snapshot delta paths and original-`HEAD`-side raw blobs. The current snapshot side is already covered by the complete snapshot scan. Together these checks supplement the base-to-snapshot diff so a WIP deletion or reversion cannot hide sensitive content that remains reachable from the original source `HEAD`.

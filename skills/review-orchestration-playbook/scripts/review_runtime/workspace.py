@@ -562,6 +562,85 @@ def _git_environment(
     return env
 
 
+def _source_git_home() -> pathlib.Path:
+    try:
+        import pwd
+
+        raw_home = pwd.getpwuid(os.getuid()).pw_dir
+    except (ImportError, KeyError, OSError) as error:
+        raise ReviewError(
+            f"cannot resolve the current user's Git home: {error}"
+        ) from error
+    home = pathlib.Path(raw_home)
+    if not home.is_absolute() or home == pathlib.Path("/"):
+        raise ReviewError(
+            "the current user's Git home must be an absolute user directory"
+        )
+    return home
+
+
+def _source_git_config_environment(
+    home: pathlib.Path,
+) -> tuple[dict[str, str], pathlib.Path]:
+    environment = _git_environment()
+    environment.pop("GIT_CONFIG_GLOBAL", None)
+    environment["HOME"] = str(home)
+    raw_xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
+    if raw_xdg_config_home:
+        xdg_config_home = pathlib.Path(raw_xdg_config_home)
+        if not xdg_config_home.is_absolute():
+            raise ReviewError("XDG_CONFIG_HOME must be absolute for source Git queries")
+        environment["XDG_CONFIG_HOME"] = str(xdg_config_home)
+    else:
+        xdg_config_home = home / ".config"
+    return environment, xdg_config_home / "git" / "ignore"
+
+
+def _source_excludes_file(repo: pathlib.Path) -> str:
+    environment, default_path = _source_git_config_environment(_source_git_home())
+    command = (
+        str(resolve_git()),
+        "--no-pager",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.filemode=true",
+        "-c",
+        f"core.hooksPath={os.devnull}",
+        "-c",
+        "diff.external=",
+        "-C",
+        str(repo),
+        "config",
+        "--includes",
+        "--null",
+        "--path",
+        "--get",
+        "core.excludesFile",
+    )
+    completed = _run_bounded_git_capture(
+        command,
+        input_bytes=None,
+        check=False,
+        label="source Git excludes-file query",
+        byte_limit=MAX_SOURCE_GIT_QUERY_BYTES,
+        timeout_seconds=SOURCE_GIT_TIMEOUT_SECONDS,
+        timeout_label="source Git",
+        environment=environment,
+    )
+    if completed.returncode == 1:
+        if completed.stdout:
+            raise ReviewError(
+                "source Git excludes-file query returned malformed output"
+            )
+        return str(default_path)
+    if completed.returncode != 0:
+        raise ReviewError("cannot resolve the source Git excludes file")
+    if completed.stdout.count(b"\0") != 1 or not completed.stdout.endswith(b"\0"):
+        raise ReviewError("source Git excludes-file query returned malformed output")
+    return os.fsdecode(completed.stdout[:-1])
+
+
 def _git(repo: pathlib.Path, *args: str, check: bool = True):
     command = (
         str(resolve_git()),
@@ -624,7 +703,9 @@ def _bounded_source_git_output(
     byte_limit: int,
     record_limit: int,
     label: str,
+    config_overrides: tuple[str, ...] = (),
 ) -> bytes:
+    config_args = tuple(item for value in config_overrides for item in ("-c", value))
     command = (
         str(resolve_git()),
         "--no-pager",
@@ -636,6 +717,7 @@ def _bounded_source_git_output(
         f"core.hooksPath={os.devnull}",
         "-c",
         "diff.external=",
+        *config_args,
         "-C",
         str(repo),
         *args,
@@ -927,6 +1009,7 @@ def _run_bounded_git_capture(
     byte_limit: int = MAX_PRIVATE_OBJECT_LIST_BYTES,
     timeout_seconds: float = PRIVATE_GIT_TIMEOUT_SECONDS,
     timeout_label: str = "private Git",
+    environment: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as input_file:
         input_handle: BinaryIO | int = subprocess.DEVNULL
@@ -936,7 +1019,7 @@ def _run_bounded_git_capture(
             input_handle = input_file
         result = _run_bounded_process_to_file(
             command,
-            environment=_git_environment(),
+            environment=_git_environment() if environment is None else environment,
             destination=output,
             label=label,
             byte_limit=byte_limit,
@@ -6488,6 +6571,7 @@ def _validate_prompt_size(prompt: str) -> None:
 
 def _source_status(repo: pathlib.Path) -> bytes:
     _reject_hidden_index_entries(repo)
+    excludes_file = _source_excludes_file(repo)
     return _bounded_source_git_output(
         repo,
         "status",
@@ -6498,6 +6582,7 @@ def _source_status(repo: pathlib.Path) -> bytes:
         byte_limit=MAX_SOURCE_STATUS_BYTES,
         record_limit=MAX_SOURCE_STATUS_RECORDS,
         label="source WIP status metadata",
+        config_overrides=(f"core.excludesFile={excludes_file}",),
     )
 
 
