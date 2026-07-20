@@ -3764,6 +3764,12 @@ def _read_staged_credential_under_lock(
     return candidate, candidate_identity
 
 
+class _StagedCredentialWatcherStartState(enum.Enum):
+    NOT_STARTED = "not-started"
+    UNKNOWN = "unknown"
+    CONFIRMED = "confirmed"
+
+
 class _StagedCredentialWatcher:
     """Persist every observed Claude refresh rotation before carrier cleanup."""
 
@@ -3804,6 +3810,9 @@ class _StagedCredentialWatcher:
         self._worker_failure: BaseException | None = None
         self._source_anchor_handoff_lock = threading.Lock()
         self._source_anchor_cleanup_reached = False
+        self._start_state_lock = threading.Lock()
+        self._start_state = _StagedCredentialWatcherStartState.NOT_STARTED
+        self._stop_deadline: float | None = None
         self._thread = threading.Thread(
             target=self._run,
             name="codex-claude-staged-credential-watcher",
@@ -3816,6 +3825,20 @@ class _StagedCredentialWatcher:
 
     def start(self) -> None:
         try:
+            with self._start_state_lock:
+                if (
+                    self._start_state
+                    is not _StagedCredentialWatcherStartState.NOT_STARTED
+                ):
+                    raise LinuxCredentialInspectionInconclusive(
+                        "staged Claude credential watcher start was repeated"
+                    )
+                # Publish the conservative state before the interruptible
+                # Thread.start() CALL boundary. A late native start must never
+                # be mistaken for a definitely unstarted watcher.
+                self._start_state = (
+                    _StagedCredentialWatcherStartState.UNKNOWN
+                )
             self._thread.start()
         except BaseException as error:
             if not _is_control_flow_error(error):
@@ -3823,9 +3846,24 @@ class _StagedCredentialWatcher:
                     "cannot start staged Claude credential watcher"
                 ) from error
             raise
+        with self._start_state_lock:
+            self._start_state = _StagedCredentialWatcherStartState.CONFIRMED
+
+    def start_state(self) -> _StagedCredentialWatcherStartState:
+        with self._start_state_lock:
+            return self._start_state
 
     def has_started(self) -> bool:
-        return self._thread.ident is not None
+        return (
+            self.start_state()
+            is _StagedCredentialWatcherStartState.CONFIRMED
+        )
+
+    def may_have_started(self) -> bool:
+        return (
+            self.start_state()
+            is not _StagedCredentialWatcherStartState.NOT_STARTED
+        )
 
     def request_stop(self) -> BaseException | None:
         stop_errors: list[BaseException] = []
@@ -3845,10 +3883,56 @@ class _StagedCredentialWatcher:
                 self._stop.set()
             except BaseException as error:
                 stop_errors.append(error)
+        while True:
+            try:
+                now = time.monotonic()
+                with self._start_state_lock:
+                    if self._stop_deadline is None:
+                        self._stop_deadline = (
+                            now
+                            + STAGED_CREDENTIAL_JOIN_TIMEOUT_SECONDS
+                        )
+                break
+            except BaseException as error:
+                stop_errors.append(error)
         return _primary_cleanup_error(stop_errors)
 
     def wait_until_stopped(self) -> bool:
-        self._thread.join(timeout=STAGED_CREDENTIAL_JOIN_TIMEOUT_SECONDS)
+        with self._start_state_lock:
+            state = self._start_state
+            deadline = self._stop_deadline
+        if state is _StagedCredentialWatcherStartState.NOT_STARTED:
+            return True
+        if deadline is None:
+            deadline = (
+                time.monotonic()
+                + STAGED_CREDENTIAL_JOIN_TIMEOUT_SECONDS
+            )
+            with self._start_state_lock:
+                if self._stop_deadline is None:
+                    self._stop_deadline = deadline
+                else:
+                    deadline = self._stop_deadline
+        if state is _StagedCredentialWatcherStartState.UNKNOWN:
+            started_event = getattr(self._thread, "_started", None)
+            if not isinstance(started_event, threading.Event):
+                return False
+            published = started_event.wait(
+                timeout=max(0.0, deadline - time.monotonic())
+            )
+            if not published:
+                return False
+            with self._start_state_lock:
+                if (
+                    self._start_state
+                    is _StagedCredentialWatcherStartState.UNKNOWN
+                ):
+                    self._start_state = (
+                        _StagedCredentialWatcherStartState.CONFIRMED
+                    )
+        self._thread.join(
+            timeout=max(0.0, deadline - time.monotonic())
+        )
         return not self._thread.is_alive()
 
     def is_alive(self) -> bool:
@@ -4269,7 +4353,7 @@ class _HostRefreshLockCleanupCoordinator:
         if watcher is not None:
             while True:
                 try:
-                    watcher_started = watcher.has_started()
+                    watcher_started = watcher.may_have_started()
                 except BaseException as error:
                     self._errors.append(error)
                     continue
@@ -4511,7 +4595,7 @@ def _retain_unmasked_credential_cleanup(
     watcher_is_started = watcher_started
     if watcher is not None and not watcher_is_started:
         try:
-            watcher_is_started = watcher.has_started()
+            watcher_is_started = watcher.may_have_started()
         except BaseException as error:
             mask_errors.append(error)
             watcher_is_started = True
@@ -4901,12 +4985,18 @@ def _stage_claude_credentials_anchored(
             cleanup_is_safe = True
             carrier_cleanup_proven = False
             retain_for_recovery = False
-            if (
-                watcher is not None
-                and not watcher_started
-                and watcher.has_started()
-            ):
-                watcher_started = True
+            watcher_start_state_error: BaseException | None = None
+            if watcher is not None and not watcher_started:
+                try:
+                    watcher_started = watcher.may_have_started()
+                except BaseException as error:
+                    # Failure to read the conservative handoff state cannot
+                    # prove that the native thread was never launched.
+                    watcher_started = True
+                    if _is_control_flow_error(error):
+                        deferred_signals.append(error)
+                    else:
+                        watcher_start_state_error = error
             if watcher is not None and not watcher_started:
                 try:
                     watcher.scrub()
@@ -4915,7 +5005,18 @@ def _stage_claude_credentials_anchored(
             if watcher is not None and watcher_started:
                 watcher_stopped = False
                 try:
-                    writeback_error = watcher.request_stop()
+                    stop_error = watcher.request_stop()
+                    writeback_error = _primary_cleanup_error(
+                        [
+                            candidate
+                            for candidate in (
+                                writeback_error,
+                                watcher_start_state_error,
+                                stop_error,
+                            )
+                            if candidate is not None
+                        ]
+                    )
                     watcher_stopped = watcher.wait_until_stopped()
                     if not watcher_stopped:
                         # The recovery carrier becomes authoritative before
@@ -4990,6 +5091,7 @@ def _stage_claude_credentials_anchored(
                 except BaseException as error:
                     should_retain = (
                         retain_for_recovery
+                        or not watcher_stopped
                         or isinstance(
                             error,
                             (
@@ -5042,7 +5144,10 @@ def _stage_claude_credentials_anchored(
                                 True,
                             )
                     if not watcher_stopped:
-                        cleanup_is_safe = not watcher.is_alive()
+                        # UNKNOWN can have a live native thread before
+                        # threading publishes `_started` or `ident`; a false
+                        # is_alive() result is therefore not quiescence proof.
+                        cleanup_is_safe = False
                 if cleanup_is_safe:
                     try:
                         watcher.scrub()

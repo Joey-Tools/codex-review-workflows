@@ -7579,7 +7579,8 @@ class CredentialStagingTest(unittest.TestCase):
                     "helper = pathlib.Path(sys.argv[3])",
                     "started = threading.Event()",
                     "release_drain = threading.Event()",
-                    "real_is_alive = claude_linux._StagedCredentialWatcher.is_alive",
+                    "real_retain_anchor = claude_linux._StagedCredentialWatcher.retain_source_anchor_after_timeout",
+                    "signal_sent = False",
                     "def forward_signal(signum, _frame):",
                     "    raise claude_linux.ForwardedSignal(signal.Signals(signum))",
                     "signal.signal(signal.SIGTERM, forward_signal)",
@@ -7588,14 +7589,16 @@ class CredentialStagingTest(unittest.TestCase):
                     "        return",
                     "    started.set()",
                     "    release_drain.wait()",
-                    "def signal_during_branch(self):",
-                    "    result = real_is_alive(self)",
-                    "    os.kill(os.getpid(), signal.SIGTERM)",
-                    "    return result",
+                    "def signal_during_handoff(self):",
+                    "    global signal_sent",
+                    "    real_retain_anchor(self)",
+                    "    if not signal_sent:",
+                    "        signal_sent = True",
+                    "        os.kill(os.getpid(), signal.SIGTERM)",
                     "claude_linux.STAGED_CREDENTIAL_POLL_SECONDS = 0.01",
                     "claude_linux.STAGED_CREDENTIAL_JOIN_TIMEOUT_SECONDS = 0.01",
                     "claude_linux._StagedCredentialWatcher._drain = block_drain",
-                    "claude_linux._StagedCredentialWatcher.is_alive = signal_during_branch",
+                    "claude_linux._StagedCredentialWatcher.retain_source_anchor_after_timeout = signal_during_handoff",
                     "try:",
                     "    with claude_linux.stage_claude_credentials(",
                     "        source,",
@@ -7702,6 +7705,238 @@ class CredentialStagingTest(unittest.TestCase):
                 )
             )
             self.assertEqual(list(helper.iterdir()), [])
+
+    def _assert_interrupted_start_before_started_publication_retains_carrier(
+        self,
+        *,
+        confirmation_error: BaseException | None,
+    ) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            helper = root / "helper"
+            helper.mkdir(mode=0o700)
+            source = self._credential(
+                root / ".credentials.json",
+                expires_at_ms=(now - 60) * 1000,
+            )
+            forwarded = claude_linux.ForwardedSignal(signal.SIGTERM)
+            native_thread_entered = threading.Event()
+            allow_bootstrap = threading.Event()
+            watchers: list[claude_linux._StagedCredentialWatcher] = []
+            source_anchor_descriptors: list[int] = []
+            staged_credentials: list[claude_linux.StagedCredential] = []
+            host_leases: list[
+                claude_refresh_lock.ClaudeRefreshLockLease
+            ] = []
+            real_publish = (
+                claude_linux._HostRefreshLockCleanupCoordinator.publish_watcher
+            )
+            real_acquire = claude_linux.acquire_claude_refresh_lock
+
+            def acquire_refresh_lock(
+                config_path: os.PathLike[str] | str,
+                **kwargs: object,
+            ) -> claude_refresh_lock.ClaudeRefreshLockLease:
+                lease = real_acquire(config_path, **kwargs)
+                if pathlib.Path(config_path) == source.parent:
+                    host_leases.append(lease)
+                return lease
+
+            def publish_watcher(
+                coordinator: (
+                    claude_linux._HostRefreshLockCleanupCoordinator
+                ),
+                staged: claude_linux.StagedCredential,
+                watcher: claude_linux._StagedCredentialWatcher,
+            ) -> None:
+                real_publish(coordinator, staged, watcher)
+                watchers.append(watcher)
+                source_anchor_descriptors.append(
+                    watcher._source_anchor.descriptor
+                )
+                staged_credentials.append(staged)
+                real_bootstrap = watcher._thread._bootstrap_inner
+                real_started_wait = watcher._thread._started.wait
+                started_wait_calls = 0
+
+                def delayed_bootstrap() -> None:
+                    native_thread_entered.set()
+                    allow_bootstrap.wait(timeout=2.0)
+                    real_bootstrap()
+
+                def interrupt_first_started_wait(
+                    timeout: float | None = None,
+                ) -> bool:
+                    nonlocal started_wait_calls
+                    started_wait_calls += 1
+                    if started_wait_calls == 1:
+                        if not native_thread_entered.wait(timeout=2.0):
+                            raise AssertionError(
+                                "native watcher thread did not start"
+                            )
+                        raise forwarded
+                    if started_wait_calls == 2 and confirmation_error is not None:
+                        raise confirmation_error
+                    return real_started_wait(timeout)
+
+                watcher._thread._bootstrap_inner = delayed_bootstrap
+                watcher._thread._started.wait = interrupt_first_started_wait
+
+            try:
+                with (
+                    mock.patch.object(
+                        claude_linux,
+                        "STAGED_CREDENTIAL_JOIN_TIMEOUT_SECONDS",
+                        0.01,
+                    ),
+                    mock.patch.object(
+                        claude_linux,
+                        "acquire_claude_refresh_lock",
+                        side_effect=acquire_refresh_lock,
+                    ),
+                    mock.patch.object(
+                        claude_linux._HostRefreshLockCleanupCoordinator,
+                        "publish_watcher",
+                        autospec=True,
+                        side_effect=publish_watcher,
+                    ),
+                    self.assertRaises(
+                        claude_linux.ForwardedSignal
+                    ) as caught,
+                ):
+                    with claude_linux.stage_claude_credentials(
+                        source,
+                        helper,
+                        now=now,
+                        refresh_lock_protocol=self.PROTOCOL,
+                    ):
+                        self.fail("an interrupted watcher start must not yield")
+
+                self.assertIs(caught.exception, forwarded)
+                self.assertEqual(len(watchers), 1)
+                watcher = watchers[0]
+                self.assertTrue(watcher._stop.is_set())
+                self.assertTrue(
+                    watcher._source_anchor.detached_to_watcher
+                )
+                self.assertFalse(watcher._source_anchor_cleanup_reached)
+                self.assertEqual(len(source_anchor_descriptors), 1)
+                os.fstat(source_anchor_descriptors[0])
+                self.assertEqual(len(host_leases), 1)
+                host_lease = host_leases[0]
+                snapshot = host_lease.retention_snapshot()
+                self.assertTrue(snapshot.terminal)
+                self.assertFalse(host_lease.released)
+                self._assert_assignment_interrupt_retained_lock(host_lease)
+                self.assertIsNotNone(snapshot.diagnostic)
+                self.assertEqual(
+                    getattr(
+                        snapshot.diagnostic,
+                        "_codex_claude_refresh_lock_paths",
+                        (),
+                    ),
+                    (),
+                )
+                self.assertTrue(
+                    getattr(
+                        snapshot.diagnostic,
+                        "_codex_claude_refresh_lock_descriptor_bound",
+                        False,
+                    )
+                )
+                self._assert_retained_recovery_carrier(
+                    error=caught.exception,
+                    staged=staged_credentials[0],
+                    helper=helper,
+                    expected_refresh_token=self.SYNTH_REFRESH_A,
+                )
+            finally:
+                allow_bootstrap.set()
+                for watcher in watchers:
+                    watcher.request_stop()
+                    watcher._thread._started.wait(timeout=1.0)
+                    if watcher._thread._started.is_set():
+                        watcher._thread.join(timeout=1.0)
+                for lease in host_leases:
+                    if lease.retention_snapshot().terminal:
+                        continue
+                    lease._deletion_prohibited = True
+                    lease._heartbeat_stop.set()
+                    try:
+                        lease.abandon(
+                            "test cleanup after interrupted watcher startup"
+                        )
+                    except claude_refresh_lock.ClaudeRefreshLockError:
+                        pass
+
+            self.assertEqual(len(watchers), 1)
+            self.assertFalse(watchers[0]._thread.is_alive())
+            self.assertTrue(watchers[0]._source_anchor_cleanup_reached)
+            self.assertEqual(len(source_anchor_descriptors), 1)
+            with self.assertRaises(OSError) as raised:
+                os.fstat(source_anchor_descriptors[0])
+            self.assertEqual(raised.exception.errno, errno.EBADF)
+
+    def test_interrupted_start_before_started_publication_retains_carrier(
+        self,
+    ) -> None:
+        self._assert_interrupted_start_before_started_publication_retains_carrier(
+            confirmation_error=None,
+        )
+
+    def test_interrupted_start_confirmation_error_retains_carrier(
+        self,
+    ) -> None:
+        self._assert_interrupted_start_before_started_publication_retains_carrier(
+            confirmation_error=OSError("cannot confirm watcher startup"),
+        )
+
+    def test_unknown_watcher_start_confirms_then_joins(self) -> None:
+        watcher = object.__new__(claude_linux._StagedCredentialWatcher)
+        watcher._stop = threading.Event()
+        watcher._background_writeback_state_lock = threading.Lock()
+        watcher._background_writeback_admission_open = True
+        watcher._background_writeback_in_flight = False
+        watcher._background_writeback_was_in_flight_at_stop = False
+        watcher._start_state_lock = threading.Lock()
+        watcher._start_state = (
+            claude_linux._StagedCredentialWatcherStartState.UNKNOWN
+        )
+        watcher._stop_deadline = None
+        watcher._thread = threading.Thread(
+            target=watcher._stop.wait,
+            name="delayed-staged-credential-watcher",
+            daemon=True,
+        )
+        native_thread_entered = threading.Event()
+        allow_bootstrap = threading.Event()
+        real_bootstrap = watcher._thread._bootstrap_inner
+
+        def delayed_bootstrap() -> None:
+            native_thread_entered.set()
+            allow_bootstrap.wait(timeout=2.0)
+            real_bootstrap()
+
+        watcher._thread._bootstrap_inner = delayed_bootstrap
+        launcher = threading.Thread(
+            target=watcher._thread.start,
+            name="delayed-watcher-native-launcher",
+            daemon=True,
+        )
+        launcher.start()
+        self.assertTrue(native_thread_entered.wait(timeout=1.0))
+        self.assertIsNone(watcher.request_stop())
+        allow_bootstrap.set()
+
+        self.assertTrue(watcher.wait_until_stopped())
+        launcher.join(timeout=1.0)
+        self.assertFalse(launcher.is_alive())
+        self.assertFalse(watcher._thread.is_alive())
+        self.assertEqual(
+            watcher.start_state(),
+            claude_linux._StagedCredentialWatcherStartState.CONFIRMED,
+        )
 
     def test_final_drain_recovers_after_ordinary_watcher_failure(self) -> None:
         now = time.time()
