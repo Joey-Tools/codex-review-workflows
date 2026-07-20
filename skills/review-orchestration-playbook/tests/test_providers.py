@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import json
 import os
 import pathlib
@@ -3082,6 +3083,15 @@ class ProviderPolicyTest(unittest.TestCase):
                 evidence["scope"],
                 "detached clean head worktree, scanned endpoint Git objects, "
                 "diff, and review prompt",
+            )
+            diff_bytes = self.review.diff_file.read_bytes()
+            self.assertEqual(
+                evidence["primary_diff"],
+                {
+                    "path": ".codex-review/review.diff",
+                    "sha256": hashlib.sha256(diff_bytes).hexdigest(),
+                    "size": len(diff_bytes),
+                },
             )
             return "success", "No findings."
 

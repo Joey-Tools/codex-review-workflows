@@ -28,6 +28,8 @@ The helper and clean-context `reviewer` agent use explicit models; they do not i
 
 Claude Code `2.1.212` must pass the signed-manifest provenance, native-platform, capability, structured-output, and sandbox checks in [claude-runtime-trust.md](references/claude-runtime-trust.md). Every other release fails closed until its read-only permission, path-rule, sandbox, and output contracts are revalidated and the exact supported version is deliberately advanced. WSL1 and native Windows remain unsupported.
 
+Helper-backed Codex CLI and Copilot CLI are not pinned to exact executable versions; their acceptance remains identity-, capability-, and output-contract based. The independent ephemeral Codex lane instead trusts the executable selected from the reviewer environment and records its path/version only as observational metadata when available. Claude Code was the only exact-version CLI pin. After its signed manifest and SHA-256 match the source candidate, the helper materializes a current-user-only verified executable snapshot; the same snapshot is captured before the model chain and runs every `--help`, post-provenance dependency inspection, authentication preparation, and final model attempt. The mutable source installation is never rediscovered between Opus attempts.
+
 Every Claude attempt uses one combined runtime boundary:
 
 - cwd is a helper-owned literal detached Git worktree at the exact resolved head;
@@ -46,7 +48,7 @@ The review prompt plus the verified effective `dontAsk` mode, workspace file all
 
 Authentication precedence is `ANTHROPIC_API_KEY` > `CLAUDE_CODE_OAUTH_TOKEN` > ordinary local login. Only the winning explicit value is selected and opaque-forwarded; the helper never parses, logs, writes to disk, stages, brokers, or persists it. Claude Code owns ordinary local-login lookup and refresh through its supported control plane. Before review content enters a child process, `claude auth status --json` must prove a compatible effective provider/method/API-key-source tuple; its valid JSON is parsed even when the CLI uses a nonzero exit for `loggedIn: false`, which becomes `blocked-authentication` rather than runtime failure. Gateway, cloud-provider, `apiKeyHelper`, or otherwise conflicting observable state is blocked. A rejected API key directs the operator to unset or replace `ANTHROPIC_API_KEY`; a rejected OAuth token directs the operator to unset or replace `CLAUDE_CODE_OAUTH_TOKEN`; a rejected local login directs the operator to run `claude auth login`. Every authentication failure is `blocked-authentication` and never a model or Copilot fallback reason.
 
-Capacity, overload, rate limits, timeouts, network errors, 5xx responses, missing final artifacts, silent model substitution, or reviewer findings are not model-fallback reasons. Retry the same runtime/model only within a bounded transient retry policy; otherwise report `inconclusive`.
+Capacity, overload, rate limits, timeouts, network errors, 5xx responses, missing final artifacts, silent model substitution, or reviewer findings are not model-fallback reasons. Retry the same runtime/model only within a bounded transient retry policy; otherwise report `inconclusive`. For helper-backed lanes, invalid configuration or an unexpected effective model/effort is `blocked`, not a reason to downgrade models, and missing runtime-verification metadata is also `blocked`. The independent ephemeral gate records requested and observed values without treating a difference as a blocker by itself, because trusted higher-priority managed policy may override the request.
 
 ## Workflow
 
@@ -56,6 +58,7 @@ Capacity, overload, rate limits, timeouts, network errors, 5xx responses, missin
 - WIP review: require explicit `--include-source-wip` consent and treat the digest-bound artifact as review-only evidence.
 - Triple review: establish the PR/current head, run the local double review, then require final current-head GitHub Codex evidence.
 - PR readiness/full workflow: follow [pr-readiness.md](references/pr-readiness.md) after a clean local delivery commit exists. Full PR readiness retains separate required `independent-codex-pr-review` and helper-backed `offline-frozen-diff-review` evidence.
+  The independent lane uses a clean detached worktree plus `codex exec --ephemeral` while preserving normal user and tracked project instructions. Those delivery gates do not alter the standalone double/triple definitions above.
 
 2. Freeze scope.
 - Prefer a `wip/<topic>` branch and an exact `base_sha..head_sha` range.
@@ -67,10 +70,13 @@ Capacity, overload, rate limits, timeouts, network errors, 5xx responses, missin
 - When source or tests need credential-shaped fixtures, use `$synthetic-token-fixtures` to select an exact helper-catalog token.
 - Start one stateful helper run per logical reviewer: `--reviewer codex` and, for double/triple review, `--reviewer claude`.
 - A Claude-family run must pass `--egress-consent double-review`, `--egress-consent triple-review`, or `--egress-consent explicit-claude-review`, matching the user's request.
+- `explicit-claude-review` authorizes only Anthropic Claude Code. Only `double-review` and `triple-review` authorize GitHub Copilot fallback when the secure Claude runtime is deterministically absent/unavailable or all pinned Claude models are entitlement-blocked. Authentication failure is always `blocked-authentication`, never fallback.
 - Add `--include-source-wip` only when the user explicitly opts into sending the complete WIP snapshot, including non-ignored untracked files.
 - Before egress, require the helper's escaping-symlink and sensitive-content preflight over the complete selected snapshot, diff, and prompt. A match is a hard stop.
-- When approval is needed, repeat the exact repository, frozen range, clean/WIP content category, destinations, and exclusions from [egress-consent.md](references/egress-consent.md).
+- In WIP mode, that preflight must additionally scan the helper-private Git database's original source `HEAD`-to-snapshot delta paths and original-`HEAD`-side raw blobs; the current snapshot side is already covered by the complete snapshot scan. Base-to-snapshot and current-snapshot scans alone are insufficient because a WIP deletion or reversion must not hide sensitive content that remains reachable from the original source `HEAD`.
+- When approval is needed, the escalation justification must repeat the explicit user request, exact repository, frozen range, clean/WIP content category, Anthropic destination plus GitHub Copilot fallback only when authorized, included snapshot/diff/prompt scope, and exclusions from [egress-consent.md](references/egress-consent.md). A generic `run external reviewer` justification is insufficient.
 - Use `stateful start`, bounded `stateful status` / `stateful wait`, and finally `stateful final --state-dir <dir>`.
+- For `independent-codex-pr-review`, use the lightweight trust boundary in [review-lane-contracts.md](references/review-lane-contracts.md): a clean detached raw-materialized worktree and a fresh `codex exec --ephemeral --strict-config --json --sandbox read-only` process with normal `~/.codex` configuration, Rules, MCP servers, Plugins, and tracked project instructions. Pass the table-valued worktree trust entry, sole `.git` project-root marker, `features.hooks=false`, and `notify=[]` as four direct per-invocation argv overrides. Ordinary user configuration and organization-managed configuration are trusted parts of the reviewer environment. The CLI overrides express the values requested for this invocation; higher-priority managed policy may prevail, and that possibility is accepted within this trust model. Do not add a separate runtime-identity, authentication/account, managed-configuration, feature, or effective-configuration probe, and do not claim independent attestation of the effective configuration. Never run `codex debug prompt-input`, because it adds another Session and configured MCP startup. If the actual structured output or exit explicitly reports a configuration conflict before reviewer execution, classify the attempt as prelaunch `blocked` / `not-run`; once launch is possible, or whenever hook/notify execution is observed, the attempt is `inconclusive`. Do not add another probe to search for those conditions.
 - A bounded `stateful wait` that expires while the same reviewer remains healthy is only an intermediate poll, not task completion. Keep the parent task active and continue bounded status/wait checks until `stateful final` is terminal or a real `blocked` / `inconclusive` decision point is reached; do not end the task merely because one wait window expires.
 - Treat only the terminal final artifact as review evidence. Intermediate reasoning, tool traces, stdout tails, and keepalives are not findings.
 
@@ -89,7 +95,7 @@ Capacity, overload, rate limits, timeouts, network errors, 5xx responses, missin
 - Never report a requested double/triple review as clean when one requested logical lane is blocked, missing, or inconclusive.
 
 6. Report precisely.
-- Name the logical lane, runtime, requested/effective model, effort, workspace content mode, frozen range or WIP digest, and terminal status.
+- Name the logical lane, runtime, requested model and effort, effective values when observable, workspace content mode, frozen range or WIP digest, and terminal status.
 - Keep model fallback attempts within the same logical lane; they do not increase the review count.
 - For triple review, bind GitHub Codex evidence to the current PR head.
 
@@ -114,7 +120,11 @@ Read [helper-contract.md](references/helper-contract.md) before modifying or deb
 - Do not count fallback attempts or multiple helper implementations as additional reviews.
 - Do not silently replace Claude-family review with OpenCode, Cursor Agent, or another model family.
 - Do not treat authentication failure as runtime unavailability or entitlement; report `blocked-authentication` and pause.
-- Do not let model aliases or global defaults override pinned policy.
+- Do not downgrade on capacity or other transient failures, and do not infer account entitlement from silent model substitution.
+- Do not accept a helper-backed Codex result unless the persisted rollout verifies both the effective model and effort. For the independent ephemeral gate, require explicit requested model/effort plus the requested-runtime and structured-output contract in [review-lane-contracts.md](references/review-lane-contracts.md); report observed differences without treating them as blockers by themselves, do not require a rollout that `--ephemeral` intentionally does not persist, and do not claim that requested values attest the effective configuration.
+- Do not describe the independent ephemeral gate as full instruction/process isolation or as proof against silent model substitution. Its normal project/customization loading, PGID escape risk, and unobserved effective metadata are explicit accepted tradeoffs; stricter repo-local policy still wins.
+- For helper-backed pinned lanes, do not let model aliases or global defaults override the pinned policy. The independent ephemeral lane instead accepts trusted higher-priority managed policy overriding its requested values.
+- Do not let model aliases or global defaults override the pinned Claude policy.
 - Do not run an unverified or mutable source Claude executable with authentication or review content.
 - Do not accept a Claude result without matching effective `dontAsk`/tool/model/auth evidence from the unique first `system/init` and unique last result. File tools require the workspace allowlist plus explicit sensitive-path denies; Shell availability requires the documented v2.1.212 non-prompting read-only Bash contract and a launch that requests disabled sandbox auto-approval and no unsandboxed escape. Do not promote requested sandbox settings to independently verified evidence.
 - Run exact external-workspace validation after every completed Claude attempt and before accepting its result or retrying another model. Treat any observable worktree, private-Git, diff, or prompt mutation as terminal `permission-mismatch`; do not claim this check rules out transient writes or out-of-workspace side effects.

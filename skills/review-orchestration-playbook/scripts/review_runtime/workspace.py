@@ -226,6 +226,19 @@ PRIVATE_GIT_TIMEOUT_SECONDS = 300.0
 REVIEW_ROOT_BASE = pathlib.Path("/tmp")
 REVIEW_USER_ROOT_PREFIX = "codex-isolated-review-uid-"
 REVIEW_CONTAINER_PATTERN = re.compile(r"isolated-review-[0-9]{8}-[0-9]{6}-[0-9a-f]{10}")
+MAX_PREFLIGHT_JSON_BYTES = 128 * 1024
+MAX_BOUNDED_JSON_DEPTH = 64
+GIT_LFS_POINTER_MAX_BYTES = 1024
+GIT_LFS_V1_ALIASES = frozenset(
+    {
+        b"http://git-media.io/v/2",
+        b"https://hawser.github.com/spec/v1",
+        b"https://git-lfs.github.com/spec/v1",
+    }
+)
+GIT_LFS_OID_PATTERN = re.compile(rb"sha256:[0-9a-f]{64}\Z")
+GIT_LFS_EXTENSION_PREFIX_PATTERN = re.compile(rb"\Aext-[0-9]{1}-\w+")
+GIT_LFS_SIZE_PATTERN = re.compile(rb"[+-]?[0-9]+\Z")
 SYNTHETIC_MANIFEST_NAME = "synthetic-secret-manifest.json"
 SYNTHETIC_PRIVATE_MANIFEST_NAME = "synthetic-secret-state.json"
 SYNTHETIC_CHANGED_EVIDENCE_NAME = "synthetic-changed-evidence.json"
@@ -1928,6 +1941,94 @@ def _read_exact(stream: BinaryIO, size: int) -> bytes:
     return bytes(value)
 
 
+def _go_is_space(character: str) -> bool:
+    codepoint = ord(character)
+    return (
+        0x09 <= codepoint <= 0x0D
+        or codepoint
+        in {
+            0x20,
+            0x85,
+            0xA0,
+            0x1680,
+            0x2028,
+            0x2029,
+            0x202F,
+            0x205F,
+            0x3000,
+        }
+        or 0x2000 <= codepoint <= 0x200A
+    )
+
+
+def _go_bytes_trim_space(payload: bytes) -> bytes:
+    text = payload.decode("utf-8", errors="surrogateescape")
+    start = 0
+    end = len(text)
+    while start < end and _go_is_space(text[start]):
+        start += 1
+    while end > start and _go_is_space(text[end - 1]):
+        end -= 1
+    return text[start:end].encode("utf-8", errors="surrogateescape")
+
+
+def _go_scan_lines(payload: bytes) -> list[bytes]:
+    if not payload:
+        return []
+    records = payload.split(b"\n")
+    if payload.endswith(b"\n"):
+        records.pop()
+    return [record[:-1] if record.endswith(b"\r") else record for record in records]
+
+
+def _is_git_lfs_pointer(payload: bytes) -> bool:
+    if not payload or len(payload) >= GIT_LFS_POINTER_MAX_BYTES:
+        return False
+
+    pointer_keys = (b"version", b"oid", b"size")
+    core: dict[bytes, bytes] = {}
+    extensions: dict[bytes, bytes] = {}
+    line = 0
+    for record in _go_scan_lines(_go_bytes_trim_space(payload)):
+        if not record:
+            continue
+        parts = record.split(b" ", 1)
+        if len(parts) != 2 or line >= len(pointer_keys):
+            return False
+        key, value = parts
+        if key != pointer_keys[line]:
+            if GIT_LFS_EXTENSION_PREFIX_PATTERN.match(key) is None:
+                return False
+            extensions[key] = value
+            continue
+        core[key] = value
+        line += 1
+
+    if core.get(b"version") not in GIT_LFS_V1_ALIASES:
+        return False
+    if GIT_LFS_OID_PATTERN.fullmatch(core.get(b"oid", b"")) is None:
+        return False
+    size_bytes = core.get(b"size", b"")
+    if GIT_LFS_SIZE_PATTERN.fullmatch(size_bytes) is None:
+        return False
+    parsed_size = int(size_bytes, 10)
+    if parsed_size < 0 or parsed_size > (1 << 63) - 1:
+        return False
+
+    priorities: set[int] = set()
+    for key, value in extensions.items():
+        key_parts = key.split(b"-", 2)
+        if len(key_parts) != 3 or key_parts[0] != b"ext":
+            return False
+        priority = int(key_parts[1], 10)
+        if priority in priorities:
+            return False
+        priorities.add(priority)
+        if GIT_LFS_OID_PATTERN.fullmatch(value) is None:
+            return False
+    return True
+
+
 def _copy_exact(stream: BinaryIO, destination: BinaryIO, size: int) -> None:
     remaining = size
     while remaining:
@@ -1965,6 +2066,8 @@ def _materialize_blob(
         size = int(raw_size)
     except ValueError as error:
         raise ReviewError(f"invalid git cat-file blob size: {header!r}") from error
+    if size < 0:
+        raise ReviewError(f"invalid git cat-file blob size: {header!r}")
     try:
         actual_object_id = actual_object.decode("ascii")
     except UnicodeDecodeError as error:
@@ -1985,6 +2088,19 @@ def _materialize_blob(
         raise ReviewError(
             f"frozen Git tree path escapes workspace: {destination_display}"
         )
+    buffered_payload: bytes | None = None
+    delimiter_consumed = False
+    if mode in {"100644", "100755"} and 0 < size < GIT_LFS_POINTER_MAX_BYTES:
+        buffered_payload = _read_exact(cat_output, size)
+        if cat_output.read(1) != b"\n":
+            raise ReviewError("missing delimiter after git cat-file blob")
+        delimiter_consumed = True
+        if _is_git_lfs_pointer(buffered_payload):
+            raise ReviewError(
+                "blocked-checkout-lfs-pointer: review_status=not-run: "
+                f"{destination_display}"
+            )
+
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     if mode == "120000":
@@ -2033,13 +2149,16 @@ def _materialize_blob(
         destination.symlink_to(target_text)
     elif mode in {"100644", "100755"}:
         with destination.open("xb") as handle:
-            _copy_exact(cat_output, handle, size)
+            if buffered_payload is None:
+                _copy_exact(cat_output, handle, size)
+            else:
+                handle.write(buffered_payload)
         destination.chmod(0o755 if mode == "100755" else 0o644)
     else:
         raise ReviewError(
             f"unsupported mode in frozen Git tree: {mode} {destination_display}"
         )
-    if cat_output.read(1) != b"\n":
+    if not delimiter_consumed and cat_output.read(1) != b"\n":
         raise ReviewError("missing delimiter after git cat-file blob")
     return materialized_bytes + size
 
@@ -2664,6 +2783,109 @@ def _iter_changed_blob_sides(
                     f"invalid changed Git object id: {raw_object!r}"
                 ) from error
             yield side, object_id, raw_path
+
+
+def _scan_source_head_wip_delta(
+    *,
+    git_view: pathlib.Path,
+    object_directory: pathlib.Path,
+    source_head_sha: str,
+    snapshot_tree_sha: str,
+    accepted_values: Iterable[AcceptedSyntheticValue],
+    raw_occurrence_values: Iterable[AcceptedSyntheticValue],
+    accepted_index: AcceptedValueIndex,
+    event_budget: SecretScanBudget,
+    exact_index: ExactValueIndex,
+    occurrence_budget: LegacyOccurrenceBudget,
+    path_callback: Callable[[bytes], None],
+    blob_callback: Callable[[bytes, SecretScanResult], None],
+) -> None:
+    accepted = tuple(accepted_values)
+    raw_occurrences = tuple(raw_occurrence_values)
+    with (
+        tempfile.TemporaryFile() as changed_paths,
+        tempfile.TemporaryFile() as raw_output,
+        tempfile.TemporaryFile() as batch_input,
+        tempfile.TemporaryFile() as batch_output,
+    ):
+        _write_limited_diff_metadata(
+            git_view=git_view,
+            object_directory=object_directory,
+            args=(
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                source_head_sha,
+                snapshot_tree_sha,
+            ),
+            output=changed_paths,
+            label="source HEAD to WIP snapshot changed paths",
+            record_limit=MAX_CHANGED_ENTRIES,
+        )
+        changed_paths.seek(0)
+        for raw_path in _iter_nul_records(
+            changed_paths,
+            byte_limit=MAX_CHANGED_METADATA_BYTES,
+            record_limit=MAX_CHANGED_ENTRIES,
+            label="source HEAD to WIP snapshot changed paths",
+        ):
+            path_callback(raw_path)
+
+        _write_limited_diff_metadata(
+            git_view=git_view,
+            object_directory=object_directory,
+            args=(
+                "diff",
+                "--raw",
+                "-z",
+                "--no-abbrev",
+                "--no-renames",
+                source_head_sha,
+                snapshot_tree_sha,
+            ),
+            output=raw_output,
+            label="source HEAD to WIP snapshot blob metadata",
+            record_limit=MAX_CHANGED_ENTRIES * 2,
+        )
+        blob_count = 0
+        for side, object_id, _raw_path in _iter_changed_blob_sides(raw_output):
+            if side != "base":
+                continue
+            batch_input.write(object_id.encode("ascii") + b"\n")
+            blob_count += 1
+        if blob_count:
+            batch_input.seek(0)
+            _run_bounded_process_to_file(
+                _frozen_command(git_view=git_view, args=("cat-file", "--batch")),
+                environment=_git_environment(object_directory=object_directory),
+                input_handle=batch_input,
+                destination=batch_output,
+                label="source HEAD WIP delta blob batch",
+                byte_limit=MAX_CHANGED_BLOB_SCAN_BYTES + MAX_CHANGED_METADATA_BYTES,
+            )
+        batch_output.seek(0)
+        scanned_bytes = 0
+        for side, object_id, raw_path in _iter_changed_blob_sides(raw_output):
+            if side != "base":
+                continue
+            scan, scanned_bytes = _scan_batch_blob(
+                cat_input=None,
+                cat_output=batch_output,
+                object_id=object_id,
+                scanned_bytes=scanned_bytes,
+                accepted_values=accepted,
+                raw_occurrence_values=raw_occurrences,
+                accepted_index=accepted_index,
+                event_budget=event_budget,
+                exact_index=exact_index,
+                occurrence_budget=occurrence_budget,
+            )
+            blob_callback(raw_path, scan)
+        if batch_output.read(1):
+            raise ReviewError(
+                "source HEAD WIP delta blob batch contains unexpected trailing data"
+            )
 
 
 def _write_changed_blob_findings(
@@ -3587,27 +3809,77 @@ def _read_bounded_json(
     *,
     label: str,
     expected_artifact: ControlArtifactEvidence | None = None,
+    max_bytes: int = MAX_SYNTHETIC_EVIDENCE_BYTES,
 ) -> dict[str, Any]:
     chunks: list[bytes] = []
     with _secure_file_reader(
         path,
         label=label,
-        max_bytes=MAX_SYNTHETIC_EVIDENCE_BYTES,
+        max_bytes=max_bytes,
         expected_artifact=expected_artifact,
     ) as (reader, _metadata):
-        while chunk := reader.read(64 * 1024):
+        remaining = max_bytes
+        while chunk := reader.read(min(64 * 1024, remaining + 1)):
+            if len(chunk) > remaining:
+                raise ReviewError(f"{label} exceeds its review size limit")
             chunks.append(chunk)
+            remaining -= len(chunk)
     encoded = b"".join(chunks)
     try:
         value = json.loads(
             encoded.decode("utf-8"),
             object_pairs_hook=_reject_duplicate_json_object,
         )
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    except RecursionError as error:
+        raise ReviewError(f"{label} exceeds the JSON nesting depth limit") from error
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        OverflowError,
+        ValueError,
+    ) as error:
         raise ReviewError(f"{label} is not valid JSON") from error
     if not isinstance(value, dict):
         raise ReviewError(f"{label} must be a JSON object")
+    _validate_bounded_json_depth(value, label=label)
     return value
+
+
+def _validate_bounded_json_depth(value: dict[str, Any], *, label: str) -> None:
+    pending: list[tuple[Any, int]] = [(value, 0)]
+    while pending:
+        candidate, depth = pending.pop()
+        if depth > MAX_BOUNDED_JSON_DEPTH:
+            raise ReviewError(f"{label} exceeds the JSON nesting depth limit")
+        if isinstance(candidate, dict):
+            children = candidate.values()
+        elif isinstance(candidate, list):
+            children = candidate
+        else:
+            continue
+        next_depth = depth + 1
+        for child in children:
+            if isinstance(child, (dict, list)):
+                pending.append((child, next_depth))
+
+
+def encode_preflight_json(value: dict[str, Any]) -> str:
+    encoded = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    if len(encoded) > MAX_PREFLIGHT_JSON_BYTES:
+        raise ReviewError("serialized preflight evidence exceeds the size limit")
+    return encoded.decode("utf-8")
+
+
+def _encode_synthetic_evidence_json(value: dict[str, Any]) -> bytes:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    if len(encoded) > MAX_SYNTHETIC_EVIDENCE_BYTES:
+        raise ReviewError("synthetic-token preflight evidence exceeds the size limit")
+    return encoded
 
 
 def _control_entry_names_sha256(names: Iterable[str]) -> str:
@@ -4167,6 +4439,67 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
                 ),
             )
 
+    if review.content_variant == "source-wip":
+
+        def record_source_head_path(raw_path: bytes) -> None:
+            legacy_path_token_id = catalog_legacy_path_matcher.match(raw_path)
+            if legacy_path_token_id is not None:
+                record_finding(
+                    "<redacted source HEAD path> "
+                    "(legacy-synthetic-value; source-head-path)"
+                )
+                return
+            path_secret_rule = _value_secret_rule(
+                raw_path,
+                event_budget=event_budget,
+            )
+            if path_secret_rule:
+                record_finding(
+                    "<redacted source HEAD path> "
+                    f"({path_secret_rule}; source-head-path)"
+                )
+                return
+            path = os.fsdecode(raw_path)
+            if path_rule := _sensitive_path_rule(path):
+                path_display = _redact_secret_path(path, "source HEAD path")
+                record_finding(f"{path_display} ({path_rule}; source-head-path)")
+
+        def record_source_head_blob(
+            raw_path: bytes,
+            scan: SecretScanResult,
+        ) -> None:
+            path_display = (
+                "<redacted source HEAD blob path>"
+                if catalog_legacy_path_matcher.match(raw_path) is not None
+                else _redact_secret_path(
+                    os.fsdecode(raw_path),
+                    "source HEAD blob path",
+                )
+            )
+            record_scan(
+                scan,
+                surface="source-head-blob",
+                side="head",
+                path_bytes=raw_path,
+                finding_label=path_display,
+                diagnostic_surface="source-head-blob",
+            )
+
+        _scan_source_head_wip_delta(
+            git_view=git_dir,
+            object_directory=git_dir / "objects",
+            source_head_sha=review.head_ref,
+            snapshot_tree_sha=review.snapshot_tree_sha,
+            accepted_values=accepted_values,
+            raw_occurrence_values=legacy_values,
+            accepted_index=accepted_index,
+            event_budget=event_budget,
+            exact_index=legacy_exact_index,
+            occurrence_budget=occurrence_budget,
+            path_callback=record_source_head_path,
+            blob_callback=record_source_head_blob,
+        )
+
     changed_paths_file = review.workspace_root / ".codex-review/changed-paths.z"
     changed_path_count = 0
     changed_path_artifact = control_artifacts["changed-paths.z"]
@@ -4403,6 +4736,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
                 f"actual={actual_head_unembedded_count}"
             )
 
+    primary_diff_artifact = control_artifacts["review.diff"]
     diff_scan = _file_secret_scan(
         review.diff_file,
         accepted_values=accepted_values,
@@ -4410,7 +4744,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
         accepted_index=accepted_index,
         event_budget=event_budget,
         max_bytes=MAX_DIFF_BYTES,
-        expected_artifact=control_artifacts["review.diff"],
+        expected_artifact=primary_diff_artifact,
     )
     record_scan(
         diff_scan,
@@ -4465,21 +4799,19 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     if len(accepted_evidence) > MAX_SYNTHETIC_EVIDENCE_ENTRIES:
         raise ReviewError("accepted synthetic-token evidence has too many entries")
     evidence = {
+        "primary_diff": {
+            "path": ".codex-review/review.diff",
+            "sha256": primary_diff_artifact.sha256,
+            "size": primary_diff_artifact.size,
+        },
         "synthetic_tokens": {
             "accepted": accepted_evidence,
             "catalog_schema_version": catalog.schema_version,
             "legacy_counts": legacy_evidence,
             "pool_version": catalog.pool_version,
-        }
+        },
     }
-    encoded_evidence = json.dumps(
-        evidence,
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    if len(encoded_evidence) > MAX_SYNTHETIC_EVIDENCE_BYTES:
-        raise ReviewError("synthetic-token preflight evidence exceeds the size limit")
+    _encode_synthetic_evidence_json(evidence)
     complete_preflight_evidence = {
         "content_variant": review.content_variant,
         "review_range": f"{review.base_ref}..{review.head_ref}",
@@ -4493,6 +4825,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
         "status": "sensitive-content and escaping-symlink checks passed",
     }
     complete_preflight_evidence.update(evidence)
+    encode_preflight_json(complete_preflight_evidence)
     _reject_raw_values_in_evidence(
         complete_preflight_evidence,
         accepted_values=evidence_sensitive_values,

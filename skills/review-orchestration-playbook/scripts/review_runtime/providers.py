@@ -64,6 +64,7 @@ from .common import (
 from .workspace import (
     MAX_REVIEW_PROMPT_BYTES,
     ReviewWorkspace,
+    encode_preflight_json,
     validate_external_workspace,
 )
 
@@ -3203,7 +3204,10 @@ def _run_review_impl(
         "status": "sensitive-content and escaping-symlink checks passed",
     }
     preflight_evidence.update(synthetic_evidence)
-    write_json(review.container_dir / "preflight.json", preflight_evidence)
+    write_text_atomic(
+        review.container_dir / "preflight.json",
+        encode_preflight_json(preflight_evidence),
+    )
 
     if reviewer == "claude":
         write_json(

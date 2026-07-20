@@ -103,6 +103,7 @@ The helper places the detached worktree, private Git database, control artifacts
 - Exclude ignored files. Apply the same file, entry-count, byte, symlink, and secret-scan budgets used for clean evidence.
 - Bind the result to a deterministic WIP digest plus the base/head/tree identity and source-state observations before and after capture.
 - Drive the rendered diff, changed-path inventory, blob scan, prompt, and reviewer-visible files from that same captured artifact. Never scan one tree while reviewing another.
+- Preserve the original source `HEAD` in the helper-private Git database and additionally scan its `HEAD`-to-snapshot delta paths and original-`HEAD`-side raw blobs. The current snapshot side is already covered by the complete snapshot scan. Together these checks supplement the base-to-snapshot diff so a WIP deletion or reversion cannot hide sensitive content that remains reachable from the original source `HEAD`.
 - Treat the WIP digest as fixed review-only artifact evidence. It is not an authored Git commit and cannot count for formal PR-readiness or merge-ready review.
 
 The detached worktree contains Git metadata sufficient for read-only `git` inspection, but its database and administrative files stay helper-owned and immutable to model tools. Reviewer-visible control artifacts live outside tracked content and are independently identity/digest checked. Cleanup is idempotent and removes only helper-owned external workspace content; it never prunes or mutates the source repository or another worktree.
@@ -113,7 +114,7 @@ Submodules remain uninitialized and unfetched. A partial clone with missing requ
 
 ## Sensitive-Content And Egress Preflight
 
-Before any network-backed Codex, Claude Code, or Copilot run, the helper checks the complete selected artifact, exact diff, changed paths, raw changed blobs, symlink targets, reviewer controls, and prompt. It rejects escaping symlinks, credential-like paths, and high-confidence secret patterns. WIP mode includes non-ignored untracked files in both capture and scanning.
+Before any network-backed Codex, Claude Code, or Copilot run, the helper checks the complete selected artifact, exact diff, changed paths, raw changed blobs, symlink targets, reviewer controls, and prompt. It rejects escaping symlinks, credential-like paths, and high-confidence secret patterns. WIP mode includes non-ignored untracked files in both capture and scanning, plus the original source `HEAD`-to-snapshot delta paths and original-`HEAD`-side raw blobs from the helper-private Git database; the complete snapshot scan covers the current side.
 
 The scanner reports only side/path/rule metadata, never the matched value. Exact helper-catalog synthetic fixtures may suppress only their declared finding. A successful check writes retained `preflight.json` before executable discovery or model launch.
 
@@ -157,6 +158,8 @@ Reviewer stdout/stderr stream to complete per-attempt files with finite deadline
 Only a validated non-empty terminal artifact counts. Every attempt records runtime, requested/effective model, requested/effective effort when observable, category, exit status, workspace content mode, exact range or WIP digest, and bounded log paths. Repository-controlled partial result text never authorizes authentication, entitlement, or fallback classification.
 
 Stateful final artifacts survive helper workspace cleanup inside the external per-run container, subject to the `/tmp` reboot and host-cleanup lifetime above. A retained fallback worktree is valid only when its preflight, mode, exact range, and clean-tree or WIP digest match the requested fallback evidence.
+
+Cleanup-only legacy compatibility admits an empty owner-owned mode-`0664` `cleanup.lock` only through no-follow descriptors after proving a non-group/other-writable owner-owned `.codex-tmp` root and an exact-mode-`0700` state directory. After the exclusive lock is acquired, the helper revalidates both directories and the lock identity/mode before `fchmod(0600)`, `fsync`, and exact mode-`0600` validation. Every other group/other-writable or nonempty legacy lock fails closed without workspace removal.
 
 ## Terminal States
 
