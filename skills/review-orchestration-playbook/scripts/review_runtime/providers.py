@@ -2779,6 +2779,192 @@ def _claude_keychain_account() -> str:
     return account
 
 
+def _require_claude_keychain_executable(
+    path: pathlib.Path,
+    *,
+    requirement: str,
+) -> None:
+    try:
+        metadata = path.stat()
+    except FileNotFoundError as error:
+        raise ClaudeKeychainBrokerUnavailable(requirement) from error
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            f"cannot inspect required Claude Keychain executable {path}: {error}"
+        ) from error
+    if not stat.S_ISREG(metadata.st_mode) or not metadata.st_mode & 0o111:
+        raise ClaudeKeychainBrokerUnavailable(requirement)
+    try:
+        executable = os.access(path, os.X_OK)
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            f"cannot check required Claude Keychain executable {path}: {error}"
+        ) from error
+    if not executable:
+        raise ClaudeExecutableInspectionInconclusive(
+            f"required Claude Keychain executable is not accessible: {path}"
+        )
+
+
+@contextlib.contextmanager
+def _open_or_create_claude_keychain_broker_directory(
+    review: ReviewWorkspace,
+) -> Iterator[tuple[pathlib.Path, int]]:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude Keychain broker preparation requires O_NOFOLLOW"
+        )
+    container = review.container_dir.expanduser().absolute()
+    if container != pathlib.Path(os.path.normpath(container)):
+        raise ReviewError("Claude Keychain broker container path is not normalized")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0) | nofollow
+    try:
+        with _open_absolute_directory_chain_without_symlinks(container) as (
+            container_descriptor,
+            _ancestor_identities,
+        ):
+            _validate_claude_runtime_directory_descriptor(
+                container,
+                container_descriptor,
+                private=True,
+            )
+            descriptors: list[int] = []
+            current = container
+            try:
+                for component in ("claude-runtime", "keychain-broker"):
+                    parent_descriptor = (
+                        descriptors[-1] if descriptors else container_descriptor
+                    )
+                    try:
+                        os.mkdir(component, 0o700, dir_fd=parent_descriptor)
+                    except FileExistsError:
+                        pass
+                    except OSError as error:
+                        raise ClaudeExecutableInspectionInconclusive(
+                            "cannot create the Claude Keychain broker directory: "
+                            f"{error}"
+                        ) from error
+                    try:
+                        descriptor = os.open(
+                            component,
+                            flags,
+                            dir_fd=parent_descriptor,
+                        )
+                    except OSError as error:
+                        if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                            raise ReviewError(
+                                "Claude Keychain broker path must use real directories"
+                            ) from error
+                        raise ClaudeExecutableInspectionInconclusive(
+                            "cannot open the Claude Keychain broker directory chain"
+                        ) from error
+                    descriptors.append(descriptor)
+                    current /= component
+                    _validate_claude_runtime_directory_descriptor(
+                        current,
+                        descriptor,
+                        private=True,
+                    )
+                yield current, descriptors[-1]
+            except BaseException:
+                for descriptor in reversed(descriptors):
+                    with contextlib.suppress(OSError):
+                        os.close(descriptor)
+                raise
+            else:
+                close_error: OSError | None = None
+                for descriptor in reversed(descriptors):
+                    try:
+                        os.close(descriptor)
+                    except OSError as error:
+                        close_error = close_error or error
+                if close_error is not None:
+                    raise ClaudeExecutableInspectionInconclusive(
+                        "cannot close the Claude Keychain broker directory chain"
+                    ) from close_error
+    except OSError as error:
+        if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise ReviewError(
+                "Claude Keychain broker container path must use real directories"
+            ) from error
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot inspect the Claude Keychain broker container path"
+        ) from error
+
+
+def _remove_claude_keychain_broker_artifact(
+    directory_descriptor: int,
+    name: str,
+) -> None:
+    try:
+        os.unlink(name, dir_fd=directory_descriptor)
+    except FileNotFoundError:
+        return
+    except IsADirectoryError as error:
+        raise ReviewError(
+            f"Claude Keychain broker artifact must not be a directory: {name}"
+        ) from error
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            f"cannot remove stale Claude Keychain broker artifact {name}: {error}"
+        ) from error
+
+
+def _finalize_claude_keychain_broker(
+    broker: pathlib.Path,
+    *,
+    directory_descriptor: int,
+) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(broker.name, flags, dir_fd=directory_descriptor)
+    except OSError as error:
+        if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise ReviewError("Claude Keychain broker must be a real file") from error
+        raise ClaudeExecutableInspectionInconclusive(
+            f"cannot open the compiled Claude Keychain broker: {error}"
+        ) from error
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+        ):
+            raise ReviewError(
+                "Claude Keychain broker must be a current-user-owned regular file "
+                "with one link"
+            )
+        os.fchmod(descriptor, 0o700)
+        dirent = os.stat(
+            broker.name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            dirent.st_dev != metadata.st_dev
+            or dirent.st_ino != metadata.st_ino
+            or not stat.S_ISREG(dirent.st_mode)
+        ):
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude Keychain broker changed while finalized"
+            )
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        raise
+    else:
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                "cannot close the compiled Claude Keychain broker"
+            ) from error
+
+
 def _prepare_claude_keychain_broker(
     review: ReviewWorkspace,
     env: dict[str, str],
@@ -2786,18 +2972,24 @@ def _prepare_claude_keychain_broker(
     result = dict(env)
     if result.get("ANTHROPIC_API_KEY"):
         return result
-    if not CLAUDE_KEYCHAIN_CLIENT.is_file() or not os.access(
-        CLAUDE_KEYCHAIN_CLIENT, os.X_OK
-    ):
-        raise ClaudeKeychainBrokerUnavailable(
-            "Claude local-login review requires /usr/bin/security"
-        )
+    _require_claude_keychain_executable(
+        CLAUDE_KEYCHAIN_CLIENT,
+        requirement="Claude local-login review requires /usr/bin/security",
+    )
     compiler = CLAUDE_KEYCHAIN_BROKER_COMPILER
-    if not compiler.is_file() or not os.access(compiler, os.X_OK):
-        raise ClaudeKeychainBrokerUnavailable(
-            "Claude local-login review requires /usr/bin/clang"
-        )
-    if not CLAUDE_KEYCHAIN_BROKER_SOURCE.is_file():
+    _require_claude_keychain_executable(
+        compiler,
+        requirement="Claude local-login review requires /usr/bin/clang",
+    )
+    try:
+        source_metadata = CLAUDE_KEYCHAIN_BROKER_SOURCE.stat()
+    except FileNotFoundError as error:
+        raise ReviewError("Claude Keychain broker source is unavailable") from error
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            f"cannot inspect the Claude Keychain broker source: {error}"
+        ) from error
+    if not stat.S_ISREG(source_metadata.st_mode):
         raise ReviewError("Claude Keychain broker source is unavailable")
     home_raw = result.get("HOME")
     if not home_raw:
@@ -2805,43 +2997,62 @@ def _prepare_claude_keychain_broker(
     home = pathlib.Path(home_raw).resolve()
     if not is_relative_to(home, review.container_dir.resolve()):
         raise ReviewError("Claude Keychain broker requires a helper-owned HOME")
-    broker_dir = review.container_dir.resolve() / "claude-runtime" / "keychain-broker"
-    broker_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    broker = broker_dir / "security"
-    broker.unlink(missing_ok=True)
-    stdout_path = broker_dir / "build.stdout.log"
-    stderr_path = broker_dir / "build.stderr.log"
-    try:
-        completed = run(
-            (
-                str(compiler),
-                "-Wall",
-                "-Wextra",
-                "-Werror",
-                "-Wno-deprecated-declarations",
-                str(CLAUDE_KEYCHAIN_BROKER_SOURCE),
-                "-o",
-                str(broker),
-            ),
-            cwd=broker_dir,
-            env=child_environment(container_dir=review.container_dir),
-            stdout_path=stdout_path,
-            stderr_path=stderr_path,
-            timeout_seconds=CLAUDE_KEYCHAIN_BROKER_TIMEOUT_SECONDS,
-            output_file_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
+    with _open_or_create_claude_keychain_broker_directory(review) as (
+        broker_dir,
+        broker_directory_descriptor,
+    ):
+        broker = broker_dir / "security"
+        stdout_path = broker_dir / "build.stdout.log"
+        stderr_path = broker_dir / "build.stderr.log"
+        for artifact_name in (broker.name, stdout_path.name, stderr_path.name):
+            _remove_claude_keychain_broker_artifact(
+                broker_directory_descriptor,
+                artifact_name,
+            )
+        try:
+            completed = run(
+                (
+                    str(compiler),
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-Wno-deprecated-declarations",
+                    str(CLAUDE_KEYCHAIN_BROKER_SOURCE),
+                    "-o",
+                    str(broker),
+                ),
+                cwd=broker_dir,
+                env=child_environment(container_dir=review.container_dir),
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                timeout_seconds=CLAUDE_KEYCHAIN_BROKER_TIMEOUT_SECONDS,
+                output_file_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
+            )
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot build the Claude Keychain broker: {error}"
+            ) from error
+        if completed.returncode != 0:
+            detail = completed.stderr.decode("utf-8", errors="replace").strip()
+            raise ClaudeExecutableInspectionInconclusive(
+                "failed to build the Claude Keychain broker"
+                + (f": {detail}" if detail else "")
+            )
+        _finalize_claude_keychain_broker(
+            broker,
+            directory_descriptor=broker_directory_descriptor,
         )
-    except OSError as error:
-        raise ClaudeExecutableInspectionInconclusive(
-            f"cannot build the Claude Keychain broker: {error}"
-        ) from error
-    if completed.returncode != 0:
-        detail = completed.stderr.decode("utf-8", errors="replace").strip()
-        raise ClaudeExecutableInspectionInconclusive(
-            "failed to build the Claude Keychain broker"
-            + (f": {detail}" if detail else "")
+        _validate_claude_runtime_directory_descriptor(
+            broker_dir,
+            broker_directory_descriptor,
+            private=True,
         )
-    broker.chmod(0o700)
-    _native_macho_dependencies(broker, label="Claude Keychain broker")
+        _native_macho_dependencies(broker, label="Claude Keychain broker")
+        _validate_claude_runtime_directory_descriptor(
+            broker_dir,
+            broker_directory_descriptor,
+            private=True,
+        )
     result["USER"] = _claude_keychain_account()
     result["PATH"] = os.pathsep.join(
         value for value in (str(broker_dir), result.get("PATH")) if value

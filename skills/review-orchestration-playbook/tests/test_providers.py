@@ -14348,6 +14348,145 @@ class ProviderPolicyTest(unittest.TestCase):
                 },
             )
 
+    def test_keychain_client_inspection_io_failure_is_inconclusive(self) -> None:
+        candidate = mock.Mock(spec=pathlib.Path)
+        candidate.stat.side_effect = PermissionError(
+            errno.EACCES,
+            "injected inspection denial",
+        )
+
+        with self.assertRaisesRegex(
+            providers.ClaudeExecutableInspectionInconclusive,
+            "inspection denial",
+        ):
+            providers._require_claude_keychain_executable(
+                candidate,
+                requirement="fixture requirement",
+            )
+
+    def test_keychain_client_access_denial_is_inconclusive(self) -> None:
+        with (
+            mock.patch.object(providers.os, "access", return_value=False),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "not accessible",
+            ),
+        ):
+            providers._require_claude_keychain_executable(
+                self.claude_keychain_client,
+                requirement="fixture requirement",
+            )
+
+    @mock.patch.object(
+        providers,
+        "CLAUDE_KEYCHAIN_BROKER_COMPILER",
+        pathlib.Path("/usr/bin/true"),
+    )
+    @mock.patch.object(providers, "run")
+    def test_keychain_broker_rejects_symlinked_runtime_before_writes(
+        self,
+        run_command: mock.Mock,
+    ) -> None:
+        self.claude_broker.unlink()
+        self.claude_broker.parent.rmdir()
+        self.claude_broker.parent.parent.rmdir()
+        outside = pathlib.Path(self.temporary.name) / "outside-runtime"
+        outside.mkdir(mode=0o700)
+        victim = outside / "security"
+        victim.write_bytes(b"outside")
+        (self.review.container_dir / "claude-runtime").symlink_to(
+            outside,
+            target_is_directory=True,
+        )
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "must use real directories",
+        ):
+            self.prepare_claude_keychain_broker(
+                self.review,
+                {
+                    "HOME": str(self.review.container_dir / "claude-home"),
+                    "PATH": "/usr/bin",
+                },
+            )
+
+        self.assertEqual(victim.read_bytes(), b"outside")
+        run_command.assert_not_called()
+
+    @mock.patch.object(
+        providers,
+        "CLAUDE_KEYCHAIN_BROKER_COMPILER",
+        pathlib.Path("/usr/bin/true"),
+    )
+    @mock.patch.object(providers, "run")
+    def test_keychain_broker_rejects_symlinked_leaf_before_writes(
+        self,
+        run_command: mock.Mock,
+    ) -> None:
+        self.claude_broker.unlink()
+        self.claude_broker.parent.rmdir()
+        outside = pathlib.Path(self.temporary.name) / "outside-broker"
+        outside.mkdir(mode=0o700)
+        victim = outside / "security"
+        victim.write_bytes(b"outside")
+        self.claude_broker.parent.symlink_to(outside, target_is_directory=True)
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "must use real directories",
+        ):
+            self.prepare_claude_keychain_broker(
+                self.review,
+                {
+                    "HOME": str(self.review.container_dir / "claude-home"),
+                    "PATH": "/usr/bin",
+                },
+            )
+
+        self.assertEqual(victim.read_bytes(), b"outside")
+        run_command.assert_not_called()
+
+    @mock.patch.object(
+        providers,
+        "CLAUDE_KEYCHAIN_BROKER_COMPILER",
+        pathlib.Path("/usr/bin/true"),
+    )
+    @mock.patch.object(providers, "run")
+    def test_keychain_broker_rejects_symlinked_container_ancestor(
+        self,
+        run_command: mock.Mock,
+    ) -> None:
+        alias_parent = pathlib.Path(self.temporary.name) / "container-parent-alias"
+        alias_parent.symlink_to(
+            self.review.container_dir.parent,
+            target_is_directory=True,
+        )
+        aliased_container = alias_parent / self.review.container_dir.name
+        aliased_review = ReviewWorkspace(
+            source_root=self.review.source_root,
+            container_dir=aliased_container,
+            workspace_root=self.review.workspace_root,
+            base_ref=self.review.base_ref,
+            head_ref=self.review.head_ref,
+            diff_file=self.review.diff_file,
+            prompt_file=self.review.prompt_file,
+        )
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "container path must use real directories",
+        ):
+            self.prepare_claude_keychain_broker(
+                aliased_review,
+                {
+                    "HOME": str(aliased_container / "claude-home"),
+                    "PATH": "/usr/bin",
+                },
+            )
+
+        run_command.assert_not_called()
+
     def test_auth_warmup_shape_uses_recursive_strict_json(self) -> None:
         nested = (
             "[" * (common.STRICT_JSON_MAX_NESTING_DEPTH + 1)
