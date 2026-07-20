@@ -4532,7 +4532,7 @@ class ProviderPolicyTest(unittest.TestCase):
         normalized_output = (
             "proxy=http://reviewer:pass%40w%C3%B6rd@proxy.example.invalid:8080 "
             "decoded-password=pass@wörd "
-            "lowercase-password=pass%40w%c3%b6rd"
+            "lowercase-percent-encoding=pass%40w%c3%b6rd"
         )
         redacted = common.redact_text(normalized_output, values)
         self.assertNotIn("pass@wörd", redacted)
