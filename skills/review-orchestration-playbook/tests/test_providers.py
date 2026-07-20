@@ -20051,6 +20051,15 @@ class ProviderPolicyTest(unittest.TestCase):
                 evidence["review_range"],
                 f"{self.review.base_ref}..{self.review.head_ref}",
             )
+            diff_bytes = self.review.diff_file.read_bytes()
+            self.assertEqual(
+                evidence["primary_diff"],
+                {
+                    "path": ".codex-review/review.diff",
+                    "sha256": hashlib.sha256(diff_bytes).hexdigest(),
+                    "size": len(diff_bytes),
+                },
+            )
             return "success", "No findings."
 
         run_model_chain.side_effect = inspect_preflight

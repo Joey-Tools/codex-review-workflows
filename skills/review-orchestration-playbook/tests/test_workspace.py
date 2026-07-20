@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import os
 import pathlib
@@ -187,6 +188,61 @@ class WorkspaceTest(unittest.TestCase):
         cleanup_workspace(review, keep_container=False)
         self.assertFalse(review.container_dir.exists())
 
+    def test_prepare_rejects_lfs_pointer_after_attributes_are_deleted(self) -> None:
+        git(self.repo, "rm", ".gitattributes")
+        oid = "a" * 64
+        (self.repo / "asset.bin").write_text(
+            "version https://git-lfs.github.com/spec/v1\n"
+            f"oid sha256:{oid}\n"
+            "size 1\n",
+            encoding="utf-8",
+        )
+        git(self.repo, "add", "asset.bin")
+        git(self.repo, "commit", "-m", "Add direct LFS pointer")
+        self.head = git(self.repo, "rev-parse", "HEAD")
+        handoffs = []
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            r"blocked-checkout-lfs-pointer: review_status=not-run: .*asset\.bin",
+        ):
+            _prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+                ownership_handoff=handoffs.append,
+            )
+
+        self.assertEqual(handoffs, [])
+        self.assertEqual(
+            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            [],
+        )
+
+    def test_prepare_materializes_blob_at_lfs_pointer_cutoff(self) -> None:
+        git(self.repo, "rm", ".gitattributes")
+        oid = "a" * 64
+        canonical = (
+            "version https://git-lfs.github.com/spec/v1\n"
+            f"oid sha256:{oid}\n"
+            "size 1\n"
+        ).encode("ascii")
+        payload = canonical + (b" " * (1024 - len(canonical)))
+        self.assertEqual(len(payload), workspace_runtime.GIT_LFS_POINTER_MAX_BYTES)
+        (self.repo / "asset.bin").write_bytes(payload)
+        git(self.repo, "add", "asset.bin")
+        git(self.repo, "commit", "-m", "Add cutoff-sized pointer-like blob")
+        self.head = git(self.repo, "rev-parse", "HEAD")
+
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(review)
+
+        self.assertEqual((review.workspace_root / "asset.bin").read_bytes(), payload)
+
     def test_prepare_uses_private_control_modes_under_permissive_umask(self) -> None:
         for mask in (0o002, 0o000):
             with self.subTest(mask=oct(mask)):
@@ -237,6 +293,129 @@ class WorkspaceTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ReviewError, "group or other writable"):
             validate_external_workspace(review)
+
+    def test_external_workspace_attests_exact_primary_diff(self) -> None:
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(review)
+        diff_bytes = review.diff_file.read_bytes()
+
+        evidence = validate_external_workspace(review)
+
+        self.assertEqual(
+            evidence["primary_diff"],
+            {
+                "path": ".codex-review/review.diff",
+                "sha256": hashlib.sha256(diff_bytes).hexdigest(),
+                "size": len(diff_bytes),
+            },
+        )
+        encoded_evidence = json.dumps(evidence, sort_keys=True)
+        self.assertNotIn(str(review.workspace_root), encoded_evidence)
+        self.assertNotIn("+two", encoded_evidence)
+
+        tampered_diff = bytearray(diff_bytes)
+        tampered_diff[0] ^= 1
+        review.diff_file.write_bytes(tampered_diff)
+        with self.assertRaisesRegex(
+            ReviewError,
+            "does not match helper-private control state",
+        ):
+            validate_external_workspace(review)
+
+    def test_preflight_serialization_has_a_separate_pretty_json_bound(self) -> None:
+        def exact_value(target_size: int, *, pretty: bool) -> dict[str, str]:
+            value = {"padding": ""}
+            if pretty:
+                empty = json.dumps(value, indent=2, sort_keys=True) + "\n"
+            else:
+                empty = json.dumps(value, separators=(",", ":"), sort_keys=True)
+            value["padding"] = "x" * (target_size - len(empty.encode("utf-8")))
+            return value
+
+        compact_limit = workspace_runtime.MAX_SYNTHETIC_EVIDENCE_BYTES
+        compact = exact_value(compact_limit, pretty=False)
+        self.assertEqual(
+            len(workspace_runtime._encode_synthetic_evidence_json(compact)),
+            compact_limit,
+        )
+        with self.assertRaisesRegex(ReviewError, "synthetic-token preflight evidence"):
+            workspace_runtime._encode_synthetic_evidence_json(
+                exact_value(compact_limit + 1, pretty=False)
+            )
+
+        pretty_limit = workspace_runtime.MAX_PREFLIGHT_JSON_BYTES
+        pretty = exact_value(pretty_limit, pretty=True)
+        self.assertEqual(
+            len(workspace_runtime.encode_preflight_json(pretty).encode("utf-8")),
+            pretty_limit,
+        )
+        with self.assertRaisesRegex(ReviewError, "serialized preflight evidence"):
+            workspace_runtime.encode_preflight_json(
+                exact_value(pretty_limit + 1, pretty=True)
+            )
+
+    def test_bounded_json_reader_rejects_growth_past_limit(self) -> None:
+        limit = workspace_runtime.MAX_PREFLIGHT_JSON_BYTES
+        path = pathlib.Path(self.temporary.name) / "growing.json"
+        empty = json.dumps({"padding": ""}, sort_keys=True)
+        value = {"padding": "x" * (limit - len(empty.encode("utf-8")))}
+        encoded = json.dumps(value, sort_keys=True).encode("utf-8")
+        self.assertEqual(len(encoded), limit)
+        path.write_bytes(encoded)
+        original_read = workspace_runtime._DigestingReader.read
+        grew = False
+
+        def grow_before_first_read(reader, size=-1):
+            nonlocal grew
+            if not grew:
+                with path.open("ab") as handle:
+                    handle.write(b"x")
+                grew = True
+            return original_read(reader, size)
+
+        with mock.patch.object(
+            workspace_runtime._DigestingReader,
+            "read",
+            new=grow_before_first_read,
+        ):
+            with self.assertRaisesRegex(ReviewError, "exceeds its review size limit"):
+                workspace_runtime._read_bounded_json(
+                    path,
+                    label="growing evidence",
+                    max_bytes=limit,
+                )
+
+    def test_bounded_json_reader_enforces_explicit_depth_limit(self) -> None:
+        path = pathlib.Path(self.temporary.name) / "nested.json"
+
+        def nested(depth: int) -> dict[str, object]:
+            value: object = None
+            for _ in range(depth):
+                value = [value]
+            return {"padding": value}
+
+        path.write_text(
+            json.dumps(nested(workspace_runtime.MAX_BOUNDED_JSON_DEPTH)),
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            workspace_runtime._read_bounded_json(path, label="nested evidence"),
+            nested(workspace_runtime.MAX_BOUNDED_JSON_DEPTH),
+        )
+
+        path.write_text(
+            json.dumps(nested(workspace_runtime.MAX_BOUNDED_JSON_DEPTH + 1)),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(
+            ReviewError,
+            "nested evidence exceeds the JSON nesting depth limit",
+        ):
+            workspace_runtime._read_bounded_json(path, label="nested evidence")
 
     def test_prompt_override_replaces_only_review_scope_placeholders(self) -> None:
         template = pathlib.Path(self.temporary.name) / "prompt.txt"

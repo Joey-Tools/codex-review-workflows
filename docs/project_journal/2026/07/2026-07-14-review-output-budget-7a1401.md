@@ -7,7 +7,7 @@ updated: 2026-07-16
 branch: codex/daily-skill-friction-20260714-codex-review-workflows-review-stdout-artifact-budget
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/43
 supersedes: []
-superseded_by:
+superseded_by: 20260719-7f1901
 ---
 
 # Bound Independent Codex Review Output
