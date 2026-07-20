@@ -672,6 +672,20 @@ def _claude_auth_repository_policy_files(
 
 
 class RepositoryContractTest(unittest.TestCase):
+    def test_change_delivery_runtime_matrix_scope_and_isolation(self) -> None:
+        skill = (
+            SKILL_SCOPE_ROOT / "skills/change-delivery-workflow/SKILL.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "最低支持版本和 CI matrix 本身不构成本地多版本门禁",
+            skill,
+        )
+        self.assertIn("其余声明的版本继续由 CI 覆盖", skill)
+        self.assertIn("必须串行执行", skill)
+        self.assertIn("独立 worktree/cache/state", skill)
+        self.assertIn("只有 suite 已证明隔离时才可在同一 checkout 并发", skill)
+
     def test_cleanup_only_legacy_0664_lock_migration_is_private_and_ordered(
         self,
     ) -> None:
