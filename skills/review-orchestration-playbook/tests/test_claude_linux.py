@@ -2287,7 +2287,7 @@ class CredentialStagingTest(unittest.TestCase):
     PROTOCOL = claude_refresh_lock.CLAUDE_REFRESH_LOCK_PROTOCOL_2_1_211
 
     # synthetic-token-fixtures IDs: access-expired, access-a, access-b,
-    # refresh-a, refresh-b (pool joey-private-v1).
+    # refresh-a, refresh-b (pool joey-private-v3).
     SYNTH_ACCESS_EXPIRED = "codex_synth_v1_access_expired"
     SYNTH_ACCESS_A = "codex_synth_v1_access_a"
     SYNTH_ACCESS_B = "codex_synth_v1_access_b"
@@ -2753,9 +2753,17 @@ class CredentialStagingTest(unittest.TestCase):
         path: pathlib.Path,
         *,
         expires_at_ms: float,
-        access_token: str = "not-a-real-token",
-        refresh_token: str = "not-a-real-token",
+        access_token: str | None = None,
+        refresh_token: str = SYNTH_REFRESH_A,
     ) -> pathlib.Path:
+        if access_token is None:
+            # Boundary tests pass an explicit catalog fixture so scheduling
+            # delay cannot change the logical token state.
+            access_token = (
+                self.SYNTH_ACCESS_EXPIRED
+                if expires_at_ms <= time.time() * 1000
+                else self.SYNTH_ACCESS_A
+            )
         path.write_text(
             json.dumps(
                 {
@@ -2770,6 +2778,32 @@ class CredentialStagingTest(unittest.TestCase):
         )
         path.chmod(0o600)
         return path.resolve(strict=True)
+
+    def test_default_access_fixture_tracks_expiry_state(self) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            active = self._credential(
+                root / "active.json",
+                expires_at_ms=(now + 7200) * 1000,
+            )
+            expired = self._credential(
+                root / "expired.json",
+                expires_at_ms=(now - 60) * 1000,
+            )
+
+            active_payload = json.loads(active.read_text(encoding="utf-8"))
+            expired_payload = json.loads(
+                expired.read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                active_payload["claudeAiOauth"]["accessToken"],
+                self.SYNTH_ACCESS_A,
+            )
+            self.assertEqual(
+                expired_payload["claudeAiOauth"]["accessToken"],
+                self.SYNTH_ACCESS_EXPIRED,
+            )
 
     @staticmethod
     def _publish_test_signal_mask(
@@ -3288,6 +3322,7 @@ class CredentialStagingTest(unittest.TestCase):
             source = self._credential(
                 root / ".credentials.json",
                 expires_at_ms=(now + 1) * 1000,
+                access_token=self.SYNTH_ACCESS_A,
             )
 
             with claude_linux.stage_claude_credentials(
@@ -3306,6 +3341,7 @@ class CredentialStagingTest(unittest.TestCase):
             source = self._credential(
                 root / ".credentials.json",
                 expires_at_ms=(now + 1) * 1000,
+                access_token=self.SYNTH_ACCESS_A,
             )
 
             with claude_linux.stage_claude_credentials(
@@ -3325,6 +3361,7 @@ class CredentialStagingTest(unittest.TestCase):
             source = self._credential(
                 root / ".credentials.json",
                 expires_at_ms=now * 1000,
+                access_token=self.SYNTH_ACCESS_EXPIRED,
             )
 
             with claude_linux.stage_claude_credentials(
@@ -3343,6 +3380,7 @@ class CredentialStagingTest(unittest.TestCase):
             source = self._credential(
                 root / ".credentials.json",
                 expires_at_ms=(now + 1) * 1000,
+                access_token=self.SYNTH_ACCESS_A,
             )
 
             with self.assertRaisesRegex(
@@ -7613,7 +7651,7 @@ class CredentialStagingTest(unittest.TestCase):
             retained = json.loads(credential.read_text(encoding="utf-8"))
             self.assertEqual(
                 retained["claudeAiOauth"]["refreshToken"],
-                "not-a-real-token",
+                self.SYNTH_REFRESH_A,
             )
 
     def test_interrupted_start_handoff_still_cleans_watcher(self) -> None:
@@ -8519,7 +8557,7 @@ class CredentialStagingTest(unittest.TestCase):
                 error=thread_errors[0],
                 staged=staged_credentials[0],
                 helper=helper,
-                expected_refresh_token="not-a-real-token",
+                expected_refresh_token=self.SYNTH_REFRESH_A,
             )
 
     def test_missing_watcher_mask_uses_masked_retention_coordinator(
@@ -8829,7 +8867,7 @@ class CredentialStagingTest(unittest.TestCase):
                     error=caught.exception,
                     staged=staged_credentials[0],
                     helper=helper,
-                    expected_refresh_token="not-a-real-token",
+                    expected_refresh_token=self.SYNTH_REFRESH_A,
                 )
                 self.assertEqual(
                     getattr(
@@ -10032,7 +10070,7 @@ class CredentialStagingTest(unittest.TestCase):
                 json.dumps(
                     {
                         "claudeAiOauth": {
-                            "accessToken": "not-a-real-token",
+                            "accessToken": self.SYNTH_ACCESS_A,
                             "expiresAt": (now + 7200) * 1000,
                         }
                     }
