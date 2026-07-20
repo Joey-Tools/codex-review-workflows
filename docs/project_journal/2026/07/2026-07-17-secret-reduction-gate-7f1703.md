@@ -17,6 +17,7 @@ superseded_by:
 - Codex, Claude Code, and the consent-gated Copilot fallback are trusted processors for the frozen tracked review scope.
 - Tracked secret deltas do not block reviewer launch or trigger reviewer-input rewriting.
 - PR/master admission allows every existing exact raw secret whose global tracked count does not grow and blocks only first appearance or growth.
+- The frozen reviewer launch boundary uses safe modes, prepared runner-lock identity checks, and descriptor-bound workspace, prompt, sandbox, attempt-output, and verdict/control I/O.
 
 ## Decision
 
@@ -84,13 +85,13 @@ PR readiness reuses that Codex artifact. It does not add separate `offline-froze
 
 ### Workspace Scope
 
-This decision does not redesign the frozen workspace, materialization, symlink handling, control artifacts, process supervision, cleanup, retention, or accounting. Do not import a separate detached-worktree or supervisor design as part of this policy update.
+Targeted launch-boundary hardening is part of this delivery: frozen workspace and control artifacts use safe owner-only modes, cleanup is bound to the prepared runner-lock identity, and reviewer workspace, prompt, sandbox mount, attempt output, and verdict/control I/O remain attached to validated descriptors. This does not adopt a detached-worktree or reflinked-snapshot architecture; that broader redesign remains deferred.
 
 ## Current State
 
 This note supersedes its earlier strict-reduction design, which required raw-count decrease, unembedded non-growth, same-location provenance, encoded-variant denial, and two extra Codex PR-readiness gates. Those requirements are no longer the target contract.
 
-Implementation, local validation, and the fresh local Codex review now match this decision. This tracked implementation workstream is `completed`; PR merge, private-overlay release, installation sync, and remote-task notification remain delivery operations tracked by the active PR/task rather than transient project state. Historical test counts and prior fixed-range review claims in earlier revisions of this note are not validation evidence for the new semantics.
+Implementation and final-head local validation now match this decision. This tracked implementation workstream is `completed`; the final fixed-range Codex review, PR merge, private-overlay release, installation sync, and remote-task notification remain delivery operations tracked by the active PR/task rather than transient project state. Historical test counts and prior fixed-range review claims in earlier revisions of this note are not validation evidence for the new semantics.
 
 ## Validation Criteria
 
@@ -105,7 +106,8 @@ Implementation, local validation, and the fresh local Codex review now match thi
 - Violation diagnostics include only newly added `path:line` locations.
 - Single/double/triple review counting remains Codex / Codex+Claude / Codex+Claude+GitHub Codex.
 - PR readiness has no additional offline/independent Codex double gate.
-- Existing workspace behavior remains unchanged.
+- Frozen workspace/control creation and runner-lock cleanup fail closed under permissive umasks, symlinks/FIFOs, path swaps, and identity/mode/link-count/owner mismatches.
+- Reviewer cwd, frozen prompt, Linux sandbox workspace mount, attempt output, and terminal verdict/control artifacts remain bound to the prepared container across pathname swaps; descriptor handoff and close failures surface before a result is accepted.
 - Skill and journal validation pass.
 
 ## Next Steps
@@ -118,9 +120,10 @@ Implementation, local validation, and the fresh local Codex review now match thi
 - [x] Align the exact-secret policy, reviewer trust boundary, lane model, and encoded-form limitation.
 - [x] Update the canonical design and workflow contracts.
 - [x] Finish the exact raw counter, added-line evidence, and reviewer-egress separation.
-- [x] Update focused scanner, workspace, provider, state, CLI, and contract tests.
+- [x] Harden frozen review launch modes, runner-lock cleanup identity, and descriptor-bound workspace, sandbox, prompt, attempt, and verdict I/O.
+- [x] Update focused scanner, workspace, provider, state, CLI, descriptor-launch, and contract tests.
 - [x] Run Python 3.13 validation, contract checks, skill validation, and journal validation.
-- [x] Run one fresh local Codex review over the fixed whole range and resolve actionable findings.
+- [ ] Run one fresh local Codex review over the final signed fixed range and resolve actionable findings.
 - [ ] Push the branch, update PR #60, and wait for current-head CI and review completion.
 - [ ] Squash-merge PR #60 after every merge-readiness gate is clean.
 - [ ] Trigger and verify the private-overlay sync/release, then update the local and `BL-mac-mini-m4-hoteng` installations with the installed synchronizer.
@@ -139,10 +142,12 @@ The remaining unchecked items are post-commit delivery operations. They are inte
 - `skills/review-orchestration-playbook/references/pr-readiness.md`
 - `skills/review-orchestration-playbook/references/review-lane-contracts.md`
 - `skills/review-orchestration-playbook/references/synthetic-token-fixtures.md`
-- Python 3.13.0: `1260 tests`, `OK (skipped=4)`, 327.283 seconds.
+- Python 3.13.0: `1285 tests`, `OK (skipped=4)`, 252.878 seconds.
+- Focused runtime suites: `test_common.py` 38 tests; `test_claude_linux.py` 153 tests with 3 skipped; `test_providers.py` 479 tests with 3 skipped; all passed.
 - Focused contract suite: `41 tests`, `OK`.
-- Focused base-only deletion and head-side incomplete-scan boundary: `2 tests`, `OK`.
+- Focused CLI suite: `8 tests`, `OK`.
+- Descriptor-bound runtime patch review: two actionable findings were fixed; follow-up result `No findings.`.
 - Ruff checks, changed-file format checks, and `git diff --check`: passed.
 - Official skill validator: `Skill is valid!`.
 - Project journal validator: `Project journal validation passed.`.
-- Fresh local Codex CLI review over `473e5d54c4bb506388bb8e2993e2a2e9453309d8..c22708328157fdd78a76e97f3dede2ee370b3da1`: `No findings.`.
+- The final immutable whole-range review result is recorded in PR #60 after the signed implementation anchor exists; it is not pre-claimed by this commit.

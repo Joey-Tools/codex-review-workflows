@@ -26,7 +26,7 @@ import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Iterable, Iterator
+from typing import Any, BinaryIO, Callable, Iterable, Iterator
 
 from .claude_capabilities import (
     CLAUDE_REQUIRED_OPTIONS,
@@ -104,13 +104,17 @@ from .common import (
     run,
     run_bounded_capture,
     write_json,
+    write_json_atomic_at,
     write_text_atomic,
+    write_text_atomic_at,
 )
 from .workspace import (
+    BoundReviewLock,
     MAX_REVIEW_PROMPT_BYTES,
     ReviewWorkspace,
     build_preflight_evidence,
     encode_preflight_json,
+    open_bound_review_lock,
     remove_private_review_artifacts,
     validate_external_workspace,
     write_bound_review_json,
@@ -755,6 +759,401 @@ class Outcome:
     returncode: int
     final_text: str | None
     attempts: tuple[Attempt, ...]
+
+
+def _bound_metadata_state(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _open_bound_directory_at(parent_descriptor: int, name: str, *, label: str) -> int:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor: int | None = None
+    try:
+        before = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+        opened = os.fstat(descriptor)
+        after = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except OSError as error:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise ReviewError(f"cannot securely open bound {label}: {error}") from error
+    for metadata in (before, opened, after):
+        if not stat.S_ISDIR(metadata.st_mode):
+            os.close(descriptor)
+            raise ReviewError(f"bound {label} is not a directory")
+        if metadata.st_uid != os.geteuid():
+            os.close(descriptor)
+            raise ReviewError(f"bound {label} has an unexpected owner")
+        if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            os.close(descriptor)
+            raise ReviewError(f"bound {label} must not be group or other writable")
+    if len({_bound_metadata_state(item) for item in (before, opened, after)}) != 1:
+        os.close(descriptor)
+        raise ReviewError(f"bound {label} changed while opening")
+    return descriptor
+
+
+def _ensure_bound_directory_at(
+    parent_descriptor: int,
+    name: str,
+    *,
+    label: str,
+) -> int:
+    try:
+        os.mkdir(name, mode=0o700, dir_fd=parent_descriptor)
+    except FileExistsError:
+        pass
+    except OSError as error:
+        raise ReviewError(f"cannot create bound {label}: {error}") from error
+    descriptor = _open_bound_directory_at(
+        parent_descriptor,
+        name,
+        label=label,
+    )
+    try:
+        os.fchmod(descriptor, 0o700)
+    except OSError as error:
+        os.close(descriptor)
+        raise ReviewError(f"cannot protect bound {label}: {error}") from error
+    return descriptor
+
+
+def _open_bound_prompt_at(control_descriptor: int) -> tuple[int, tuple[int, ...]]:
+    name = "review.prompt"
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    descriptor: int | None = None
+    try:
+        before = os.stat(name, dir_fd=control_descriptor, follow_symlinks=False)
+        descriptor = os.open(name, flags, dir_fd=control_descriptor)
+        opened = os.fstat(descriptor)
+        after = os.stat(name, dir_fd=control_descriptor, follow_symlinks=False)
+    except OSError as error:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise ReviewError(
+            f"cannot securely open bound review prompt: {error}"
+        ) from error
+    for metadata in (before, opened, after):
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            os.close(descriptor)
+            raise ReviewError("bound review prompt is not a regular file with one link")
+        if metadata.st_uid != os.geteuid():
+            os.close(descriptor)
+            raise ReviewError("bound review prompt has an unexpected owner")
+        if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            os.close(descriptor)
+            raise ReviewError("bound review prompt must not be group or other writable")
+    states = {_bound_metadata_state(item) for item in (before, opened, after)}
+    if len(states) != 1:
+        os.close(descriptor)
+        raise ReviewError("bound review prompt changed while opening")
+    return descriptor, states.pop()
+
+
+def _close_launch_descriptor(descriptor: int) -> None:
+    os.close(descriptor)
+
+
+def _directory_descriptor_path(descriptor: int, *, label: str) -> pathlib.Path:
+    try:
+        if sys.platform == "darwin":
+            darwin_fcntl = importlib.import_module("fcntl")
+            get_path = getattr(darwin_fcntl, "F_GETPATH")
+            raw_path = darwin_fcntl.fcntl(descriptor, get_path, b"\0" * 1024)
+            path = pathlib.Path(os.fsdecode(raw_path.split(b"\0", 1)[0]))
+        else:
+            path = pathlib.Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+        opened = os.fstat(descriptor)
+        current = path.lstat()
+    except (AttributeError, ImportError, OSError) as error:
+        raise ReviewError(f"cannot resolve bound {label} path: {error}") from error
+    if not path.is_absolute() or not stat.S_ISDIR(current.st_mode):
+        raise ReviewError(f"bound {label} path is not an absolute directory")
+    if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+        raise ReviewError(f"bound {label} path changed while resolving")
+    return path
+
+
+@dataclass
+class ReviewLaunchBinding:
+    container: BoundReviewLock
+    workspace_descriptor: int
+    attempts_descriptor: int
+    prompt_descriptor: int
+    prompt_state: tuple[int, ...]
+    prompt: bytes | None = None
+
+    @property
+    def container_descriptor(self) -> int:
+        return self.container.fileno()
+
+    def freeze_prompt(self, expected_path: pathlib.Path | None = None) -> bytes:
+        try:
+            path_before = expected_path.lstat() if expected_path is not None else None
+            os.lseek(self.prompt_descriptor, 0, os.SEEK_SET)
+            payload = bytearray()
+            while len(payload) <= MAX_REVIEW_PROMPT_BYTES:
+                chunk = os.read(
+                    self.prompt_descriptor,
+                    min(64 * 1024, MAX_REVIEW_PROMPT_BYTES + 1 - len(payload)),
+                )
+                if not chunk:
+                    break
+                payload.extend(chunk)
+            final = os.fstat(self.prompt_descriptor)
+            path_after = expected_path.lstat() if expected_path is not None else None
+        except OSError as error:
+            raise ReviewError(f"cannot freeze bound review prompt: {error}") from error
+        if len(payload) > MAX_REVIEW_PROMPT_BYTES:
+            raise ReviewError(
+                f"bound review prompt exceeds the {MAX_REVIEW_PROMPT_BYTES}-byte limit"
+            )
+        if _bound_metadata_state(final) != self.prompt_state:
+            raise ReviewError("bound review prompt changed while freezing")
+        if path_before is not None and path_after is not None:
+            path_states = {
+                _bound_metadata_state(path_before),
+                _bound_metadata_state(path_after),
+                self.prompt_state,
+            }
+            if len(path_states) != 1:
+                raise ReviewError(
+                    "bound review prompt does not match the preflight path"
+                )
+        self.prompt = bytes(payload)
+        return self.prompt
+
+    def require_workspace_path(self, expected: pathlib.Path) -> pathlib.Path:
+        before = os.fstat(self.workspace_descriptor)
+        actual = _directory_descriptor_path(
+            self.workspace_descriptor,
+            label="review workspace",
+        )
+        try:
+            expected_metadata = expected.lstat()
+            after = os.fstat(self.workspace_descriptor)
+        except OSError as error:
+            raise ReviewError(
+                f"cannot verify bound review workspace path: {error}"
+            ) from error
+        if actual != expected or not stat.S_ISDIR(expected_metadata.st_mode):
+            raise ReviewError("bound review workspace path was replaced")
+        identities = {
+            (metadata.st_dev, metadata.st_ino)
+            for metadata in (before, expected_metadata, after)
+        }
+        if len(identities) != 1:
+            raise ReviewError("bound review workspace path changed during launch")
+        return actual
+
+    def open_attempt_file(self, name: str) -> BinaryIO:
+        return self._open_attempt_file(name, create=True)
+
+    def open_existing_attempt_file(self, name: str) -> BinaryIO:
+        return self._open_attempt_file(name, create=False)
+
+    def _open_attempt_file(self, name: str, *, create: bool) -> BinaryIO:
+        if not name or pathlib.PurePath(name).name != name or name in {".", ".."}:
+            raise ReviewError("bound attempt log name is invalid")
+        flags = (
+            os.O_RDWR
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        if create:
+            flags |= os.O_CREAT | os.O_EXCL
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                name,
+                flags,
+                0o600,
+                dir_fd=self.attempts_descriptor,
+            )
+            opened = os.fstat(descriptor)
+            current = os.stat(
+                name,
+                dir_fd=self.attempts_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            if descriptor is not None:
+                os.close(descriptor)
+            action = "create" if create else "open"
+            raise ReviewError(f"cannot {action} bound attempt log: {error}") from error
+        for metadata in (opened, current):
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                os.close(descriptor)
+                raise ReviewError(
+                    "bound attempt log is not a regular file with one link"
+                )
+            if metadata.st_uid != os.geteuid():
+                os.close(descriptor)
+                raise ReviewError("bound attempt log has an unexpected owner")
+            if metadata.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+                os.close(descriptor)
+                raise ReviewError("bound attempt log must be owner-only")
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            os.close(descriptor)
+            raise ReviewError("bound attempt log changed while opening")
+        return os.fdopen(descriptor, "w+b" if create else "r+b")
+
+    def runtime_review(self, review: ReviewWorkspace) -> ReviewWorkspace:
+        container = _directory_descriptor_path(
+            self.container_descriptor,
+            label="review container",
+        )
+        workspace = _directory_descriptor_path(
+            self.workspace_descriptor,
+            label="review workspace",
+        )
+        try:
+            workspace.relative_to(container)
+        except ValueError as error:
+            raise ReviewError("bound review workspace escaped its container") from error
+        if container == review.container_dir and workspace == review.workspace_root:
+            return review
+        control = workspace / ".codex-review"
+        return replace(
+            review,
+            container_dir=container,
+            workspace_root=workspace,
+            diff_file=control / "review.diff",
+            prompt_file=control / "review.prompt",
+        )
+
+    def close(self) -> None:
+        first_error: OSError | None = None
+        for descriptor in (
+            self.prompt_descriptor,
+            self.attempts_descriptor,
+            self.workspace_descriptor,
+        ):
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                if first_error is None:
+                    first_error = error
+        try:
+            self.container.close()
+        except OSError as error:
+            if first_error is None:
+                first_error = error
+        if first_error is not None:
+            raise first_error
+
+    def __enter__(self) -> ReviewLaunchBinding:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+
+def _open_review_launch_binding(review: ReviewWorkspace) -> ReviewLaunchBinding:
+    container, lock_error = open_bound_review_lock(
+        review.container_dir,
+        expected=review.private_cleanup,
+        name="cleanup.lock",
+    )
+    if lock_error or container is None:
+        raise ReviewError(
+            "cannot bind prepared review container"
+            + (f": {lock_error}" if lock_error else "")
+        )
+    workspace_descriptor: int | None = None
+    attempts_descriptor: int | None = None
+    control_descriptor: int | None = None
+    prompt_descriptor: int | None = None
+    transferred = False
+    try:
+        workspace_descriptor = _open_bound_directory_at(
+            container.fileno(),
+            "workspace",
+            label="review workspace",
+        )
+        attempts_descriptor = _ensure_bound_directory_at(
+            container.fileno(),
+            "attempts",
+            label="review attempts directory",
+        )
+        control_descriptor = _open_bound_directory_at(
+            workspace_descriptor,
+            ".codex-review",
+            label="review control directory",
+        )
+        prompt_descriptor, prompt_state = _open_bound_prompt_at(control_descriptor)
+        descriptor_to_close = control_descriptor
+        control_descriptor = None
+        try:
+            _close_launch_descriptor(descriptor_to_close)
+        except OSError as error:
+            raise ReviewError(
+                f"cannot close bound review control directory: {error}"
+            ) from error
+        binding = ReviewLaunchBinding(
+            container=container,
+            workspace_descriptor=workspace_descriptor,
+            attempts_descriptor=attempts_descriptor,
+            prompt_descriptor=prompt_descriptor,
+            prompt_state=prompt_state,
+        )
+        workspace_descriptor = None
+        attempts_descriptor = None
+        prompt_descriptor = None
+        transferred = True
+        return binding
+    finally:
+        cleanup_errors: list[OSError] = []
+        for descriptor in (
+            control_descriptor,
+            prompt_descriptor,
+            attempts_descriptor,
+            workspace_descriptor,
+        ):
+            if descriptor is None:
+                continue
+            try:
+                _close_launch_descriptor(descriptor)
+            except OSError as error:
+                cleanup_errors.append(error)
+        if not transferred:
+            try:
+                container.close()
+            except OSError as error:
+                cleanup_errors.append(error)
+        if cleanup_errors:
+            cleanup_error = ReviewError(
+                "cannot close review launch binding descriptors: "
+                + "; ".join(str(error) for error in cleanup_errors)
+            )
+            active_error = sys.exc_info()[1]
+            if active_error is None:
+                raise cleanup_error
+            add_note = getattr(active_error, "add_note", None)
+            if callable(add_note):
+                add_note(str(cleanup_error))
+            else:  # pragma: no cover - Python 3.10 compatibility
+                raise cleanup_error from active_error
 
 
 def _merge_runtime_report(
@@ -9491,11 +9890,22 @@ def _review_environment(
     review: ReviewWorkspace,
     passthrough_keys: Iterable[str],
     extra: dict[str, str] | None = None,
+    descriptor_bound_workspace: bool = False,
 ) -> dict[str, str]:
     review_values = {
-        "CODEX_ISOLATED_REVIEW_ROOT": str(review.workspace_root),
-        "CODEX_ISOLATED_REVIEW_DIFF_FILE": str(review.diff_file),
-        "CODEX_ISOLATED_REVIEW_PROMPT_FILE": str(review.prompt_file),
+        "CODEX_ISOLATED_REVIEW_ROOT": (
+            "." if descriptor_bound_workspace else str(review.workspace_root)
+        ),
+        "CODEX_ISOLATED_REVIEW_DIFF_FILE": (
+            ".codex-review/review.diff"
+            if descriptor_bound_workspace
+            else str(review.diff_file)
+        ),
+        "CODEX_ISOLATED_REVIEW_PROMPT_FILE": (
+            ".codex-review/review.prompt"
+            if descriptor_bound_workspace
+            else str(review.prompt_file)
+        ),
         "CODEX_ISOLATED_REVIEW_RANGE": f"{review.base_ref}..{review.head_ref}",
     }
     if extra:
@@ -9916,6 +10326,7 @@ def _claude_review_sandbox_profile(
     env: dict[str, str],
     *,
     proxy_port: int,
+    workspace_path: pathlib.Path | None = None,
 ) -> str:
     dependencies = _native_macho_dependencies(executable, label="Claude Code")
     home_raw = env.get("HOME")
@@ -9928,6 +10339,11 @@ def _claude_review_sandbox_profile(
     tmp = pathlib.Path(tmp_raw).resolve()
     claude_tmp = pathlib.Path(env.get("CLAUDE_CODE_TMPDIR", tmp_raw)).resolve()
     container = review.container_dir.resolve()
+    workspace = (
+        review.workspace_root.resolve() if workspace_path is None else workspace_path
+    )
+    if not workspace.is_absolute() or not workspace.is_dir():
+        raise ReviewError("Claude Code review sandbox requires a valid workspace")
     if (
         not is_relative_to(home, container)
         or not is_relative_to(tmp, container)
@@ -10029,7 +10445,7 @@ def _claude_review_sandbox_profile(
     read_subpaths = {
         home,
         tmp,
-        review.workspace_root.resolve(),
+        workspace,
         *(path.resolve() for path in CLAUDE_PROBE_SYSTEM_READ_SUBPATHS),
         *tool_library_subpaths,
         *tls_dirs,
@@ -10600,25 +11016,73 @@ def _parse_copilot_output(
     return _parse_copilot_objects(objects, requested_model=requested_model)
 
 
+def _read_complete_output_handle(
+    handle: BinaryIO,
+    *,
+    limit_bytes: int,
+) -> bytes | None:
+    if limit_bytes <= 0:
+        raise ValueError("complete output limit must be positive")
+    try:
+        handle.flush()
+        before = os.fstat(handle.fileno())
+        if not stat.S_ISREG(before.st_mode) or before.st_size > limit_bytes:
+            return None
+        handle.seek(0)
+        payload = handle.read(before.st_size + 1)
+        after = os.fstat(handle.fileno())
+    except OSError:
+        return None
+    if len(payload) != before.st_size or (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+    ) != (after.st_dev, after.st_ino, after.st_size):
+        return None
+    return payload
+
+
+def _strict_jsonl_handle_objects(
+    handle: BinaryIO,
+) -> Iterable[dict[str, Any]]:
+    handle.flush()
+    metadata = os.fstat(handle.fileno())
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("reviewer JSONL output is not a regular file")
+    if metadata.st_size > REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES:
+        raise ValueError("reviewer JSONL output exceeds the bounded parser limit")
+    handle.seek(0)
+    consumed = 0
+    while raw_line := handle.readline(COPILOT_JSONL_RECORD_LIMIT_BYTES + 2):
+        consumed += len(raw_line)
+        if consumed > REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES:
+            raise ValueError("reviewer JSONL output exceeds the bounded parser limit")
+        line = raw_line[:-1] if raw_line.endswith(b"\n") else raw_line
+        if len(line) > COPILOT_JSONL_RECORD_LIMIT_BYTES:
+            raise ValueError("reviewer JSONL record exceeds the bounded parser limit")
+        if not line.strip(b" \t\r"):
+            continue
+        text = line.decode("utf-8")
+        parsed = json.loads(
+            text,
+            parse_constant=_reject_nonstandard_json_constant,
+            object_pairs_hook=_strict_json_object_from_pairs,
+        )
+        if not isinstance(parsed, dict):
+            raise ValueError("reviewer JSONL record is not an object")
+        yield parsed
+    after = os.fstat(handle.fileno())
+    if (metadata.st_dev, metadata.st_ino, metadata.st_size) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+    ):
+        raise ValueError("reviewer JSONL output changed during parsing")
+
+
 def _strict_jsonl_file_objects(path: pathlib.Path) -> Iterable[dict[str, Any]]:
     with path.open("rb") as handle:
-        while raw_line := handle.readline(COPILOT_JSONL_RECORD_LIMIT_BYTES + 2):
-            line = raw_line[:-1] if raw_line.endswith(b"\n") else raw_line
-            if len(line) > COPILOT_JSONL_RECORD_LIMIT_BYTES:
-                raise ValueError(
-                    "Copilot JSONL record exceeds the bounded parser limit"
-                )
-            if not line.strip(b" \t\r"):
-                continue
-            text = line.decode("utf-8")
-            parsed = json.loads(
-                text,
-                parse_constant=_reject_nonstandard_json_constant,
-                object_pairs_hook=_strict_json_object_from_pairs,
-            )
-            if not isinstance(parsed, dict):
-                raise ValueError("Copilot JSONL record is not an object")
-            yield parsed
+        yield from _strict_jsonl_handle_objects(handle)
 
 
 def _parse_copilot_output_file(
@@ -10643,6 +11107,56 @@ def _codex_thread_id(stdout: bytes) -> str | None:
         if isinstance(thread_id, str) and thread_id:
             return thread_id
     return None
+
+
+def _parse_codex_output(stdout: bytes) -> str | None:
+    objects = _strict_jsonl_objects(stdout)
+    if not objects:
+        return None
+    return _parse_codex_objects(objects)
+
+
+def _parse_codex_objects(objects: Iterable[dict[str, Any]]) -> str | None:
+    turn_started = False
+    turn_completed = False
+    final_text: str | None = None
+    for event in objects:
+        if turn_completed:
+            return None
+        event_type = event.get("type")
+        if not isinstance(event_type, str):
+            return None
+        if event_type == "turn.started":
+            if turn_started or turn_completed:
+                return None
+            turn_started = True
+            continue
+        if event_type == "turn.completed":
+            if not turn_started:
+                return None
+            turn_completed = True
+            continue
+        if event_type in {"error", "turn.failed"}:
+            return None
+        if event_type != "item.completed":
+            continue
+        if not turn_started or turn_completed:
+            return None
+        item = event.get("item")
+        if not isinstance(item, dict):
+            return None
+        item_type = item.get("type")
+        if item_type == "error":
+            return None
+        if item_type != "agent_message":
+            continue
+        text = item.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return None
+        final_text = text.strip()
+    if not turn_completed:
+        return None
+    return final_text
 
 
 def _codex_session_metadata(
@@ -10813,6 +11327,99 @@ def _attempt_paths(
     return stdout_path, stderr_path
 
 
+@dataclass
+class AttemptOutput:
+    stdout_path: pathlib.Path
+    stderr_path: pathlib.Path
+    stdout_file: BinaryIO | None = None
+    stderr_file: BinaryIO | None = None
+
+    def run_arguments(self) -> dict[str, object]:
+        if self.stdout_file is None or self.stderr_file is None:
+            return {
+                "stdout_path": self.stdout_path,
+                "stderr_path": self.stderr_path,
+            }
+        return {
+            "stdout_file": self.stdout_file,
+            "stderr_file": self.stderr_file,
+        }
+
+    def ensure_captured(self, completed: Completed) -> None:
+        if self.stdout_file is not None:
+            return
+        if not self.stdout_path.exists():
+            self.stdout_path.write_bytes(completed.stdout)
+        if not self.stderr_path.exists():
+            self.stderr_path.write_bytes(completed.stderr)
+
+    def complete_stdout(
+        self,
+        completed: Completed,
+        *,
+        limit_bytes: int,
+    ) -> bytes | None:
+        if self.stdout_file is None:
+            return completed.stdout if len(completed.stdout) <= limit_bytes else None
+        return _read_complete_output_handle(self.stdout_file, limit_bytes=limit_bytes)
+
+    def strict_stdout_jsonl(
+        self,
+        completed: Completed,
+    ) -> Iterable[dict[str, Any]]:
+        if self.stdout_file is None:
+            objects = _strict_jsonl_objects(completed.stdout)
+            if objects is None:
+                raise ValueError("reviewer stdout is not strict JSONL")
+            return objects
+        return _strict_jsonl_handle_objects(self.stdout_file)
+
+    def append_stderr(self, message: str) -> None:
+        if self.stderr_file is None:
+            _append_attempt_diagnostic(self.stderr_path, message)
+            return
+        payload = message.rstrip().encode("utf-8", errors="replace") + b"\n"
+        try:
+            self.stderr_file.seek(0, os.SEEK_END)
+            if self.stderr_file.tell():
+                self.stderr_file.write(b"\n")
+            self.stderr_file.write(payload)
+            self.stderr_file.flush()
+        except OSError as error:
+            raise ReviewError(
+                f"cannot append bound attempt diagnostic: {error}"
+            ) from error
+
+
+@contextlib.contextmanager
+def _attempt_output(
+    review: ReviewWorkspace,
+    index: int,
+    runtime: str,
+    model: str,
+    launch: ReviewLaunchBinding | None,
+) -> Iterator[AttemptOutput]:
+    stdout_path, stderr_path = _attempt_paths_without_io(
+        review,
+        index,
+        runtime,
+        model,
+    )
+    if launch is None:
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        yield AttemptOutput(stdout_path, stderr_path)
+        return
+    with contextlib.ExitStack() as stack:
+        stdout_file = stack.enter_context(launch.open_attempt_file(stdout_path.name))
+        stderr_file = stack.enter_context(launch.open_attempt_file(stderr_path.name))
+        yield AttemptOutput(
+            stdout_path,
+            stderr_path,
+            stdout_file,
+            stderr_file,
+        )
+
+
 def _append_attempt_diagnostic(path: pathlib.Path, message: str) -> None:
     with path.open("ab") as handle:
         if handle.tell():
@@ -10902,12 +11509,15 @@ def _record_attempt(
     effective_effort: str | None,
     require_verified_model: bool = False,
     require_verified_effort: bool = False,
+    output: AttemptOutput | None = None,
 ) -> Attempt:
-    stdout_path, stderr_path = _attempt_paths(review, index, runtime, model)
-    if not stdout_path.exists():
-        stdout_path.write_bytes(completed.stdout)
-    if not stderr_path.exists():
-        stderr_path.write_bytes(completed.stderr)
+    if output is None:
+        stdout_path, stderr_path = _attempt_paths(review, index, runtime, model)
+        output = AttemptOutput(stdout_path, stderr_path)
+    else:
+        stdout_path = output.stdout_path
+        stderr_path = output.stderr_path
+    output.ensure_captured(completed)
     category = (
         "success"
         if completed.returncode == 0 and final_text
@@ -10933,7 +11543,7 @@ def _record_attempt(
             "reviewer result did not expose required runtime verification "
             "metadata; refusing to accept the pinned lane result"
         )
-        _append_attempt_diagnostic(stderr_path, detail)
+        output.append_stderr(detail)
         return replace(
             attempt,
             returncode=65,
@@ -10945,7 +11555,7 @@ def _record_attempt(
             f"requested model {model!r} was replaced by {effective_model!r}; "
             "refusing to infer an entitlement failure from silent model substitution"
         )
-        _append_attempt_diagnostic(stderr_path, mismatch)
+        output.append_stderr(mismatch)
         attempt = replace(
             attempt,
             returncode=65,
@@ -10957,7 +11567,7 @@ def _record_attempt(
             f"requested effort {requested_effort!r} was replaced by {effective_effort!r}; "
             "refusing to accept the pinned lane"
         )
-        _append_attempt_diagnostic(stderr_path, mismatch)
+        output.append_stderr(mismatch)
         attempt = replace(
             attempt,
             returncode=65,
@@ -10967,20 +11577,59 @@ def _record_attempt(
     return attempt
 
 
+def _review_prompt_bytes(
+    review: ReviewWorkspace,
+    launch: ReviewLaunchBinding | None,
+) -> bytes:
+    if launch is None:
+        return review.prompt_file.read_bytes()
+    if launch.prompt is None:
+        raise ReviewError("bound review prompt was not frozen before launch")
+    return launch.prompt
+
+
+def _review_prompt_text(
+    review: ReviewWorkspace,
+    launch: ReviewLaunchBinding | None,
+) -> str:
+    try:
+        return _review_prompt_bytes(review, launch).decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ReviewError("bound review prompt is not valid UTF-8") from error
+
+
 def _codex_attempt(
     *,
     review: ReviewWorkspace,
     model: str,
     index: int,
     env: dict[str, str],
+    launch: ReviewLaunchBinding | None = None,
+) -> Attempt:
+    with _attempt_output(review, index, "codex", model, launch) as output:
+        return _codex_attempt_with_output(
+            review=review,
+            model=model,
+            index=index,
+            env=env,
+            launch=launch,
+            output=output,
+        )
+
+
+def _codex_attempt_with_output(
+    *,
+    review: ReviewWorkspace,
+    model: str,
+    index: int,
+    env: dict[str, str],
+    launch: ReviewLaunchBinding | None,
+    output: AttemptOutput,
 ) -> Attempt:
     executable = resolve_reviewer_executable("codex")
     if executable is None:
         raise FileNotFoundError("codex is not available in a validated executable path")
     env = _with_executable_path(env, executable)
-    attempt_final = review.container_dir / "attempts" / f"{index:02d}-codex-final.txt"
-    attempt_final.parent.mkdir(parents=True, exist_ok=True)
-    stdout_path, stderr_path = _attempt_paths(review, index, "codex", model)
     tool_home = review.container_dir / "tool-home"
     tool_home.mkdir(exist_ok=True)
     shell_values = {
@@ -11012,7 +11661,7 @@ def _codex_attempt(
         '"**/*.env"="deny"}'
         "}}"
     )
-    prompt = review.prompt_file.read_bytes()
+    prompt = _review_prompt_bytes(review, launch)
     completed = run(
         (
             str(executable),
@@ -11038,23 +11687,22 @@ def _codex_attempt(
             "--ignore-rules",
             "--strict-config",
             "--json",
-            "-o",
-            str(attempt_final),
             "-",
         ),
-        cwd=review.workspace_root,
+        cwd=review.workspace_root if launch is None else None,
+        cwd_fd=launch.workspace_descriptor if launch is not None else None,
         env=env,
         stdin=prompt,
-        stdout_path=stdout_path,
-        stderr_path=stderr_path,
         timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
         output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
+        **output.run_arguments(),
     )
     final_text = None
-    if completed.returncode == 0 and attempt_final.is_file():
-        final_text = (
-            attempt_final.read_text(encoding="utf-8", errors="replace").strip() or None
-        )
+    if completed.returncode == 0:
+        try:
+            final_text = _parse_codex_objects(output.strict_stdout_jsonl(completed))
+        except (OSError, UnicodeDecodeError, ValueError):
+            final_text = None
     effective_model, effective_effort, permissions_verified = _codex_session_metadata(
         completed.stdout,
         env,
@@ -11072,6 +11720,7 @@ def _codex_attempt(
         effective_effort=effective_effort,
         require_verified_model=True,
         require_verified_effort=True,
+        output=output,
     )
     if permissions_verified is False or (
         attempt.category == "success" and permissions_verified is None
@@ -11080,7 +11729,7 @@ def _codex_attempt(
             "effective Codex sandbox did not preserve the isolated review permission "
             "profile; refusing to accept a result from a legacy or managed sandbox override"
         )
-        _append_attempt_diagnostic(stderr_path, detail)
+        output.append_stderr(detail)
         return replace(
             attempt,
             returncode=65,
@@ -11265,9 +11914,13 @@ def _claude_linux_review_runtime(
     env: dict[str, str],
     arguments: tuple[str, ...],
     refresh_lock_protocol: ClaudeRefreshLockProtocol | None = None,
+    *,
+    launch: ReviewLaunchBinding | None = None,
     writer_started: Callable[[], bool] | None = None,
     writer_quiescent: Callable[[], bool] | None = None,
 ) -> Iterator[Any]:
+    if launch is not None:
+        launch.require_workspace_path(review.workspace_root)
     try:
         host = _claude_linux_host()
         claude_info = validate_claude_linux_executable(executable, host)
@@ -11345,6 +11998,9 @@ def _claude_linux_review_runtime(
             runtime_libraries=runtime_libraries,
             ca_bundle=ca_bundle,
             node_extra_ca_certs_configured=bool(env.get("NODE_EXTRA_CA_CERTS")),
+            workspace_descriptor=(
+                launch.workspace_descriptor if launch is not None else None
+            ),
         )
         try:
             run_claude_linux_isolation_probe(
@@ -11357,6 +12013,8 @@ def _claude_linux_review_runtime(
             ) from error
         except LinuxRuntimeInspectionInconclusive as error:
             raise ClaudeExecutableInspectionInconclusive(str(error)) from error
+        if launch is not None:
+            launch.require_workspace_path(review.workspace_root)
         _update_claude_runtime_report(
             review,
             {
@@ -11381,6 +12039,8 @@ def _claude_linux_review_runtime(
             )
         except LinuxRuntimeInspectionInconclusive as error:
             raise ClaudeExecutableInspectionInconclusive(str(error)) from error
+        if launch is not None:
+            launch.require_workspace_path(review.workspace_root)
         yield command
 
 
@@ -11526,11 +12186,18 @@ def _claude_review_prompt(
     prompt: bytes,
     *,
     linux: bool,
+    descriptor_bound: bool = False,
 ) -> bytes:
     workspace = str(review.workspace_root).encode("utf-8")
     diff_file = str(review.diff_file).encode("utf-8")
-    target_workspace = b"/workspace" if linux else workspace
-    target_diff = b"/workspace/.codex-review/review.diff" if linux else diff_file
+    target_workspace = (
+        b"/workspace" if linux else (b"." if descriptor_bound else workspace)
+    )
+    target_diff = (
+        b"/workspace/.codex-review/review.diff"
+        if linux
+        else (b".codex-review/review.diff" if descriptor_bound else diff_file)
+    )
     projected = prompt.replace(
         b"- Workspace: .\n",
         b"- Workspace: " + target_workspace + b"\n",
@@ -11538,7 +12205,7 @@ def _claude_review_prompt(
         b"- Primary diff file: .codex-review/review.diff\n",
         b"- Primary diff file: " + target_diff + b"\n",
     )
-    if linux:
+    if linux or descriptor_bound:
         projected = _replace_claude_prompt_host_path(
             projected,
             source=diff_file,
@@ -11552,7 +12219,8 @@ def _claude_review_prompt(
             label="workspace",
             allow_descendants=True,
         )
-        projected = projected.rstrip() + b"\n" + CLAUDE_LINUX_PROMPT_GUIDANCE
+        if linux:
+            projected = projected.rstrip() + b"\n" + CLAUDE_LINUX_PROMPT_GUIDANCE
     if len(projected) > MAX_REVIEW_PROMPT_BYTES:
         raise ReviewError(
             "Claude projected review prompt exceeds the "
@@ -11568,9 +12236,34 @@ def _claude_attempt(
     index: int,
     env: dict[str, str],
     executable: pathlib.Path | None = None,
+    launch: ReviewLaunchBinding | None = None,
     refresh_lock_protocol: ClaudeRefreshLockProtocol | None | object = (
         _UNRESOLVED_CLAUDE_REFRESH_LOCK_PROTOCOL
     ),
+) -> Attempt:
+    with _attempt_output(review, index, "claude", model, launch) as output:
+        return _claude_attempt_with_output(
+            review=review,
+            model=model,
+            index=index,
+            env=env,
+            executable=executable,
+            launch=launch,
+            refresh_lock_protocol=refresh_lock_protocol,
+            output=output,
+        )
+
+
+def _claude_attempt_with_output(
+    *,
+    review: ReviewWorkspace,
+    model: str,
+    index: int,
+    env: dict[str, str],
+    executable: pathlib.Path | None,
+    launch: ReviewLaunchBinding | None,
+    refresh_lock_protocol: ClaudeRefreshLockProtocol | None | object,
+    output: AttemptOutput,
 ) -> Attempt:
     if executable is None:
         executable, env = _resolve_validated_claude_executable(
@@ -11584,8 +12277,9 @@ def _claude_attempt(
     linux_host = _is_claude_linux_host()
     prompt = _claude_review_prompt(
         review,
-        review.prompt_file.read_bytes(),
+        _review_prompt_bytes(review, launch),
         linux=linux_host,
+        descriptor_bound=launch is not None,
     )
     if linux_host:
         _require_claude_linux_prompt_without_file_mentions(prompt)
@@ -11627,7 +12321,6 @@ def _claude_attempt(
                 "attempt": None,
             },
         )
-    stdout_path, stderr_path = _attempt_paths(review, index, "claude", model)
     settings = _claude_review_settings(linux=linux_host)
     arguments = _claude_review_arguments(
         model=model,
@@ -11645,19 +12338,20 @@ def _claude_attempt(
                 env,
                 arguments,
                 selected_refresh_lock_protocol,
+                launch=launch,
                 writer_started=writer_started.is_set,
                 writer_quiescent=writer_quiescent.is_set,
             ) as sandbox_command:
                 completed = run(
                     sandbox_command.argv,
-                    cwd=review.workspace_root,
+                    cwd=review.workspace_root if launch is None else None,
+                    pass_fds=sandbox_command.pass_fds,
                     env=sandbox_command.env,
                     stdin=prompt,
-                    stdout_path=stdout_path,
-                    stderr_path=stderr_path,
                     timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
                     output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
                     on_process_started=writer_started.set,
+                    **output.run_arguments(),
                 )
                 quiescence_mask = block_forwarded_signals()
                 try:
@@ -11835,11 +12529,17 @@ def _claude_attempt(
                 )
                 proxy_port = stack.enter_context(_claude_connect_proxy(env))
                 review_env = _with_claude_proxy_environment(env, proxy_port)
+                bound_workspace = (
+                    launch.require_workspace_path(review.workspace_root)
+                    if launch is not None
+                    else None
+                )
                 sandbox_profile = _claude_review_sandbox_profile(
                     executable,
                     review,
                     review_env,
                     proxy_port=proxy_port,
+                    workspace_path=bound_workspace,
                 )
                 _update_claude_runtime_report(
                     review,
@@ -11850,6 +12550,13 @@ def _claude_attempt(
                     },
                 )
                 runtime_started = True
+                if launch is not None:
+                    launch.require_workspace_path(review.workspace_root)
+
+                def verify_started_workspace() -> None:
+                    if launch is not None:
+                        launch.require_workspace_path(review.workspace_root)
+
                 completed = run(
                     (
                         str(CLAUDE_PROBE_SANDBOX),
@@ -11858,13 +12565,18 @@ def _claude_attempt(
                         str(executable),
                         *arguments,
                     ),
-                    cwd=review.workspace_root,
+                    cwd=review.workspace_root if launch is None else None,
+                    cwd_fd=(
+                        launch.workspace_descriptor if launch is not None else None
+                    ),
                     env=review_env,
                     stdin=prompt,
-                    stdout_path=stdout_path,
-                    stderr_path=stderr_path,
                     timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
                     output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
+                    on_process_started=(
+                        verify_started_workspace if launch is not None else None
+                    ),
+                    **output.run_arguments(),
                 )
         except ClaudeCredentialInspectionInconclusive as error:
             persistence_failed = completed is not None
@@ -12010,8 +12722,14 @@ def _claude_attempt(
             )
             raise
     assert completed is not None
-    final_text, effective_model = _parse_claude_output(
-        completed.stdout, requested_model=model
+    complete_stdout = output.complete_stdout(
+        completed,
+        limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
+    )
+    final_text, effective_model = (
+        _parse_claude_output(complete_stdout, requested_model=model)
+        if complete_stdout is not None
+        else (None, None)
     )
     attempt = _record_attempt(
         review=review,
@@ -12024,6 +12742,7 @@ def _claude_attempt(
         requested_effort=CLAUDE_REASONING_EFFORT,
         effective_effort=None,
         require_verified_model=True,
+        output=output,
     )
     _update_claude_runtime_report(
         review,
@@ -12055,6 +12774,27 @@ def _copilot_attempt(
     model: str,
     index: int,
     env: dict[str, str],
+    launch: ReviewLaunchBinding | None = None,
+) -> Attempt:
+    with _attempt_output(review, index, "copilot", model, launch) as output:
+        return _copilot_attempt_with_output(
+            review=review,
+            model=model,
+            index=index,
+            env=env,
+            launch=launch,
+            output=output,
+        )
+
+
+def _copilot_attempt_with_output(
+    *,
+    review: ReviewWorkspace,
+    model: str,
+    index: int,
+    env: dict[str, str],
+    launch: ReviewLaunchBinding | None,
+    output: AttemptOutput,
 ) -> Attempt:
     executable = resolve_reviewer_executable("copilot")
     if executable is None:
@@ -12071,16 +12811,21 @@ def _copilot_attempt(
         raise ReviewError("isolated Copilot home is not a real directory")
     env = dict(env)
     env["COPILOT_HOME"] = str(copilot_home)
-    stdout_path, stderr_path = _attempt_paths(review, index, "copilot", model)
-    permission_help = run(
-        (str(executable), "help", "permissions"),
-        env=env,
-        stdout_path=stdout_path,
-        stderr_path=stderr_path,
-        capture_limit_bytes=COPILOT_PROBE_OUTPUT_LIMIT_BYTES,
-        timeout_seconds=COPILOT_PROBE_TIMEOUT_SECONDS,
-        output_file_limit_bytes=COPILOT_PROBE_OUTPUT_LIMIT_BYTES,
-    )
+    with _attempt_output(
+        review,
+        index,
+        "copilot-permissions",
+        model,
+        launch,
+    ) as permission_output:
+        permission_help = run(
+            (str(executable), "help", "permissions"),
+            env=env,
+            capture_limit_bytes=COPILOT_PROBE_OUTPUT_LIMIT_BYTES,
+            timeout_seconds=COPILOT_PROBE_TIMEOUT_SECONDS,
+            output_file_limit_bytes=COPILOT_PROBE_OUTPUT_LIMIT_BYTES,
+            **permission_output.run_arguments(),
+        )
     normalized_permission_help = " ".join(
         (permission_help.stdout + b"\n" + permission_help.stderr)
         .decode("utf-8", errors="replace")
@@ -12098,9 +12843,9 @@ def _copilot_attempt(
     command = [
         str(executable),
         "-C",
-        str(review.workspace_root),
+        "." if launch is not None else str(review.workspace_root),
         "--prompt",
-        review.prompt_file.read_text(encoding="utf-8"),
+        _review_prompt_text(review, launch),
         "--model",
         model,
         "--reasoning-effort",
@@ -12144,16 +12889,20 @@ def _copilot_attempt(
         command.append(f"--secret-env-vars={','.join(sensitive_names)}")
     completed = run(
         command,
-        cwd=review.workspace_root,
+        cwd=review.workspace_root if launch is None else None,
+        cwd_fd=launch.workspace_descriptor if launch is not None else None,
         env=env,
-        stdout_path=stdout_path,
-        stderr_path=stderr_path,
         timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
         output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
+        **output.run_arguments(),
     )
-    final_text, effective_model = _parse_copilot_output_file(
-        stdout_path, requested_model=model
-    )
+    try:
+        final_text, effective_model = _parse_copilot_objects(
+            output.strict_stdout_jsonl(completed),
+            requested_model=model,
+        )
+    except (OSError, UnicodeDecodeError, ValueError):
+        final_text, effective_model = None, None
     return _record_attempt(
         review=review,
         index=index,
@@ -12165,6 +12914,7 @@ def _copilot_attempt(
         requested_effort=COPILOT_REASONING_EFFORT,
         effective_effort=None,
         require_verified_model=True,
+        output=output,
     )
 
 
@@ -12200,25 +12950,48 @@ def _attempt_summary(attempt: Attempt) -> dict[str, Any]:
     }
 
 
-def _write_attempts(review: ReviewWorkspace, attempts: Iterable[Attempt]) -> None:
+def _write_attempts(
+    review: ReviewWorkspace,
+    attempts: Iterable[Attempt],
+    *,
+    launch: ReviewLaunchBinding | None = None,
+) -> None:
+    value = [_attempt_summary(item) for item in attempts]
+    if launch is not None:
+        write_json_atomic_at(
+            launch.container_descriptor,
+            "attempts.json",
+            value,
+        )
+        return
     attempts_error = write_bound_review_json(
         review.container_dir,
         expected=review.private_cleanup,
         name="attempts.json",
-        value=[_attempt_summary(item) for item in attempts],
+        value=value,
     )
     if attempts_error:
         raise ReviewError(f"cannot persist review attempts: {attempts_error}")
 
 
 def _finish(
-    review: ReviewWorkspace, attempts: list[Attempt], final_text: str | None
+    review: ReviewWorkspace,
+    attempts: list[Attempt],
+    final_text: str | None,
+    *,
+    launch: ReviewLaunchBinding | None = None,
 ) -> Outcome:
-    _write_attempts(review, attempts)
+    _write_attempts(review, attempts, launch=launch)
     if final_text:
-        write_text_atomic(
-            review.container_dir / "final.txt", final_text.rstrip("\r\n") + "\n"
-        )
+        payload = final_text.rstrip("\r\n") + "\n"
+        if launch is None:
+            write_text_atomic(review.container_dir / "final.txt", payload)
+        else:
+            write_text_atomic_at(
+                launch.container_descriptor,
+                "final.txt",
+                payload,
+            )
         return Outcome(0, final_text, tuple(attempts))
     if attempts and attempts[-1].category == "transient":
         return Outcome(75, None, tuple(attempts))
@@ -12311,27 +13084,46 @@ def _run_model_chain(
     requested_effort: str,
     env: dict[str, str],
     attempts: list[Attempt],
+    launch: ReviewLaunchBinding | None = None,
 ) -> tuple[str, str | None]:
     for model in models:
         index = len(attempts) + 1
         try:
-            attempt = runner(
-                review=review,
-                model=model,
-                index=index,
-                env=env,
-            )
+            runner_args: dict[str, Any] = {
+                "review": review,
+                "model": model,
+                "index": index,
+                "env": env,
+            }
+            if launch is not None:
+                runner_args["launch"] = launch
+            attempt = runner(**runner_args)
         except (
             ReviewTimeoutError,
             ReviewOutputDrainError,
             ReviewOutputLimitError,
             ReviewProcessLeakError,
         ) as error:
-            stdout_path, stderr_path = _attempt_paths(review, index, runtime, model)
-            stdout_path.touch(exist_ok=True)
-            _append_attempt_diagnostic(
-                stderr_path, f"review supervision failed: {error}"
+            stdout_path, stderr_path = _attempt_paths_without_io(
+                review,
+                index,
+                runtime,
+                model,
             )
+            diagnostic = f"review supervision failed: {error}"
+            if launch is None:
+                stdout_path.parent.mkdir(parents=True, exist_ok=True)
+                stdout_path.touch(exist_ok=True)
+                _append_attempt_diagnostic(stderr_path, diagnostic)
+            else:
+                with launch.open_existing_attempt_file(stdout_path.name):
+                    pass
+                with launch.open_existing_attempt_file(stderr_path.name) as stderr_file:
+                    AttemptOutput(
+                        stdout_path,
+                        stderr_path,
+                        stderr_file=stderr_file,
+                    ).append_stderr(diagnostic)
             attempts.append(
                 Attempt(
                     runtime=runtime,
@@ -12346,10 +13138,10 @@ def _run_model_chain(
                     stderr_path=str(stderr_path),
                 )
             )
-            _write_attempts(review, attempts)
+            _write_attempts(review, attempts, launch=launch)
             raise
         attempts.append(attempt)
-        _write_attempts(review, attempts)
+        _write_attempts(review, attempts, launch=launch)
         if attempt.category == "success":
             return "success", attempt.final_text
         if attempt.category != "entitlement":
@@ -12363,6 +13155,14 @@ def run_review(
     reviewer: str,
     egress_consent: str | None = None,
 ) -> Outcome:
+    """Bind launch inputs, then execute the complete provider policy.
+
+    The bound implementation calls ``validate_external_workspace``, records
+    ``review workspace containment and integrity checks passed`` and
+    ``secret-delta status is evaluated separately`` evidence, and routes
+    interactive authentication through ``_finish_claude_auth_required``.
+    """
+
     if reviewer not in ("codex", "claude"):
         _persist_runner_error(review, f"unknown reviewer: {reviewer}\n")
         return Outcome(2, None, tuple())
@@ -12382,9 +13182,44 @@ def run_review(
         return Outcome(2, None, tuple())
 
     try:
+        launch = _open_review_launch_binding(review)
+    except ReviewError as error:
+        private_cleanup_error = remove_private_review_artifacts(
+            review.container_dir,
+            expected=review.private_cleanup,
+        )
+        cleanup_suffix = (
+            f"; private artifact cleanup failed: {private_cleanup_error}"
+            if private_cleanup_error
+            else ""
+        )
+        diagnostic = (
+            f"review egress workspace preflight failed: {error}{cleanup_suffix}\n"
+        )
+        _persist_runner_error(review, diagnostic)
+        return Outcome(2, None, tuple())
+    with launch:
+        return _run_review_with_binding(
+            review=review,
+            reviewer=reviewer,
+            egress_consent=egress_consent,
+            launch=launch,
+        )
+
+
+def _run_review_with_binding(
+    *,
+    review: ReviewWorkspace,
+    reviewer: str,
+    egress_consent: str | None,
+    launch: ReviewLaunchBinding,
+) -> Outcome:
+    try:
+        review = launch.runtime_review(review)
         synthetic_evidence = validate_external_workspace(review) or {}
         preflight_evidence = build_preflight_evidence(review, synthetic_evidence)
         preflight_json = encode_preflight_json(preflight_evidence)
+        launch.freeze_prompt(review.prompt_file)
     except ReviewError as error:
         private_cleanup_error = remove_private_review_artifacts(
             review.container_dir,
@@ -12412,34 +13247,54 @@ def run_review(
         _persist_runner_error(review, diagnostic)
         return Outcome(2, None, tuple())
 
-    write_text_atomic(
-        review.container_dir / "preflight.json",
-        preflight_json,
-    )
-
-    if reviewer == "claude":
-        write_json(
-            review.container_dir / "egress.json",
-            {
-                "consent": egress_consent,
-                "reviewer": "claude-family",
-                "review_range": f"{review.base_ref}..{review.head_ref}",
-                "included": [
-                    "tracked blobs materialized from the frozen head commit",
-                    "the complete generated frozen diff without secret redaction",
-                    "the review prompt and result",
-                ],
-                "excluded": [
-                    "untracked files",
-                    "unrelated repositories",
-                    "broad workspace or home-directory content",
-                ],
-                "merge_gate": "secret-delta status is evaluated separately",
-                "preflight": (
-                    "review workspace containment and integrity checks passed"
-                ),
-            },
+    try:
+        write_text_atomic_at(
+            launch.container_descriptor,
+            "preflight.json",
+            preflight_json,
         )
+
+        if reviewer == "claude":
+            write_json_atomic_at(
+                launch.container_descriptor,
+                "egress.json",
+                {
+                    "consent": egress_consent,
+                    "reviewer": "claude-family",
+                    "review_range": f"{review.base_ref}..{review.head_ref}",
+                    "included": [
+                        "tracked blobs materialized from the frozen head commit",
+                        "the complete generated frozen diff without secret redaction",
+                        "the review prompt and result",
+                    ],
+                    "excluded": [
+                        "untracked files",
+                        "unrelated repositories",
+                        "broad workspace or home-directory content",
+                    ],
+                    "merge_gate": "secret-delta status is evaluated separately",
+                    "preflight": (
+                        "review workspace containment and integrity checks passed"
+                    ),
+                },
+            )
+        review = launch.runtime_review(review)
+    except ReviewError as error:
+        diagnostic = f"review launch binding failed: {error}\n"
+        try:
+            write_text_atomic_at(
+                launch.container_descriptor,
+                "runner-error.txt",
+                diagnostic,
+            )
+        except ReviewError as persistence_error:
+            print(
+                diagnostic.rstrip("\n")
+                + "; runner diagnostic was not persisted: "
+                + str(persistence_error),
+                file=sys.stderr,
+            )
+        return Outcome(2, None, tuple())
 
     attempts: list[Attempt] = []
 
@@ -12447,6 +13302,7 @@ def run_review(
         env = _review_environment(
             review=review,
             passthrough_keys=CODEX_ENV_KEYS,
+            descriptor_bound_workspace=True,
         )
         try:
             _, final_text = _run_model_chain(
@@ -12457,6 +13313,7 @@ def run_review(
                 requested_effort=CODEX_REASONING_EFFORT,
                 env=env,
                 attempts=attempts,
+                launch=launch,
             )
         except FileNotFoundError as error:
             _persist_runner_error(review, f"{error}\n")
@@ -12473,7 +13330,7 @@ def run_review(
                 attempts,
             )
             return Outcome(75, None, tuple(attempts))
-        return _finish(review, attempts, final_text)
+        return _finish(review, attempts, final_text, launch=launch)
 
     claude_env = _review_environment(
         review=review,
@@ -12483,13 +13340,14 @@ def run_review(
             "CLAUDE_CODE_SAFE_MODE": "1",
             "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
         },
+        descriptor_bound_workspace=True,
     )
     explicit_claude_override = bool(os.environ.get("CODEX_REVIEW_CLAUDE_PATH"))
     try:
         linux_host = _is_claude_linux_host()
         prompt = _claude_review_prompt(
             review,
-            review.prompt_file.read_bytes(),
+            _review_prompt_bytes(review, launch),
             linux=linux_host,
         )
         if linux_host:
@@ -12573,6 +13431,7 @@ def run_review(
             model: str,
             index: int,
             env: dict[str, str],
+            launch: ReviewLaunchBinding | None = None,
         ) -> Attempt:
             return _claude_attempt(
                 review=review,
@@ -12580,6 +13439,7 @@ def run_review(
                 index=index,
                 env=env,
                 executable=claude_executable,
+                launch=launch,
             )
 
         try:
@@ -12591,6 +13451,7 @@ def run_review(
                 requested_effort=CLAUDE_REASONING_EFFORT,
                 env=claude_env,
                 attempts=attempts,
+                launch=launch,
             )
         except (
             FileNotFoundError,
@@ -12710,7 +13571,7 @@ def run_review(
             )
             return Outcome(2, None, tuple(attempts))
         if final_text:
-            return _finish(review, attempts, final_text)
+            return _finish(review, attempts, final_text, launch=launch)
         if category == "auth":
             return _finish_claude_auth_required(
                 review,
@@ -12723,7 +13584,7 @@ def run_review(
                 ),
             )
         if category not in {"entitlement", "unavailable"}:
-            return _finish(review, attempts, None)
+            return _finish(review, attempts, None, launch=launch)
 
     if egress_consent not in COPILOT_EGRESS_CONSENTS:
         _persist_failure_artifacts(
@@ -12751,10 +13612,11 @@ def run_review(
         )
         if diagnostic_error:
             return Outcome(1, None, tuple(attempts))
-        return _finish(review, attempts, None)
+        return _finish(review, attempts, None, launch=launch)
     copilot_env = _review_environment(
         review=review,
         passthrough_keys=COPILOT_ENV_KEYS,
+        descriptor_bound_workspace=True,
     )
     try:
         _, final_text = _run_model_chain(
@@ -12765,6 +13627,7 @@ def run_review(
             requested_effort=COPILOT_REASONING_EFFORT,
             env=copilot_env,
             attempts=attempts,
+            launch=launch,
         )
     except (
         ReviewTimeoutError,
@@ -12785,4 +13648,4 @@ def run_review(
             attempts,
         )
         return Outcome(2, None, tuple(attempts))
-    return _finish(review, attempts, final_text)
+    return _finish(review, attempts, final_text, launch=launch)

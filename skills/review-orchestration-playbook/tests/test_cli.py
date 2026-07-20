@@ -258,9 +258,7 @@ class ForegroundCleanupTest(unittest.TestCase):
             def cleanup_with_lock_probe(prepared, *, keep_container):
                 self.assertIs(prepared, review)
                 self.assertFalse(keep_container)
-                self.assertTrue(
-                    state._runner_lock_held(review.container_dir / state.LOCK_FILE)
-                )
+                self.assertTrue(state._runner_lock_held(review.container_dir))
                 probe, lock_error = state.open_bound_review_lock(
                     review.container_dir,
                     expected=review.private_cleanup,

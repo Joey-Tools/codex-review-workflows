@@ -798,7 +798,9 @@ class RepositoryContractTest(unittest.TestCase):
             hasattr(providers, "CLAUDE_ATTEMPT_CREDENTIAL_VALIDITY_SECONDS")
         )
 
-        attempt_source = inspect.getsource(providers._claude_attempt)
+        attempt_source = inspect.getsource(
+            providers._claude_attempt
+        ) + inspect.getsource(providers._claude_attempt_with_output)
         pwd_home_source = inspect.getsource(providers._claude_pwd_home)
         select_source = inspect.getsource(providers._select_claude_macos_credential)
         validate_source = inspect.getsource(providers._validate_claude_local_credential)

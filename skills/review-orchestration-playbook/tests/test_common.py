@@ -22,8 +22,7 @@ class ChildEnvironmentTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = pathlib.Path(temporary) / "review.log"
             path.write_bytes(
-                b"discarded-line\n" * 10_000
-                + b"keep-one\nkeep-two\nkeep-three\n"
+                b"discarded-line\n" * 10_000 + b"keep-one\nkeep-two\nkeep-three\n"
             )
 
             result = common.tail_text(path, line_count=2, byte_count=128)
@@ -72,6 +71,45 @@ class ChildEnvironmentTest(unittest.TestCase):
 
         self.assertLessEqual(output_size, 4096)
 
+    def test_logged_command_reads_held_files_after_path_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            attempts = root / "attempts"
+            attempts.mkdir()
+            retained = root / "attempts-retained"
+            stdout_path = attempts / "stdout.log"
+            stderr_path = attempts / "stderr.log"
+            with (
+                stdout_path.open("w+b") as stdout_file,
+                stderr_path.open("w+b") as stderr_file,
+            ):
+
+                def replace_paths() -> None:
+                    attempts.rename(retained)
+                    attempts.mkdir()
+                    stdout_path.write_bytes(b"forged clean verdict")
+                    stderr_path.write_bytes(b"")
+
+                completed = common.run(
+                    (
+                        sys.executable,
+                        "-c",
+                        "import os; os.write(1, b'real finding')",
+                    ),
+                    stdout_file=stdout_file,
+                    stderr_file=stderr_file,
+                    timeout_seconds=5,
+                    output_file_limit_bytes=4096,
+                    on_process_started=replace_paths,
+                )
+
+            self.assertEqual(completed.stdout, b"real finding")
+            self.assertEqual(stdout_path.read_bytes(), b"forged clean verdict")
+            self.assertEqual(
+                (retained / "stdout.log").read_bytes(),
+                b"real finding",
+            )
+
     def test_bounded_capture_enforces_independent_stream_limits(self) -> None:
         with self.assertRaises(common.ReviewOutputLimitError):
             common.run_bounded_capture(
@@ -93,11 +131,7 @@ class ChildEnvironmentTest(unittest.TestCase):
                     (
                         sys.executable,
                         "-c",
-                        (
-                            "import os,time; "
-                            "os.write(1, b'x' * 4097); "
-                            "time.sleep(5)"
-                        ),
+                        ("import os,time; os.write(1, b'x' * 4097); time.sleep(5)"),
                     ),
                     stdout_path=root / "stdout.log",
                     stderr_path=root / "stderr.log",
@@ -149,9 +183,7 @@ class ChildEnvironmentTest(unittest.TestCase):
     def test_invalid_bounded_output_arguments_preserve_existing_logs(
         self, popen: mock.Mock
     ) -> None:
-        cases = (
-            ({"output_file_limit_bytes": 0}, "must be positive"),
-        )
+        cases = (({"output_file_limit_bytes": 0}, "must be positive"),)
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             for index, (arguments, message) in enumerate(cases):
@@ -243,7 +275,9 @@ class ChildEnvironmentTest(unittest.TestCase):
                 mock.patch.object(
                     common.select, "select", return_value=([123], [], [])
                 ),
-                mock.patch.object(common.os, "read", side_effect=OSError("read failed")),
+                mock.patch.object(
+                    common.os, "read", side_effect=OSError("read failed")
+                ),
             ):
                 with self.assertRaises(common.ReviewOutputDrainError):
                     common.run(
@@ -556,9 +590,7 @@ class ChildEnvironmentTest(unittest.TestCase):
                 events.append("spawn")
                 return process
 
-            on_process_started = mock.Mock(
-                side_effect=lambda: events.append("started")
-            )
+            on_process_started = mock.Mock(side_effect=lambda: events.append("started"))
             with (
                 mock.patch.object(common.subprocess, "Popen", side_effect=spawn),
                 mock.patch.object(
