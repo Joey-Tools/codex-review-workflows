@@ -389,6 +389,56 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.assertFalse(self.review.workspace_root.exists())
         self.assertFalse((self.review.container_dir / "cleanup-error.txt").exists())
 
+    def test_directory_identity_allows_child_entry_changes(self) -> None:
+        state_dir = self.review.container_dir
+        descriptor = os.open(state_dir, os.O_RDONLY | os.O_DIRECTORY)
+        original_stat = os.stat
+        path_stat_calls = 0
+
+        def stat_then_create_child(*args, **kwargs):
+            nonlocal path_stat_calls
+            metadata = original_stat(*args, **kwargs)
+            path_stat_calls += 1
+            if path_stat_calls == 1:
+                (state_dir / "concurrent-child").mkdir()
+            return metadata
+
+        try:
+            with mock.patch.object(state.os, "stat", side_effect=stat_then_create_child):
+                state._validate_private_directory_path_identity(
+                    state_dir,
+                    descriptor,
+                    label="review state directory",
+                    expected_mode=0o700,
+                )
+        finally:
+            os.close(descriptor)
+            (state_dir / "concurrent-child").rmdir()
+
+    def test_directory_identity_rejects_path_replacement(self) -> None:
+        state_dir = self.review.container_dir
+        moved_state_dir = state_dir.with_name(f"{state_dir.name}-moved")
+        descriptor = os.open(state_dir, os.O_RDONLY | os.O_DIRECTORY)
+        state_dir.rename(moved_state_dir)
+        state_dir.mkdir(mode=0o700)
+        state_dir.chmod(0o700)
+
+        try:
+            with self.assertRaisesRegex(
+                state.ReviewError,
+                "review state directory path does not match its open descriptor",
+            ):
+                state._validate_private_directory_path_identity(
+                    state_dir,
+                    descriptor,
+                    label="review state directory",
+                    expected_mode=0o700,
+                )
+        finally:
+            os.close(descriptor)
+            state_dir.rmdir()
+            moved_state_dir.rename(state_dir)
+
     def test_wait_clears_stale_cleanup_error_after_successful_retry(self) -> None:
         self.write_completed_state()
         cleanup_error_path = self.review.container_dir / "cleanup-error.txt"
