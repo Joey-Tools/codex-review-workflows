@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import shutil
 import signal
 import stat
 import subprocess
@@ -747,7 +748,9 @@ class StatefulLifecycleTest(unittest.TestCase):
             return metadata
 
         try:
-            with mock.patch.object(state.os, "stat", side_effect=stat_then_create_child):
+            with mock.patch.object(
+                state.os, "stat", side_effect=stat_then_create_child
+            ):
                 state._validate_private_directory_path_identity(
                     state_dir,
                     descriptor,
@@ -801,6 +804,34 @@ class StatefulLifecycleTest(unittest.TestCase):
             0,
         )
         self.assertFalse(self.review.workspace_root.exists())
+        self.assertFalse(cleanup_error_path.exists())
+
+    def test_cleanup_retries_when_v2_git_remains_without_workspace(self) -> None:
+        self.write_completed_state()
+        cleanup_error_path = self.review.container_dir / "cleanup-error.txt"
+        cleanup_error_path.write_text("previous cleanup failed\n", encoding="utf-8")
+        git_dir = self.review.container_dir / "review.git"
+        shutil.rmtree(self.review.workspace_root)
+
+        with mock.patch.object(
+            state,
+            "cleanup_workspace",
+            return_value=None,
+        ) as cleanup:
+            self.assertEqual(
+                state.cleanup(self.review.container_dir, timeout_seconds=None),
+                1,
+            )
+
+        cleanup.assert_called_once_with(self.review, keep_container=True)
+        self.assertTrue(git_dir.exists())
+        self.assertTrue(cleanup_error_path.exists())
+
+        self.assertEqual(
+            state.cleanup(self.review.container_dir, timeout_seconds=None),
+            0,
+        )
+        self.assertFalse(git_dir.exists())
         self.assertFalse(cleanup_error_path.exists())
 
     def test_cleanup_worker_clears_stale_error_after_success(self) -> None:

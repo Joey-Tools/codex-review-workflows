@@ -1235,7 +1235,11 @@ def _cleanup_terminal_workspace(
                 exit_code=exit_code,
             )
             should_keep = not force and (keep_workspace or retain_for_fallback)
-            if review.workspace_root.exists() and not should_keep:
+            private_git_dir = review.git_dir or review.container_dir / "review.git"
+            cleanup_required = review.workspace_root.exists() or (
+                not legacy and private_git_dir.exists()
+            )
+            if cleanup_required and not should_keep:
                 cleanup_completed, cleanup_error = _cleanup_before_deadline(
                     review,
                     deadline=deadline,
@@ -1248,7 +1252,10 @@ def _cleanup_terminal_workspace(
                 if cleanup_error:
                     write_text_atomic(cleanup_error_path, cleanup_error + "\n")
                     return 1
-            if not should_keep and not review.workspace_root.exists():
+            cleanup_resolved = not review.workspace_root.exists() and (
+                legacy or not private_git_dir.exists()
+            )
+            if not should_keep and cleanup_resolved:
                 try:
                     cleanup_error_path.unlink(missing_ok=True)
                 except OSError as error:

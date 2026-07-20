@@ -555,6 +555,30 @@ class WorkspaceTest(unittest.TestCase):
         self.assertIn("Content variant: source-wip", prompt)
         self.assertIn("not an exact committed range", prompt)
 
+    def test_wip_snapshot_includes_staged_only_content(self) -> None:
+        (self.repo / "example.txt").write_text(
+            "staged-only\n",
+            encoding="utf-8",
+        )
+        git(self.repo, "add", "example.txt")
+
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+            include_source_wip=True,
+        )
+        self.reviews.append(review)
+
+        self.assertEqual(
+            (review.workspace_root / "example.txt").read_text(encoding="utf-8"),
+            "staged-only\n",
+        )
+        self.assertIn(
+            "+staged-only",
+            review.diff_file.read_text(encoding="utf-8"),
+        )
+
     def test_clean_and_wip_respect_user_global_git_ignores(self) -> None:
         configured_home = pathlib.Path(self.temporary.name) / "configured-home"
         configured_home.mkdir()
