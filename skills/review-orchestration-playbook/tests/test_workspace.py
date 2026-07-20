@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import errno
 import hashlib
 import json
@@ -70,6 +71,10 @@ def git(repo: pathlib.Path, *args: str) -> str:
 
 def oauth_refresh_credential() -> str:
     return "1//" + "".join(("oauth", "-refresh", "-credential", "-value"))
+
+
+def aws_access_key_credential() -> str:
+    return "AKIA" + "A" * 16
 
 
 def prepare_workspace(**kwargs):
@@ -149,6 +154,41 @@ class WorkspaceTest(unittest.TestCase):
         commit = created.stdout.decode("ascii").strip()
         git(self.repo, "update-ref", "refs/heads/master", commit, previous)
         return commit
+
+    def install_signature_commit(
+        self,
+        *,
+        metadata_key: str,
+        body_lines: tuple[str, ...],
+    ) -> str:
+        tree = git(self.repo, "rev-parse", "HEAD^{tree}")
+        armor = (
+            "-----BEGIN PGP SIGNATURE-----",
+            *body_lines,
+            "-----END PGP SIGNATURE-----",
+        )
+        if metadata_key == "mergetag":
+            signature_metadata = (
+                f"mergetag object {self.head}\n"
+                " type commit\n"
+                " tag fixture\n"
+                " tagger Review Test <review@example.com> 1700000000 +0000\n"
+                " \n" + "".join(f" {line}\n" for line in armor)
+            )
+        else:
+            signature_metadata = f"{metadata_key} {armor[0]}\n" + "".join(
+                f" {line}\n" for line in armor[1:]
+            )
+        raw_commit = (
+            f"tree {tree}\n"
+            f"parent {self.head}\n"
+            "author Review Test <review@example.com> 1700000000 +0000\n"
+            "committer Review Test <review@example.com> 1700000000 +0000\n"
+            f"{signature_metadata}"
+            "\n"
+            "Signed endpoint fixture\n"
+        ).encode("utf-8")
+        return self.install_raw_commit(raw_commit, previous=self.head)
 
     def assert_no_review_containers(self, repo: pathlib.Path | None = None) -> None:
         review_root = workspace_runtime._review_root_for_source(repo or self.repo)
@@ -883,7 +923,7 @@ class WorkspaceTest(unittest.TestCase):
         worktree_admin = pathlib.Path(pointer.removeprefix("gitdir: ").strip())
         index_path = worktree_admin / "index"
         encoded = bytearray(index_path.read_bytes())
-        token = ("AKIA" + "A" * 16).encode("ascii")
+        token = aws_access_key_credential().encode("ascii")
         encoded[12 : 12 + len(token)] = token
         encoded[-20:] = hashlib.sha1(encoded[:-20]).digest()
         index_path.write_bytes(encoded)
@@ -1051,6 +1091,51 @@ class WorkspaceTest(unittest.TestCase):
         self.reviews.append(review)
         validate_external_workspace(review)
 
+    def test_endpoint_commit_signature_scans_joined_base64_body(self) -> None:
+        credential = aws_access_key_credential()
+        body_lines = (credential[:9], credential[9:])
+
+        for metadata_key in ("gpgsig", "gpgsig-sha256", "mergetag"):
+            with self.subTest(metadata_key=metadata_key):
+                head = self.install_signature_commit(
+                    metadata_key=metadata_key,
+                    body_lines=body_lines,
+                )
+                try:
+                    with self.assertRaisesRegex(ReviewError, "endpoint commit object"):
+                        prepare_workspace(
+                            repo=self.repo,
+                            base_ref=self.head,
+                            head_ref=head,
+                        )
+                finally:
+                    git(self.repo, "update-ref", "refs/heads/master", self.head, head)
+                self.assert_no_review_containers()
+
+    def test_endpoint_commit_signature_scans_strict_decoded_body(self) -> None:
+        encoded = base64.b64encode(
+            f"refresh_token={oauth_refresh_credential()}".encode("ascii")
+        ).decode("ascii")
+        midpoint = len(encoded) // 2
+        body_lines = (encoded[:midpoint], encoded[midpoint:])
+
+        for metadata_key in ("gpgsig", "gpgsig-sha256", "mergetag"):
+            with self.subTest(metadata_key=metadata_key):
+                head = self.install_signature_commit(
+                    metadata_key=metadata_key,
+                    body_lines=body_lines,
+                )
+                try:
+                    with self.assertRaisesRegex(ReviewError, "endpoint commit object"):
+                        prepare_workspace(
+                            repo=self.repo,
+                            base_ref=self.head,
+                            head_ref=head,
+                        )
+                finally:
+                    git(self.repo, "update-ref", "refs/heads/master", self.head, head)
+                self.assert_no_review_containers()
+
     def test_endpoint_commit_malformed_signature_header_fails_closed(self) -> None:
         tree = git(self.repo, "rev-parse", "HEAD^{tree}")
         raw_commit = (
@@ -1073,7 +1158,7 @@ class WorkspaceTest(unittest.TestCase):
 
     def test_endpoint_commit_noncanonical_signature_key_is_scanned(self) -> None:
         tree = git(self.repo, "rev-parse", "HEAD^{tree}")
-        access_key = "AKIA" + "A" * 16
+        access_key = aws_access_key_credential()
         raw_commit = (
             f"tree {tree}\n"
             f"parent {self.head}\n"
@@ -1978,7 +2063,7 @@ class WorkspaceTest(unittest.TestCase):
         )
 
     def test_tree_record_diagnostics_redact_secret_paths_and_payloads(self) -> None:
-        secret = "AKIA" + "A" * 16
+        secret = aws_access_key_credential()
         malformed = f"malformed-{secret}".encode()
         with self.assertRaises(ReviewError) as malformed_error:
             _parse_tree_record(malformed)

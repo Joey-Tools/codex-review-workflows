@@ -4883,6 +4883,232 @@ class ProviderPolicyTest(unittest.TestCase):
             egress["authentication"]["effective_init_contract"], "verified"
         )
 
+    @mock.patch.object(
+        providers,
+        "validate_external_workspace",
+        wraps=providers.validate_external_workspace,
+    )
+    @mock.patch.object(providers, "run")
+    def test_claude_attempt_cleans_staging_after_timeout(
+        self,
+        run_command: mock.Mock,
+        validate_workspace: mock.Mock,
+    ) -> None:
+        primary = providers.ReviewTimeoutError("review timed out")
+
+        def run_or_timeout(argv: tuple[str, ...], **kwargs: object) -> Completed:
+            if "auth" in argv:
+                payload = claude_auth_status_fixture("local-login")
+                stdout_path = pathlib.Path(kwargs["stdout_path"])
+                stderr_path = pathlib.Path(kwargs["stderr_path"])
+                stdout_path.parent.mkdir(parents=True, exist_ok=True)
+                stdout_path.write_bytes(payload)
+                stderr_path.write_bytes(b"")
+                return Completed(argv=argv, returncode=0, stdout=payload, stderr=b"")
+            parent = self.review.workspace_root / ".claude"
+            parent.mkdir(mode=0o755)
+            (parent / ".cc-writes").mkdir(mode=0o700)
+            raise primary
+
+        run_command.side_effect = run_or_timeout
+        temporary = self.review.container_dir / "tmp"
+        temporary.mkdir(exist_ok=True)
+
+        with self.assertRaises(providers.ReviewTimeoutError) as caught:
+            providers._claude_attempt(
+                review=self.review,
+                model="claude-opus-4-8",
+                index=1,
+                env={
+                    "HOME": str(self.claude_pwd_home),
+                    "TMPDIR": str(temporary),
+                    "TMP": str(temporary),
+                    "TEMP": str(temporary),
+                    "CLAUDE_CODE_TMPDIR": str(temporary),
+                    "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "0",
+                },
+                executable=pathlib.Path("/bin/claude"),
+            )
+
+        self.assertIs(caught.exception, primary)
+        self.assertFalse((self.review.workspace_root / ".claude").exists())
+        validate_workspace.assert_called_once_with(self.review)
+
+    @mock.patch.object(
+        providers,
+        "validate_external_workspace",
+        wraps=providers.validate_external_workspace,
+    )
+    @mock.patch.object(providers, "run")
+    def test_claude_attempt_cleans_staging_after_output_limit(
+        self,
+        run_command: mock.Mock,
+        validate_workspace: mock.Mock,
+    ) -> None:
+        primary = providers.ReviewOutputLimitError("review output exceeded limit")
+
+        def run_or_limit(argv: tuple[str, ...], **kwargs: object) -> Completed:
+            if "auth" in argv:
+                payload = claude_auth_status_fixture("local-login")
+                stdout_path = pathlib.Path(kwargs["stdout_path"])
+                stderr_path = pathlib.Path(kwargs["stderr_path"])
+                stdout_path.parent.mkdir(parents=True, exist_ok=True)
+                stdout_path.write_bytes(payload)
+                stderr_path.write_bytes(b"")
+                return Completed(argv=argv, returncode=0, stdout=payload, stderr=b"")
+            parent = self.review.workspace_root / ".claude"
+            parent.mkdir(mode=0o755)
+            (parent / ".cc-writes").mkdir(mode=0o700)
+            raise primary
+
+        run_command.side_effect = run_or_limit
+        temporary = self.review.container_dir / "tmp"
+        temporary.mkdir(exist_ok=True)
+
+        with self.assertRaises(providers.ReviewOutputLimitError) as caught:
+            providers._claude_attempt(
+                review=self.review,
+                model="claude-opus-4-8",
+                index=1,
+                env={
+                    "HOME": str(self.claude_pwd_home),
+                    "TMPDIR": str(temporary),
+                    "TMP": str(temporary),
+                    "TEMP": str(temporary),
+                    "CLAUDE_CODE_TMPDIR": str(temporary),
+                    "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "0",
+                },
+                executable=pathlib.Path("/bin/claude"),
+            )
+
+        self.assertIs(caught.exception, primary)
+        self.assertFalse((self.review.workspace_root / ".claude").exists())
+        validate_workspace.assert_called_once_with(self.review)
+
+    @mock.patch.object(
+        providers,
+        "validate_external_workspace",
+        wraps=providers.validate_external_workspace,
+    )
+    @mock.patch.object(providers, "run")
+    def test_claude_attempt_cleanup_rejection_preserves_primary_and_evidence(
+        self,
+        run_command: mock.Mock,
+        validate_workspace: mock.Mock,
+    ) -> None:
+        primary = providers.ReviewTimeoutError("review timed out")
+        retained_detail = "do not persist this staging detail"
+
+        def run_or_timeout(argv: tuple[str, ...], **kwargs: object) -> Completed:
+            stdout_path = pathlib.Path(kwargs["stdout_path"])
+            stderr_path = pathlib.Path(kwargs["stderr_path"])
+            stdout_path.parent.mkdir(parents=True, exist_ok=True)
+            if "auth" in argv:
+                payload = claude_auth_status_fixture("local-login")
+                stdout_path.write_bytes(payload)
+                stderr_path.write_bytes(b"")
+                return Completed(argv=argv, returncode=0, stdout=payload, stderr=b"")
+            staging = self.review.workspace_root / ".claude" / ".cc-writes"
+            staging.mkdir(mode=0o700, parents=True)
+            (staging / "retained.txt").write_text(
+                retained_detail,
+                encoding="utf-8",
+            )
+            stderr_path.write_bytes(b"primary supervision evidence\n")
+            raise primary
+
+        run_command.side_effect = run_or_timeout
+        temporary = self.review.container_dir / "tmp"
+        temporary.mkdir(exist_ok=True)
+
+        with self.assertRaises(providers.ReviewTimeoutError) as caught:
+            providers._claude_attempt(
+                review=self.review,
+                model="claude-opus-4-8",
+                index=1,
+                env={
+                    "HOME": str(self.claude_pwd_home),
+                    "TMPDIR": str(temporary),
+                    "TMP": str(temporary),
+                    "TEMP": str(temporary),
+                    "CLAUDE_CODE_TMPDIR": str(temporary),
+                    "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "0",
+                },
+                executable=pathlib.Path("/bin/claude"),
+            )
+
+        self.assertIs(caught.exception, primary)
+        validate_workspace.assert_called_once_with(self.review)
+        retained = (
+            self.review.workspace_root / ".claude" / ".cc-writes" / "retained.txt"
+        )
+        self.assertEqual(retained.read_text(encoding="utf-8"), retained_detail)
+        diagnostic = (
+            self.review.container_dir
+            / "attempts"
+            / "01-claude-claude-opus-4-8.stderr.log"
+        ).read_text(encoding="utf-8")
+        self.assertIn("primary supervision evidence", diagnostic)
+        self.assertIn(
+            "post-exception Claude staging cleanup or external review workspace "
+            "validation failed",
+            diagnostic,
+        )
+        self.assertNotIn(retained_detail, diagnostic)
+
+        retained.unlink()
+        retained.parent.rmdir()
+        retained.parent.parent.rmdir()
+
+    @mock.patch.object(
+        providers,
+        "_append_attempt_diagnostic",
+        side_effect=OSError("diagnostic write failed"),
+    )
+    @mock.patch.object(
+        providers,
+        "_remove_claude_bash_staging_directory",
+        side_effect=ReviewError("cleanup rejected"),
+    )
+    @mock.patch.object(providers, "run")
+    def test_claude_attempt_diagnostic_failure_preserves_primary(
+        self,
+        run_command: mock.Mock,
+        _remove_staging: mock.Mock,
+        append_diagnostic: mock.Mock,
+    ) -> None:
+        primary = providers.ReviewOutputLimitError("review output exceeded limit")
+
+        def run_or_limit(argv: tuple[str, ...], **kwargs: object) -> Completed:
+            if "auth" in argv:
+                payload = claude_auth_status_fixture("local-login")
+                return Completed(argv=argv, returncode=0, stdout=payload, stderr=b"")
+            raise primary
+
+        run_command.side_effect = run_or_limit
+        temporary = self.review.container_dir / "tmp"
+        temporary.mkdir(exist_ok=True)
+
+        with self.assertRaises(providers.ReviewOutputLimitError) as caught:
+            providers._claude_attempt(
+                review=self.review,
+                model="claude-opus-4-8",
+                index=1,
+                env={
+                    "HOME": str(self.claude_pwd_home),
+                    "TMPDIR": str(temporary),
+                    "TMP": str(temporary),
+                    "TEMP": str(temporary),
+                    "CLAUDE_CODE_TMPDIR": str(temporary),
+                    "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "0",
+                },
+                executable=pathlib.Path("/bin/claude"),
+            )
+
+        self.assertIs(caught.exception, primary)
+        _remove_staging.assert_called_once()
+        append_diagnostic.assert_called_once()
+
     def test_claude_bash_staging_cleanup_rejects_nonempty_directory(self) -> None:
         baseline = providers._claude_bash_staging_baseline(self.review)
         parent = self.review.workspace_root / ".claude"

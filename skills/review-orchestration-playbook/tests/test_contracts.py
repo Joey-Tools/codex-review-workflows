@@ -643,7 +643,7 @@ def _current_claude_contract_files() -> dict[str, str]:
 
 
 class RepositoryContractTest(unittest.TestCase):
-    def test_cleanup_only_legacy_0664_lock_migration_is_private_and_ordered(
+    def test_management_only_legacy_v1_lock_migration_is_private_and_ordered(
         self,
     ) -> None:
         contract = (SKILL_ROOT / "references/helper-contract.md").read_text(
@@ -651,9 +651,12 @@ class RepositoryContractTest(unittest.TestCase):
         )
 
         anchors = (
-            "empty owner-owned mode-`0664` `cleanup.lock`",
-            "non-group/other-writable owner-owned `.codex-tmp` root",
+            "exact v2 marker/schema pair",
+            "Management-only legacy compatibility accepts v1",
+            "`<canonical-source>/.codex-tmp/<generated-container>`",
+            "cannot enter `run-state`",
             "exact-mode-`0700` state directory",
+            "empty owner-owned mode-`0664` `cleanup.lock`",
             "exclusive lock is acquired",
             "revalidates both directories and the lock identity/mode",
             "`fchmod(0600)`",
@@ -663,8 +666,8 @@ class RepositoryContractTest(unittest.TestCase):
         cursor = 0
         for anchor in anchors:
             cursor = contract.index(anchor, cursor) + len(anchor)
-        self.assertIn("Every other group/other-writable", contract)
-        self.assertIn("nonempty legacy lock fails closed", contract)
+        self.assertIn("V2 requires a private mode-`0600` lock", contract)
+        self.assertIn("legacy lock fails closed without workspace removal", contract)
 
     def test_only_canonical_review_skill_entrypoint_remains(self) -> None:
         self.assertTrue((SKILL_ROOT / "SKILL.md").is_file())

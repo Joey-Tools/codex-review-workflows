@@ -25,6 +25,7 @@ from review_runtime.common import (  # noqa: E402
     write_text_atomic,
 )
 from review_runtime.workspace import (  # noqa: E402
+    ReviewWorkspace,
     _load_control_artifact_state,
     cleanup_workspace,
     prepare_workspace as _prepare_workspace,
@@ -86,6 +87,7 @@ class StatefulLifecycleTest(unittest.TestCase):
             base_ref=self.base,
             head_ref=self.head,
         )
+        self.legacy_index = 0
 
     def tearDown(self) -> None:
         if self.review.workspace_root.exists():
@@ -95,13 +97,13 @@ class StatefulLifecycleTest(unittest.TestCase):
     def write_completed_state(self) -> None:
         state_dir = self.review.container_dir
         (state_dir / state.STATE_MARKER).write_text(
-            "isolated-review-state-v1\n",
+            "isolated-review-state-v2\n",
             encoding="utf-8",
         )
         write_json(
             state_dir / state.STATE_FILE,
             {
-                "version": 1,
+                "version": 2,
                 "reviewer": "claude",
                 "egress_consent": "double-review",
                 "workspace": self.review.to_json(),
@@ -115,6 +117,66 @@ class StatefulLifecycleTest(unittest.TestCase):
         )
         (state_dir / state.EXIT_FILE).write_text("0\n", encoding="utf-8")
         (state_dir / "final.txt").write_text("No findings.\n", encoding="utf-8")
+
+    def write_legacy_completed_state(
+        self,
+        *,
+        container_name: str | None = None,
+    ) -> ReviewWorkspace:
+        self.legacy_index += 1
+        legacy_root = self.repo.resolve() / ".codex-tmp"
+        legacy_root.mkdir(mode=0o700, exist_ok=True)
+        legacy_root.chmod(0o700)
+        name = container_name or (
+            f"isolated-review-20260720-000000-{self.legacy_index:010x}"
+        )
+        container_dir = legacy_root / name
+        workspace_root = container_dir / "workspace"
+        control_dir = workspace_root / ".codex-review"
+        control_dir.mkdir(parents=True)
+        container_dir.chmod(0o700)
+        diff_file = control_dir / "review.diff"
+        prompt_file = control_dir / "review.prompt"
+        diff_file.write_text("legacy diff\n", encoding="utf-8")
+        prompt_file.write_text("legacy prompt\n", encoding="utf-8")
+        review = ReviewWorkspace(
+            source_root=self.repo.resolve(),
+            container_dir=container_dir,
+            workspace_root=workspace_root,
+            base_ref=self.base,
+            head_ref=self.head,
+            diff_file=diff_file,
+            prompt_file=prompt_file,
+            git_dir=container_dir / "review.git",
+        )
+        (container_dir / state.STATE_MARKER).write_text(
+            "isolated-review-state-v1\n",
+            encoding="utf-8",
+        )
+        workspace_value = review.to_json()
+        for current_only_key in (
+            "git_dir",
+            "content_variant",
+            "snapshot_tree_sha",
+            "scope_identity",
+        ):
+            workspace_value.pop(current_only_key, None)
+        write_json(
+            container_dir / state.STATE_FILE,
+            {
+                "version": 1,
+                "reviewer": "claude",
+                "workspace": workspace_value,
+                "keep_workspace": False,
+                "pid": 99999999,
+            },
+        )
+        (container_dir / state.EXIT_FILE).write_text("0\n", encoding="utf-8")
+        (container_dir / "final.txt").write_text(
+            "Legacy no findings.\n",
+            encoding="utf-8",
+        )
+        return review
 
     def test_claude_redactions_include_auth_and_credential_proxy_transport(
         self,
@@ -232,6 +294,170 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.assertEqual(text, "No findings.")
         self.assertFalse(self.review.workspace_root.exists())
         self.assertTrue(self.review.container_dir.exists())
+
+    def test_load_state_requires_exact_marker_version_pair(self) -> None:
+        self.write_completed_state()
+        state_dir = self.review.container_dir
+        cases = (
+            ("isolated-review-state-v1\n", 2, "marker does not match"),
+            ("isolated-review-state-v2\n", 1, "marker does not match"),
+            ("isolated-review-state-v2\n\n", 2, "marker does not match"),
+            ("isolated-review-state-v3\n", 3, "unsupported version"),
+            ("isolated-review-state-v2\n", True, "unsupported version"),
+        )
+
+        for marker, version, expected in cases:
+            with self.subTest(marker=marker, version=version):
+                value = read_json(state_dir / state.STATE_FILE)
+                value["version"] = version
+                write_json(state_dir / state.STATE_FILE, value)
+                (state_dir / state.STATE_MARKER).write_text(
+                    marker,
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(ReviewError, expected):
+                    state.load_state(state_dir)
+
+    def test_state_versions_reject_the_opposite_workspace_layout(self) -> None:
+        self.write_completed_state()
+        current = read_json(self.review.container_dir / state.STATE_FILE)
+        current["version"] = 1
+        write_json(self.review.container_dir / state.STATE_FILE, current)
+        (self.review.container_dir / state.STATE_MARKER).write_text(
+            "isolated-review-state-v1\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(ReviewError):
+            state.load_review_state(self.review.container_dir)
+
+        legacy_review = self.write_legacy_completed_state()
+        legacy_state = read_json(legacy_review.container_dir / state.STATE_FILE)
+        legacy_state["version"] = 2
+        write_json(legacy_review.container_dir / state.STATE_FILE, legacy_state)
+        (legacy_review.container_dir / state.STATE_MARKER).write_text(
+            "isolated-review-state-v2\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(ReviewError):
+            state.load_review_state(legacy_review.container_dir)
+
+    def test_exact_v1_legacy_status_cleanup_and_final(self) -> None:
+        cleanup_review = self.write_legacy_completed_state()
+        summary = state.status(cleanup_review.container_dir)
+        self.assertFalse(summary["running"])
+        self.assertEqual(summary["exit_code"], 0)
+        self.assertEqual(
+            state.cleanup(cleanup_review.container_dir, timeout_seconds=None),
+            0,
+        )
+        self.assertFalse(cleanup_review.workspace_root.exists())
+
+        final_review = self.write_legacy_completed_state()
+        exit_code, text = state.final(final_review.container_dir)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(text, "Legacy no findings.")
+        self.assertFalse(final_review.workspace_root.exists())
+
+    def test_exact_v1_legacy_cleanup_worker_reclassifies_before_opt_in(self) -> None:
+        legacy_review = self.write_legacy_completed_state()
+        lock_path = legacy_review.container_dir / state.CLEANUP_LOCK_FILE
+        with state.open_private_lock_file(
+            lock_path,
+            label="test legacy cleanup worker lock",
+        ) as cleanup_lock:
+            with mock.patch.object(
+                cleanup_worker,
+                "cleanup_workspace",
+                return_value=None,
+            ) as cleanup:
+                exit_code = cleanup_worker.main(
+                    [
+                        str(legacy_review.container_dir),
+                        str(cleanup_lock.fileno()),
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        cleanup.assert_called_once()
+        self.assertTrue(cleanup.call_args.kwargs["allow_legacy"])
+        self.assertTrue(cleanup.call_args.kwargs["keep_container"])
+
+    def test_legacy_reviewer_launch_is_rejected(self) -> None:
+        legacy_review = self.write_legacy_completed_state()
+
+        with mock.patch.object(state, "run_review") as run_review:
+            exit_code = state.run_state(state_dir=legacy_review.container_dir)
+
+        self.assertEqual(exit_code, 1)
+        run_review.assert_not_called()
+
+    def test_legacy_runner_lock_mode_still_reports_running(self) -> None:
+        legacy_review = self.write_legacy_completed_state()
+        lock_path = legacy_review.container_dir / state.LOCK_FILE
+        lock_path.write_bytes(b"")
+        lock_path.chmod(0o644)
+
+        with lock_path.open("r+b") as runner_lock:
+            state.fcntl.flock(runner_lock.fileno(), state.fcntl.LOCK_EX)
+            summary = state.status(legacy_review.container_dir)
+
+        self.assertTrue(summary["running"])
+        self.assertTrue(summary["runner_lock_held"])
+        self.assertIsNone(summary["exit_code"])
+
+    def test_legacy_forged_source_and_container_name_are_rejected(self) -> None:
+        forged_name_review = self.write_legacy_completed_state(
+            container_name="isolated-review-forged",
+        )
+        with self.assertRaises(ReviewError):
+            state.load_review_state(forged_name_review.container_dir)
+
+        forged_source_review = self.write_legacy_completed_state()
+        value = read_json(forged_source_review.container_dir / state.STATE_FILE)
+        value["workspace"]["source_root"] = str(
+            pathlib.Path(self.temporary.name).resolve()
+        )
+        write_json(forged_source_review.container_dir / state.STATE_FILE, value)
+        with self.assertRaises(ReviewError):
+            state.load_review_state(forged_source_review.container_dir)
+
+    def test_legacy_cleanup_revalidates_container_after_flock(self) -> None:
+        legacy_review = self.write_legacy_completed_state()
+        original_container = legacy_review.container_dir
+        moved_container = original_container.with_name("moved-legacy-container")
+
+        def acquire_then_replace_with_symlink(handle, *, deadline):
+            del deadline
+            state.fcntl.flock(
+                handle.fileno(),
+                state.fcntl.LOCK_EX | state.fcntl.LOCK_NB,
+            )
+            original_container.rename(moved_container)
+            original_container.symlink_to(
+                moved_container.name, target_is_directory=True
+            )
+            return True
+
+        try:
+            with (
+                mock.patch.object(
+                    state,
+                    "_acquire_cleanup_lock",
+                    side_effect=acquire_then_replace_with_symlink,
+                ),
+                self.assertRaisesRegex(
+                    ReviewError,
+                    "path does not match|not a real directory",
+                ),
+            ):
+                state.cleanup(original_container, timeout_seconds=1)
+        finally:
+            if original_container.is_symlink():
+                original_container.unlink()
+            if moved_container.exists():
+                moved_container.rename(original_container)
+
+        self.assertTrue(legacy_review.workspace_root.exists())
 
     def test_codex_unavailable_retains_preflight_workspace_until_cleanup(self) -> None:
         self.write_codex_unavailable_state()
@@ -643,22 +869,22 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o664)
 
     def test_cleanup_migrates_safe_legacy_lock_mode_after_flock(self) -> None:
-        self.write_completed_state()
-        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+        legacy_review = self.write_legacy_completed_state()
+        lock_path = legacy_review.container_dir / state.CLEANUP_LOCK_FILE
         lock_path.write_bytes(b"")
         lock_path.chmod(0o644)
 
         self.assertEqual(
-            state.cleanup(self.review.container_dir, timeout_seconds=1),
+            state.cleanup(legacy_review.container_dir, timeout_seconds=1),
             0,
         )
 
         self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o600)
-        self.assertFalse(self.review.workspace_root.exists())
+        self.assertFalse(legacy_review.workspace_root.exists())
 
     def test_cleanup_migrates_private_empty_legacy_0664_lock(self) -> None:
-        self.write_completed_state()
-        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+        legacy_review = self.write_legacy_completed_state()
+        lock_path = legacy_review.container_dir / state.CLEANUP_LOCK_FILE
         previous_umask = os.umask(0o002)
         try:
             with lock_path.open("a+b"):
@@ -668,12 +894,24 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o664)
 
         self.assertEqual(
-            state.cleanup(self.review.container_dir, timeout_seconds=1),
+            state.cleanup(legacy_review.container_dir, timeout_seconds=1),
             0,
         )
 
         self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o600)
-        self.assertFalse(self.review.workspace_root.exists())
+        self.assertFalse(legacy_review.workspace_root.exists())
+
+    def test_v2_cleanup_rejects_legacy_cleanup_lock_mode(self) -> None:
+        self.write_completed_state()
+        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+        lock_path.write_bytes(b"")
+        lock_path.chmod(0o644)
+
+        with self.assertRaisesRegex(ReviewError, "mode must be exactly 0600"):
+            state.cleanup(self.review.container_dir, timeout_seconds=1)
+
+        self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o644)
+        self.assertTrue(self.review.workspace_root.exists())
 
     def test_cleanup_rejects_0664_lock_outside_exact_private_state_mode(self) -> None:
         self.write_completed_state()
@@ -717,7 +955,7 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.write_completed_state()
         lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
         lock_path.write_bytes(b"")
-        lock_path.chmod(0o664)
+        lock_path.chmod(0o600)
 
         def acquire_then_change_state_mode(handle, *, deadline):
             del deadline
@@ -744,12 +982,12 @@ class StatefulLifecycleTest(unittest.TestCase):
         finally:
             self.review.container_dir.chmod(0o700)
 
-        self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o664)
+        self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o600)
         self.assertTrue(self.review.workspace_root.exists())
 
     def test_cleanup_rejects_unsafe_legacy_lock_modes(self) -> None:
-        self.write_completed_state()
-        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+        legacy_review = self.write_legacy_completed_state()
+        lock_path = legacy_review.container_dir / state.CLEANUP_LOCK_FILE
         lock_path.write_bytes(b"")
 
         for mode in (0o1644, 0o700, 0o611, 0o660):
@@ -757,11 +995,11 @@ class StatefulLifecycleTest(unittest.TestCase):
                 lock_path.chmod(mode)
                 with self.assertRaisesRegex(
                     ReviewError,
-                    "unsafe legacy mode|group or other writable",
+                    "unsafe legacy mode",
                 ):
-                    state.cleanup(self.review.container_dir, timeout_seconds=1)
+                    state.cleanup(legacy_review.container_dir, timeout_seconds=1)
 
-        self.assertTrue(self.review.workspace_root.exists())
+        self.assertTrue(legacy_review.workspace_root.exists())
 
     def test_legacy_lock_mode_whitelist_rejects_special_bits(self) -> None:
         metadata = mock.Mock(st_mode=stat.S_IFREG | 0o4644)
@@ -781,8 +1019,8 @@ class StatefulLifecycleTest(unittest.TestCase):
                 )
 
     def test_cleanup_revalidates_legacy_lock_mode_after_flock(self) -> None:
-        self.write_completed_state()
-        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+        legacy_review = self.write_legacy_completed_state()
+        lock_path = legacy_review.container_dir / state.CLEANUP_LOCK_FILE
         lock_path.write_bytes(b"")
         lock_path.chmod(0o644)
 
@@ -796,10 +1034,47 @@ class StatefulLifecycleTest(unittest.TestCase):
             side_effect=mutate_mode_after_flock,
         ):
             with self.assertRaisesRegex(ReviewError, "unsafe legacy mode"):
-                state.cleanup(self.review.container_dir, timeout_seconds=1)
+                state.cleanup(legacy_review.container_dir, timeout_seconds=1)
 
         self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o700)
-        self.assertTrue(self.review.workspace_root.exists())
+        self.assertTrue(legacy_review.workspace_root.exists())
+
+    def test_cleanup_does_not_migrate_lock_after_legacy_state_reclassification(
+        self,
+    ) -> None:
+        legacy_review = self.write_legacy_completed_state()
+        state_dir = legacy_review.container_dir
+        lock_path = state_dir / state.CLEANUP_LOCK_FILE
+        lock_path.write_bytes(b"")
+        lock_path.chmod(0o644)
+
+        def change_state_version_after_flock(handle, *, deadline):
+            del deadline
+            state.fcntl.flock(
+                handle.fileno(),
+                state.fcntl.LOCK_EX | state.fcntl.LOCK_NB,
+            )
+            value = read_json(state_dir / state.STATE_FILE)
+            value["version"] = 2
+            write_json(state_dir / state.STATE_FILE, value)
+            (state_dir / state.STATE_MARKER).write_text(
+                "isolated-review-state-v2\n",
+                encoding="utf-8",
+            )
+            return True
+
+        with (
+            mock.patch.object(
+                state,
+                "_acquire_cleanup_lock",
+                side_effect=change_state_version_after_flock,
+            ),
+            self.assertRaises(ReviewError),
+        ):
+            state.cleanup(state_dir, timeout_seconds=1)
+
+        self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o644)
+        self.assertTrue(legacy_review.workspace_root.exists())
 
     def test_cleanup_rejects_symlink_lock(self) -> None:
         self.write_completed_state()
@@ -977,6 +1252,11 @@ time.sleep(0.2)
             keep_workspace=False,
             egress_consent=None,
         )
+        self.assertEqual(state.load_state(state_dir)["version"], 2)
+        self.assertEqual(
+            (state_dir / state.STATE_MARKER).read_text(encoding="utf-8"),
+            "isolated-review-state-v2\n",
+        )
         self.assertEqual(state.wait(state_dir, timeout_seconds=5), 0)
         exit_code, text = state.final(state_dir)
         self.assertEqual(exit_code, 0)
@@ -986,13 +1266,13 @@ time.sleep(0.2)
     def test_runner_unblocks_signals_inherited_from_stateful_start(self) -> None:
         state_dir = self.review.container_dir
         (state_dir / state.STATE_MARKER).write_text(
-            "isolated-review-state-v1\n",
+            "isolated-review-state-v2\n",
             encoding="utf-8",
         )
         write_json(
             state_dir / state.STATE_FILE,
             {
-                "version": 1,
+                "version": 2,
                 "reviewer": "codex",
                 "workspace": self.review.to_json(),
             },
@@ -1016,13 +1296,13 @@ time.sleep(0.2)
     def test_runner_records_forwarded_signal_detail_for_stateful_final(self) -> None:
         state_dir = self.review.container_dir
         (state_dir / state.STATE_MARKER).write_text(
-            "isolated-review-state-v1\n",
+            "isolated-review-state-v2\n",
             encoding="utf-8",
         )
         write_json(
             state_dir / state.STATE_FILE,
             {
-                "version": 1,
+                "version": 2,
                 "reviewer": "claude",
                 "egress_consent": "double-review",
                 "workspace": self.review.to_json(),
@@ -1050,13 +1330,13 @@ time.sleep(0.2)
     def test_runner_preserves_signal_exit_when_diagnostic_write_fails(self) -> None:
         state_dir = self.review.container_dir
         (state_dir / state.STATE_MARKER).write_text(
-            "isolated-review-state-v1\n",
+            "isolated-review-state-v2\n",
             encoding="utf-8",
         )
         write_json(
             state_dir / state.STATE_FILE,
             {
-                "version": 1,
+                "version": 2,
                 "reviewer": "claude",
                 "egress_consent": "double-review",
                 "workspace": self.review.to_json(),
@@ -1099,13 +1379,13 @@ time.sleep(0.2)
     ) -> None:
         state_dir = self.review.container_dir
         (state_dir / state.STATE_MARKER).write_text(
-            "isolated-review-state-v1\n",
+            "isolated-review-state-v2\n",
             encoding="utf-8",
         )
         write_json(
             state_dir / state.STATE_FILE,
             {
-                "version": 1,
+                "version": 2,
                 "reviewer": "codex",
                 "workspace": self.review.to_json(),
             },
@@ -1548,13 +1828,13 @@ time.sleep(0.2)
     def test_runner_records_signal_between_reviewer_attempts(self) -> None:
         state_dir = self.review.container_dir
         (state_dir / state.STATE_MARKER).write_text(
-            "isolated-review-state-v1\n",
+            "isolated-review-state-v2\n",
             encoding="utf-8",
         )
         write_json(
             state_dir / state.STATE_FILE,
             {
-                "version": 1,
+                "version": 2,
                 "reviewer": "codex",
                 "workspace": self.review.to_json(),
             },
@@ -1588,13 +1868,13 @@ time.sleep(0.2)
     def test_runner_defers_signal_while_blocking_for_terminal_publish(self) -> None:
         state_dir = self.review.container_dir
         (state_dir / state.STATE_MARKER).write_text(
-            "isolated-review-state-v1\n",
+            "isolated-review-state-v2\n",
             encoding="utf-8",
         )
         write_json(
             state_dir / state.STATE_FILE,
             {
-                "version": 1,
+                "version": 2,
                 "reviewer": "codex",
                 "workspace": self.review.to_json(),
             },
@@ -1644,13 +1924,13 @@ time.sleep(0.2)
     def test_terminal_runner_keeps_signals_blocked_through_process_exit(self) -> None:
         state_dir = self.review.container_dir
         (state_dir / state.STATE_MARKER).write_text(
-            "isolated-review-state-v1\n",
+            "isolated-review-state-v2\n",
             encoding="utf-8",
         )
         write_json(
             state_dir / state.STATE_FILE,
             {
-                "version": 1,
+                "version": 2,
                 "reviewer": "codex",
                 "workspace": self.review.to_json(),
             },

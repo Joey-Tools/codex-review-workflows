@@ -2748,17 +2748,42 @@ def _claude_attempt(
         },
     )
     claude_bash_staging_baseline = _claude_bash_staging_baseline(review)
-    completed = run(
-        (str(executable), *arguments),
-        cwd=review.workspace_root,
-        env=env,
-        stdin=prompt,
-        stdout_path=stdout_path,
-        stderr_path=stderr_path,
-        timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
-        output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
-        redact_values=output_redact_values(redact_values),
-    )
+    try:
+        completed = run(
+            (str(executable), *arguments),
+            cwd=review.workspace_root,
+            env=env,
+            stdin=prompt,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
+            output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
+            redact_values=output_redact_values(redact_values),
+        )
+    except BaseException:
+        post_exception_workspace_rejected = False
+        try:
+            _remove_claude_bash_staging_directory(
+                review,
+                baseline=claude_bash_staging_baseline,
+            )
+        except BaseException:
+            post_exception_workspace_rejected = True
+        try:
+            validate_external_workspace(review)
+        except BaseException:
+            post_exception_workspace_rejected = True
+        if post_exception_workspace_rejected:
+            try:
+                _append_attempt_diagnostic(
+                    stderr_path,
+                    "post-exception Claude staging cleanup or external review "
+                    "workspace validation failed; preserving the primary runtime "
+                    "failure and retained workspace evidence",
+                )
+            except BaseException:
+                pass
+        raise
     post_attempt_workspace_verified = True
     claude_bash_staging_contract = "rejected"
     try:

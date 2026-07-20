@@ -47,12 +47,19 @@ from .workspace import (
     _read_bounded_json,
     cleanup_workspace,
     prepare_workspace,
+    validate_legacy_workspace_layout,
     validate_workspace_layout,
 )
 
 
 STATE_FILE = "state.json"
 STATE_MARKER = ".isolated-review-state"
+STATE_VERSION = 2
+LEGACY_STATE_VERSION = 1
+STATE_MARKER_VALUES = {
+    LEGACY_STATE_VERSION: "isolated-review-state-v1\n",
+    STATE_VERSION: "isolated-review-state-v2\n",
+}
 EXIT_FILE = "exit-code"
 LOCK_FILE = "runner.lock"
 CLEANUP_LOCK_FILE = "cleanup.lock"
@@ -382,7 +389,7 @@ def _validate_private_directory_path_identity(
 
 
 @contextmanager
-def _open_private_cleanup_state_directory(
+def _open_external_cleanup_state_directory(
     state_dir: pathlib.Path,
 ) -> Iterator[tuple[int, Callable[[], None]]]:
     source_review_root = state_dir.parent
@@ -470,16 +477,91 @@ def _open_private_cleanup_state_directory(
             os.close(review_root_base_fd)
 
 
-def _state_path(state_dir: pathlib.Path) -> pathlib.Path:
-    state_dir = state_dir.expanduser().resolve()
-    marker = state_dir / STATE_MARKER
-    if not marker.is_file():
-        raise ReviewError(f"not an isolated-review state directory: {state_dir}")
-    return state_dir / STATE_FILE
+@contextmanager
+def _open_legacy_cleanup_state_directory(
+    state_dir: pathlib.Path,
+) -> Iterator[tuple[int, Callable[[], None]]]:
+    review_root = state_dir.parent
+    if (
+        review_root.name != ".codex-tmp"
+        or REVIEW_CONTAINER_PATTERN.fullmatch(state_dir.name) is None
+    ):
+        raise ReviewError("legacy review state directory has an invalid layout")
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW
+    review_root_fd: int | None = None
+    state_dir_fd: int | None = None
+    try:
+        review_root_fd = os.open(review_root, flags)
+        state_dir_fd = os.open(
+            state_dir.name,
+            flags,
+            dir_fd=review_root_fd,
+        )
+
+        def revalidate() -> None:
+            assert review_root_fd is not None
+            assert state_dir_fd is not None
+            _validate_private_directory_path_identity(
+                review_root,
+                review_root_fd,
+                label="legacy review state root",
+            )
+            _validate_private_directory_path_identity(
+                pathlib.Path(state_dir.name),
+                state_dir_fd,
+                label="legacy review state directory",
+                expected_mode=0o700,
+                dir_fd=review_root_fd,
+            )
+
+        revalidate()
+        yield state_dir_fd, revalidate
+    except OSError as error:
+        raise ReviewError(
+            f"cannot open legacy review state directory safely: {error}"
+        ) from error
+    finally:
+        if state_dir_fd is not None:
+            os.close(state_dir_fd)
+        if review_root_fd is not None:
+            os.close(review_root_fd)
+
+
+def _open_private_cleanup_state_directory(
+    state_dir: pathlib.Path,
+    *,
+    legacy: bool,
+):
+    if legacy:
+        return _open_legacy_cleanup_state_directory(state_dir)
+    return _open_external_cleanup_state_directory(state_dir)
+
+
+def _state_version(state: Mapping[str, Any]) -> int:
+    version = state.get("version")
+    if type(version) is not int or version not in STATE_MARKER_VALUES:
+        raise ReviewError("review state has an unsupported version")
+    return version
+
+
+def is_legacy_review_state(state: Mapping[str, Any]) -> bool:
+    return _state_version(state) == LEGACY_STATE_VERSION
 
 
 def load_state(state_dir: pathlib.Path) -> dict[str, Any]:
-    return read_json(_state_path(state_dir))
+    resolved_state_dir = state_dir.expanduser().resolve()
+    marker_path = resolved_state_dir / STATE_MARKER
+    try:
+        marker = marker_path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise ReviewError(
+            f"not an isolated-review state directory: {resolved_state_dir}: {error}"
+        ) from error
+    state = read_json(resolved_state_dir / STATE_FILE)
+    version = _state_version(state)
+    if marker != STATE_MARKER_VALUES[version]:
+        raise ReviewError("review state marker does not match its version")
+    return state
 
 
 def load_review_state(
@@ -496,7 +578,10 @@ def load_review_state(
         raise ReviewError(
             f"review state contains an invalid workspace: {error}"
         ) from error
-    validate_workspace_layout(review)
+    if is_legacy_review_state(state):
+        validate_legacy_workspace_layout(review)
+    else:
+        validate_workspace_layout(review)
     if review.container_dir.resolve(strict=False) != resolved_state_dir:
         raise ReviewError("review state container does not match its state directory")
     return state, review
@@ -627,11 +712,14 @@ def start(
         )
         write_redaction_scope.__enter__()
         write_redaction_entered = True
-        write_text_atomic(state_dir / STATE_MARKER, "isolated-review-state-v1\n")
+        write_text_atomic(
+            state_dir / STATE_MARKER,
+            STATE_MARKER_VALUES[STATE_VERSION],
+        )
         stdout_path = state_dir / "runner.stdout.log"
         stderr_path = state_dir / "runner.stderr.log"
         state: dict[str, Any] = {
-            "version": 1,
+            "version": STATE_VERSION,
             "reviewer": reviewer,
             "workspace": review.to_json(),
             "keep_workspace": keep_workspace,
@@ -808,6 +896,8 @@ def run_state(
 
     try:
         state, review = load_review_state(state_dir)
+        if is_legacy_review_state(state):
+            raise ReviewError("legacy review state cannot launch a reviewer")
         state_dir = review.container_dir.expanduser().resolve(strict=True)
         state_loaded = True
         write_redaction_scope = atomic_write_redactions(
@@ -1081,17 +1171,22 @@ def _cleanup_terminal_workspace(
     deadline: float | None,
     force: bool,
 ) -> int:
+    classified_state, _classified_review = load_review_state(state_dir)
+    classified_legacy = is_legacy_review_state(classified_state)
     cleanup_lock_name = pathlib.Path(CLEANUP_LOCK_FILE)
     cleanup_error_path = state_dir / "cleanup-error.txt"
     with (
-        _open_private_cleanup_state_directory(state_dir) as (
+        _open_private_cleanup_state_directory(
+            state_dir,
+            legacy=classified_legacy,
+        ) as (
             state_dir_fd,
             revalidate_state_directory,
         ),
         open_private_lock_file(
             cleanup_lock_name,
             label="review cleanup lock",
-            allow_legacy_read_mode=True,
+            allow_legacy_read_mode=classified_legacy,
             allowed_legacy_modes=PRIVATE_STATE_LEGACY_LOCK_MODES,
             dir_fd=state_dir_fd,
         ) as cleanup_lock,
@@ -1106,23 +1201,28 @@ def _cleanup_terminal_workspace(
             cleanup_lock_transferred = True
 
         try:
-            locked_metadata = validate_safe_legacy_lock_file(
-                cleanup_lock_name,
-                cleanup_lock,
-                label="review cleanup lock",
-                allowed_modes=PRIVATE_STATE_LEGACY_LOCK_MODES,
-                dir_fd=state_dir_fd,
-            )
-            if stat.S_IMODE(locked_metadata.st_mode) != 0o600:
-                os.fchmod(cleanup_lock.fileno(), 0o600)
-                os.fsync(cleanup_lock.fileno())
+            state, review = load_review_state(state_dir)
+            legacy = is_legacy_review_state(state)
+            if legacy != classified_legacy:
+                raise ReviewError("review state version changed during cleanup")
+            if legacy:
+                locked_metadata = validate_safe_legacy_lock_file(
+                    cleanup_lock_name,
+                    cleanup_lock,
+                    label="review cleanup lock",
+                    allowed_modes=PRIVATE_STATE_LEGACY_LOCK_MODES,
+                    dir_fd=state_dir_fd,
+                )
+                if stat.S_IMODE(locked_metadata.st_mode) != 0o600:
+                    os.fchmod(cleanup_lock.fileno(), 0o600)
+                    os.fsync(cleanup_lock.fileno())
             validate_private_lock_file(
                 cleanup_lock_name,
                 cleanup_lock,
                 label="review cleanup lock",
                 dir_fd=state_dir_fd,
             )
-            state, review = load_review_state(state_dir)
+            revalidate_state_directory()
             keep_workspace = bool(state.get("keep_workspace"))
             exit_code = _read_exit_code(state_dir)
             retain_for_fallback = _should_retain_fallback_workspace(
@@ -1138,6 +1238,7 @@ def _cleanup_terminal_workspace(
                     deadline=deadline,
                     cleanup_lock_fd=cleanup_lock.fileno(),
                     lock_handoff=transfer_cleanup_lock,
+                    legacy=legacy,
                 )
                 if not cleanup_completed:
                     return 124
@@ -1178,8 +1279,15 @@ def _cleanup_before_deadline(
     deadline: float | None,
     cleanup_lock_fd: int,
     lock_handoff: Callable[[], None],
+    legacy: bool,
 ) -> tuple[bool, str | None]:
     if deadline is None:
+        if legacy:
+            return True, cleanup_workspace(
+                review,
+                keep_container=True,
+                allow_legacy=True,
+            )
         return True, cleanup_workspace(review, keep_container=True)
     remaining = deadline - time.monotonic()
     if remaining <= 0:

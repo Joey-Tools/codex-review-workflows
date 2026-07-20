@@ -197,6 +197,10 @@ MAX_PRIVATE_STORAGE_BYTES = (
     MAX_PRIVATE_PACK_BYTES + MAX_SNAPSHOT_BYTES + 2 * MAX_PRIVATE_OBJECT_LIST_BYTES
 )
 MAX_ENDPOINT_COMMIT_BYTES = 4 * 1024 * 1024
+# Signature scan material adds strict decoded bytes to content already bounded by
+# MAX_ENDPOINT_COMMIT_BYTES. Base64 decoding can add at most three bytes per four
+# joined body bytes, so twice the endpoint limit is a conservative total bound.
+MAX_ENDPOINT_COMMIT_SCAN_BYTES = 2 * MAX_ENDPOINT_COMMIT_BYTES
 MAX_DIFF_BYTES = 128 * 1024 * 1024
 MAX_CHANGED_METADATA_BYTES = 128 * 1024 * 1024
 MAX_CHANGED_ENTRIES = 100_000
@@ -1165,8 +1169,8 @@ def _human_commit_metadata(
     if tree_count != 1:
         raise ReviewError("endpoint commit object must contain exactly one tree")
     human.extend(b"\n" + message)
-    if len(human) > MAX_ENDPOINT_COMMIT_BYTES:
-        raise ReviewError("human endpoint commit metadata exceeds its byte limit")
+    if len(human) > MAX_ENDPOINT_COMMIT_SCAN_BYTES:
+        raise ReviewError("scannable endpoint commit metadata exceeds its byte limit")
     return bytes(human)
 
 
@@ -1229,14 +1233,16 @@ def _human_signature_metadata(value: bytes) -> bytes:
         body_lines.append(line)
     if not body_lines:
         raise ReviewError("endpoint commit object has empty signature metadata")
+    joined_body = b"".join(body_lines)
     try:
-        decoded = base64.b64decode(b"".join(body_lines), validate=True)
+        decoded = base64.b64decode(joined_body, validate=True)
     except (binascii.Error, ValueError) as error:
         raise ReviewError(
             "endpoint commit object has malformed signature metadata"
         ) from error
     if not decoded:
         raise ReviewError("endpoint commit object has empty signature metadata")
+    human.extend(b"\n" + joined_body + b"\n" + decoded + b"\n")
     return bytes(human)
 
 
@@ -3044,6 +3050,72 @@ def validate_workspace_layout(review: ReviewWorkspace) -> None:
         and re.fullmatch(r"[0-9a-f]{64}", review.scope_identity) is None
     ):
         raise ReviewError("review workspace has an invalid scope identity")
+
+
+def validate_legacy_workspace_layout(review: ReviewWorkspace) -> None:
+    try:
+        source_root = review.source_root.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ReviewError("cannot resolve legacy review source repository") from error
+    if review.source_root != source_root:
+        raise ReviewError("legacy review source repository is not canonical")
+    expected_parent = source_root / ".codex-tmp"
+    container_dir = review.container_dir
+    if (
+        not container_dir.is_absolute()
+        or container_dir.parent != expected_parent
+        or REVIEW_CONTAINER_PATTERN.fullmatch(container_dir.name) is None
+    ):
+        raise ReviewError(
+            "legacy review container is outside the source repository review root: "
+            f"{container_dir}"
+        )
+    try:
+        review_root_status = os.lstat(expected_parent)
+        container_status = os.lstat(container_dir)
+    except OSError as error:
+        raise ReviewError("cannot inspect legacy review container layout") from error
+    if (
+        not stat.S_ISDIR(review_root_status.st_mode)
+        or stat.S_ISLNK(review_root_status.st_mode)
+        or review_root_status.st_uid != os.geteuid()
+        or review_root_status.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise ReviewError("legacy review state root is not a private real directory")
+    if (
+        not stat.S_ISDIR(container_status.st_mode)
+        or stat.S_ISLNK(container_status.st_mode)
+        or container_status.st_uid != os.geteuid()
+        or stat.S_IMODE(container_status.st_mode) != 0o700
+    ):
+        raise ReviewError("legacy review container mode must be exactly 0700")
+    expected_workspace = container_dir / "workspace"
+    if review.workspace_root != expected_workspace:
+        raise ReviewError(
+            f"legacy review workspace escapes its container: {review.workspace_root}"
+        )
+    control_dir = expected_workspace / ".codex-review"
+    if review.diff_file != control_dir / "review.diff":
+        raise ReviewError(
+            f"legacy review diff escapes its control directory: {review.diff_file}"
+        )
+    if review.prompt_file != control_dir / "review.prompt":
+        raise ReviewError(
+            f"legacy review prompt escapes its control directory: {review.prompt_file}"
+        )
+    expected_git_dir = container_dir / "review.git"
+    if (review.git_dir or expected_git_dir) != expected_git_dir:
+        raise ReviewError("legacy review Git path escapes its container")
+    if os.path.lexists(expected_git_dir):
+        raise ReviewError(
+            "legacy review state contains an unexpected private Git database"
+        )
+    if (
+        review.content_variant != "head"
+        or review.snapshot_tree_sha
+        or review.scope_identity
+    ):
+        raise ReviewError("legacy review state contains unsupported scope metadata")
 
 
 def _validate_worktree_git_control(review: ReviewWorkspace) -> pathlib.Path:
@@ -7485,9 +7557,23 @@ def prepare_workspace(
             restore_signal_mask(handoff_mask)
 
 
-def cleanup_workspace(review: ReviewWorkspace, *, keep_container: bool) -> str | None:
-    validate_workspace_layout(review)
+def cleanup_workspace(
+    review: ReviewWorkspace,
+    *,
+    keep_container: bool,
+    allow_legacy: bool = False,
+) -> str | None:
+    if allow_legacy:
+        validate_legacy_workspace_layout(review)
+    else:
+        validate_workspace_layout(review)
     try:
+        if allow_legacy:
+            if review.workspace_root.exists():
+                shutil.rmtree(review.workspace_root)
+            if not keep_container and review.container_dir.exists():
+                shutil.rmtree(review.container_dir)
+            return None
         git_dir = review.git_dir or review.container_dir / "review.git"
         if review.workspace_root.exists():
             if git_dir.is_dir():
