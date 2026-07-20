@@ -646,6 +646,27 @@ def _reap_started_process(pid: int) -> None:
     _STARTED_PROCESSES.pop(pid, None)
 
 
+def _observe_runner_terminal_state(
+    state_dir: pathlib.Path,
+    state: dict[str, Any],
+) -> tuple[bool, int | None, int]:
+    pid_value = state.get("pid")
+    pid = pid_value if isinstance(pid_value, int) else 0
+    running = _runner_lock_held(state_dir / LOCK_FILE)
+    if running:
+        return True, None, pid
+    exit_code = _read_exit_code(state_dir)
+    if exit_code is None:
+        exit_code = 1
+        write_text_atomic(state_dir / EXIT_FILE, "1\n")
+        write_text_atomic(
+            state_dir / "runner-error.txt",
+            "review runner exited without recording a terminal result\n",
+        )
+    _reap_started_process(pid)
+    return False, exit_code, pid
+
+
 def start(
     *,
     script_path: pathlib.Path,
@@ -978,23 +999,8 @@ def status(state_dir: pathlib.Path) -> dict[str, Any]:
     redact_values = _freeze_claude_redactions()
     state_dir = state_dir.expanduser().resolve()
     state, review = load_review_state(state_dir)
-    pid_value = state.get("pid")
-    pid = pid_value if isinstance(pid_value, int) else 0
-    process_running = _runner_lock_held(state_dir / LOCK_FILE)
-    running = process_running
-    if running:
-        exit_code = None
-    else:
-        exit_code = _read_exit_code(state_dir)
-        if exit_code is not None:
-            _reap_started_process(pid)
-    if exit_code is None and not running:
-        exit_code = 1
-        write_text_atomic(state_dir / EXIT_FILE, "1\n")
-        write_text_atomic(
-            state_dir / "runner-error.txt",
-            "review runner exited without recording a terminal result\n",
-        )
+    running, exit_code, pid = _observe_runner_terminal_state(state_dir, state)
+    process_running = running
     fallback_workspace_retained = not running and _should_retain_fallback_workspace(
         state_dir=state_dir,
         state=state,
@@ -1162,7 +1168,12 @@ def wait(
 def cleanup(state_dir: pathlib.Path, *, timeout_seconds: float | None) -> int:
     _validate_timeout(timeout_seconds)
     state_dir = state_dir.expanduser().resolve()
-    if status(state_dir)["running"]:
+    # Explicit cleanup is the recovery path for an already-created state. It
+    # neither displays reviewer output nor needs the caller's current Claude
+    # credential carriers, so keep it independent from status redaction setup.
+    state, _review = load_review_state(state_dir)
+    running, _exit_code, _pid = _observe_runner_terminal_state(state_dir, state)
+    if running:
         return 3
     deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
     return _cleanup_terminal_workspace(state_dir, deadline=deadline, force=True)

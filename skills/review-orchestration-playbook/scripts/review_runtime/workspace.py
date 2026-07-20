@@ -19,7 +19,7 @@ import tempfile
 import time
 import uuid
 from collections import Counter, deque
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from typing import Any, BinaryIO, Callable, Iterable, Iterator
 
@@ -237,6 +237,7 @@ MAX_SOURCE_TRACKED_PATH_BYTES = MAX_CHANGED_METADATA_BYTES
 MAX_SOURCE_TRACKED_PATH_RECORDS = MAX_CHANGED_ENTRIES
 MAX_SOURCE_INDEX_METADATA_BYTES = MAX_TREE_METADATA_BYTES
 MAX_SOURCE_INDEX_RECORDS = MAX_SNAPSHOT_ENTRIES
+MAX_SOURCE_INFO_EXCLUDE_BYTES = 1024 * 1024
 MAX_SOURCE_GIT_QUERY_BYTES = 64 * 1024
 MAX_SOURCE_GIT_STDERR_BYTES = 64 * 1024
 SOURCE_GIT_TIMEOUT_SECONDS = 120.0
@@ -561,6 +562,20 @@ class BoundedProcessResult:
     stderr: bytes
 
 
+@dataclass(frozen=True)
+class SourceInspectionGitContext:
+    source_root: pathlib.Path
+    git_dir: pathlib.Path
+    object_directory: pathlib.Path
+    index_file: pathlib.Path
+    head_sha: str
+    excludes_file: str
+
+
+def _temporary_review_file() -> BinaryIO:
+    return tempfile.TemporaryFile(dir=_canonical_review_root_base())
+
+
 def _git_environment(
     *,
     object_directory: pathlib.Path | None = None,
@@ -622,22 +637,15 @@ def _source_git_config_environment(
     return environment, xdg_config_home / "git" / "ignore"
 
 
-def _source_excludes_file(repo: pathlib.Path) -> str:
+def _source_excludes_file(source_root: pathlib.Path) -> str:
     environment, default_path = _source_git_config_environment(_source_git_home())
     command = (
         str(resolve_git()),
         "--no-pager",
-        "-c",
-        "core.fsmonitor=false",
-        "-c",
-        "core.filemode=true",
-        "-c",
-        f"core.hooksPath={os.devnull}",
-        "-c",
-        "diff.external=",
         "-C",
-        str(repo),
+        str(source_root),
         "config",
+        "--global",
         "--includes",
         "--null",
         "--path",
@@ -671,6 +679,8 @@ def _git(repo: pathlib.Path, *args: str, check: bool = True):
     command = (
         str(resolve_git()),
         "--no-pager",
+        "-c",
+        "core.commitGraph=false",
         "-c",
         "core.fsmonitor=false",
         "-c",
@@ -724,7 +734,7 @@ def _stop_source_git_process(process: subprocess.Popen[bytes]) -> None:
 
 
 def _bounded_source_git_output(
-    repo: pathlib.Path,
+    context: SourceInspectionGitContext,
     *args: str,
     byte_limit: int,
     record_limit: int,
@@ -736,6 +746,8 @@ def _bounded_source_git_output(
         str(resolve_git()),
         "--no-pager",
         "-c",
+        "core.commitGraph=false",
+        "-c",
         "core.fsmonitor=false",
         "-c",
         "core.filemode=true",
@@ -744,13 +756,16 @@ def _bounded_source_git_output(
         "-c",
         "diff.external=",
         *config_args,
-        "-C",
-        str(repo),
+        f"--git-dir={context.git_dir}",
+        f"--work-tree={context.source_root}",
         *args,
     )
     process = subprocess.Popen(
         command,
-        env=_git_environment(),
+        env=_git_environment(
+            object_directory=context.object_directory,
+            index_file=context.index_file,
+        ),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -767,7 +782,7 @@ def _bounded_source_git_output(
     try:
         selector.register(process.stdout, selectors.EVENT_READ, "stdout")
         selector.register(process.stderr, selectors.EVENT_READ, "stderr")
-        with tempfile.TemporaryFile() as output:
+        with _temporary_review_file() as output:
             while selector.get_map():
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -926,6 +941,120 @@ def _run_bounded_process_to_file(
         _close_pipe(process.stderr)
 
 
+def _source_git_path(
+    source_root: pathlib.Path,
+    relative: str,
+    *,
+    label: str,
+) -> pathlib.Path:
+    result = _git(
+        source_root,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        relative,
+    )
+    raw_path = result.stdout
+    if not raw_path.endswith(b"\n") or b"\n" in raw_path[:-1] or b"\0" in raw_path:
+        raise ReviewError(f"source Git {label} path is malformed")
+    path = pathlib.Path(os.fsdecode(raw_path[:-1]))
+    if not path.is_absolute():
+        raise ReviewError(f"source Git {label} path is not absolute")
+    return path
+
+
+def _read_source_info_exclude(path: pathlib.Path) -> bytes:
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return b""
+    except OSError as error:
+        raise ReviewError("cannot inspect source Git info/exclude") from error
+    with _secure_file_reader(
+        path,
+        label="source Git info/exclude",
+        max_bytes=MAX_SOURCE_INFO_EXCLUDE_BYTES,
+    ) as (handle, _metadata):
+        return handle.read(MAX_SOURCE_INFO_EXCLUDE_BYTES + 1)
+
+
+def _create_source_inspection_git_context(
+    *,
+    source_root: pathlib.Path,
+    head_sha: str,
+    container: pathlib.Path,
+) -> SourceInspectionGitContext:
+    if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", head_sha) is None:
+        raise ReviewError("source inspection HEAD is malformed")
+    object_directory = _source_git_path(
+        source_root,
+        "objects",
+        label="object directory",
+    ).resolve()
+    if not object_directory.is_dir():
+        raise ReviewError(
+            f"source Git object directory does not exist: {object_directory}"
+        )
+    index_file = _source_git_path(source_root, "index", label="index")
+    try:
+        index_status = os.lstat(index_file)
+    except FileNotFoundError:
+        index_status = None
+    except OSError as error:
+        raise ReviewError("cannot inspect the source Git index") from error
+    if index_status is not None and (
+        not stat.S_ISREG(index_status.st_mode) or index_status.st_uid != os.getuid()
+    ):
+        raise ReviewError("source Git index must be a current-user regular file")
+    info_exclude = _read_source_info_exclude(
+        _source_git_path(source_root, "info/exclude", label="info/exclude")
+    )
+
+    git_dir = container / "source-inspection.git"
+    git_dir.mkdir(mode=0o700)
+    for name in ("info", "objects", "refs"):
+        (git_dir / name).mkdir(mode=0o700)
+    write_text_atomic(git_dir / "HEAD", f"{head_sha}\n")
+    format_version = 1 if len(head_sha) == 64 else 0
+    config = (
+        "[core]\n"
+        f"\trepositoryformatversion = {format_version}\n"
+        "\tbare = false\n"
+        "\tlogAllRefUpdates = false\n"
+    )
+    if len(head_sha) == 64:
+        config += "[extensions]\n\tobjectFormat = sha256\n"
+    write_text_atomic(git_dir / "config", config)
+    exclude_destination = git_dir / "info" / "exclude"
+    exclude_destination.write_bytes(info_exclude)
+    exclude_destination.chmod(0o600)
+    return SourceInspectionGitContext(
+        source_root=source_root,
+        git_dir=git_dir,
+        object_directory=object_directory,
+        index_file=index_file,
+        head_sha=head_sha,
+        excludes_file=_source_excludes_file(source_root),
+    )
+
+
+@contextmanager
+def _temporary_source_inspection_git_context(
+    *,
+    source_root: pathlib.Path,
+    head_sha: str,
+) -> Iterator[SourceInspectionGitContext]:
+    with tempfile.TemporaryDirectory(
+        prefix="isolated-review-source-git-",
+        dir=_canonical_review_root_base(),
+    ) as raw:
+        yield _create_source_inspection_git_context(
+            source_root=source_root,
+            head_sha=head_sha,
+            container=pathlib.Path(raw),
+        )
+
+
 def _create_sanitized_git_view(
     *,
     source_root: pathlib.Path,
@@ -960,7 +1089,10 @@ def _temporary_sanitized_git_view(
     *,
     source_root: pathlib.Path,
 ) -> Iterator[tuple[pathlib.Path, pathlib.Path]]:
-    with tempfile.TemporaryDirectory(prefix="isolated-review-git-view-") as raw:
+    with tempfile.TemporaryDirectory(
+        prefix="isolated-review-git-view-",
+        dir=_canonical_review_root_base(),
+    ) as raw:
         yield _create_sanitized_git_view(
             source_root=source_root,
             container=pathlib.Path(raw),
@@ -1059,7 +1191,7 @@ def _run_bounded_git_capture(
     timeout_label: str = "private Git",
     environment: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
-    with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as input_file:
+    with _temporary_review_file() as output, _temporary_review_file() as input_file:
         if input_bytes is not None and input_handle is not None:
             raise ReviewError(
                 "bounded Git input must use bytes or one handle, not both"
@@ -1101,7 +1233,7 @@ def _copy_review_objects(
     base_sha: str,
     head_sha: str,
 ) -> None:
-    with tempfile.TemporaryFile() as object_ids:
+    with _temporary_review_file() as object_ids:
         copied = 0
         for revisions in ((f"{base_sha}^{{tree}}",), (f"{head_sha}^{{tree}}",)):
             copied += _run_bounded_process_to_file(
@@ -1126,7 +1258,7 @@ def _copy_review_objects(
             object_ids=object_ids,
         )
         object_ids.seek(0)
-        with tempfile.TemporaryFile() as pack_file:
+        with _temporary_review_file() as pack_file:
             _run_bounded_process_to_file(
                 _frozen_command(
                     git_view=git_view,
@@ -1145,7 +1277,7 @@ def _copy_review_objects(
                 byte_limit=MAX_PRIVATE_PACK_BYTES,
             )
             pack_file.seek(0)
-            with tempfile.TemporaryFile() as index_output:
+            with _temporary_review_file() as index_output:
                 _run_bounded_process_to_file(
                     _private_git_command(
                         git_dir=git_dir,
@@ -1171,7 +1303,7 @@ def _validate_private_object_sizes(
 ) -> None:
     object_ids.flush()
     object_ids.seek(0)
-    with tempfile.TemporaryFile() as metadata:
+    with _temporary_review_file() as metadata:
         _run_bounded_process_to_file(
             _frozen_command(
                 git_view=git_view,
@@ -1231,7 +1363,7 @@ def _scan_endpoint_commit_metadata(
     if any(item.kind != "legacy" for item in legacy):
         raise ReviewError("endpoint metadata legacy values are invalid")
     for revision in sorted({base_sha, head_sha}):
-        with tempfile.TemporaryFile() as content:
+        with _temporary_review_file() as content:
             size = _run_bounded_process_to_file(
                 _frozen_command(
                     git_view=git_view,
@@ -1471,7 +1603,7 @@ def _create_private_review_repository(
         init_args.append("--object-format=sha256")
     init_args.append(str(git_dir))
     try:
-        with tempfile.TemporaryFile() as init_output:
+        with _temporary_review_file() as init_output:
             _run_bounded_process_to_file(
                 tuple(init_args),
                 environment=_git_environment(),
@@ -1718,7 +1850,7 @@ def _commit_uses_reserved_control_path(
     commit: str,
     label: str,
 ) -> bool:
-    with tempfile.TemporaryFile() as output:
+    with _temporary_review_file() as output:
         _run_bounded_process_to_file(
             _frozen_command(
                 git_view=git_view,
@@ -2169,7 +2301,7 @@ def _reject_legacy_values_in_frozen_tree_paths(
     matcher = _legacy_path_matcher(legacy_values)
     if len(matcher.transitions) == 1:
         return
-    with tempfile.TemporaryFile() as output:
+    with _temporary_review_file() as output:
         _run_bounded_process_to_file(
             _frozen_command(
                 git_view=git_view,
@@ -2462,9 +2594,9 @@ def _materialize_frozen_tree(
     else:
         workspace_root.mkdir()
     with (
-        tempfile.TemporaryFile() as tree_metadata,
-        tempfile.TemporaryFile() as batch_input,
-        tempfile.TemporaryFile() as batch_output,
+        _temporary_review_file() as tree_metadata,
+        _temporary_review_file() as batch_input,
+        _temporary_review_file() as batch_output,
     ):
         _run_bounded_process_to_file(
             _frozen_command(
@@ -2848,9 +2980,9 @@ def _scan_frozen_tree_values(
     occurrence_budget = LegacyOccurrenceBudget.default()
     result = SecretScanResult.empty()
     with (
-        tempfile.TemporaryFile() as tree_metadata,
-        tempfile.TemporaryFile() as batch_input,
-        tempfile.TemporaryFile() as batch_output,
+        _temporary_review_file() as tree_metadata,
+        _temporary_review_file() as batch_input,
+        _temporary_review_file() as batch_output,
     ):
         _run_bounded_process_to_file(
             _frozen_command(
@@ -3111,10 +3243,10 @@ def _scan_source_head_wip_delta(
     accepted = tuple(accepted_values)
     raw_occurrences = tuple(raw_occurrence_values)
     with (
-        tempfile.TemporaryFile() as changed_paths,
-        tempfile.TemporaryFile() as raw_output,
-        tempfile.TemporaryFile() as batch_input,
-        tempfile.TemporaryFile() as batch_output,
+        _temporary_review_file() as changed_paths,
+        _temporary_review_file() as raw_output,
+        _temporary_review_file() as batch_input,
+        _temporary_review_file() as batch_output,
     ):
         _write_limited_diff_metadata(
             git_view=git_view,
@@ -3212,9 +3344,9 @@ def _write_changed_blob_findings(
     event_budget = SecretScanBudget.default()
     accepted_evidence: Counter[tuple[AcceptedSyntheticValue, str, str]] = Counter()
     with (
-        tempfile.TemporaryFile() as raw_output,
-        tempfile.TemporaryFile() as batch_input,
-        tempfile.TemporaryFile() as batch_output,
+        _temporary_review_file() as raw_output,
+        _temporary_review_file() as batch_input,
+        _temporary_review_file() as batch_output,
         _open_new_private_binary(destination) as findings_output,
     ):
         _write_limited_diff_metadata(
@@ -3708,7 +3840,7 @@ def _validate_canonical_worktree_index(
     git_dir: pathlib.Path,
     worktree_admin: pathlib.Path,
 ) -> None:
-    with tempfile.TemporaryDirectory() as temporary:
+    with tempfile.TemporaryDirectory(dir=_canonical_review_root_base()) as temporary:
         canonical_index = pathlib.Path(temporary) / "index"
         _populate_canonical_worktree_index(
             git_dir=git_dir,
@@ -3740,7 +3872,7 @@ def _populate_canonical_worktree_index(
     index_file: pathlib.Path,
 ) -> None:
     environment = _git_environment(index_file=index_file)
-    with tempfile.TemporaryFile() as output:
+    with _temporary_review_file() as output:
         _run_bounded_process_to_file(
             _private_git_command(
                 git_dir=git_dir,
@@ -3963,7 +4095,7 @@ def _private_object_id_set(
     label: str,
     object_id_length: int,
 ) -> set[str]:
-    with tempfile.TemporaryFile() as output:
+    with _temporary_review_file() as output:
         size = _run_bounded_process_to_file(
             _private_git_command(git_dir=git_dir, args=args),
             environment=_git_environment(),
@@ -4021,7 +4153,7 @@ def _validate_private_review_integrity(
         git_dir,
         object_id_length=object_id_length,
     )
-    with tempfile.TemporaryFile() as fsck_output:
+    with _temporary_review_file() as fsck_output:
         _run_bounded_process_to_file(
             _private_git_command(
                 git_dir=git_dir,
@@ -6831,27 +6963,28 @@ def _validate_prompt_size(prompt: str) -> None:
         )
 
 
-def _source_status(repo: pathlib.Path) -> bytes:
-    _reject_hidden_index_entries(repo)
-    excludes_file = _source_excludes_file(repo)
+def _source_status(context: SourceInspectionGitContext) -> bytes:
+    _reject_hidden_index_entries(context)
+    _reject_source_head_gitlinks(context)
     return _bounded_source_git_output(
-        repo,
+        context,
         "status",
         "--porcelain=v2",
         "-z",
         "--untracked-files=all",
-        "--ignore-submodules=none",
+        "--ignore-submodules=all",
         byte_limit=MAX_SOURCE_STATUS_BYTES,
         record_limit=MAX_SOURCE_STATUS_RECORDS,
         label="source WIP status metadata",
-        config_overrides=(f"core.excludesFile={excludes_file}",),
+        config_overrides=(f"core.excludesFile={context.excludes_file}",),
     )
 
 
-def _reject_hidden_index_entries(repo: pathlib.Path) -> None:
+def _reject_hidden_index_entries(context: SourceInspectionGitContext) -> None:
     value = _bounded_source_git_output(
-        repo,
+        context,
         "ls-files",
+        "--stage",
         "-v",
         "-z",
         "--cached",
@@ -6871,10 +7004,46 @@ def _reject_hidden_index_entries(repo: pathlib.Path) -> None:
                 "source index contains assume-unchanged or skip-worktree entries; "
                 "clear hidden index flags before preparing a review"
             )
+        metadata, separator, _raw_path = record[2:].partition(b"\t")
+        fields = metadata.split(b" ")
+        if not separator or len(fields) != 3:
+            raise ReviewError("source index-flag metadata is malformed")
+        if fields[0] == b"160000":
+            raise ReviewError(
+                "source index contains a gitlink; submodule source inspection is "
+                "not supported"
+            )
 
 
-def _require_clean_source(repo: pathlib.Path) -> None:
-    if _source_status(repo):
+def _reject_source_head_gitlinks(context: SourceInspectionGitContext) -> None:
+    value = _bounded_source_git_output(
+        context,
+        "ls-tree",
+        "-r",
+        "-z",
+        "--full-tree",
+        context.head_sha,
+        "--",
+        byte_limit=MAX_SOURCE_INDEX_METADATA_BYTES,
+        record_limit=MAX_SOURCE_INDEX_RECORDS,
+        label="source HEAD tree metadata",
+    )
+    if value and not value.endswith(b"\0"):
+        raise ReviewError("unterminated source HEAD tree metadata")
+    for record in value.split(b"\0")[:-1]:
+        metadata, separator, _raw_path = record.partition(b"\t")
+        fields = metadata.split(b" ")
+        if not separator or len(fields) != 3:
+            raise ReviewError("source HEAD tree metadata is malformed")
+        if fields[0] == b"160000":
+            raise ReviewError(
+                "source HEAD tree contains a gitlink; submodule source inspection "
+                "is not supported"
+            )
+
+
+def _require_clean_source(context: SourceInspectionGitContext) -> None:
+    if _source_status(context):
         raise ReviewError(
             "source repository has staged, unstaged, or nonignored untracked "
             "changes; commit or clean them, or explicitly use --include-source-wip"
@@ -6958,13 +7127,13 @@ def _initial_untracked_wip_paths(
 
 
 def _source_wip_paths(
-    repo: pathlib.Path,
-    head_sha: str,
+    context: SourceInspectionGitContext,
     initial_status: bytes,
 ) -> tuple[set[pathlib.PurePosixPath], set[pathlib.PurePosixPath]]:
-    _reject_hidden_index_entries(repo)
+    _reject_hidden_index_entries(context)
+    _reject_source_head_gitlinks(context)
     tracked = _bounded_source_git_output(
-        repo,
+        context,
         "diff",
         "--name-only",
         "-z",
@@ -6972,7 +7141,7 @@ def _source_wip_paths(
         "--no-ext-diff",
         "--no-textconv",
         "--ignore-submodules=none",
-        head_sha,
+        context.head_sha,
         "--",
         byte_limit=MAX_SOURCE_TRACKED_PATH_BYTES,
         record_limit=MAX_SOURCE_TRACKED_PATH_RECORDS,
@@ -6980,7 +7149,7 @@ def _source_wip_paths(
     )
     tracked_paths = _nul_path_set(tracked, label="source WIP tracked paths")
     deleted = _bounded_source_git_output(
-        repo,
+        context,
         "diff",
         "--name-only",
         "-z",
@@ -6989,7 +7158,7 @@ def _source_wip_paths(
         "--no-ext-diff",
         "--no-textconv",
         "--ignore-submodules=none",
-        head_sha,
+        context.head_sha,
         "--",
         byte_limit=MAX_SOURCE_TRACKED_PATH_BYTES,
         record_limit=MAX_SOURCE_TRACKED_PATH_RECORDS,
@@ -7194,7 +7363,7 @@ def _import_source_wip_blobs(
     object_id_length = {"sha1": 40, "sha256": 64}[object_format]
     sorted_entries = sorted(entries.items(), key=lambda item: item[0].as_posix())
     expected_ids: list[str] = []
-    with tempfile.TemporaryFile() as stream:
+    with _temporary_review_file() as stream:
         stream.write(b"feature get-mark\n")
         for mark, (_relative, (_mode, data)) in enumerate(sorted_entries, start=1):
             digest = hashlib.new(object_format)
@@ -7259,7 +7428,7 @@ def _apply_source_wip_index_overlay(
     if object_id_length is None:
         raise ReviewError(f"unsupported Git object format: {object_format!r}")
     zero_object_id = b"0" * object_id_length
-    with tempfile.TemporaryFile() as index_info:
+    with _temporary_review_file() as index_info:
         for relative in sorted(
             paths,
             key=lambda item: (len(item.parts), item.as_posix()),
@@ -7292,6 +7461,7 @@ def _apply_source_wip_index_overlay(
 
 def _overlay_source_wip(
     *,
+    source_inspection: SourceInspectionGitContext,
     source_root: pathlib.Path,
     workspace_root: pathlib.Path,
     head_sha: str,
@@ -7334,7 +7504,7 @@ def _overlay_source_wip(
             )
         if rechecked is not None:
             recheck_remaining_bytes -= len(rechecked[1])
-    final_status = _source_status(source_root)
+    final_status = _source_status(source_inspection)
     if final_status != initial_status:
         raise ReviewError("source WIP changed while the review snapshot was prepared")
     return snapshot_tree_sha
@@ -7413,7 +7583,7 @@ def _verify_materialized_snapshot(
     expected_paths: set[pathlib.PurePosixPath] = set()
     expected_directories: set[pathlib.PurePosixPath] = set()
     byte_budget = MAX_SNAPSHOT_BYTES
-    with tempfile.TemporaryFile() as metadata:
+    with _temporary_review_file() as metadata:
         _run_bounded_process_to_file(
             _frozen_command(
                 git_view=git_view,
@@ -7688,49 +7858,62 @@ def prepare_workspace(
             base_sha=base_sha,
             head_sha=head_sha,
         )
-    if include_source_wip:
-        if resolve_commit(source_root, "HEAD", label="source HEAD") != head_sha:
-            raise ReviewError(
-                "--include-source-wip requires --head-ref to resolve to source HEAD"
+    source_head_sha = resolve_commit(source_root, "HEAD", label="source HEAD")
+    source_inspection_stack = ExitStack()
+    try:
+        source_inspection = source_inspection_stack.enter_context(
+            _temporary_source_inspection_git_context(
+                source_root=source_root,
+                head_sha=source_head_sha,
             )
-        source_status = _source_status(source_root)
-        _parse_wip_status(source_status)
-        source_wip_paths, source_wip_capture_paths = _source_wip_paths(
-            source_root,
-            head_sha,
-            source_status,
         )
-        source_wip_entries = _capture_source_wip_entries(
-            source_root=source_root,
-            paths=source_wip_capture_paths,
+        if include_source_wip:
+            if source_head_sha != head_sha:
+                raise ReviewError(
+                    "--include-source-wip requires --head-ref to resolve to source HEAD"
+                )
+            source_status = _source_status(source_inspection)
+            _parse_wip_status(source_status)
+            source_wip_paths, source_wip_capture_paths = _source_wip_paths(
+                source_inspection,
+                source_status,
+            )
+            source_wip_entries = _capture_source_wip_entries(
+                source_root=source_root,
+                paths=source_wip_capture_paths,
+            )
+            if resolve_commit(source_root, "HEAD", label="source WIP HEAD") != head_sha:
+                raise ReviewError(
+                    "source HEAD changed while the WIP snapshot was captured"
+                )
+            if _source_status(source_inspection) != source_status:
+                raise ReviewError("source WIP changed while its content was captured")
+        else:
+            _require_clean_source(source_inspection)
+            source_status = b""
+            source_wip_paths = set()
+            source_wip_capture_paths = set()
+            source_wip_entries = {}
+        catalog = load_catalog()
+        validate_authoring_catalog_scanner_contract(catalog)
+        selected_exemptions = resolve_legacy_exemptions(
+            catalog,
+            synthetic_secret_exemptions,
         )
-        if resolve_commit(source_root, "HEAD", label="source WIP HEAD") != head_sha:
-            raise ReviewError("source HEAD changed while the WIP snapshot was captured")
-        if _source_status(source_root) != source_status:
-            raise ReviewError("source WIP changed while its content was captured")
-    else:
-        _require_clean_source(source_root)
-        source_status = b""
-        source_wip_paths = set()
-        source_wip_capture_paths = set()
-        source_wip_entries = {}
-    catalog = load_catalog()
-    validate_authoring_catalog_scanner_contract(catalog)
-    selected_exemptions = resolve_legacy_exemptions(
-        catalog,
-        synthetic_secret_exemptions,
-    )
-    authoring_values = accepted_authoring_values(catalog)
-    accepted_values = authoring_values + accepted_legacy_values(
-        catalog, selected_exemptions
-    )
-    catalog_legacy_values = accepted_legacy_values(
-        catalog,
-        catalog.legacy_exemptions,
-    )
-    catalog_legacy_value_matcher = _legacy_path_matcher(catalog_legacy_values)
-    evidence_sensitive_values = _all_catalog_sensitive_values(catalog)
-    container, handoff_mask = _new_container(source_root)
+        authoring_values = accepted_authoring_values(catalog)
+        accepted_values = authoring_values + accepted_legacy_values(
+            catalog, selected_exemptions
+        )
+        catalog_legacy_values = accepted_legacy_values(
+            catalog,
+            catalog.legacy_exemptions,
+        )
+        catalog_legacy_value_matcher = _legacy_path_matcher(catalog_legacy_values)
+        evidence_sensitive_values = _all_catalog_sensitive_values(catalog)
+        container, handoff_mask = _new_container(source_root)
+    except BaseException:
+        source_inspection_stack.close()
+        raise
     ownership_transferred = False
 
     try:
@@ -7790,6 +7973,7 @@ def prepare_workspace(
         _run_worktree_git(workspace_root, "read-tree", "--reset", head_sha)
         if include_source_wip:
             snapshot_tree_sha = _overlay_source_wip(
+                source_inspection=source_inspection,
                 source_root=source_root,
                 workspace_root=workspace_root,
                 head_sha=head_sha,
@@ -8005,8 +8189,11 @@ def prepare_workspace(
             ) from error
         raise
     finally:
-        if handoff_mask is not None:
-            restore_signal_mask(handoff_mask)
+        try:
+            if handoff_mask is not None:
+                restore_signal_mask(handoff_mask)
+        finally:
+            source_inspection_stack.close()
 
 
 def cleanup_workspace(

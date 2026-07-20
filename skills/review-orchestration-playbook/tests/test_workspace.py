@@ -515,6 +515,20 @@ class WorkspaceTest(unittest.TestCase):
         cleanup_workspace(review, keep_container=False)
         self.assertFalse(review.container_dir.exists())
 
+    def test_clean_source_inspection_uses_source_head_for_arbitrary_range(self) -> None:
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.base,
+        )
+        self.reviews.append(review)
+
+        self.assertEqual(review.head_ref, self.base)
+        self.assertEqual(
+            (review.workspace_root / "example.txt").read_text(encoding="utf-8"),
+            "one\n",
+        )
+
     def test_review_root_is_exact_stable_and_source_specific(self) -> None:
         canonical_source = self.repo.resolve(strict=True)
         digest = hashlib.sha256(os.fsencode(str(canonical_source))).hexdigest()
@@ -617,6 +631,240 @@ class WorkspaceTest(unittest.TestCase):
             "+staged-only",
             review.diff_file.read_text(encoding="utf-8"),
         )
+
+    def test_clean_and_wip_source_inspection_never_executes_local_filters(
+        self,
+    ) -> None:
+        source_file = self.repo / "example.txt"
+        committed_content = source_file.read_text(encoding="utf-8")
+        for filter_kind in ("clean", "process"):
+            marker = pathlib.Path(self.temporary.name) / f"{filter_kind}-ran"
+            filter_script = pathlib.Path(self.temporary.name) / f"{filter_kind}.sh"
+            filter_script.write_text(
+                f"#!/bin/sh\ntouch '{marker}'\n"
+                + ("cat\n" if filter_kind == "clean" else "exit 1\n"),
+                encoding="utf-8",
+            )
+            filter_script.chmod(0o755)
+            git(
+                self.repo,
+                "config",
+                f"filter.evil.{filter_kind}",
+                str(filter_script),
+            )
+            git(self.repo, "config", "filter.evil.required", "true")
+            try:
+                for include_source_wip in (False, True):
+                    with self.subTest(
+                        filter_kind=filter_kind,
+                        include_source_wip=include_source_wip,
+                    ):
+                        marker.unlink(missing_ok=True)
+                        source_file.write_text(
+                            (
+                                "source WIP content\n"
+                                if include_source_wip
+                                else committed_content
+                            ),
+                            encoding="utf-8",
+                        )
+                        if not include_source_wip:
+                            source_status = source_file.stat()
+                            os.utime(
+                                source_file,
+                                ns=(
+                                    source_status.st_atime_ns,
+                                    source_status.st_mtime_ns + 2_000_000_000,
+                                ),
+                            )
+                        review = prepare_workspace(
+                            repo=self.repo,
+                            base_ref=self.base,
+                            head_ref=self.head,
+                            include_source_wip=include_source_wip,
+                        )
+                        self.reviews.append(review)
+                        self.assertFalse(marker.exists())
+                        expected = (
+                            "source WIP content\n"
+                            if include_source_wip
+                            else committed_content
+                        )
+                        self.assertEqual(
+                            (review.workspace_root / "example.txt").read_text(
+                                encoding="utf-8"
+                            ),
+                            expected,
+                        )
+            finally:
+                source_file.write_text(committed_content, encoding="utf-8")
+                git(self.repo, "config", "--unset-all", f"filter.evil.{filter_kind}")
+                git(self.repo, "config", "--unset-all", "filter.evil.required")
+
+    def test_source_inspection_ignores_caller_tmpdir_inside_source(self) -> None:
+        original_temporary_file = tempfile.TemporaryFile
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"TMPDIR": str(self.repo)},
+            ),
+            mock.patch.object(workspace_runtime.tempfile, "tempdir", str(self.repo)),
+            mock.patch.object(
+                workspace_runtime.tempfile,
+                "TemporaryFile",
+                wraps=original_temporary_file,
+            ) as temporary_files,
+        ):
+            clean_review = prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+            self.reviews.append(clean_review)
+
+            (self.repo / "example.txt").write_text(
+                "source WIP outside caller TMPDIR\n",
+                encoding="utf-8",
+            )
+            wip_review = prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+                include_source_wip=True,
+            )
+            self.reviews.append(wip_review)
+
+        canonical_root = workspace_runtime._canonical_review_root_base()
+        self.assertGreater(temporary_files.call_count, 0)
+        for call in temporary_files.call_args_list:
+            self.assertEqual(call.kwargs.get("dir"), canonical_root)
+        self.assertEqual(
+            (wip_review.workspace_root / "example.txt").read_text(encoding="utf-8"),
+            "source WIP outside caller TMPDIR\n",
+        )
+        self.assertEqual(
+            list(self.repo.glob("isolated-review-source-git-*")),
+            [],
+        )
+        self.assertEqual(
+            list(self.repo.glob("isolated-review-git-view-*")),
+            [],
+        )
+
+    def test_source_inspection_disables_commit_graph_for_every_query(self) -> None:
+        original_popen = subprocess.Popen
+        with (
+            workspace_runtime._temporary_source_inspection_git_context(
+                source_root=self.repo,
+                head_sha=self.head,
+            ) as source_inspection,
+            mock.patch.object(
+                workspace_runtime.subprocess,
+                "Popen",
+                wraps=original_popen,
+            ) as launched,
+        ):
+            status_bytes = workspace_runtime._source_status(source_inspection)
+            workspace_runtime._source_wip_paths(source_inspection, status_bytes)
+
+        source_commands = [
+            call.args[0]
+            for call in launched.call_args_list
+            if any(
+                str(argument).startswith("--work-tree=") for argument in call.args[0]
+            )
+        ]
+        self.assertGreaterEqual(len(source_commands), 5)
+        for command in source_commands:
+            self.assertIn("core.commitGraph=false", command)
+
+    def test_clean_and_wip_respect_source_info_exclude(self) -> None:
+        raw_info_exclude = pathlib.Path(
+            git(self.repo, "rev-parse", "--git-path", "info/exclude")
+        )
+        info_exclude = (
+            raw_info_exclude
+            if raw_info_exclude.is_absolute()
+            else self.repo / raw_info_exclude
+        )
+        ignored_name = "source-info-ignored.txt"
+        visible_name = "source-info-visible.txt"
+        info_exclude.write_text(f"/{ignored_name}\n", encoding="utf-8")
+        (self.repo / ignored_name).write_text("ignored\n", encoding="utf-8")
+
+        clean_review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(clean_review)
+        self.assertFalse((clean_review.workspace_root / ignored_name).exists())
+
+        (self.repo / visible_name).write_text("visible WIP\n", encoding="utf-8")
+        wip_review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+            include_source_wip=True,
+        )
+        self.reviews.append(wip_review)
+        self.assertFalse((wip_review.workspace_root / ignored_name).exists())
+        self.assertEqual(
+            (wip_review.workspace_root / visible_name).read_text(encoding="utf-8"),
+            "visible WIP\n",
+        )
+        diff = wip_review.diff_file.read_text(encoding="utf-8")
+        self.assertNotIn(ignored_name, diff)
+        self.assertIn(visible_name, diff)
+
+    def test_wip_source_inspection_uses_linked_worktree_index(self) -> None:
+        linked = pathlib.Path(self.temporary.name) / "linked"
+        git(
+            self.repo,
+            "worktree",
+            "add",
+            "--detach",
+            str(linked),
+            self.head,
+        )
+        linked_review = None
+        try:
+            (linked / "example.txt").write_text("linked staged\n", encoding="utf-8")
+            git(linked, "add", "example.txt")
+            (linked / "example.txt").write_text(
+                "linked staged\nlinked unstaged\n",
+                encoding="utf-8",
+            )
+            (linked / "linked-untracked.txt").write_text(
+                "linked untracked\n",
+                encoding="utf-8",
+            )
+
+            linked_review = prepare_workspace(
+                repo=linked,
+                base_ref=self.base,
+                head_ref=self.head,
+                include_source_wip=True,
+            )
+            self.assertEqual(
+                (linked_review.workspace_root / "example.txt").read_text(
+                    encoding="utf-8"
+                ),
+                "linked staged\nlinked unstaged\n",
+            )
+            self.assertEqual(
+                (linked_review.workspace_root / "linked-untracked.txt").read_text(
+                    encoding="utf-8"
+                ),
+                "linked untracked\n",
+            )
+        finally:
+            review_root = workspace_runtime._review_root_for_source(linked)
+            if linked_review is not None and linked_review.container_dir.exists():
+                cleanup_workspace(linked_review, keep_container=False)
+            git(self.repo, "worktree", "remove", "--force", str(linked))
+            if review_root.exists():
+                review_root.rmdir()
 
     def test_clean_and_wip_respect_user_global_git_ignores(self) -> None:
         configured_home = pathlib.Path(self.temporary.name) / "configured-home"
@@ -1632,7 +1880,7 @@ class WorkspaceTest(unittest.TestCase):
         )
         git(self.repo, "commit", "-m", "Add gitlink fixture")
         head = git(self.repo, "rev-parse", "HEAD")
-        (self.repo / "module").mkdir()
+        git(self.repo, "switch", "--detach", self.head)
 
         review = prepare_workspace(
             repo=self.repo,
@@ -2128,21 +2376,29 @@ class WorkspaceTest(unittest.TestCase):
         fake_git.chmod(0o755)
         stop_process = workspace_runtime._stop_source_git_process
 
-        with (
-            mock.patch.object(workspace_runtime, "resolve_git", return_value=fake_git),
-            mock.patch.object(
-                workspace_runtime,
-                "SOURCE_GIT_TIMEOUT_SECONDS",
-                0.25,
-            ),
-            mock.patch.object(
-                workspace_runtime,
-                "_stop_source_git_process",
-                wraps=stop_process,
-            ) as stopped,
-            self.assertRaisesRegex(ReviewError, "source Git time limit"),
-        ):
-            workspace_runtime._source_status(self.repo)
+        with workspace_runtime._temporary_source_inspection_git_context(
+            source_root=self.repo,
+            head_sha=self.head,
+        ) as source_inspection:
+            with (
+                mock.patch.object(
+                    workspace_runtime,
+                    "resolve_git",
+                    return_value=fake_git,
+                ),
+                mock.patch.object(
+                    workspace_runtime,
+                    "SOURCE_GIT_TIMEOUT_SECONDS",
+                    0.25,
+                ),
+                mock.patch.object(
+                    workspace_runtime,
+                    "_stop_source_git_process",
+                    wraps=stop_process,
+                ) as stopped,
+                self.assertRaisesRegex(ReviewError, "source Git time limit"),
+            ):
+                workspace_runtime._source_status(source_inspection)
 
         stopped.assert_called_once()
         process = stopped.call_args.args[0]
@@ -2262,6 +2518,91 @@ class WorkspaceTest(unittest.TestCase):
                     head_ref=self.head,
                     include_source_wip=include_source_wip,
                 )
+
+    def test_clean_and_wip_reject_committed_gitlink_before_status(
+        self,
+    ) -> None:
+        git(
+            self.repo,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{self.head},nested-submodule",
+        )
+        git(self.repo, "commit", "-m", "Add gitlink")
+        gitlink_head = git(self.repo, "rev-parse", "HEAD")
+
+        source_git_output = workspace_runtime._bounded_source_git_output
+        for include_source_wip in (False, True):
+            with (
+                self.subTest(include_source_wip=include_source_wip),
+                mock.patch.object(
+                    workspace_runtime,
+                    "_bounded_source_git_output",
+                    wraps=source_git_output,
+                ) as inspected,
+                self.assertRaisesRegex(
+                    ReviewError,
+                    "source index contains a gitlink",
+                ),
+            ):
+                prepare_workspace(
+                    repo=self.repo,
+                    base_ref=self.head,
+                    head_ref=gitlink_head,
+                    include_source_wip=include_source_wip,
+                )
+            self.assertEqual(inspected.call_count, 1)
+            self.assertEqual(inspected.call_args.args[1], "ls-files")
+
+    def test_clean_and_wip_reject_head_gitlink_after_staged_replacement(
+        self,
+    ) -> None:
+        git(
+            self.repo,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{self.head},nested-submodule",
+        )
+        git(self.repo, "commit", "-m", "Add gitlink")
+        gitlink_head = git(self.repo, "rev-parse", "HEAD")
+
+        def assert_rejected_before_status() -> None:
+            source_git_output = workspace_runtime._bounded_source_git_output
+            for include_source_wip in (False, True):
+                with (
+                    self.subTest(include_source_wip=include_source_wip),
+                    mock.patch.object(
+                        workspace_runtime,
+                        "_bounded_source_git_output",
+                        wraps=source_git_output,
+                    ) as inspected,
+                    self.assertRaisesRegex(
+                        ReviewError,
+                        "source HEAD tree contains a gitlink",
+                    ),
+                ):
+                    prepare_workspace(
+                        repo=self.repo,
+                        base_ref=self.head,
+                        head_ref=gitlink_head,
+                        include_source_wip=include_source_wip,
+                    )
+                self.assertEqual(
+                    [call.args[1] for call in inspected.call_args_list],
+                    ["ls-files", "ls-tree"],
+                )
+
+        git(self.repo, "update-index", "--force-remove", "nested-submodule")
+        assert_rejected_before_status()
+
+        (self.repo / "nested-submodule").write_text(
+            "replace gitlink with a regular file\n",
+            encoding="utf-8",
+        )
+        git(self.repo, "add", "nested-submodule")
+        assert_rejected_before_status()
 
     def test_core_filemode_false_cannot_hide_mode_only_wip(self) -> None:
         git(self.repo, "config", "core.filemode", "false")

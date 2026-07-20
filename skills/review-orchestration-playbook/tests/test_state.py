@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import pathlib
@@ -226,6 +227,123 @@ class StatefulLifecycleTest(unittest.TestCase):
             state._freeze_claude_redactions(
                 {"HTTPS_PROXY": "http://reviewer:short@proxy.example.invalid"}
             )
+
+    def test_cleanup_does_not_depend_on_current_proxy_redactions(self) -> None:
+        self.write_completed_state()
+        environment = {"HTTPS_PROXY": "http://reviewer:short@proxy.example.invalid"}
+
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertRaisesRegex(
+                ReviewError,
+                "too short for safe output redaction",
+            ):
+                state.status(self.review.container_dir)
+            self.assertEqual(
+                state.cleanup(self.review.container_dir, timeout_seconds=None),
+                0,
+            )
+
+        self.assertFalse(self.review.workspace_root.exists())
+        self.assertFalse(self.review.git_dir.exists())
+
+    def test_cleanup_checks_runner_lock_before_current_proxy_redactions(self) -> None:
+        self.write_completed_state()
+        runner_lock_path = self.review.container_dir / state.LOCK_FILE
+        runner_lock_path.write_bytes(b"")
+
+        with runner_lock_path.open("r+b") as runner_lock:
+            fcntl.flock(runner_lock.fileno(), fcntl.LOCK_EX)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "HTTPS_PROXY": (
+                        "http://reviewer:proxy%ZZsecret@proxy.example.invalid"
+                    )
+                },
+                clear=True,
+            ):
+                self.assertEqual(
+                    state.cleanup(self.review.container_dir, timeout_seconds=None),
+                    3,
+                )
+
+        self.assertTrue(self.review.workspace_root.is_dir())
+        self.assertTrue(self.review.git_dir.is_dir())
+
+    def test_cleanup_normalizes_missing_runner_exit_without_proxy_redactions(
+        self,
+    ) -> None:
+        self.write_completed_state()
+        (self.review.container_dir / state.EXIT_FILE).unlink()
+        (self.review.container_dir / "runner-error.txt").unlink(missing_ok=True)
+
+        with mock.patch.dict(
+            os.environ,
+            {"HTTPS_PROXY": "http://reviewer:short@proxy.example.invalid"},
+            clear=True,
+        ):
+            self.assertEqual(
+                state.cleanup(self.review.container_dir, timeout_seconds=None),
+                0,
+            )
+
+        self.assertEqual(
+            (self.review.container_dir / state.EXIT_FILE).read_text(encoding="utf-8"),
+            "1\n",
+        )
+        self.assertEqual(
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+            "review runner exited without recording a terminal result\n",
+        )
+        self.assertFalse(self.review.workspace_root.exists())
+        self.assertFalse(self.review.git_dir.exists())
+
+    def test_cleanup_rejects_invalid_runner_exit_without_proxy_redactions(
+        self,
+    ) -> None:
+        self.write_completed_state()
+        (self.review.container_dir / state.EXIT_FILE).write_text(
+            "not-an-exit-code\n",
+            encoding="utf-8",
+        )
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"HTTPS_PROXY": "http://reviewer:short@proxy.example.invalid"},
+                clear=True,
+            ),
+            self.assertRaisesRegex(ReviewError, "invalid exit code"),
+        ):
+            state.cleanup(self.review.container_dir, timeout_seconds=None)
+
+        self.assertTrue(self.review.workspace_root.is_dir())
+        self.assertTrue(self.review.git_dir.is_dir())
+
+    def test_cleanup_reaps_a_finished_started_process(self) -> None:
+        self.write_completed_state()
+        process = subprocess.Popen(
+            ("/usr/bin/true",),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        process.wait(timeout=5)
+        current = state.load_state(self.review.container_dir)
+        current["pid"] = process.pid
+        write_json(self.review.container_dir / state.STATE_FILE, current)
+        state._STARTED_PROCESSES[process.pid] = process
+        try:
+            self.assertEqual(
+                state.cleanup(self.review.container_dir, timeout_seconds=None),
+                0,
+            )
+            self.assertNotIn(process.pid, state._STARTED_PROCESSES)
+        finally:
+            process.wait(timeout=5)
+            state._STARTED_PROCESSES.pop(process.pid, None)
 
     def test_start_passes_include_source_wip_to_workspace_preparation(self) -> None:
         captured = {}
