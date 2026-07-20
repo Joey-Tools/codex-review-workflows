@@ -34,6 +34,7 @@ from .claude_refresh_lock import (
 )
 from .common import (
     ForwardedSignal,
+    ForwardedSignalMaskOwner,
     ReviewError,
     block_forwarded_signals,
     consume_pending_forwarded_signal,
@@ -2184,22 +2185,51 @@ def _is_control_flow_error(error: BaseException) -> bool:
 
 @contextlib.contextmanager
 def _defer_forwarded_signals_during_cleanup(
-) -> Iterator[list[ForwardedSignal]]:
-    previous_mask = block_forwarded_signals()
-    deferred_signals: list[ForwardedSignal] = []
+) -> Iterator[list[BaseException]]:
+    signal_mask_owner = ForwardedSignalMaskOwner()
+    deferred_signals: list[BaseException] = []
+    for _attempt in range(2):
+        try:
+            previous_mask = block_forwarded_signals(
+                signal_mask_owner=signal_mask_owner,
+            )
+            if not signal_mask_owner.active and previous_mask is not None:
+                signal_mask_owner.publish(previous_mask)
+        except BaseException as error:
+            deferred_signals.append(error)
+            if signal_mask_owner.active:
+                break
+            continue
+        break
     try:
         yield deferred_signals
     finally:
         try:
-            pending_signal = (
-                consume_pending_forwarded_signal()
-                if previous_mask is not None
-                else None
-            )
+            pending_signal = None
+            if signal_mask_owner.active:
+                pending_signal = consume_pending_forwarded_signal()
             if pending_signal is not None:
                 deferred_signals.append(ForwardedSignal(pending_signal))
-        finally:
-            restore_signal_mask(previous_mask)
+        except BaseException as error:
+            deferred_signals.append(error)
+        try:
+            signal_mask_owner.restore(restore_signal_mask)
+        except BaseException as error:
+            deferred_signals.append(error)
+
+
+def _restore_forwarded_signal_mask_owner(
+    signal_mask_owner: ForwardedSignalMaskOwner,
+    primary_error: BaseException | None,
+) -> None:
+    try:
+        signal_mask_owner.restore(restore_signal_mask)
+    except BaseException as restore_error:
+        if primary_error is None:
+            raise
+        selected = _primary_cleanup_error([primary_error, restore_error])
+        assert selected is not None
+        raise selected
 
 
 def _primary_cleanup_error(
@@ -4154,14 +4184,18 @@ def _stage_claude_credentials_anchored(
     failure: BaseException | None = None
     try:
         if refresh_lock_protocol is not None:
+            refresh_lock_signal_mask_owner = ForwardedSignalMaskOwner()
+            refresh_lock_start_error: BaseException | None = None
             try:
-                # The lease heartbeat must inherit the forwarded-signal mask.
-                # Otherwise a process-directed signal can reach that thread
-                # while the main thread is aggregating cleanup, bypassing the
-                # deferred-signal path before retained-carrier diagnostics are
-                # attached.
-                refresh_lock_start_mask = block_forwarded_signals()
                 try:
+                    # The lease heartbeat must inherit the forwarded-signal
+                    # mask. Otherwise a process-directed signal can reach that
+                    # thread while the main thread is aggregating cleanup,
+                    # bypassing the deferred-signal path before retained-carrier
+                    # diagnostics are attached.
+                    block_forwarded_signals(
+                        signal_mask_owner=refresh_lock_signal_mask_owner,
+                    )
                     host_refresh_lock = acquire_claude_refresh_lock(
                         source.parent,
                         protocol=refresh_lock_protocol,
@@ -4172,8 +4206,14 @@ def _stage_claude_credentials_anchored(
                         ),
                     )
                     host_refresh_lock_owner.transfer(host_refresh_lock)
+                except BaseException as error:
+                    refresh_lock_start_error = error
+                    raise
                 finally:
-                    restore_signal_mask(refresh_lock_start_mask)
+                    _restore_forwarded_signal_mask_owner(
+                        refresh_lock_signal_mask_owner,
+                        refresh_lock_start_error,
+                    )
             except ClaudeRefreshLockStale as error:
                 raise LinuxCredentialStaleRefreshLock(
                     "a stale Claude refresh lock requires controlled cleanup "
@@ -4225,12 +4265,22 @@ def _stage_claude_credentials_anchored(
                 refresh_lock_protocol=refresh_lock_protocol,
                 coordinated_refresh_lock=host_refresh_lock,
             )
-            start_mask = block_forwarded_signals()
+            watcher_signal_mask_owner = ForwardedSignalMaskOwner()
+            watcher_start_error: BaseException | None = None
             try:
+                block_forwarded_signals(
+                    signal_mask_owner=watcher_signal_mask_owner,
+                )
                 watcher.start()
                 watcher_started = True
+            except BaseException as error:
+                watcher_start_error = error
+                raise
             finally:
-                restore_signal_mask(start_mask)
+                _restore_forwarded_signal_mask_owner(
+                    watcher_signal_mask_owner,
+                    watcher_start_error,
+                )
         yield staged
     except BaseException as error:
         failure = error

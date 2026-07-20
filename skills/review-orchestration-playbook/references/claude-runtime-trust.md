@@ -667,8 +667,8 @@ quiescence or a fully verified latest host commit releases the lease. If process
 or broker quiescence is unproven, a rotation is not durably committed, a private
 carrier must be retained, or cleanup cannot be proved, the helper abandons the
 lease: it stops the heartbeat, closes owned descriptors, intentionally leaves
-the shared lock directories as a stale fence, attaches only authoritative path
-or descriptor-bound recovery evidence, and pauses. It never automatically
+the shared lock directories as a stale fence, attaches only descriptor-bound
+recovery evidence without a lexical pathname, and pauses. It never automatically
 deletes that fence or treats it as authentication failure or Copilot fallback
 evidence. Explicit API-key mode performs no local-login carrier read and does
 not enter this transaction.
@@ -797,15 +797,14 @@ The owning release call performs one further bounded
 cleanup attempt while preserving the first timeout as its primary diagnostic;
 if both joins time out, it reports cleanup as inconclusive and pauses for
 controlled operator cleanup after confirming that no credential writer remains.
-Exact helper-owned paths are authoritative only after a quiesced
-descriptor/no-follow identity proof for an intentionally retained complete lock
-set; otherwise the diagnostic reports descriptor-bound residue without an
-authoritative pathname. The lease then remains terminal, so queued or later
+Intentionally retained shared refresh-lock directories never authorize a lexical
+recovery or cleanup pathname; report only descriptor-bound residue. The lease
+then remains terminal, so queued or later
 release calls repeat the same diagnostic instead of retrying deletion.
 An interruption after descriptor or lock removal starts has the same terminal
 policy. Recovery metadata remains visible even when an earlier credential
-operation stays primary, and a forwarded signal carries the authoritative-path
-or descriptor-bound diagnostic in its detail. It never silently labels a
+operation stays primary, and a forwarded signal carries the descriptor-bound
+diagnostic in its detail. It never silently labels a
 potentially orphaned lock as completed cleanup. Every
 successful post-quiescence write advances the full baseline, including the new
 file identity, for final verification and subsequent model attempts. Supported

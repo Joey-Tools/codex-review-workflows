@@ -323,14 +323,72 @@ def forwarded_signals() -> tuple[signal.Signals, ...]:
     return tuple(forwarded)
 
 
-def block_forwarded_signals() -> set[signal.Signals] | None:
+@dataclass
+class ForwardedSignalMaskOwner:
+    """Retain mask ownership across a callee-return assignment boundary."""
+
+    previous_mask: set[signal.Signals] | None = None
+    active: bool = False
+    restore_attempted: bool = False
+
+    def publish(self, previous_mask: set[signal.Signals] | None) -> None:
+        self.previous_mask = previous_mask
+        self.active = True
+
+    def owns(self, previous_mask: set[signal.Signals] | None) -> bool:
+        return self.active and self.previous_mask is previous_mask
+
+    def restore(
+        self,
+        restore: Callable[[set[signal.Signals] | None], None] | None = None,
+    ) -> None:
+        if not self.active:
+            return
+        if restore is None:
+            restore = restore_signal_mask
+        try:
+            restore(self.previous_mask)
+        finally:
+            self.active = False
+            self.restore_attempted = True
+
+
+def block_forwarded_signals(
+    *,
+    signal_mask_owner: ForwardedSignalMaskOwner | None = None,
+) -> set[signal.Signals] | None:
     if (
         os.name != "posix"
         or threading.current_thread() is not threading.main_thread()
         or not hasattr(signal, "pthread_sigmask")
     ):
         return None
-    return signal.pthread_sigmask(signal.SIG_BLOCK, forwarded_signals())
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    try:
+        previous_mask = signal.pthread_sigmask(
+            signal.SIG_BLOCK,
+            forwarded_signals(),
+        )
+        if signal_mask_owner is not None:
+            signal_mask_owner.publish(previous_mask)
+    except BaseException as block_error:
+        if (
+            signal_mask_owner is None
+            or not signal_mask_owner.owns(previous_mask)
+        ):
+            try:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            except BaseException as restore_error:
+                _attach_process_secondary_failure(
+                    block_error,
+                    restore_error,
+                    context=(
+                        "restoring the forwarded-signal mask after interrupted "
+                        "mask acquisition"
+                    ),
+                )
+        raise
+    return previous_mask
 
 
 def restore_signal_mask(previous: set[signal.Signals] | None) -> None:

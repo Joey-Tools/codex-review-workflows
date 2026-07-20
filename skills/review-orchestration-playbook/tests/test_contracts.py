@@ -4055,6 +4055,31 @@ class RepositoryContractTest(unittest.TestCase):
                 str(candidate),
             )
 
+    def test_retained_refresh_locks_never_authorize_lexical_paths(self) -> None:
+        required = (
+            "Intentionally retained shared refresh-lock directories never "
+            "authorize a lexical recovery or cleanup pathname; report only "
+            "descriptor-bound residue."
+        )
+        candidates = (
+            SKILL_ROOT / "SKILL.md",
+            SKILL_ROOT / "references/helper-contract.md",
+            SKILL_ROOT / "references/claude-runtime-trust.md",
+        )
+        forbidden = (
+            "Report exact helper-owned lock paths only when",
+            "paths only after a quiesced descriptor/no-follow identity proof",
+            "Exact helper-owned paths are authoritative only after",
+            "authoritative path or descriptor-bound recovery evidence",
+            "Path-owned anchors may report exact recovery paths",
+        )
+        for candidate in candidates:
+            content = candidate.read_text(encoding="utf-8")
+            normalized = " ".join(content.split())
+            self.assertIn(required, normalized, str(candidate))
+            for phrase in forbidden:
+                self.assertNotIn(phrase, normalized, str(candidate))
+
 
 if __name__ == "__main__":
     unittest.main()

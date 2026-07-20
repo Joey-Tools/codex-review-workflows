@@ -7903,6 +7903,95 @@ class CredentialStagingTest(unittest.TestCase):
                 self.assertIn("injected cleanup diagnostic", str(diagnostic))
             self.assertEqual(list(helper.iterdir()), [])
 
+    def test_mask_handoffs_restore_and_release_host_lease(self) -> None:
+        now = time.time()
+        for interrupted_call in (1, 2, 3):
+            with self.subTest(interrupted_call=interrupted_call):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = pathlib.Path(temporary).resolve()
+                    helper = root / "helper"
+                    helper.mkdir(mode=0o700)
+                    source = self._credential(
+                        root / ".credentials.json",
+                        expires_at_ms=(now - 60) * 1000,
+                    )
+                    forwarded = claude_linux.ForwardedSignal(signal.SIGTERM)
+                    block_calls = 0
+                    restored_masks: list[set[signal.Signals] | None] = []
+                    host_leases: list[
+                        claude_refresh_lock.ClaudeRefreshLockLease
+                    ] = []
+                    real_acquire = claude_linux.acquire_claude_refresh_lock
+
+                    def block_forwarded_signals(
+                        *,
+                        signal_mask_owner: object | None = None,
+                    ) -> set[signal.Signals]:
+                        nonlocal block_calls
+                        block_calls += 1
+                        previous_mask: set[signal.Signals] = {signal.SIGUSR1}
+                        if signal_mask_owner is not None:
+                            signal_mask_owner.publish(previous_mask)
+                        if block_calls == interrupted_call:
+                            raise forwarded
+                        return previous_mask
+
+                    def acquire_refresh_lock(
+                        config_path: os.PathLike[str] | str,
+                        **kwargs: object,
+                    ) -> claude_refresh_lock.ClaudeRefreshLockLease:
+                        lease = real_acquire(config_path, **kwargs)
+                        if pathlib.Path(config_path) == source.parent:
+                            host_leases.append(lease)
+                        return lease
+
+                    with (
+                        mock.patch.object(
+                            claude_linux,
+                            "block_forwarded_signals",
+                            side_effect=block_forwarded_signals,
+                        ),
+                        mock.patch.object(
+                            claude_linux,
+                            "restore_signal_mask",
+                            side_effect=restored_masks.append,
+                        ),
+                        mock.patch.object(
+                            claude_linux,
+                            "acquire_claude_refresh_lock",
+                            side_effect=acquire_refresh_lock,
+                        ),
+                        self.assertRaises(
+                            claude_linux.ForwardedSignal
+                        ) as caught,
+                    ):
+                        with claude_linux.stage_claude_credentials(
+                            source,
+                            helper,
+                            now=now,
+                            refresh_lock_protocol=self.PROTOCOL,
+                        ):
+                            pass
+
+                    self.assertIs(caught.exception, forwarded)
+                    self.assertGreaterEqual(block_calls, interrupted_call)
+                    self.assertEqual(
+                        restored_masks,
+                        [{signal.SIGUSR1}] * block_calls,
+                    )
+                    self.assertEqual(list(helper.iterdir()), [])
+                    if interrupted_call == 1:
+                        self.assertEqual(host_leases, [])
+                        continue
+                    self.assertGreaterEqual(len(host_leases), 1)
+                    host_lease = host_leases[0]
+                    self.assertTrue(host_lease.retention_snapshot().terminal)
+                    heartbeat = host_lease._heartbeat_thread
+                    assert heartbeat is not None
+                    self.assertFalse(heartbeat.is_alive())
+                    for path in host_lease.paths:
+                        self.assertFalse(path.exists(), path)
+
     def test_persistent_watcher_inspection_failure_is_inconclusive(self) -> None:
         now = time.time()
         with tempfile.TemporaryDirectory() as temporary:

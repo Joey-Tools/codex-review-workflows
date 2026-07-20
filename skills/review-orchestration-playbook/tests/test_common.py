@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dis
 import os
 import pathlib
 import signal
@@ -27,6 +28,122 @@ def _visible_exception_messages(error: BaseException) -> tuple[str, ...]:
         messages.extend(str(note) for note in getattr(current, "__notes__", ()))
         current = current.__cause__ or current.__context__
     return tuple(messages)
+
+
+class ForwardedSignalMaskTest(unittest.TestCase):
+    def test_block_rolls_back_mask_when_signal_arrives_after_syscall(self) -> None:
+        current_mask: set[signal.Signals] = set()
+        syscall_applied = False
+        interruption = common.ForwardedSignal(signal.SIGTERM)
+
+        def pthread_sigmask(
+            how: int,
+            mask: object,
+        ) -> set[signal.Signals]:
+            nonlocal syscall_applied
+            requested = set(mask)
+            previous = set(current_mask)
+            if how == signal.SIG_BLOCK:
+                current_mask.update(requested)
+                syscall_applied = bool(requested)
+            elif how == signal.SIG_SETMASK:
+                current_mask.clear()
+                current_mask.update(requested)
+            return previous
+
+        def inject_after_syscall(frame, event, _arg):
+            nonlocal syscall_applied
+            if (
+                event == "return"
+                and frame.f_code is pthread_sigmask.__code__
+                and syscall_applied
+            ):
+                syscall_applied = False
+                raise interruption
+            return inject_after_syscall
+
+        with mock.patch.object(
+            common.signal,
+            "pthread_sigmask",
+            new=pthread_sigmask,
+        ):
+            sys.settrace(inject_after_syscall)
+            try:
+                with self.assertRaises(common.ForwardedSignal) as raised:
+                    common.block_forwarded_signals()
+            finally:
+                sys.settrace(None)
+
+        self.assertIs(raised.exception, interruption)
+        self.assertEqual(current_mask, set())
+
+    def test_owner_restores_mask_after_caller_result_boundary(self) -> None:
+        original_mask = {signal.SIGUSR1}
+        current_mask = set(original_mask)
+        interruption = common.ForwardedSignal(signal.SIGTERM)
+
+        def pthread_sigmask(
+            how: int,
+            mask: object,
+        ) -> set[signal.Signals]:
+            requested = set(mask)
+            previous = set(current_mask)
+            if how == signal.SIG_BLOCK:
+                current_mask.update(requested)
+            elif how == signal.SIG_SETMASK:
+                current_mask.clear()
+                current_mask.update(requested)
+            return previous
+
+        def call_with_owner() -> None:
+            owner = common.ForwardedSignalMaskOwner()
+            try:
+                common.block_forwarded_signals(signal_mask_owner=owner)
+            finally:
+                owner.restore()
+
+        instructions = list(dis.get_instructions(call_with_owner))
+        call_result_offsets: set[int] = set()
+        for index, instruction in enumerate(instructions):
+            if instruction.argval != "block_forwarded_signals":
+                continue
+            for candidate_index in range(index + 1, len(instructions)):
+                if not instructions[candidate_index].opname.startswith("CALL"):
+                    continue
+                call_result_offsets.add(instructions[candidate_index + 1].offset)
+                break
+        self.assertTrue(call_result_offsets)
+        previous_trace = sys.gettrace()
+        armed = True
+
+        def trace(frame, event, _arg):
+            nonlocal armed
+            if frame.f_code is call_with_owner.__code__:
+                frame.f_trace_opcodes = True
+                if (
+                    event == "opcode"
+                    and armed
+                    and frame.f_lasti in call_result_offsets
+                ):
+                    armed = False
+                    raise interruption
+            return trace
+
+        with mock.patch.object(
+            common.signal,
+            "pthread_sigmask",
+            new=pthread_sigmask,
+        ):
+            sys.settrace(trace)
+            try:
+                with self.assertRaises(common.ForwardedSignal) as raised:
+                    call_with_owner()
+            finally:
+                sys.settrace(previous_trace)
+
+        self.assertIs(raised.exception, interruption)
+        self.assertFalse(armed)
+        self.assertEqual(current_mask, original_mask)
 
 
 class ChildEnvironmentTest(unittest.TestCase):
