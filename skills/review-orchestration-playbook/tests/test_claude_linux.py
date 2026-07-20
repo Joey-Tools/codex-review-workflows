@@ -2627,57 +2627,6 @@ class CredentialStagingTest(unittest.TestCase):
 
         return TracePatch()
 
-    def _interrupt_opcode(
-        self,
-        function: object,
-        *,
-        opname: str,
-        target_lease: list[
-            claude_refresh_lock.ClaudeRefreshLockLease
-        ],
-        error: BaseException,
-    ) -> mock._patch:
-        code = function.__code__
-        equivalent_opnames = {
-            "BEFORE_WITH": {"BEFORE_WITH", "SETUP_WITH"},
-        }.get(opname, {opname})
-        offsets = {
-            instruction.offset
-            for instruction in dis.get_instructions(function)
-            if instruction.opname in equivalent_opnames
-        }
-        self.assertTrue(offsets)
-        previous_trace = sys.gettrace()
-        armed = [True]
-
-        def trace(frame: object, event: str, _argument: object) -> object:
-            if frame.f_code is code:
-                frame.f_trace_opcodes = True
-                if (
-                    event == "opcode"
-                    and armed[0]
-                    and frame.f_lasti in offsets
-                    and target_lease
-                    and frame.f_locals.get("lease") is target_lease[0]
-                ):
-                    armed[0] = False
-                    raise error
-            return trace
-
-        class TracePatch:
-            def __enter__(self) -> None:
-                sys.settrace(trace)
-
-            def __exit__(
-                self,
-                _error_type: object,
-                _error: object,
-                _traceback: object,
-            ) -> None:
-                sys.settrace(previous_trace)
-
-        return TracePatch()
-
     def _dispose_refresh_lock_fixture(
         self,
         lease: claude_refresh_lock.ClaudeRefreshLockLease,
@@ -5894,7 +5843,6 @@ class CredentialStagingTest(unittest.TestCase):
         self,
     ) -> None:
         release_helper = claude_linux._release_owned_claude_refresh_lock
-        abandon_helper = claude_linux._abandon_owned_claude_refresh_lock
         for boundary in ("helper-entry", "helper-pre-latch"):
             with self.subTest(boundary=boundary):
                 with tempfile.TemporaryDirectory() as temporary:
@@ -5927,6 +5875,7 @@ class CredentialStagingTest(unittest.TestCase):
                         "injected release fallback "
                         f"{boundary} interruption"
                     )
+                    pre_latch_armed: list[bool] | None = None
                     if boundary == "helper-entry":
                         interrupt_context = (
                             self._interrupt_function_call_boundary(
@@ -5940,11 +5889,26 @@ class CredentialStagingTest(unittest.TestCase):
                             )
                         )
                     else:
-                        interrupt_context = self._interrupt_opcode(
-                            abandon_helper,
-                            opname="BEFORE_WITH",
-                            target_lease=target_lease,
-                            error=interruption,
+                        real_retention_snapshot = lease.retention_snapshot
+                        pre_latch_armed = [True]
+
+                        def interrupt_prearmed_retention_snapshot():
+                            assert pre_latch_armed is not None
+                            if (
+                                pre_latch_armed[0]
+                                and lease._deletion_prohibited
+                                and lease._heartbeat_stop.is_set()
+                            ):
+                                pre_latch_armed[0] = False
+                                raise interruption
+                            return real_retention_snapshot()
+
+                        interrupt_context = mock.patch.object(
+                            lease,
+                            "retention_snapshot",
+                            side_effect=(
+                                interrupt_prearmed_retention_snapshot
+                            ),
                         )
                     try:
                         with (
@@ -5992,6 +5956,8 @@ class CredentialStagingTest(unittest.TestCase):
                                 None,
                             )
                         )
+                        if pre_latch_armed is not None:
+                            self.assertFalse(pre_latch_armed[0])
                     finally:
                         self._dispose_refresh_lock_fixture(lease)
 

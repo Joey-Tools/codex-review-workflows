@@ -2506,27 +2506,6 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 path.rmdir()
 
     def test_abandon_lifecycle_store_cannot_reopen_racing_release(self) -> None:
-        abandon = claude_refresh_lock.ClaudeRefreshLockLease._abandon
-        instructions = tuple(dis.get_instructions(abandon))
-        release_lock_load = next(
-            index
-            for index, instruction in enumerate(instructions)
-            if instruction.argval == "_release_lock"
-        )
-        release_lock_enter = next(
-            index
-            for index in range(release_lock_load + 1, len(instructions))
-            if instructions[index].opname in {"BEFORE_WITH", "SETUP_WITH"}
-        )
-        pause_offset = instructions[release_lock_enter + 1].offset
-        lifecycle_store = next(
-            index
-            for index, instruction in enumerate(instructions)
-            if instruction.opname == "STORE_ATTR"
-            and instruction.argval == "_abandonment_cleanup_lifecycle"
-        )
-        interrupt_offset = instructions[lifecycle_store + 1].offset
-
         with tempfile.TemporaryDirectory() as temporary:
             config = self._config_dir(pathlib.Path(temporary)).resolve()
             lease = self._acquire_lock(
@@ -2545,23 +2524,71 @@ class ClaudeRefreshLockTest(unittest.TestCase):
             prepare_calls = 0
             prepare_calls_lock = threading.Lock()
             real_prepare = lease._prepare_abandonment_resume
+            real_release_lock = lease._release_lock
+            real_heartbeat_stop = lease._heartbeat_stop
 
-            def trace_abandon(
-                frame: object,
-                event: str,
-                _argument: object,
-            ) -> object:
-                if frame.f_code is abandon.__code__:
-                    frame.f_trace_opcodes = True
-                    if event == "opcode" and frame.f_lasti == pause_offset:
-                        abandon_holds_release_lock.set()
-                        allow_abandon_store.wait(timeout=2.0)
-                    elif (
-                        event == "opcode"
-                        and frame.f_lasti == interrupt_offset
+            class PausingReleaseLock:
+                def __enter__(self) -> object:
+                    real_release_lock.acquire()
+                    try:
+                        if (
+                            threading.current_thread().name
+                            == "interrupting-abandon"
+                        ):
+                            abandon_holds_release_lock.set()
+                            if not allow_abandon_store.wait(timeout=2.0):
+                                raise AssertionError(
+                                    "abandonment release-lock pause timed out"
+                                )
+                    except BaseException:
+                        real_release_lock.release()
+                        raise
+                    return self
+
+                def __exit__(
+                    self,
+                    _error_type: object,
+                    _error: object,
+                    _traceback: object,
+                ) -> bool:
+                    real_release_lock.release()
+                    return False
+
+            class InterruptingHeartbeatStop:
+                def __init__(self) -> None:
+                    self.armed = True
+
+                def set(self) -> None:
+                    if (
+                        self.armed
+                        and threading.current_thread().name
+                        == "interrupting-abandon"
                     ):
+                        if (
+                            lease._abandonment_cleanup_lifecycle
+                            is not claude_refresh_lock.
+                            _AbandonmentCleanupLifecycle.RESUMABLE
+                        ):
+                            raise AssertionError(
+                                "heartbeat stop preceded lifecycle publication"
+                            )
+                        if real_heartbeat_stop.is_set():
+                            raise AssertionError(
+                                "heartbeat stop was already published at the "
+                                "lifecycle interruption boundary"
+                            )
+                        self.armed = False
                         raise interruption
-                return trace_abandon
+                    real_heartbeat_stop.set()
+
+                def is_set(self) -> bool:
+                    return real_heartbeat_stop.is_set()
+
+                def wait(self, timeout: float | None = None) -> bool:
+                    return real_heartbeat_stop.wait(timeout)
+
+            pausing_release_lock = PausingReleaseLock()
+            interrupting_heartbeat_stop = InterruptingHeartbeatStop()
 
             def observe_prepare() -> bool:
                 nonlocal prepare_calls
@@ -2587,16 +2614,12 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     outcomes["release"] = None
 
             def run_abandon() -> None:
-                previous_trace = sys.gettrace()
-                sys.settrace(trace_abandon)
                 try:
                     lease.abandon("interrupt lifecycle publication")
                 except BaseException as error:
                     outcomes["abandon"] = error
                 else:
                     outcomes["abandon"] = None
-                finally:
-                    sys.settrace(previous_trace)
 
             release_worker = threading.Thread(
                 target=run_release,
@@ -2626,6 +2649,16 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                         "racing release removed a retained lock"
                     ),
                 ) as remove_owned_lock,
+                mock.patch.object(
+                    lease,
+                    "_release_lock",
+                    pausing_release_lock,
+                ),
+                mock.patch.object(
+                    lease,
+                    "_heartbeat_stop",
+                    interrupting_heartbeat_stop,
+                ),
             ):
                 release_worker.start()
                 self.assertTrue(first_release_check.wait(timeout=2.0))
