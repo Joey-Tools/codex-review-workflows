@@ -3584,6 +3584,73 @@ class WorkspaceTest(unittest.TestCase):
             )
         self.assert_no_review_containers()
 
+    def test_ambiguous_false_ancestry_requires_complete_commit_walk(self) -> None:
+        calls: list[tuple[str, ...]] = []
+
+        def incomplete_query(*, args, **_kwargs):
+            calls.append(args)
+            if args[:2] == ("merge-base", "--is-ancestor"):
+                return subprocess.CompletedProcess(args, 1, b"", b"")
+            if args[:2] == ("rev-list", "--quiet"):
+                return subprocess.CompletedProcess(
+                    args,
+                    128,
+                    b"",
+                    b"fatal: failed to traverse parents\n",
+                )
+            self.fail(f"unexpected sanitized Git query: {args!r}")
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "_run_sanitized_git_query",
+                side_effect=incomplete_query,
+            ),
+            self.assertRaisesRegex(
+                ReviewError,
+                "cannot verify that the frozen base is an ancestor of head",
+            ),
+        ):
+            workspace_runtime._require_ancestor_range(
+                git_view=self.repo / "sanitized.git",
+                object_directory=self.repo / ".git" / "objects",
+                base_sha=self.base,
+                head_sha=self.head,
+            )
+
+        self.assertEqual(
+            calls,
+            [
+                ("merge-base", "--is-ancestor", self.base, self.head),
+                (
+                    "rev-list",
+                    "--quiet",
+                    "--missing=error",
+                    self.base,
+                    self.head,
+                    "--",
+                ),
+            ],
+        )
+
+    def test_complete_unrelated_histories_report_no_merge_base(self) -> None:
+        git(self.repo, "switch", "--orphan", "disconnected")
+        git(self.repo, "commit", "--allow-empty", "-m", "Disconnected")
+        disconnected = git(self.repo, "rev-parse", "HEAD")
+
+        with (
+            workspace_runtime._temporary_sanitized_git_view(
+                source_root=self.repo,
+            ) as (git_view, object_directory),
+            self.assertRaisesRegex(ReviewError, "commits have no merge base"),
+        ):
+            workspace_runtime._require_ancestor_range(
+                git_view=git_view,
+                object_directory=object_directory,
+                base_sha=self.base,
+                head_sha=disconnected,
+            )
+
     def test_ancestor_check_fails_closed_for_git_query_errors(self) -> None:
         cases = (
             (
@@ -3592,9 +3659,26 @@ class WorkspaceTest(unittest.TestCase):
                 "cannot verify that the frozen base is an ancestor of head",
             ),
             (
+                "connectivity-query",
+                (
+                    subprocess.CompletedProcess(("git",), 1, b"", b""),
+                    subprocess.CompletedProcess(("git",), 128, b"", b"missing object"),
+                ),
+                "cannot verify that the frozen base is an ancestor of head",
+            ),
+            (
+                "connectivity-unexpected-output",
+                (
+                    subprocess.CompletedProcess(("git",), 1, b"", b""),
+                    subprocess.CompletedProcess(("git",), 0, b"unexpected", b""),
+                ),
+                "cannot verify that the frozen base is an ancestor of head",
+            ),
+            (
                 "merge-base-query",
                 (
                     subprocess.CompletedProcess(("git",), 1, b"", b""),
+                    subprocess.CompletedProcess(("git",), 0, b"", b""),
                     subprocess.CompletedProcess(("git",), 128, b"", b"missing object"),
                 ),
                 "cannot determine the merge base",

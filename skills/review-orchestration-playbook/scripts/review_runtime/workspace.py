@@ -1917,6 +1917,22 @@ def _require_ancestor_range(
         failure_message="cannot verify that the frozen base is an ancestor of head",
     ):
         return
+    connectivity = _run_sanitized_git_query(
+        git_view=git_view,
+        object_directory=object_directory,
+        args=(
+            "rev-list",
+            "--quiet",
+            "--missing=error",
+            base_sha,
+            head_sha,
+            "--",
+        ),
+        label="sanitized commit-connectivity Git query",
+        check=False,
+    )
+    if connectivity.returncode != 0 or connectivity.stdout:
+        raise ReviewError("cannot verify that the frozen base is an ancestor of head")
     merge_base = _run_sanitized_git_query(
         git_view=git_view,
         object_directory=object_directory,
