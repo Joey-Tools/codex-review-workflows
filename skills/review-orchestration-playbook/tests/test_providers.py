@@ -183,10 +183,7 @@ def _blocked_keychain_handler_worker(connection: object, mode: str) -> None:
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=2.0) as sock:
                 sock.sendall(
-                    capability
-                    + b"W"
-                    + len(refreshed).to_bytes(4, "big")
-                    + refreshed
+                    capability + b"W" + len(refreshed).to_bytes(4, "big") + refreshed
                 )
                 with contextlib.suppress(OSError):
                     sock.recv(1)
@@ -200,14 +197,17 @@ def _blocked_keychain_handler_worker(connection: object, mode: str) -> None:
         signal.signal(signal.SIGTERM, forward_signal)
 
     try:
-        with mock.patch.object(
-            providers,
-            "CLAUDE_KEYCHAIN_SERVER_SHUTDOWN_TIMEOUT_SECONDS",
-            0.15,
-        ), mock.patch.object(
-            providers,
-            "CLAUDE_KEYCHAIN_RECOVERY_TIMEOUT_SECONDS",
-            0.15,
+        with (
+            mock.patch.object(
+                providers,
+                "CLAUDE_KEYCHAIN_SERVER_SHUTDOWN_TIMEOUT_SECONDS",
+                0.15,
+            ),
+            mock.patch.object(
+                providers,
+                "CLAUDE_KEYCHAIN_RECOVERY_TIMEOUT_SECONDS",
+                0.15,
+            ),
         ):
             with providers._claude_keychain_credential_server(
                 credential,
@@ -249,10 +249,7 @@ def _blocked_keychain_handler_worker(connection: object, mode: str) -> None:
                 bool(
                     getattr(
                         error,
-                        (
-                            "_codex_claude_keychain_handler_"
-                            "quiescence_unproven"
-                        ),
+                        ("_codex_claude_keychain_handler_quiescence_unproven"),
                         False,
                     )
                 ),
@@ -431,6 +428,14 @@ class ProviderPolicyTest(unittest.TestCase):
             side_effect=lambda _review, env, **_kwargs: dict(env),
         )
         self.macos_tls = self.macos_tls_patcher.start()
+        self.require_matching_claude_macos_tls_bundle = (
+            providers._require_matching_claude_macos_tls_bundle
+        )
+        self.macos_tls_bundle_match_patcher = mock.patch.object(
+            providers,
+            "_require_matching_claude_macos_tls_bundle",
+        )
+        self.macos_tls_bundle_match = self.macos_tls_bundle_match_patcher.start()
         self.prepare_claude_keychain_broker = providers._prepare_claude_keychain_broker
         self.keychain_broker_patcher = mock.patch.object(
             providers,
@@ -461,6 +466,7 @@ class ProviderPolicyTest(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
+        self.macos_tls_bundle_match_patcher.stop()
         self.macos_tls_patcher.stop()
         self.snapshot_match_patcher.stop()
         self.executable_inspection_patcher.stop()
@@ -537,14 +543,10 @@ class ProviderPolicyTest(unittest.TestCase):
                 for note in getattr(current, "__notes__", ())
             ):
                 return
-            if (
-                isinstance(
-                    current,
-                    providers.ClaudeCredentialPersistenceDiagnostic,
-                )
-                and providers.CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC
-                in str(current)
-            ):
+            if isinstance(
+                current,
+                providers.ClaudeCredentialPersistenceDiagnostic,
+            ) and providers.CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC in str(current):
                 return
             for related in (current.__cause__, current.__context__):
                 if related is not None:
@@ -660,9 +662,7 @@ class ProviderPolicyTest(unittest.TestCase):
             )
 
     def test_cleanup_diagnostic_fallback_preserves_original_cause(self) -> None:
-        class LegacyInspectionError(
-            providers.ClaudeCredentialInspectionInconclusive
-        ):
+        class LegacyInspectionError(providers.ClaudeCredentialInspectionInconclusive):
             add_note = None
 
         primary = LegacyInspectionError("injected legacy primary")
@@ -688,11 +688,9 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         interruption = LegacyKeyboardInterrupt("injected control flow")
 
-        selected = (
-            providers._attach_claude_persistence_failure_preserving_control_flow(
-                persistence_error,
-                interruption,
-            )
+        selected = providers._attach_claude_persistence_failure_preserving_control_flow(
+            persistence_error,
+            interruption,
         )
 
         self.assertIs(selected, interruption)
@@ -961,7 +959,10 @@ class ProviderPolicyTest(unittest.TestCase):
                 if value_tag == 0x13:
                     variant[value_offset] = 0x0C
                     return bytes(variant)
-                if value_tag == 0x0C and set(variant[value_start:value_end]) <= printable:
+                if (
+                    value_tag == 0x0C
+                    and set(variant[value_start:value_end]) <= printable
+                ):
                     variant[value_offset] = 0x13
                     return bytes(variant)
         raise AssertionError("fixture has no interchangeable directory string")
@@ -1367,9 +1368,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     "_ClaudeKeychainCredentialServer",
                     side_effect=bind_error,
                 ),
-                self.assertRaises(
-                    providers.ClaudeCredentialInspectionInconclusive
-                ),
+                self.assertRaises(providers.ClaudeCredentialInspectionInconclusive),
             ):
                 with providers._claude_keychain_credential_server(
                     None,
@@ -1400,9 +1399,7 @@ class ProviderPolicyTest(unittest.TestCase):
     @mock.patch.object(
         providers,
         "_claude_keychain_credential_server",
-        side_effect=providers.ClaudeCredentialInspectionInconclusive(
-            "bind denied"
-        ),
+        side_effect=providers.ClaudeCredentialInspectionInconclusive("bind denied"),
     )
     def test_keychain_runtime_zeroes_credential_when_broker_bind_fails(
         self,
@@ -1729,9 +1726,7 @@ class ProviderPolicyTest(unittest.TestCase):
             assert generation is not None
             server._pending_update_lock.acquire()
             try:
-                self.assertFalse(
-                    server.close_pending_update_publication(0.0)
-                )
+                self.assertFalse(server.close_pending_update_publication(0.0))
             finally:
                 server._pending_update_lock.release()
             self.assertFalse(server.commit_pending_update(generation, publish))
@@ -1837,9 +1832,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 credential = bytearray(
                     oauth_credential_fixture(expires_in_seconds=3600)
                 )
-                pending = bytearray(
-                    oauth_credential_fixture(expires_in_seconds=7200)
-                )
+                pending = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
                 server = providers._ClaudeKeychainCredentialServer(
                     credential,
                     bytes.fromhex("03" * 32),
@@ -1861,9 +1854,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
                 def abandon() -> None:
                     if blocked_step == "abandon":
-                        self.assertTrue(
-                            release_abandonment.wait(timeout=2.0)
-                        )
+                        self.assertTrue(release_abandonment.wait(timeout=2.0))
 
                 def run_shutdown() -> None:
                     try:
@@ -1891,9 +1882,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     ):
                         owner.start()
                         finished_within_bound = completed.wait(timeout=0.2)
-                        publication_closed_within_bound = (
-                            server._abandoned.is_set()
-                        )
+                        publication_closed_within_bound = server._abandoned.is_set()
                 finally:
                     release_abandonment.set()
                     if held_lock is not None:
@@ -1973,11 +1962,9 @@ class ProviderPolicyTest(unittest.TestCase):
 
         started = time.monotonic()
         try:
-            result, error = (
-                providers._bounded_claude_keychain_fail_closed_error(
-                    fail_closed_error,
-                    0.01,
-                )
+            result, error = providers._bounded_claude_keychain_fail_closed_error(
+                fail_closed_error,
+                0.01,
             )
         finally:
             release_callback.set()
@@ -2010,9 +1997,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
         def timeout_error() -> BaseException:
             try:
-                self.assertTrue(
-                    release_timeout_callback.wait(timeout=2.0)
-                )
+                self.assertTrue(release_timeout_callback.wait(timeout=2.0))
                 return RuntimeError("fixture late timeout callback")
             finally:
                 timeout_callback_finished.set()
@@ -2030,11 +2015,9 @@ class ProviderPolicyTest(unittest.TestCase):
                 "CLAUDE_KEYCHAIN_RECOVERY_TIMEOUT_SECONDS",
                 0.01,
             ):
-                result = (
-                    providers._bounded_claude_keychain_quiescence_recovery(
-                        callbacks,
-                        None,
-                    )
+                result = providers._bounded_claude_keychain_quiescence_recovery(
+                    callbacks,
+                    None,
                 )
         finally:
             release_recovery.set()
@@ -2074,9 +2057,7 @@ class ProviderPolicyTest(unittest.TestCase):
                         update_callback,
                     )
                 except OSError:
-                    self.skipTest(
-                        "loopback bind is unavailable in the current sandbox"
-                    )
+                    self.skipTest("loopback bind is unavailable in the current sandbox")
                 with server.credential_lock:
                     server.consumed = True
                 real_stage = server.stage_pending_update
@@ -2169,9 +2150,7 @@ class ProviderPolicyTest(unittest.TestCase):
             if payload == older:
                 older_callback_started.set()
                 if not release_older_callback.wait(timeout=2.0):
-                    raise RuntimeError(
-                        "fixture older callback was not released"
-                    )
+                    raise RuntimeError("fixture older callback was not released")
             return commit_pending(lambda: True)
 
         try:
@@ -2198,10 +2177,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 timeout=2.0,
             ) as sock:
                 sock.sendall(
-                    capability
-                    + b"W"
-                    + len(payload).to_bytes(4, "big")
-                    + payload
+                    capability + b"W" + len(payload).to_bytes(4, "big") + payload
                 )
                 responses[payload] = sock.recv(1)
 
@@ -2276,10 +2252,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 timeout=2.0,
             ) as sock:
                 sock.sendall(
-                    capability
-                    + b"W"
-                    + len(payload).to_bytes(4, "big")
-                    + payload
+                    capability + b"W" + len(payload).to_bytes(4, "big") + payload
                 )
                 return sock.recv(1)
 
@@ -2353,10 +2326,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 timeout=2.0,
             ) as sock:
                 sock.sendall(
-                    capability
-                    + b"W"
-                    + len(payload).to_bytes(4, "big")
-                    + payload
+                    capability + b"W" + len(payload).to_bytes(4, "big") + payload
                 )
                 responses[payload] = sock.recv(1)
 
@@ -2758,7 +2728,7 @@ class ProviderPolicyTest(unittest.TestCase):
         )
 
     @mock.patch.object(providers, "run_bounded_capture")
-    def test_keychain_exit_44_is_absent_but_other_errors_fail_integrity(
+    def test_keychain_exit_44_is_absent_but_other_errors_are_inconclusive(
         self,
         run_command: mock.Mock,
     ) -> None:
@@ -2770,17 +2740,32 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         self.assertIsNone(providers._read_claude_keychain_credential(self.review))
 
-        run_command.return_value = common.BoundedCapture(
-            argv=(),
-            returncode=36,
-            stdout=bytearray(),
-            stderr=bytearray(b"interaction denied"),
-        )
-        with self.assertRaisesRegex(
-            providers.ClaudeKeychainCredentialIntegrityError,
-            "deterministic missing-item status",
+        for name, returncode, detail in (
+            ("locked", 36, b"User interaction is not allowed"),
+            ("acl-denied", 51, b"Keychain ACL denied access"),
+            ("securityd", 1, b"securityd operation failed"),
         ):
-            providers._read_claude_keychain_credential(self.review)
+            completed_error = common.BoundedCapture(
+                argv=(),
+                returncode=returncode,
+                stdout=bytearray(),
+                stderr=bytearray(detail),
+            )
+            run_command.return_value = completed_error
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(
+                    providers.ClaudeCredentialInspectionInconclusive,
+                    "deterministic missing-item status",
+                ) as raised,
+            ):
+                providers._read_claude_keychain_credential(self.review)
+            self.assertNotIsInstance(
+                raised.exception,
+                providers.ClaudeKeychainCredentialIntegrityError,
+            )
+            self.assertEqual(completed_error.stdout, bytearray())
+            self.assertEqual(completed_error.stderr, bytearray(len(detail)))
 
         payload = oauth_credential_fixture()
         completed = common.BoundedCapture(
@@ -2795,6 +2780,32 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(completed.stdout, bytearray(len(completed.stdout)))
         assert credential is not None
         credential[:] = b"\x00" * len(credential)
+
+    @mock.patch.object(providers, "run_bounded_capture")
+    def test_keychain_success_output_corruption_is_integrity_failure(
+        self,
+        run_command: mock.Mock,
+    ) -> None:
+        for name, output, message in (
+            ("missing-terminator", b"credential", "command terminator"),
+            ("empty", b"\n", "empty credential"),
+        ):
+            completed = common.BoundedCapture(
+                argv=(),
+                returncode=0,
+                stdout=bytearray(output),
+                stderr=bytearray(),
+            )
+            run_command.return_value = completed
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(
+                    providers.ClaudeKeychainCredentialIntegrityError,
+                    message,
+                ),
+            ):
+                providers._read_claude_keychain_credential(self.review)
+            self.assertEqual(completed.stdout, bytearray(len(output)))
 
     @mock.patch.object(
         providers,
@@ -2815,9 +2826,7 @@ class ProviderPolicyTest(unittest.TestCase):
         cases = ("missing", "non-executable")
         for condition in cases:
             with self.subTest(condition=condition):
-                client = (
-                    self.claude_keychain_client.parent / f"security-{condition}"
-                )
+                client = self.claude_keychain_client.parent / f"security-{condition}"
                 if condition == "non-executable":
                     client.write_bytes(b"fixture")
                     client.chmod(0o600)
@@ -2888,9 +2897,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 real_open = providers.os.open
                 real_fstat = providers.os.fstat
                 real_close = providers.os.close
-                chain_code = (
-                    providers._open_absolute_directory_chain_without_symlinks.__wrapped__.__code__
-                )
+                chain_code = providers._open_absolute_directory_chain_without_symlinks.__wrapped__.__code__
                 interrupted = False
 
                 def tracking_open(
@@ -2918,9 +2925,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     locals_map = getattr(frame, "f_locals", {})
                     descriptors = locals_map.get("descriptors", ())
                     candidate = locals_map.get(
-                        "root_descriptor"
-                        if window == "root"
-                        else "next_descriptor"
+                        "root_descriptor" if window == "root" else "next_descriptor"
                     )
                     if (
                         isinstance(candidate, int)
@@ -2996,9 +3001,7 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
             self.assertRaises(SystemExit),
         ):
-            providers._open_claude_credential_config_directory(
-                pathlib.Path("/fixture")
-            )
+            providers._open_claude_credential_config_directory(pathlib.Path("/fixture"))
 
         self.assertEqual(close_calls, [11, 10])
 
@@ -3031,9 +3034,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 "credential home",
             ),
         ):
-            providers._open_claude_credential_config_directory(
-                pathlib.Path("/fixture")
-            )
+            providers._open_claude_credential_config_directory(pathlib.Path("/fixture"))
 
         close_fd.assert_called_once_with(10)
 
@@ -3081,9 +3082,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     "not regular",
                 ),
             ):
-                providers._read_claude_credential_file_from_directory(
-                    config_descriptor
-                )
+                providers._read_claude_credential_file_from_directory(config_descriptor)
         finally:
             os.close(config_descriptor)
 
@@ -3187,9 +3186,7 @@ class ProviderPolicyTest(unittest.TestCase):
             providers.CLAUDE_KEYCHAIN_SECURITY_STDIN_LIMIT_BYTES
         )
         keychain = bytearray(json.dumps(keychain_value).encode())
-        file_credential = bytearray(
-            oauth_credential_fixture(expires_in_seconds=3600)
-        )
+        file_credential = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
         snapshot = providers._ClaudeCredentialFileSnapshot(
             home=self.claude_pwd_home,
             home_identity=(1,),
@@ -3326,11 +3323,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         depth = 10_000
         credential = bytearray(
-            b'{"claudeAiOauth":'
-            + b"[" * depth
-            + b"0"
-            + b"]" * depth
-            + b"}"
+            b'{"claudeAiOauth":' + b"[" * depth + b"0" + b"]" * depth + b"}"
         )
         read_keychain.return_value = credential
 
@@ -3342,11 +3335,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertEqual(credential, bytearray(len(credential)))
         raw_credential = bytearray(
-            b'{"claudeAiOauth":'
-            + b"[" * depth
-            + b"0"
-            + b"]" * depth
-            + b"}"
+            b'{"claudeAiOauth":' + b"[" * depth + b"0" + b"]" * depth + b"}"
         )
         with self.assertRaisesRegex(
             providers.ClaudeCredentialUnsafe,
@@ -3380,12 +3369,12 @@ class ProviderPolicyTest(unittest.TestCase):
             b'"refreshToken":"r","expiresAt":1}}'
         )
         nonfinite = bytearray(
-            b'{"claudeAiOauth":{"accessToken":"a","refreshToken":"r",'
-            b'"expiresAt":NaN}}'
+            b'{"claudeAiOauth":{"accessToken":"a","refreshToken":"r","expiresAt":NaN}}'
         )
         for payload in (duplicate, nonfinite):
-            with self.subTest(payload=payload), self.assertRaises(
-                providers.ClaudeCredentialUnsafe
+            with (
+                self.subTest(payload=payload),
+                self.assertRaises(providers.ClaudeCredentialUnsafe),
             ):
                 providers._validate_claude_local_credential(
                     payload,
@@ -3416,9 +3405,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 ).encode("ascii")
             )
             with self.subTest(field=field):
-                with self.assertRaises(
-                    providers.ClaudeCredentialUnsafe
-                ) as validated:
+                with self.assertRaises(providers.ClaudeCredentialUnsafe) as validated:
                     providers._validate_claude_local_credential(
                         payload,
                         source="fixture",
@@ -3480,9 +3467,7 @@ class ProviderPolicyTest(unittest.TestCase):
         result = providers._read_claude_macos_file_credential()
         assert result is not None
         expected, snapshot = result
-        refreshed_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=-60)
-        )
+        refreshed_value = json.loads(oauth_credential_fixture(expires_in_seconds=-60))
         refreshed_value["claudeAiOauth"]["refreshToken"] = (
             "fixture-" + "rotated-refresh-value"
         )
@@ -3498,14 +3483,16 @@ class ProviderPolicyTest(unittest.TestCase):
             "_read_claude_keychain_credential",
             return_value=None,
         ):
-            self.assertTrue(providers._write_claude_file_credential(
-                self.review,
-                refreshed,
-                expected,
-                snapshot,
-                carrier_snapshot,
-                self.claude_refresh_lock_protocol,
-            ))
+            self.assertTrue(
+                providers._write_claude_file_credential(
+                    self.review,
+                    refreshed,
+                    expected,
+                    snapshot,
+                    carrier_snapshot,
+                    self.claude_refresh_lock_protocol,
+                )
+            )
         self.assertEqual(credential_path.read_bytes(), bytes(refreshed))
         self.assertEqual(stat.S_IMODE(credential_path.stat().st_mode), 0o600)
 
@@ -3525,14 +3512,16 @@ class ProviderPolicyTest(unittest.TestCase):
             "_read_claude_keychain_credential",
             return_value=None,
         ):
-            self.assertFalse(providers._write_claude_file_credential(
-                self.review,
-                newer,
-                stale_expected,
-                stale_snapshot,
-                stale_carrier_snapshot,
-                self.claude_refresh_lock_protocol,
-            ))
+            self.assertFalse(
+                providers._write_claude_file_credential(
+                    self.review,
+                    newer,
+                    stale_expected,
+                    stale_snapshot,
+                    stale_carrier_snapshot,
+                    self.claude_refresh_lock_protocol,
+                )
+            )
         self.assertEqual(credential_path.read_bytes(), replacement)
         for payload in (expected, refreshed, stale_expected, newer):
             payload[:] = b"\x00" * len(payload)
@@ -3738,9 +3727,7 @@ class ProviderPolicyTest(unittest.TestCase):
         def broker(_credential, _capability, *, update_callback=None, **_kwargs):
             assert update_callback is not None
             self.assertTrue(update_callback(refreshed))
-            recovery_root = providers._claude_macos_recovery_root(
-                self.review
-            )
+            recovery_root = providers._claude_macos_recovery_root(self.review)
             durable_carriers = sorted(
                 recovery_root.glob(
                     f"{providers.CLAUDE_MACOS_DURABLE_STAGE_COMMITTED_PREFIX}*"
@@ -3904,9 +3891,7 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         write_file.assert_not_called()
         self.assertIn(str(carrier), str(raised.exception))
-        recovery_artifact = (
-            carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
-        )
+        recovery_artifact = carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
         self.assertEqual(
             getattr(
                 raised.exception,
@@ -3915,9 +3900,7 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
             str(recovery_artifact),
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_artifact"],
             str(recovery_artifact),
@@ -3988,9 +3971,7 @@ class ProviderPolicyTest(unittest.TestCase):
             )
             providers._mark_claude_macos_recovery_cleanup_artifact(
                 failure,
-                carrier
-                / "config"
-                / providers.CLAUDE_CREDENTIAL_FILE_NAME,
+                carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME,
             )
             raise failure
 
@@ -4026,22 +4007,12 @@ class ProviderPolicyTest(unittest.TestCase):
                 "_codex_claude_retained_cleanup_artifact",
                 None,
             ),
-            str(
-                retained
-                / "config"
-                / providers.CLAUDE_CREDENTIAL_FILE_NAME
-            ),
+            str(retained / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME),
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_cleanup_artifact"],
-            str(
-                retained
-                / "config"
-                / providers.CLAUDE_CREDENTIAL_FILE_NAME
-            ),
+            str(retained / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME),
         )
 
     def test_removed_recovery_carrier_fsync_failure_has_no_cleanup_path(
@@ -4101,9 +4072,7 @@ class ProviderPolicyTest(unittest.TestCase):
             self.review,
             raised.exception,
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_cleanup_artifact"],
             str(recovery_root),
@@ -4229,9 +4198,7 @@ class ProviderPolicyTest(unittest.TestCase):
             self.review,
             forwarded,
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_cleanup_artifact"],
             str(config_dir),
@@ -4248,9 +4215,7 @@ class ProviderPolicyTest(unittest.TestCase):
             self.review,
             credential,
         )
-        credential_path = (
-            carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
-        )
+        credential_path = carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
         digest = providers._claude_credential_digest(credential)
         forwarded = providers.ForwardedSignal(signal.SIGTERM)
 
@@ -4496,9 +4461,7 @@ class ProviderPolicyTest(unittest.TestCase):
             expected_digest=expected_digest,
         )
 
-        self.assertIsNone(
-            providers._get_claude_retained_credential_proof(error)
-        )
+        self.assertIsNone(providers._get_claude_retained_credential_proof(error))
         self.assertIsNone(
             getattr(
                 error,
@@ -4562,9 +4525,7 @@ class ProviderPolicyTest(unittest.TestCase):
         allow_legacy_publication = threading.Event()
         writer_errors: list[BaseException] = []
 
-        class BlockingProofError(
-            providers.ClaudeCredentialInspectionInconclusive
-        ):
+        class BlockingProofError(providers.ClaudeCredentialInspectionInconclusive):
             publication_armed = False
 
             def __setattr__(self, name: str, value: object) -> None:
@@ -4575,9 +4536,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 ):
                     proof_published.set()
                     if not allow_legacy_publication.wait(timeout=2.0):
-                        raise RuntimeError(
-                            "fixture proof publication was not released"
-                        )
+                        raise RuntimeError("fixture proof publication was not released")
 
         error = BlockingProofError("fixture publication target")
         error.publication_armed = True
@@ -4634,9 +4593,7 @@ class ProviderPolicyTest(unittest.TestCase):
         ):
             providers._capture_claude_retained_credential_proof(
                 artifact,
-                expected_digest=providers._claude_credential_digest(
-                    credential
-                ),
+                expected_digest=providers._claude_credential_digest(credential),
             )
 
         self.assertIs(raised.exception, forwarded)
@@ -4653,9 +4610,7 @@ class ProviderPolicyTest(unittest.TestCase):
         artifact = carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
         forwarded = providers.ForwardedSignal(signal.SIGTERM)
 
-        class InterruptingClearError(
-            providers.ClaudeCredentialInspectionInconclusive
-        ):
+        class InterruptingClearError(providers.ClaudeCredentialInspectionInconclusive):
             clear_armed = False
 
             def __delattr__(self, name: str) -> None:
@@ -4678,9 +4633,7 @@ class ProviderPolicyTest(unittest.TestCase):
             providers._clear_claude_retained_credential_proof(error)
 
         self.assertIs(raised.exception, forwarded)
-        self.assertIsNone(
-            providers._get_claude_retained_credential_proof(error)
-        )
+        self.assertIsNone(providers._get_claude_retained_credential_proof(error))
         credential[:] = b"\x00" * len(credential)
 
     def test_retained_proof_transfer_interrupt_wipes_credential_payloads(
@@ -4716,9 +4669,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 providers._capture_claude_retained_credential_proof,
                 lambda: providers._capture_claude_retained_credential_proof(
                     artifact,
-                    expected_digest=providers._claude_credential_digest(
-                        credential
-                    ),
+                    expected_digest=providers._claude_credential_digest(credential),
                 ),
             ),
             (
@@ -5181,9 +5132,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 regular_close_count += 1
                 if regular_close_count == 2:
                     failed_descriptor = descriptor
-                    raise OSError(
-                        "injected verified recovery carrier close failure"
-                    )
+                    raise OSError("injected verified recovery carrier close failure")
             real_close(descriptor)
 
         try:
@@ -5216,11 +5165,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 "_codex_claude_retained_credential_artifact",
                 None,
             ),
-            str(
-                carrier
-                / "config"
-                / providers.CLAUDE_CREDENTIAL_FILE_NAME
-            ),
+            str(carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME),
         )
         self.assertIsNone(
             getattr(
@@ -5239,16 +5184,12 @@ class ProviderPolicyTest(unittest.TestCase):
                 credential = bytearray(
                     oauth_credential_fixture(expires_in_seconds=7200)
                 )
-                recovery_root = providers._claude_macos_recovery_root(
-                    self.review
-                )
+                recovery_root = providers._claude_macos_recovery_root(self.review)
                 pending = recovery_root / (
-                    providers.CLAUDE_MACOS_DURABLE_STAGE_PENDING_PREFIX
-                    + failure_kind
+                    providers.CLAUDE_MACOS_DURABLE_STAGE_PENDING_PREFIX + failure_kind
                 )
                 committed = recovery_root / (
-                    providers.CLAUDE_MACOS_DURABLE_STAGE_COMMITTED_PREFIX
-                    + failure_kind
+                    providers.CLAUDE_MACOS_DURABLE_STAGE_COMMITTED_PREFIX + failure_kind
                 )
                 providers._retain_claude_macos_refreshed_credential(
                     self.review,
@@ -5265,9 +5206,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     nonlocal failed_descriptor
                     if stat.S_ISREG(real_fstat(descriptor).st_mode):
                         failed_descriptor = descriptor
-                        raise OSError(
-                            "injected pre-rename carrier close failure"
-                        )
+                        raise OSError("injected pre-rename carrier close failure")
                     real_close(descriptor)
 
                 try:
@@ -5308,10 +5247,8 @@ class ProviderPolicyTest(unittest.TestCase):
                     if failed_descriptor is not None:
                         real_close(failed_descriptor)
 
-                cleanup_artifact = (
-                    self.assert_cleanup_only_macos_recovery_artifact(
-                        raised.exception
-                    )
+                cleanup_artifact = self.assert_cleanup_only_macos_recovery_artifact(
+                    raised.exception
                 )
                 self.assertTrue(cleanup_artifact.is_relative_to(pending))
                 self.assertTrue(pending.is_dir())
@@ -5328,9 +5265,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     oauth_credential_fixture(expires_in_seconds=7200)
                 )
                 credential_bytes = bytes(credential)
-                recovery_root = providers._claude_macos_recovery_root(
-                    self.review
-                )
+                recovery_root = providers._claude_macos_recovery_root(self.review)
                 pending = recovery_root / (
                     providers.CLAUDE_MACOS_DURABLE_STAGE_PENDING_PREFIX
                     + "post-"
@@ -5361,9 +5296,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     nonlocal read_calls
                     read_calls += 1
                     if read_calls == 2 and failure_kind == "read":
-                        raise OSError(
-                            "injected post-rename carrier read failure"
-                        )
+                        raise OSError("injected post-rename carrier read failure")
                     return real_read(review, carrier)
 
                 def fail_post_rename_close(descriptor: int) -> None:
@@ -5372,9 +5305,7 @@ class ProviderPolicyTest(unittest.TestCase):
                         regular_close_count += 1
                         if regular_close_count == 2:
                             failed_descriptor = descriptor
-                            raise OSError(
-                                "injected post-rename carrier close failure"
-                            )
+                            raise OSError("injected post-rename carrier close failure")
                     real_close(descriptor)
 
                 try:
@@ -5433,17 +5364,13 @@ class ProviderPolicyTest(unittest.TestCase):
     def test_durable_stage_post_rename_payload_mismatch_is_cleanup_only(
         self,
     ) -> None:
-        credential = bytearray(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        credential = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
         recovery_root = providers._claude_macos_recovery_root(self.review)
         pending = recovery_root / (
-            providers.CLAUDE_MACOS_DURABLE_STAGE_PENDING_PREFIX
-            + "post-mismatch"
+            providers.CLAUDE_MACOS_DURABLE_STAGE_PENDING_PREFIX + "post-mismatch"
         )
         committed = recovery_root / (
-            providers.CLAUDE_MACOS_DURABLE_STAGE_COMMITTED_PREFIX
-            + "post-mismatch"
+            providers.CLAUDE_MACOS_DURABLE_STAGE_COMMITTED_PREFIX + "post-mismatch"
         )
         providers._retain_claude_macos_refreshed_credential(
             self.review,
@@ -5488,9 +5415,7 @@ class ProviderPolicyTest(unittest.TestCase):
             self.assertEqual(read_calls, 2)
             self.assertFalse(pending.exists())
             self.assertEqual(
-                self.assert_cleanup_only_macos_recovery_artifact(
-                    raised.exception
-                ),
+                self.assert_cleanup_only_macos_recovery_artifact(raised.exception),
                 committed,
             )
         finally:
@@ -5758,9 +5683,7 @@ class ProviderPolicyTest(unittest.TestCase):
         artifact = pathlib.Path(artifact_value)
         self.assertEqual(artifact.parent, config)
         self.assertTrue(
-            artifact.name.startswith(
-                providers.CLAUDE_MACOS_RECOVERY_UPDATE_PREFIX
-            )
+            artifact.name.startswith(providers.CLAUDE_MACOS_RECOVERY_UPDATE_PREFIX)
         )
         self.assertEqual(artifact.read_bytes(), refreshed_bytes)
         self.assertEqual(
@@ -5779,9 +5702,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
     def test_tampered_complete_recovery_temp_is_cleanup_only(self) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
-        refreshed = bytearray(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
         tampered = bytearray(refreshed)
         tampered[-1] = ord("]")
         original_bytes = bytes(original)
@@ -5855,9 +5776,7 @@ class ProviderPolicyTest(unittest.TestCase):
             self.review,
             failure,
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertNotIn("recovery_artifact", report["authentication"])
         self.assertEqual(
             report["authentication"]["recovery_cleanup_artifact"],
@@ -5870,9 +5789,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self,
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
-        refreshed = bytearray(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
         original_bytes = bytes(original)
         carrier = providers._retain_claude_macos_refreshed_credential(
             self.review,
@@ -6052,9 +5969,7 @@ class ProviderPolicyTest(unittest.TestCase):
             self.review,
             failure,
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertNotIn("recovery_artifact", report["authentication"])
         self.assertEqual(
             report["authentication"]["recovery_cleanup_artifact"],
@@ -6170,9 +6085,7 @@ class ProviderPolicyTest(unittest.TestCase):
         def broker(_credential, _capability, *, update_callback=None, **_kwargs):
             assert update_callback is not None
             self.assertTrue(update_callback(first))
-            recovery_root = providers._claude_macos_recovery_root(
-                self.review
-            )
+            recovery_root = providers._claude_macos_recovery_root(self.review)
             first_carriers = sorted(
                 recovery_root.glob(
                     f"{providers.CLAUDE_MACOS_DURABLE_STAGE_COMMITTED_PREFIX}*"
@@ -6181,9 +6094,7 @@ class ProviderPolicyTest(unittest.TestCase):
             self.assertEqual(len(first_carriers), 1)
             self.assertEqual(
                 (
-                    first_carriers[0]
-                    / "config"
-                    / providers.CLAUDE_CREDENTIAL_FILE_NAME
+                    first_carriers[0] / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
                 ).read_bytes(),
                 bytes(first),
             )
@@ -6251,9 +6162,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
         first = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
-        second_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        second_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
         second_value["claudeAiOauth"]["refreshToken"] = (
             "fixture-failed-new-durable-generation-refresh-value"
         )
@@ -6309,9 +6218,7 @@ class ProviderPolicyTest(unittest.TestCase):
             nonlocal first_carrier
             assert update_callback is not None
             self.assertTrue(update_callback(first))
-            recovery_root = providers._claude_macos_recovery_root(
-                self.review
-            )
+            recovery_root = providers._claude_macos_recovery_root(self.review)
             acknowledged = sorted(
                 recovery_root.glob(
                     f"{providers.CLAUDE_MACOS_DURABLE_STAGE_COMMITTED_PREFIX}*"
@@ -6323,9 +6230,7 @@ class ProviderPolicyTest(unittest.TestCase):
             assert first_carrier is not None
             self.assertEqual(
                 (
-                    first_carrier
-                    / "config"
-                    / providers.CLAUDE_CREDENTIAL_FILE_NAME
+                    first_carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
                 ).read_bytes(),
                 bytes(first),
             )
@@ -6386,16 +6291,12 @@ class ProviderPolicyTest(unittest.TestCase):
         invalidate_latest: bool,
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
-        failed_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=3600)
-        )
+        failed_value = json.loads(oauth_credential_fixture(expires_in_seconds=3600))
         failed_value["claudeAiOauth"]["refreshToken"] = (
             "fixture-earlier-verified-failure-refresh"
         )
         failed = bytearray(json.dumps(failed_value).encode())
-        latest_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        latest_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
         latest_value["claudeAiOauth"]["refreshToken"] = (
             "fixture-latest-success-after-verified-failure"
         )
@@ -6461,9 +6362,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 carrier
                 for carrier in carriers
                 if (
-                    carrier
-                    / "config"
-                    / providers.CLAUDE_CREDENTIAL_FILE_NAME
+                    carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
                 ).read_bytes()
                 == latest_bytes
             )
@@ -6554,9 +6453,7 @@ class ProviderPolicyTest(unittest.TestCase):
         third_bytes = bytes(third)
         generation_cap = 3
         byte_cap = (
-            len(first)
-            + len(second)
-            + providers.CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES
+            len(first) + len(second) + providers.CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES
         )
         selected = providers._ClaudeLocalCredential(
             source="macos-keychain",
@@ -6597,12 +6494,8 @@ class ProviderPolicyTest(unittest.TestCase):
                 terminal_claim_calls += 1
                 return True
 
-            self.assertTrue(
-                update_callback(first, commit_pending, claim_terminal)
-            )
-            self.assertTrue(
-                update_callback(second, commit_pending, claim_terminal)
-            )
+            self.assertTrue(update_callback(first, commit_pending, claim_terminal))
+            self.assertTrue(update_callback(second, commit_pending, claim_terminal))
             recovery_root = providers._claude_macos_recovery_root(self.review)
             carriers = sorted(
                 recovery_root.glob(
@@ -6612,17 +6505,13 @@ class ProviderPolicyTest(unittest.TestCase):
             self.assertEqual(len(carriers), 2)
             self.assertEqual(
                 (
-                    carriers[0]
-                    / "config"
-                    / providers.CLAUDE_CREDENTIAL_FILE_NAME
+                    carriers[0] / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
                 ).read_bytes(),
                 bytes(first),
             )
             self.assertEqual(
                 (
-                    carriers[1]
-                    / "config"
-                    / providers.CLAUDE_CREDENTIAL_FILE_NAME
+                    carriers[1] / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
                 ).read_bytes(),
                 second_bytes,
             )
@@ -6632,9 +6521,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 if candidate == second_bytes
             ]
             self.assertEqual(len(staged_copies), 1)
-            self.assertFalse(
-                update_callback(third, commit_pending, claim_terminal)
-            )
+            self.assertFalse(update_callback(third, commit_pending, claim_terminal))
             self.assertEqual(
                 staged_copies[0],
                 b"\x00" * len(second_bytes),
@@ -6648,11 +6535,9 @@ class ProviderPolicyTest(unittest.TestCase):
             self.assertLessEqual(len(carriers), generation_cap)
             self.assertLessEqual(
                 sum(
-                    (
-                        carrier
-                        / "config"
-                        / providers.CLAUDE_CREDENTIAL_FILE_NAME
-                    ).stat().st_size
+                    (carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME)
+                    .stat()
+                    .st_size
                     for carrier in carriers
                 ),
                 byte_cap,
@@ -6661,9 +6546,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 third_bytes,
                 [
                     (
-                        carrier
-                        / "config"
-                        / providers.CLAUDE_CREDENTIAL_FILE_NAME
+                        carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
                     ).read_bytes()
                     for carrier in carriers
                 ],
@@ -6737,19 +6620,11 @@ class ProviderPolicyTest(unittest.TestCase):
         self,
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
-        first_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=3600)
-        )
-        first_value["claudeAiOauth"]["refreshToken"] = (
-            "fixture-lock-free-proof-first"
-        )
+        first_value = json.loads(oauth_credential_fixture(expires_in_seconds=3600))
+        first_value["claudeAiOauth"]["refreshToken"] = "fixture-lock-free-proof-first"
         first = bytearray(json.dumps(first_value).encode())
-        second_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
-        second_value["claudeAiOauth"]["refreshToken"] = (
-            "fixture-lock-free-proof-second"
-        )
+        second_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
+        second_value["claudeAiOauth"]["refreshToken"] = "fixture-lock-free-proof-second"
         second = bytearray(json.dumps(second_value).encode())
         selected = providers._ClaudeLocalCredential(
             source="macos-keychain",
@@ -6982,20 +6857,14 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertNotIn(latest_carrier, complete_carriers)
         recovery_root = providers._claude_macos_recovery_root(self.review)
         self.assertEqual(list(recovery_root.iterdir()), [latest_carrier])
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_carrier"],
             str(latest_carrier),
         )
         self.assertEqual(
             report["authentication"]["recovery_artifact"],
-            str(
-                latest_carrier
-                / "config"
-                / providers.CLAUDE_CREDENTIAL_FILE_NAME
-            ),
+            str(latest_carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME),
         )
         self.assertNotIn(
             "recovery_cleanup_artifact",
@@ -7034,10 +6903,15 @@ class ProviderPolicyTest(unittest.TestCase):
             *,
             expected_digest: bytes,
         ) -> providers._ClaudeRetainedCredentialProof:
-            if fail_capture and complete_carriers and artifact == (
-                complete_carriers[-1]
-                / "config"
-                / providers.CLAUDE_CREDENTIAL_FILE_NAME
+            if (
+                fail_capture
+                and complete_carriers
+                and artifact
+                == (
+                    complete_carriers[-1]
+                    / "config"
+                    / providers.CLAUDE_CREDENTIAL_FILE_NAME
+                )
             ):
                 raise OSError("injected current proof capture failure")
             return real_capture(
@@ -7068,15 +6942,11 @@ class ProviderPolicyTest(unittest.TestCase):
             )
             self.assertEqual(len(all_carriers), 4)
             terminal_carrier = next(
-                carrier
-                for carrier in all_carriers
-                if carrier not in complete_carriers
+                carrier for carrier in all_carriers if carrier not in complete_carriers
             )
             complete_carriers.append(terminal_carrier)
             latest_artifact = (
-                terminal_carrier
-                / "config"
-                / providers.CLAUDE_CREDENTIAL_FILE_NAME
+                terminal_carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
             )
             replacement = latest_artifact.with_name("replacement.json")
             replacement.write_bytes(updates[3])
@@ -7165,9 +7035,7 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
             str(recovery_root),
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertNotIn("recovery_carrier", report["authentication"])
         self.assertNotIn("recovery_artifact", report["authentication"])
         self.assertEqual(
@@ -7303,20 +7171,14 @@ class ProviderPolicyTest(unittest.TestCase):
             sorted(recovery_root.iterdir()),
             [complete_carriers[0], latest_carrier],
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_carrier"],
             str(latest_carrier),
         )
         self.assertEqual(
             report["authentication"]["recovery_artifact"],
-            str(
-                latest_carrier
-                / "config"
-                / providers.CLAUDE_CREDENTIAL_FILE_NAME
-            ),
+            str(latest_carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME),
         )
         self.assertEqual(
             report["authentication"]["recovery_cleanup_artifact"],
@@ -7334,15 +7196,11 @@ class ProviderPolicyTest(unittest.TestCase):
 
         for label, interruption in interruptions:
             with self.subTest(interruption=label):
-                original = bytearray(
-                    oauth_credential_fixture(expires_in_seconds=-60)
-                )
+                original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
                 updates: list[bytearray] = []
                 for generation in range(1, 5):
                     value = json.loads(
-                        oauth_credential_fixture(
-                            expires_in_seconds=3600 * generation
-                        )
+                        oauth_credential_fixture(expires_in_seconds=3600 * generation)
                     )
                     value["claudeAiOauth"]["refreshToken"] = (
                         f"fixture-non-staged-control-flow-{label}-{generation}"
@@ -7354,9 +7212,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     payload=original,
                     expires_at_ms=0,
                     carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
-                        keychain_digest=(
-                            providers._claude_credential_digest(original)
-                        ),
+                        keychain_digest=(providers._claude_credential_digest(original)),
                         file_digest=None,
                         file_snapshot=None,
                     ),
@@ -7372,18 +7228,13 @@ class ProviderPolicyTest(unittest.TestCase):
                     **_kwargs,
                 ):
                     assert update_callback is not None
-                    recovery_root = providers._claude_macos_recovery_root(
-                        self.review
-                    )
+                    recovery_root = providers._claude_macos_recovery_root(self.review)
                     before = set(recovery_root.glob("claude-carrier-*"))
                     for update in updates[:3]:
                         self.assertTrue(update_callback(update))
                     self.assertFalse(update_callback(updates[3]))
                     staged_carriers.extend(
-                        sorted(
-                            set(recovery_root.glob("claude-carrier-*"))
-                            - before
-                        )
+                        sorted(set(recovery_root.glob("claude-carrier-*")) - before)
                     )
                     self.assertEqual(len(staged_carriers), 4)
                     for update in updates:
@@ -7441,9 +7292,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 self.assertTrue(staged_carriers[2].is_dir())
                 self.assertTrue(staged_carriers[3].is_dir())
                 persist.assert_not_called()
-                recovery_root = providers._claude_macos_recovery_root(
-                    self.review
-                )
+                recovery_root = providers._claude_macos_recovery_root(self.review)
                 self.assertEqual(
                     getattr(
                         raised.exception,
@@ -7563,9 +7412,7 @@ class ProviderPolicyTest(unittest.TestCase):
             "_codex_claude_retained_cleanup_artifact",
         ):
             self.assertIsNone(getattr(raised.exception, attribute, None))
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertNotIn("recovery_artifact", report["authentication"])
         self.assertNotIn("recovery_cleanup_artifact", report["authentication"])
 
@@ -7593,9 +7440,7 @@ class ProviderPolicyTest(unittest.TestCase):
         @contextlib.contextmanager
         def broker(_credential, _capability, *, update_callback=None, **_kwargs):
             assert update_callback is not None
-            callback_results.extend(
-                update_callback(update) for update in updates
-            )
+            callback_results.extend(update_callback(update) for update in updates)
             yield 43211
 
         common.write_json(
@@ -7667,9 +7512,7 @@ class ProviderPolicyTest(unittest.TestCase):
             "_codex_claude_retained_cleanup_artifact",
         ):
             self.assertIsNone(getattr(raised.exception, attribute, None))
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertNotIn("recovery_carrier", report["authentication"])
         self.assertNotIn("recovery_artifact", report["authentication"])
 
@@ -7921,9 +7764,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self,
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
-        refreshed = bytearray(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
         selected = providers._ClaudeLocalCredential(
             source="macos-keychain",
             payload=original,
@@ -7972,9 +7813,7 @@ class ProviderPolicyTest(unittest.TestCase):
         def track_fsync(descriptor: int) -> None:
             metadata = providers.os.fstat(descriptor)
             if stat.S_ISDIR(metadata.st_mode):
-                synchronized_directories.add(
-                    (metadata.st_dev, metadata.st_ino)
-                )
+                synchronized_directories.add((metadata.st_dev, metadata.st_ino))
             real_fsync(descriptor)
 
         def track_fullfsync(descriptor: int, command: int) -> int:
@@ -7982,9 +7821,7 @@ class ProviderPolicyTest(unittest.TestCase):
             self.assertEqual(command, 51)
             metadata = providers.os.fstat(descriptor)
             if stat.S_ISDIR(metadata.st_mode):
-                full_synced_directories.add(
-                    (metadata.st_dev, metadata.st_ino)
-                )
+                full_synced_directories.add((metadata.st_dev, metadata.st_ino))
             elif stat.S_ISREG(metadata.st_mode):
                 full_synced_regular_files += 1
             return 0
@@ -7996,12 +7833,8 @@ class ProviderPolicyTest(unittest.TestCase):
         def commit_pending(publish: Callable[[], bool]) -> bool:
             nonlocal publication_checks
             publication_checks += 1
-            self.assertTrue(
-                required_identities.issubset(synchronized_directories)
-            )
-            self.assertTrue(
-                required_identities.issubset(full_synced_directories)
-            )
+            self.assertTrue(required_identities.issubset(synchronized_directories))
+            self.assertTrue(required_identities.issubset(full_synced_directories))
             self.assertGreaterEqual(full_synced_regular_files, 1)
             return publish()
 
@@ -8014,9 +7847,7 @@ class ProviderPolicyTest(unittest.TestCase):
             **_kwargs: object,
         ):
             assert update_callback is not None
-            callback_results.append(
-                update_callback(refreshed, commit_pending)
-            )
+            callback_results.append(update_callback(refreshed, commit_pending))
             yield 43211
 
         common.write_json(
@@ -8088,12 +7919,10 @@ class ProviderPolicyTest(unittest.TestCase):
         ):
             with self.subTest(failure_kind=failure_kind):
                 pending = recovery_root / (
-                    providers.CLAUDE_MACOS_DURABLE_STAGE_PENDING_PREFIX
-                    + failure_kind
+                    providers.CLAUDE_MACOS_DURABLE_STAGE_PENDING_PREFIX + failure_kind
                 )
                 committed = recovery_root / (
-                    providers.CLAUDE_MACOS_DURABLE_STAGE_COMMITTED_PREFIX
-                    + failure_kind
+                    providers.CLAUDE_MACOS_DURABLE_STAGE_COMMITTED_PREFIX + failure_kind
                 )
                 providers._retain_claude_macos_refreshed_credential(
                     self.review,
@@ -8319,15 +8148,12 @@ class ProviderPolicyTest(unittest.TestCase):
         for failure_kind in ("swapped", "loop"):
             with self.subTest(failure_kind=failure_kind):
                 fixture_root = (
-                    self.review.source_root.parent
-                    / f"durable-ancestor-{failure_kind}"
+                    self.review.source_root.parent / f"durable-ancestor-{failure_kind}"
                 )
                 lexical_parent = fixture_root / "workspace-anchor"
                 lexical_source = lexical_parent / "source"
                 lexical_container = (
-                    lexical_source
-                    / ".codex-tmp"
-                    / "isolated-review-symlink-fixture"
+                    lexical_source / ".codex-tmp" / "isolated-review-symlink-fixture"
                 )
                 fixture_root.mkdir(mode=0o700)
                 if failure_kind == "swapped":
@@ -8375,9 +8201,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     )
 
                 if alternate_container is not None:
-                    self.assertFalse(
-                        (alternate_container / "claude-runtime").exists()
-                    )
+                    self.assertFalse((alternate_container / "claude-runtime").exists())
                 credential[:] = b"\x00" * len(credential)
 
     def test_durable_ancestor_fsync_failure_nacks_before_publication(
@@ -8391,20 +8215,14 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         for failed_path in required_paths:
             with self.subTest(path=failed_path.name):
-                original = bytearray(
-                    oauth_credential_fixture(expires_in_seconds=-60)
-                )
-                refreshed = bytearray(
-                    oauth_credential_fixture(expires_in_seconds=7200)
-                )
+                original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+                refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
                 selected = providers._ClaudeLocalCredential(
                     source="macos-keychain",
                     payload=original,
                     expires_at_ms=0,
                     carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
-                        keychain_digest=providers._claude_credential_digest(
-                            original
-                        ),
+                        keychain_digest=providers._claude_credential_digest(original),
                         file_digest=None,
                         file_snapshot=None,
                     ),
@@ -8438,9 +8256,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     **_kwargs: object,
                 ):
                     assert update_callback is not None
-                    callback_results.append(
-                        update_callback(refreshed, commit_pending)
-                    )
+                    callback_results.append(update_callback(refreshed, commit_pending))
                     yield 43211
 
                 common.write_json(
@@ -8492,16 +8308,13 @@ class ProviderPolicyTest(unittest.TestCase):
     def test_durable_stage_byte_quota_exact_boundary_and_plus_one(
         self,
     ) -> None:
-        refreshed = bytearray(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
         refreshed_bytes = bytes(refreshed)
 
         for label, byte_limit, accepted in (
             (
                 "exact",
-                providers.CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES
-                + len(refreshed_bytes),
+                providers.CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES + len(refreshed_bytes),
                 True,
             ),
             (
@@ -8513,17 +8326,13 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
         ):
             with self.subTest(label=label):
-                original = bytearray(
-                    oauth_credential_fixture(expires_in_seconds=-60)
-                )
+                original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
                 selected = providers._ClaudeLocalCredential(
                     source="macos-keychain",
                     payload=original,
                     expires_at_ms=0,
                     carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
-                        keychain_digest=providers._claude_credential_digest(
-                            original
-                        ),
+                        keychain_digest=providers._claude_credential_digest(original),
                         file_digest=None,
                         file_snapshot=None,
                     ),
@@ -8543,9 +8352,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     yield 43211
 
                 updated_snapshot = providers._ClaudeMacOSCarrierSnapshot(
-                    keychain_digest=providers._claude_credential_digest(
-                        refreshed
-                    ),
+                    keychain_digest=providers._claude_credential_digest(refreshed),
                     file_digest=None,
                     file_snapshot=None,
                 )
@@ -8577,9 +8384,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     mock.patch.object(
                         providers,
                         "_retain_claude_macos_refreshed_credential",
-                        wraps=(
-                            providers._retain_claude_macos_refreshed_credential
-                        ),
+                        wraps=(providers._retain_claude_macos_refreshed_credential),
                     ) as retain,
                     mock.patch.object(
                         providers,
@@ -8717,9 +8522,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         first = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
         second = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
-        third_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=10800)
-        )
+        third_value = json.loads(oauth_credential_fixture(expires_in_seconds=10800))
         third_value["claudeAiOauth"]["refreshToken"] = (
             "fixture-latest-cleanup-refresh-value"
         )
@@ -8737,9 +8540,7 @@ class ProviderPolicyTest(unittest.TestCase):
             is_recovery_update = (
                 len(args) >= 2
                 and isinstance(args[0], str)
-                and args[0].startswith(
-                    providers.CLAUDE_MACOS_RECOVERY_UPDATE_PREFIX
-                )
+                and args[0].startswith(providers.CLAUDE_MACOS_RECOVERY_UPDATE_PREFIX)
                 and args[1] == providers.CLAUDE_CREDENTIAL_FILE_NAME
             )
             if is_recovery_update:
@@ -8790,9 +8591,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 self.review,
                 failure,
             )
-            report = common.read_json(
-                self.review.container_dir / "claude-runtime.json"
-            )
+            report = common.read_json(self.review.container_dir / "claude-runtime.json")
             self.assertEqual(
                 report["authentication"]["recovery_artifact"],
                 str(artifact),
@@ -8875,9 +8674,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         for failure_kind in ("stale-fsync", "config-close"):
             with self.subTest(failure_kind=failure_kind):
-                original = bytearray(
-                    oauth_credential_fixture(expires_in_seconds=3600)
-                )
+                original = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
                 updated_value = json.loads(
                     oauth_credential_fixture(expires_in_seconds=7200)
                 )
@@ -8915,9 +8712,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     if stat.S_ISDIR(real_fstat(descriptor).st_mode):
                         directory_fsyncs += 1
                         if directory_fsyncs == 2:
-                            raise OSError(
-                                "injected post-commit stale fsync failure"
-                            )
+                            raise OSError("injected post-commit stale fsync failure")
                     real_fsync(descriptor)
 
                 def track_config_open(
@@ -8952,9 +8747,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     ):
                         close_failed = True
                         failed_descriptor = descriptor
-                        raise OSError(
-                            "injected post-commit config close failure"
-                        )
+                        raise OSError("injected post-commit config close failure")
                     real_close(descriptor)
 
                 try:
@@ -9006,9 +8799,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     if failed_descriptor is not None:
                         real_close(failed_descriptor)
 
-                current = (
-                    config_dir / providers.CLAUDE_CREDENTIAL_FILE_NAME
-                )
+                current = config_dir / providers.CLAUDE_CREDENTIAL_FILE_NAME
                 self.assertEqual(current.read_bytes(), bytes(updated))
                 self.assertEqual(
                     providers._validated_claude_retained_credential_artifact(
@@ -9197,21 +8988,15 @@ class ProviderPolicyTest(unittest.TestCase):
 
         for label, interruption in interruptions:
             with self.subTest(interruption=label):
-                original = bytearray(
-                    oauth_credential_fixture(expires_in_seconds=-60)
-                )
-                refreshed = bytearray(
-                    oauth_credential_fixture(expires_in_seconds=7200)
-                )
+                original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+                refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
                 refreshed_bytes = bytes(refreshed)
                 selected = providers._ClaudeLocalCredential(
                     source="macos-keychain",
                     payload=original,
                     expires_at_ms=0,
                     carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
-                        keychain_digest=providers._claude_credential_digest(
-                            original
-                        ),
+                        keychain_digest=providers._claude_credential_digest(original),
                         file_digest=None,
                         file_snapshot=None,
                     ),
@@ -9619,9 +9404,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
         first = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
-        latest_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        latest_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
         latest_value["claudeAiOauth"]["refreshToken"] = (
             "fixture-malformed-successor-latest-refresh"
         )
@@ -9695,20 +9478,14 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(latest_carrier, complete_carriers[-1])
         recovery_root = providers._claude_macos_recovery_root(self.review)
         self.assertEqual(list(recovery_root.iterdir()), [latest_carrier])
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_carrier"],
             str(latest_carrier),
         )
         self.assertEqual(
             report["authentication"]["recovery_artifact"],
-            str(
-                latest_carrier
-                / "config"
-                / providers.CLAUDE_CREDENTIAL_FILE_NAME
-            ),
+            str(latest_carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME),
         )
 
     def test_failed_new_generation_cleans_unreported_complete_carriers(
@@ -9823,20 +9600,14 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(latest_carrier, complete_carriers[-1])
         recovery_root = providers._claude_macos_recovery_root(self.review)
         self.assertEqual(list(recovery_root.iterdir()), [latest_carrier])
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_carrier"],
             str(latest_carrier),
         )
         self.assertEqual(
             report["authentication"]["recovery_artifact"],
-            str(
-                latest_carrier
-                / "config"
-                / providers.CLAUDE_CREDENTIAL_FILE_NAME
-            ),
+            str(latest_carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME),
         )
         self.assertNotIn(
             "recovery_cleanup_artifact",
@@ -9915,9 +9686,7 @@ class ProviderPolicyTest(unittest.TestCase):
             providers._retained_claude_macos_credential_error(
                 candidate,
                 raised.exception,
-                expected_digest=providers._claude_credential_digest(
-                    credential
-                ),
+                expected_digest=providers._claude_credential_digest(credential),
             ),
             expected,
         )
@@ -10021,10 +9790,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 )
                 setattr(
                     error,
-                    (
-                        "_codex_claude_keychain_handler_"
-                        "quiescence_unproven"
-                    ),
+                    ("_codex_claude_keychain_handler_quiescence_unproven"),
                     True,
                 )
                 raise
@@ -10064,9 +9830,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 False,
             )
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["refresh_persistence"],
             "failed-after-attempt",
@@ -10077,9 +9841,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
         first = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
-        latest_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        latest_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
         latest_value["claudeAiOauth"]["refreshToken"] = (
             "fixture-unquiescent-prior-journal-latest"
         )
@@ -10112,9 +9874,7 @@ class ProviderPolicyTest(unittest.TestCase):
             self.assertTrue(update_callback(first))
             self.assertTrue(update_callback(latest))
             recovery_root = providers._claude_macos_recovery_root(self.review)
-            staged_carriers.extend(
-                sorted(recovery_root.glob("claude-carrier-*"))
-            )
+            staged_carriers.extend(sorted(recovery_root.glob("claude-carrier-*")))
             self.assertEqual(len(staged_carriers), 2)
             quiescence_callbacks.abandon()
             recovery_error = quiescence_callbacks.recover(None)
@@ -10187,9 +9947,7 @@ class ProviderPolicyTest(unittest.TestCase):
             sorted(recovery_root.glob("claude-carrier-*")),
             staged_carriers,
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_carrier"],
             str(latest_carrier),
@@ -10204,9 +9962,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
         first = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
-        second_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        second_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
         second_value["claudeAiOauth"]["refreshToken"] = (
             "fixture-completed-journal-timeout-second"
         )
@@ -10271,17 +10027,13 @@ class ProviderPolicyTest(unittest.TestCase):
             self.assertTrue(update_callback(first))
             self.assertTrue(update_callback(second))
             recovery_root = providers._claude_macos_recovery_root(self.review)
-            staged_carriers.extend(
-                sorted(recovery_root.glob("claude-carrier-*"))
-            )
+            staged_carriers.extend(sorted(recovery_root.glob("claude-carrier-*")))
             self.assertEqual(len(staged_carriers), 2)
             quiescence_callbacks.abandon()
-            timeout_error = (
-                providers._bounded_claude_keychain_quiescence_recovery(
-                    quiescence_callbacks,
-                    bytearray(replacement),
-                    already_abandoned=True,
-                )
+            timeout_error = providers._bounded_claude_keychain_quiescence_recovery(
+                quiescence_callbacks,
+                bytearray(replacement),
+                already_abandoned=True,
             )
             self.assertTrue(replace_started.is_set())
             self.assertIsNotNone(timeout_error)
@@ -10363,11 +10115,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(immediate_state["carrier"], str(latest_carrier))
         self.assertEqual(
             immediate_state["artifact"],
-            str(
-                latest_carrier
-                / "config"
-                / providers.CLAUDE_CREDENTIAL_FILE_NAME
-            ),
+            str(latest_carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME),
         )
         self.assertEqual(immediate_state["cleanup"], str(recovery_root))
         self.assertEqual(len(recovery_threads), 1)
@@ -10379,9 +10127,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
         first = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
-        second_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        second_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
         second_value["claudeAiOauth"]["refreshToken"] = (
             "fixture-recovery-proof-timeout-second"
         )
@@ -10411,9 +10157,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 providers.ClaudeCredentialInspectionInconclusive(
                     "injected post-commit recovery failure"
                 ),
-                expected_digest=providers._claude_credential_digest(
-                    credential
-                ),
+                expected_digest=providers._claude_credential_digest(credential),
             )
 
         @contextlib.contextmanager
@@ -10494,9 +10238,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
         first = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
-        second_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        second_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
         second_value["claudeAiOauth"]["refreshToken"] = (
             "fixture-recovery-temp-proof-timeout-second"
         )
@@ -10523,9 +10265,7 @@ class ProviderPolicyTest(unittest.TestCase):
         ) -> None:
             if (
                 isinstance(source, str)
-                and source.startswith(
-                    providers.CLAUDE_MACOS_RECOVERY_UPDATE_PREFIX
-                )
+                and source.startswith(providers.CLAUDE_MACOS_RECOVERY_UPDATE_PREFIX)
                 and destination == providers.CLAUDE_CREDENTIAL_FILE_NAME
             ):
                 raise OSError("injected recovery temporary rename failure")
@@ -10623,9 +10363,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self,
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
-        refreshed = bytearray(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
         selected = providers._ClaudeLocalCredential(
             source="macos-keychain",
             payload=original,
@@ -10650,9 +10388,7 @@ class ProviderPolicyTest(unittest.TestCase):
         ):
             assert quiescence_callbacks is not None
             quiescence_callbacks.abandon()
-            recovery_error = quiescence_callbacks.recover(
-                bytearray(refreshed)
-            )
+            recovery_error = quiescence_callbacks.recover(bytearray(refreshed))
             self.assertIsNotNone(recovery_error)
             assert recovery_error is not None
             captured["recovery"] = recovery_error
@@ -10720,9 +10456,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
     def test_timeout_reproof_failure_keeps_root_cleanup_scope(self) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
-        refreshed = bytearray(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
         replacement = oauth_credential_fixture(expires_in_seconds=10800)
         selected = providers._ClaudeLocalCredential(
             source="macos-keychain",
@@ -10748,9 +10482,7 @@ class ProviderPolicyTest(unittest.TestCase):
         ):
             assert quiescence_callbacks is not None
             quiescence_callbacks.abandon()
-            recovery_error = quiescence_callbacks.recover(
-                bytearray(refreshed)
-            )
+            recovery_error = quiescence_callbacks.recover(bytearray(refreshed))
             self.assertIsNotNone(recovery_error)
             assert recovery_error is not None
             recovery_proof = providers._get_claude_retained_credential_proof(
@@ -10758,9 +10490,7 @@ class ProviderPolicyTest(unittest.TestCase):
             )
             self.assertIsNotNone(recovery_proof)
             assert recovery_proof is not None
-            replacement_path = recovery_proof.artifact.with_name(
-                "replacement.json"
-            )
+            replacement_path = recovery_proof.artifact.with_name("replacement.json")
             replacement_path.write_bytes(replacement)
             replacement_path.chmod(0o600)
             os.replace(replacement_path, recovery_proof.artifact)
@@ -10827,9 +10557,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
         first = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
-        second_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        second_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
         second_value["claudeAiOauth"]["refreshToken"] = (
             "fixture-inflight-exact-proof-second"
         )
@@ -10862,10 +10590,7 @@ class ProviderPolicyTest(unittest.TestCase):
             event: providers._ClaudeThreadEvent,
             timeout: float | None = None,
         ) -> bool:
-            if (
-                threading.current_thread() is recovery_thread
-                and not event.is_set()
-            ):
+            if threading.current_thread() is recovery_thread and not event.is_set():
                 recovery_wait_started.set()
             return real_event_wait(event, timeout)
 
@@ -10886,17 +10611,13 @@ class ProviderPolicyTest(unittest.TestCase):
             if commit_calls == 2:
                 second_commit_ready.set()
                 if not release_second_commit.wait(timeout=2.0):
-                    raise RuntimeError(
-                        "fixture second durable commit was not released"
-                    )
+                    raise RuntimeError("fixture second durable commit was not released")
                 raise providers._retained_claude_macos_credential_error(
                     committed_carrier,
                     providers.ClaudeCredentialInspectionInconclusive(
                         "injected second post-commit failure"
                     ),
-                    expected_digest=providers._claude_credential_digest(
-                        credential
-                    ),
+                    expected_digest=providers._claude_credential_digest(credential),
                 )
             return committed_carrier
 
@@ -11012,9 +10733,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self,
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
-        refreshed = bytearray(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
         refreshed_digest = providers._claude_credential_digest(refreshed)
         selected = providers._ClaudeLocalCredential(
             source="macos-keychain",
@@ -11040,11 +10759,8 @@ class ProviderPolicyTest(unittest.TestCase):
             *args: object,
             **kwargs: object,
         ) -> None:
-            if (
-                isinstance(source, str)
-                and source.startswith(
-                    providers.CLAUDE_MACOS_DURABLE_STAGE_PENDING_PREFIX
-                )
+            if isinstance(source, str) and source.startswith(
+                providers.CLAUDE_MACOS_DURABLE_STAGE_PENDING_PREFIX
             ):
                 rename_started.set()
                 if not release_rename.wait(timeout=2.0):
@@ -11129,9 +10845,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIs(raised.exception, captured["recovery"])
         self.assertEqual(callback_results, [False])
         self.assertEqual(callback_errors, [])
-        proof = providers._get_claude_retained_credential_proof(
-            captured["recovery"]
-        )
+        proof = providers._get_claude_retained_credential_proof(captured["recovery"])
         self.assertIsNotNone(proof)
         assert proof is not None
         self.assertEqual(proof.digest, refreshed_digest)
@@ -11154,9 +10868,7 @@ class ProviderPolicyTest(unittest.TestCase):
         persist_credential: mock.Mock,
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
-        refreshed = bytearray(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
         refreshed_bytes = bytes(refreshed)
         select_credential.return_value = providers._ClaudeLocalCredential(
             source="macos-keychain",
@@ -11231,17 +10943,12 @@ class ProviderPolicyTest(unittest.TestCase):
                 finally:
                     release_commit.set()
                     callback_thread.join(timeout=2.0)
-                shutdown_error = (
-                    providers.ClaudeCredentialInspectionInconclusive(
-                        "fixture handler quiescence failure"
-                    )
+                shutdown_error = providers.ClaudeCredentialInspectionInconclusive(
+                    "fixture handler quiescence failure"
                 )
                 setattr(
                     shutdown_error,
-                    (
-                        "_codex_claude_keychain_handler_"
-                        "quiescence_unproven"
-                    ),
+                    ("_codex_claude_keychain_handler_quiescence_unproven"),
                     True,
                 )
                 if recovery_error is not None:
@@ -11295,9 +11002,7 @@ class ProviderPolicyTest(unittest.TestCase):
             sorted(recovery_root.glob("claude-carrier-*")),
             [reported],
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_carrier"],
             str(reported),
@@ -11480,9 +11185,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 providers.ClaudeCredentialInspectionInconclusive(
                     "injected post-commit finishing failure"
                 ),
-                expected_digest=providers._claude_credential_digest(
-                    credential
-                ),
+                expected_digest=providers._claude_credential_digest(credential),
             )
 
         @contextlib.contextmanager
@@ -11591,9 +11294,7 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
             str(recovery_root),
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_cleanup_artifact"],
             str(recovery_root),
@@ -11622,10 +11323,7 @@ class ProviderPolicyTest(unittest.TestCase):
         writer: threading.Thread | None = None
         writer_errors: list[BaseException] = []
         real_commit = providers._commit_claude_macos_durable_stage
-        real_abandon = (
-            providers._ClaudeKeychainCredentialServer
-            .try_abandon_and_detach_pending_update
-        )
+        real_abandon = providers._ClaudeKeychainCredentialServer.try_abandon_and_detach_pending_update
 
         def blocking_commit(
             review: providers.ReviewWorkspace,
@@ -11716,15 +11414,9 @@ class ProviderPolicyTest(unittest.TestCase):
                     {},
                     self.claude_refresh_lock_protocol,
                 ) as runtime_env:
-                    port = int(
-                        runtime_env[
-                            providers.CLAUDE_KEYCHAIN_BROKER_PORT_ENV
-                        ]
-                    )
+                    port = int(runtime_env[providers.CLAUDE_KEYCHAIN_BROKER_PORT_ENV])
                     capability = bytes.fromhex(
-                        runtime_env[
-                            providers.CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV
-                        ]
+                        runtime_env[providers.CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV]
                     )
                     with socket.create_connection(
                         ("127.0.0.1", port),
@@ -11793,10 +11485,7 @@ class ProviderPolicyTest(unittest.TestCase):
         writer: threading.Thread | None = None
         writer_responses: list[bytes] = []
         real_commit = providers._commit_claude_macos_durable_stage
-        real_detach = (
-            providers._ClaudeKeychainCredentialServer
-            .try_abandon_and_detach_pending_update
-        )
+        real_detach = providers._ClaudeKeychainCredentialServer.try_abandon_and_detach_pending_update
         detach_calls = 0
 
         def blocking_commit(
@@ -11895,15 +11584,9 @@ class ProviderPolicyTest(unittest.TestCase):
                     {},
                     self.claude_refresh_lock_protocol,
                 ) as runtime_env:
-                    port = int(
-                        runtime_env[
-                            providers.CLAUDE_KEYCHAIN_BROKER_PORT_ENV
-                        ]
-                    )
+                    port = int(runtime_env[providers.CLAUDE_KEYCHAIN_BROKER_PORT_ENV])
                     capability = bytes.fromhex(
-                        runtime_env[
-                            providers.CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV
-                        ]
+                        runtime_env[providers.CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV]
                     )
                     with socket.create_connection(
                         ("127.0.0.1", port),
@@ -12117,15 +11800,9 @@ class ProviderPolicyTest(unittest.TestCase):
                     {},
                     self.claude_refresh_lock_protocol,
                 ) as runtime_env:
-                    port = int(
-                        runtime_env[
-                            providers.CLAUDE_KEYCHAIN_BROKER_PORT_ENV
-                        ]
-                    )
+                    port = int(runtime_env[providers.CLAUDE_KEYCHAIN_BROKER_PORT_ENV])
                     capability = bytes.fromhex(
-                        runtime_env[
-                            providers.CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV
-                        ]
+                        runtime_env[providers.CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV]
                     )
                     with socket.create_connection(
                         ("127.0.0.1", port),
@@ -12184,9 +11861,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertNotIn(b"\x00", writer_responses)
         persist.assert_not_called()
         recovery_root = providers._claude_macos_recovery_root(self.review)
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_cleanup_artifact"],
             str(recovery_root),
@@ -12261,11 +11936,9 @@ class ProviderPolicyTest(unittest.TestCase):
             try:
                 yield 43211
             finally:
-                recovery_error = (
-                    providers._bounded_claude_keychain_quiescence_recovery(
-                        quiescence_callbacks,
-                        bytearray(refreshed_bytes),
-                    )
+                recovery_error = providers._bounded_claude_keychain_quiescence_recovery(
+                    quiescence_callbacks,
+                    bytearray(refreshed_bytes),
                 )
                 self.assertTrue(recovery_started.is_set())
                 failure = providers.ClaudeCredentialInspectionInconclusive(
@@ -12273,10 +11946,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 )
                 setattr(
                     failure,
-                    (
-                        "_codex_claude_keychain_handler_"
-                        "quiescence_unproven"
-                    ),
+                    ("_codex_claude_keychain_handler_quiescence_unproven"),
                     True,
                 )
                 if recovery_error is not None:
@@ -12309,9 +11979,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     "Thread",
                     side_effect=tracking_thread,
                 ),
-                self.assertRaises(
-                    providers.ClaudeCredentialInspectionInconclusive
-                ),
+                self.assertRaises(providers.ClaudeCredentialInspectionInconclusive),
             ):
                 with self.claude_keychain_runtime(
                     self.review,
@@ -12328,9 +11996,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertFalse(recovery_threads[0].is_alive())
         persist_credential.assert_not_called()
         recovery_root = providers._claude_macos_recovery_root(self.review)
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         authentication = report["authentication"]
         reported_paths = tuple(
             pathlib.Path(value)
@@ -12363,9 +12029,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
         first = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
-        second_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        second_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
         second_value["claudeAiOauth"]["refreshToken"] = (
             "fixture-late-existing-replacement-refresh"
         )
@@ -12455,11 +12119,9 @@ class ProviderPolicyTest(unittest.TestCase):
             try:
                 yield 43211
             finally:
-                recovery_error = (
-                    providers._bounded_claude_keychain_quiescence_recovery(
-                        quiescence_callbacks,
-                        bytearray(second_bytes),
-                    )
+                recovery_error = providers._bounded_claude_keychain_quiescence_recovery(
+                    quiescence_callbacks,
+                    bytearray(second_bytes),
                 )
                 self.assertTrue(replace_started.is_set())
                 failure = providers.ClaudeCredentialInspectionInconclusive(
@@ -12467,10 +12129,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 )
                 setattr(
                     failure,
-                    (
-                        "_codex_claude_keychain_handler_"
-                        "quiescence_unproven"
-                    ),
+                    ("_codex_claude_keychain_handler_quiescence_unproven"),
                     True,
                 )
                 if recovery_error is not None:
@@ -12541,9 +12200,7 @@ class ProviderPolicyTest(unittest.TestCase):
             sorted(recovery_root.glob("claude-carrier-*")),
             [reported],
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_carrier"],
             str(reported),
@@ -12633,9 +12290,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 None,
             )
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertNotIn("recovery_carrier", report["authentication"])
         self.assertNotIn("recovery_artifact", report["authentication"])
         persist_credential.assert_not_called()
@@ -12650,9 +12305,7 @@ class ProviderPolicyTest(unittest.TestCase):
         persist_credential: mock.Mock,
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
-        refreshed = bytearray(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
         creation_error = providers.ClaudeCredentialInspectionInconclusive(
             "injected durable stage creation failure"
         )
@@ -12724,9 +12377,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 None,
             )
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertNotIn("recovery_carrier", report["authentication"])
         self.assertNotIn("recovery_artifact", report["authentication"])
         recovery_root = providers._claude_macos_recovery_root(self.review)
@@ -12750,9 +12401,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
         first = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
-        latest_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        latest_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
         latest_value["claudeAiOauth"]["refreshToken"] = (
             "fixture-latest-carrier-reverify"
         )
@@ -12791,9 +12440,7 @@ class ProviderPolicyTest(unittest.TestCase):
             )
             self.assertEqual(len(staged_carriers), 2)
             latest_credential = (
-                staged_carriers[-1]
-                / "config"
-                / providers.CLAUDE_CREDENTIAL_FILE_NAME
+                staged_carriers[-1] / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
             )
             latest_credential.write_bytes(first)
             yield 43211
@@ -12849,9 +12496,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 None,
             )
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_cleanup_artifact"],
             str(recovery_root),
@@ -12875,9 +12520,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
         first = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
-        latest_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        latest_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
         latest_value["claudeAiOauth"]["refreshToken"] = (
             "fixture-latest-carrier-ordering"
         )
@@ -13023,12 +12666,8 @@ class ProviderPolicyTest(unittest.TestCase):
 
         for label, interruption in interruptions:
             with self.subTest(interruption=label):
-                original = bytearray(
-                    oauth_credential_fixture(expires_in_seconds=-60)
-                )
-                first = bytearray(
-                    oauth_credential_fixture(expires_in_seconds=3600)
-                )
+                original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+                first = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
                 second_value = json.loads(
                     oauth_credential_fixture(expires_in_seconds=7200)
                 )
@@ -13036,23 +12675,19 @@ class ProviderPolicyTest(unittest.TestCase):
                     f"fixture-cleanup-control-flow-{label}"
                 )
                 second = bytearray(json.dumps(second_value).encode())
-                select_credential.return_value = (
-                    providers._ClaudeLocalCredential(
-                        source="macos-keychain",
-                        payload=original,
-                        expires_at_ms=0,
-                        carrier_snapshot=(
-                            providers._ClaudeMacOSCarrierSnapshot(
-                                keychain_digest=(
-                                    providers._claude_credential_digest(
-                                        original
-                                    )
-                                ),
-                                file_digest=None,
-                                file_snapshot=None,
-                            )
-                        ),
-                    )
+                select_credential.return_value = providers._ClaudeLocalCredential(
+                    source="macos-keychain",
+                    payload=original,
+                    expires_at_ms=0,
+                    carrier_snapshot=(
+                        providers._ClaudeMacOSCarrierSnapshot(
+                            keychain_digest=(
+                                providers._claude_credential_digest(original)
+                            ),
+                            file_digest=None,
+                            file_snapshot=None,
+                        )
+                    ),
                 )
                 staged_carriers: list[pathlib.Path] = []
 
@@ -13065,9 +12700,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     **_kwargs: object,
                 ):
                     assert update_callback is not None
-                    recovery_root = providers._claude_macos_recovery_root(
-                        self.review
-                    )
+                    recovery_root = providers._claude_macos_recovery_root(self.review)
                     before = set(
                         recovery_root.glob(
                             f"{providers.CLAUDE_MACOS_DURABLE_STAGE_COMMITTED_PREFIX}*"
@@ -13089,9 +12722,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
                 credential_server.side_effect = broker
                 updated_snapshot = providers._ClaudeMacOSCarrierSnapshot(
-                    keychain_digest=providers._claude_credential_digest(
-                        second
-                    ),
+                    keychain_digest=providers._claude_credential_digest(second),
                     file_digest=None,
                     file_snapshot=None,
                 )
@@ -13178,9 +12809,7 @@ class ProviderPolicyTest(unittest.TestCase):
             for update in updates:
                 self.assertTrue(update_callback(update))
             staged_carriers.extend(
-                sorted(
-                    set(recovery_root.glob("claude-carrier-*")) - before
-                )
+                sorted(set(recovery_root.glob("claude-carrier-*")) - before)
             )
             self.assertEqual(len(staged_carriers), 4)
             for update in updates:
@@ -13241,9 +12870,7 @@ class ProviderPolicyTest(unittest.TestCase):
             latest_bytes,
         )
         self.assertEqual(latest_carrier, staged_carriers[-1])
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertIn(
             "recovery_cleanup_artifact",
             report["authentication"],
@@ -13293,9 +12920,7 @@ class ProviderPolicyTest(unittest.TestCase):
                         carrier_snapshot=(
                             providers._ClaudeMacOSCarrierSnapshot(
                                 keychain_digest=(
-                                    providers._claude_credential_digest(
-                                        original
-                                    )
+                                    providers._claude_credential_digest(original)
                                 ),
                                 file_digest=None,
                                 file_snapshot=None,
@@ -13334,9 +12959,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     ):
                         assert update_callback is not None
                         recovery_root = real_recovery_root(self.review)
-                        before = set(
-                            recovery_root.glob("claude-carrier-*")
-                        )
+                        before = set(recovery_root.glob("claude-carrier-*"))
                         expected_results = (
                             (True, True, True, True)
                             if cleanup_mode == "staged"
@@ -13347,12 +12970,7 @@ class ProviderPolicyTest(unittest.TestCase):
                         )
                         self.assertEqual(actual_results, expected_results)
                         staged_carriers.extend(
-                            sorted(
-                                set(
-                                    recovery_root.glob("claude-carrier-*")
-                                )
-                                - before
-                            )
+                            sorted(set(recovery_root.glob("claude-carrier-*")) - before)
                         )
                         self.assertEqual(
                             len(staged_carriers),
@@ -13450,8 +13068,8 @@ class ProviderPolicyTest(unittest.TestCase):
             scope_interruption: BaseException,
         ) -> None:
             with self.subTest(
-                    abandoned_primary=abandoned_primary,
-                    interruption=label,
+                abandoned_primary=abandoned_primary,
+                interruption=label,
             ):
                 marked_primary = (
                     providers.ClaudeCredentialInspectionInconclusive(
@@ -13466,15 +13084,11 @@ class ProviderPolicyTest(unittest.TestCase):
                         "_codex_claude_refresh_persistence_failed",
                         True,
                     )
-                original = bytearray(
-                    oauth_credential_fixture(expires_in_seconds=-60)
-                )
+                original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
                 updates: list[bytearray] = []
                 for generation in range(1, 5):
                     value = json.loads(
-                        oauth_credential_fixture(
-                            expires_in_seconds=3600 * generation
-                        )
+                        oauth_credential_fixture(expires_in_seconds=3600 * generation)
                     )
                     value["claudeAiOauth"]["refreshToken"] = (
                         f"fixture-multi-path-scope-{label}-{generation}"
@@ -13485,9 +13099,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     payload=original,
                     expires_at_ms=0,
                     carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
-                        keychain_digest=(
-                            providers._claude_credential_digest(original)
-                        ),
+                        keychain_digest=(providers._claude_credential_digest(original)),
                         file_digest=None,
                         file_snapshot=None,
                     ),
@@ -13520,9 +13132,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     remove_calls += 1
                     if remove_calls > 2:
                         return
-                    cleanup_error = OSError(
-                        f"injected cleanup failure {remove_calls}"
-                    )
+                    cleanup_error = OSError(f"injected cleanup failure {remove_calls}")
                     providers._mark_claude_macos_recovery_cleanup_artifact(
                         cleanup_error,
                         carrier,
@@ -13552,10 +13162,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     for update in updates:
                         self.assertTrue(update_callback(update))
                     staged_carriers.extend(
-                        sorted(
-                            set(recovery_root.glob("claude-carrier-*"))
-                            - before
-                        )
+                        sorted(set(recovery_root.glob("claude-carrier-*")) - before)
                     )
                     self.assertEqual(len(staged_carriers), 4)
                     try:
@@ -13565,9 +13172,7 @@ class ProviderPolicyTest(unittest.TestCase):
                             raise marked_primary
 
                 updated_snapshot = providers._ClaudeMacOSCarrierSnapshot(
-                    keychain_digest=providers._claude_credential_digest(
-                        updates[-1]
-                    ),
+                    keychain_digest=providers._claude_credential_digest(updates[-1]),
                     file_digest=None,
                     file_snapshot=None,
                 )
@@ -13714,10 +13319,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 )
                 setattr(
                     failure,
-                    (
-                        "_codex_claude_keychain_handler_"
-                        "quiescence_unproven"
-                    ),
+                    ("_codex_claude_keychain_handler_quiescence_unproven"),
                     True,
                 )
                 if persistence_error is not None:
@@ -13821,9 +13423,7 @@ class ProviderPolicyTest(unittest.TestCase):
         persist_credential.assert_called_once()
         notes = getattr(primary, "__notes__", ())
         if notes:
-            self.assertTrue(
-                any("persistence also failed" in note for note in notes)
-            )
+            self.assertTrue(any("persistence also failed" in note for note in notes))
         carrier = self.assert_macos_recovery_carrier(
             primary,
             refreshed_bytes,
@@ -14150,9 +13750,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
     def test_keychain_write_forwarded_signal_is_not_reconciled(self) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=60))
-        refreshed_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=3600)
-        )
+        refreshed_value = json.loads(oauth_credential_fixture(expires_in_seconds=3600))
         refreshed_value["claudeAiOauth"]["refreshToken"] = (
             "fixture-keychain-forwarded-signal-refresh"
         )
@@ -14284,8 +13882,8 @@ class ProviderPolicyTest(unittest.TestCase):
                     ),
                 )
                 refreshed_digest = providers._claude_credential_digest(refreshed)
-                refreshed_refresh_digest = (
-                    providers._claude_credential_refresh_digest(refreshed)
+                refreshed_refresh_digest = providers._claude_credential_refresh_digest(
+                    refreshed
                 )
                 partial_snapshot = providers._ClaudeMacOSCarrierSnapshot(
                     keychain_digest=carrier_snapshot.keychain_digest,
@@ -15570,6 +15168,33 @@ class ProviderPolicyTest(unittest.TestCase):
                 self.assertEqual(attempt.reason, reason)
                 self.assertIsNone(attempt.final_text)
 
+    def test_exact_auth_rejects_raw_line_breaks_before_normalization(self) -> None:
+        model = providers.CLAUDE_MODELS[0]
+        for index, separator in enumerate(("\r", "\n", "\r\n"), start=190):
+            payload = {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "result": f"Not logged in - please{separator}run /login",
+                "modelUsage": {model: {}},
+            }
+            encoded = json.dumps(payload).encode()
+            with self.subTest(separator=repr(separator)):
+                shape = providers._claude_auth_warmup_output_shape(encoded)
+                self.assertFalse(shape["result_matches_known_auth_message"])
+                self.assertIsNone(
+                    providers._claude_supported_failure_category(
+                        encoded,
+                        requested_model=model,
+                    )
+                )
+                attempt = self.record_claude_result(encoded, index=index)
+                self.assertEqual(attempt.category, "inconclusive")
+                self.assertEqual(
+                    attempt.reason,
+                    "unverified-auth-failure-envelope",
+                )
+
     def test_success_subtype_error_cannot_authorize_auth_fallback(self) -> None:
         model = providers.CLAUDE_MODELS[0]
         payload = {
@@ -15955,6 +15580,47 @@ class ProviderPolicyTest(unittest.TestCase):
                     index=index,
                 )
                 self.assertEqual(attempt.category, "entitlement")
+
+    def test_entitlement_rejects_present_non_string_code(self) -> None:
+        model = providers.CLAUDE_MODELS[0]
+        for index, fields in enumerate(
+            (
+                {
+                    "error": {
+                        "code": 500,
+                        "message": "Model is not available for your account plan",
+                    }
+                },
+                {
+                    "code": 500,
+                    "error": {
+                        "message": "Model is not available for your account plan",
+                    },
+                },
+            ),
+            start=193,
+        ):
+            payload = {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                **fields,
+                "modelUsage": {model: {}},
+            }
+            encoded = json.dumps(payload).encode()
+            with self.subTest(fields=fields):
+                self.assertIsNone(
+                    providers._claude_supported_failure_category(
+                        encoded,
+                        requested_model=model,
+                    )
+                )
+                attempt = self.record_claude_result(encoded, index=index)
+                self.assertEqual(attempt.category, "inconclusive")
+                self.assertEqual(
+                    attempt.reason,
+                    "unverified-entitlement-failure-envelope",
+                )
 
     def test_explicit_model_code_rejects_non_neutral_result_and_multiline_text(
         self,
@@ -17602,9 +17268,9 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertEqual(outcome.returncode, 75)
         copilot_attempt.assert_not_called()
-        runner_error = (
-            self.review.container_dir / "runner-error.txt"
-        ).read_text(encoding="utf-8")
+        runner_error = (self.review.container_dir / "runner-error.txt").read_text(
+            encoding="utf-8"
+        )
         self.assertIn("trust policy evidence write was inconclusive", runner_error)
         self.assertNotIn(private_detail, runner_error)
 
@@ -18263,6 +17929,36 @@ class ProviderPolicyTest(unittest.TestCase):
         copilot_attempt.assert_not_called()
         self.assertIn(
             "inconclusive",
+            (self.review.container_dir / "runner-error.txt").read_text(
+                encoding="utf-8"
+            ),
+        )
+
+    @mock.patch.object(providers, "child_environment", return_value={})
+    @mock.patch.object(providers, "_copilot_attempt")
+    @mock.patch.object(
+        providers,
+        "resolve_reviewer_executable",
+        side_effect=providers.ClaudeExecutableInspectionInconclusive(
+            "reviewer executable candidate ENOENT involves a symlink"
+        ),
+    )
+    def test_automatic_dangling_claude_candidate_refuses_copilot_fallback(
+        self,
+        _resolve: mock.Mock,
+        copilot_attempt: mock.Mock,
+        _environment: mock.Mock,
+    ) -> None:
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="claude",
+            egress_consent="double-review",
+        )
+
+        self.assertEqual(outcome.returncode, 75)
+        copilot_attempt.assert_not_called()
+        self.assertIn(
+            "ENOENT involves a symlink",
             (self.review.container_dir / "runner-error.txt").read_text(
                 encoding="utf-8"
             ),
@@ -18945,10 +18641,8 @@ class ProviderPolicyTest(unittest.TestCase):
         _resolve_claude: mock.Mock,
         _environment: mock.Mock,
     ) -> None:
-        claude_attempt.side_effect = (
-            providers.ClaudeCredentialInspectionInconclusive(
-                "credential source changed while it was read"
-            )
+        claude_attempt.side_effect = providers.ClaudeCredentialInspectionInconclusive(
+            "credential source changed while it was read"
         )
 
         outcome = providers.run_review(
@@ -19000,9 +18694,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     else:
                         client.chmod(0o600)
                     providers._read_claude_keychain_credential(self.review)
-                    raise AssertionError(
-                        "late Keychain inspection unexpectedly passed"
-                    )
+                    raise AssertionError("late Keychain inspection unexpectedly passed")
 
                 with (
                     mock.patch.object(
@@ -19628,16 +19320,12 @@ class ProviderPolicyTest(unittest.TestCase):
     def test_automatic_claude_trust_tool_unavailable_reports_evidence_failure(
         self,
     ) -> None:
-        class LegacyClaudeTrustToolUnavailable(
-            providers.ClaudeTrustToolUnavailable
-        ):
+        class LegacyClaudeTrustToolUnavailable(providers.ClaudeTrustToolUnavailable):
             add_note = None
 
         private_detail = "private automatic terminal evidence write detail"
         trust_error = self.trust_tool_failure_with_terminal_evidence_write_failure(
-            LegacyClaudeTrustToolUnavailable(
-                "fixed trust export tool is unavailable"
-            ),
+            LegacyClaudeTrustToolUnavailable("fixed trust export tool is unavailable"),
             private_detail=private_detail,
         )
         copilot_result = self.attempt(
@@ -21466,14 +21154,12 @@ class ProviderPolicyTest(unittest.TestCase):
             "_append_attempt_diagnostic",
             side_effect=OSError("attempt diagnostic unavailable"),
         ):
-            failure = (
-                providers._claude_auth_rejection_after_credential_inspection(
-                    review=self.review,
-                    index=1,
-                    model=model,
-                    completed=completed,
-                    inspection_error=inspection_error,
-                )
+            failure = providers._claude_auth_rejection_after_credential_inspection(
+                review=self.review,
+                index=1,
+                model=model,
+                completed=completed,
+                inspection_error=inspection_error,
             )
 
         self.assertIsInstance(
@@ -21635,9 +21321,7 @@ class ProviderPolicyTest(unittest.TestCase):
             try:
                 yield mock.Mock(argv=("sandbox",), env={})
             finally:
-                lifecycle_states.append(
-                    (writer_started(), writer_quiescent())
-                )
+                lifecycle_states.append((writer_started(), writer_quiescent()))
 
         def timeout_after_spawn(*_args: object, **kwargs: object) -> None:
             on_process_started = kwargs.get("on_process_started")
@@ -21699,9 +21383,7 @@ class ProviderPolicyTest(unittest.TestCase):
             try:
                 yield mock.Mock(argv=("sandbox",), env={})
             finally:
-                lifecycle_states.append(
-                    (writer_started(), writer_quiescent())
-                )
+                lifecycle_states.append((writer_started(), writer_quiescent()))
 
         with (
             mock.patch.object(providers, "_is_claude_linux_host", return_value=True),
@@ -21768,9 +21450,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
         assert diagnostic is not None
         self.assertIn(str(carrier), diagnostic)
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_carrier"],
             str(carrier),
@@ -21987,9 +21667,7 @@ class ProviderPolicyTest(unittest.TestCase):
         assert error.detail is not None
         self.assertIn("review process group stopped", error.detail)
         self.assertIn(str(carrier), error.detail)
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_carrier"],
             str(carrier),
@@ -22020,9 +21698,7 @@ class ProviderPolicyTest(unittest.TestCase):
             providers.CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC,
         )
         self.assertEqual(error.detail, diagnostic)
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["refresh_persistence"],
             "failed-after-attempt",
@@ -22033,11 +21709,9 @@ class ProviderPolicyTest(unittest.TestCase):
         self,
     ) -> None:
         lock_path = pathlib.Path("/fixture/.claude/.oauth_refresh.lock")
-        cleanup_error = (
-            claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
-                "helper-owned lock paths may remain at "
-                f"{lock_path}; confirm that no writer is active before cleanup"
-            )
+        cleanup_error = claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+            "helper-owned lock paths may remain at "
+            f"{lock_path}; confirm that no writer is active before cleanup"
         )
 
         @contextlib.contextmanager
@@ -22101,6 +21775,7 @@ class ProviderPolicyTest(unittest.TestCase):
             "SSL_CERT_FILE": "/helper/proxy-ca.pem",
         }
         proxy_ssl_context = mock.Mock(spec=ssl.SSLContext)
+        proxy_tls_snapshot_sha256 = (("SSL_CERT_FILE", -1, "", "0" * 64),)
         tls_inputs: list[dict[str, str]] = []
 
         def prepare_tls(
@@ -22129,9 +21804,7 @@ class ProviderPolicyTest(unittest.TestCase):
             try:
                 yield staged
             finally:
-                lifecycle_exit_states.append(
-                    (writer_started(), writer_quiescent())
-                )
+                lifecycle_exit_states.append((writer_started(), writer_quiescent()))
 
         def stage_once(*_args: object, **kwargs: object):
             writer_started = kwargs.get("writer_started")
@@ -22260,7 +21933,17 @@ class ProviderPolicyTest(unittest.TestCase):
                 mock.patch.object(
                     providers,
                     "_prepare_claude_proxy_tls_environment",
-                    return_value=(proxy_tls_env, proxy_ssl_context),
+                    return_value=(
+                        proxy_tls_env,
+                        proxy_ssl_context,
+                        proxy_tls_snapshot_sha256,
+                    ),
+                )
+            )
+            verify_proxy_tls = stack.enter_context(
+                mock.patch.object(
+                    providers,
+                    "_verify_claude_proxy_tls_snapshot",
                 )
             )
             stack.enter_context(
@@ -22310,6 +21993,10 @@ class ProviderPolicyTest(unittest.TestCase):
             self.assertEqual(final_text, "No findings.")
             self.assertEqual(recorded_attempts, list(attempts))
             prepare_proxy_tls.assert_called_once()
+            verify_proxy_tls.assert_called_once_with(
+                proxy_tls_env,
+                proxy_tls_snapshot_sha256,
+            )
             self.assertEqual(len(tls_inputs), len(providers.CLAUDE_MODELS))
             self.assertTrue(
                 all(
@@ -22372,7 +22059,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 {"ANTHROPIC_API_KEY": "test-only"},
             )
 
-    def test_claude_linux_runtime_rejects_proxy_env_without_tls_context(
+    def test_claude_linux_runtime_rejects_https_proxy_without_tls_context(
         self,
     ) -> None:
         with self.assertRaisesRegex(
@@ -22384,9 +22071,40 @@ class ProviderPolicyTest(unittest.TestCase):
                 pathlib.Path("/verified/claude"),
                 {},
                 (),
-                proxy_env={"SSL_CERT_FILE": "/helper/proxy-ca.pem"},
+                proxy_env={"HTTPS_PROXY": "https://proxy.example.test"},
             ):
                 self.fail("Linux runtime accepted proxy state without its TLS context")
+
+    def test_direct_and_http_proxy_paths_do_not_require_tls_context(self) -> None:
+        cases = (
+            ("direct", {}),
+            ("http-proxy", {"HTTPS_PROXY": "http://proxy.example.test"}),
+        )
+
+        for name, proxy_env in cases:
+            with self.subTest(name=name):
+                self.assertFalse(providers._claude_https_proxy_tls_required(proxy_env))
+                with (
+                    mock.patch.object(
+                        providers,
+                        "_claude_linux_host",
+                        side_effect=providers.ClaudeProbeSandboxUnavailable(
+                            "advanced past proxy TLS preflight"
+                        ),
+                    ),
+                    self.assertRaisesRegex(
+                        providers.ClaudeProbeSandboxUnavailable,
+                        "advanced past proxy TLS preflight",
+                    ),
+                ):
+                    with providers._claude_linux_review_runtime(
+                        self.review,
+                        pathlib.Path("/verified/claude"),
+                        {},
+                        (),
+                        proxy_env=proxy_env,
+                    ):
+                        self.fail("Linux runtime unexpectedly started")
 
     def test_claude_linux_final_workspace_inspection_is_inconclusive(self) -> None:
         host = mock.Mock()
@@ -23087,10 +22805,8 @@ class ProviderPolicyTest(unittest.TestCase):
         executable = self.review.container_dir / "verified-executable-acl-io"
         executable.write_bytes(b"publisher-verified-snapshot")
         executable.chmod(0o500)
-        self.acl_check.side_effect = (
-            providers.ClaudeExecutableInspectionInconclusive(
-                "snapshot ACL inspection unavailable"
-            )
+        self.acl_check.side_effect = providers.ClaudeExecutableInspectionInconclusive(
+            "snapshot ACL inspection unavailable"
         )
 
         with self.assertRaisesRegex(
@@ -24008,6 +23724,75 @@ class ProviderPolicyTest(unittest.TestCase):
         resolve_claude.assert_not_called()
         run_command.assert_not_called()
 
+    def test_claude_macos_attempt_reuses_proxy_tls_snapshot_after_source_mutation(
+        self,
+    ) -> None:
+        executable = self.review.container_dir / "verified-claude"
+        executable.write_bytes(b"snapshot")
+        source = self.review.container_dir / "caller-ca.pem"
+        source_material = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+        source.write_bytes(source_material)
+        source.chmod(0o600)
+        trust_state = providers.ClaudeTrustSessionState()
+        real_proxy_tls = providers._claude_proxy_tls_environment
+
+        def snapshot_then_mutate(*args: object, **kwargs: object):
+            prepared = real_proxy_tls(*args, **kwargs)
+            source.write_bytes(b"mutated after proxy snapshot")
+            return prepared
+
+        def inspect_final_tls_input(
+            _review: ReviewWorkspace,
+            env: dict[str, str],
+            **kwargs: object,
+        ) -> dict[str, str]:
+            snapshot = pathlib.Path(env["SSL_CERT_FILE"])
+            self.assertNotEqual(snapshot, source)
+            self.assertEqual(snapshot.read_bytes(), source_material)
+            self.assertEqual(
+                kwargs["expected_snapshot_sha256"],
+                trust_state.proxy_tls_snapshot_sha256,
+            )
+            raise ReviewError("stop after TLS snapshot assertion")
+
+        with (
+            mock.patch.object(providers, "_is_claude_linux_host", return_value=False),
+            mock.patch.object(
+                providers,
+                "_with_claude_review_tool_path",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_proxy_tls_environment",
+                side_effect=snapshot_then_mutate,
+            ),
+            mock.patch.object(
+                providers,
+                "_prepare_claude_tls_environment",
+                side_effect=inspect_final_tls_input,
+            ),
+            self.assertRaisesRegex(
+                ReviewError,
+                "stop after TLS snapshot assertion",
+            ),
+        ):
+            providers._claude_attempt(
+                review=self.review,
+                model=providers.CLAUDE_MODELS[0],
+                index=1,
+                env={
+                    "ANTHROPIC_API_KEY": FIXTURES["api-key-a"],
+                    "SSL_CERT_FILE": str(source),
+                },
+                executable=executable,
+                executable_evidence=self.claude_executable_evidence,
+                trust_state=trust_state,
+            )
+
+        self.assertEqual(source.read_bytes(), b"mutated after proxy snapshot")
+        self.assertIsNotNone(trust_state.proxy_tls_snapshot_sha256)
+
     def test_claude_post_run_refresh_failure_reports_completed_attempt(self) -> None:
         executable = self.review.container_dir / "verified-claude"
         executable.write_bytes(b"snapshot")
@@ -24045,7 +23830,9 @@ class ProviderPolicyTest(unittest.TestCase):
                 "_prepare_claude_tls_environment",
                 side_effect=lambda _review, env, **_kwargs: dict(env),
             ),
-            mock.patch.object(providers, "_claude_keychain_runtime", side_effect=runtime),
+            mock.patch.object(
+                providers, "_claude_keychain_runtime", side_effect=runtime
+            ),
             mock.patch.object(
                 providers,
                 "_claude_connect_proxy",
@@ -24137,7 +23924,9 @@ class ProviderPolicyTest(unittest.TestCase):
                 "_prepare_claude_tls_environment",
                 side_effect=lambda _review, env, **_kwargs: dict(env),
             ),
-            mock.patch.object(providers, "_claude_keychain_runtime", side_effect=runtime),
+            mock.patch.object(
+                providers, "_claude_keychain_runtime", side_effect=runtime
+            ),
             mock.patch.object(
                 providers,
                 "_claude_connect_proxy",
@@ -25939,8 +25728,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
         terminal = json.loads(
             (
-                self.review.container_dir
-                / providers.CLAUDE_TRUST_POLICY_EVIDENCE_NAME
+                self.review.container_dir / providers.CLAUDE_TRUST_POLICY_EVIDENCE_NAME
             ).read_text(encoding="utf-8")
         )
         self.assertEqual(terminal["status"], "inconclusive")
@@ -26175,9 +25963,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     argv=arguments,
                     returncode=1,
                     stdout=bytearray(),
-                    stderr=bytearray(
-                        providers.CLAUDE_TRUST_NO_SETTINGS[0].encode()
-                    ),
+                    stderr=bytearray(providers.CLAUDE_TRUST_NO_SETTINGS[0].encode()),
                 )
             self.assertIn("find-certificate", arguments)
             return common.BoundedCapture(
@@ -26483,9 +26269,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     argv=arguments,
                     returncode=1,
                     stdout=bytearray(),
-                    stderr=bytearray(
-                        providers.CLAUDE_TRUST_NO_SETTINGS[0].encode()
-                    ),
+                    stderr=bytearray(providers.CLAUDE_TRUST_NO_SETTINGS[0].encode()),
                 )
             self.assertIn("find-certificate", arguments)
             raise OSError(errno.EIO, "certificate export launch failed")
@@ -26514,8 +26298,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
         terminal = json.loads(
             (
-                self.review.container_dir
-                / providers.CLAUDE_TRUST_POLICY_EVIDENCE_NAME
+                self.review.container_dir / providers.CLAUDE_TRUST_POLICY_EVIDENCE_NAME
             ).read_text(encoding="utf-8")
         )
         self.assertEqual(terminal["status"], "inconclusive")
@@ -26571,8 +26354,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
         terminal = json.loads(
             (
-                self.review.container_dir
-                / providers.CLAUDE_TRUST_POLICY_EVIDENCE_NAME
+                self.review.container_dir / providers.CLAUDE_TRUST_POLICY_EVIDENCE_NAME
             ).read_text(encoding="utf-8")
         )
         self.assertEqual(terminal["status"], "inconclusive")
@@ -26737,8 +26519,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
         terminal = json.loads(
             (
-                self.review.container_dir
-                / providers.CLAUDE_TRUST_POLICY_EVIDENCE_NAME
+                self.review.container_dir / providers.CLAUDE_TRUST_POLICY_EVIDENCE_NAME
             ).read_text(encoding="utf-8")
         )
         self.assertEqual(terminal["status"], "inconclusive")
@@ -26871,10 +26652,7 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
         )
         self.assertEqual(
-            {
-                prepared[key]
-                for key in providers.CLAUDE_TLS_REPLACEMENT_FILE_ENV_KEYS
-            },
+            {prepared[key] for key in providers.CLAUDE_TLS_REPLACEMENT_FILE_ENV_KEYS},
             {prepared["SSL_CERT_FILE"]},
         )
         self.assertNotIn("NODE_EXTRA_CA_CERTS", prepared)
@@ -26931,6 +26709,121 @@ class ProviderPolicyTest(unittest.TestCase):
                 }
             ),
         )
+
+    def test_macos_tls_rejects_mutated_proxy_snapshot_material(self) -> None:
+        system, caller, replacement = self.sample_ca_certificates(3)
+        system_path = self.review.source_root / "system-for-proxy-binding.pem"
+        caller_path = self.review.source_root / "caller-for-proxy-binding.pem"
+        self.write_private_source(system_path, system)
+        self.write_private_source(caller_path, caller)
+        proxy_env, _context, expected_snapshot = (
+            providers._prepare_claude_proxy_tls_environment(
+                self.review,
+                {"SSL_CERT_FILE": str(caller_path)},
+            )
+        )
+        pathlib.Path(proxy_env["SSL_CERT_FILE"]).write_bytes(replacement)
+        trust_state = providers.ClaudeTrustSessionState()
+
+        with (
+            mock.patch.object(providers, "CLAUDE_SYSTEM_CA_FILE", system_path),
+            mock.patch.object(
+                providers,
+                "_read_claude_trust_certificates",
+                return_value=providers.ClaudeTrustMaterial(
+                    certificates=b"",
+                    excluded_sha1_fingerprints=frozenset(),
+                    evidence={},
+                ),
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "proxy TLS snapshot changed",
+            ),
+        ):
+            self.prepare_claude_macos_tls_environment(
+                self.review,
+                proxy_env,
+                executable_evidence=self.claude_executable_evidence,
+                trust_state=trust_state,
+                expected_snapshot_sha256=expected_snapshot,
+            )
+
+        self.assertIsNone(trust_state.caller_ca_snapshot_sha256)
+        self.assertIsNone(trust_state.caller_ca_source_snapshot_sha256)
+
+    def test_macos_tls_bundle_is_read_only_and_rechecked_before_launch(self) -> None:
+        system, replacement = self.sample_ca_certificates(2)
+        system_path = self.review.source_root / "system-for-launch-recheck.pem"
+        self.write_private_source(system_path, system)
+        trust_state = providers.ClaudeTrustSessionState()
+
+        with (
+            mock.patch.object(providers, "CLAUDE_SYSTEM_CA_FILE", system_path),
+            mock.patch.object(
+                providers,
+                "_read_claude_trust_certificates",
+                return_value=providers.ClaudeTrustMaterial(
+                    certificates=b"",
+                    excluded_sha1_fingerprints=frozenset(),
+                    evidence={},
+                ),
+            ),
+        ):
+            prepared = self.prepare_claude_macos_tls_environment(
+                self.review,
+                {},
+                executable_evidence=self.claude_executable_evidence,
+                trust_state=trust_state,
+            )
+
+        bundle = pathlib.Path(prepared["SSL_CERT_FILE"])
+        self.assertEqual(stat.S_IMODE(bundle.stat().st_mode), 0o400)
+        self.require_matching_claude_macos_tls_bundle(
+            self.review,
+            prepared,
+            trust_state=trust_state,
+        )
+        alternate_bundle = self.review.container_dir / "alternate-ca-bundle.pem"
+        alternate_bundle.write_bytes(bundle.read_bytes())
+        alternate_bundle.chmod(0o400)
+        substituted = dict(prepared)
+        for key in providers.CLAUDE_TLS_REPLACEMENT_FILE_ENV_KEYS:
+            substituted[key] = str(alternate_bundle)
+        if "NODE_EXTRA_CA_CERTS" in substituted:
+            substituted["NODE_EXTRA_CA_CERTS"] = str(alternate_bundle)
+        with self.assertRaisesRegex(
+            providers.ClaudeExecutableInspectionInconclusive,
+            "bundle paths are inconsistent",
+        ):
+            self.require_matching_claude_macos_tls_bundle(
+                self.review,
+                substituted,
+                trust_state=trust_state,
+            )
+        directory_reintroduced = dict(prepared)
+        directory_reintroduced["SSL_CERT_DIR"] = str(self.review.container_dir)
+        with self.assertRaisesRegex(
+            providers.ClaudeExecutableInspectionInconclusive,
+            "bundle environment changed",
+        ):
+            self.require_matching_claude_macos_tls_bundle(
+                self.review,
+                directory_reintroduced,
+                trust_state=trust_state,
+            )
+        bundle.chmod(0o600)
+        bundle.write_bytes(replacement)
+        bundle.chmod(0o400)
+        with self.assertRaisesRegex(
+            providers.ClaudeExecutableInspectionInconclusive,
+            "changed before runtime launch",
+        ):
+            self.require_matching_claude_macos_tls_bundle(
+                self.review,
+                prepared,
+                trust_state=trust_state,
+            )
 
     def test_macos_tls_excludes_constrained_roots_from_every_input(self) -> None:
         system, excluded = self.sample_ca_certificates(2)
@@ -27096,9 +26989,7 @@ class ProviderPolicyTest(unittest.TestCase):
         cases = (
             providers.ClaudeTrustSettingsDeny("explicit deny"),
             providers.ClaudeTrustPolicyUnavailable("blocked policy"),
-            providers.ClaudeExecutableInspectionInconclusive(
-                "inspection inconclusive"
-            ),
+            providers.ClaudeExecutableInspectionInconclusive("inspection inconclusive"),
         )
 
         for primary in cases:
@@ -27135,6 +27026,74 @@ class ProviderPolicyTest(unittest.TestCase):
                 diagnostic = str(primary.__cause__)
             self.assertIn("trust policy evidence also failed to persist", diagnostic)
             self.assertNotIn(private_detail, diagnostic)
+
+    def test_terminal_trust_evidence_retry_success_clears_diagnostic(self) -> None:
+        class LegacyTrustPolicyUnavailable(providers.ClaudeTrustPolicyUnavailable):
+            add_note = None
+
+        for failure_type in (
+            providers.ClaudeTrustPolicyUnavailable,
+            LegacyTrustPolicyUnavailable,
+        ):
+            primary = failure_type("blocked policy")
+            implicit_context = RuntimeError("injected implicit context")
+            primary.__context__ = implicit_context
+            original_suppress_context = primary.__suppress_context__
+            evidence = providers._new_claude_trust_policy_evidence(
+                self.claude_executable_evidence
+            )
+            with mock.patch.object(
+                providers,
+                "_write_claude_trust_policy_evidence",
+                side_effect=(
+                    providers.ClaudeExecutableInspectionInconclusive(
+                        "private write failure"
+                    ),
+                    None,
+                ),
+            ) as write_evidence:
+                providers._terminalize_claude_trust_policy_evidence(
+                    self.review,
+                    evidence,
+                    status="blocked",
+                    unresolved_resolution="blocked",
+                    primary_error=primary,
+                )
+                self.assertEqual(
+                    providers._claude_trust_evidence_write_diagnostic(primary),
+                    providers.CLAUDE_TRUST_EVIDENCE_WRITE_DIAGNOSTIC,
+                )
+                providers._terminalize_claude_trust_policy_evidence(
+                    self.review,
+                    evidence,
+                    status="blocked",
+                    unresolved_resolution="blocked",
+                    primary_error=primary,
+                )
+
+            with self.subTest(failure_type=failure_type.__name__):
+                self.assertEqual(write_evidence.call_count, 2)
+                self.assertIsNone(
+                    providers._claude_trust_evidence_write_diagnostic(primary)
+                )
+                self.assertFalse(
+                    getattr(
+                        primary,
+                        "_codex_claude_trust_evidence_write_failed",
+                        False,
+                    )
+                )
+                self.assertIs(primary.__context__, implicit_context)
+                self.assertIs(
+                    primary.__suppress_context__,
+                    original_suppress_context,
+                )
+                self.assertTrue(
+                    providers._claude_visible_error_chain_contains(
+                        primary,
+                        implicit_context,
+                    )
+                )
 
     def test_output_limit_evidence_write_retries_preserve_legacy_diagnostic(
         self,
@@ -27567,8 +27526,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.write_private_source(source_dir / "valid.pem", certificate)
         self.write_private_source(
             source_dir / "contains no PEM certificate",
-            b"-----BEGIN "
-            + b"PRIVATE KEY-----\nfixture\n-----END PRIVATE KEY-----\n",
+            b"-----BEGIN " + b"PRIVATE KEY-----\nfixture\n-----END PRIVATE KEY-----\n",
         )
 
         with self.assertRaisesRegex(ReviewError, "contains a private key"):
@@ -28215,6 +28173,78 @@ class ProviderPolicyTest(unittest.TestCase):
                 trust_state=state,
             )
 
+    def test_caller_ca_binding_detects_ignored_raw_byte_drift(self) -> None:
+        certificate = self.sample_ca_certificate()
+        source = self.review.source_root / "caller-ca-raw-byte-binding.pem"
+        self.write_private_source(source, certificate)
+        proxy_env, _context, expected_snapshot = (
+            providers._prepare_claude_proxy_tls_environment(
+                self.review,
+                {"SSL_CERT_FILE": str(source)},
+            )
+        )
+        pathlib.Path(proxy_env["SSL_CERT_FILE"]).write_bytes(
+            certificate + b"\n# ignored by PEM extraction\n"
+        )
+
+        with self.assertRaisesRegex(
+            providers.ClaudeExecutableInspectionInconclusive,
+            "proxy TLS snapshot changed",
+        ):
+            providers._caller_ca_snapshot_material(
+                self.review,
+                proxy_env,
+                trust_state=providers.ClaudeTrustSessionState(),
+                expected_snapshot_sha256=expected_snapshot,
+            )
+
+    def test_proxy_snapshot_verification_detects_ignored_raw_byte_drift(
+        self,
+    ) -> None:
+        certificate = self.sample_ca_certificate()
+        source = self.review.source_root / "proxy-ca-raw-byte-binding.pem"
+        self.write_private_source(source, certificate)
+        proxy_env, _context, expected_snapshot = (
+            providers._prepare_claude_proxy_tls_environment(
+                self.review,
+                {"SSL_CERT_FILE": str(source)},
+            )
+        )
+        snapshot = pathlib.Path(proxy_env["SSL_CERT_FILE"])
+        snapshot.write_bytes(snapshot.read_bytes() + b"\n# ignored by PEM extraction\n")
+
+        with self.assertRaisesRegex(
+            providers.ClaudeExecutableInspectionInconclusive,
+            "proxy TLS snapshot changed",
+        ):
+            providers._verify_claude_proxy_tls_snapshot(
+                proxy_env,
+                expected_snapshot,
+            )
+
+    def test_caller_ca_binding_classifies_invalid_drift_as_inconclusive(self) -> None:
+        certificate = self.sample_ca_certificate()
+        source = self.review.source_root / "caller-ca-invalid-drift.pem"
+        self.write_private_source(source, certificate)
+        proxy_env, _context, expected_snapshot = (
+            providers._prepare_claude_proxy_tls_environment(
+                self.review,
+                {"SSL_CERT_FILE": str(source)},
+            )
+        )
+        pathlib.Path(proxy_env["SSL_CERT_FILE"]).write_bytes(b"not a certificate")
+
+        with self.assertRaisesRegex(
+            providers.ClaudeExecutableInspectionInconclusive,
+            "proxy TLS snapshot changed",
+        ):
+            providers._caller_ca_snapshot_material(
+                self.review,
+                proxy_env,
+                trust_state=providers.ClaudeTrustSessionState(),
+                expected_snapshot_sha256=expected_snapshot,
+            )
+
     def test_caller_ca_first_use_rejects_prepopulated_private_snapshot(
         self,
     ) -> None:
@@ -28276,7 +28306,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(state.caller_ca_snapshot_sha256, expected_digest)
         collect_material.assert_not_called()
 
-    def test_proxy_ca_source_is_snapshotted_once_per_review(self) -> None:
+    def test_proxy_ca_file_snapshot_mutation_blocks_reuse(self) -> None:
         certificate = self.sample_ca_certificate()
         source = self.review.source_root / "proxy-ca.pem"
         self.write_private_source(source, certificate)
@@ -28290,7 +28320,6 @@ class ProviderPolicyTest(unittest.TestCase):
         snapshot = pathlib.Path(first["SSL_CERT_FILE"])
         self.assertEqual(snapshot.read_bytes(), certificate)
         source.write_bytes(b"replacement must not become trusted")
-        snapshot.write_bytes(b"same-uid replacement must not become trusted")
         first["SSL_CERT_FILE"] = str(source)
         second, second_context = providers._claude_proxy_tls_environment(
             self.review,
@@ -28302,6 +28331,42 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(snapshot.parent.name, "claude-proxy-ca")
         self.assertEqual(second["SSL_CERT_FILE"], str(snapshot))
         self.assertIs(second_context, first_context)
+        snapshot.write_bytes(b"same-uid replacement must not become trusted")
+        with self.assertRaisesRegex(
+            providers.ClaudeExecutableInspectionInconclusive,
+            "snapshot changed between attempts",
+        ):
+            providers._claude_proxy_tls_environment(
+                self.review,
+                {"SSL_CERT_FILE": str(source)},
+                trust_state=state,
+            )
+
+    def test_proxy_ca_directory_snapshot_mutation_blocks_reuse(self) -> None:
+        certificate = self.sample_ca_certificate()
+        source = self.review.source_root / "proxy-ca-dir"
+        source.mkdir(mode=0o700)
+        self.write_private_source(source / "fixture.0", certificate)
+        state = providers.ClaudeTrustSessionState()
+
+        first, _context = providers._claude_proxy_tls_environment(
+            self.review,
+            {"SSL_CERT_DIR": str(source)},
+            trust_state=state,
+        )
+        snapshot_dir = pathlib.Path(first["SSL_CERT_DIR"])
+        snapshot_entry = snapshot_dir / "fixture.0"
+        snapshot_entry.write_bytes(b"same-uid directory mutation")
+
+        with self.assertRaisesRegex(
+            providers.ClaudeExecutableInspectionInconclusive,
+            "snapshot changed between attempts",
+        ):
+            providers._claude_proxy_tls_environment(
+                self.review,
+                {"SSL_CERT_DIR": str(source)},
+                trust_state=state,
+            )
 
     def test_caller_ca_material_is_certificate_only(self) -> None:
         certificate = self.sample_ca_certificate()
@@ -29859,6 +29924,790 @@ class ProviderPolicyTest(unittest.TestCase):
         context.load_verify_locations.assert_called_once_with(cadata="system-ca")
 
     @mock.patch.object(providers.ssl, "SSLContext")
+    def test_proxy_ssl_context_uses_default_system_ca_directory(
+        self,
+        context_type: mock.Mock,
+    ) -> None:
+        context = context_type.return_value
+        default_directory = self.review.container_dir / "system-ca-directory"
+        default_directory.mkdir()
+        snapshot_path = default_directory / "01234567.0"
+        snapshot_material = {str(snapshot_path): b"system-directory-ca"}
+
+        with (
+            mock.patch.object(providers.sys, "platform", "linux"),
+            mock.patch.object(
+                providers.ssl,
+                "get_default_verify_paths",
+                return_value=mock.Mock(
+                    openssl_cafile=None,
+                    openssl_capath=str(default_directory),
+                ),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_proxy_system_ca_directory",
+                return_value=snapshot_material,
+            ) as read_default,
+            mock.patch.object(
+                providers,
+                "_proxy_ca_subject_hashes",
+                return_value=(frozenset({"01234567"}), 1),
+            ),
+        ):
+            result = providers._proxy_ssl_context({}, snapshot_material={})
+
+        self.assertIs(result, context)
+        read_default.assert_called_once_with(default_directory)
+        context_type.assert_called_once_with(ssl.PROTOCOL_TLS_CLIENT)
+        context.load_verify_locations.assert_called_once_with(
+            cadata="system-directory-ca"
+        )
+
+    @mock.patch.object(providers.ssl, "SSLContext")
+    def test_proxy_ssl_context_uses_capath_when_cafile_is_missing(
+        self,
+        context_type: mock.Mock,
+    ) -> None:
+        context = context_type.return_value
+        missing_file = self.review.container_dir / "missing-system-ca.pem"
+        default_directory = self.review.container_dir / "system-ca-directory"
+        default_directory.mkdir()
+        snapshot_path = default_directory / "01234567.0"
+        snapshot_material = {str(snapshot_path): b"system-directory-ca"}
+
+        with (
+            mock.patch.object(providers.sys, "platform", "linux"),
+            mock.patch.object(
+                providers.ssl,
+                "get_default_verify_paths",
+                return_value=mock.Mock(
+                    openssl_cafile=str(missing_file),
+                    openssl_capath=str(default_directory),
+                ),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_proxy_system_ca_source",
+            ) as read_file,
+            mock.patch.object(
+                providers,
+                "_read_proxy_system_ca_directory",
+                return_value=snapshot_material,
+            ) as read_directory,
+            mock.patch.object(
+                providers,
+                "_proxy_ca_subject_hashes",
+                return_value=(frozenset({"01234567"}), 1),
+            ),
+        ):
+            result = providers._proxy_ssl_context({}, snapshot_material={})
+
+        self.assertIs(result, context)
+        read_file.assert_not_called()
+        read_directory.assert_called_once_with(default_directory)
+        context_type.assert_called_once_with(ssl.PROTOCOL_TLS_CLIENT)
+        context.load_verify_locations.assert_called_once_with(
+            cadata="system-directory-ca"
+        )
+
+    def test_proxy_ssl_context_capath_hard_fails_malformed_certificate_content(
+        self,
+    ) -> None:
+        missing_file = self.review.container_dir / "missing-system-ca.pem"
+        default_directory = self.review.container_dir / "system-ca-directory"
+        default_directory.mkdir()
+        indexed_certificate = default_directory / "01234567.0"
+        malformed_materials = (
+            (
+                "malformed-pem",
+                b"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n",
+            ),
+            (
+                "malformed-base64",
+                b"-----BEGIN CERTIFICATE-----\nnot-base64!\n"
+                b"-----END CERTIFICATE-----\n",
+            ),
+            (
+                "malformed-der",
+                b"-----BEGIN CERTIFICATE-----\n"
+                b"bm90LWEteDUwOS1jZXJ0aWZpY2F0ZQ==\n"
+                b"-----END CERTIFICATE-----\n",
+            ),
+        )
+
+        for name, material in malformed_materials:
+            indexed_certificate.write_bytes(material)
+            indexed_certificate.chmod(0o644)
+            with (
+                self.subTest(name=name),
+                mock.patch.object(providers.sys, "platform", "linux"),
+                mock.patch.object(
+                    providers,
+                    "_is_claude_macos_host",
+                    return_value=False,
+                ),
+                mock.patch.object(
+                    providers.ssl,
+                    "get_default_verify_paths",
+                    return_value=mock.Mock(
+                        openssl_cafile=str(missing_file),
+                        openssl_capath=str(default_directory),
+                    ),
+                ),
+                mock.patch.object(
+                    providers,
+                    "run_bounded_capture",
+                ) as run_hash,
+                self.assertRaisesRegex(
+                    ReviewError,
+                    "Claude review CA source contains an invalid certificate",
+                ) as raised,
+            ):
+                providers._proxy_ssl_context({}, snapshot_material={})
+
+            self.assertIs(type(raised.exception), ReviewError)
+            run_hash.assert_not_called()
+
+    def test_proxy_ssl_context_capath_keeps_openssl_failures_inconclusive(
+        self,
+    ) -> None:
+        missing_file = self.review.container_dir / "missing-system-ca.pem"
+        default_directory = self.review.container_dir / "system-ca-directory"
+        default_directory.mkdir()
+        indexed_certificate = default_directory / "01234567.0"
+        indexed_certificate.write_bytes(self.sample_ca_certificate())
+        indexed_certificate.chmod(0o644)
+        operational_failures = (
+            (
+                "openssl-nonzero",
+                common.BoundedCapture(
+                    argv=(),
+                    returncode=1,
+                    stdout=bytearray(),
+                    stderr=bytearray(b"bounded diagnostic"),
+                ),
+                "subject hash is inconclusive",
+            ),
+            (
+                "openssl-signal",
+                common.BoundedCapture(
+                    argv=(),
+                    returncode=-signal.SIGTERM,
+                    stdout=bytearray(),
+                    stderr=bytearray(),
+                ),
+                "subject hash is inconclusive",
+            ),
+            (
+                "io-failure",
+                OSError(errno.EIO, "injected openssl launch I/O failure"),
+                "hash tooling could not be launched",
+            ),
+            (
+                "permission-failure",
+                PermissionError(errno.EACCES, "injected openssl permission failure"),
+                "hash tooling could not be launched",
+            ),
+            (
+                "timeout",
+                providers.ReviewTimeoutError("injected openssl timeout"),
+                "subject hash timed out",
+            ),
+        )
+
+        for name, outcome, message in operational_failures:
+            run_arguments = (
+                {"side_effect": outcome}
+                if isinstance(outcome, BaseException)
+                else {"return_value": outcome}
+            )
+            with (
+                self.subTest(name=name),
+                mock.patch.object(providers.sys, "platform", "linux"),
+                mock.patch.object(
+                    providers,
+                    "_is_claude_macos_host",
+                    return_value=False,
+                ),
+                mock.patch.object(
+                    providers.ssl,
+                    "get_default_verify_paths",
+                    return_value=mock.Mock(
+                        openssl_cafile=str(missing_file),
+                        openssl_capath=str(default_directory),
+                    ),
+                ),
+                mock.patch.object(
+                    providers,
+                    "run_bounded_capture",
+                    **run_arguments,
+                ) as run_hash,
+                self.assertRaisesRegex(
+                    providers.ClaudeExecutableInspectionInconclusive,
+                    message,
+                ) as raised,
+            ):
+                providers._proxy_ssl_context({}, snapshot_material={})
+
+            run_hash.assert_called_once()
+            self.assertEqual(run_hash.call_args.kwargs["stderr_limit_bytes"], 4096)
+            if isinstance(outcome, BaseException):
+                self.assertIs(raised.exception.__cause__, outcome)
+
+    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "requires O_NOFOLLOW")
+    def test_proxy_ssl_context_rejects_missing_cafile_below_parent_symlink(
+        self,
+    ) -> None:
+        linked_parent = self.review.container_dir / "linked-cafile-parent"
+        linked_parent.symlink_to(
+            self.review.container_dir / "missing-cafile-parent",
+            target_is_directory=True,
+        )
+        missing_file = linked_parent / "missing-system-ca.pem"
+        default_directory = self.review.container_dir / "system-ca-directory"
+        default_directory.mkdir()
+
+        with (
+            mock.patch.object(providers.sys, "platform", "linux"),
+            mock.patch.object(
+                providers.ssl,
+                "get_default_verify_paths",
+                return_value=mock.Mock(
+                    openssl_cafile=str(missing_file),
+                    openssl_capath=str(default_directory),
+                ),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_proxy_system_ca_directory",
+            ) as read_directory,
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "ambiguous parent path",
+            ),
+        ):
+            providers._proxy_ssl_context({}, snapshot_material={})
+
+        read_directory.assert_not_called()
+
+    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "requires O_NOFOLLOW")
+    @mock.patch.object(providers.ssl, "SSLContext")
+    def test_proxy_ssl_context_preserves_existing_cafile_below_parent_symlink(
+        self,
+        context_type: mock.Mock,
+    ) -> None:
+        context = context_type.return_value
+        real_parent = self.review.container_dir / "real-cafile-parent"
+        real_parent.mkdir()
+        default_file = real_parent / "system-ca.pem"
+        default_file.write_bytes(b"fixture")
+        linked_parent = self.review.container_dir / "linked-cafile-parent"
+        linked_parent.symlink_to(real_parent, target_is_directory=True)
+        linked_file = linked_parent / default_file.name
+
+        with (
+            mock.patch.object(providers.sys, "platform", "linux"),
+            mock.patch.object(
+                providers.ssl,
+                "get_default_verify_paths",
+                return_value=mock.Mock(
+                    openssl_cafile=str(linked_file),
+                    openssl_capath=None,
+                ),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_proxy_system_ca_source",
+                return_value=b"system-ca",
+            ) as read_file,
+        ):
+            result = providers._proxy_ssl_context({}, snapshot_material={})
+
+        self.assertIs(result, context)
+        read_file.assert_called_once_with(linked_file)
+        context.load_verify_locations.assert_called_once_with(cadata="system-ca")
+
+    @mock.patch.object(providers.ssl, "SSLContext")
+    def test_proxy_ssl_context_rejects_cafile_parent_replacement_during_capath(
+        self,
+        context_type: mock.Mock,
+    ) -> None:
+        context = context_type.return_value
+        cafile_root = self.review.container_dir / "cafile-root"
+        cafile_root.mkdir()
+        cafile_parent = cafile_root / "cafile-parent"
+        cafile_parent.mkdir()
+        missing_file = cafile_parent / "missing-system-ca.pem"
+        replacement_parent = cafile_root / "replacement-cafile-parent"
+        replacement_parent.mkdir()
+        displaced_parent = cafile_root / "displaced-cafile-parent"
+        default_directory = self.review.container_dir / "system-ca-directory"
+        default_directory.mkdir()
+        snapshot_path = default_directory / "01234567.0"
+        snapshot_material = {str(snapshot_path): b"system-directory-ca"}
+
+        def replace_cafile_parent(_path: pathlib.Path) -> dict[str, bytes]:
+            cafile_parent.rename(displaced_parent)
+            replacement_parent.rename(cafile_parent)
+            return snapshot_material
+
+        with (
+            mock.patch.object(providers.sys, "platform", "linux"),
+            mock.patch.object(
+                providers.ssl,
+                "get_default_verify_paths",
+                return_value=mock.Mock(
+                    openssl_cafile=str(missing_file),
+                    openssl_capath=str(default_directory),
+                ),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_proxy_system_ca_directory",
+                side_effect=replace_cafile_parent,
+            ),
+            mock.patch.object(
+                providers,
+                "_proxy_ca_subject_hashes",
+                return_value=(frozenset({"01234567"}), 1),
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "parent path changed",
+            ),
+        ):
+            providers._proxy_ssl_context({}, snapshot_material={})
+
+        context.load_verify_locations.assert_called_once_with(
+            cadata="system-directory-ca"
+        )
+
+    @mock.patch.object(providers.ssl, "SSLContext")
+    def test_proxy_ssl_context_rechecks_cafile_after_capath_binding(
+        self,
+        context_type: mock.Mock,
+    ) -> None:
+        context = context_type.return_value
+        cafile_parent = self.review.container_dir / "cafile-parent"
+        cafile_parent.mkdir()
+        missing_file = cafile_parent / "missing-system-ca.pem"
+        default_directory = self.review.container_dir / "system-ca-directory"
+        default_directory.mkdir()
+        snapshot_path = default_directory / "01234567.0"
+        snapshot_material = {str(snapshot_path): b"system-directory-ca"}
+        certificate = self.sample_ca_certificate()
+
+        def create_cafile_after_binding(*, cadata: str) -> None:
+            self.assertEqual(cadata, "system-directory-ca")
+            missing_file.write_bytes(certificate)
+
+        context.load_verify_locations.side_effect = create_cafile_after_binding
+        with (
+            mock.patch.object(providers.sys, "platform", "linux"),
+            mock.patch.object(
+                providers.ssl,
+                "get_default_verify_paths",
+                return_value=mock.Mock(
+                    openssl_cafile=str(missing_file),
+                    openssl_capath=str(default_directory),
+                ),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_proxy_system_ca_directory",
+                return_value=snapshot_material,
+            ),
+            mock.patch.object(
+                providers,
+                "_proxy_ca_subject_hashes",
+                return_value=(frozenset({"01234567"}), 1),
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "appeared while the CA directory snapshot was bound",
+            ),
+        ):
+            providers._proxy_ssl_context({}, snapshot_material={})
+
+        context.load_verify_locations.assert_called_once_with(
+            cadata="system-directory-ca"
+        )
+
+    def test_proxy_ssl_context_does_not_fall_back_from_unsafe_cafile(self) -> None:
+        default_file = self.review.container_dir / "unsafe-system-ca.pem"
+        default_file.write_bytes(self.sample_ca_certificate())
+        default_file.chmod(0o666)
+        default_directory = self.review.container_dir / "system-ca-directory"
+        default_directory.mkdir()
+
+        with (
+            mock.patch.object(providers.sys, "platform", "linux"),
+            mock.patch.object(
+                providers.ssl,
+                "get_default_verify_paths",
+                return_value=mock.Mock(
+                    openssl_cafile=str(default_file),
+                    openssl_capath=str(default_directory),
+                ),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_proxy_system_ca_directory",
+            ) as read_directory,
+            self.assertRaisesRegex(ReviewError, "unsafe metadata"),
+        ):
+            providers._proxy_ssl_context({}, snapshot_material={})
+
+        read_directory.assert_not_called()
+
+    def test_proxy_ssl_context_does_not_fall_back_from_cafile_errors(self) -> None:
+        default_file = self.review.container_dir / "system-ca.pem"
+        default_file.write_bytes(b"fixture")
+        default_directory = self.review.container_dir / "system-ca-directory"
+        default_directory.mkdir()
+        permission_error = PermissionError(errno.EACCES, "denied", default_file)
+        inconclusive = providers.ClaudeExecutableInspectionInconclusive(
+            "cannot open a stable Claude proxy system CA bundle"
+        )
+        inconclusive.__cause__ = permission_error
+
+        with (
+            mock.patch.object(providers.sys, "platform", "linux"),
+            mock.patch.object(
+                providers.ssl,
+                "get_default_verify_paths",
+                return_value=mock.Mock(
+                    openssl_cafile=str(default_file),
+                    openssl_capath=str(default_directory),
+                ),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_proxy_system_ca_source",
+                side_effect=inconclusive,
+            ),
+            mock.patch.object(
+                providers,
+                "_read_proxy_system_ca_directory",
+            ) as read_directory,
+            self.assertRaises(
+                providers.ClaudeExecutableInspectionInconclusive
+            ) as raised,
+        ):
+            providers._proxy_ssl_context({}, snapshot_material={})
+
+        self.assertIs(raised.exception.__cause__, permission_error)
+        read_directory.assert_not_called()
+
+    def test_proxy_ssl_context_does_not_fall_back_from_cafile_integrity_error(
+        self,
+    ) -> None:
+        default_file = self.review.container_dir / "system-ca.pem"
+        default_file.write_bytes(b"fixture")
+        default_directory = self.review.container_dir / "system-ca-directory"
+        default_directory.mkdir()
+
+        with (
+            mock.patch.object(providers.sys, "platform", "linux"),
+            mock.patch.object(
+                providers.ssl,
+                "get_default_verify_paths",
+                return_value=mock.Mock(
+                    openssl_cafile=str(default_file),
+                    openssl_capath=str(default_directory),
+                ),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_proxy_system_ca_source",
+                side_effect=ReviewError("invalid default CA certificate"),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_proxy_system_ca_directory",
+            ) as read_directory,
+            self.assertRaisesRegex(ReviewError, "invalid default CA certificate"),
+        ):
+            providers._proxy_ssl_context({}, snapshot_material={})
+
+        read_directory.assert_not_called()
+
+    def test_proxy_ssl_context_hard_fails_malformed_default_cafile_material(
+        self,
+    ) -> None:
+        default_file = self.review.container_dir / "system-ca.pem"
+        default_file.write_bytes(b"fixture")
+        malformed_material = (
+            (
+                "non-ascii",
+                b"\xff",
+                UnicodeDecodeError,
+            ),
+            (
+                "malformed-pem",
+                b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+                ssl.SSLError,
+            ),
+        )
+
+        for name, material, expected_cause in malformed_material:
+            with (
+                self.subTest(name=name),
+                mock.patch.object(providers.sys, "platform", "linux"),
+                mock.patch.object(
+                    providers.ssl,
+                    "get_default_verify_paths",
+                    return_value=mock.Mock(
+                        openssl_cafile=str(default_file),
+                        openssl_capath=None,
+                    ),
+                ),
+                mock.patch.object(
+                    providers,
+                    "_read_proxy_system_ca_source",
+                    return_value=material,
+                ),
+                self.assertRaisesRegex(
+                    ReviewError,
+                    "Claude review CA source contains an invalid certificate",
+                ) as raised,
+            ):
+                providers._proxy_ssl_context({}, snapshot_material={})
+
+            self.assertIsInstance(raised.exception.__cause__, expected_cause)
+
+    def test_proxy_ssl_context_hard_fails_certificate_parser_errors(self) -> None:
+        default_file = self.review.container_dir / "system-ca.pem"
+        default_file.write_bytes(b"fixture")
+        certificate = self.sample_ca_certificate()
+        parser_errors = (
+            ValueError("malformed certificate encoding"),
+            ssl.SSLError("malformed certificate data"),
+        )
+
+        for parser_error in parser_errors:
+            context = mock.Mock(spec=ssl.SSLContext)
+            context.load_verify_locations.side_effect = parser_error
+            with (
+                self.subTest(error_type=type(parser_error).__name__),
+                mock.patch.object(providers.sys, "platform", "linux"),
+                mock.patch.object(
+                    providers.ssl,
+                    "get_default_verify_paths",
+                    return_value=mock.Mock(
+                        openssl_cafile=str(default_file),
+                        openssl_capath=None,
+                    ),
+                ),
+                mock.patch.object(
+                    providers,
+                    "_read_proxy_system_ca_source",
+                    return_value=certificate,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_new_proxy_ssl_context",
+                    return_value=context,
+                ),
+                self.assertRaisesRegex(
+                    ReviewError,
+                    "Claude review CA source contains an invalid certificate",
+                ) as raised,
+            ):
+                providers._proxy_ssl_context({}, snapshot_material={})
+
+            self.assertIs(raised.exception.__cause__, parser_error)
+
+    def test_proxy_ssl_context_keeps_operational_load_errors_inconclusive(
+        self,
+    ) -> None:
+        default_file = self.review.container_dir / "system-ca.pem"
+        default_file.write_bytes(b"fixture")
+        certificate = self.sample_ca_certificate()
+        operational_errors = (
+            PermissionError(errno.EACCES, "permission denied", default_file),
+            OSError(errno.EIO, "transient I/O failure", default_file),
+        )
+
+        for operational_error in operational_errors:
+            context = mock.Mock(spec=ssl.SSLContext)
+            context.load_verify_locations.side_effect = operational_error
+            with (
+                self.subTest(error_type=type(operational_error).__name__),
+                mock.patch.object(providers.sys, "platform", "linux"),
+                mock.patch.object(
+                    providers.ssl,
+                    "get_default_verify_paths",
+                    return_value=mock.Mock(
+                        openssl_cafile=str(default_file),
+                        openssl_capath=None,
+                    ),
+                ),
+                mock.patch.object(
+                    providers,
+                    "_read_proxy_system_ca_source",
+                    return_value=certificate,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_new_proxy_ssl_context",
+                    return_value=context,
+                ),
+                self.assertRaisesRegex(
+                    providers.ClaudeExecutableInspectionInconclusive,
+                    "Claude proxy CA snapshot could not be loaded",
+                ) as raised,
+            ):
+                providers._proxy_ssl_context({}, snapshot_material={})
+
+            self.assertIs(raised.exception.__cause__, operational_error)
+
+    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "requires O_NOFOLLOW")
+    @mock.patch.object(providers.ssl, "SSLContext")
+    def test_proxy_ssl_context_uses_capath_for_symlinked_default_cafile(
+        self,
+        context_type: mock.Mock,
+    ) -> None:
+        context = context_type.return_value
+        target = self.review.container_dir / "system-ca-target.pem"
+        target.write_bytes(self.sample_ca_certificate())
+        target.chmod(0o644)
+        default_file = self.review.container_dir / "system-ca.pem"
+        default_file.symlink_to(target.name)
+        default_directory = self.review.container_dir / "system-ca-directory"
+        default_directory.mkdir()
+        snapshot_path = default_directory / "01234567.0"
+        snapshot_material = {str(snapshot_path): b"system-directory-ca"}
+
+        with (
+            mock.patch.object(providers.sys, "platform", "linux"),
+            mock.patch.object(
+                providers.ssl,
+                "get_default_verify_paths",
+                return_value=mock.Mock(
+                    openssl_cafile=str(default_file),
+                    openssl_capath=str(default_directory),
+                ),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_proxy_system_ca_source",
+            ) as read_file,
+            mock.patch.object(
+                providers,
+                "_read_proxy_system_ca_directory",
+                return_value=snapshot_material,
+            ) as read_directory,
+            mock.patch.object(
+                providers,
+                "_proxy_ca_subject_hashes",
+                return_value=(frozenset({"01234567"}), 1),
+            ),
+        ):
+            result = providers._proxy_ssl_context({}, snapshot_material={})
+
+        self.assertIs(result, context)
+        read_file.assert_not_called()
+        read_directory.assert_called_once_with(default_directory)
+        context_type.assert_called_once_with(ssl.PROTOCOL_TLS_CLIENT)
+        context.load_verify_locations.assert_called_once_with(
+            cadata="system-directory-ca"
+        )
+
+    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "requires O_NOFOLLOW")
+    def test_proxy_ssl_context_rejects_symlinked_cafile_without_capath(
+        self,
+    ) -> None:
+        target = self.review.container_dir / "system-ca-target.pem"
+        target.write_bytes(self.sample_ca_certificate())
+        target.chmod(0o644)
+        default_file = self.review.container_dir / "system-ca.pem"
+        default_file.symlink_to(target.name)
+
+        with (
+            mock.patch.object(providers.sys, "platform", "linux"),
+            mock.patch.object(
+                providers.ssl,
+                "get_default_verify_paths",
+                return_value=mock.Mock(
+                    openssl_cafile=str(default_file),
+                    openssl_capath=None,
+                ),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_proxy_system_ca_source",
+            ) as read_file,
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "is a symlink and no CA directory is configured",
+            ),
+        ):
+            providers._proxy_ssl_context({}, snapshot_material={})
+
+        read_file.assert_not_called()
+
+    def test_proxy_ssl_context_reports_both_missing_default_ca_paths(self) -> None:
+        missing_file = self.review.container_dir / "missing-system-ca.pem"
+        missing_directory = self.review.container_dir / "missing-system-ca-directory"
+
+        with (
+            mock.patch.object(providers.sys, "platform", "linux"),
+            mock.patch.object(
+                providers.ssl,
+                "get_default_verify_paths",
+                return_value=mock.Mock(
+                    openssl_cafile=str(missing_file),
+                    openssl_capath=str(missing_directory),
+                ),
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "file and directory are missing",
+            ),
+        ):
+            providers._proxy_ssl_context({}, snapshot_material={})
+
+    def test_proxy_ssl_context_does_not_fall_back_from_cafile_race(self) -> None:
+        default_file = self.review.container_dir / "system-ca.pem"
+        default_file.write_bytes(b"fixture")
+        default_directory = self.review.container_dir / "system-ca-directory"
+        default_directory.mkdir()
+        race_error = providers.ClaudeExecutableInspectionInconclusive(
+            "Claude proxy system CA bundle changed while being read"
+        )
+        race_error.__cause__ = FileNotFoundError(default_file)
+
+        with (
+            mock.patch.object(providers.sys, "platform", "linux"),
+            mock.patch.object(
+                providers.ssl,
+                "get_default_verify_paths",
+                return_value=mock.Mock(
+                    openssl_cafile=str(default_file),
+                    openssl_capath=str(default_directory),
+                ),
+            ),
+            mock.patch.object(
+                providers,
+                "_read_proxy_system_ca_source",
+                side_effect=race_error,
+            ),
+            mock.patch.object(
+                providers,
+                "_read_proxy_system_ca_directory",
+            ) as read_directory,
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "changed while being read",
+            ),
+        ):
+            providers._proxy_ssl_context({}, snapshot_material={})
+
+        read_directory.assert_not_called()
+
+    @mock.patch.object(providers.ssl, "SSLContext")
     def test_proxy_ssl_context_uses_fixed_macos_system_ca_file(
         self,
         context_type: mock.Mock,
@@ -29894,9 +30743,7 @@ class ProviderPolicyTest(unittest.TestCase):
         get_defaults.assert_not_called()
         read_default.assert_called_once_with(system_file.resolve())
         context_type.assert_called_once_with(ssl.PROTOCOL_TLS_CLIENT)
-        context.load_verify_locations.assert_called_once_with(
-            cadata="macos-system-ca"
-        )
+        context.load_verify_locations.assert_called_once_with(cadata="macos-system-ca")
 
     def test_proxy_system_ca_reader_accepts_public_read_only_bundle(self) -> None:
         default_file = self.review.container_dir / "system-ca.pem"
@@ -29948,8 +30795,7 @@ class ProviderPolicyTest(unittest.TestCase):
     def test_proxy_ca_subject_hashes_uses_fixed_openssl(self) -> None:
         hashes, certificate_count = providers._proxy_ca_subject_hashes(
             self.sample_ca_certificate(),
-            deadline=time.monotonic()
-            + providers.CLAUDE_PROXY_CA_HASH_TIMEOUT_SECONDS,
+            deadline=time.monotonic() + providers.CLAUDE_PROXY_CA_HASH_TIMEOUT_SECONDS,
             certificate_limit=providers.CLAUDE_PROXY_CA_HASH_CERTIFICATE_LIMIT,
         )
 
@@ -30048,6 +30894,7 @@ class ProviderPolicyTest(unittest.TestCase):
             b"second-ca": frozenset({"89abcdef"}),
             b"wrong-hash-ca": frozenset({"cafebabe"}),
         }
+
         def calculate_hashes(
             material: bytes,
             *,
@@ -30801,9 +31648,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     "_ClaudeProxyServer",
                     side_effect=bind_error,
                 ),
-                self.assertRaises(
-                    providers.ClaudeCredentialInspectionInconclusive
-                ),
+                self.assertRaises(providers.ClaudeCredentialInspectionInconclusive),
             ):
                 with providers._claude_connect_proxy(
                     {},

@@ -3,7 +3,7 @@ id: 20260716-821601
 title: Review Helper Trust Hardening Port
 status: completed
 created: 2026-07-16
-updated: 2026-07-17
+updated: 2026-07-20
 branch: wip/review-helper-trust-port
 pr: 53
 supersedes: []
@@ -16,8 +16,8 @@ superseded_by:
 
 This work semantically ports the still-applicable security hardening from
 private-overlay PR 82 onto the canonical repository. The final integration
-also incorporates canonical `master` through
-`8c095454d2d5cb25b6a2c1fb544de5e7487ba423`. It preserves canonical floating
+also incorporates the canonical `master` state from the final pre-merge sync.
+It preserves canonical floating
 publisher-signed Claude provenance, immutable executable snapshots, macOS and
 Linux/WSL2 isolation, the synthetic-token catalog, and the Python 3.10
 contract. It does not cherry-pick or restore obsolete private-overlay account
@@ -68,6 +68,15 @@ metadata behavior.
   deadline exhaustion, direct and deferred output limits, Python 3.10 cause
   fallback, Python 3.11+ notes, and strict post-inspection authentication. The
   complete repository contract suite ran 20 tests with no failures.
+- The 2026-07-20 trust-boundary pass binds proxy CA snapshots to exact raw
+  bytes, safely falls back from a symlinked Linux default CA file to the
+  bounded compiled-in CA directory, and binds every macOS replacement CA
+  variable to the canonical helper bundle. The final bundle is set to `0400`
+  and its exact path, mode, digest, directory-input absence, bypass-input
+  absence, and certificate-store mode are rechecked at profile construction
+  and immediately before launch. The complete Python 3.13 suite ran 1280 tests
+  with 4 skips and no failures; the focused repository contract suite ran 20
+  tests with no failures.
 - Final-head review remediation covers strict signed-manifest numeric parsing,
   system-domain custom roots, bounded snapshot revalidation without repeated
   OpenSSL self-signature work, blocked `runtime-unverified` outcomes,

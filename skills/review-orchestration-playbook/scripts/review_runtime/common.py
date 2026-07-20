@@ -330,9 +330,7 @@ def run(
         raise ReviewError("output_file_limit_bytes requires timeout_seconds")
     if timeout_seconds is not None and (stdout_path is None or stderr_path is None):
         raise ReviewError("timeout_seconds requires logged output paths")
-    if on_process_started is not None and (
-        stdout_path is None or stderr_path is None
-    ):
+    if on_process_started is not None and (stdout_path is None or stderr_path is None):
         raise ReviewError("on_process_started requires logged output paths")
     if output_file_limit_bytes is not None and output_file_limit_bytes <= 0:
         raise ReviewError("output_file_limit_bytes must be positive")
@@ -1256,7 +1254,8 @@ def _prove_reviewer_candidate_lexical_absence(
             if index == len(components) - 1:
                 if stat.S_ISLNK(metadata.st_mode):
                     raise inspection_error(
-                        f"reviewer executable candidate ENOENT involves a symlink: {path}"
+                        "reviewer executable candidate ENOENT involves a "
+                        f"symlink: {path}"
                     )
                 raise inspection_error(
                     f"reviewer executable candidate appeared during inspection: {path}"
@@ -1344,10 +1343,10 @@ def _prove_reviewer_candidate_lexical_absence(
                     f"{path}: {error}"
                 ) from error
             current_is_symlink = stat.S_ISLNK(current.st_mode)
-            if (
-                current_is_symlink != (expected_symlink_target is not None)
-                or _lexical_component_identity(expected)
-                != _lexical_component_identity(current)
+            if current_is_symlink != (
+                expected_symlink_target is not None
+            ) or _lexical_component_identity(expected) != _lexical_component_identity(
+                current
             ):
                 raise inspection_error(
                     f"reviewer executable candidate parent changed during inspection: "
@@ -1462,21 +1461,18 @@ def _reviewer_candidate_is_executable(
         raise inspection_error(
             f"cannot inspect reviewer executable candidate {path}: {error}"
         ) from error
-    if not stat.S_ISREG(before.st_mode) or not before.st_mode & 0o111:
-        return False
+    executable = stat.S_ISREG(before.st_mode) and bool(before.st_mode & 0o111)
     try:
         after = path.stat()
     except OSError as error:
         raise inspection_error(
             f"reviewer executable candidate changed during inspection: {path}"
         ) from error
-    if _executable_candidate_identity(before) != _executable_candidate_identity(
-        after
-    ):
+    if _executable_candidate_identity(before) != _executable_candidate_identity(after):
         raise inspection_error(
             f"reviewer executable candidate changed during inspection: {path}"
         )
-    return True
+    return executable
 
 
 def resolve_reviewer_executable(

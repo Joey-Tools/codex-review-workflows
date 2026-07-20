@@ -588,11 +588,15 @@ Custom TLS sources are copied rather than mounted from their original paths.
 The Claude-only `NODE_EXTRA_CA_CERTS` input uses the same absolute-path, stable
 no-follow identity, owner/mode, bounded-read, PEM-only, private-key rejection,
 and private-`0600` materialization policy as the existing CA-file inputs. On
-macOS, the rewritten variable names only the exact helper-owned copy; the
-Seatbelt profile grants `file-read*` to that file literally, does not grant a
-parent-directory subpath read, and does not disclose the caller path through
-the profile or launch arguments. Literal ancestor metadata checks remain part
-of safe path traversal.
+macOS, the proxy snapshot digest binds the exact captured file bytes rather
+than only normalized certificate blocks. The final merged bundle is atomically
+materialized in helper-private storage and changed to exact `0400` mode. The
+helper verifies its exact path, mode, and digest while constructing the
+Seatbelt profile and repeats the same checks immediately before `sandbox-exec`
+launch. This detects ordinary
+path and content drift at the helper boundary. As with the Linux mount
+handoff, it does not claim protection from a malicious same-euid host process
+after the final check.
 `SSL_CERT_FILE` and `SSL_CERT_DIR` retain their existing handling. The latter is
 enumerated through a fixed directory descriptor with bounded entry counts and
 supports normal OpenSSL hash links, including the multi-hop relative/absolute
@@ -611,8 +615,9 @@ name therefore cannot disguise private-key or malformed-certificate rejection.
 
 On macOS, caller CA inputs use owner-only, single-link regular-file reads with
 no symlinks, FIFOs, extended ACL entries, or identity/growth races. The helper
-snapshots only bounded certificate material once and revalidates its digest for
-the model chain. Before every attempt it re-exports user, admin, and system
+captures bounded certificate material once for the proxy while retaining an
+exact raw-byte digest binding for later runtime preparation. Before every
+attempt it re-exports user, admin, and system
 trust settings into bounded helper files. The exact no-settings response is
 accepted only with `security` status `1`; signal and other abnormal exits remain
 inconclusive. Explicit deny wins even when another
@@ -636,11 +641,15 @@ and a 512-certificate budget for the complete snapshot and replacement-context
 initialization. The deadline is rechecked after each subprocess and before
 acceptance; duplicate material is verified once. The in-memory context enables
 strict X.509 verification and partial-chain trust anchors without loading
-ambient roots. Default trust uses explicit compiled-in OpenSSL
-CA-file material captured through the same stable descriptor reader rather than
-caller-controlled environment lookup or a lazy CA directory. Neither original
-nor helper snapshot paths are reopened, so later path replacement cannot change
-the proxy's trust set.
+ambient roots. Default trust uses explicit compiled-in OpenSSL CA-file material
+captured through the same stable descriptor reader. On Linux, a symlinked
+compiled-in CA file is not followed; the helper instead snapshots and
+hash-validates the compiled-in CA directory when available. It never consults
+caller-controlled environment lookup or retains a lazy CA directory. Original
+caller paths are not reopened. Between model attempts, helper snapshot paths
+are reopened only to verify their exact raw-byte bindings; individual upstream
+connections continue to reuse the already prepared in-memory context without
+reloading trust material.
 An unconstrained `TrustRoot` entry must be a strict currently valid self-signed
 CA root. An unconstrained `TrustAsRoot` entry may instead be a non-self-issued
 CA or intermediate certificate: it must retain strict CA and certificate-signing
@@ -693,7 +702,8 @@ material remain outside the contract.
 On macOS, each model attempt captures the parent/proxy TLS environment before
 building the Claude-only merged bundle. The final review proxy uses that
 pre-merge environment; only the sandboxed Claude process receives the merged
-bundle paths. A discovered fixed OpenSSL verifier that then fails to launch or
+bundle through the helper-private `0400` path admitted by the Seatbelt profile.
+A discovered fixed OpenSSL verifier that then fails to launch or
 returns an operating-system I/O error is inspection-inconclusive, never
 deterministic tool absence, and cannot authorize Copilot fallback.
 

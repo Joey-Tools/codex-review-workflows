@@ -901,9 +901,7 @@ class ChildEnvironmentTest(unittest.TestCase):
                 events.append("spawn")
                 return process
 
-            on_process_started = mock.Mock(
-                side_effect=lambda: events.append("started")
-            )
+            on_process_started = mock.Mock(side_effect=lambda: events.append("started"))
             with (
                 mock.patch.object(common.subprocess, "Popen", side_effect=spawn),
                 mock.patch.object(
@@ -1145,7 +1143,9 @@ class ChildEnvironmentTest(unittest.TestCase):
         self,
     ) -> None:
         candidate = pathlib.Path("/home/reviewer/.local/bin/claude")
-        metadata = os.stat_result((stat.S_IFREG | 0o700, 1, 2, 1, 1000, 1000, 1, 0, 0, 0))
+        metadata = os.stat_result(
+            (stat.S_IFREG | 0o700, 1, 2, 1, 1000, 1000, 1, 0, 0, 0)
+        )
         candidate_stat_calls = 0
 
         def stat_candidate(path: pathlib.Path, *_args, **_kwargs):
@@ -1190,12 +1190,18 @@ class ChildEnvironmentTest(unittest.TestCase):
             root = pathlib.Path(temporary).resolve()
             candidate = root / "claude"
             candidate.symlink_to("missing-target")
+            valid = root / "valid" / "claude"
+            valid.parent.mkdir()
+            valid.write_bytes(b"#!/bin/sh\n")
+            valid.chmod(0o700)
             inspect_candidate = common._reviewer_candidate_is_executable
 
             def inspect_only_candidate(path: pathlib.Path, **kwargs):
-                if path != candidate:
+                if path not in {candidate, valid}:
                     return False
                 return inspect_candidate(path, **kwargs)
+
+            candidate_validator = mock.Mock()
 
             with (
                 mock.patch.dict(
@@ -1206,7 +1212,7 @@ class ChildEnvironmentTest(unittest.TestCase):
                 mock.patch.object(
                     common,
                     "_user_executable_candidates",
-                    return_value=[candidate],
+                    return_value=[candidate, valid],
                 ),
                 mock.patch.object(common.shutil, "which", return_value=None),
                 mock.patch.object(
@@ -1216,13 +1222,106 @@ class ChildEnvironmentTest(unittest.TestCase):
                 ),
                 self.assertRaisesRegex(
                     CandidateInspectionInconclusive,
-                    "involves a symlink",
+                    "ENOENT involves a symlink",
+                ),
+            ):
+                common.resolve_reviewer_executable(
+                    "claude",
+                    candidate_validator=candidate_validator,
+                    inspection_error=CandidateInspectionInconclusive,
+                )
+
+        candidate_validator.assert_not_called()
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "O_NOFOLLOW"),
+        "requires POSIX no-follow path inspection",
+    )
+    def test_explicit_dangling_final_symlink_is_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            candidate = root / "claude"
+            candidate.symlink_to("missing-target")
+
+            with (
+                mock.patch.dict(
+                    common.os.environ,
+                    {
+                        "HOME": str(root),
+                        "CODEX_REVIEW_CLAUDE_PATH": str(candidate),
+                    },
+                    clear=True,
+                ),
+                self.assertRaisesRegex(
+                    CandidateInspectionInconclusive,
+                    "ENOENT involves a symlink",
                 ),
             ):
                 common.resolve_reviewer_executable(
                     "claude",
                     inspection_error=CandidateInspectionInconclusive,
                 )
+
+    def test_existing_nonexecutable_candidate_races_are_inconclusive(self) -> None:
+        candidate = pathlib.Path("/home/reviewer/.local/bin/claude")
+        executable_mode = stat.S_IFREG | 0o700
+        cases = (
+            ("directory-replaced", stat.S_IFDIR | 0o700, executable_mode, 2, 2),
+            ("fifo-replaced", stat.S_IFIFO | 0o600, executable_mode, 2, 2),
+            ("regular-replaced", stat.S_IFREG | 0o600, stat.S_IFREG | 0o600, 2, 3),
+            ("chmod", stat.S_IFREG | 0o600, executable_mode, 2, 2),
+        )
+
+        for name, before_mode, after_mode, before_inode, after_inode in cases:
+            before = os.stat_result(
+                (before_mode, 1, before_inode, 1, 1000, 1000, 1, 0, 0, 0)
+            )
+            after = os.stat_result(
+                (after_mode, 1, after_inode, 1, 1000, 1000, 1, 0, 0, 0)
+            )
+            with (
+                self.subTest(name=name),
+                mock.patch.object(
+                    common.pathlib.Path,
+                    "stat",
+                    autospec=True,
+                    side_effect=(before, after),
+                ) as candidate_stat,
+                self.assertRaisesRegex(
+                    CandidateInspectionInconclusive,
+                    "changed during inspection",
+                ),
+            ):
+                common._reviewer_candidate_is_executable(
+                    candidate,
+                    inspection_error=CandidateInspectionInconclusive,
+                )
+            self.assertEqual(candidate_stat.call_count, 2)
+
+    def test_stable_existing_nonexecutable_candidates_are_absent(self) -> None:
+        candidate = pathlib.Path("/home/reviewer/.local/bin/claude")
+        for name, mode in (
+            ("directory", stat.S_IFDIR | 0o700),
+            ("fifo", stat.S_IFIFO | 0o600),
+            ("no-exec", stat.S_IFREG | 0o600),
+        ):
+            metadata = os.stat_result((mode, 1, 2, 1, 1000, 1000, 1, 0, 0, 0))
+            with (
+                self.subTest(name=name),
+                mock.patch.object(
+                    common.pathlib.Path,
+                    "stat",
+                    autospec=True,
+                    return_value=metadata,
+                ) as candidate_stat,
+            ):
+                self.assertFalse(
+                    common._reviewer_candidate_is_executable(
+                        candidate,
+                        inspection_error=CandidateInspectionInconclusive,
+                    )
+                )
+            self.assertEqual(candidate_stat.call_count, 2)
 
     @unittest.skipUnless(os.name == "posix", "requires POSIX symlinks")
     def test_existing_symlink_candidate_is_validated(self) -> None:
@@ -1559,8 +1658,9 @@ class ChildEnvironmentTest(unittest.TestCase):
                 mock.patch.object(
                     common.os,
                     "access",
-                    side_effect=lambda path, _mode: pathlib.Path(path)
-                    in {invalid, valid},
+                    side_effect=lambda path, _mode: (
+                        pathlib.Path(path) in {invalid, valid}
+                    ),
                 ),
             ):
                 resolved = common.resolve_reviewer_executable(
