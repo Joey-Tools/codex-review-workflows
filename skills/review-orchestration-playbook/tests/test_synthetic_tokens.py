@@ -3045,6 +3045,68 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         git(repo, "commit", "-m", message)
         return git(repo, "rev-parse", "HEAD")
 
+    def install_encoded_metadata_commit(
+        self,
+        repo: pathlib.Path,
+        *,
+        previous: str,
+        metadata_key: str,
+        decoded_metadata: str,
+    ) -> str:
+        tree = git(repo, "rev-parse", f"{previous}^{{tree}}")
+        encoded = base64.b64encode(decoded_metadata.encode("ascii")).decode("ascii")
+        midpoint = len(encoded) // 2
+        armor = (
+            "-----BEGIN PGP SIGNATURE-----",
+            encoded[:midpoint],
+            encoded[midpoint:],
+            "-----END PGP SIGNATURE-----",
+        )
+        if metadata_key == "mergetag":
+            encoded_metadata = (
+                f"mergetag object {previous}\n"
+                " type commit\n"
+                " tag fixture\n"
+                " tagger Synthetic Token Test <synthetic@example.com> "
+                "1700000000 +0000\n"
+                " \n" + "".join(f" {line}\n" for line in armor)
+            )
+        else:
+            self.assertEqual(metadata_key, "gpgsig")
+            encoded_metadata = f"gpgsig {armor[0]}\n" + "".join(
+                f" {line}\n" for line in armor[1:]
+            )
+        raw_commit = (
+            f"tree {tree}\n"
+            f"parent {previous}\n"
+            "author Synthetic Token Test <synthetic@example.com> "
+            "1700000000 +0000\n"
+            "committer Synthetic Token Test <synthetic@example.com> "
+            "1700000000 +0000\n"
+            f"{encoded_metadata}"
+            "\n"
+            "Encoded endpoint fixture\n"
+        ).encode("ascii")
+        created = subprocess.run(
+            (
+                "git",
+                "-C",
+                str(repo),
+                "hash-object",
+                "-t",
+                "commit",
+                "-w",
+                "--stdin",
+            ),
+            input=raw_commit,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        head = created.stdout.decode("ascii").strip()
+        git(repo, "update-ref", "refs/heads/master", head, previous)
+        return head
+
     def prepare(
         self,
         *,
@@ -3054,6 +3116,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         catalog=None,
         exemptions: tuple[str, ...] = (),
         prompt_override: pathlib.Path | None = None,
+        include_source_wip: bool = False,
     ) -> workspace.ReviewWorkspace:
         captured: list[workspace.ReviewWorkspace] = []
         catalog = catalog or synthetic_tokens.load_catalog()
@@ -3064,6 +3127,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
                 head_ref=head,
                 synthetic_secret_exemptions=exemptions,
                 prompt_override=prompt_override,
+                include_source_wip=include_source_wip,
                 ownership_handoff=captured.append,
             )
         self.assertEqual(captured, [review])
@@ -3090,6 +3154,87 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         self.assertTrue(accepted)
         self.assertTrue(all("value_sha256" in entry for entry in accepted))
         self.assertTrue(any(entry["token_id"] == "access-a" for entry in accepted))
+
+    def test_selected_legacy_value_in_endpoint_message_is_rejected_and_redacted(
+        self,
+    ) -> None:
+        catalog = legacy_catalog(values=(LEGACY_A,))
+        repo, base = self.new_repo(
+            {"fixture.cfg": assignment_text("access_token", LEGACY_A)}
+        )
+        (repo / "README.md").write_text("head\n", encoding="utf-8")
+        head = self.commit(
+            repo,
+            assignment_text("access_token", LEGACY_A).strip(),
+        )
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "endpoint commit object",
+        ) as caught:
+            self.prepare(
+                repo=repo,
+                base=base,
+                head=head,
+                catalog=catalog,
+                exemptions=("historical-fixtures",),
+            )
+        message = str(caught.exception)
+        self.assertNotIn(LEGACY_A, message)
+        self.assertNotIn(legacy_value_base64(LEGACY_A), message)
+
+    def test_selected_legacy_value_in_decoded_endpoint_metadata_is_rejected(
+        self,
+    ) -> None:
+        catalog = legacy_catalog(values=(LEGACY_A,))
+        decoded_metadata = assignment_text("access_token", LEGACY_A).strip()
+        for metadata_key in ("gpgsig", "mergetag"):
+            with self.subTest(metadata_key=metadata_key):
+                repo, base = self.new_repo(
+                    {"fixture.cfg": assignment_text("access_token", LEGACY_A)}
+                )
+                head = self.install_encoded_metadata_commit(
+                    repo,
+                    previous=base,
+                    metadata_key=metadata_key,
+                    decoded_metadata=decoded_metadata,
+                )
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "endpoint commit object",
+                ) as caught:
+                    self.prepare(
+                        repo=repo,
+                        base=base,
+                        head=head,
+                        catalog=catalog,
+                        exemptions=("historical-fixtures",),
+                    )
+                message = str(caught.exception)
+                self.assertNotIn(LEGACY_A, message)
+                self.assertNotIn(legacy_value_base64(LEGACY_A), message)
+
+    def test_authoring_value_in_endpoint_metadata_remains_allowed(self) -> None:
+        catalog = legacy_catalog(values=(LEGACY_A,))
+        repo, base = self.new_repo(
+            {"fixture.cfg": assignment_text("access_token", LEGACY_A)}
+        )
+        (repo / "README.md").write_text("head\n", encoding="utf-8")
+        head = self.commit(
+            repo,
+            assignment_text("access_token", AUTHORING_VALUES[0]).strip(),
+        )
+        review = self.prepare(
+            repo=repo,
+            base=base,
+            head=head,
+            catalog=catalog,
+            exemptions=("historical-fixtures",),
+        )
+        evidence = self.validate(review, catalog=catalog)
+        serialized = json.dumps(evidence, sort_keys=True)
+        self.assertNotIn(AUTHORING_VALUES[0], serialized)
+        self.assertNotIn(LEGACY_A, serialized)
 
     def test_dynamic_path_digest_cannot_expose_an_authoring_value(self) -> None:
         relative = "fixture.cfg"
@@ -3672,6 +3817,166 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             ),
             (1, 1),
         )
+
+    def test_source_wip_cannot_hide_a_raw_count_increase_in_source_head(
+        self,
+    ) -> None:
+        catalog = legacy_catalog(values=(LEGACY_A,))
+        repo, base = self.new_repo(
+            {"fixture.cfg": assignment_text("access_token", LEGACY_A)}
+        )
+        (repo / "copy.cfg").write_text(
+            assignment_text("access_token", LEGACY_A),
+            encoding="utf-8",
+        )
+        head = self.commit(repo)
+        (repo / "copy.cfg").unlink()
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "count increased in source HEAD",
+        ) as caught:
+            self.prepare(
+                repo=repo,
+                base=base,
+                head=head,
+                catalog=catalog,
+                exemptions=("historical-fixtures",),
+                include_source_wip=True,
+            )
+        self.assertNotIn(LEGACY_A, str(caught.exception))
+
+    def test_source_wip_cannot_hide_an_unembedded_increase_in_source_head(
+        self,
+    ) -> None:
+        longer = LEGACY_A + "Suffix"
+        catalog = legacy_catalog(values=(LEGACY_A, longer))
+        repo, base = self.new_repo(
+            {"fixture.cfg": assignment_text("refresh_token", longer)}
+        )
+        (repo / "fixture.cfg").write_text(
+            assignment_text("access_token", LEGACY_A),
+            encoding="utf-8",
+        )
+        head = self.commit(repo)
+        (repo / "fixture.cfg").write_text(
+            assignment_text("refresh_token", longer),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "unembedded count increased in source HEAD",
+        ) as caught:
+            self.prepare(
+                repo=repo,
+                base=base,
+                head=head,
+                catalog=catalog,
+                exemptions=("historical-fixtures",),
+                include_source_wip=True,
+            )
+        message = str(caught.exception)
+        self.assertNotIn(LEGACY_A, message)
+        self.assertNotIn(longer, message)
+
+    def test_source_wip_legacy_manifest_and_validation_bind_source_head_counts(
+        self,
+    ) -> None:
+        catalog = legacy_catalog(values=(LEGACY_A,))
+        repo, base = self.new_repo(
+            {
+                "fixture.cfg": assignment_text("access_token", LEGACY_A),
+                "README.md": "base\n",
+            }
+        )
+        (repo / "fixture.cfg").write_text("safe\n", encoding="utf-8")
+        (repo / "README.md").write_text("head\n", encoding="utf-8")
+        head = self.commit(repo)
+        (repo / "fixture.cfg").write_text(
+            assignment_text("access_token", LEGACY_A),
+            encoding="utf-8",
+        )
+
+        review = self.prepare(
+            repo=repo,
+            base=base,
+            head=head,
+            catalog=catalog,
+            exemptions=("historical-fixtures",),
+            include_source_wip=True,
+        )
+        manifest_path = (
+            review.workspace_root / ".codex-review" / workspace.SYNTHETIC_MANIFEST_NAME
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            manifest["schema_version"],
+            workspace.SYNTHETIC_MANIFEST_SCHEMA_VERSION,
+        )
+        manifest_count = manifest["entries"][0]
+        self.assertEqual(
+            (
+                manifest_count["base_count"],
+                manifest_count["head_count"],
+                manifest_count["source_head_count"],
+                manifest_count["base_unembedded_count"],
+                manifest_count["head_unembedded_count"],
+                manifest_count["source_head_unembedded_count"],
+            ),
+            (1, 1, 0, 1, 1, 0),
+        )
+
+        evidence = self.validate(review, catalog=catalog)
+        evidence_count = evidence["synthetic_tokens"]["legacy_counts"][0]
+        self.assertEqual(evidence_count["source_head_count"], 0)
+        self.assertEqual(evidence_count["source_head_unembedded_count"], 0)
+        serialized = json.dumps(evidence, sort_keys=True)
+        self.assertNotIn(LEGACY_A, serialized)
+        self.assertNotIn(legacy_value_base64(LEGACY_A), serialized)
+
+        accepted = synthetic_tokens.accepted_legacy_values(
+            catalog,
+            catalog.legacy_exemptions,
+        )[0]
+        mismatched_source_head = workspace.SecretScanResult.empty()
+        mismatched_source_head.raw_occurrence_counts[accepted] = 1
+        mismatched_source_head.unembedded_occurrence_counts[accepted] = 1
+        with (
+            mock.patch.object(
+                workspace,
+                "_scan_frozen_tree_values",
+                return_value=mismatched_source_head,
+            ),
+            self.assertRaisesRegex(
+                ReviewError,
+                "source HEAD legacy synthetic fixture count changed",
+            ) as caught,
+        ):
+            self.validate(review, catalog=catalog)
+        self.assertNotIn(LEGACY_A, str(caught.exception))
+
+    def test_source_wip_without_legacy_exemptions_skips_full_head_count_scan(
+        self,
+    ) -> None:
+        repo, base = self.new_repo({"README.md": "base\n"})
+        (repo / "README.md").write_text("head\n", encoding="utf-8")
+        head = self.commit(repo)
+        (repo / "README.md").write_text("wip\n", encoding="utf-8")
+        review = self.prepare(
+            repo=repo,
+            base=base,
+            head=head,
+            include_source_wip=True,
+        )
+
+        with mock.patch.object(
+            workspace,
+            "_scan_frozen_tree_values",
+            side_effect=AssertionError("unexpected full source HEAD count scan"),
+        ):
+            evidence = self.validate(review)
+        self.assertEqual(evidence["synthetic_tokens"]["legacy_counts"], [])
 
     def test_frozen_head_plain_text_tampering_fails_raw_count_revalidation(
         self,

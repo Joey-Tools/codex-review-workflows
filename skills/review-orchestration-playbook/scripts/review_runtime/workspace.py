@@ -262,7 +262,7 @@ GIT_LFS_SIZE_PATTERN = re.compile(rb"[+-]?[0-9]+\Z")
 SYNTHETIC_MANIFEST_NAME = "synthetic-secret-manifest.json"
 SYNTHETIC_PRIVATE_MANIFEST_NAME = "synthetic-secret-state.json"
 SYNTHETIC_CHANGED_EVIDENCE_NAME = "synthetic-changed-evidence.json"
-SYNTHETIC_MANIFEST_SCHEMA_VERSION = 2
+SYNTHETIC_MANIFEST_SCHEMA_VERSION = 3
 CONTROL_ARTIFACT_STATE_NAME = "control-artifact-state.json"
 CONTROL_ARTIFACT_SCHEMA_VERSION = 2
 CONTROL_ARTIFACT_SPECS: dict[str, tuple[int, int | None]] = {
@@ -380,6 +380,16 @@ class ControlDirectoryEvidence:
 class ControlArtifactState:
     artifacts: dict[str, ControlArtifactEvidence]
     directory: ControlDirectoryEvidence
+
+
+@dataclass(frozen=True)
+class LegacyCountState:
+    base_count: int
+    head_count: int
+    source_head_count: int
+    base_unembedded_count: int
+    head_unembedded_count: int
+    source_head_unembedded_count: int
 
 
 class _IncompleteSecretScanSuffix(Exception):
@@ -1211,8 +1221,15 @@ def _scan_endpoint_commit_metadata(
     object_directory: pathlib.Path,
     base_sha: str,
     head_sha: str,
-    accepted_values: Iterable[AcceptedSyntheticValue],
+    authoring_values: Iterable[AcceptedSyntheticValue],
+    legacy_values: Iterable[AcceptedSyntheticValue],
 ) -> None:
+    authoring = tuple(authoring_values)
+    legacy = tuple(legacy_values)
+    if any(item.kind != "authoring" for item in authoring):
+        raise ReviewError("endpoint metadata authoring values are invalid")
+    if any(item.kind != "legacy" for item in legacy):
+        raise ReviewError("endpoint metadata legacy values are invalid")
     for revision in sorted({base_sha, head_sha}):
         with tempfile.TemporaryFile() as content:
             size = _run_bounded_process_to_file(
@@ -1233,9 +1250,12 @@ def _scan_endpoint_commit_metadata(
             scan = _stream_secret_scan(
                 io.BytesIO(human_metadata),
                 size=len(human_metadata),
-                accepted_values=accepted_values,
+                accepted_values=authoring,
+                raw_occurrence_values=legacy,
             )
-            if scan.blocking_rule is not None:
+            if scan.blocking_rule is not None or any(
+                scan.raw_occurrence_counts.values()
+            ):
                 raise ReviewError(
                     "sensitive content preflight blocked external review; "
                     "an endpoint commit object contains credential-like metadata"
@@ -2848,6 +2868,7 @@ def _legacy_count_manifest(
     object_directory: pathlib.Path,
     base_sha: str,
     head_sha: str,
+    source_head_sha: str | None = None,
     catalog: SyntheticTokenCatalog,
     exemptions: tuple[LegacyExemption, ...],
 ) -> dict[str, Any]:
@@ -2869,9 +2890,21 @@ def _legacy_count_manifest(
             accepted_values=scan_accepted,
             raw_occurrence_values=legacy_accepted,
         )
+        source_head_scan = (
+            head_scan
+            if source_head_sha is None or source_head_sha == head_sha
+            else _scan_frozen_tree_values(
+                git_view=git_view,
+                object_directory=object_directory,
+                commit=source_head_sha,
+                accepted_values=scan_accepted,
+                raw_occurrence_values=legacy_accepted,
+            )
+        )
     else:
         base_scan = SecretScanResult.empty()
         head_scan = SecretScanResult.empty()
+        source_head_scan = head_scan
     entries: list[dict[str, Any]] = []
     for exemption in exemptions:
         envelope_used = False
@@ -2884,19 +2917,41 @@ def _legacy_count_manifest(
             )
             base_count = base_scan.raw_occurrence_counts[descriptor]
             head_count = head_scan.raw_occurrence_counts[descriptor]
+            source_head_count = source_head_scan.raw_occurrence_counts[descriptor]
             base_unembedded_count = base_scan.unembedded_occurrence_counts[descriptor]
             head_unembedded_count = head_scan.unembedded_occurrence_counts[descriptor]
-            envelope_used = envelope_used or base_count > 0 or head_count > 0
+            source_head_unembedded_count = (
+                source_head_scan.unembedded_occurrence_counts[descriptor]
+            )
+            envelope_used = (
+                envelope_used
+                or base_count > 0
+                or head_count > 0
+                or source_head_count > 0
+            )
             if head_count > base_count:
                 raise ReviewError(
                     "legacy synthetic fixture count increased for "
                     f"{token.identifier}: base={base_count}, head={head_count}"
+                )
+            if source_head_count > base_count:
+                raise ReviewError(
+                    "legacy synthetic fixture count increased in source HEAD for "
+                    f"{token.identifier}: base={base_count}, "
+                    f"source_head={source_head_count}"
                 )
             if head_unembedded_count > base_unembedded_count:
                 raise ReviewError(
                     "legacy synthetic fixture unembedded count increased for "
                     f"{token.identifier}: base={base_unembedded_count}, "
                     f"head={head_unembedded_count}"
+                )
+            if source_head_unembedded_count > base_unembedded_count:
+                raise ReviewError(
+                    "legacy synthetic fixture unembedded count increased in "
+                    f"source HEAD for {token.identifier}: "
+                    f"base={base_unembedded_count}, "
+                    f"source_head={source_head_unembedded_count}"
                 )
             entries.append(
                 {
@@ -2906,6 +2961,8 @@ def _legacy_count_manifest(
                     "head_count": head_count,
                     "head_unembedded_count": head_unembedded_count,
                     "rule": token.rule,
+                    "source_head_count": source_head_count,
+                    "source_head_unembedded_count": source_head_unembedded_count,
                     "token_id": token.identifier,
                     "value_length": token.value_length,
                     "value_sha256": token.value_sha256,
@@ -4395,7 +4452,7 @@ def _load_legacy_manifest(
 ) -> tuple[
     tuple[LegacyExemption, ...],
     tuple[AcceptedSyntheticValue, ...],
-    dict[AcceptedSyntheticValue, tuple[int, int, int, int]],
+    dict[AcceptedSyntheticValue, LegacyCountState],
     list[dict[str, Any]],
 ]:
     manifest_path = control_dir / SYNTHETIC_MANIFEST_NAME
@@ -4447,7 +4504,7 @@ def _load_legacy_manifest(
         or len(raw_entries) > MAX_SYNTHETIC_EVIDENCE_ENTRIES
     ):
         raise ReviewError("synthetic secret manifest entries are invalid")
-    counts: dict[AcceptedSyntheticValue, tuple[int, int, int, int]] = {}
+    counts: dict[AcceptedSyntheticValue, LegacyCountState] = {}
     evidence: list[dict[str, Any]] = []
     for raw_entry in raw_entries:
         if not isinstance(raw_entry, dict) or set(raw_entry) != {
@@ -4457,6 +4514,8 @@ def _load_legacy_manifest(
             "head_count",
             "head_unembedded_count",
             "rule",
+            "source_head_count",
+            "source_head_unembedded_count",
             "token_id",
             "value_length",
             "value_sha256",
@@ -4468,44 +4527,52 @@ def _load_legacy_manifest(
             raise ReviewError("synthetic secret manifest entry is unknown or duplicate")
         base_count = raw_entry["base_count"]
         head_count = raw_entry["head_count"]
+        source_head_count = raw_entry["source_head_count"]
         base_unembedded_count = raw_entry["base_unembedded_count"]
         head_unembedded_count = raw_entry["head_unembedded_count"]
+        source_head_unembedded_count = raw_entry["source_head_unembedded_count"]
         if (
             type(base_count) is not int
             or type(head_count) is not int
+            or type(source_head_count) is not int
             or type(base_unembedded_count) is not int
             or type(head_unembedded_count) is not int
+            or type(source_head_unembedded_count) is not int
             or base_count < 0
             or head_count < 0
+            or source_head_count < 0
             or base_unembedded_count < 0
             or head_unembedded_count < 0
+            or source_head_unembedded_count < 0
             or head_count > base_count
+            or source_head_count > base_count
             or head_unembedded_count > base_unembedded_count
+            or source_head_unembedded_count > base_unembedded_count
             or base_unembedded_count > base_count
             or head_unembedded_count > head_count
+            or source_head_unembedded_count > source_head_count
             or raw_entry["rule"] != descriptor.rule
             or raw_entry["value_sha256"] != descriptor.value_sha256
             or raw_entry["value_length"] != descriptor.value_length
         ):
             raise ReviewError("synthetic secret manifest entry is inconsistent")
-        counts[descriptor] = (
-            base_count,
-            head_count,
-            base_unembedded_count,
-            head_unembedded_count,
+        counts[descriptor] = LegacyCountState(
+            base_count=base_count,
+            head_count=head_count,
+            source_head_count=source_head_count,
+            base_unembedded_count=base_unembedded_count,
+            head_unembedded_count=head_unembedded_count,
+            source_head_unembedded_count=source_head_unembedded_count,
         )
         evidence.append(dict(raw_entry))
     if set(counts) != set(accepted):
         raise ReviewError("synthetic secret manifest does not cover its selection")
     for exemption in exemptions:
         if not any(
-            base_count or head_count
-            for descriptor, (
-                base_count,
-                head_count,
-                _base_unembedded_count,
-                _head_unembedded_count,
-            ) in counts.items()
+            count_state.base_count
+            or count_state.head_count
+            or count_state.source_head_count
+            for descriptor, count_state in counts.items()
             if descriptor.exemption_id == exemption.identifier
         ):
             raise ReviewError(
@@ -4618,9 +4685,8 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     control_dir = workspace_root / ".codex-review"
     catalog = load_catalog()
     validate_authoring_catalog_scanner_contract(catalog)
-    catalog_legacy_path_matcher = _legacy_path_matcher(
-        accepted_legacy_values(catalog, catalog.legacy_exemptions)
-    )
+    catalog_legacy_values = accepted_legacy_values(catalog, catalog.legacy_exemptions)
+    catalog_legacy_path_matcher = _legacy_path_matcher(catalog_legacy_values)
     control_state = _load_control_artifact_state(
         container_dir=review.container_dir,
     )
@@ -4634,12 +4700,19 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     )
     authoring_values = accepted_authoring_values(catalog)
     accepted_values = authoring_values + legacy_values
+    if review.content_variant == "head" and any(
+        count_state.source_head_count != count_state.head_count
+        or count_state.source_head_unembedded_count != count_state.head_unembedded_count
+        for count_state in legacy_counts.values()
+    ):
+        raise ReviewError("synthetic secret manifest head counts are inconsistent")
     _scan_endpoint_commit_metadata(
         git_view=git_dir,
         object_directory=git_dir / "objects",
         base_sha=review.base_ref,
         head_sha=review.head_ref,
-        accepted_values=accepted_values,
+        authoring_values=authoring_values,
+        legacy_values=catalog_legacy_values,
     )
     evidence_sensitive_values = _all_catalog_sensitive_values(catalog)
     changed_accepted_evidence = _load_changed_synthetic_evidence(
@@ -4694,6 +4767,38 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
             )
 
     if review.content_variant == "source-wip":
+        if legacy_counts:
+            source_head_scan = _scan_frozen_tree_values(
+                git_view=git_dir,
+                object_directory=git_dir / "objects",
+                commit=review.head_ref,
+                accepted_values=legacy_values,
+                raw_occurrence_values=legacy_values,
+            )
+            for accepted, count_state in legacy_counts.items():
+                actual_source_head_count = source_head_scan.raw_occurrence_counts[
+                    accepted
+                ]
+                if actual_source_head_count != count_state.source_head_count:
+                    raise ReviewError(
+                        "source HEAD legacy synthetic fixture count changed after "
+                        f"preparation for {accepted.identifier}: "
+                        f"expected={count_state.source_head_count}, "
+                        f"actual={actual_source_head_count}"
+                    )
+                actual_source_head_unembedded_count = (
+                    source_head_scan.unembedded_occurrence_counts[accepted]
+                )
+                if (
+                    actual_source_head_unembedded_count
+                    != count_state.source_head_unembedded_count
+                ):
+                    raise ReviewError(
+                        "source HEAD legacy synthetic fixture unembedded count changed "
+                        f"after preparation for {accepted.identifier}: "
+                        f"expected={count_state.source_head_unembedded_count}, "
+                        f"actual={actual_source_head_unembedded_count}"
+                    )
 
         def record_source_head_path(raw_path: bytes) -> None:
             legacy_path_token_id = catalog_legacy_path_matcher.match(raw_path)
@@ -4968,25 +5073,20 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
         frozen_head_legacy_counts.update(scan.raw_occurrence_counts)
         frozen_head_legacy_unembedded_counts.update(scan.unembedded_occurrence_counts)
 
-    for accepted, (
-        _base_count,
-        expected_head_count,
-        _base_unembedded_count,
-        expected_head_unembedded_count,
-    ) in legacy_counts.items():
+    for accepted, count_state in legacy_counts.items():
         actual_head_count = frozen_head_legacy_counts[accepted]
-        if actual_head_count != expected_head_count:
+        if actual_head_count != count_state.head_count:
             raise ReviewError(
                 "frozen head legacy synthetic fixture count changed after preparation "
-                f"for {accepted.identifier}: expected={expected_head_count}, "
+                f"for {accepted.identifier}: expected={count_state.head_count}, "
                 f"actual={actual_head_count}"
             )
         actual_head_unembedded_count = frozen_head_legacy_unembedded_counts[accepted]
-        if actual_head_unembedded_count != expected_head_unembedded_count:
+        if actual_head_unembedded_count != count_state.head_unembedded_count:
             raise ReviewError(
                 "frozen head legacy synthetic fixture unembedded count changed "
                 f"after preparation for {accepted.identifier}: "
-                f"expected={expected_head_unembedded_count}, "
+                f"expected={count_state.head_unembedded_count}, "
                 f"actual={actual_head_unembedded_count}"
             )
 
@@ -7557,9 +7657,9 @@ def prepare_workspace(
         catalog,
         synthetic_secret_exemptions,
     )
-    accepted_values = accepted_authoring_values(catalog) + accepted_legacy_values(
-        catalog,
-        selected_exemptions,
+    authoring_values = accepted_authoring_values(catalog)
+    accepted_values = authoring_values + accepted_legacy_values(
+        catalog, selected_exemptions
     )
     catalog_legacy_values = accepted_legacy_values(
         catalog,
@@ -7590,7 +7690,8 @@ def prepare_workspace(
             object_directory=git_dir / "objects",
             base_sha=base_sha,
             head_sha=head_sha,
-            accepted_values=accepted_values,
+            authoring_values=authoring_values,
+            legacy_values=catalog_legacy_values,
         )
         shutil.rmtree(source_git_view)
         git_view = git_dir
@@ -7706,6 +7807,7 @@ def prepare_workspace(
             object_directory=object_directory,
             base_sha=base_sha,
             head_sha=snapshot_tree_sha,
+            source_head_sha=head_sha if include_source_wip else None,
             catalog=catalog,
             exemptions=selected_exemptions,
         )
