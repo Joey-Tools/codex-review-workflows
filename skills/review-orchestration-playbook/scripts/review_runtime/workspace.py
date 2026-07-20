@@ -929,6 +929,18 @@ def _create_sanitized_git_view(
     return git_view, object_directory
 
 
+@contextmanager
+def _temporary_sanitized_git_view(
+    *,
+    source_root: pathlib.Path,
+) -> Iterator[tuple[pathlib.Path, pathlib.Path]]:
+    with tempfile.TemporaryDirectory(prefix="isolated-review-git-view-") as raw:
+        yield _create_sanitized_git_view(
+            source_root=source_root,
+            container=pathlib.Path(raw),
+        )
+
+
 def _private_git_command(
     *,
     git_dir: pathlib.Path,
@@ -1659,17 +1671,14 @@ def _require_ancestor_range(
     base_sha: str,
     head_sha: str,
 ) -> None:
-    ancestor = _run_sanitized_git_query(
+    if _is_ancestor_in_sanitized_view(
         git_view=git_view,
         object_directory=object_directory,
-        args=("merge-base", "--is-ancestor", base_sha, head_sha),
-        label="sanitized ancestry Git query",
-        check=False,
-    )
-    if ancestor.returncode == 0:
+        ancestor=base_sha,
+        descendant=head_sha,
+        failure_message="cannot verify that the frozen base is an ancestor of head",
+    ):
         return
-    if ancestor.returncode != 1:
-        raise ReviewError("cannot verify that the frozen base is an ancestor of head")
     merge_base = _run_sanitized_git_query(
         git_view=git_view,
         object_directory=object_directory,
@@ -1687,6 +1696,28 @@ def _require_ancestor_range(
     raise ReviewError(
         f"frozen base {base_sha} is not an ancestor of head {head_sha}{detail}"
     )
+
+
+def _is_ancestor_in_sanitized_view(
+    *,
+    git_view: pathlib.Path,
+    object_directory: pathlib.Path,
+    ancestor: str,
+    descendant: str,
+    failure_message: str,
+) -> bool:
+    result = _run_sanitized_git_query(
+        git_view=git_view,
+        object_directory=object_directory,
+        args=("merge-base", "--is-ancestor", ancestor, descendant),
+        label="sanitized ancestry Git query",
+        check=False,
+    )
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    raise ReviewError(failure_message)
 
 
 def _remove_partial_container(container: pathlib.Path) -> str | None:
@@ -7358,31 +7389,24 @@ def audit_legacy_exemption(
     descriptors = {item.identifier: item for item in accepted}
     evidence: list[dict[str, Any]] = []
 
-    with tempfile.TemporaryDirectory(prefix="synthetic-token-master-audit-") as raw:
-        container = pathlib.Path(raw)
-        git_view, object_directory = _create_sanitized_git_view(
-            source_root=source_root,
-            container=container,
-        )
+    with _temporary_sanitized_git_view(
+        source_root=source_root,
+    ) as (git_view, object_directory):
         by_commit: dict[str, list[AcceptedSyntheticValue]] = {}
         for token in exemption.values:
-            ancestor = _run_sanitized_git_query(
+            ancestry_error = (
+                "legacy provenance commit is not an ancestor of the verified "
+                f"master tip: {token.identifier}"
+            )
+            is_ancestor = _is_ancestor_in_sanitized_view(
                 git_view=git_view,
                 object_directory=object_directory,
-                args=(
-                    "merge-base",
-                    "--is-ancestor",
-                    token.containing_commit,
-                    tip,
-                ),
-                label="sanitized legacy ancestry Git query",
-                check=False,
+                ancestor=token.containing_commit,
+                descendant=tip,
+                failure_message=ancestry_error,
             )
-            if ancestor.returncode != 0:
-                raise ReviewError(
-                    "legacy provenance commit is not an ancestor of the verified master tip: "
-                    f"{token.identifier}"
-                )
+            if not is_ancestor:
+                raise ReviewError(ancestry_error)
             by_commit.setdefault(token.containing_commit, []).append(
                 descriptors[token.identifier]
             )
@@ -7469,6 +7493,15 @@ def prepare_workspace(
     source_root = resolve_repo_root(repo)
     base_sha = resolve_commit(source_root, base_ref, label="base ref")
     head_sha = resolve_commit(source_root, head_ref, label="head ref")
+    with _temporary_sanitized_git_view(
+        source_root=source_root,
+    ) as (ancestry_git_view, ancestry_object_directory):
+        _require_ancestor_range(
+            git_view=ancestry_git_view,
+            object_directory=ancestry_object_directory,
+            base_sha=base_sha,
+            head_sha=head_sha,
+        )
     if include_source_wip:
         if resolve_commit(source_root, "HEAD", label="source HEAD") != head_sha:
             raise ReviewError(
@@ -7521,12 +7554,6 @@ def prepare_workspace(
         source_git_view, source_object_directory = _create_sanitized_git_view(
             source_root=source_root,
             container=container,
-        )
-        _require_ancestor_range(
-            git_view=source_git_view,
-            object_directory=source_object_directory,
-            base_sha=base_sha,
-            head_sha=head_sha,
         )
         git_dir = _create_private_review_repository(
             container=container,

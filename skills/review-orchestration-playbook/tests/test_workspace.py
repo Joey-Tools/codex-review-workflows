@@ -195,13 +195,74 @@ class WorkspaceTest(unittest.TestCase):
         review_root = workspace_runtime._review_root_for_source(repo or self.repo)
         self.assertEqual(list(review_root.glob("isolated-review-*")), [])
 
-    def test_git_environment_disables_lazy_fetch_and_prompts(self) -> None:
+    def test_git_environment_disables_lazy_fetch_replacements_and_prompts(
+        self,
+    ) -> None:
         environment = workspace_runtime._git_environment()
 
         self.assertEqual(environment["GIT_NO_LAZY_FETCH"], "1")
+        self.assertEqual(environment["GIT_NO_REPLACE_OBJECTS"], "1")
         self.assertEqual(environment["GIT_TERMINAL_PROMPT"], "0")
         self.assertEqual(environment["GIT_ASKPASS"], "/usr/bin/false")
         self.assertEqual(environment["SSH_ASKPASS"], "/usr/bin/false")
+        self.assertNotIn("GIT_GRAFT_FILE", environment)
+
+    def test_sanitized_git_query_uses_short_lived_view_and_source_objects(
+        self,
+    ) -> None:
+        completed = subprocess.CompletedProcess(("git",), 0, b"", b"")
+        with workspace_runtime._temporary_sanitized_git_view(
+            source_root=self.repo,
+        ) as (git_view, object_directory):
+            temporary_root = git_view.parent
+            config = (git_view / "config").read_text(encoding="utf-8")
+            with (
+                mock.patch.dict(
+                    workspace_runtime.os.environ,
+                    {
+                        "GIT_CONFIG_GLOBAL": str(self.repo / "hostile-config"),
+                        "GIT_DIR": str(self.repo / ".git"),
+                        "GIT_GRAFT_FILE": str(self.repo / ".git" / "info" / "grafts"),
+                    },
+                ),
+                mock.patch.object(
+                    workspace_runtime,
+                    "_run_bounded_git_capture",
+                    return_value=completed,
+                ) as bounded,
+            ):
+                result = workspace_runtime._run_sanitized_git_query(
+                    git_view=git_view,
+                    object_directory=object_directory,
+                    args=("merge-base", "--is-ancestor", self.base, self.head),
+                    label="sanitized ancestry Git query",
+                    check=False,
+                )
+
+            self.assertIs(result, completed)
+            command = bounded.call_args.args[0]
+            environment = bounded.call_args.kwargs["environment"]
+            self.assertIn(f"--git-dir={git_view}", command)
+            self.assertNotIn("-C", command)
+            self.assertIn("core.commitGraph=false", command)
+            self.assertEqual(
+                command[-4:],
+                ("merge-base", "--is-ancestor", self.base, self.head),
+            )
+            self.assertEqual(
+                environment["GIT_OBJECT_DIRECTORY"],
+                str(object_directory),
+            )
+            self.assertEqual(environment["GIT_CONFIG_GLOBAL"], os.devnull)
+            self.assertEqual(environment["GIT_CONFIG_NOSYSTEM"], "1")
+            self.assertEqual(environment["GIT_NO_LAZY_FETCH"], "1")
+            self.assertEqual(environment["GIT_NO_REPLACE_OBJECTS"], "1")
+            self.assertNotIn("GIT_DIR", environment)
+            self.assertNotIn("GIT_GRAFT_FILE", environment)
+            self.assertNotIn("remote", config.casefold())
+            self.assertFalse((git_view / "info" / "grafts").exists())
+
+        self.assertFalse(temporary_root.exists())
 
     def test_git_environment_ignores_ambient_global_config_override(self) -> None:
         with mock.patch.dict(
@@ -2740,23 +2801,32 @@ class WorkspaceTest(unittest.TestCase):
             )
         self.assertFalse(review_root.exists())
 
-    def test_diverged_range_reports_merge_base_and_cleans_container(self) -> None:
+    def test_diverged_range_reports_merge_base_before_creating_container(self) -> None:
         git(self.repo, "switch", "-c", "diverged", self.base)
         (self.repo / "side.txt").write_text("side\n", encoding="utf-8")
         git(self.repo, "add", "side.txt")
         git(self.repo, "commit", "-m", "Diverge")
         diverged = git(self.repo, "rev-parse", "HEAD")
 
-        with self.assertRaisesRegex(
-            ReviewError,
-            rf"not an ancestor.*merge base {self.base}",
+        review_root = workspace_runtime._review_root_for_source(self.repo)
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "_new_container",
+                wraps=workspace_runtime._new_container,
+            ) as new_container,
+            self.assertRaisesRegex(
+                ReviewError,
+                rf"not an ancestor.*merge base {self.base}",
+            ),
         ):
             prepare_workspace(
                 repo=self.repo,
                 base_ref=diverged,
                 head_ref=self.head,
             )
-        self.assert_no_review_containers()
+        new_container.assert_not_called()
+        self.assertFalse(review_root.exists())
 
     def test_ancestor_check_ignores_local_replace_refs(self) -> None:
         git(self.repo, "switch", "-c", "replace-diverged", self.base)
@@ -2792,7 +2862,7 @@ class WorkspaceTest(unittest.TestCase):
                 base_ref=diverged,
                 head_ref=self.head,
             )
-        self.assert_no_review_containers()
+        self.assertFalse(workspace_runtime._review_root_for_source(self.repo).exists())
 
     def test_ancestor_check_ignores_local_grafts(self) -> None:
         git(self.repo, "switch", "-c", "graft-diverged", self.base)
@@ -2819,7 +2889,7 @@ class WorkspaceTest(unittest.TestCase):
                 base_ref=diverged,
                 head_ref=self.head,
             )
-        self.assert_no_review_containers()
+        self.assertFalse(workspace_runtime._review_root_for_source(self.repo).exists())
 
     def test_ancestor_check_ignores_stale_commit_graph(self) -> None:
         (self.repo / "middle.txt").write_text("middle\n", encoding="utf-8")
@@ -2875,30 +2945,43 @@ class WorkspaceTest(unittest.TestCase):
             )
         self.assert_no_review_containers()
 
-    def test_ancestor_check_fails_closed_when_merge_base_cannot_run(self) -> None:
-        responses = (
-            subprocess.CompletedProcess(("git",), 1, b"", b""),
-            subprocess.CompletedProcess(("git",), 128, b"", b"missing object"),
-        )
-        with (
-            mock.patch.object(
-                workspace_runtime,
-                "_run_sanitized_git_query",
-                side_effect=responses,
+    def test_ancestor_check_fails_closed_for_git_query_errors(self) -> None:
+        cases = (
+            (
+                "ancestor-query",
+                (subprocess.CompletedProcess(("git",), 128, b"", b"bad object"),),
+                "cannot verify that the frozen base is an ancestor of head",
             ),
-            self.assertRaisesRegex(ReviewError, "cannot determine the merge base"),
-        ):
-            workspace_runtime._require_ancestor_range(
-                git_view=self.repo / ".git",
-                object_directory=self.repo / ".git" / "objects",
-                base_sha="a" * 40,
-                head_sha="b" * 40,
-            )
+            (
+                "merge-base-query",
+                (
+                    subprocess.CompletedProcess(("git",), 1, b"", b""),
+                    subprocess.CompletedProcess(("git",), 128, b"", b"missing object"),
+                ),
+                "cannot determine the merge base",
+            ),
+        )
+        for name, responses, message in cases:
+            with (
+                self.subTest(name=name),
+                mock.patch.object(
+                    workspace_runtime,
+                    "_run_sanitized_git_query",
+                    side_effect=responses,
+                ),
+                self.assertRaisesRegex(ReviewError, message),
+            ):
+                workspace_runtime._require_ancestor_range(
+                    git_view=self.repo / ".git",
+                    object_directory=self.repo / ".git" / "objects",
+                    base_sha="a" * 40,
+                    head_sha="b" * 40,
+                )
 
     def test_keyboard_interrupt_cleans_partial_review_container(self) -> None:
         with (
             mock.patch(
-                "review_runtime.workspace._create_sanitized_git_view",
+                "review_runtime.workspace._create_private_review_repository",
                 side_effect=KeyboardInterrupt,
             ),
             self.assertRaises(KeyboardInterrupt),
@@ -2914,12 +2997,12 @@ class WorkspaceTest(unittest.TestCase):
     def test_prepare_cleanup_failure_reports_retained_container(self) -> None:
         with (
             mock.patch(
-                "review_runtime.workspace._create_sanitized_git_view",
+                "review_runtime.workspace._create_private_review_repository",
                 side_effect=RuntimeError("prepare failed"),
             ),
             mock.patch(
-                "review_runtime.workspace.shutil.rmtree",
-                side_effect=PermissionError("permission denied"),
+                "review_runtime.workspace._remove_partial_container",
+                return_value="permission denied",
             ),
             self.assertRaisesRegex(
                 ReviewError,
@@ -2994,7 +3077,7 @@ class WorkspaceTest(unittest.TestCase):
     def test_partial_snapshot_cleanup_reports_second_signal(self) -> None:
         with (
             mock.patch(
-                "review_runtime.workspace._create_sanitized_git_view",
+                "review_runtime.workspace._create_private_review_repository",
                 side_effect=KeyboardInterrupt,
             ),
             mock.patch(
