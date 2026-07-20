@@ -29750,12 +29750,7 @@ class ProviderPolicyTest(unittest.TestCase):
             restore.call_args_list,
             [mock.call(prior_mask), mock.call(prior_mask)],
         )
-        self.assertTrue(
-            any(
-                "cleanup failure" in note
-                for note in getattr(pre_entry_signal, "__notes__", ())
-            )
-        )
+        self.assert_cleanup_diagnostic_visible(pre_entry_signal)
 
     def test_macos_coordination_masks_heartbeat_start_signal_until_cleanup(
         self,
@@ -31688,16 +31683,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     self.assertFalse(
                         observed_owners[0].signal_mask_owner_active
                     )
-                    self.assertTrue(
-                        any(
-                            "cleanup failure" in note
-                            for note in getattr(
-                                primary_signal,
-                                "__notes__",
-                                (),
-                            )
-                        )
-                    )
+                    self.assert_cleanup_diagnostic_visible(primary_signal)
 
     def test_claude_post_run_auth_rejection_precedes_inspection_failure(
         self,

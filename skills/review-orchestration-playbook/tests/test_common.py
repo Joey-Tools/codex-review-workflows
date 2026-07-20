@@ -289,8 +289,14 @@ class ChildEnvironmentTest(unittest.TestCase):
             for candidate_index in range(index + 1, len(instructions) - 1):
                 if not instructions[candidate_index].opname.startswith("CALL"):
                     continue
-                line = instruction.positions.lineno
-                assert line is not None
+                line = getattr(
+                    getattr(instruction, "positions", None),
+                    "lineno",
+                    None,
+                )
+                if line is None:
+                    line = instruction.starts_line
+                assert isinstance(line, int) and not isinstance(line, bool)
                 call_result_offsets_by_line.setdefault(line, set()).add(
                     instructions[candidate_index + 1].offset
                 )
