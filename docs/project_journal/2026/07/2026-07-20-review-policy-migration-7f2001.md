@@ -5,7 +5,7 @@ status: completed
 created: 2026-07-20
 updated: 2026-07-21
 branch: codex/review-policy-migration
-pr:
+pr: https://github.com/Joey-Tools/codex-review-workflows/pull/68
 supersedes:
   - 20260717-c17a11
   - 20260719-7f1901
@@ -43,3 +43,4 @@ superseded_by:
 - Fresh-context semantic checks independently reconstructed the single, double, and triple contracts without a competing active definition.
 - Skill validation passed for `review-orchestration-playbook` and `change-delivery-workflow`; project-journal validation passed.
 - A late fixed-range review correctly found that an intermediate hardening draft made the default review gate depend on an unimplemented raw-object/sanitized-Git runtime. The final migration removed that overreach and returned the named lanes to clean worktrees, behavioral read-only enforcement, normal instruction loading, and reviewer-derived diffs.
+- GitHub Codex review on PR #68 found that partial-clone worktrees could lazy-fetch during review. The final contract requires parent-owned no-lazy-fetch/local-completeness proof and forbids reviewer fetches or credential prompts without generating a full diff.

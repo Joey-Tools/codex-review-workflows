@@ -884,6 +884,9 @@ class RepositoryContractTest(unittest.TestCase):
             '"denyWrite": ["/"]',
             "lane-private local clone or private bare object store plus worktree",
             "not a network clone or prepared-diff materialization",
+            "GIT_NO_LAZY_FETCH=1",
+            "locally complete",
+            "never run `fetch`, `pull`",
             "global write denial",
             "critical sensitive roots",
             "not a global host-read whitelist",
@@ -893,6 +896,24 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             self.assertIn(anchor, contract)
         self.assertNotIn("Primary diff:", contract)
+
+    def test_named_lanes_block_lazy_fetch_before_reviewer_launch(self) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        templates = (SKILL_ROOT / "references/review-prompt-templates.md").read_text(
+            encoding="utf-8"
+        )
+
+        for content in (skill, contracts):
+            self.assertIn("GIT_NO_LAZY_FETCH=1", content)
+            self.assertIn("GIT_TERMINAL_PROMPT=0", content)
+            self.assertIn("locally complete", content)
+        self.assertIn("without rendering or persisting a full diff", contracts)
+        self.assertIn("never let the reviewer trigger an on-demand fetch", skill)
+        self.assertIn("forbid `fetch`, `pull`", templates)
+        self.assertNotIn("prepared full diff", contracts)
 
     def test_named_lane_keeps_raw_findings_separate_from_parent_metadata(
         self,

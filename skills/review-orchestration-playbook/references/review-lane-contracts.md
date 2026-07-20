@@ -9,6 +9,7 @@ For every local logical lane:
 - Resolve and record full `base_sha` and `head_sha`; verify that both commits exist and that the chosen range is correct for the target branch. If implementation changes are uncommitted, create an intentional review-anchor commit on the review branch first. Never derive a formal named-lane range from a dirty working tree or untracked files.
 - Create a lane-unique clean Git worktree at `head_sha`. Do not reuse the implementation checkout or another reviewer's checkout.
 - Before launch, require `git status --porcelain` to be empty, `HEAD` to equal `head_sha`, both frozen commits to resolve, and read-only `git diff base_sha..head_sha` queries to work.
+- With `GIT_NO_LAZY_FETCH=1` and `GIT_TERMINAL_PROMPT=0`, use parent-owned read-only Git plumbing to verify local object completeness for the exact range and both endpoint trees without rendering or persisting a full diff. If any required object is missing, hydrate it deliberately before freezing or report the lane blocked. Do not launch a reviewer that could trigger a promisor-remote fetch, credential helper, or interactive authentication while inspecting the frozen scope.
 - Expose the workspace and Git metadata for read-only reviewer behavior. Disable writes to files, index, refs, config, hooks, remotes, PR state, and other external systems. A filesystem read-only sandbox does not prove that state-changing MCP, Plugin, connector, or GitHub tools are absent: the reviewer policy must forbid those actions and the parent must not authorize them. This is a write/behavior contract; it is not a claim that every runtime has an OS-level global host-read whitelist.
 - Keep the model-visible workspace free of generated prompts, diff files, manifests, state directories, and helper control artifacts.
 - If a security preflight needs private evidence, keep it outside the reviewer-visible workspace and never project a full diff into the prompt.
@@ -25,6 +26,7 @@ The reviewer prompt contains only review-control metadata:
 - for Codex, an instruction to load the authoritative active playbook from its normal skill environment before that shared discovery sequence;
 - for Claude, the complete lane contract plus an instruction to read only tracked repository/path guidance and repo-local skills from the worktree during that sequence;
 - an instruction to discover evidence itself with bounded Git and source-inspection tools.
+- an instruction not to run `fetch`, `pull`, or any networked Git operation; the parent has already proved the frozen scope locally complete.
 
 The parent must not:
 

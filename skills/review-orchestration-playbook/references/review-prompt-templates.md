@@ -13,6 +13,7 @@ A separately requested Copilot diagnostic never counts toward named double. If G
 - Give a named Codex reviewer only review-control metadata: the clean worktree path, exact `base_sha`, exact `head_sha`, authoritative instruction source/version, instruction-loading order, read-only/evidence limits, focus/non-goals, and output contract. Never prebuild, paste, attach, or otherwise inject the full diff, changed-file content, suspected finding, or another reviewer's output into its prompt.
 - Require the reviewer to load the review skill and repository-wide `AGENTS.md`, inspect changed-path metadata, then load every applicable path-scoped `AGENTS.md`, domain skill, and project-guidance file before judging hunks.
 - Require the reviewer to verify the two refs and derive the diff, changed paths, hunks, and necessary nearby tracked context itself with bounded Git/tool calls.
+- State that the parent has already proved the frozen scope locally complete with lazy fetching disabled, and forbid `fetch`, `pull`, credential prompts, or any other networked Git operation.
 - Keep the worktree read-only. Do not ask the reviewer to fix findings, modify files, stage changes, commit, switch branches, or perform other Git mutations.
 - Ask for findings only, ordered by severity, with file references and concrete failure modes or triggering conditions.
 - Use exact `No findings.` output when there are no findings.
@@ -52,6 +53,7 @@ Evidence budget:
 - Use rg -l / rg --count before bounded line-producing searches.
 - Avoid multi-file full or wide diffs, whole-file dumps, broad inventories, untracked files, and noisy validation output.
 - Prefer direct argv calls and keep every operation read-only.
+- Do not run fetch, pull, or any networked Git operation; the parent already proved the frozen scope locally complete with lazy fetching disabled.
 </context>
 
 <focus_areas>
@@ -89,7 +91,7 @@ Head SHA: {head_sha}
 Frozen review range: {base_sha}..{head_sha}
 Canonical Claude lane contract version: {review_contract_version}
 
-Review exactly this frozen range from this independent read-only workspace. Explicitly read repository-wide AGENTS.md, inspect only changed-path metadata, then read applicable path-scoped AGENTS.md, repo-local domain skills, and project guidance before inspecting hunks. Obtain bounded range evidence and necessary nearby tracked context yourself; no prepared diff or other reviewer's output is supplied. Do not directly read any path outside this detached workspace, including its parent, the source checkout, other reviews, real-HOME content, installed skills, or unrelated repositories. Read-only Git may internally use only this worktree's registered Git metadata/object paths for the frozen refs. Do not inspect untracked/private files or mutate the workspace. This outside-workspace exclusion is a model/prompt scope rule; do not assume native-sandbox `allowRead` is a global host-read whitelist.
+Review exactly this frozen range from this independent read-only workspace. Explicitly read repository-wide AGENTS.md, inspect only changed-path metadata, then read applicable path-scoped AGENTS.md, repo-local domain skills, and project guidance before inspecting hunks. Obtain bounded range evidence and necessary nearby tracked context yourself; no prepared diff or other reviewer's output is supplied. The parent already proved the frozen scope locally complete with lazy fetching disabled; do not run `fetch`, `pull`, credential prompts, or another networked Git operation. Do not directly read any path outside this detached workspace, including its parent, the source checkout, other reviews, real-HOME content, installed skills, or unrelated repositories. Read-only Git may internally use only this worktree's registered Git metadata/object paths for the frozen refs. Do not inspect untracked/private files or mutate the workspace. This outside-workspace exclusion is a model/prompt scope rule; do not assume native-sandbox `allowRead` is a global host-read whitelist.
 </context>
 
 <task>
