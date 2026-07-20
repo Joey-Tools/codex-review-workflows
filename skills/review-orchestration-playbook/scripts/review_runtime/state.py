@@ -307,7 +307,9 @@ def open_private_lock_file(
                 opened_metadata.st_ino,
             ):
                 raise ReviewError(f"{label} changed before it could be opened safely")
-        if created:
+        # A no-op chmod still changes ctime and can race another first opener's
+        # path/descriptor identity validation.
+        if created and stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o600:
             os.fchmod(descriptor, 0o600)
         handle = os.fdopen(descriptor, "r+b", buffering=0)
         descriptor = None
@@ -339,14 +341,15 @@ def open_private_lock_file(
 
 
 def _directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    # Directory contents may legitimately change while cleanup waiters race to
+    # create the lock or remove a workspace. Bind the open descriptor to the
+    # same directory and its safety metadata, not content-derived timestamps
+    # or link counts.
     return (
         metadata.st_dev,
         metadata.st_ino,
         metadata.st_mode,
-        metadata.st_nlink,
         metadata.st_uid,
-        metadata.st_mtime_ns,
-        metadata.st_ctime_ns,
     )
 
 
