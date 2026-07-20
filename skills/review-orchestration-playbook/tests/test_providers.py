@@ -84,6 +84,27 @@ def publish_thread_start_fixture(
     setattr(owner, "error", outcome.error)
 
 
+_FAST_LOCAL_LOAD_OPNAMES = frozenset({"LOAD_FAST", "LOAD_FAST_BORROW"})
+_FAST_LOCAL_PAIR_LOAD_OPNAMES = frozenset(
+    {"LOAD_FAST_LOAD_FAST", "LOAD_FAST_BORROW_LOAD_FAST_BORROW"}
+)
+
+
+def _instruction_loads_fast_local(
+    instruction: object,
+    local_name: str,
+) -> bool:
+    opname = getattr(instruction, "opname", None)
+    argval = getattr(instruction, "argval", None)
+    if opname in _FAST_LOCAL_LOAD_OPNAMES:
+        return argval == local_name
+    return (
+        opname in _FAST_LOCAL_PAIR_LOAD_OPNAMES
+        and isinstance(argval, tuple)
+        and local_name in argval
+    )
+
+
 def claude_help_fixture(*, safe_mode: str | None = None) -> bytes:
     safe_mode = safe_mode or CLAUDE_SAFE_MODE_DESCRIPTION
     lines = ["Usage: claude [options]", "", "Options:"]
@@ -427,6 +448,27 @@ class ProviderPolicyTest(unittest.TestCase):
         for patcher in reversed(self.host_dependency_patchers):
             patcher.stop()
         self.temporary.cleanup()
+
+    def test_instruction_loads_fast_local_accepts_borrowed_forms(self) -> None:
+        for opname, argval, expected in (
+            ("LOAD_FAST", "owner", True),
+            ("LOAD_FAST_BORROW", "owner", True),
+            ("LOAD_FAST_LOAD_FAST", ("thread", "owner"), True),
+            (
+                "LOAD_FAST_BORROW_LOAD_FAST_BORROW",
+                ("thread", "owner"),
+                True,
+            ),
+            ("LOAD_FAST_BORROW", "other", False),
+            ("LOAD_FAST_CHECK", "owner", False),
+            ("LOAD_DEREF", "owner", False),
+        ):
+            with self.subTest(opname=opname, argval=argval):
+                instruction = mock.Mock(opname=opname, argval=argval)
+                self.assertIs(
+                    _instruction_loads_fast_local(instruction, "owner"),
+                    expected,
+                )
 
     def fake_prepare_claude_keychain_broker(
         self,
@@ -2172,8 +2214,9 @@ class ProviderPolicyTest(unittest.TestCase):
         ]
         self.assertEqual(len(acquisition_store_indexes), 1)
         target_instruction = instructions[acquisition_store_indexes[0] + 1]
-        self.assertEqual(target_instruction.opname, "LOAD_FAST")
-        self.assertEqual(target_instruction.argval, "acquisition")
+        self.assertTrue(
+            _instruction_loads_fast_local(target_instruction, "acquisition")
+        )
         prior_mask = {signal.SIGINT}
         mask_blocked = False
         interruption = RuntimeError(
@@ -4149,8 +4192,14 @@ class ProviderPolicyTest(unittest.TestCase):
                 for index, instruction in enumerate(instructions)
                 if instruction.opname.startswith("CALL")
                 and any(
-                    candidate.opname in {"LOAD_FAST", "LOAD_DEREF"}
-                    and candidate.argval == "serve_cancelled"
+                    _instruction_loads_fast_local(
+                        candidate,
+                        "serve_cancelled",
+                    )
+                    or (
+                        candidate.opname == "LOAD_DEREF"
+                        and candidate.argval == "serve_cancelled"
+                    )
                     for candidate in instructions[max(0, index - 6) : index]
                 )
                 and any(
@@ -4370,19 +4419,24 @@ class ProviderPolicyTest(unittest.TestCase):
                 ]
                 self.assertEqual(len(helper_load_indexes), 1)
                 helper_load_index = helper_load_indexes[0]
+                helper_call_indexes = [
+                    index
+                    for index in range(
+                        helper_load_index + 1,
+                        min(helper_load_index + 8, len(instructions)),
+                    )
+                    if instructions[index].opname.startswith("CALL")
+                ]
+                self.assertEqual(len(helper_call_indexes), 1)
                 call_window = instructions[
-                    helper_load_index : helper_load_index + 8
+                    helper_load_index + 1 : helper_call_indexes[0]
                 ]
                 self.assertTrue(
                     any(
-                        instruction.opname == "LOAD_FAST"
-                        and instruction.argval == "thread_start_owner"
-                        for instruction in call_window
-                    )
-                )
-                self.assertTrue(
-                    any(
-                        instruction.opname.startswith("CALL")
+                        _instruction_loads_fast_local(
+                            instruction,
+                            "thread_start_owner",
+                        )
                         for instruction in call_window
                     )
                 )

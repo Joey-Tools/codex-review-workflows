@@ -1505,6 +1505,59 @@ class ClaudeRefreshLockLease:
                 diagnostic=diagnostic,
             )
 
+    def _settle_descriptor_bound_retention(
+        self,
+        reason: str,
+    ) -> ClaudeRefreshLockCleanupInconclusive:
+        """Publish terminal retained residue without closing live descriptors."""
+
+        normalized_reason = reason.strip()
+        if not normalized_reason:
+            raise ValueError(
+                "descriptor-bound retention reason must not be empty"
+        )
+        with self._state_lock:
+            if self._released:
+                raise ClaudeRefreshLockCompromised(
+                    "cannot retain residue for a released Claude refresh-lock "
+                    "lease"
+                )
+            operation_handoff = self._pending_operation_handoff
+            if operation_handoff is not None:
+                if not operation_handoff.resolved:
+                    raise ClaudeRefreshLockCompromised(
+                        "cannot settle descriptor-bound retention with an "
+                        "unresolved operation handoff"
+                    )
+                self._pending_operation_handoff = None
+            self._deletion_prohibited = True
+            self._abandoned = True
+            self._release_started = True
+            self._cleanup_started = True
+            self._heartbeat_stop.set()
+            self._abandonment_diagnostic_reason = normalized_reason
+            self._cleanup_inconclusive = (
+                self._descriptor_bound_cleanup_fallback
+            )
+            descriptors = {
+                *(lock.descriptor for lock in self._locks),
+                self._legacy_parent_anchor.descriptor,
+                self._config_anchor.descriptor,
+                *(self._abandonment_descriptors_pending or ()),
+                *self._abandonment_descriptors_unconfirmed,
+            }
+            self._abandonment_descriptors_residue.update(descriptors)
+            self._abandonment_descriptors_pending = []
+            self._abandonment_descriptors_unconfirmed.clear()
+            self._abandonment_cleanup_completed = False
+            self._retention_recovery_evidence = (
+                self._descriptor_bound_cleanup_fallback
+            )
+            self._abandonment_cleanup_lifecycle = (
+                _AbandonmentCleanupLifecycle.SETTLED
+            )
+            return self._descriptor_bound_cleanup_fallback
+
     def _begin_pending_acquisition(
         self,
         *,

@@ -331,7 +331,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 continue
             for previous in reversed(instructions[max(0, index - 3) : index]):
                 if (
-                    previous.opname == "LOAD_FAST"
+                    previous.opname in {"LOAD_FAST", "LOAD_FAST_BORROW"}
                     and previous.argval == "lease"
                 ):
                     return previous.offset

@@ -5290,10 +5290,10 @@ class CredentialStagingTest(unittest.TestCase):
             claude_linux._writeback_refreshed_credential_impl: 2,
             claude_linux._read_staged_credential_under_lock: 1,
             claude_linux._retain_unmasked_credential_cleanup: 1,
-            claude_linux._stage_claude_credentials_anchored.__wrapped__: 3,
+            claude_linux._stage_claude_credentials_anchored.__wrapped__: 4,
         }
         source = pathlib.Path(claude_linux.__file__).read_text(encoding="utf-8")
-        self.assertEqual(source.count("_retention_recovery_evidence"), 11)
+        self.assertEqual(source.count("_retention_recovery_evidence"), 12)
         self.assertNotIn("_retention_recovery_evidence(", source)
 
         total_reads = 0
@@ -5327,7 +5327,7 @@ class CredentialStagingTest(unittest.TestCase):
                         instructions[index + 1].opname,
                         "STORE_FAST",
                     )
-        self.assertEqual(total_reads, 11)
+        self.assertEqual(total_reads, 12)
 
     def test_release_retry_evidence_cannot_alias_promoted_fallback(
         self,
@@ -7988,6 +7988,70 @@ class CredentialStagingTest(unittest.TestCase):
             claude_linux._StagedCredentialWatcherStartState.CONFIRMED,
         )
 
+    def test_watcher_request_stop_bounds_persistent_state_failures(
+        self,
+    ) -> None:
+        expected_attempts = 2
+
+        class EventuallyAvailableLock:
+            def __init__(self, message: str) -> None:
+                self.message = message
+                self.enter_calls = 0
+
+            def __enter__(self) -> object:
+                self.enter_calls += 1
+                if self.enter_calls <= expected_attempts:
+                    raise OSError(self.message)
+                return self
+
+            def __exit__(
+                self,
+                _exception_type: object,
+                _exception: object,
+                _traceback: object,
+            ) -> bool:
+                return False
+
+        class EventuallyAvailableStop:
+            def __init__(self) -> None:
+                self.is_set_calls = 0
+                self.set_calls = 0
+
+            def is_set(self) -> bool:
+                self.is_set_calls += 1
+                return False
+
+            def set(self) -> None:
+                self.set_calls += 1
+                if self.set_calls <= expected_attempts:
+                    raise OSError("injected persistent stop-state failure")
+
+        watcher = object.__new__(claude_linux._StagedCredentialWatcher)
+        background_lock = EventuallyAvailableLock(
+            "injected persistent writeback-state failure"
+        )
+        start_lock = EventuallyAvailableLock(
+            "injected persistent stop-deadline failure"
+        )
+        stop = EventuallyAvailableStop()
+        watcher._background_writeback_state_lock = background_lock  # type: ignore[assignment]
+        watcher._background_writeback_admission_open = True
+        watcher._background_writeback_in_flight = False
+        watcher._background_writeback_was_in_flight_at_stop = False
+        watcher._stop = stop  # type: ignore[assignment]
+        watcher._start_state_lock = start_lock  # type: ignore[assignment]
+        watcher._stop_deadline = None
+
+        error = watcher.request_stop()
+
+        self.assertIsInstance(error, OSError)
+        self.assertEqual(background_lock.enter_calls, expected_attempts)
+        self.assertEqual(stop.is_set_calls, 0)
+        self.assertEqual(stop.set_calls, expected_attempts)
+        self.assertEqual(start_lock.enter_calls, expected_attempts)
+        self.assertTrue(watcher._background_writeback_admission_open)
+        self.assertIsNone(watcher._stop_deadline)
+
     def test_final_drain_recovers_after_ordinary_watcher_failure(self) -> None:
         now = time.time()
         with tempfile.TemporaryDirectory() as temporary:
@@ -8540,6 +8604,288 @@ class CredentialStagingTest(unittest.TestCase):
             finally:
                 source_anchor.close_if_owned()
 
+    def test_cleanup_coordinator_settles_live_heartbeat_as_retained_residue(
+        self,
+    ) -> None:
+        class RetainedHeartbeat:
+            def __init__(self, allow_exit: threading.Event) -> None:
+                self.allow_exit = allow_exit
+
+            def join(self, timeout: float | None = None) -> None:
+                self.allow_exit.wait(min(timeout or 0.0, 0.005))
+
+            def is_alive(self) -> bool:
+                return not self.allow_exit.is_set()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            source = self._credential(
+                root / ".credentials.json",
+                expires_at_ms=(time.time() - 60) * 1000,
+            )
+            source_anchor = claude_linux._open_credential_directory_anchor(
+                source,
+                owner_uid=os.getuid(),
+            )
+            coordinator = claude_linux._HostRefreshLockCleanupCoordinator(
+                source_anchor
+            )
+            lease: claude_refresh_lock.ClaudeRefreshLockLease | None = None
+            real_heartbeat: threading.Thread | None = None
+            allow_exit = threading.Event()
+            retain_errors: list[BaseException] = []
+            retain_failures: list[BaseException] = []
+
+            def retain() -> None:
+                try:
+                    retain_errors.extend(
+                        coordinator.retain(
+                            reason="injected live heartbeat retention"
+                        )
+                    )
+                except BaseException as error:
+                    retain_failures.append(error)
+
+            retain_thread = threading.Thread(
+                target=retain,
+                daemon=True,
+            )
+            try:
+                coordinator._thread.start()
+                self.assertTrue(coordinator._ready.wait(timeout=1.0))
+                lease = claude_linux.acquire_claude_refresh_lock(
+                    source.parent,
+                    protocol=self.PROTOCOL,
+                    owner=coordinator.owner,
+                    timeout_seconds=0,
+                    config_dir_fd=source_anchor.descriptor,
+                    legacy_parent_dir_fd=(
+                        source_anchor.legacy_parent_descriptor
+                    ),
+                    require_explicit_context_release=True,
+                )
+                coordinator.owner.transfer(lease)
+                real_heartbeat = lease._heartbeat_thread
+                assert real_heartbeat is not None
+                lease._heartbeat_stop.set()
+                real_heartbeat.join(timeout=1.0)
+                self.assertFalse(real_heartbeat.is_alive())
+                lease._heartbeat_thread = RetainedHeartbeat(  # type: ignore[assignment]
+                    allow_exit
+                )
+                known_descriptors = {
+                    *(lock.descriptor for lock in lease._locks),
+                    lease._legacy_parent_anchor.descriptor,
+                    lease._config_anchor.descriptor,
+                }
+
+                with (
+                    mock.patch.object(
+                        lease,
+                        "abandon",
+                        wraps=lease.abandon,
+                    ) as abandon,
+                    mock.patch.object(
+                        lease,
+                        "release",
+                        wraps=lease.release,
+                    ) as release,
+                ):
+                    retain_thread.start()
+                    retain_thread.join(timeout=0.5)
+
+                self.assertFalse(
+                    retain_thread.is_alive(),
+                    "live heartbeat left coordinator retention unbounded",
+                )
+                self.assertFalse(coordinator._thread.is_alive())
+                self.assertEqual(retain_failures, [])
+                self.assertNotEqual(retain_errors, [])
+                self.assertEqual(abandon.call_count, 2)
+                self.assertEqual(release.call_count, 2)
+                snapshot = lease.retention_snapshot()
+                self.assertTrue(snapshot.terminal)
+                self.assertFalse(snapshot.verified_closed)
+                self.assertIs(
+                    snapshot.diagnostic,
+                    lease._descriptor_bound_cleanup_fallback,
+                )
+                assert snapshot.diagnostic is not None
+                self.assertTrue(
+                    getattr(
+                        snapshot.diagnostic,
+                        "_codex_claude_refresh_lock_descriptor_bound",
+                        False,
+                    )
+                )
+                self.assertFalse(lease.released)
+                self.assertTrue(all(path.is_dir() for path in lease.paths))
+                self.assertTrue(
+                    known_descriptors.issubset(
+                        lease._abandonment_descriptors_residue
+                    )
+                )
+                self.assertEqual(lease._abandonment_descriptors_pending, [])
+                self.assertEqual(
+                    lease._abandonment_descriptors_unconfirmed,
+                    set(),
+                )
+                for descriptor in known_descriptors:
+                    os.fstat(descriptor)
+                with self.assertRaises(
+                    claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive
+                ) as raised:
+                    lease.release()
+                self.assertIs(
+                    raised.exception,
+                    lease._descriptor_bound_cleanup_fallback,
+                )
+                self.assertTrue(all(path.is_dir() for path in lease.paths))
+            finally:
+                allow_exit.set()
+                if retain_thread.ident is not None:
+                    retain_thread.join(timeout=1.0)
+                if coordinator._thread.ident is not None:
+                    coordinator._terminal.set()
+                    coordinator._thread.join(timeout=1.0)
+                if lease is not None:
+                    lease._heartbeat_thread = real_heartbeat
+                    self._dispose_refresh_lock_fixture(lease)
+                source_anchor.close_if_owned()
+
+    def test_cleanup_coordinator_bounds_persistent_watcher_failures(
+        self,
+    ) -> None:
+        expected_attempts = 2
+
+        class EventuallyAvailableWatcher:
+            def __init__(
+                self,
+                source_anchor: claude_linux._CredentialDirectoryAnchor,
+            ) -> None:
+                self.source_anchor = source_anchor
+                self.request_stop_calls = 0
+                self.wait_calls = 0
+                self.retain_anchor_calls = 0
+
+            def may_have_started(self) -> bool:
+                return True
+
+            def request_stop(self) -> None:
+                self.request_stop_calls += 1
+                if self.request_stop_calls <= expected_attempts:
+                    raise OSError("injected persistent watcher stop failure")
+
+            def wait_until_stopped(self) -> bool:
+                self.wait_calls += 1
+                if self.wait_calls <= expected_attempts:
+                    raise OSError("injected persistent watcher wait failure")
+                return False
+
+            def retain_source_anchor_after_timeout(self) -> None:
+                self.retain_anchor_calls += 1
+                if self.retain_anchor_calls <= expected_attempts:
+                    raise OSError("injected persistent source-handoff failure")
+                self.source_anchor.detach_to_watcher()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            source = self._credential(
+                root / ".credentials.json",
+                expires_at_ms=(time.time() - 60) * 1000,
+            )
+            carrier = root / "retained-carrier"
+            config_dir = carrier / "config"
+            config_dir.mkdir(parents=True)
+            staged = claude_linux.StagedCredential(
+                carrier_root=carrier,
+                config_dir=config_dir,
+                credential_path=config_dir / ".credentials.json",
+                expires_at_ms=(time.time() + 3600) * 1000,
+            )
+            source_anchor = claude_linux._open_credential_directory_anchor(
+                source,
+                owner_uid=os.getuid(),
+            )
+            source_descriptor = source_anchor.descriptor
+            watcher = EventuallyAvailableWatcher(source_anchor)
+            coordinator = claude_linux._HostRefreshLockCleanupCoordinator(
+                source_anchor
+            )
+            lease: claude_refresh_lock.ClaudeRefreshLockLease | None = None
+            retain_errors: list[BaseException] = []
+            retain_failures: list[BaseException] = []
+
+            def retain() -> None:
+                try:
+                    retain_errors.extend(
+                        coordinator.retain(
+                            reason="injected persistent watcher retention"
+                        )
+                    )
+                except BaseException as error:
+                    retain_failures.append(error)
+
+            retain_thread = threading.Thread(target=retain, daemon=True)
+            try:
+                coordinator._thread.start()
+                self.assertTrue(coordinator._ready.wait(timeout=1.0))
+                lease = claude_linux.acquire_claude_refresh_lock(
+                    source.parent,
+                    protocol=self.PROTOCOL,
+                    owner=coordinator.owner,
+                    timeout_seconds=0,
+                    config_dir_fd=source_anchor.descriptor,
+                    legacy_parent_dir_fd=(
+                        source_anchor.legacy_parent_descriptor
+                    ),
+                    require_explicit_context_release=True,
+                )
+                coordinator.owner.transfer(lease)
+                coordinator.publish_watcher(staged, watcher)  # type: ignore[arg-type]
+
+                retain_thread.start()
+                retain_thread.join(timeout=0.5)
+
+                self.assertFalse(
+                    retain_thread.is_alive(),
+                    "persistent watcher failures left retention unbounded",
+                )
+                self.assertEqual(retain_failures, [])
+                self.assertNotEqual(retain_errors, [])
+                self.assertEqual(
+                    watcher.request_stop_calls,
+                    expected_attempts,
+                )
+                self.assertEqual(watcher.wait_calls, expected_attempts)
+                self.assertEqual(
+                    watcher.retain_anchor_calls,
+                    expected_attempts,
+                )
+                self.assertFalse(coordinator._source_terminal)
+                self.assertFalse(source_anchor.detached_to_watcher)
+                os.fstat(source_descriptor)
+                self.assertTrue(carrier.is_dir())
+                snapshot = lease.retention_snapshot()
+                self.assertTrue(snapshot.terminal)
+                self.assertFalse(lease.released)
+                self.assertTrue(all(path.is_dir() for path in lease.paths))
+                self.assertTrue(
+                    any(
+                        "source-anchor retention" in str(error)
+                        for error in retain_errors
+                    )
+                )
+            finally:
+                if retain_thread.ident is not None:
+                    retain_thread.join(timeout=1.0)
+                if coordinator._thread.ident is not None:
+                    coordinator._terminal.set()
+                    coordinator._thread.join(timeout=1.0)
+                if lease is not None:
+                    self._dispose_refresh_lock_fixture(lease)
+                source_anchor.close_if_owned()
+
     def test_cleanup_coordinator_retries_decision_wait_before_acquire(
         self,
     ) -> None:
@@ -8820,6 +9166,142 @@ class CredentialStagingTest(unittest.TestCase):
                     self.assertFalse(signal_mask_owner.active)
 
                 self.assertEqual(restore_calls, 2)
+
+    def test_missing_signal_mask_bounds_persistent_retention_failure(
+        self,
+    ) -> None:
+        mask_failure = OSError(
+            errno.EPERM,
+            "injected forwarded-signal mask failure",
+        )
+        retention_failure = OSError(
+            errno.EIO,
+            "injected persistent retention failure",
+        )
+        unexpected_success = RuntimeError(
+            "unbounded retention retry unexpectedly succeeded",
+        )
+        retention_calls = 0
+
+        def retain_unmasked_cleanup(
+            _errors: list[BaseException],
+        ) -> BaseException:
+            nonlocal retention_calls
+            retention_calls += 1
+            if (
+                retention_calls
+                <= claude_linux.UNMASKED_CREDENTIAL_CLEANUP_MAX_ATTEMPTS
+            ):
+                raise retention_failure
+            return unexpected_success
+
+        with (
+            mock.patch.object(
+                claude_linux,
+                "block_forwarded_signals",
+                side_effect=mask_failure,
+            ),
+            claude_linux._defer_forwarded_signals_during_cleanup(
+                retain_unmasked_cleanup=retain_unmasked_cleanup,
+            ) as cleanup_signals,
+        ):
+            pass
+
+        self.assertEqual(
+            retention_calls,
+            claude_linux.UNMASKED_CREDENTIAL_CLEANUP_MAX_ATTEMPTS,
+        )
+        self.assertFalse(cleanup_signals.mask_established)
+        self.assertIsInstance(
+            cleanup_signals.fail_closed_error,
+            claude_linux.LinuxCredentialInspectionInconclusive,
+        )
+        assert cleanup_signals.fail_closed_error is not None
+        self.assertIs(
+            cleanup_signals.fail_closed_error.__cause__,
+            retention_failure,
+        )
+        self.assertTrue(
+            getattr(
+                cleanup_signals.fail_closed_error,
+                "_codex_claude_refresh_persistence_failed",
+                False,
+            )
+        )
+        self.assertEqual(
+            cleanup_signals.errors,
+            [mask_failure, mask_failure]
+            + [retention_failure]
+            * claude_linux.UNMASKED_CREDENTIAL_CLEANUP_MAX_ATTEMPTS,
+        )
+
+    def test_persistent_unmasked_retention_failure_keeps_carrier_metadata(
+        self,
+    ) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            helper = root / "worker-helper"
+            helper.mkdir(mode=0o700)
+            source = self._credential(
+                root / ".credentials.json",
+                expires_at_ms=(now - 60) * 1000,
+            )
+            staged_credentials: list[claude_linux.StagedCredential] = []
+            thread_errors: list[BaseException] = []
+            retention_failure = OSError(
+                errno.EIO,
+                "injected persistent retention failure",
+            )
+
+            def stage_on_worker() -> None:
+                try:
+                    with claude_linux.stage_claude_credentials(
+                        source,
+                        helper,
+                        now=now,
+                    ) as staged:
+                        staged_credentials.append(staged)
+                except BaseException as error:
+                    thread_errors.append(error)
+
+            with (
+                mock.patch.object(
+                    claude_linux,
+                    "_retain_unmasked_credential_cleanup",
+                    side_effect=retention_failure,
+                ) as retain,
+                mock.patch.object(
+                    claude_linux,
+                    "_cleanup_staged_credential",
+                ) as cleanup_staged,
+            ):
+                worker = threading.Thread(
+                    target=stage_on_worker,
+                    name="persistent-unmasked-retention-worker",
+                    daemon=True,
+                )
+                worker.start()
+                worker.join(timeout=3.0)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(
+                retain.call_count,
+                claude_linux.UNMASKED_CREDENTIAL_CLEANUP_MAX_ATTEMPTS,
+            )
+            self.assertEqual(len(staged_credentials), 1)
+            self.assertEqual(len(thread_errors), 1)
+            self.assertIsInstance(
+                thread_errors[0],
+                claude_linux.LinuxCredentialInspectionInconclusive,
+            )
+            cleanup_staged.assert_not_called()
+            self._assert_retained_recovery_carrier(
+                error=thread_errors[0],
+                staged=staged_credentials[0],
+                helper=helper,
+                expected_refresh_token=self.SYNTH_REFRESH_A,
+            )
 
     def test_missing_signal_mask_never_starts_threads_or_destroys_carrier(
         self,

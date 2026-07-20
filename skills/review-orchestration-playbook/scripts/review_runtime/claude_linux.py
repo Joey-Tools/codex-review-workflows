@@ -433,6 +433,8 @@ STAGED_CREDENTIAL_POLL_SECONDS = 0.05
 STAGED_CREDENTIAL_RETRY_SECONDS = 1.0
 STAGED_CREDENTIAL_LOCK_TIMEOUT_SECONDS = 0.2
 STAGED_CREDENTIAL_JOIN_TIMEOUT_SECONDS = 6.0
+CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS = 2
+UNMASKED_CREDENTIAL_CLEANUP_MAX_ATTEMPTS = 8
 PROBE_TIMEOUT_SECONDS = 20.0
 PROBE_OUTPUT_LIMIT_BYTES = 64 * 1024
 TOOL_PROBE_TIMEOUT_SECONDS = 10.0
@@ -2220,14 +2222,43 @@ def _defer_forwarded_signals_during_cleanup(
         break
     fail_closed_error: BaseException | None = None
     if not signal_mask_owner.active:
-        while fail_closed_error is None:
+        retention_errors: list[BaseException] = []
+        for _attempt in range(UNMASKED_CREDENTIAL_CLEANUP_MAX_ATTEMPTS):
             try:
                 fail_closed_error = retain_unmasked_cleanup(
                     deferred_signals
                 )
             except BaseException as error:
                 deferred_signals.append(error)
+                retention_errors.append(error)
                 continue
+            break
+        if fail_closed_error is None:
+            fail_closed_error = LinuxCredentialInspectionInconclusive(
+                "cannot complete fail-closed Claude credential retention "
+                "after bounded retries; credential cleanup was skipped and "
+                "any shared refresh locks were left in place"
+            )
+            setattr(
+                fail_closed_error,
+                "_codex_claude_refresh_persistence_failed",
+                True,
+            )
+            setattr(
+                fail_closed_error,
+                "_codex_claude_unmasked_cleanup_retry_exhausted",
+                True,
+            )
+            retention_error = next(
+                (
+                    error
+                    for error in retention_errors
+                    if not _is_control_flow_error(error)
+                ),
+                None,
+            )
+            if retention_error is not None:
+                fail_closed_error.__cause__ = retention_error
     cleanup_signals = _DeferredCleanupSignals(
         errors=deferred_signals,
         mask_established=signal_mask_owner.active,
@@ -3867,23 +3898,43 @@ class _StagedCredentialWatcher:
 
     def request_stop(self) -> BaseException | None:
         stop_errors: list[BaseException] = []
-        while True:
+        admission_closed = False
+        for _attempt in range(CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS):
             try:
                 with self._background_writeback_state_lock:
                     self._background_writeback_admission_open = False
                     if self._background_writeback_in_flight:
                         self._background_writeback_was_in_flight_at_stop = True
-                break
             except BaseException as error:
                 stop_errors.append(error)
-        while True:
+                continue
+            admission_closed = True
+            break
+        if not admission_closed:
+            stop_errors.append(
+                LinuxCredentialInspectionInconclusive(
+                    "cannot close staged Claude credential writeback "
+                    "admission after bounded retries"
+                )
+            )
+        stop_requested = False
+        for _attempt in range(CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS):
             try:
-                if self._stop.is_set():
-                    break
                 self._stop.set()
             except BaseException as error:
                 stop_errors.append(error)
-        while True:
+                continue
+            stop_requested = True
+            break
+        if not stop_requested:
+            stop_errors.append(
+                LinuxCredentialInspectionInconclusive(
+                    "cannot request staged Claude credential watcher stop "
+                    "after bounded retries"
+                )
+            )
+        deadline_published = False
+        for _attempt in range(CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS):
             try:
                 now = time.monotonic()
                 with self._start_state_lock:
@@ -3892,9 +3943,18 @@ class _StagedCredentialWatcher:
                             now
                             + STAGED_CREDENTIAL_JOIN_TIMEOUT_SECONDS
                         )
-                break
             except BaseException as error:
                 stop_errors.append(error)
+                continue
+            deadline_published = True
+            break
+        if not deadline_published:
+            stop_errors.append(
+                LinuxCredentialInspectionInconclusive(
+                    "cannot publish staged Claude credential watcher stop "
+                    "deadline after bounded retries"
+                )
+            )
         return _primary_cleanup_error(stop_errors)
 
     def wait_until_stopped(self) -> bool:
@@ -4351,20 +4411,32 @@ class _HostRefreshLockCleanupCoordinator:
         watcher = self._watcher
         watcher_started = False
         if watcher is not None:
-            while True:
+            start_state_known = False
+            for _attempt in range(CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS):
                 try:
                     watcher_started = watcher.may_have_started()
                 except BaseException as error:
                     self._errors.append(error)
                     continue
+                start_state_known = True
                 break
+            if not start_state_known:
+                watcher_started = True
+                self._errors.append(
+                    LinuxCredentialInspectionInconclusive(
+                        "cannot confirm whether the staged Claude credential "
+                        "watcher started after bounded retries; treating it "
+                        "as started"
+                    )
+                )
         if watcher is None or not watcher_started:
             self._source_anchor.detach_to_watcher()
             self._source_anchor.close_if_detached()
             self._source_terminal = True
             return
 
-        while True:
+        stop_completed = False
+        for _attempt in range(CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS):
             try:
                 stop_error = watcher.request_stop()
             except BaseException as error:
@@ -4372,29 +4444,64 @@ class _HostRefreshLockCleanupCoordinator:
                 continue
             if stop_error is not None:
                 self._errors.append(stop_error)
+                continue
+            stop_completed = True
             break
+        if not stop_completed:
+            self._errors.append(
+                LinuxCredentialInspectionInconclusive(
+                    "cannot request staged Claude credential watcher stop "
+                    "after bounded coordinator retries"
+                )
+            )
         watcher_stopped = False
         completed_waits = 0
-        while completed_waits < 2:
+        for _attempt in range(CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS):
             try:
                 watcher_stopped = watcher.wait_until_stopped()
             except BaseException as error:
                 self._errors.append(error)
                 continue
+            completed_waits += 1
             if watcher_stopped:
                 break
-            completed_waits += 1
-        while True:
+        if completed_waits == 0:
+            self._errors.append(
+                LinuxCredentialInspectionInconclusive(
+                    "cannot observe staged Claude credential watcher "
+                    "quiescence after bounded retries"
+                )
+            )
+        source_handoff_completed = False
+        for _attempt in range(CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS):
             try:
                 watcher.retain_source_anchor_after_timeout()
             except BaseException as error:
                 self._errors.append(error)
                 continue
+            source_handoff_completed = True
             break
-        if not self._source_anchor.detached_to_watcher:
-            raise LinuxCredentialInspectionInconclusive(
-                "host cleanup coordinator did not transfer the source anchor"
+        if not source_handoff_completed:
+            self._errors.append(
+                LinuxCredentialInspectionInconclusive(
+                    "source-anchor retention did not complete after bounded "
+                    "retries; descriptors remain coordinator-owned"
+                )
             )
+            return
+        try:
+            source_detached = self._source_anchor.detached_to_watcher
+        except BaseException as error:
+            self._errors.append(error)
+            return
+        if not source_detached:
+            self._errors.append(
+                LinuxCredentialInspectionInconclusive(
+                    "host cleanup coordinator could not verify source-anchor "
+                    "transfer; descriptors remain coordinator-owned"
+                )
+            )
+            return
         self._source_terminal = True
         if not watcher_stopped:
             self._errors.append(
@@ -4407,17 +4514,36 @@ class _HostRefreshLockCleanupCoordinator:
     def _retain_lease(self, lease: ClaudeRefreshLockLease) -> None:
         lease._deletion_prohibited = True
         lease._heartbeat_stop.set()
-        while not lease.retention_snapshot().terminal:
+        for _attempt in range(2):
+            try:
+                if lease.retention_snapshot().terminal:
+                    return
+            except BaseException as error:
+                self._errors.append(error)
             try:
                 lease.abandon(self._retention_reason)
             except BaseException as error:
                 self._errors.append(error)
-            if lease.retention_snapshot().terminal:
-                break
+            try:
+                if lease.retention_snapshot().terminal:
+                    return
+            except BaseException as error:
+                self._errors.append(error)
             try:
                 lease.release()
             except BaseException as error:
                 self._errors.append(error)
+        failure = LinuxCredentialInspectionInconclusive(
+            "host refresh-lock cleanup did not become terminal after bounded "
+            "retention attempts; retaining descriptor-bound lock residue"
+        )
+        self._errors.append(failure)
+        try:
+            recovery = lease._settle_descriptor_bound_retention(str(failure))
+        except BaseException as error:
+            self._errors.append(error)
+        else:
+            _attach_host_refresh_lock_recovery(failure, recovery)
 
     def _run(self) -> None:
         self._worker_entered.set()
@@ -4473,7 +4599,9 @@ class _HostRefreshLockCleanupCoordinator:
         except BaseException as error:
             self._errors.append(error)
             if self._retaining:
-                while not self._source_terminal:
+                for _attempt in range(2):
+                    if self._source_terminal:
+                        break
                     try:
                         self._retain_source_anchor()
                     except BaseException as retry_error:
@@ -4483,20 +4611,33 @@ class _HostRefreshLockCleanupCoordinator:
                     self._retention_reason
                     or "host cleanup coordinator failed closed"
                 )
-                while not lease.retention_snapshot().terminal:
-                    try:
-                        self._retain_lease(lease)
-                    except BaseException as retry_error:
-                        self._errors.append(retry_error)
+                try:
+                    self._retain_lease(lease)
+                except BaseException as retry_error:
+                    self._errors.append(retry_error)
         finally:
+            if self._retaining and not self._source_terminal:
+                self._errors.append(
+                    LinuxCredentialInspectionInconclusive(
+                        "host cleanup coordinator ended before source-anchor "
+                        "retention became terminal"
+                    )
+                )
             lease = self.owner.lease
-            source_terminal = (
-                not self._retaining or self._source_terminal
-            )
-            if source_terminal and (
-                lease is None or lease.retention_snapshot().terminal
-            ):
-                self._terminal.set()
+            if lease is not None:
+                try:
+                    lease_terminal = lease.retention_snapshot().terminal
+                except BaseException as error:
+                    self._errors.append(error)
+                else:
+                    if not lease_terminal:
+                        self._errors.append(
+                            LinuxCredentialInspectionInconclusive(
+                                "host cleanup coordinator ended before "
+                                "refresh-lock retention became terminal"
+                            )
+                        )
+            self._terminal.set()
 
 
 def _retain_unmasked_credential_cleanup(
@@ -4984,6 +5125,46 @@ def _stage_claude_credentials_anchored(
             payload_error = None
             cleanup_error = None
             if not cleanup_signals.mask_established:
+                if (
+                    writeback_error is not None
+                    and getattr(
+                        writeback_error,
+                        "_codex_claude_unmasked_cleanup_retry_exhausted",
+                        False,
+                    )
+                ):
+                    retained_carrier = (
+                        staged.carrier_root
+                        if staged is not None
+                        else carrier_root
+                    )
+                    if retained_carrier is not None:
+                        setattr(
+                            writeback_error,
+                            "_codex_claude_retained_credential_carrier",
+                            str(retained_carrier),
+                        )
+                    cleanup_host_refresh_lock = (
+                        host_refresh_lock
+                        if host_refresh_lock is not None
+                        else host_refresh_lock_owner.lease
+                    )
+                    stateful_host_refresh_lock = (
+                        _stateful_claude_refresh_lock_lease(
+                            cleanup_host_refresh_lock
+                        )
+                        if cleanup_host_refresh_lock is not None
+                        else None
+                    )
+                    if stateful_host_refresh_lock is not None:
+                        fallback_diagnostic = (
+                            stateful_host_refresh_lock.
+                            _retention_recovery_evidence
+                        )
+                        _attach_host_refresh_lock_recovery(
+                            writeback_error,
+                            fallback_diagnostic,
+                        )
                 raise _SkipUnmaskedCredentialCleanup
             cleanup_is_safe = True
             carrier_cleanup_proven = False
