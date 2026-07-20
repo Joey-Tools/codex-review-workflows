@@ -953,6 +953,8 @@ def _private_git_command(
         "-c",
         "core.fsmonitor=false",
         "-c",
+        "core.logAllRefUpdates=false",
+        "-c",
         f"core.hooksPath={os.devnull}",
         "-c",
         "diff.external=",
@@ -1477,7 +1479,11 @@ def _create_private_review_repository(
 def _canonical_private_git_config(*, object_id_length: int) -> bytes:
     if object_id_length == 40:
         return (
-            b"[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n"
+            b"[core]\n"
+            b"\trepositoryformatversion = 0\n"
+            b"\tfilemode = true\n"
+            b"\tbare = true\n"
+            b"\tlogAllRefUpdates = false\n"
         )
     if object_id_length == 64:
         return (
@@ -1485,6 +1491,7 @@ def _canonical_private_git_config(*, object_id_length: int) -> bytes:
             b"\trepositoryformatversion = 1\n"
             b"\tfilemode = true\n"
             b"\tbare = true\n"
+            b"\tlogAllRefUpdates = false\n"
             b"[extensions]\n"
             b"\tobjectFormat = sha256\n"
         )

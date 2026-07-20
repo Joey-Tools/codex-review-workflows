@@ -4389,10 +4389,27 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         self.assertTrue(middle_object.is_file())
         self.assertEqual(list((objects / "pack").glob("*.pack")), [])
         middle_object.unlink()
-        self.assertEqual(
-            git(repo, "merge-base", "--is-ancestor", containing, tip),
-            "",
+        with_graph = subprocess.run(
+            (
+                "git",
+                "-C",
+                str(repo),
+                "merge-base",
+                "--is-ancestor",
+                containing,
+                tip,
+            ),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
+        # Git versions differ on whether a stale graph masks the missing object
+        # or makes the default ancestry query fail closed immediately.
+        if with_graph.returncode == 0:
+            self.assertEqual(with_graph.stdout, b"")
+        else:
+            self.assertNotEqual(with_graph.returncode, 1)
+            self.assertTrue(with_graph.stderr)
         without_graph = subprocess.run(
             (
                 "git",

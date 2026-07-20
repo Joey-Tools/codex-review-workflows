@@ -273,6 +273,19 @@ class WorkspaceTest(unittest.TestCase):
 
         self.assertEqual(environment["GIT_CONFIG_GLOBAL"], os.devnull)
 
+    def test_private_git_commands_and_config_disable_reflogs(self) -> None:
+        command = workspace_runtime._private_git_command(
+            git_dir=self.repo / "private.git",
+            args=("status",),
+        )
+        self.assertIn("core.logAllRefUpdates=false", command)
+        for object_id_length in (40, 64):
+            with self.subTest(object_id_length=object_id_length):
+                config = workspace_runtime._canonical_private_git_config(
+                    object_id_length=object_id_length
+                )
+                self.assertIn(b"\tlogAllRefUpdates = false\n", config)
+
     def test_partial_clone_missing_blob_fails_without_transport(self) -> None:
         git(self.repo, "config", "uploadpack.allowFilter", "true")
         partial = pathlib.Path(self.temporary.name) / "partial"
@@ -1173,6 +1186,32 @@ class WorkspaceTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ReviewError, "locked"):
             validate_external_workspace(review)
+
+    def test_external_preflight_rejects_worktree_reflog_and_cleanup_succeeds(
+        self,
+    ) -> None:
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(review)
+        pointer = (review.workspace_root / ".git").read_text(encoding="utf-8")
+        worktree_admin = pathlib.Path(pointer.removeprefix("gitdir: ").strip())
+        self.assertFalse((review.git_dir / "logs").exists())
+        self.assertFalse((worktree_admin / "logs").exists())
+        validate_external_workspace(review)
+
+        reflog = worktree_admin / "logs" / "HEAD"
+        reflog.parent.mkdir()
+        reflog.write_bytes(b"unexpected private reflog\n")
+        with self.assertRaisesRegex(ReviewError, "unexpected entry"):
+            validate_external_workspace(review)
+
+        container = review.container_dir
+        self.assertIsNone(cleanup_workspace(review, keep_container=False))
+        self.reviews.remove(review)
+        self.assertFalse(container.exists())
 
     def test_external_preflight_rejects_unexpected_private_root_file(self) -> None:
         review = prepare_workspace(
@@ -2905,16 +2944,28 @@ class WorkspaceTest(unittest.TestCase):
         middle_object = self.repo / ".git" / "objects" / middle[:2] / middle[2:]
         self.assertTrue(middle_object.is_file())
         middle_object.unlink()
-        self.assertEqual(
-            git(
-                self.repo,
+        with_graph = subprocess.run(
+            (
+                "git",
+                "-C",
+                str(self.repo),
                 "merge-base",
                 "--is-ancestor",
                 self.base,
                 final,
             ),
-            "",
+            check=False,
+            env=test_git_environment(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
+        # Git versions differ on whether a stale graph masks the missing object
+        # or makes the default ancestry query fail closed immediately.
+        if with_graph.returncode == 0:
+            self.assertEqual(with_graph.stdout, b"")
+        else:
+            self.assertNotEqual(with_graph.returncode, 1)
+            self.assertTrue(with_graph.stderr)
         without_graph = subprocess.run(
             (
                 "git",
