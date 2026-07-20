@@ -225,6 +225,18 @@ metadata behavior.
   inconclusive credential reinspection. Only a strict request/model-bound
   result envelope can establish `blocked-authentication`; partial result text
   and loose stderr fragments remain non-authoritative.
+- The final current-head GitHub review found two executable-discovery regressions.
+  Automatic discovery now proves and skips a stable dangling leaf symlink so a
+  stale shim cannot hide a later valid reviewer, while an explicit dangling
+  override remains inspection-inconclusive. A regular file with execute bits is
+  accepted only when the current user also has effective execute access; stable
+  inaccessible candidates are skipped after the same metadata recheck. Focused
+  Python 3.13 tests cover dangling-leaf replacement, inaccessible-candidate
+  fallback, and the explicit-override boundary. Per the final operator request,
+  this follow-up was validated only on Python 3.13. The final host-level suite
+  ran 1333 tests with 4 skips and no failures; a preceding inner-sandbox run's
+  sole failure was traced to the outer sandbox denying the test's nested
+  `sandbox-exec`, not to broker behavior.
 - Ruff 0.13.2 lint, Python compile, project-journal validation, and the official
   skill validator passed. No formatter churn was retained: full-file
   `ruff format --check` still reports existing drift in the three changed Python

@@ -1185,7 +1185,7 @@ class ChildEnvironmentTest(unittest.TestCase):
         os.name == "posix" and hasattr(os, "O_NOFOLLOW"),
         "requires POSIX no-follow path inspection",
     )
-    def test_automatic_dangling_final_symlink_is_inconclusive(self) -> None:
+    def test_automatic_dangling_final_symlink_is_skipped(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary).resolve()
             candidate = root / "claude"
@@ -1220,18 +1220,15 @@ class ChildEnvironmentTest(unittest.TestCase):
                     "_reviewer_candidate_is_executable",
                     side_effect=inspect_only_candidate,
                 ),
-                self.assertRaisesRegex(
-                    CandidateInspectionInconclusive,
-                    "ENOENT involves a symlink",
-                ),
             ):
-                common.resolve_reviewer_executable(
+                resolved = common.resolve_reviewer_executable(
                     "claude",
                     candidate_validator=candidate_validator,
                     inspection_error=CandidateInspectionInconclusive,
                 )
 
-        candidate_validator.assert_not_called()
+        self.assertEqual(resolved, valid.absolute())
+        candidate_validator.assert_called_once_with(valid.absolute())
 
     @unittest.skipUnless(
         os.name == "posix" and hasattr(os, "O_NOFOLLOW"),
@@ -1260,6 +1257,44 @@ class ChildEnvironmentTest(unittest.TestCase):
                 common.resolve_reviewer_executable(
                     "claude",
                     inspection_error=CandidateInspectionInconclusive,
+                )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "O_NOFOLLOW"),
+        "requires POSIX no-follow path inspection",
+    )
+    def test_automatic_dangling_leaf_symlink_race_is_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            candidate = root / "claude"
+            candidate.symlink_to("missing-first")
+            original_readlink = common.os.readlink
+            changed = False
+
+            def readlink_with_race(path, *, dir_fd=None):
+                nonlocal changed
+                target = original_readlink(path, dir_fd=dir_fd)
+                if path == candidate.name and not changed:
+                    candidate.unlink()
+                    candidate.symlink_to("missing-second")
+                    changed = True
+                return target
+
+            with (
+                mock.patch.object(
+                    common.os,
+                    "readlink",
+                    side_effect=readlink_with_race,
+                ),
+                self.assertRaisesRegex(
+                    CandidateInspectionInconclusive,
+                    "changed during inspection",
+                ),
+            ):
+                common._reviewer_candidate_is_executable(
+                    candidate,
+                    inspection_error=CandidateInspectionInconclusive,
+                    allow_dangling_leaf_symlink=True,
                 )
 
     def test_existing_nonexecutable_candidate_races_are_inconclusive(self) -> None:
@@ -1322,6 +1357,66 @@ class ChildEnvironmentTest(unittest.TestCase):
                     )
                 )
             self.assertEqual(candidate_stat.call_count, 2)
+
+    def test_mode_executable_candidate_without_effective_access_is_absent(self) -> None:
+        candidate = pathlib.Path("/home/reviewer/.local/bin/claude")
+        metadata = os.stat_result(
+            (stat.S_IFREG | 0o711, 1, 2, 1, 1000, 1000, 1, 0, 0, 0)
+        )
+        with (
+            mock.patch.object(
+                common.pathlib.Path,
+                "stat",
+                autospec=True,
+                return_value=metadata,
+            ) as candidate_stat,
+            mock.patch.object(common.os, "access", return_value=False) as access,
+        ):
+            self.assertFalse(
+                common._reviewer_candidate_is_executable(
+                    candidate,
+                    inspection_error=CandidateInspectionInconclusive,
+                )
+            )
+
+        self.assertEqual(candidate_stat.call_count, 2)
+        access.assert_called_once_with(candidate, os.X_OK)
+
+    def test_automatic_discovery_skips_inaccessible_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = pathlib.Path(temporary)
+            inaccessible = home / "inaccessible" / "claude"
+            valid = home / "valid" / "claude"
+            for executable in (inaccessible, valid):
+                executable.parent.mkdir(parents=True)
+                executable.write_bytes(b"#!/bin/sh\n")
+                executable.chmod(0o700)
+            candidate_validator = mock.Mock()
+
+            with (
+                mock.patch.dict(common.os.environ, {"HOME": str(home)}, clear=True),
+                mock.patch.object(
+                    common,
+                    "_user_executable_candidates",
+                    return_value=[inaccessible, valid],
+                ),
+                mock.patch.object(common.shutil, "which", return_value=None),
+                mock.patch.object(
+                    common.os,
+                    "access",
+                    side_effect=lambda path, mode: (
+                        mode == os.X_OK and pathlib.Path(path) == valid
+                    ),
+                ),
+            ):
+                resolved = common.resolve_reviewer_executable(
+                    "claude",
+                    candidate_validator=candidate_validator,
+                    inspection_error=CandidateInspectionInconclusive,
+                )
+
+        self.assertEqual(resolved, valid.absolute())
+        candidate_validator.assert_called_once_with(valid.absolute())
 
     @unittest.skipUnless(os.name == "posix", "requires POSIX symlinks")
     def test_existing_symlink_candidate_is_validated(self) -> None:

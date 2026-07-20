@@ -1198,6 +1198,7 @@ def _prove_reviewer_candidate_lexical_absence(
     path: pathlib.Path,
     *,
     inspection_error: type[ReviewError],
+    allow_dangling_leaf_symlink: bool = False,
 ) -> None:
     if not path.is_absolute():
         raise inspection_error(
@@ -1231,6 +1232,7 @@ def _prove_reviewer_candidate_lexical_absence(
         ]
     ] = []
     missing_component: tuple[int, str] | None = None
+    dangling_leaf: tuple[int, str, os.stat_result, str] | None = None
     try:
         try:
             root_descriptor = os.open(path.anchor, directory_flags)
@@ -1253,10 +1255,28 @@ def _prove_reviewer_candidate_lexical_absence(
                 ) from error
             if index == len(components) - 1:
                 if stat.S_ISLNK(metadata.st_mode):
-                    raise inspection_error(
-                        "reviewer executable candidate ENOENT involves a "
-                        f"symlink: {path}"
+                    if not allow_dangling_leaf_symlink:
+                        raise inspection_error(
+                            "reviewer executable candidate ENOENT involves a "
+                            f"symlink: {path}"
+                        )
+                    try:
+                        target = os.readlink(
+                            component,
+                            dir_fd=current_directory,
+                        )
+                    except OSError as error:
+                        raise inspection_error(
+                            "cannot inspect dangling reviewer executable candidate "
+                            f"symlink for {path}: {error}"
+                        ) from error
+                    dangling_leaf = (
+                        current_directory,
+                        component,
+                        metadata,
+                        target,
                     )
+                    break
                 raise inspection_error(
                     f"reviewer executable candidate appeared during inspection: {path}"
                 )
@@ -1324,7 +1344,7 @@ def _prove_reviewer_candidate_lexical_absence(
                 )
             )
             current_directory = next_directory
-        if missing_component is None:
+        if missing_component is None and dangling_leaf is None:
             raise inspection_error(
                 f"reviewer executable candidate absence could not be proven: {path}"
             )
@@ -1404,19 +1424,61 @@ def _prove_reviewer_candidate_lexical_absence(
                         f"cannot close reviewer executable parent recheck for {path}: "
                         f"{error}"
                     ) from error
-        missing_parent, missing_name = missing_component
-        try:
-            os.lstat(missing_name, dir_fd=missing_parent)
-        except OSError as error:
-            if error.errno != errno.ENOENT:
+        if dangling_leaf is not None:
+            leaf_parent, leaf_name, expected_leaf, expected_target = dangling_leaf
+            try:
+                current_leaf = os.lstat(leaf_name, dir_fd=leaf_parent)
+            except OSError as error:
                 raise inspection_error(
-                    f"cannot recheck missing reviewer executable component for "
+                    f"dangling reviewer executable candidate changed during inspection: "
                     f"{path}: {error}"
                 ) from error
+            if not stat.S_ISLNK(current_leaf.st_mode) or _lexical_component_identity(
+                expected_leaf
+            ) != _lexical_component_identity(current_leaf):
+                raise inspection_error(
+                    "dangling reviewer executable candidate changed during inspection: "
+                    f"{path}"
+                )
+            try:
+                current_target = os.readlink(leaf_name, dir_fd=leaf_parent)
+            except OSError as error:
+                raise inspection_error(
+                    "cannot recheck dangling reviewer executable candidate symlink "
+                    f"for {path}: {error}"
+                ) from error
+            if current_target != expected_target:
+                raise inspection_error(
+                    "dangling reviewer executable candidate changed during inspection: "
+                    f"{path}"
+                )
+            try:
+                path.stat()
+            except OSError as error:
+                if error.errno != errno.ENOENT:
+                    raise inspection_error(
+                        "cannot recheck dangling reviewer executable candidate for "
+                        f"{path}: {error}"
+                    ) from error
+            else:
+                raise inspection_error(
+                    f"reviewer executable candidate appeared during inspection: {path}"
+                )
         else:
-            raise inspection_error(
-                f"reviewer executable candidate appeared during inspection: {path}"
-            )
+            assert missing_component is not None
+            missing_parent, missing_name = missing_component
+            try:
+                os.lstat(missing_name, dir_fd=missing_parent)
+            except OSError as error:
+                if error.errno != errno.ENOENT:
+                    raise inspection_error(
+                        f"cannot recheck missing reviewer executable component for "
+                        f"{path}: {error}"
+                    ) from error
+            else:
+                raise inspection_error(
+                    f"reviewer executable candidate appeared during inspection: {path}"
+                )
     except BaseException:
         for descriptor in reversed(descriptors):
             try:
@@ -1442,6 +1504,7 @@ def _reviewer_candidate_is_executable(
     path: pathlib.Path,
     *,
     inspection_error: type[ReviewError],
+    allow_dangling_leaf_symlink: bool = False,
 ) -> bool:
     try:
         before = path.stat()
@@ -1449,6 +1512,7 @@ def _reviewer_candidate_is_executable(
         _prove_reviewer_candidate_lexical_absence(
             path,
             inspection_error=inspection_error,
+            allow_dangling_leaf_symlink=allow_dangling_leaf_symlink,
         )
         return False
     except OSError as error:
@@ -1456,12 +1520,20 @@ def _reviewer_candidate_is_executable(
             _prove_reviewer_candidate_lexical_absence(
                 path,
                 inspection_error=inspection_error,
+                allow_dangling_leaf_symlink=allow_dangling_leaf_symlink,
             )
             return False
         raise inspection_error(
             f"cannot inspect reviewer executable candidate {path}: {error}"
         ) from error
     executable = stat.S_ISREG(before.st_mode) and bool(before.st_mode & 0o111)
+    if executable:
+        try:
+            executable = os.access(path, os.X_OK)
+        except OSError as error:
+            raise inspection_error(
+                f"cannot check reviewer executable candidate access for {path}: {error}"
+            ) from error
     try:
         after = path.stat()
     except OSError as error:
@@ -1554,6 +1626,7 @@ def resolve_reviewer_executable(
         if not _reviewer_candidate_is_executable(
             candidate,
             inspection_error=inspection_error,
+            allow_dangling_leaf_symlink=True,
         ):
             continue
         absolute = candidate.absolute()
