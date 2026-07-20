@@ -30,7 +30,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator, TypeVar
 
 from .claude_capabilities import (
     CLAUDE_REQUIRED_OPTIONS,
@@ -90,6 +90,7 @@ from .claude_linux import (
     validate_claude_executable as validate_claude_linux_executable,
 )
 from .common import (
+    BoundedCapture,
     Completed,
     ForwardedSignal,
     InvalidReviewerExecutable,
@@ -118,6 +119,9 @@ from .workspace import (
     encode_preflight_json,
     validate_external_workspace,
 )
+
+
+_CaptureResult = TypeVar("_CaptureResult")
 
 
 _CLAUDE_THREAD_LOCK_FACTORY = threading.Lock
@@ -1735,6 +1739,31 @@ def _require_unconditional_root_extensions(
         ) from error
 
 
+def _consume_sensitive_bounded_capture(
+    command: tuple[str, ...],
+    *,
+    cwd: pathlib.Path,
+    deadline: float,
+    consume: Callable[[BoundedCapture], _CaptureResult],
+) -> _CaptureResult:
+    previous_mask = block_forwarded_signals()
+    completed: BoundedCapture | None = None
+    try:
+        completed = run_bounded_capture(
+            command,
+            cwd=cwd,
+            env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+            deadline=deadline,
+            stdout_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
+            stderr_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
+        )
+        return consume(completed)
+    finally:
+        if completed is not None:
+            completed.zeroize()
+        restore_signal_mask(previous_mask)
+
+
 def _verify_unconditional_trust_root(
     der: bytes,
     canonical: bytes,
@@ -1809,36 +1838,34 @@ def _verify_unconditional_trust_root(
         try:
             use_partial_chain = False
             if allow_non_self_signed:
-                capabilities = run_bounded_capture(
-                    (str(CLAUDE_OPENSSL_CLIENT), "verify", "-help"),
-                    cwd=ca_root,
-                    env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
-                    timeout_seconds=remaining_timeout(),
-                    stdout_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
-                    stderr_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
-                )
-                try:
+                remaining_timeout()
+
+                def inspect_capabilities(capabilities: BoundedCapture) -> bool:
                     remaining_timeout()
-                    capability_output = bytes(capabilities.stdout) + bytes(
-                        capabilities.stderr
-                    )
                     if capabilities.returncode not in (0, 1):
                         raise ClaudeExecutableInspectionInconclusive(
                             "Claude TLS root verification capability probe was "
                             "inconclusive"
                         )
-                    if (
-                        b"-trusted" not in capability_output
-                        or b"-x509_strict" not in capability_output
-                    ):
+
+                    def contains(value: bytes) -> bool:
+                        return (
+                            value in capabilities.stdout or value in capabilities.stderr
+                        )
+
+                    if not contains(b"-trusted") or not contains(b"-x509_strict"):
                         raise ClaudeTrustToolUnavailable(
                             "Claude TLS root verification tooling lacks required "
                             "capabilities"
                         )
-                    use_partial_chain = b"-partial_chain" in capability_output
-                finally:
-                    capabilities.stdout[:] = b"\x00" * len(capabilities.stdout)
-                    capabilities.stderr[:] = b"\x00" * len(capabilities.stderr)
+                    return contains(b"-partial_chain")
+
+                use_partial_chain = _consume_sensitive_bounded_capture(
+                    (str(CLAUDE_OPENSSL_CLIENT), "verify", "-help"),
+                    cwd=ca_root,
+                    deadline=deadline,
+                    consume=inspect_capabilities,
+                )
 
             if allow_non_self_signed and not use_partial_chain:
                 verification_command = (
@@ -1866,50 +1893,48 @@ def _verify_unconditional_trust_root(
                     certificate_path.name,
                 )
                 invalid_returncode = 2
-            completed = run_bounded_capture(
+            remaining_timeout()
+
+            def validate_verification(completed: BoundedCapture) -> None:
+                remaining_timeout()
+                public_key_invalid = (
+                    allow_non_self_signed
+                    and not use_partial_chain
+                    and b"-----BEGIN PUBLIC KEY-----" not in completed.stdout
+                )
+                if (
+                    invalid_returncode is not None
+                    and completed.returncode == invalid_returncode
+                ):
+                    certificate_kind = (
+                        "CA trust anchor"
+                        if allow_non_self_signed
+                        else "self-signed CA root"
+                    )
+                    raise ClaudeTrustCertificateInvalid(
+                        "Claude trust settings reference a certificate that is not a "
+                        f"currently valid {certificate_kind}"
+                    )
+                if completed.returncode != 0:
+                    raise ClaudeExecutableInspectionInconclusive(
+                        "Claude TLS root verification failed inconclusively"
+                    )
+                if public_key_invalid:
+                    raise ClaudeTrustCertificateInvalid(
+                        "Claude trust settings reference a certificate that is not a "
+                        "currently valid CA trust anchor"
+                    )
+
+            _consume_sensitive_bounded_capture(
                 verification_command,
                 cwd=ca_root,
-                env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
-                timeout_seconds=remaining_timeout(),
-                stdout_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
-                stderr_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
+                deadline=deadline,
+                consume=validate_verification,
             )
         except OSError as error:
             raise ClaudeExecutableInspectionInconclusive(
                 "Claude TLS root verification launch was inconclusive"
             ) from error
-        try:
-            remaining_timeout()
-            public_key_invalid = (
-                allow_non_self_signed
-                and not use_partial_chain
-                and b"-----BEGIN PUBLIC KEY-----" not in completed.stdout
-            )
-            if (
-                invalid_returncode is not None
-                and completed.returncode == invalid_returncode
-            ):
-                certificate_kind = (
-                    "CA trust anchor"
-                    if allow_non_self_signed
-                    else "self-signed CA root"
-                )
-                raise ClaudeTrustCertificateInvalid(
-                    "Claude trust settings reference a certificate that is not a "
-                    f"currently valid {certificate_kind}"
-                )
-            if completed.returncode != 0:
-                raise ClaudeExecutableInspectionInconclusive(
-                    "Claude TLS root verification failed inconclusively"
-                )
-            if public_key_invalid:
-                raise ClaudeTrustCertificateInvalid(
-                    "Claude trust settings reference a certificate that is not a "
-                    "currently valid CA trust anchor"
-                )
-        finally:
-            completed.stdout[:] = b"\x00" * len(completed.stdout)
-            completed.stderr[:] = b"\x00" * len(completed.stderr)
     finally:
         active_error = sys.exc_info()[0] is not None
         cleanup_error: OSError | None = None
@@ -2089,7 +2114,10 @@ def _certificate_self_signature_evidence(
         ) from error
 
 
-def _write_private_verification_file(path: pathlib.Path, data: bytes) -> None:
+def _write_private_verification_file(
+    path: pathlib.Path,
+    data: bytes | bytearray,
+) -> None:
     try:
         descriptor = os.open(
             path,
@@ -2137,16 +2165,83 @@ def _write_private_verification_file(path: pathlib.Path, data: bytes) -> None:
             ) from cleanup_error
 
 
+def _require_bundled_root_deadline(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ReviewTimeoutError(
+            "Claude bundled root verification exceeded its total timeout"
+        )
+    return remaining
+
+
+def _run_with_bundled_root_deadline(
+    deadline: float,
+    operation: Callable[[], Any],
+) -> Any:
+    _require_bundled_root_deadline(deadline)
+    try:
+        result = operation()
+    except (ForwardedSignal, ReviewTimeoutError):
+        raise
+    except Exception:
+        _require_bundled_root_deadline(deadline)
+        raise
+    _require_bundled_root_deadline(deadline)
+    return result
+
+
+def _zeroize_bounded_capture(completed: BoundedCapture) -> None:
+    completed.zeroize()
+
+
+def _run_bundled_root_openssl(
+    command: tuple[str, ...],
+    *,
+    verification_root: pathlib.Path,
+    deadline: float,
+    consume: Callable[[BoundedCapture], _CaptureResult],
+) -> _CaptureResult:
+    try:
+        _require_bundled_root_deadline(deadline)
+        return _consume_sensitive_bounded_capture(
+            command,
+            cwd=verification_root,
+            deadline=deadline,
+            consume=lambda completed: _run_with_bundled_root_deadline(
+                deadline,
+                lambda: consume(completed),
+            ),
+        )
+    except (ForwardedSignal, ReviewTimeoutError):
+        raise
+    except FileNotFoundError as error:
+        _require_bundled_root_deadline(deadline)
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude bundled root verification tooling changed before launch"
+        ) from error
+    except OSError as error:
+        _require_bundled_root_deadline(deadline)
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude bundled root verification tooling could not be launched"
+        ) from error
+    except Exception:
+        _require_bundled_root_deadline(deadline)
+        raise
+
+
 def _require_bundled_root_self_signature(
     der: bytes,
     canonical: bytes,
     *,
     verification_root: pathlib.Path,
     index: int,
-    timeout_seconds: float,
+    deadline: float,
 ) -> None:
     try:
-        metadata = CLAUDE_OPENSSL_CLIENT.lstat()
+        metadata = _run_with_bundled_root_deadline(
+            deadline,
+            CLAUDE_OPENSSL_CLIENT.lstat,
+        )
     except FileNotFoundError as error:
         raise ClaudeTrustToolUnavailable(
             "Claude bundled root verification tooling is unavailable"
@@ -2155,110 +2250,103 @@ def _require_bundled_root_self_signature(
         raise ClaudeExecutableInspectionInconclusive(
             "cannot inspect Claude bundled root verification tooling"
         ) from error
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_uid != 0
-        or metadata.st_mode & 0o6022
-        or not os.access(CLAUDE_OPENSSL_CLIENT, os.X_OK)
-    ):
+    openssl_accessible = _run_with_bundled_root_deadline(
+        deadline,
+        lambda: os.access(CLAUDE_OPENSSL_CLIENT, os.X_OK),
+    )
+    unsafe_metadata = _run_with_bundled_root_deadline(
+        deadline,
+        lambda: (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_mode & 0o6022
+            or not openssl_accessible
+        ),
+    )
+    if unsafe_metadata:
         raise ClaudeTrustPolicyUnavailable(
             "Claude bundled root verification tooling has unsafe metadata"
         )
-    tbs, signature, digest = _certificate_self_signature_evidence(der)
+    tbs, signature, digest = _run_with_bundled_root_deadline(
+        deadline,
+        lambda: _certificate_self_signature_evidence(der),
+    )
     prefix = f"root-{index:04d}"
     certificate_path = verification_root / f"{prefix}.pem"
     tbs_path = verification_root / f"{prefix}.tbs"
     signature_path = verification_root / f"{prefix}.sig"
     public_key_path = verification_root / f"{prefix}.pub"
-    _write_private_verification_file(certificate_path, canonical)
-    _write_private_verification_file(tbs_path, tbs)
-    _write_private_verification_file(signature_path, signature)
-    deadline = time.monotonic() + timeout_seconds
-
-    def remaining_timeout() -> float:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise ReviewTimeoutError(
-                "Claude bundled root verification exceeded its total timeout"
-            )
-        return remaining
-
-    try:
-        public_key = run_bounded_capture(
-            (
-                str(CLAUDE_OPENSSL_CLIENT),
-                "x509",
-                "-in",
-                certificate_path.name,
-                "-pubkey",
-                "-noout",
+    for path, payload in (
+        (certificate_path, canonical),
+        (tbs_path, tbs),
+        (signature_path, signature),
+    ):
+        _run_with_bundled_root_deadline(
+            deadline,
+            lambda path=path, payload=payload: _write_private_verification_file(
+                path,
+                payload,
             ),
-            cwd=verification_root,
-            env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
-            timeout_seconds=remaining_timeout(),
-            stdout_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
-            stderr_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
         )
-    except FileNotFoundError as error:
-        raise ClaudeExecutableInspectionInconclusive(
-            "Claude bundled root verification tooling changed before launch"
-        ) from error
-    except OSError as error:
-        raise ClaudeExecutableInspectionInconclusive(
-            "Claude bundled root verification tooling could not be launched"
-        ) from error
-    try:
-        public_key_bytes = bytes(public_key.stdout)
-        if (
-            public_key.returncode != 0
-            or b"-----BEGIN PUBLIC KEY-----" not in public_key_bytes
-            or b"PRIVATE KEY" in public_key_bytes
-        ):
-            raise ClaudeTrustCertificateInvalid(
-                "Claude executable bundled root has an invalid public key"
-            )
-        _write_private_verification_file(public_key_path, public_key_bytes)
-    finally:
-        public_key.stdout[:] = b"\x00" * len(public_key.stdout)
-        public_key.stderr[:] = b"\x00" * len(public_key.stderr)
-    try:
-        verified = run_bounded_capture(
-            (
-                str(CLAUDE_OPENSSL_CLIENT),
-                "dgst",
-                f"-{digest}",
-                "-verify",
-                public_key_path.name,
-                "-signature",
-                signature_path.name,
-                tbs_path.name,
-            ),
-            cwd=verification_root,
-            env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
-            timeout_seconds=remaining_timeout(),
-            stdout_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
-            stderr_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
-        )
-    except FileNotFoundError as error:
-        raise ClaudeExecutableInspectionInconclusive(
-            "Claude bundled root verification tooling changed before launch"
-        ) from error
-    except OSError as error:
-        raise ClaudeExecutableInspectionInconclusive(
-            "Claude bundled root verification tooling could not be launched"
-        ) from error
-    try:
-        if verified.returncode == 1:
-            raise ClaudeTrustCertificateInvalid(
-                "Claude executable bundled root is not self-signed"
-            )
-        if verified.returncode != 0:
-            raise ClaudeExecutableInspectionInconclusive(
-                "Claude bundled root verification tooling failed unexpectedly"
-            )
-    finally:
-        verified.stdout[:] = b"\x00" * len(verified.stdout)
-        verified.stderr[:] = b"\x00" * len(verified.stderr)
+
+    def validate_and_write_public_key(public_key: BoundedCapture) -> None:
+        def validate_and_write() -> None:
+            if (
+                public_key.returncode != 0
+                or b"-----BEGIN PUBLIC KEY-----" not in public_key.stdout
+                or b"PRIVATE KEY" in public_key.stdout
+            ):
+                raise ClaudeTrustCertificateInvalid(
+                    "Claude executable bundled root has an invalid public key"
+                )
+            _write_private_verification_file(public_key_path, public_key.stdout)
+
+        _run_with_bundled_root_deadline(deadline, validate_and_write)
+
+    _run_bundled_root_openssl(
+        (
+            str(CLAUDE_OPENSSL_CLIENT),
+            "x509",
+            "-in",
+            certificate_path.name,
+            "-pubkey",
+            "-noout",
+        ),
+        verification_root=verification_root,
+        deadline=deadline,
+        consume=validate_and_write_public_key,
+    )
+    _require_bundled_root_deadline(deadline)
+
+    def validate_self_signature(verified: BoundedCapture) -> None:
+        def validate() -> None:
+            if verified.returncode == 1:
+                raise ClaudeTrustCertificateInvalid(
+                    "Claude executable bundled root is not self-signed"
+                )
+            if verified.returncode != 0:
+                raise ClaudeExecutableInspectionInconclusive(
+                    "Claude bundled root verification tooling failed unexpectedly"
+                )
+
+        _run_with_bundled_root_deadline(deadline, validate)
+
+    _run_bundled_root_openssl(
+        (
+            str(CLAUDE_OPENSSL_CLIENT),
+            "dgst",
+            f"-{digest}",
+            "-verify",
+            public_key_path.name,
+            "-signature",
+            signature_path.name,
+            tbs_path.name,
+        ),
+        verification_root=verification_root,
+        deadline=deadline,
+        consume=validate_self_signature,
+    )
+    _require_bundled_root_deadline(deadline)
 
 
 def _validated_bundled_root_certificates(
@@ -2267,46 +2355,80 @@ def _validated_bundled_root_certificates(
     executable: pathlib.Path,
     verify_self_signatures: bool = True,
 ) -> dict[bytes, bytes]:
-    blocks = CLAUDE_CERTIFICATE_BLOCK.findall(data)
-    if not blocks or len(blocks) > CLAUDE_BUNDLED_ROOT_LIMIT:
-        raise ClaudeExecutableInspectionInconclusive(
-            "Claude executable bundled root store has an invalid certificate count"
-        )
     deadline = time.monotonic() + CLAUDE_TRUST_ROOT_VERIFY_TOTAL_SECONDS
-    certificates: dict[bytes, bytes] = {}
-    verification_directory = (
-        _bundled_root_verification_directory(executable)
-        if verify_self_signatures
-        else contextlib.nullcontext(None)
-    )
-    with verification_directory as verification_root:
-        for index, block in enumerate(blocks):
-            der, canonical = _canonical_ca_certificate(
-                block,
-                source="publisher-verified Claude bundled root store",
+    try:
+        blocks = CLAUDE_CERTIFICATE_BLOCK.findall(data)
+        _require_bundled_root_deadline(deadline)
+        if not blocks or len(blocks) > CLAUDE_BUNDLED_ROOT_LIMIT:
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude executable bundled root store has an invalid certificate count"
             )
-            _require_unconditional_root_extensions(der, require_critical=False)
-            if verify_self_signatures:
-                assert verification_root is not None
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise ReviewTimeoutError(
-                        "Claude bundled root verification exceeded its total timeout"
+        certificates: dict[bytes, bytes] = {}
+        verification_directory = _run_with_bundled_root_deadline(
+            deadline,
+            lambda: (
+                _bundled_root_verification_directory(executable)
+                if verify_self_signatures
+                else contextlib.nullcontext(None)
+            ),
+        )
+        with verification_directory as verification_root:
+            _require_bundled_root_deadline(deadline)
+            for index, block in enumerate(blocks):
+                der, canonical = _run_with_bundled_root_deadline(
+                    deadline,
+                    lambda block=block: _canonical_ca_certificate(
+                        block,
+                        source="publisher-verified Claude bundled root store",
+                    ),
+                )
+                _run_with_bundled_root_deadline(
+                    deadline,
+                    lambda: _require_unconditional_root_extensions(
+                        der,
+                        require_critical=False,
+                    ),
+                )
+                if verify_self_signatures:
+                    assert verification_root is not None
+                    _run_with_bundled_root_deadline(
+                        deadline,
+                        lambda: _require_bundled_root_self_signature(
+                            der,
+                            canonical,
+                            verification_root=verification_root,
+                            index=index,
+                            deadline=deadline,
+                        ),
                     )
-                _require_bundled_root_self_signature(
-                    der,
-                    canonical,
-                    verification_root=verification_root,
-                    index=index,
-                    timeout_seconds=remaining,
+                fingerprint = _run_with_bundled_root_deadline(
+                    deadline,
+                    lambda: hashlib.sha256(der).digest(),
                 )
-            fingerprint = hashlib.sha256(der).digest()
-            existing = certificates.get(fingerprint)
-            if existing is not None and existing != canonical:
-                raise ClaudeExecutableInspectionInconclusive(
-                    "Claude executable bundled roots contain a fingerprint collision"
+                existing = _run_with_bundled_root_deadline(
+                    deadline,
+                    lambda: certificates.get(fingerprint),
                 )
-            certificates[fingerprint] = canonical
+                collision = _run_with_bundled_root_deadline(
+                    deadline,
+                    lambda: existing is not None and existing != canonical,
+                )
+                if collision:
+                    raise ClaudeExecutableInspectionInconclusive(
+                        "Claude executable bundled roots contain a fingerprint collision"
+                    )
+                _run_with_bundled_root_deadline(
+                    deadline,
+                    lambda: certificates.__setitem__(fingerprint, canonical),
+                )
+            _require_bundled_root_deadline(deadline)
+        _require_bundled_root_deadline(deadline)
+    except (ForwardedSignal, ReviewTimeoutError):
+        raise
+    except Exception:
+        _require_bundled_root_deadline(deadline)
+        raise
+    _require_bundled_root_deadline(deadline)
     return certificates
 
 
@@ -2327,8 +2449,12 @@ def _bundled_root_verification_directory(
         verification_root = pathlib.Path(directory.__enter__())
     except OSError as error:
         active_error = sys.exc_info()
-        with contextlib.suppress(BaseException):
+        try:
             directory.__exit__(*active_error)
+        except (ForwardedSignal, KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            pass
         raise ClaudeExecutableInspectionInconclusive(
             "cannot enter Claude bundled root verification directory"
         ) from error
@@ -2336,8 +2462,12 @@ def _bundled_root_verification_directory(
         yield verification_root
     except BaseException:
         active_error = sys.exc_info()
-        with contextlib.suppress(BaseException):
+        try:
             directory.__exit__(*active_error)
+        except (ForwardedSignal, KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            pass
         raise
     else:
         try:
@@ -12759,11 +12889,16 @@ def _proxy_ca_subject_hashes(
         canonical_blocks.append(canonical)
     hashes: set[str] = set()
     for block in canonical_blocks:
-        remaining_seconds = deadline - time.monotonic()
+        call_started = time.monotonic()
+        remaining_seconds = deadline - call_started
         if remaining_seconds <= 0:
             raise ClaudeExecutableInspectionInconclusive(
                 "Claude proxy CA hash deadline expired"
             )
+        call_deadline = min(
+            deadline,
+            call_started + CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS,
+        )
         try:
             completed = run_bounded_capture(
                 (
@@ -12774,10 +12909,7 @@ def _proxy_ca_subject_hashes(
                 ),
                 env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
                 stdin=block,
-                timeout_seconds=min(
-                    CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS,
-                    remaining_seconds,
-                ),
+                deadline=call_deadline,
                 stdout_limit_bytes=4096,
                 stderr_limit_bytes=4096,
             )

@@ -207,13 +207,59 @@ metadata behavior.
   self-issued name cannot enter the `TrustAsRoot` path. Generated CA and
   bundled-root verification files also preserve a primary policy rejection
   across both descriptor-close and temporary-file cleanup failures.
-- The latest trust-budget review moves the absolute verification deadline ahead
-  of certificate normalization and passes that same deadline through DER
-  validation, OpenSSL metadata inspection, temporary-file creation, ACL checks,
-  write/fsync preparation, capability probing, and final validation. Preparation
-  can consume the remaining budget, in which case no OpenSSL process starts and
-  the operation remains a timeout rather than receiving a fresh subprocess
-  budget.
+- The deadline follow-up keeps one absolute budget through parent preparation,
+  both OpenSSL launches, and the child process itself. `run_bounded_capture`
+  uses a ready/launch/close-on-exec status handshake for absolute deadlines, so
+  a parent scheduling pause during the launch handshake cannot make a late
+  result acceptable; relative timeout callers retain their existing launch
+  path. The wrapper recomputes its remaining budget after signal preparation
+  and arms a child timer, while the parent independently rejects any result
+  observed at or after the deadline. This is a bounded timeout contract, not a
+  hard real-time guarantee that target userspace can never execute after the
+  wall-clock boundary. Pending `ForwardedSignal` and other cancellation outrank a
+  simultaneous timeout, and captured buffers are zeroized on every exceptional
+  exit. Bundled-root validation now applies the same precedence to outer
+  canonicalization, extensions, hashing, dictionary publication, temporary
+  directory cleanup, and final success. Both OpenSSL result pairs are zeroized,
+  and no immutable public-key output copy is retained. Twelve focused provider
+  regressions and the complete Python 3.13 common/provider suites pass; the
+  combined host-level result is 770 tests run, 3 skipped, and no failures. The
+  parent owns fresh review and the final repository-wide suite.
+- Fresh frozen-diff review then closed the remaining launch-boundary races. The
+  absolute-deadline child now arms a kernel interval timer before preparation;
+  the remaining budget is recomputed after signal setup, closing the practical
+  pre-arm scheduling gap. A relative `setitimer` cannot establish a hard
+  real-time execution cutoff across its final userspace clock/syscall race, so
+  the helper promises bounded termination and rejection of late results rather
+  than impossible instruction-level timing. Signal forwarding becomes active as
+  soon as the deadline wrapper process is published, so a forwarded termination
+  signal cannot be ignored between the parent's final check and launch
+  authorization.
+  The parent temporarily unblocks forwarded signals and restores the caller's
+  exact entry mask after cleanup; the child independently unblocks its alarm and
+  cancellation signals before arming the timer. Buffered status parsing
+  classifies coalesced `RT` and launch-pipe `EPIPE` as the original timeout, and
+  cleanup synchronously reaps a dead direct child even when Linux reports no
+  live process-group members.
+  Every bounded non-process operation now checks the shared deadline before and
+  after execution, and a new control-flow cancellation raised by temporary-root
+  cleanup outranks an older policy error. Focused scheduling, signal, pre-expiry,
+  and cleanup regressions pass, as does the Python 3.13 common/provider suite.
+  A final review clarified that the timer does not guarantee an instruction-level
+  cutoff across the final clock, timer-arm, and `execve` races; late results are
+  rejected and the process is terminated and reaped within the bounded cleanup
+  contract. Sensitive OpenSSL captures keep forwarded signals blocked before
+  capture through consumer validation and buffer zeroization, then restore the exact
+  caller mask; a pending cancellation is delivered only after zeroization.
+  The focused common/provider result is 783 tests run, 4 skipped, and no
+  failures. The nested macOS `sandbox-exec`
+  broker test is expected to fail inside Codex's outer sandbox and passes in the
+  host-level suite. Proxy CA subject-hash probes also retain a per-call absolute
+  deadline bounded by the shared inspection deadline, so a parent scheduling
+  gap cannot restart a relative launch budget. The final repository-wide Python
+  3.13 run completed 1,361 tests with 5 skips and no failures; Ruff lint/format,
+  `py_compile`, project
+  journal validation, and the official skill validator also pass.
 - A terminal trust-policy evidence write failure remains secondary to the
   blocked or inconclusive trust failure. Production `runner-error.txt` output
   now recognizes both Python 3.11+ exception notes and the Python 3.10 cause
@@ -237,8 +283,7 @@ metadata behavior.
   ran 1333 tests with 4 skips and no failures; a preceding inner-sandbox run's
   sole failure was traced to the outer sandbox denying the test's nested
   `sandbox-exec`, not to broker behavior.
-- Ruff 0.13.2 lint, Python compile, project-journal validation, and the official
-  skill validator passed. No formatter churn was retained: full-file
-  `ruff format --check` still reports existing drift in the three changed Python
-  files, while range checks over every newly added implementation, test, and
-  contract hunk pass. That unrelated drift remains untouched.
+- Ruff 0.13.2 lint and full-file format checks pass for the four owned Python
+  files. Python 3.13 `py_compile`, project-journal validation, and the official
+  skill validator also pass; the validator ran through a Python 3.13 `uv`
+  environment because the host interpreter does not include PyYAML.

@@ -80,6 +80,10 @@ class BoundedCapture:
     stdout: bytearray
     stderr: bytearray
 
+    def zeroize(self) -> None:
+        self.stdout[:] = b"\x00" * len(self.stdout)
+        self.stderr[:] = b"\x00" * len(self.stderr)
+
 
 class _BytearrayWriter:
     def __init__(self) -> None:
@@ -157,6 +161,79 @@ try:
 except OSError as error:
     os.write(status_fd, str(error.errno or errno.EIO).encode("ascii"))
     os._exit(127)
+""".strip()
+
+ABSOLUTE_DEADLINE_WRAPPER = """
+import errno
+import os
+import signal
+import sys
+import time
+
+deadline = float(sys.argv[1])
+status_fd = int(sys.argv[2])
+launch_fd = int(sys.argv[3])
+kernel_limit = None if sys.argv[4] == "-" else int(sys.argv[4])
+os.set_inheritable(status_fd, False)
+os.set_inheritable(launch_fd, False)
+
+def fail(payload, exit_code):
+    try:
+        os.write(status_fd, payload)
+    except OSError:
+        pass
+    os._exit(exit_code)
+
+def deadline_expired(_signum, _frame):
+    fail(b"T", 124)
+
+try:
+    signal.signal(signal.SIGALRM, deadline_expired)
+    unblocked = {signal.SIGALRM, signal.SIGTERM, signal.SIGINT}
+    for name in ("SIGHUP", "SIGQUIT"):
+        candidate = getattr(signal, name, None)
+        if candidate is not None:
+            unblocked.add(candidate)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, unblocked)
+except (AttributeError, OSError, ValueError):
+    fail(b"E" + str(errno.ENOTSUP).encode("ascii"), 127)
+remaining = deadline - time.monotonic()
+if remaining <= 0:
+    fail(b"T", 124)
+try:
+    signal.setitimer(signal.ITIMER_REAL, remaining)
+except (AttributeError, OSError, ValueError):
+    fail(b"E" + str(errno.ENOTSUP).encode("ascii"), 127)
+if time.monotonic() >= deadline:
+    fail(b"T", 124)
+
+try:
+    if kernel_limit is not None:
+        import resource
+
+        for name in ("SIGPIPE", "SIGXFZ", "SIGXFSZ"):
+            candidate = getattr(signal, name, None)
+            if candidate is not None:
+                signal.signal(candidate, signal.SIG_DFL)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (kernel_limit, kernel_limit))
+    os.write(status_fd, b"R")
+    launch = os.read(launch_fd, 1)
+except OSError as error:
+    fail(b"E" + str(error.errno or errno.EIO).encode("ascii"), 127)
+except Exception:
+    fail(b"E" + str(errno.EIO).encode("ascii"), 127)
+if launch != b"L":
+    os._exit(126)
+try:
+    os.close(launch_fd)
+except OSError as error:
+    fail(b"E" + str(error.errno or errno.EIO).encode("ascii"), 127)
+if time.monotonic() >= deadline:
+    fail(b"T", 124)
+try:
+    os.execve(sys.argv[5], sys.argv[5:], os.environ)
+except OSError as error:
+    fail(b"E" + str(error.errno or errno.EIO).encode("ascii"), 127)
 """.strip()
 
 
@@ -393,13 +470,16 @@ def run_bounded_capture(
     cwd: pathlib.Path | None = None,
     env: dict[str, str] | None = None,
     stdin: bytes | bytearray | None = None,
-    timeout_seconds: float,
+    timeout_seconds: float | None = None,
+    deadline: float | None = None,
     stdout_limit_bytes: int,
     stderr_limit_bytes: int,
     regular_file_limit_bytes: int | None = None,
     regular_file_limit_path: pathlib.Path | None = None,
 ) -> BoundedCapture:
     command = tuple(str(item) for item in argv)
+    if (timeout_seconds is None) == (deadline is None):
+        raise ReviewError("exactly one bounded capture timeout form is required")
     if stdout_limit_bytes <= 0 or stderr_limit_bytes <= 0:
         raise ReviewError("bounded capture limits must be positive")
     if regular_file_limit_bytes is not None and regular_file_limit_bytes <= 0:
@@ -418,7 +498,14 @@ def run_bounded_capture(
         regular_file_limit_path = target_path.absolute()
     stdout = _BytearrayWriter()
     stderr = _BytearrayWriter()
+
+    def zeroize_output() -> None:
+        stdout.data[:] = b"\x00" * len(stdout.data)
+        stderr.data[:] = b"\x00" * len(stderr.data)
+
     try:
+        if deadline is not None and deadline - time.monotonic() <= 0:
+            raise subprocess.TimeoutExpired(command, 0.0)
         returncode = _run_logged_process(
             command,
             cwd=cwd,
@@ -427,20 +514,34 @@ def run_bounded_capture(
             stdout_handle=stdout,
             stderr_handle=stderr,
             timeout_seconds=timeout_seconds,
+            deadline=deadline,
             stdout_file_limit_bytes=stdout_limit_bytes,
             stderr_file_limit_bytes=stderr_limit_bytes,
             regular_file_limit_bytes=regular_file_limit_bytes,
             regular_file_limit_path=regular_file_limit_path,
         )
+        if deadline is not None and deadline - time.monotonic() <= 0:
+            raise subprocess.TimeoutExpired(command, 0.0)
+    except ForwardedSignal:
+        zeroize_output()
+        raise
     except subprocess.TimeoutExpired as error:
-        stdout.data[:] = b"\x00" * len(stdout.data)
-        stderr.data[:] = b"\x00" * len(stderr.data)
-        raise ReviewTimeoutError(
-            f"command timed out after {timeout_seconds} seconds: {' '.join(command)}"
-        ) from error
-    except Exception:
-        stdout.data[:] = b"\x00" * len(stdout.data)
-        stderr.data[:] = b"\x00" * len(stderr.data)
+        zeroize_output()
+        message = (
+            f"command timed out after {timeout_seconds} seconds"
+            if timeout_seconds is not None
+            else "command exceeded its absolute deadline"
+        )
+        raise ReviewTimeoutError(f"{message}: {' '.join(command)}") from error
+    except Exception as error:
+        zeroize_output()
+        if deadline is not None and deadline - time.monotonic() <= 0:
+            raise ReviewTimeoutError(
+                f"command exceeded its absolute deadline: {' '.join(command)}"
+            ) from error
+        raise
+    except BaseException:
+        zeroize_output()
         raise
     return BoundedCapture(command, returncode, stdout.data, stderr.data)
 
@@ -489,6 +590,29 @@ def _regular_file_limit_wrapper_command(
         REGULAR_FILE_LIMIT_WRAPPER,
         str(kernel_limit),
         str(exec_status_write_fd),
+        *command,
+    )
+
+
+def _absolute_deadline_wrapper_command(
+    command: tuple[str, ...],
+    *,
+    deadline: float,
+    exec_status_write_fd: int,
+    launch_read_fd: int,
+    kernel_limit: int | None,
+) -> tuple[str, ...]:
+    return (
+        str(pathlib.Path(sys.executable).resolve()),
+        "-B",
+        "-I",
+        "-S",
+        "-c",
+        ABSOLUTE_DEADLINE_WRAPPER,
+        repr(deadline),
+        str(exec_status_write_fd),
+        str(launch_read_fd),
+        "-" if kernel_limit is None else str(kernel_limit),
         *command,
     )
 
@@ -589,14 +713,14 @@ def terminate_process_group(
                 process.kill()
                 process.wait()
         return
-    if not _process_group_exists(process.pid):
-        return
-    if not signal_already_sent:
+    group_exists = _process_group_exists(process.pid)
+    if group_exists and not signal_already_sent:
         signal_process_group(process, initial_signal)
     deadline = time.monotonic() + grace_seconds
-    while _process_group_exists(process.pid) and time.monotonic() < deadline:
+    while group_exists and time.monotonic() < deadline:
         time.sleep(PROCESS_GROUP_POLL_SECONDS)
-    if _process_group_exists(process.pid):
+        group_exists = _process_group_exists(process.pid)
+    if group_exists:
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -609,7 +733,14 @@ def terminate_process_group(
     try:
         process.wait(timeout=grace_seconds)
     except subprocess.TimeoutExpired:
-        pass
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=grace_seconds)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def _run_logged_process(
@@ -621,12 +752,16 @@ def _run_logged_process(
     stdout_handle: BinaryIO,
     stderr_handle: BinaryIO,
     timeout_seconds: float | None = None,
+    deadline: float | None = None,
     stdout_file_limit_bytes: int | None = None,
     stderr_file_limit_bytes: int | None = None,
     regular_file_limit_bytes: int | None = None,
     regular_file_limit_path: pathlib.Path | None = None,
     on_process_started: Callable[[], None] | None = None,
 ) -> int:
+    if timeout_seconds is not None and deadline is not None:
+        raise ReviewError("logged process timeout forms are mutually exclusive")
+    deadline_supplied = deadline is not None
     process: subprocess.Popen[bytes] | None = None
     pending_signal: signal.Signals | None = None
     forwarded_signal_sent = False
@@ -636,8 +771,70 @@ def _run_logged_process(
     regular_file_overflow = threading.Event()
     exec_status_read_fd: int | None = None
     exec_status_write_fd: int | None = None
+    launch_read_fd: int | None = None
+    launch_write_fd: int | None = None
     effective_regular_file_limit: int | None = None
-    deadline: float | None = None
+    absolute_deadline_wrapper = deadline_supplied and os.name == "posix"
+    wrapper_status_buffer = bytearray()
+
+    def timeout_expired() -> subprocess.TimeoutExpired:
+        return subprocess.TimeoutExpired(
+            command,
+            timeout_seconds if timeout_seconds is not None else 0.0,
+        )
+
+    def raise_pending_forwarded_signal() -> None:
+        nonlocal forwarded_signal_sent
+        if pending_signal is None:
+            return
+        if process is not None:
+            signal_process_group(process, pending_signal)
+            forwarded_signal_sent = True
+        raise ForwardedSignal(pending_signal)
+
+    def remaining_before_deadline() -> float:
+        raise_pending_forwarded_signal()
+        assert deadline is not None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise_pending_forwarded_signal()
+            raise timeout_expired()
+        return remaining
+
+    def read_wrapper_status(*, stop_after_ready: bool) -> bytearray:
+        assert exec_status_read_fd is not None
+        while True:
+            if stop_after_ready and wrapper_status_buffer[:1] == b"R":
+                del wrapper_status_buffer[:1]
+                return bytearray(b"R")
+            remaining = remaining_before_deadline()
+            readable, _, _ = select.select(
+                (exec_status_read_fd,),
+                (),
+                (),
+                min(PROCESS_GROUP_POLL_SECONDS, remaining),
+            )
+            raise_pending_forwarded_signal()
+            if not readable:
+                continue
+            chunk = os.read(exec_status_read_fd, 32)
+            raise_pending_forwarded_signal()
+            if not chunk:
+                status = bytearray(wrapper_status_buffer)
+                wrapper_status_buffer.clear()
+                return status
+            wrapper_status_buffer.extend(chunk)
+            if len(wrapper_status_buffer) > 17:
+                raise ReviewError("process wrapper returned invalid exec status")
+
+    def raise_wrapper_failure(status: bytearray) -> None:
+        if status == b"T":
+            raise timeout_expired()
+        match = re.fullmatch(rb"E([0-9]{1,10})", status)
+        if match is not None:
+            errno_value = int(match.group(1))
+            raise OSError(errno_value, os.strerror(errno_value), command[0])
+        raise ReviewError("process wrapper returned invalid exec status")
 
     def forward_signal(signum: int, _frame: object) -> None:
         nonlocal forwarded_signal_sent, pending_signal
@@ -650,10 +847,13 @@ def _run_logged_process(
         raise ForwardedSignal(forwarded)
 
     previous_handlers: dict[signal.Signals, object] = {}
+    caller_signal_mask: set[signal.Signals] | None = None
     if os.name == "posix" and threading.current_thread() is threading.main_thread():
+        caller_signal_mask = block_forwarded_signals()
         for forwarded in forwarded_signals():
             previous_handlers[forwarded] = signal.getsignal(forwarded)
             signal.signal(forwarded, forward_signal)
+        unblock_forwarded_signals()
 
     cleanup_signal = signal.SIGTERM
     try:
@@ -661,6 +861,7 @@ def _run_logged_process(
             raise ForwardedSignal(pending_signal)
         popen_command = command
         pass_fds: tuple[int, ...] = ()
+        kernel_limit: int | None = None
         if regular_file_limit_bytes is not None:
             try:
                 import resource as posix_resource
@@ -681,6 +882,19 @@ def _run_logged_process(
                     "sentinel"
                 )
             effective_regular_file_limit = regular_file_limit_bytes
+        if absolute_deadline_wrapper:
+            assert deadline is not None
+            exec_status_read_fd, exec_status_write_fd = os.pipe()
+            launch_read_fd, launch_write_fd = os.pipe()
+            pass_fds = (exec_status_write_fd, launch_read_fd)
+            popen_command = _absolute_deadline_wrapper_command(
+                command,
+                deadline=deadline,
+                exec_status_write_fd=exec_status_write_fd,
+                launch_read_fd=launch_read_fd,
+                kernel_limit=kernel_limit,
+            )
+        elif kernel_limit is not None:
             exec_status_read_fd, exec_status_write_fd = os.pipe()
             pass_fds = (exec_status_write_fd,)
             popen_command = _regular_file_limit_wrapper_command(
@@ -706,36 +920,50 @@ def _run_logged_process(
         }
         if pass_fds:
             popen_options["pass_fds"] = pass_fds
-        deadline = (
-            None if timeout_seconds is None else time.monotonic() + timeout_seconds
-        )
+        if deadline is None and timeout_seconds is not None:
+            deadline = time.monotonic() + timeout_seconds
+        if deadline_supplied:
+            remaining_before_deadline()
         process = subprocess.Popen(popen_command, **popen_options)
+        if absolute_deadline_wrapper:
+            spawn_handoff_complete = True
+            raise_pending_forwarded_signal()
         if exec_status_write_fd is not None:
             os.close(exec_status_write_fd)
             exec_status_write_fd = None
-        if exec_status_read_fd is not None:
-            exec_status = bytearray()
-            while True:
-                assert deadline is not None
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise subprocess.TimeoutExpired(command, timeout_seconds)
-                readable, _, _ = select.select(
-                    (exec_status_read_fd,),
-                    (),
-                    (),
-                    min(PROCESS_GROUP_POLL_SECONDS, remaining),
-                )
-                if not readable:
-                    continue
-                chunk = os.read(exec_status_read_fd, 32)
-                if not chunk:
-                    break
-                exec_status.extend(chunk)
-                if len(exec_status) > 16:
+        if launch_read_fd is not None:
+            os.close(launch_read_fd)
+            launch_read_fd = None
+        if absolute_deadline_wrapper:
+            ready_status = read_wrapper_status(stop_after_ready=True)
+            if ready_status != b"R":
+                raise_wrapper_failure(ready_status)
+            remaining_before_deadline()
+            assert launch_write_fd is not None
+            try:
+                try:
+                    launch_bytes = os.write(launch_write_fd, b"L")
+                except BrokenPipeError as error:
+                    exec_status = read_wrapper_status(stop_after_ready=False)
+                    os.close(exec_status_read_fd)
+                    exec_status_read_fd = None
+                    if exec_status:
+                        raise_wrapper_failure(exec_status)
                     raise ReviewError(
-                        "regular-file wrapper returned invalid exec status"
-                    )
+                        "process wrapper closed before launch authorization"
+                    ) from error
+                if launch_bytes != 1:
+                    raise ReviewError("process wrapper launch acknowledgement failed")
+            finally:
+                os.close(launch_write_fd)
+                launch_write_fd = None
+            exec_status = read_wrapper_status(stop_after_ready=False)
+            os.close(exec_status_read_fd)
+            exec_status_read_fd = None
+            if exec_status:
+                raise_wrapper_failure(exec_status)
+        elif exec_status_read_fd is not None:
+            exec_status = read_wrapper_status(stop_after_ready=False)
             os.close(exec_status_read_fd)
             exec_status_read_fd = None
             if exec_status:
@@ -753,13 +981,15 @@ def _run_logged_process(
             forwarded_signal_sent = True
             raise ForwardedSignal(pending_signal)
         if stdout_file_limit_bytes is None or stderr_file_limit_bytes is None:
-            if timeout_seconds is None:
+            if deadline is None:
                 process.communicate(input=stdin)
             else:
-                assert deadline is not None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise timeout_expired()
                 process.communicate(
                     input=stdin,
-                    timeout=max(0.0, deadline - time.monotonic()),
+                    timeout=remaining,
                 )
             return int(process.returncode)
 
@@ -888,7 +1118,6 @@ def _run_logged_process(
                 io_threads.append(thread)
         finally:
             restore_signal_mask(thread_start_mask)
-        assert timeout_seconds is not None
         assert deadline is not None
         while True:
             if regular_file_overflow.is_set() or regular_file_target_exceeded_limit():
@@ -897,7 +1126,7 @@ def _run_logged_process(
                 break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise subprocess.TimeoutExpired(command, timeout_seconds)
+                raise timeout_expired()
             try:
                 process.wait(timeout=min(PROCESS_GROUP_POLL_SECONDS, remaining))
                 break
@@ -975,7 +1204,12 @@ def _run_logged_process(
             stop_io.set()
             for thread in io_threads:
                 thread.join(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
-            for descriptor in (exec_status_read_fd, exec_status_write_fd):
+            for descriptor in (
+                exec_status_read_fd,
+                exec_status_write_fd,
+                launch_read_fd,
+                launch_write_fd,
+            ):
                 if descriptor is not None:
                     try:
                         os.close(descriptor)
@@ -990,7 +1224,9 @@ def _run_logged_process(
             if previous_mask is not None:
                 pending_cleanup_signal = consume_pending_forwarded_signal()
         finally:
-            restore_signal_mask(previous_mask)
+            restore_signal_mask(
+                caller_signal_mask if caller_signal_mask is not None else previous_mask
+            )
         if pending_cleanup_signal is not None:
             raise ForwardedSignal(pending_cleanup_signal)
 

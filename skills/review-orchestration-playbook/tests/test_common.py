@@ -8,6 +8,7 @@ import signal
 import stat
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -168,6 +169,476 @@ class ChildEnvironmentTest(unittest.TestCase):
                 stderr_limit_bytes=1024,
             )
         self.assertEqual(raised.exception.limit_kind, "stream")
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX descriptor passing")
+    def test_absolute_deadline_rejects_parent_scheduling_gap(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = pathlib.Path(temporary) / "launched"
+            real_popen = common.subprocess.Popen
+
+            def delayed_spawn(*args: object, **kwargs: object):
+                process = real_popen(*args, **kwargs)
+                time.sleep(0.15)
+                return process
+
+            with (
+                mock.patch.object(
+                    common.subprocess,
+                    "Popen",
+                    side_effect=delayed_spawn,
+                ),
+                self.assertRaisesRegex(
+                    common.ReviewTimeoutError,
+                    "exceeded its absolute deadline",
+                ),
+            ):
+                common.run_bounded_capture(
+                    (
+                        sys.executable,
+                        "-c",
+                        (
+                            "import pathlib,sys; "
+                            "pathlib.Path(sys.argv[1]).write_text('launched')"
+                        ),
+                        str(marker),
+                    ),
+                    deadline=time.monotonic() + 0.05,
+                    stdout_limit_bytes=4096,
+                    stderr_limit_bytes=4096,
+                )
+
+            self.assertFalse(marker.exists())
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX descriptor passing")
+    def test_absolute_deadline_classifies_coalesced_ready_timeout_status(self) -> None:
+        wrapper = common.ABSOLUTE_DEADLINE_WRAPPER.replace(
+            'os.write(status_fd, b"R")\n    launch = os.read(launch_fd, 1)',
+            'os.write(status_fd, b"RT")\n    os._exit(124)',
+        )
+        self.assertNotEqual(wrapper, common.ABSOLUTE_DEADLINE_WRAPPER)
+
+        with (
+            mock.patch.object(common, "ABSOLUTE_DEADLINE_WRAPPER", wrapper),
+            self.assertRaisesRegex(
+                common.ReviewTimeoutError,
+                "exceeded its absolute deadline",
+            ),
+        ):
+            common.run_bounded_capture(
+                (sys.executable, "-c", "raise SystemExit('must not execute')"),
+                deadline=time.monotonic() + 2,
+                stdout_limit_bytes=4096,
+                stderr_limit_bytes=4096,
+            )
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX descriptor passing")
+    def test_absolute_deadline_classifies_launch_pipe_epipe(self) -> None:
+        real_write = common.os.write
+
+        def delay_before_launch(descriptor: int, value: bytes) -> int:
+            if value == b"L":
+                time.sleep(0.1)
+            return real_write(descriptor, value)
+
+        with (
+            mock.patch.object(
+                common.os,
+                "write",
+                side_effect=delay_before_launch,
+            ),
+            self.assertRaisesRegex(
+                common.ReviewTimeoutError,
+                "exceeded its absolute deadline",
+            ),
+        ):
+            common.run_bounded_capture(
+                (sys.executable, "-c", "raise SystemExit('must not execute')"),
+                deadline=time.monotonic() + 0.05,
+                stdout_limit_bytes=4096,
+                stderr_limit_bytes=4096,
+            )
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX descriptor passing")
+    def test_absolute_deadline_rejects_expiry_after_child_final_check(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = pathlib.Path(temporary) / "launched"
+            wrapper = common.ABSOLUTE_DEADLINE_WRAPPER.replace(
+                "try:\n    os.execve(sys.argv[5], sys.argv[5:], os.environ)",
+                (
+                    "time.sleep(0.15)\n"
+                    "try:\n    os.execve(sys.argv[5], sys.argv[5:], os.environ)"
+                ),
+            )
+            self.assertNotEqual(wrapper, common.ABSOLUTE_DEADLINE_WRAPPER)
+            real_write = common.os.write
+
+            def delay_parent_after_launch(descriptor: int, value: bytes) -> int:
+                written = real_write(descriptor, value)
+                if value == b"L":
+                    time.sleep(0.2)
+                return written
+
+            with (
+                mock.patch.object(common, "ABSOLUTE_DEADLINE_WRAPPER", wrapper),
+                mock.patch.object(
+                    common.os,
+                    "write",
+                    side_effect=delay_parent_after_launch,
+                ),
+                self.assertRaisesRegex(
+                    common.ReviewTimeoutError,
+                    "exceeded its absolute deadline",
+                ),
+            ):
+                common.run_bounded_capture(
+                    (
+                        sys.executable,
+                        "-c",
+                        (
+                            "import pathlib,sys; "
+                            "pathlib.Path(sys.argv[1]).write_text('launched')"
+                        ),
+                        str(marker),
+                    ),
+                    deadline=time.monotonic() + 0.05,
+                    stdout_limit_bytes=4096,
+                    stderr_limit_bytes=4096,
+                )
+
+            self.assertFalse(marker.exists())
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX descriptor passing")
+    def test_absolute_deadline_rechecks_after_signal_setup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = pathlib.Path(temporary) / "launched"
+            wrapper = common.ABSOLUTE_DEADLINE_WRAPPER.replace(
+                "remaining = deadline - time.monotonic()",
+                "time.sleep(0.15)\nremaining = deadline - time.monotonic()",
+                1,
+            )
+            self.assertNotEqual(wrapper, common.ABSOLUTE_DEADLINE_WRAPPER)
+
+            with (
+                mock.patch.object(common, "ABSOLUTE_DEADLINE_WRAPPER", wrapper),
+                self.assertRaisesRegex(
+                    common.ReviewTimeoutError,
+                    "exceeded its absolute deadline",
+                ),
+            ):
+                common.run_bounded_capture(
+                    (
+                        sys.executable,
+                        "-c",
+                        (
+                            "import pathlib,sys; "
+                            "pathlib.Path(sys.argv[1]).write_text('launched')"
+                        ),
+                        str(marker),
+                    ),
+                    deadline=time.monotonic() + 0.05,
+                    stdout_limit_bytes=4096,
+                    stderr_limit_bytes=4096,
+                )
+
+            self.assertFalse(marker.exists())
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "requires POSIX signal masks",
+    )
+    def test_absolute_deadline_unblocks_inherited_child_alarm(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = pathlib.Path(temporary) / "launched"
+            wrapper = common.ABSOLUTE_DEADLINE_WRAPPER.replace(
+                "try:\n    os.execve(sys.argv[5], sys.argv[5:], os.environ)",
+                (
+                    "time.sleep(0.15)\n"
+                    "try:\n    os.execve(sys.argv[5], sys.argv[5:], os.environ)"
+                ),
+            )
+            real_write = common.os.write
+
+            def delay_parent_after_launch(descriptor: int, value: bytes) -> int:
+                written = real_write(descriptor, value)
+                if value == b"L":
+                    time.sleep(0.2)
+                return written
+
+            previous_mask = signal.pthread_sigmask(
+                signal.SIG_BLOCK,
+                {signal.SIGALRM},
+            )
+            try:
+                with (
+                    mock.patch.object(common, "ABSOLUTE_DEADLINE_WRAPPER", wrapper),
+                    mock.patch.object(
+                        common.os,
+                        "write",
+                        side_effect=delay_parent_after_launch,
+                    ),
+                    self.assertRaisesRegex(
+                        common.ReviewTimeoutError,
+                        "exceeded its absolute deadline",
+                    ),
+                ):
+                    common.run_bounded_capture(
+                        (
+                            sys.executable,
+                            "-c",
+                            (
+                                "import pathlib,sys; "
+                                "pathlib.Path(sys.argv[1]).write_text('launched')"
+                            ),
+                            str(marker),
+                        ),
+                        deadline=time.monotonic() + 0.05,
+                        stdout_limit_bytes=4096,
+                        stderr_limit_bytes=4096,
+                    )
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+            self.assertFalse(marker.exists())
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux")
+        and hasattr(os, "waitid")
+        and hasattr(os, "WNOWAIT"),
+        "requires Linux waitid zombie observation",
+    )
+    def test_terminate_process_group_reaps_zombie_leader(self) -> None:
+        process = common.subprocess.Popen(
+            (sys.executable, "-c", "pass"),
+            start_new_session=True,
+        )
+        try:
+            os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOWAIT)
+            self.assertFalse(common._process_group_exists(process.pid))
+
+            common.terminate_process_group(process)
+
+            with self.assertRaises(ChildProcessError):
+                os.waitpid(process.pid, os.WNOHANG)
+        finally:
+            if process.returncode is None:
+                process.kill()
+                process.wait()
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "SIGTERM"),
+        "requires POSIX signal forwarding",
+    )
+    def test_forwarded_signal_prevents_launch_authorization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = pathlib.Path(temporary) / "launched"
+            real_write = common.os.write
+
+            def signal_before_launch(descriptor: int, value: bytes) -> int:
+                if value == b"L":
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    time.sleep(0.1)
+                return real_write(descriptor, value)
+
+            with (
+                mock.patch.object(
+                    common.os,
+                    "write",
+                    side_effect=signal_before_launch,
+                ),
+                self.assertRaises(common.ForwardedSignal) as raised,
+            ):
+                common.run_bounded_capture(
+                    (
+                        sys.executable,
+                        "-c",
+                        (
+                            "import pathlib,sys; "
+                            "pathlib.Path(sys.argv[1]).write_text('launched')"
+                        ),
+                        str(marker),
+                    ),
+                    deadline=time.monotonic() + 2,
+                    stdout_limit_bytes=4096,
+                    stderr_limit_bytes=4096,
+                )
+
+            self.assertEqual(raised.exception.signum, signal.SIGTERM)
+            self.assertFalse(marker.exists())
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "requires POSIX signal masks",
+    )
+    def test_forwarded_signal_unblocks_inherited_parent_mask(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = pathlib.Path(temporary) / "launched"
+            real_write = common.os.write
+            timer: threading.Timer | None = None
+
+            def delay_launch_authorization(descriptor: int, value: bytes) -> int:
+                nonlocal timer
+                if value == b"L":
+                    timer = threading.Timer(
+                        0.02,
+                        os.kill,
+                        args=(os.getpid(), signal.SIGTERM),
+                    )
+                    timer.start()
+                    time.sleep(0.1)
+                return real_write(descriptor, value)
+
+            previous_mask = signal.pthread_sigmask(
+                signal.SIG_BLOCK,
+                {signal.SIGTERM},
+            )
+            try:
+                with (
+                    mock.patch.object(
+                        common.os,
+                        "write",
+                        side_effect=delay_launch_authorization,
+                    ),
+                    self.assertRaises(common.ForwardedSignal) as raised,
+                ):
+                    common.run_bounded_capture(
+                        (
+                            sys.executable,
+                            "-c",
+                            (
+                                "import pathlib,sys; "
+                                "pathlib.Path(sys.argv[1]).write_text('launched')"
+                            ),
+                            str(marker),
+                        ),
+                        deadline=time.monotonic() + 2,
+                        stdout_limit_bytes=4096,
+                        stderr_limit_bytes=4096,
+                    )
+            finally:
+                if timer is not None:
+                    timer.join()
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+            self.assertEqual(raised.exception.signum, signal.SIGTERM)
+            self.assertFalse(marker.exists())
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "SIGTERM"),
+        "requires POSIX signal forwarding",
+    )
+    def test_forwarded_signal_wins_when_spawn_returns_after_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = pathlib.Path(temporary) / "launched"
+            real_popen = common.subprocess.Popen
+            timer: threading.Timer | None = None
+
+            def delayed_spawn(*args: object, **kwargs: object):
+                nonlocal timer
+                process = real_popen(*args, **kwargs)
+                timer = threading.Timer(
+                    0.06,
+                    os.kill,
+                    args=(os.getpid(), signal.SIGTERM),
+                )
+                timer.start()
+                time.sleep(0.15)
+                return process
+
+            try:
+                with (
+                    mock.patch.object(
+                        common.subprocess,
+                        "Popen",
+                        side_effect=delayed_spawn,
+                    ),
+                    self.assertRaises(common.ForwardedSignal) as raised,
+                ):
+                    common.run_bounded_capture(
+                        (
+                            sys.executable,
+                            "-c",
+                            (
+                                "import pathlib,sys; "
+                                "pathlib.Path(sys.argv[1]).write_text('launched')"
+                            ),
+                            str(marker),
+                        ),
+                        deadline=time.monotonic() + 0.03,
+                        stdout_limit_bytes=4096,
+                        stderr_limit_bytes=4096,
+                    )
+            finally:
+                if timer is not None:
+                    timer.join()
+
+            self.assertEqual(raised.exception.signum, signal.SIGTERM)
+            self.assertFalse(marker.exists())
+
+    def test_relative_bounded_capture_keeps_existing_launch_path(self) -> None:
+        with mock.patch.object(
+            common,
+            "_absolute_deadline_wrapper_command",
+        ) as deadline_wrapper:
+            completed = common.run_bounded_capture(
+                (sys.executable, "-c", "import os; os.write(1, b'relative')"),
+                timeout_seconds=2,
+                stdout_limit_bytes=4096,
+                stderr_limit_bytes=4096,
+            )
+
+        deadline_wrapper.assert_not_called()
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.stdout, bytearray(b"relative"))
+
+    def test_control_flow_cancellation_is_not_replaced_and_zeroizes_output(
+        self,
+    ) -> None:
+        for cancellation in (
+            common.ForwardedSignal(signal.SIGTERM),
+            KeyboardInterrupt("cancelled"),
+        ):
+            now = [100.0]
+            writers: dict[str, object] = {}
+
+            def cancel_after_output(*_args: object, **kwargs: object) -> int:
+                stdout = kwargs["stdout_handle"]
+                stderr = kwargs["stderr_handle"]
+                writers["stdout"] = stdout
+                writers["stderr"] = stderr
+                stdout.write(b"sensitive stdout")
+                stderr.write(b"sensitive stderr")
+                now[0] = 101.0
+                raise cancellation
+
+            with (
+                self.subTest(cancellation=type(cancellation).__name__),
+                mock.patch.object(
+                    common.time,
+                    "monotonic",
+                    side_effect=lambda: now[0],
+                ),
+                mock.patch.object(
+                    common,
+                    "_run_logged_process",
+                    side_effect=cancel_after_output,
+                ),
+                self.assertRaises(type(cancellation)) as raised,
+            ):
+                common.run_bounded_capture(
+                    ("reviewer",),
+                    deadline=101.0,
+                    stdout_limit_bytes=4096,
+                    stderr_limit_bytes=4096,
+                )
+
+            if isinstance(cancellation, common.ForwardedSignal):
+                self.assertIs(raised.exception, cancellation)
+            self.assertEqual(writers["stdout"].data, bytearray(16))
+            self.assertEqual(writers["stderr"].data, bytearray(16))
 
     @unittest.skipUnless(
         hasattr(signal, "SIGXFSZ") and hasattr(os, "fork"),

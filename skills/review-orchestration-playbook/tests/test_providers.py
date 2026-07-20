@@ -2676,7 +2676,11 @@ class ProviderPolicyTest(unittest.TestCase):
         except (PermissionError, providers.ClaudeLoopbackUnavailable):
             self.skipTest("loopback bind is unavailable in the current sandbox")
 
-        self.assertEqual(first.returncode, 0)
+        self.assertEqual(
+            first.returncode,
+            0,
+            first.stderr.decode("utf-8", errors="replace"),
+        )
         self.assertEqual(first.stdout, b"fixture-value\n")
         self.assertEqual(second.returncode, 44)
         self.assertEqual(valid_update.returncode, 0)
@@ -22963,6 +22967,773 @@ class ProviderPolicyTest(unittest.TestCase):
                 executable=self.review.container_dir / "verified-claude",
             )
 
+    def test_sensitive_capture_zeroizes_before_signal_mask_restore(self) -> None:
+        completed = common.BoundedCapture(
+            argv=("openssl",),
+            returncode=0,
+            stdout=bytearray(b"sensitive stdout"),
+            stderr=bytearray(b"sensitive stderr"),
+        )
+        previous_mask = {signal.SIGTERM}
+        events: list[str] = []
+
+        def consume(capture: common.BoundedCapture) -> str:
+            events.append("consume")
+            self.assertEqual(capture.stdout, b"sensitive stdout")
+            return "accepted"
+
+        def restore(mask: set[signal.Signals] | None) -> None:
+            events.append("restore")
+            self.assertEqual(mask, previous_mask)
+            self.assertEqual(completed.stdout, bytearray(len(completed.stdout)))
+            self.assertEqual(completed.stderr, bytearray(len(completed.stderr)))
+
+        with (
+            mock.patch.object(
+                providers,
+                "block_forwarded_signals",
+                side_effect=lambda: events.append("block") or previous_mask,
+            ),
+            mock.patch.object(
+                providers,
+                "run_bounded_capture",
+                side_effect=lambda *_args, **_kwargs: (
+                    events.append("capture") or completed
+                ),
+            ),
+            mock.patch.object(
+                providers,
+                "restore_signal_mask",
+                side_effect=restore,
+            ),
+        ):
+            result = providers._consume_sensitive_bounded_capture(
+                ("openssl", "version"),
+                cwd=self.review.container_dir,
+                deadline=123.0,
+                consume=consume,
+            )
+
+        self.assertEqual(result, "accepted")
+        self.assertEqual(events, ["block", "capture", "consume", "restore"])
+
+    def test_pending_signal_after_sensitive_capture_wins_after_zeroize(self) -> None:
+        completed = common.BoundedCapture(
+            argv=("openssl",),
+            returncode=0,
+            stdout=bytearray(b"sensitive stdout"),
+            stderr=bytearray(b"sensitive stderr"),
+        )
+
+        def restore(_mask: set[signal.Signals] | None) -> None:
+            self.assertEqual(completed.stdout, bytearray(len(completed.stdout)))
+            self.assertEqual(completed.stderr, bytearray(len(completed.stderr)))
+            raise common.ForwardedSignal(signal.SIGTERM)
+
+        with (
+            mock.patch.object(providers, "block_forwarded_signals", return_value=set()),
+            mock.patch.object(
+                providers,
+                "run_bounded_capture",
+                return_value=completed,
+            ),
+            mock.patch.object(
+                providers,
+                "restore_signal_mask",
+                side_effect=restore,
+            ),
+            self.assertRaises(common.ForwardedSignal),
+        ):
+            providers._consume_sensitive_bounded_capture(
+                ("openssl", "version"),
+                cwd=self.review.container_dir,
+                deadline=123.0,
+                consume=lambda _completed: "must not escape",
+            )
+
+    def test_bundled_root_preparation_is_charged_to_shared_deadline(self) -> None:
+        certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+        der, canonical = providers._canonical_ca_certificate(
+            certificate,
+            source="test bundled root",
+        )
+        public_key = common.BoundedCapture(
+            argv=(str(providers.CLAUDE_OPENSSL_CLIENT),),
+            returncode=0,
+            stdout=bytearray(
+                b"-----BEGIN PUBLIC KEY-----\nfixture\n-----END PUBLIC KEY-----\n"
+            ),
+            stderr=bytearray(),
+        )
+        verified = common.BoundedCapture(
+            argv=(str(providers.CLAUDE_OPENSSL_CLIENT),),
+            returncode=0,
+            stdout=bytearray(),
+            stderr=bytearray(),
+        )
+        start = 100.0
+        now = [start]
+        fsync_count = 0
+        real_fsync = os.fsync
+
+        def fsync_and_charge_preparation(descriptor: int) -> None:
+            nonlocal fsync_count
+            real_fsync(descriptor)
+            fsync_count += 1
+            if fsync_count == 3:
+                now[0] = start + 0.4
+            elif fsync_count == 4:
+                now[0] = start + 0.6
+
+        with (
+            mock.patch.object(
+                providers,
+                "CLAUDE_TRUST_ROOT_VERIFY_TOTAL_SECONDS",
+                1.0,
+            ),
+            mock.patch.object(
+                providers.time,
+                "monotonic",
+                side_effect=lambda: now[0],
+            ),
+            mock.patch.object(
+                providers.os,
+                "fsync",
+                side_effect=fsync_and_charge_preparation,
+            ) as fsync,
+            mock.patch.object(
+                providers,
+                "run_bounded_capture",
+                side_effect=(public_key, verified),
+            ) as openssl,
+        ):
+            roots = providers._validated_bundled_root_certificates(
+                certificate,
+                executable=self.review.container_dir / "verified-claude",
+            )
+
+        self.assertEqual(roots, {hashlib.sha256(der).digest(): canonical})
+        self.assertEqual(fsync.call_count, 4)
+        self.assertEqual(openssl.call_count, 2)
+        first_deadline = openssl.call_args_list[0].kwargs["deadline"]
+        second_deadline = openssl.call_args_list[1].kwargs["deadline"]
+        self.assertIs(second_deadline, first_deadline)
+        self.assertEqual(first_deadline, start + 1.0)
+        for openssl_call in openssl.call_args_list:
+            self.assertNotIn("timeout_seconds", openssl_call.kwargs)
+
+    def test_bundled_root_exhausted_preparation_does_not_launch_openssl(
+        self,
+    ) -> None:
+        certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+        start = 100.0
+        now = [start]
+        fsync_count = 0
+        real_fsync = os.fsync
+
+        def fsync_and_exhaust_budget(descriptor: int) -> None:
+            nonlocal fsync_count
+            real_fsync(descriptor)
+            fsync_count += 1
+            if fsync_count == 3:
+                now[0] = start + 1.0
+
+        with (
+            mock.patch.object(
+                providers,
+                "CLAUDE_TRUST_ROOT_VERIFY_TOTAL_SECONDS",
+                1.0,
+            ),
+            mock.patch.object(
+                providers.time,
+                "monotonic",
+                side_effect=lambda: now[0],
+            ),
+            mock.patch.object(
+                providers.os,
+                "fsync",
+                side_effect=fsync_and_exhaust_budget,
+            ) as fsync,
+            mock.patch.object(providers, "run_bounded_capture") as openssl,
+            self.assertRaisesRegex(
+                providers.ReviewTimeoutError,
+                "exceeded its total timeout",
+            ),
+        ):
+            providers._validated_bundled_root_certificates(
+                certificate,
+                executable=self.review.container_dir / "verified-claude",
+            )
+
+        self.assertEqual(fsync.call_count, 3)
+        openssl.assert_not_called()
+
+    def test_bundled_root_lstat_crossing_deadline_preserves_timeout(self) -> None:
+        start = 100.0
+        cases = (
+            ("success", None),
+            ("missing", lambda: FileNotFoundError(errno.ENOENT, "missing")),
+            ("io-error", lambda: OSError(errno.EIO, "lstat failed")),
+        )
+
+        for name, error_factory in cases:
+            now = [start]
+            openssl_path = mock.MagicMock()
+
+            def lstat() -> object:
+                now[0] = start + 1.0
+                if error_factory is not None:
+                    raise error_factory()
+                return mock.Mock()
+
+            openssl_path.lstat.side_effect = lstat
+            with (
+                self.subTest(name=name),
+                mock.patch.object(
+                    providers,
+                    "CLAUDE_OPENSSL_CLIENT",
+                    openssl_path,
+                ),
+                mock.patch.object(
+                    providers.time,
+                    "monotonic",
+                    side_effect=lambda: now[0],
+                ),
+                mock.patch.object(providers.os, "access") as access,
+                mock.patch.object(
+                    providers,
+                    "_certificate_self_signature_evidence",
+                ) as parse_evidence,
+                self.assertRaisesRegex(
+                    providers.ReviewTimeoutError,
+                    "exceeded its total timeout",
+                ) as caught,
+            ):
+                providers._require_bundled_root_self_signature(
+                    b"ignored DER",
+                    b"ignored PEM",
+                    verification_root=self.review.container_dir,
+                    index=0,
+                    deadline=start + 1.0,
+                )
+
+            self.assertNotIsInstance(
+                caught.exception,
+                (
+                    providers.ClaudeReviewToolUnavailable,
+                    providers.ClaudeExecutableInspectionInconclusive,
+                ),
+            )
+            access.assert_not_called()
+            parse_evidence.assert_not_called()
+
+    def test_bundled_root_expired_deadline_does_not_start_operation(self) -> None:
+        operation = mock.Mock()
+
+        with (
+            mock.patch.object(providers.time, "monotonic", return_value=100.0),
+            self.assertRaisesRegex(
+                providers.ReviewTimeoutError,
+                "exceeded its total timeout",
+            ),
+        ):
+            providers._run_with_bundled_root_deadline(100.0, operation)
+
+        operation.assert_not_called()
+
+    def test_bundled_root_der_crossing_deadline_preserves_timeout(self) -> None:
+        start = 100.0
+        cases = (
+            ("success", None),
+            (
+                "invalid",
+                lambda: providers.ClaudeTrustCertificateInvalid("invalid DER"),
+            ),
+        )
+
+        for name, error_factory in cases:
+            now = [start]
+            metadata = mock.Mock(st_mode=stat.S_IFREG | 0o555, st_uid=0)
+            openssl_path = mock.MagicMock()
+            openssl_path.lstat.return_value = metadata
+
+            def parse_evidence(_der: bytes) -> tuple[bytes, bytes, str]:
+                now[0] = start + 1.0
+                if error_factory is not None:
+                    raise error_factory()
+                return b"tbs", b"signature", "sha256"
+
+            with (
+                self.subTest(name=name),
+                mock.patch.object(
+                    providers,
+                    "CLAUDE_OPENSSL_CLIENT",
+                    openssl_path,
+                ),
+                mock.patch.object(
+                    providers.time,
+                    "monotonic",
+                    side_effect=lambda: now[0],
+                ),
+                mock.patch.object(providers.os, "access", return_value=True),
+                mock.patch.object(
+                    providers,
+                    "_certificate_self_signature_evidence",
+                    side_effect=parse_evidence,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_write_private_verification_file",
+                ) as write_file,
+                mock.patch.object(providers, "run_bounded_capture") as openssl,
+                self.assertRaisesRegex(
+                    providers.ReviewTimeoutError,
+                    "exceeded its total timeout",
+                ) as caught,
+            ):
+                providers._require_bundled_root_self_signature(
+                    b"fixture DER",
+                    b"fixture PEM",
+                    verification_root=self.review.container_dir,
+                    index=0,
+                    deadline=start + 1.0,
+                )
+
+            self.assertNotIsInstance(
+                caught.exception,
+                (
+                    providers.ClaudeReviewToolUnavailable,
+                    providers.ClaudeExecutableInspectionInconclusive,
+                ),
+            )
+            write_file.assert_not_called()
+            openssl.assert_not_called()
+
+    def test_bundled_root_input_writes_preserve_timeout_precedence(self) -> None:
+        start = 100.0
+
+        for crossing_write in (1, 2, 3):
+            for outcome in ("success", "error"):
+                now = [start]
+                write_count = 0
+                metadata = mock.Mock(st_mode=stat.S_IFREG | 0o555, st_uid=0)
+                openssl_path = mock.MagicMock()
+                openssl_path.lstat.return_value = metadata
+
+                def write_file(_path: pathlib.Path, _data: bytes) -> None:
+                    nonlocal write_count
+                    write_count += 1
+                    if write_count == crossing_write:
+                        now[0] = start + 1.0
+                        if outcome == "error":
+                            raise providers.ClaudeExecutableInspectionInconclusive(
+                                "write failed"
+                            )
+
+                with (
+                    self.subTest(write=crossing_write, outcome=outcome),
+                    mock.patch.object(
+                        providers,
+                        "CLAUDE_OPENSSL_CLIENT",
+                        openssl_path,
+                    ),
+                    mock.patch.object(
+                        providers.time,
+                        "monotonic",
+                        side_effect=lambda: now[0],
+                    ),
+                    mock.patch.object(providers.os, "access", return_value=True),
+                    mock.patch.object(
+                        providers,
+                        "_certificate_self_signature_evidence",
+                        return_value=(b"tbs", b"signature", "sha256"),
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_write_private_verification_file",
+                        side_effect=write_file,
+                    ) as write_file_mock,
+                    mock.patch.object(providers, "run_bounded_capture") as openssl,
+                    self.assertRaisesRegex(
+                        providers.ReviewTimeoutError,
+                        "exceeded its total timeout",
+                    ) as caught,
+                ):
+                    providers._require_bundled_root_self_signature(
+                        b"fixture DER",
+                        b"fixture PEM",
+                        verification_root=self.review.container_dir,
+                        index=0,
+                        deadline=start + 1.0,
+                    )
+
+                self.assertNotIsInstance(
+                    caught.exception,
+                    (
+                        providers.ClaudeReviewToolUnavailable,
+                        providers.ClaudeExecutableInspectionInconclusive,
+                    ),
+                )
+                self.assertEqual(write_file_mock.call_count, crossing_write)
+                openssl.assert_not_called()
+
+    def test_bundled_root_first_openssl_timeout_zeroizes_output(self) -> None:
+        start = 100.0
+        now = [start]
+        metadata = mock.Mock(st_mode=stat.S_IFREG | 0o555, st_uid=0)
+        openssl_path = mock.MagicMock()
+        openssl_path.lstat.return_value = metadata
+        completed = common.BoundedCapture(
+            argv=("openssl", "x509"),
+            returncode=0,
+            stdout=bytearray(b"sensitive public-key output"),
+            stderr=bytearray(b"sensitive public-key error"),
+        )
+
+        def run_after_deadline(*_args: object, **_kwargs: object) -> object:
+            now[0] = start + 1.0
+            return completed
+
+        with (
+            mock.patch.object(
+                providers,
+                "CLAUDE_OPENSSL_CLIENT",
+                openssl_path,
+            ),
+            mock.patch.object(
+                providers.time,
+                "monotonic",
+                side_effect=lambda: now[0],
+            ),
+            mock.patch.object(providers.os, "access", return_value=True),
+            mock.patch.object(
+                providers,
+                "_certificate_self_signature_evidence",
+                return_value=(b"tbs", b"signature", "sha256"),
+            ),
+            mock.patch.object(
+                providers,
+                "_write_private_verification_file",
+            ) as write_file,
+            mock.patch.object(
+                providers,
+                "run_bounded_capture",
+                side_effect=run_after_deadline,
+            ) as openssl,
+            self.assertRaisesRegex(
+                providers.ReviewTimeoutError,
+                "exceeded its total timeout",
+            ),
+        ):
+            providers._require_bundled_root_self_signature(
+                b"fixture DER",
+                b"fixture PEM",
+                verification_root=self.review.container_dir,
+                index=0,
+                deadline=start + 1.0,
+            )
+
+        self.assertEqual(write_file.call_count, 3)
+        openssl.assert_called_once()
+        self.assertEqual(completed.stdout, bytearray(len(completed.stdout)))
+        self.assertEqual(completed.stderr, bytearray(len(completed.stderr)))
+
+    def test_bundled_root_second_openssl_timeout_zeroizes_output(self) -> None:
+        start = 100.0
+        now = [start]
+        metadata = mock.Mock(st_mode=stat.S_IFREG | 0o555, st_uid=0)
+        openssl_path = mock.MagicMock()
+        openssl_path.lstat.return_value = metadata
+        public_key = common.BoundedCapture(
+            argv=("openssl", "x509"),
+            returncode=0,
+            stdout=bytearray(
+                b"-----BEGIN PUBLIC KEY-----\nsensitive\n-----END PUBLIC KEY-----\n"
+            ),
+            stderr=bytearray(b"sensitive public-key error"),
+        )
+        verified = common.BoundedCapture(
+            argv=("openssl", "dgst"),
+            returncode=0,
+            stdout=bytearray(b"sensitive verification output"),
+            stderr=bytearray(b"sensitive verification error"),
+        )
+        invocation_count = 0
+
+        def run_second_after_deadline(*_args: object, **_kwargs: object) -> object:
+            nonlocal invocation_count
+            invocation_count += 1
+            if invocation_count == 1:
+                return public_key
+            now[0] = start + 1.0
+            return verified
+
+        with (
+            mock.patch.object(
+                providers,
+                "CLAUDE_OPENSSL_CLIENT",
+                openssl_path,
+            ),
+            mock.patch.object(
+                providers.time,
+                "monotonic",
+                side_effect=lambda: now[0],
+            ),
+            mock.patch.object(providers.os, "access", return_value=True),
+            mock.patch.object(
+                providers,
+                "_certificate_self_signature_evidence",
+                return_value=(b"tbs", b"signature", "sha256"),
+            ),
+            mock.patch.object(
+                providers,
+                "_write_private_verification_file",
+            ) as write_file,
+            mock.patch.object(
+                providers,
+                "run_bounded_capture",
+                side_effect=run_second_after_deadline,
+            ) as openssl,
+            self.assertRaisesRegex(
+                providers.ReviewTimeoutError,
+                "exceeded its total timeout",
+            ),
+        ):
+            providers._require_bundled_root_self_signature(
+                b"fixture DER",
+                b"fixture PEM",
+                verification_root=self.review.container_dir,
+                index=0,
+                deadline=start + 1.0,
+            )
+
+        self.assertEqual(write_file.call_count, 4)
+        self.assertEqual(openssl.call_count, 2)
+        self.assertEqual(public_key.stdout, bytearray(len(public_key.stdout)))
+        self.assertEqual(public_key.stderr, bytearray(len(public_key.stderr)))
+        self.assertEqual(verified.stdout, bytearray(len(verified.stdout)))
+        self.assertEqual(verified.stderr, bytearray(len(verified.stderr)))
+
+    def test_bundled_root_outer_validation_boundaries_preserve_timeout(
+        self,
+    ) -> None:
+        certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+        real_canonicalize = providers._canonical_ca_certificate
+        real_extensions = providers._require_unconditional_root_extensions
+        start = 100.0
+
+        for stage, outcome in itertools.product(
+            ("canonicalization", "extensions"),
+            ("success", "error"),
+        ):
+            now = [start]
+
+            def canonicalize(*args: object, **kwargs: object):
+                result = real_canonicalize(*args, **kwargs)
+                if stage == "canonicalization":
+                    now[0] = start + 1.0
+                    if outcome == "error":
+                        raise providers.ClaudeTrustCertificateInvalid(
+                            "canonicalization failed"
+                        )
+                return result
+
+            def validate_extensions(*args: object, **kwargs: object) -> None:
+                real_extensions(*args, **kwargs)
+                if stage == "extensions":
+                    now[0] = start + 1.0
+                    if outcome == "error":
+                        raise providers.ClaudeTrustCertificateInvalid(
+                            "extension validation failed"
+                        )
+
+            with (
+                self.subTest(stage=stage, outcome=outcome),
+                mock.patch.object(
+                    providers,
+                    "CLAUDE_TRUST_ROOT_VERIFY_TOTAL_SECONDS",
+                    1.0,
+                ),
+                mock.patch.object(
+                    providers.time,
+                    "monotonic",
+                    side_effect=lambda: now[0],
+                ),
+                mock.patch.object(
+                    providers,
+                    "_canonical_ca_certificate",
+                    side_effect=canonicalize,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_require_unconditional_root_extensions",
+                    side_effect=validate_extensions,
+                ),
+                self.assertRaisesRegex(
+                    providers.ReviewTimeoutError,
+                    "exceeded its total timeout",
+                ),
+            ):
+                providers._validated_bundled_root_certificates(
+                    certificate,
+                    executable=self.review.container_dir / "verified-claude",
+                    verify_self_signatures=False,
+                )
+
+    def test_bundled_root_outer_hash_and_dict_boundaries_preserve_timeout(
+        self,
+    ) -> None:
+        certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+        start = 100.0
+
+        for stage in ("hash", "dict-get", "dict-set"):
+            now = [start]
+
+            class CrossingFingerprint:
+                def __init__(self) -> None:
+                    self.hash_calls = 0
+
+                def __hash__(self) -> int:
+                    self.hash_calls += 1
+                    crossing_call = 1 if stage == "dict-get" else 2
+                    if stage != "hash" and self.hash_calls == crossing_call:
+                        now[0] = start + 1.0
+                    return 821601
+
+            fingerprint = CrossingFingerprint()
+
+            def digest() -> object:
+                if stage == "hash":
+                    now[0] = start + 1.0
+                return fingerprint
+
+            digest_builder = mock.Mock()
+            digest_builder.digest.side_effect = digest
+            with (
+                self.subTest(stage=stage),
+                mock.patch.object(
+                    providers,
+                    "CLAUDE_TRUST_ROOT_VERIFY_TOTAL_SECONDS",
+                    1.0,
+                ),
+                mock.patch.object(
+                    providers.time,
+                    "monotonic",
+                    side_effect=lambda: now[0],
+                ),
+                mock.patch.object(
+                    providers.hashlib,
+                    "sha256",
+                    return_value=digest_builder,
+                ),
+                self.assertRaisesRegex(
+                    providers.ReviewTimeoutError,
+                    "exceeded its total timeout",
+                ),
+            ):
+                providers._validated_bundled_root_certificates(
+                    certificate,
+                    executable=self.review.container_dir / "verified-claude",
+                    verify_self_signatures=False,
+                )
+
+    def test_bundled_root_cleanup_and_final_success_obey_deadline(self) -> None:
+        certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+        start = 100.0
+
+        for outcome in ("success", "error"):
+            now = [start]
+
+            @contextlib.contextmanager
+            def verification_directory(_executable: pathlib.Path):
+                yield self.review.container_dir
+                now[0] = start + 1.0
+                if outcome == "error":
+                    raise providers.ClaudeExecutableInspectionInconclusive(
+                        "cleanup failed"
+                    )
+
+            with (
+                self.subTest(outcome=outcome),
+                mock.patch.object(
+                    providers,
+                    "CLAUDE_TRUST_ROOT_VERIFY_TOTAL_SECONDS",
+                    1.0,
+                ),
+                mock.patch.object(
+                    providers.time,
+                    "monotonic",
+                    side_effect=lambda: now[0],
+                ),
+                mock.patch.object(
+                    providers,
+                    "_bundled_root_verification_directory",
+                    side_effect=verification_directory,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_require_bundled_root_self_signature",
+                ),
+                self.assertRaisesRegex(
+                    providers.ReviewTimeoutError,
+                    "exceeded its total timeout",
+                ),
+            ):
+                providers._validated_bundled_root_certificates(
+                    certificate,
+                    executable=self.review.container_dir / "verified-claude",
+                )
+
+    def test_bundled_root_control_flow_crossing_cleanup_deadline_is_preserved(
+        self,
+    ) -> None:
+        certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+        start = 100.0
+
+        for cancellation in (
+            providers.ForwardedSignal(signal.SIGTERM),
+            KeyboardInterrupt("cancelled"),
+        ):
+            now = [start]
+
+            @contextlib.contextmanager
+            def verification_directory(_executable: pathlib.Path):
+                try:
+                    yield self.review.container_dir
+                finally:
+                    now[0] = start + 1.0
+
+            with (
+                self.subTest(cancellation=type(cancellation).__name__),
+                mock.patch.object(
+                    providers,
+                    "CLAUDE_TRUST_ROOT_VERIFY_TOTAL_SECONDS",
+                    1.0,
+                ),
+                mock.patch.object(
+                    providers.time,
+                    "monotonic",
+                    side_effect=lambda: now[0],
+                ),
+                mock.patch.object(
+                    providers,
+                    "_bundled_root_verification_directory",
+                    side_effect=verification_directory,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_canonical_ca_certificate",
+                    side_effect=cancellation,
+                ),
+                self.assertRaises(type(cancellation)) as raised,
+            ):
+                providers._validated_bundled_root_certificates(
+                    certificate,
+                    executable=self.review.container_dir / "verified-claude",
+                )
+
+            self.assertIs(raised.exception, cancellation)
+
     def test_bundled_root_creation_programmer_error_is_not_reclassified(self) -> None:
         certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
 
@@ -23028,6 +23799,34 @@ class ProviderPolicyTest(unittest.TestCase):
             )
 
         self.assertIs(raised.exception, policy_error)
+        directory.__exit__.assert_called_once()
+
+    def test_bundled_root_cleanup_signal_replaces_active_policy_error(self) -> None:
+        certificate = (CERTIFICATE_FIXTURES / "trust-root-valid.pem").read_bytes()
+        directory = mock.MagicMock()
+        directory.__enter__.return_value = str(self.review.container_dir / "verify")
+        cancellation = providers.ForwardedSignal(signal.SIGTERM)
+        directory.__exit__.side_effect = cancellation
+
+        with (
+            mock.patch.object(
+                providers.tempfile,
+                "TemporaryDirectory",
+                return_value=directory,
+            ),
+            mock.patch.object(
+                providers,
+                "_require_unconditional_root_extensions",
+                side_effect=providers.ClaudeTrustCertificateInvalid("invalid root"),
+            ),
+            self.assertRaises(providers.ForwardedSignal) as raised,
+        ):
+            providers._validated_bundled_root_certificates(
+                certificate,
+                executable=self.review.container_dir / "verified-claude",
+            )
+
+        self.assertIs(raised.exception, cancellation)
         directory.__exit__.assert_called_once()
 
     def test_bundled_root_cleanup_programmer_error_is_not_reclassified(self) -> None:
@@ -24804,11 +25603,12 @@ class ProviderPolicyTest(unittest.TestCase):
                 allow_non_self_signed=True,
             )
 
-        probe_timeout = verify.call_args_list[0].kwargs["timeout_seconds"]
-        verification_timeout = verify.call_args_list[1].kwargs["timeout_seconds"]
-        self.assertAlmostEqual(probe_timeout, 0.75)
-        self.assertGreater(verification_timeout, 0.0)
-        self.assertAlmostEqual(verification_timeout, 0.001)
+        probe_deadline = verify.call_args_list[0].kwargs["deadline"]
+        verification_deadline = verify.call_args_list[1].kwargs["deadline"]
+        self.assertIs(verification_deadline, probe_deadline)
+        self.assertEqual(probe_deadline, 101.0)
+        for verification_call in verify.call_args_list:
+            self.assertNotIn("timeout_seconds", verification_call.kwargs)
 
     def test_trust_as_root_does_not_launch_after_total_timeout(self) -> None:
         intermediate_der, intermediate_pem = self.non_self_issued_ca_fixture()
@@ -30879,6 +31679,44 @@ class ProviderPolicyTest(unittest.TestCase):
             )
 
         self.assertEqual(completed.stdout, bytearray(len(completed.stdout)))
+
+    def test_proxy_ca_subject_hashes_preserves_deadline_across_parent_gap(
+        self,
+    ) -> None:
+        now = [9.0]
+        observed: dict[str, object] = {}
+
+        def delayed_capture(*_args: object, **kwargs: object) -> object:
+            observed.update(kwargs)
+            now[0] = 11.0
+            if kwargs["deadline"] <= now[0]:
+                raise common.ReviewTimeoutError("absolute deadline expired")
+            self.fail("a scheduling gap must not create a fresh relative budget")
+
+        with (
+            mock.patch.object(
+                providers.time,
+                "monotonic",
+                side_effect=lambda: now[0],
+            ),
+            mock.patch.object(
+                providers,
+                "run_bounded_capture",
+                side_effect=delayed_capture,
+            ),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "timed out",
+            ),
+        ):
+            providers._proxy_ca_subject_hashes(
+                self.sample_ca_certificate(),
+                deadline=10.0,
+                certificate_limit=1,
+            )
+
+        self.assertEqual(observed["deadline"], 10.0)
+        self.assertNotIn("timeout_seconds", observed)
 
     def test_new_proxy_ssl_context_preserves_hardened_verification_flags(
         self,
