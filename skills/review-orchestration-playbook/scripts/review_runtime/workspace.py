@@ -5760,7 +5760,7 @@ def _write_control_artifact_state_at(
 def validate_secret_delta_summary(
     value: Any,
     *,
-    label: str = "secret-delta evidence",
+    label: str = "secret-delta",
 ) -> dict[str, Any]:
     required_fields = {"limitations", "location_status", "status", "violations"}
     if (
