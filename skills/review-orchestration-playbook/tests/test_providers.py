@@ -4428,26 +4428,224 @@ class ProviderPolicyTest(unittest.TestCase):
 
     def test_claude_output_redaction_only_includes_credential_proxy_urls(self) -> None:
         credential_proxy = (
-            "http://reviewer:proxy-secret@proxy.example.invalid:8080/route"
+            " \thttp://review%65r:proxy%2Dsecret@proxy.example.invalid:8080/route\n"
         )
+        stripped_proxy = credential_proxy.strip()
         values = providers.claude_output_redact_values(
             {
                 "HTTPS_PROXY": credential_proxy,
                 "HTTP_PROXY": "http://proxy.example.invalid:8080",
+                "all_proxy": "http://:@proxy.example.invalid:8080",
                 "NO_PROXY": "*",
                 "no_proxy": "e",
             }
         )
 
-        self.assertEqual(values, (credential_proxy,))
+        self.assertEqual(
+            values[:2],
+            (credential_proxy, stripped_proxy),
+        )
+        self.assertIn("review%65r:proxy%2Dsecret", values)
+        self.assertIn("review%65r:proxy%2dsecret", values)
+        self.assertIn("proxy%2Dsecret", values)
+        self.assertIn("proxy%2dsecret", values)
+        self.assertIn("reviewer:proxy-secret", values)
+        self.assertIn("proxy-secret", values)
+        self.assertNotIn("reviewer", values)
         variants = common.output_redact_values(values)
         self.assertIn(credential_proxy, variants)
+        self.assertIn(stripped_proxy, variants)
+        self.assertIn("reviewer:proxy-secret", variants)
+        self.assertIn("proxy-secret", variants)
         self.assertIn(
             json.dumps(credential_proxy, ensure_ascii=True)[1:-1],
             variants,
         )
         self.assertNotIn("*", variants)
         self.assertNotIn("e", variants)
+
+        normalized_output = (
+            "proxy=http://reviewer:proxy-secret@proxy.example.invalid:8080 "
+            "userinfo=reviewer:proxy-secret password=proxy-secret"
+        )
+        redacted = common.redact_text(normalized_output, values)
+        self.assertNotIn("reviewer", redacted)
+        self.assertNotIn("proxy-secret", redacted)
+
+        token_values = providers.claude_output_redact_values(
+            {"ALL_PROXY": "http://proxy%2Dtoken@proxy.example.invalid:8080"}
+        )
+        self.assertIn("proxy%2Dtoken", token_values)
+        self.assertIn("proxy%2dtoken", token_values)
+        self.assertIn("proxy-token", token_values)
+
+        self.assertEqual(
+            providers.claude_output_redact_values(
+                {"HTTPS_PROXY": "http://:@proxy.example.invalid:8080"}
+            ),
+            (),
+        )
+
+    def test_claude_output_redaction_recovers_whatwg_special_proxy_authority(
+        self,
+    ) -> None:
+        for proxy_url in (
+            "http:/reviewer:proxy-secret@proxy.example.invalid",
+            "http:////reviewer:proxy-secret@proxy.example.invalid",
+            "http:\\reviewer:proxy-secret@proxy.example.invalid",
+            "http:reviewer:proxy-secret@proxy.example.invalid",
+            "HTTPS:/reviewer:proxy-secret@proxy.example.invalid",
+        ):
+            with self.subTest(proxy_url=proxy_url):
+                values = providers.claude_output_redact_values(
+                    {"HTTPS_PROXY": proxy_url}
+                )
+                self.assertIn("reviewer:proxy-secret", values)
+                self.assertIn("proxy-secret", values)
+                normalized_output = (
+                    "proxy=http://reviewer:proxy-secret@proxy.example.invalid/ "
+                    "password=proxy-secret"
+                )
+                redacted = common.redact_text(normalized_output, values)
+                self.assertNotIn("reviewer:proxy-secret", redacted)
+                self.assertNotIn("proxy-secret", redacted)
+
+    def test_claude_output_redaction_covers_whatwg_userinfo_normalization(
+        self,
+    ) -> None:
+        credential_proxy = "http://reviewer:pa\tss@\nwö\rrd@proxy.example.invalid:8080"
+
+        values = providers.claude_output_redact_values(
+            {"HTTPS_PROXY": credential_proxy}
+        )
+
+        self.assertIn("pass@wörd", values)
+        self.assertIn("pass%40w%C3%B6rd", values)
+        self.assertIn("pass%40w%c3%b6rd", values)
+        self.assertIn("reviewer:pass%40w%C3%B6rd", values)
+        normalized_output = (
+            "proxy=http://reviewer:pass%40w%C3%B6rd@proxy.example.invalid:8080 "
+            "decoded-password=pass@wörd "
+            "lowercase-password=pass%40w%c3%b6rd"
+        )
+        redacted = common.redact_text(normalized_output, values)
+        self.assertNotIn("pass@wörd", redacted)
+        self.assertNotIn("pass%40w%C3%B6rd", redacted)
+        self.assertNotIn("pass%40w%c3%b6rd", redacted)
+
+        percent_values = providers.claude_output_redact_values(
+            {
+                "HTTPS_PROXY": (
+                    "http://reviewer:secret%25and%40value@proxy.example.invalid:8080"
+                )
+            }
+        )
+        self.assertIn("secret%and%40value", percent_values)
+        percent_output = (
+            "proxy=http://reviewer:secret%and%40value@proxy.example.invalid:8080"
+        )
+        self.assertNotIn(
+            "secret%and%40value",
+            common.redact_text(percent_output, percent_values),
+        )
+
+        mixed_values = providers.claude_output_redact_values(
+            {
+                "HTTPS_PROXY": (
+                    "http://reviewer:pass word%2dfoo@proxy.example.invalid:8080"
+                )
+            }
+        )
+        self.assertIn("pass%20word%2dfoo", mixed_values)
+        mixed_output = (
+            "proxy=http://reviewer:pass%20word%2dfoo@proxy.example.invalid:8080"
+        )
+        self.assertNotIn(
+            "pass%20word%2dfoo",
+            common.redact_text(mixed_output, mixed_values),
+        )
+
+        diagnostic_values = providers.claude_output_redact_values(
+            {
+                "HTTPS_PROXY": (
+                    "http://reviewer:proxy-\x07secret@proxy.example.invalid:8080"
+                )
+            }
+        )
+        self.assertIn("proxy-secret", diagnostic_values)
+        self.assertIn("proxy-%07secret", diagnostic_values)
+        diagnostic_output = (
+            "Invalid proxy URL: http://reviewer:proxy-secret@proxy.example.invalid:8080"
+        )
+        self.assertNotIn(
+            "proxy-secret",
+            common.redact_text(diagnostic_output, diagnostic_values),
+        )
+
+        diagnostic_mixed_values = providers.claude_output_redact_values(
+            {
+                "HTTPS_PROXY": (
+                    "http://reviewer:pa\x07ss%2dword@proxy.example.invalid:8080"
+                )
+            }
+        )
+        self.assertIn("pa%07ss%2dword", diagnostic_mixed_values)
+        self.assertIn("pass%2dword", diagnostic_mixed_values)
+
+    def test_claude_output_redaction_rejects_unsafe_proxy_normalization(
+        self,
+    ) -> None:
+        for proxy_url in (
+            "http://reviewer:proxy%ZZsecret@proxy.example.invalid:8080",
+            "http://reviewer:proxy%00secret@proxy.example.invalid:8080",
+            "http://reviewer:proxy%FFsecret@proxy.example.invalid:8080",
+            "http://reviewer:proxy\udcffsecret@proxy.example.invalid:8080",
+        ):
+            with self.subTest(proxy_url=proxy_url):
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "cannot be safely normalized",
+                ):
+                    providers.claude_output_redact_values({"HTTPS_PROXY": proxy_url})
+
+    def test_claude_output_redaction_rejects_short_standalone_credentials(
+        self,
+    ) -> None:
+        for proxy_url in (
+            "http://reviewer:1234567@proxy.example.invalid:8080",
+            "http://reviewer:%31%32%33%34%35%36%37@proxy.example.invalid:8080",
+            "http://1234567@proxy.example.invalid:8080",
+            "http://1234567:@proxy.example.invalid:8080",
+        ):
+            with self.subTest(proxy_url=proxy_url):
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "too short for safe output redaction",
+                ):
+                    providers.claude_output_redact_values({"HTTPS_PROXY": proxy_url})
+
+        accepted = providers.claude_output_redact_values(
+            {"HTTPS_PROXY": "http://r:12345678@proxy.example.invalid:8080"}
+        )
+        self.assertIn("12345678", accepted)
+        self.assertNotIn("r", accepted)
+
+    def test_claude_output_redaction_rejects_ambiguous_proxy_delimiters(
+        self,
+    ) -> None:
+        for proxy_url in (
+            "http://proxy.example.invalid/path/reviewer:password123@artifact",
+            "http://proxy.example.invalid?auth=reviewer:password123@artifact",
+            "http://proxy.example.invalid#reviewer:password123@artifact",
+            "http://[invalid]/path/reviewer:password123@artifact",
+            "http://reviewer:password123/path@proxy.example.invalid",
+        ):
+            with self.subTest(proxy_url=proxy_url):
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "ambiguous credential delimiter",
+                ):
+                    providers.claude_output_redact_values({"HTTPS_PROXY": proxy_url})
 
     @mock.patch.object(providers, "_run_review_impl")
     @mock.patch.object(providers, "_review_environment")

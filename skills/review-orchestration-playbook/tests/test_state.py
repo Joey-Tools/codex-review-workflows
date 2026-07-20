@@ -195,10 +195,16 @@ class StatefulLifecycleTest(unittest.TestCase):
             }
         )
 
-        self.assertEqual(
-            set(values),
-            {"alpha", "omega", credential_proxy},
+        self.assertTrue(
+            {
+                "alpha",
+                "omega",
+                credential_proxy,
+                "reviewer:proxy-secret",
+                "proxy-secret",
+            }.issubset(values)
         )
+        self.assertNotIn("reviewer", values)
         self.assertEqual(
             values,
             providers.claude_output_redact_values(
@@ -211,6 +217,15 @@ class StatefulLifecycleTest(unittest.TestCase):
                 }
             ),
         )
+
+    def test_state_redaction_rejects_short_proxy_credentials(self) -> None:
+        with self.assertRaisesRegex(
+            ReviewError,
+            "too short for safe output redaction",
+        ):
+            state._freeze_claude_redactions(
+                {"HTTPS_PROXY": "http://reviewer:short@proxy.example.invalid"}
+            )
 
     def test_start_passes_include_source_wip_to_workspace_preparation(self) -> None:
         captured = {}

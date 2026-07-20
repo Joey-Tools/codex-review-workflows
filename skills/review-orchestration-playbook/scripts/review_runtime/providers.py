@@ -9,6 +9,8 @@ import shutil
 import stat
 import sys
 import tempfile
+import unicodedata
+import urllib.parse
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Iterable, Mapping
 
@@ -189,6 +191,9 @@ CLAUDE_PROXY_URL_ENV_KEYS = (
     "https_proxy",
     "http_proxy",
 )
+CLAUDE_PROXY_USERINFO_SAFE_CHARACTERS = "!$%&'()*+,-._~"
+CLAUDE_PROXY_IGNORED_URL_CONTROLS = str.maketrans("", "", "\t\n\r")
+CLAUDE_PROXY_MINIMUM_STANDALONE_REDACTION_BYTES = 8
 CLAUDE_MODEL_SECRET_ENV_KEYS = (
     *CLAUDE_EXPLICIT_AUTH_ENV_KEYS,
     *CLAUDE_PROXY_ENV_KEYS,
@@ -683,16 +688,209 @@ def _review_scope_metadata(review: ReviewWorkspace) -> dict[str, str]:
     }
 
 
-def _proxy_url_has_userinfo(value: str) -> bool:
-    candidate = value.strip()
-    if not candidate:
-        return False
-    _scheme, separator, remainder = candidate.partition("://")
-    authority = remainder if separator else candidate
-    for delimiter in ("/", "?", "#"):
+def _strict_proxy_component_unquote(value: str) -> str:
+    if re.search(r"%(?![0-9A-Fa-f]{2})", value):
+        raise ReviewError(
+            "credential-bearing proxy URL cannot be safely normalized for output "
+            "redaction"
+        )
+    try:
+        decoded = urllib.parse.unquote_to_bytes(value).decode("utf-8")
+    except (UnicodeDecodeError, UnicodeEncodeError) as error:
+        raise ReviewError(
+            "credential-bearing proxy URL cannot be safely normalized for output "
+            "redaction"
+        ) from error
+    if "\x00" in decoded:
+        raise ReviewError(
+            "credential-bearing proxy URL cannot be safely normalized for output "
+            "redaction"
+        )
+    return decoded
+
+
+def _proxy_percent_escape_case(value: str, *, upper: bool) -> str:
+    def replace_escape(match: re.Match[str]) -> str:
+        escape = match.group(0)
+        return escape.upper() if upper else escape.lower()
+
+    return re.sub(r"%[0-9A-Fa-f]{2}", replace_escape, value)
+
+
+def _proxy_quote_preserving_escapes(value: str) -> str:
+    output: list[str] = []
+    start = 0
+    for escape in re.finditer(r"%[0-9A-Fa-f]{2}", value):
+        if escape.start() > start:
+            output.append(
+                urllib.parse.quote(
+                    value[start : escape.start()],
+                    safe=CLAUDE_PROXY_USERINFO_SAFE_CHARACTERS,
+                )
+            )
+        output.append(escape.group(0))
+        start = escape.end()
+    if start < len(value):
+        output.append(
+            urllib.parse.quote(
+                value[start:],
+                safe=CLAUDE_PROXY_USERINFO_SAFE_CHARACTERS,
+            )
+        )
+    return "".join(output)
+
+
+def _proxy_component_redact_values(value: str) -> tuple[str, ...]:
+    without_controls = value.translate(CLAUDE_PROXY_IGNORED_URL_CONTROLS)
+    decoded = _strict_proxy_component_unquote(without_controls)
+    without_diagnostic_controls = "".join(
+        character
+        for character in without_controls
+        if unicodedata.category(character) != "Cc"
+    )
+    decoded_without_diagnostic_controls = "".join(
+        character for character in decoded if unicodedata.category(character) != "Cc"
+    )
+    encoded = urllib.parse.quote(
+        decoded,
+        safe=CLAUDE_PROXY_USERINFO_SAFE_CHARACTERS,
+    )
+    diagnostic_encoded = urllib.parse.quote(
+        decoded_without_diagnostic_controls,
+        safe=CLAUDE_PROXY_USERINFO_SAFE_CHARACTERS,
+    )
+    preserving_encoded = _proxy_quote_preserving_escapes(without_controls)
+    diagnostic_preserving_encoded = _proxy_quote_preserving_escapes(
+        without_diagnostic_controls
+    )
+    variants = tuple(
+        dict.fromkeys(
+            item
+            for item in (
+                value,
+                without_controls,
+                _proxy_percent_escape_case(without_controls, upper=True),
+                _proxy_percent_escape_case(without_controls, upper=False),
+                without_diagnostic_controls,
+                decoded,
+                decoded_without_diagnostic_controls,
+                encoded,
+                _proxy_percent_escape_case(encoded, upper=False),
+                preserving_encoded,
+                _proxy_percent_escape_case(preserving_encoded, upper=True),
+                _proxy_percent_escape_case(preserving_encoded, upper=False),
+                diagnostic_encoded,
+                _proxy_percent_escape_case(diagnostic_encoded, upper=False),
+                diagnostic_preserving_encoded,
+                _proxy_percent_escape_case(
+                    diagnostic_preserving_encoded,
+                    upper=True,
+                ),
+                _proxy_percent_escape_case(
+                    diagnostic_preserving_encoded,
+                    upper=False,
+                ),
+            )
+            if item
+        )
+    )
+    try:
+        minimum_size = min(len(os.fsencode(item)) for item in variants)
+    except UnicodeEncodeError as error:
+        raise ReviewError(
+            "credential-bearing proxy URL cannot be safely normalized for output "
+            "redaction"
+        ) from error
+    if minimum_size < CLAUDE_PROXY_MINIMUM_STANDALONE_REDACTION_BYTES:
+        raise ReviewError(
+            "credential-bearing proxy URL contains a credential component too "
+            "short for safe output redaction"
+        )
+    return variants
+
+
+def _proxy_url_userinfo(value: str) -> tuple[str | None, bool]:
+    special_match = re.match(r"(?is)^https?:(.*)$", value)
+    if special_match is not None:
+        authority = special_match.group(1).lstrip("/\\")
+    else:
+        _scheme, separator, remainder = value.partition("://")
+        authority = remainder if separator else value
+    for delimiter in ("/", "\\", "?", "#"):
         authority = authority.partition(delimiter)[0]
     userinfo, separator, _host = authority.rpartition("@")
-    return bool(separator and userinfo)
+    if not separator:
+        return None, False
+    if not userinfo:
+        return None, True
+    normalized_userinfo = userinfo.translate(CLAUDE_PROXY_IGNORED_URL_CONTROLS)
+    username, password_separator, password = normalized_userinfo.partition(":")
+    if password_separator:
+        return (userinfo if username or password else None), True
+    return (userinfo if normalized_userinfo else None), True
+
+
+def _proxy_url_redact_values(value: str) -> tuple[str, ...]:
+    candidate = value.strip()
+    if not candidate:
+        return ()
+    normalized_candidate = candidate.translate(CLAUDE_PROXY_IGNORED_URL_CONTROLS)
+    diagnostic_candidate = "".join(
+        character
+        for character in normalized_candidate
+        if unicodedata.category(character) != "Cc"
+    )
+    candidates = tuple(
+        dict.fromkeys((candidate, normalized_candidate, diagnostic_candidate))
+    )
+    parsed_userinfos = tuple(_proxy_url_userinfo(current) for current in candidates)
+    userinfos = tuple(
+        dict.fromkeys(
+            userinfo
+            for userinfo, _authority_at_seen in parsed_userinfos
+            if userinfo is not None
+        )
+    )
+    if not userinfos:
+        authority_at_seen = any(observed for _userinfo, observed in parsed_userinfos)
+        if "@" in diagnostic_candidate and (
+            not authority_at_seen or diagnostic_candidate.count("@") != 1
+        ):
+            raise ReviewError(
+                "proxy URL contains an ambiguous credential delimiter and cannot "
+                "be safely redacted"
+            )
+        return ()
+    values = [value, *candidates]
+    for userinfo in userinfos:
+        values.extend(_proxy_component_redact_values(userinfo))
+        username, password_separator, password = userinfo.partition(":")
+        if not password_separator:
+            continue
+        if password:
+            values.extend(_proxy_component_redact_values(password))
+            normalized_username = username.translate(CLAUDE_PROXY_IGNORED_URL_CONTROLS)
+            normalized_password = password.translate(CLAUDE_PROXY_IGNORED_URL_CONTROLS)
+            canonical_userinfo = (
+                urllib.parse.quote(
+                    _strict_proxy_component_unquote(normalized_username),
+                    safe=CLAUDE_PROXY_USERINFO_SAFE_CHARACTERS,
+                )
+                + ":"
+                + urllib.parse.quote(
+                    _strict_proxy_component_unquote(normalized_password),
+                    safe=CLAUDE_PROXY_USERINFO_SAFE_CHARACTERS,
+                )
+            )
+            values.extend(
+                (
+                    canonical_userinfo,
+                    _proxy_percent_escape_case(canonical_userinfo, upper=False),
+                )
+            )
+        elif username:
+            values.extend(_proxy_component_redact_values(username))
+    return tuple(dict.fromkeys(item for item in values if item))
 
 
 def claude_output_redact_values(environment: Mapping[str, str]) -> tuple[str, ...]:
@@ -702,11 +900,9 @@ def claude_output_redact_values(environment: Mapping[str, str]) -> tuple[str, ..
         for key in CLAUDE_EXPLICIT_AUTH_ENV_KEYS
         if (value := environment.get(key))
     ]
-    values.extend(
-        value
-        for key in CLAUDE_PROXY_URL_ENV_KEYS
-        if (value := environment.get(key)) and _proxy_url_has_userinfo(value)
-    )
+    for key in CLAUDE_PROXY_URL_ENV_KEYS:
+        if value := environment.get(key):
+            values.extend(_proxy_url_redact_values(value))
     return tuple(dict.fromkeys(values))
 
 
