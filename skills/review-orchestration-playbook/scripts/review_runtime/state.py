@@ -228,14 +228,15 @@ def open_private_lock_file(
 
 
 def _directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    # Directory contents may legitimately change while cleanup waiters race to
+    # create the lock or remove a workspace. Bind the open descriptor to the
+    # same directory and its safety metadata, not content-derived timestamps
+    # or link counts.
     return (
         metadata.st_dev,
         metadata.st_ino,
         metadata.st_mode,
-        metadata.st_nlink,
         metadata.st_uid,
-        metadata.st_mtime_ns,
-        metadata.st_ctime_ns,
     )
 
 
