@@ -42,7 +42,7 @@ Codex and Claude Code use the same frozen-scope and workspace scheme. Each logic
 7. Keep the reviewer's raw terminal output findings-only. The orchestrator binds that verbatim output to a separate lane record containing the exact range, runtime/model, workspace identity, and terminal state. It may add commands, tests, or residual risk only when independently observable; never force that metadata into the findings-only output. Intermediate reasoning, tool traces, keepalives, and partial output are not review evidence.
 8. Remove the lane worktree after the terminal artifact has been collected, unless a precise recovery reason requires temporary retention.
 
-When repository policy requires a security scanner, or when a changed path or tracked context is known or reasonably suspected to contain a secret, credential, or unrelated private artifact, stop before provider egress and run the narrow repository-approved scan or narrow the scope. Do not turn that safeguard into a hidden universal reviewer lane, create a model-visible full-diff artifact, or inject diff content into the reviewer prompt. Credentials, untracked files, unrelated repositories, broad workspace dumps, and home-directory content remain out of scope regardless of scanner output.
+Repository-approved preflight may validate workspace containment, frozen-scope identity, object completeness, or reviewer-sandbox safety before launch. A tracked secret delta is not a reviewer-launch gate: the trusted reviewer may inspect the original tracked diff and necessary tracked context, including repository secrets, without redaction or rewriting. Reviewer/runtime authentication credentials, untracked files, unrelated repositories, broad workspace dumps, and home-directory content remain outside the consented scope. Keep private control evidence outside the reviewer-visible workspace, and never turn a preflight into a hidden reviewer lane or inject a generated full diff into the prompt.
 
 Read [review-lane-contracts.md](references/review-lane-contracts.md) before launching a lane.
 
@@ -100,7 +100,21 @@ Any unambiguous request classified as a named review shape authorizes scoped tra
 - Triple additionally authorizes, when supported, current-head GitHub Codex.
 - No named shape authorizes a substitute external reviewer.
 
-Read [egress-consent.md](references/egress-consent.md) before external egress. Approval justifications must name the exact repository, frozen range, destination, included tracked-code scope, and exclusions.
+The selected reviewer is a trusted processor. Consent includes the named repository's original tracked diff and necessary tracked context, including tracked repository secrets; do not redact, rewrite, or suppress reviewer-visible tracked content because a secret audit is blocked, inconclusive, or violating. It excludes automatic discovery of reviewer/runtime authentication credentials, untracked files, unrelated repositories, broad workspace dumps, and home-directory content.
+
+Read [egress-consent.md](references/egress-consent.md) before external egress. Approval justifications must name the exact repository, frozen range, destination, included tracked-code scope, tracked-secret handling, and exclusions.
+
+## PR/Master Secret Admission
+
+Secret admission is independent of every named reviewer lane and never delays or blocks reviewer launch.
+
+- For each countable candidate, use its exact raw byte value as the key and count it globally over the complete base and head tracked trees: raw Git path bytes, regular-file blob bytes, and symlink-target bytes. Gitlink entry paths count; gitlink object IDs and submodule content do not.
+- Permit `head_count <= base_count`. Equality, deletion, and movement across paths, blob/symlink surfaces, modes, or byte offsets pass. Only a first appearance or global count growth blocks admission.
+- Do not derive Base64, hex, URL-encoded, escaped, hashed, or other transformed variants. This is a deliberate detection limitation; a transformed byte string matters only when it independently becomes an exact scanner candidate.
+- A non-exact dynamic expression does not enter the counter. Incomplete tree enumeration, unreadable bounded objects, or lost count integrity makes admission `inconclusive`.
+- Report only head-side added locations for positive-delta candidates; omit unchanged occurrences. Use one-based lines for complete text evidence, `line: null` for new-path or binary fallback, and line `1` for symlink targets. Mark incomplete mapping as `location_status=inconclusive`; when endpoint trees cannot distinguish a moved occurrence from an identical new copy, omit the ambiguous locations instead of relying on heuristic rename attribution.
+
+When the low-level helper supplies PR/master evidence, run `stateful final --state-dir <state_dir>` for its reviewer artifact and then `stateful admission --state-dir <state_dir>` on that same current-head state. These checks are independent: reviewer final may succeed while admission is violating or inconclusive. Admission exit `0` is `clean`, `1` is violations, `3` is pending, and `75` is inconclusive. A head change invalidates both.
 
 ## Low-Level Helper Boundary
 
@@ -109,6 +123,7 @@ The `isolated_review` helper retains a frozen, `.git`-free, prepared-diff runtim
 - Do not use its Codex path to satisfy single review.
 - Do not count a supplied-diff helper run as the Claude Code lane of a named double/triple review.
 - Do not add helper preflight, fallback, or retry attempts to the review count.
+- For helper-only Claude diagnostics, use `explicit-claude-review`; use `explicit-claude-with-copilot-fallback` only after separate user consent explicitly authorizes both destinations. Named `double`/`triple` phrases and legacy `double-review`/`triple-review` values are not low-level helper consent markers.
 - Read [helper-contract.md](references/helper-contract.md) before modifying or debugging the helper.
 
 ## Guardrails
@@ -122,6 +137,9 @@ The `isolated_review` helper retains a frozen, `.git`-free, prepared-diff runtim
 - Do not infer entitlement from silent model substitution.
 - Do not start another reviewer from a findings-only review child.
 - Do not use state-changing MCP, Plugin, Git, or GitHub actions inside a review-only lane.
+- Do not block trusted reviewer launch on a tracked secret delta or redact tracked reviewer input based on admission status.
+- Do not count encoded variants for admission; enforce only the complete-tree global exact-raw-value non-growth rule.
+- Do not treat `stateful final` as secret-admission evidence or merge the two terminal decisions.
 
 ## References
 

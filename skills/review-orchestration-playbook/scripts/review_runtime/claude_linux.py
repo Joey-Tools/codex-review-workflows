@@ -85,21 +85,15 @@ class LinuxCredentialStaleRefreshLock(LinuxCredentialInspectionInconclusive):
     """A stale shared refresh lock needs controlled operator recovery."""
 
 
-class LinuxStagedCredentialRefreshLockBlocked(
-    LinuxCredentialInspectionInconclusive
-):
+class LinuxStagedCredentialRefreshLockBlocked(LinuxCredentialInspectionInconclusive):
     """A helper-owned staged lock blocked final refresh persistence."""
 
 
-class LinuxStagedCredentialWriterUnquiescent(
-    LinuxCredentialInspectionInconclusive
-):
+class LinuxStagedCredentialWriterUnquiescent(LinuxCredentialInspectionInconclusive):
     """A launched staged credential writer has no safe cleanup attestation."""
 
 
-class LinuxStagedCredentialWatcherUnstopped(
-    LinuxCredentialInspectionInconclusive
-):
+class LinuxStagedCredentialWatcherUnstopped(LinuxCredentialInspectionInconclusive):
     """The staged credential watcher did not stop within its bounded join."""
 
 
@@ -308,9 +302,7 @@ class _CredentialDirectoryAnchor:
                 )
             descriptors = self._descriptors
         try:
-            current_metadata = tuple(
-                os.fstat(descriptor) for descriptor in descriptors
-            )
+            current_metadata = tuple(os.fstat(descriptor) for descriptor in descriptors)
             current_identities = tuple(
                 _credential_directory_identity(metadata)
                 for metadata in current_metadata
@@ -388,6 +380,7 @@ class SandboxSpec:
     ca_bundle: pathlib.Path | None = None
     ca_bundle_identity: TrustedPathIdentity | None = None
     node_extra_ca_certs_configured: bool = False
+    workspace_descriptor: int | None = None
 
 
 @dataclass(frozen=True)
@@ -398,6 +391,7 @@ class SandboxCommand:
     home_path: pathlib.PurePosixPath
     tmp_path: pathlib.PurePosixPath
     config_path: pathlib.PurePosixPath
+    pass_fds: tuple[int, ...] = ()
 
 
 class CaptureResult(Protocol):
@@ -1034,12 +1028,7 @@ def _pread_exact(
     known_size: int,
     label: str,
 ) -> bytes:
-    if (
-        offset < 0
-        or length < 0
-        or offset > known_size
-        or length > known_size - offset
-    ):
+    if offset < 0 or length < 0 or offset > known_size or length > known_size - offset:
         raise LinuxRuntimeError(f"truncated ELF {label}")
     payload = os.pread(fd, length, offset)
     if len(payload) != length:
@@ -1420,9 +1409,7 @@ def inspect_elf(path: pathlib.Path) -> ElfInfo:
         )
         raise failure from error
     except (UnicodeDecodeError, struct.error) as error:
-        invalid = LinuxRuntimeError(
-            f"cannot inspect ELF executable {path}: {error}"
-        )
+        invalid = LinuxRuntimeError(f"cannot inspect ELF executable {path}: {error}")
         try:
             _revalidate_elf_after_failure(fd, metadata, path)
         except LinuxRuntimeInspectionInconclusive as inspection_error:
@@ -1536,9 +1523,7 @@ def _validate_trusted_path_chain(
         (root for root in normalized_roots if _is_relative_to(resolved, root)), None
     )
     if matching_root is None:
-        raise LinuxRuntimeUnsafe(
-            f"trusted tool resolves outside system roots: {path}"
-        )
+        raise LinuxRuntimeUnsafe(f"trusted tool resolves outside system roots: {path}")
     current = resolved
     while True:
         try:
@@ -1548,9 +1533,7 @@ def _validate_trusted_path_chain(
                 f"cannot stat trusted path {current}: {error}"
             ) from error
         if metadata.st_uid not in trusted_owner_uids:
-            raise LinuxRuntimeUnsafe(
-                f"trusted path has an untrusted owner: {current}"
-            )
+            raise LinuxRuntimeUnsafe(f"trusted path has an untrusted owner: {current}")
         if metadata.st_mode & 0o022:
             raise LinuxRuntimeUnsafe(
                 f"trusted path is group- or world-writable: {current}"
@@ -1564,9 +1547,7 @@ def _validate_trusted_path_chain(
             f"trusted tool is not an executable regular file: {path}"
         )
     if not allow_setuid and metadata.st_mode & (stat.S_ISUID | stat.S_ISGID):
-        raise LinuxRuntimeUnsafe(
-            f"trusted tool unexpectedly has set-id mode: {path}"
-        )
+        raise LinuxRuntimeUnsafe(f"trusted tool unexpectedly has set-id mode: {path}")
     inspect_elf(resolved)
     return resolved
 
@@ -1576,14 +1557,21 @@ def _run_tool_probe(
     argv: Iterable[str],
     *,
     timeout_seconds: float = TOOL_PROBE_TIMEOUT_SECONDS,
+    pass_fds: Iterable[int] = (),
 ) -> CaptureResult:
     try:
+        arguments: dict[str, object] = {
+            "env": fixed_host_tool_environment(),
+            "timeout_seconds": timeout_seconds,
+            "stdout_limit_bytes": TOOL_PROBE_OUTPUT_LIMIT_BYTES,
+            "stderr_limit_bytes": TOOL_PROBE_OUTPUT_LIMIT_BYTES,
+        }
+        inherited_fds = tuple(pass_fds)
+        if inherited_fds:
+            arguments["pass_fds"] = inherited_fds
         return runner(
             tuple(str(item) for item in argv),
-            env=fixed_host_tool_environment(),
-            timeout_seconds=timeout_seconds,
-            stdout_limit_bytes=TOOL_PROBE_OUTPUT_LIMIT_BYTES,
-            stderr_limit_bytes=TOOL_PROBE_OUTPUT_LIMIT_BYTES,
+            **arguments,
         )
     except (ReviewError, ForwardedSignal):
         raise
@@ -1653,7 +1641,7 @@ def discover_native_toolchain(
                 if info.arch != host.arch:
                     raise LinuxRuntimeError(
                         f"{name} architecture {info.arch} does not match {host.arch}"
-                )
+                    )
                 _probe_identity(name, executable, runner)
             except LinuxRuntimeUnsafe as error:
                 unsafe_failures.append(error)
@@ -1696,35 +1684,52 @@ def probe_bwrap(
     """Run the namespace/capability shape used by the real sandbox."""
 
     require_supported_host(host)
-    command = (
-        str(toolchain.bwrap),
-        "--die-with-parent",
-        "--new-session",
-        "--unshare-user",
-        "--unshare-pid",
-        "--unshare-net",
-        "--unshare-ipc",
-        "--unshare-uts",
-        "--unshare-cgroup",
-        "--cap-drop",
-        "ALL",
-        "--disable-userns",
-        "--clearenv",
-        "--setenv",
-        "PATH",
-        "/usr/bin:/bin",
-        "--ro-bind",
-        "/",
-        "/",
-        "--proc",
-        "/proc",
-        "--dev",
-        "/dev",
-        "--",
-        str(toolchain.rg),
-        "--version",
-    )
-    result = _run_tool_probe(runner, command)
+    root_descriptor: int | None = None
+    try:
+        root_descriptor = os.open(
+            "/",
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0),
+        )
+        command = (
+            str(toolchain.bwrap),
+            "--die-with-parent",
+            "--new-session",
+            "--unshare-user",
+            "--unshare-pid",
+            "--unshare-net",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--unshare-cgroup",
+            "--cap-drop",
+            "ALL",
+            "--disable-userns",
+            "--clearenv",
+            "--setenv",
+            "PATH",
+            "/usr/bin:/bin",
+            "--ro-bind-fd",
+            str(root_descriptor),
+            "/",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--",
+            str(toolchain.rg),
+            "--version",
+        )
+        result = _run_tool_probe(
+            runner,
+            command,
+            pass_fds=(root_descriptor,),
+        )
+    except OSError as error:
+        raise LinuxRuntimeInspectionInconclusive(
+            f"cannot prepare bubblewrap descriptor-mount probe: {error}"
+        ) from error
+    finally:
+        if root_descriptor is not None:
+            os.close(root_descriptor)
     if result.returncode != 0 or not bytes(result.stdout).lower().startswith(
         b"ripgrep "
     ):
@@ -1803,13 +1808,9 @@ def _validate_credential_parent_metadata(
     owner_uid: int,
 ) -> None:
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-        raise LinuxCredentialUnsafe(
-            "Claude credential parent is not a real directory"
-        )
+        raise LinuxCredentialUnsafe("Claude credential parent is not a real directory")
     if metadata.st_uid not in {0, owner_uid}:
-        raise LinuxCredentialUnsafe(
-            "Claude credential parent has an untrusted owner"
-        )
+        raise LinuxCredentialUnsafe("Claude credential parent has an untrusted owner")
     if metadata.st_mode & 0o022:
         raise LinuxCredentialUnsafe(
             "Claude credential parent must not be group- or world-writable"
@@ -2164,8 +2165,7 @@ def _is_control_flow_error(error: BaseException) -> bool:
 
 
 @contextlib.contextmanager
-def _defer_forwarded_signals_during_cleanup(
-) -> Iterator[list[ForwardedSignal]]:
+def _defer_forwarded_signals_during_cleanup() -> Iterator[list[ForwardedSignal]]:
     previous_mask = block_forwarded_signals()
     deferred_signals: list[ForwardedSignal] = []
     try:
@@ -2189,11 +2189,7 @@ def _primary_cleanup_error(
     if not errors:
         return None
     primary = next(
-        (
-            error
-            for error in errors
-            if _is_control_flow_error(error)
-        ),
+        (error for error in errors if _is_control_flow_error(error)),
         errors[0],
     )
     for error in errors:
@@ -2251,11 +2247,7 @@ def _discard_private_file(
         cleanup_errors.append(error)
     if unlink_error is None:
         return next(
-            (
-                error
-                for error in cleanup_errors
-                if _is_control_flow_error(error)
-            ),
+            (error for error in cleanup_errors if _is_control_flow_error(error)),
             None,
         )
     return _primary_cleanup_error(
@@ -2422,18 +2414,19 @@ def _create_private_credential_update(
         candidate = f".{source_name}.codex-review-{secrets.token_hex(16)}"
         try:
             fd = os.open(candidate, flags, 0o600, dir_fd=parent_fd)
-            break
         except FileExistsError:
             continue
         except OSError as error:
             raise LinuxCredentialUnsafe(
                 f"cannot create atomic Claude credential update: {error}"
             ) from error
+        break
     if fd is None:
         raise LinuxCredentialUnsafe(
             "cannot allocate a unique atomic Claude credential update"
         )
     try:
+        os.fchmod(fd, 0o600)
         metadata = os.fstat(fd)
         if (
             not stat.S_ISREG(metadata.st_mode)
@@ -2473,9 +2466,7 @@ def _create_private_credential_update(
                 _add_cleanup_note(cleanup_error, error)
                 raise cleanup_error
             _add_cleanup_note(error, cleanup_error)
-        if isinstance(error, LinuxCredentialError) or _is_control_flow_error(
-            error
-        ):
+        if isinstance(error, LinuxCredentialError) or _is_control_flow_error(error):
             raise
         raise LinuxCredentialUnsafe(
             f"cannot finalize atomic Claude credential update: {error}"
@@ -2519,9 +2510,7 @@ def _lock_credential_parent(
         ) from error
     _validate_credential_parent_metadata(metadata, owner_uid=owner_uid)
     if _credential_directory_identity(metadata) != expected:
-        raise LinuxCredentialUnsafe(
-            "Claude credential parent changed concurrently"
-        )
+        raise LinuxCredentialUnsafe("Claude credential parent changed concurrently")
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError as error:
@@ -2732,8 +2721,7 @@ def _writeback_refreshed_credential_impl(
                 "mtime_ns",
             )
             if any(
-                getattr(committed_identity, field)
-                != getattr(candidate_identity, field)
+                getattr(committed_identity, field) != getattr(candidate_identity, field)
                 for field in stable_replacement_fields
             ):
                 raise LinuxCredentialInspectionInconclusive(
@@ -2871,8 +2859,7 @@ def _read_staged_credential_under_lock(
         return None
     except ClaudeRefreshLockStale as error:
         raise LinuxStagedCredentialRefreshLockBlocked(
-            "a staged Claude refresh lock remained after the runtime writer "
-            "stopped"
+            "a staged Claude refresh lock remained after the runtime writer stopped"
         ) from error
     except ClaudeRefreshLockError as error:
         raise LinuxCredentialInspectionInconclusive(
@@ -2903,11 +2890,7 @@ def _read_staged_credential_under_lock(
         except BaseException as error:
             release_error = error
     primary_error = _primary_cleanup_error(
-        [
-            error
-            for error in (operation_error, release_error)
-            if error is not None
-        ]
+        [error for error in (operation_error, release_error) if error is not None]
     )
     if primary_error is not None:
         if candidate is not None:
@@ -2941,9 +2924,7 @@ class _StagedCredentialWatcher:
         self._parent_identity = parent_identity
         self._owner_uid = owner_uid
         self._refresh_lock_protocol = refresh_lock_protocol
-        self._observed_identity = _staged_credential_observation(
-            staged.credential_path
-        )
+        self._observed_identity = _staged_credential_observation(staged.credential_path)
         self._candidate_failure_observation: _CredentialFileIdentity | None = None
         self._candidate_failure_started_at: float | None = None
         self._stop = threading.Event()
@@ -3096,14 +3077,11 @@ class _StagedCredentialWatcher:
             retry_deadline = min(retry_deadline, final_deadline)
         if now < retry_deadline:
             if final:
-                time.sleep(
-                    min(STAGED_CREDENTIAL_POLL_SECONDS, retry_deadline - now)
-                )
+                time.sleep(min(STAGED_CREDENTIAL_POLL_SECONDS, retry_deadline - now))
                 return True
             return False
         normalized = LinuxCredentialInspectionInconclusive(
-            "staged Claude credential update remained unstable: "
-            f"{error}"
+            f"staged Claude credential update remained unstable: {error}"
         )
         normalized.__cause__ = error
         raise normalized
@@ -3136,9 +3114,7 @@ class _StagedCredentialWatcher:
                         self._staged,
                         owner_uid=self._owner_uid,
                         refresh_lock_protocol=self._refresh_lock_protocol,
-                        timeout_seconds=(
-                            STAGED_CREDENTIAL_LOCK_TIMEOUT_SECONDS
-                        ),
+                        timeout_seconds=(STAGED_CREDENTIAL_LOCK_TIMEOUT_SECONDS),
                     )
                 except BaseException as error:
                     if isinstance(
@@ -3219,9 +3195,7 @@ def _cleanup_staged_credential(
     staged: StagedCredential,
 ) -> BaseException | None:
     removal_error = _discard_private_file(staged.credential_path, None)
-    cleanup_errors = [
-        error for error in (removal_error,) if error is not None
-    ]
+    cleanup_errors = [error for error in (removal_error,) if error is not None]
     for directory in (staged.config_dir, staged.carrier_root):
         try:
             directory.rmdir()
@@ -3281,10 +3255,7 @@ def _final_drain_with_staged_lock_recovery(
         return
     except LinuxStagedCredentialRefreshLockBlocked as blocked:
         try:
-            quiescent = (
-                writer_quiescent is not None
-                and writer_quiescent() is True
-            )
+            quiescent = writer_quiescent is not None and writer_quiescent() is True
         except BaseException as proof_error:
             if _is_control_flow_error(proof_error):
                 raise
@@ -3323,10 +3294,7 @@ def stage_claude_credentials(
 ) -> Iterator[StagedCredential]:
     """Copy a validated local-login credential into an isolated private config."""
 
-    if (
-        not math.isfinite(required_validity_seconds)
-        or required_validity_seconds < 0
-    ):
+    if not math.isfinite(required_validity_seconds) or required_validity_seconds < 0:
         raise LinuxCredentialUnsafe(
             "required credential validity must be finite and non-negative"
         )
@@ -3445,11 +3413,7 @@ def _stage_claude_credentials_anchored(
             cleanup_error: BaseException | None = None
             cleanup_is_safe = True
             retain_for_recovery = False
-            if (
-                watcher is not None
-                and not watcher_started
-                and watcher.has_started()
-            ):
+            if watcher is not None and not watcher_started and watcher.has_started():
                 watcher_started = True
             if watcher is not None and not watcher_started:
                 try:
@@ -3466,9 +3430,7 @@ def _stage_claude_credentials_anchored(
                         # descriptor ownership handoff can itself fail.
                         retain_for_recovery = True
                         watcher.retain_source_anchor_after_timeout()
-                        if (
-                            watcher.background_writeback_was_in_flight_at_stop()
-                        ):
+                        if watcher.background_writeback_was_in_flight_at_stop():
                             unstopped = LinuxStagedCredentialWatcherUnstopped(
                                 "staged Claude credential watcher did not stop "
                                 "within its bounded join; a background host "
@@ -3492,12 +3454,10 @@ def _stage_claude_credentials_anchored(
                         )
                     try:
                         runtime_writer_started = (
-                            writer_started is not None
-                            and writer_started() is True
+                            writer_started is not None and writer_started() is True
                         )
                         runtime_writer_quiescent = (
-                            writer_quiescent is not None
-                            and writer_quiescent() is True
+                            writer_quiescent is not None and writer_quiescent() is True
                         )
                     except BaseException as state_error:
                         if _is_control_flow_error(state_error):
@@ -3542,10 +3502,7 @@ def _stage_claude_credentials_anchored(
                                 LinuxStagedCredentialWriterUnquiescent,
                             ),
                         )
-                        or (
-                            watcher_stopped
-                            and watcher.has_unpersisted_update()
-                        )
+                        or (watcher_stopped and watcher.has_unpersisted_update())
                     )
                     if should_retain:
                         retain_for_recovery = True
@@ -3622,18 +3579,12 @@ def _stage_claude_credentials_anchored(
                         if candidate is not None
                     ]
                 )
-            if (
-                staged is not None
-                and cleanup_is_safe
-                and not retain_for_recovery
-            ):
+            if staged is not None and cleanup_is_safe and not retain_for_recovery:
                 cleanup_error = _cleanup_staged_credential(staged)
             elif staged is None and carrier_root is not None:
                 cleanup_errors: list[BaseException] = []
                 if credential_path is not None:
-                    candidate_error = _discard_private_file(
-                        credential_path, None
-                    )
+                    candidate_error = _discard_private_file(credential_path, None)
                     if candidate_error is not None:
                         cleanup_errors.append(candidate_error)
                 for directory in (config_dir, carrier_root):
@@ -3815,9 +3766,7 @@ def _capture_trusted_path_identity(
             else _path_component_identity(component, metadata)
         )
     if require_executable and not os.access(resolved, os.X_OK):
-        raise LinuxRuntimeUnsafe(
-            f"trusted runtime tool is not executable: {resolved}"
-        )
+        raise LinuxRuntimeUnsafe(f"trusted runtime tool is not executable: {resolved}")
     identity = TrustedPathIdentity(
         resolved,
         tuple(captured),
@@ -3886,9 +3835,7 @@ def _capture_host_runtime_dependency(
     """Capture both the loader-visible lexical chain and its resolved file."""
 
     if not path.is_absolute():
-        raise LinuxRuntimeUnsafe(
-            f"host runtime dependency is not absolute: {path}"
-        )
+        raise LinuxRuntimeUnsafe(f"host runtime dependency is not absolute: {path}")
     if (
         not destination.is_absolute()
         or "." in destination.parts
@@ -3923,20 +3870,15 @@ def _capture_host_runtime_dependency(
             )
         if not stat.S_ISLNK(metadata.st_mode) and metadata.st_mode & 0o022:
             raise LinuxRuntimeUnsafe(
-                "host runtime dependency is group- or world-writable: "
-                f"{component}"
+                f"host runtime dependency is group- or world-writable: {component}"
             )
         is_final = index == len(components) - 1
         if is_final:
-            if not (
-                stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
-            ):
+            if not (stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)):
                 raise LinuxRuntimeUnsafe(
                     f"host runtime dependency is not a file or symlink: {component}"
                 )
-        elif not (
-            stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
-        ):
+        elif not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)):
             raise LinuxRuntimeUnsafe(
                 f"host runtime dependency parent is not a directory: {component}"
             )
@@ -3952,10 +3894,7 @@ def _capture_host_runtime_dependency(
         raise LinuxRuntimeInspectionInconclusive(
             f"host runtime dependency changed while resolving {path}: {error}"
         ) from error
-    if (
-        resolved_before != resolved_after
-        or resolved_after != resolved_identity.path
-    ):
+    if resolved_before != resolved_after or resolved_after != resolved_identity.path:
         raise LinuxRuntimeInspectionInconclusive(
             f"host runtime dependency changed while capturing: {path}"
         )
@@ -4272,13 +4211,11 @@ def _require_safe_host_dependency_loader_policy(
         raise LinuxRuntimeUnsafe(
             f"host runtime library is not an ET_DYN image: {info.path}"
         )
-    if (
-        info.interpreter is not None
-        and info.interpreter != str(_canonical_glibc_loader(host))
+    if info.interpreter is not None and info.interpreter != str(
+        _canonical_glibc_loader(host)
     ):
         raise LinuxRuntimeUnsafe(
-            "host runtime library names a noncanonical interpreter: "
-            f"{info.path}"
+            f"host runtime library names a noncanonical interpreter: {info.path}"
         )
 
 
@@ -4320,10 +4257,7 @@ def _collect_host_runtime_closure_with_loader(
         host,
     )
     glibc_version = _probe_glibc_loader_version(loader, host, runner=runner)
-    if (
-        expected_glibc_version is not None
-        and glibc_version != expected_glibc_version
-    ):
+    if expected_glibc_version is not None and glibc_version != expected_glibc_version:
         raise LinuxRuntimeInspectionInconclusive(
             "canonical glibc loader changed its reported version"
         )
@@ -4368,20 +4302,16 @@ def _collect_host_runtime_closure_with_loader(
     previous = requested.get(interpreter)
     if previous is not None and previous != interpreter_path:
         raise LinuxRuntimeUnsafe(
-            "host runtime interpreter resolves to conflicting sources: "
-            f"{interpreter}"
+            f"host runtime interpreter resolves to conflicting sources: {interpreter}"
         )
     requested[interpreter] = interpreter_path
 
     captured_dependencies: list[HostRuntimeDependency] = []
-    for destination, source in sorted(
-        requested.items(), key=lambda item: str(item[0])
-    ):
+    for destination, source in sorted(requested.items(), key=lambda item: str(item[0])):
         if destination == interpreter:
             if source != loader.lexical_path:
                 raise LinuxRuntimeUnsafe(
-                    "canonical glibc loader resolves to an unexpected source: "
-                    f"{source}"
+                    f"canonical glibc loader resolves to an unexpected source: {source}"
                 )
             dependency = loader
         else:
@@ -4405,10 +4335,7 @@ def _collect_host_runtime_closure_with_loader(
             loader.lexical_path,
             loader.resolved_identity.path,
             *(dependency.lexical_path for dependency in dependencies),
-            *(
-                dependency.resolved_identity.path
-                for dependency in dependencies
-            ),
+            *(dependency.resolved_identity.path for dependency in dependencies),
         ),
         host,
     )
@@ -4485,10 +4412,7 @@ def revalidate_host_runtime_closure(
             closure.loader.lexical_path,
             closure.loader.resolved_identity.path,
             *(dependency.lexical_path for dependency in closure.dependencies),
-            *(
-                dependency.resolved_identity.path
-                for dependency in closure.dependencies
-            ),
+            *(dependency.resolved_identity.path for dependency in closure.dependencies),
         ),
         closure.host,
     )
@@ -4523,9 +4447,7 @@ def collect_runtime_libraries(
 
     require_supported_host(host)
     if ldd_path is None:
-        ldd_identity = _trusted_ldd(
-            host, trusted_owner_uids=trusted_owner_uids
-        )
+        ldd_identity = _trusted_ldd(host, trusted_owner_uids=trusted_owner_uids)
     else:
         ldd_identity = _capture_trusted_path_identity(
             ldd_path,
@@ -4852,10 +4774,49 @@ def _validate_sandbox_spec(spec: SandboxSpec) -> SandboxSpec:
     require_supported_host(spec.host)
     owner_uid = os.getuid()
     helper_root = _validate_private_directory(spec.helper_root, owner_uid=owner_uid)
+    workspace_descriptor = spec.workspace_descriptor
+    descriptor_metadata_before: os.stat_result | None = None
+    path_metadata_before: os.stat_result | None = None
+    if workspace_descriptor is not None:
+        if isinstance(workspace_descriptor, bool) or not isinstance(
+            workspace_descriptor, int
+        ):
+            raise LinuxRuntimeError("workspace descriptor must be an integer")
+        try:
+            descriptor_metadata_before = os.fstat(workspace_descriptor)
+            path_metadata_before = spec.workspace.stat()
+        except OSError as error:
+            raise LinuxRuntimeInspectionInconclusive(
+                f"cannot inspect descriptor-backed review workspace: {error}"
+            ) from error
     workspace = spec.workspace.resolve(strict=True)
     if not workspace.is_dir():
         raise LinuxRuntimeError(f"review workspace is not a directory: {workspace}")
     _validate_workspace_symlink_boundary(workspace)
+    if workspace_descriptor is not None:
+        try:
+            descriptor_metadata_after = os.fstat(workspace_descriptor)
+            path_metadata_after = spec.workspace.stat()
+        except OSError as error:
+            raise LinuxRuntimeInspectionInconclusive(
+                f"cannot revalidate descriptor-backed review workspace: {error}"
+            ) from error
+        assert descriptor_metadata_before is not None
+        assert path_metadata_before is not None
+        metadata = (
+            descriptor_metadata_before,
+            path_metadata_before,
+            descriptor_metadata_after,
+            path_metadata_after,
+        )
+        if any(not stat.S_ISDIR(item.st_mode) for item in metadata):
+            raise LinuxRuntimeError(
+                "descriptor-backed review workspace is not a directory"
+            )
+        if len({(item.st_dev, item.st_ino) for item in metadata}) != 1:
+            raise LinuxRuntimeInspectionInconclusive(
+                "descriptor-backed review workspace path changed during validation"
+            )
     if _is_relative_to(helper_root, workspace) or _is_relative_to(
         workspace, helper_root
     ):
@@ -4872,10 +4833,7 @@ def _validate_sandbox_spec(spec: SandboxSpec) -> SandboxSpec:
         private_paths[2].parent,
         owner_uid=owner_uid,
     )
-    if (
-        private_paths[2].name != "config"
-        or config_root.parent != helper_root
-    ):
+    if private_paths[2].name != "config" or config_root.parent != helper_root:
         raise LinuxRuntimeError(
             "Claude writable config must be nested in a dedicated carrier root"
         )
@@ -4939,6 +4897,7 @@ def _validate_sandbox_spec(spec: SandboxSpec) -> SandboxSpec:
         ca_bundle=ca_bundle,
         ca_bundle_identity=ca_bundle_identity,
         node_extra_ca_certs_configured=spec.node_extra_ca_certs_configured,
+        workspace_descriptor=workspace_descriptor,
     )
 
 
@@ -5020,10 +4979,7 @@ def _validate_linux_review_tool_boundary(
         raise LinuxRuntimeUnsafe(
             "Claude Linux review must deny file-tool requests that are not allowed"
         )
-    if (
-        _unique_option_value(arguments, "--tools")
-        != CLAUDE_LINUX_REVIEW_VISIBLE_TOOLS
-    ):
+    if _unique_option_value(arguments, "--tools") != CLAUDE_LINUX_REVIEW_VISIBLE_TOOLS:
         raise LinuxRuntimeUnsafe(
             "Claude Linux review exposes an unexpected built-in tool set"
         )
@@ -5043,9 +4999,10 @@ def _validate_linux_review_tool_boundary(
         )
 
     settings = _strict_json_object(_unique_option_value(arguments, "--settings"))
-    if set(settings) != {"disableAllHooks", "permissions"} or settings.get(
-        "disableAllHooks"
-    ) is not True:
+    if (
+        set(settings) != {"disableAllHooks", "permissions"}
+        or settings.get("disableAllHooks") is not True
+    ):
         raise LinuxRuntimeUnsafe(
             "Claude Linux review settings contain an unexpected capability"
         )
@@ -5288,7 +5245,18 @@ def build_sandbox_command(
     for directory in _mount_directories(file_destinations, directory_destinations):
         command.extend(("--dir", str(directory)))
     command.extend(("--proc", "/proc", "--dev", "/dev"))
-    command.extend(("--ro-bind", str(validated.workspace), str(SANDBOX_WORKSPACE)))
+    workspace_pass_fds: tuple[int, ...] = ()
+    if validated.workspace_descriptor is None:
+        command.extend(("--ro-bind", str(validated.workspace), str(SANDBOX_WORKSPACE)))
+    else:
+        command.extend(
+            (
+                "--ro-bind-fd",
+                str(validated.workspace_descriptor),
+                str(SANDBOX_WORKSPACE),
+            )
+        )
+        workspace_pass_fds = (validated.workspace_descriptor,)
     command.extend(("--bind", str(validated.helper_home), str(SANDBOX_HOME)))
     command.extend(("--bind", str(validated.helper_tmp), str(SANDBOX_TMP)))
     command.extend(
@@ -5366,6 +5334,7 @@ def build_sandbox_command(
         SANDBOX_HOME,
         SANDBOX_TMP,
         SANDBOX_CONFIG,
+        workspace_pass_fds,
     )
 
 
@@ -5420,6 +5389,7 @@ def run_isolation_probe(
         runner,
         command.argv,
         timeout_seconds=PROBE_TIMEOUT_SECONDS,
+        pass_fds=command.pass_fds,
     )
     if result.returncode != 0 or bytes(result.stdout) != PROBE_SUCCESS:
         detail = bytes(result.stderr).decode("utf-8", errors="replace").strip()

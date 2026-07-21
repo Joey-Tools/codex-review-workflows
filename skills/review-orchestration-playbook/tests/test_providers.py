@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import errno
 import hashlib
+import io
 import itertools
 import json
 import multiprocessing
@@ -130,10 +132,7 @@ def _blocked_keychain_handler_worker(connection: object, mode: str) -> None:
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=2.0) as sock:
                 sock.sendall(
-                    capability
-                    + b"W"
-                    + len(refreshed).to_bytes(4, "big")
-                    + refreshed
+                    capability + b"W" + len(refreshed).to_bytes(4, "big") + refreshed
                 )
                 with contextlib.suppress(OSError):
                     sock.recv(1)
@@ -147,14 +146,17 @@ def _blocked_keychain_handler_worker(connection: object, mode: str) -> None:
         signal.signal(signal.SIGTERM, forward_signal)
 
     try:
-        with mock.patch.object(
-            providers,
-            "CLAUDE_KEYCHAIN_SERVER_SHUTDOWN_TIMEOUT_SECONDS",
-            0.15,
-        ), mock.patch.object(
-            providers,
-            "CLAUDE_KEYCHAIN_RECOVERY_TIMEOUT_SECONDS",
-            0.15,
+        with (
+            mock.patch.object(
+                providers,
+                "CLAUDE_KEYCHAIN_SERVER_SHUTDOWN_TIMEOUT_SECONDS",
+                0.15,
+            ),
+            mock.patch.object(
+                providers,
+                "CLAUDE_KEYCHAIN_RECOVERY_TIMEOUT_SECONDS",
+                0.15,
+            ),
         ):
             with providers._claude_keychain_credential_server(
                 credential,
@@ -196,10 +198,7 @@ def _blocked_keychain_handler_worker(connection: object, mode: str) -> None:
                 bool(
                     getattr(
                         error,
-                        (
-                            "_codex_claude_keychain_handler_"
-                            "quiescence_unproven"
-                        ),
+                        ("_codex_claude_keychain_handler_quiescence_unproven"),
                         False,
                     )
                 ),
@@ -234,15 +233,34 @@ class ProviderPolicyTest(unittest.TestCase):
         control.mkdir(mode=0o700)
         diff_file = control / "review.diff"
         diff_file.write_text("diff --git a/a b/a\n", encoding="utf-8")
-        (control / "changed-paths.z").write_bytes(b"")
+        (control / workspace_runtime.CHANGED_PATH_DIGESTS_NAME).write_bytes(b"")
+        private_changed_paths = container / workspace_runtime.PRIVATE_CHANGED_PATHS_NAME
+        private_changed_paths.write_bytes(b"")
+        private_changed_paths.chmod(0o600)
         (control / "changed-blob-findings.z").write_bytes(b"")
         catalog = workspace_runtime.load_catalog()
+        base_ref = "a" * 40
+        head_ref = "b" * 40
         synthetic_manifest = {
+            "base_ref": base_ref,
             "catalog_schema_version": catalog.schema_version,
             "entries": [],
+            "head_ref": head_ref,
             "pool_version": catalog.pool_version,
             "schema_version": workspace_runtime.SYNTHETIC_MANIFEST_SCHEMA_VERSION,
-            "selected_exemptions": [],
+            "secret_delta": {
+                "failure_class": "exact-value-scan-incomplete",
+                "limitations": [
+                    "The exact-value scan did not complete; merge admission is inconclusive."
+                ],
+                "location_status": "inconclusive",
+                "status": "inconclusive",
+                "violations": [],
+            },
+            "secret_reductions": [],
+            "selected_exemptions": [
+                item.identifier for item in catalog.legacy_exemptions
+            ],
         }
         workspace_runtime._write_bounded_json(
             control / workspace_runtime.SYNTHETIC_MANIFEST_NAME,
@@ -254,6 +272,7 @@ class ProviderPolicyTest(unittest.TestCase):
             synthetic_manifest,
             label="synthetic secret helper-private state",
         )
+        (container / workspace_runtime.SYNTHETIC_PRIVATE_MANIFEST_NAME).chmod(0o600)
         workspace_runtime._write_bounded_json(
             control / workspace_runtime.SYNTHETIC_CHANGED_EVIDENCE_NAME,
             {"entries": [], "schema_version": 1},
@@ -261,15 +280,24 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         prompt_file = control / "review.prompt"
         prompt_file.write_text("Review this diff.\n", encoding="utf-8")
+        private_cleanup = workspace_runtime._capture_private_cleanup_evidence(
+            container,
+            require_all=True,
+        )
         self.review = ReviewWorkspace(
             source_root=source_root,
             container_dir=container,
             workspace_root=workspace,
-            base_ref="a" * 40,
-            head_ref="b" * 40,
+            base_ref=base_ref,
+            head_ref=head_ref,
             diff_file=diff_file,
             prompt_file=prompt_file,
+            private_cleanup=private_cleanup,
         )
+        self.private_review_artifacts = {
+            name: (container / name).read_bytes()
+            for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
+        }
         self._refresh_control_artifact_state()
         self.claude_broker = (
             container / "claude-runtime" / "keychain-broker" / "security"
@@ -339,17 +367,13 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         self.claude_linux_platform_patcher.start()
         self.claude_macos_platform_patcher.start()
-        self.require_trusted_claude_release = (
-            providers._require_trusted_claude_release
-        )
+        self.require_trusted_claude_release = providers._require_trusted_claude_release
         self.trusted_release_patcher = mock.patch.object(
             providers,
             "_require_trusted_claude_release",
         )
         self.trusted_release = self.trusted_release_patcher.start()
-        self.prepare_claude_keychain_broker = (
-            providers._prepare_claude_keychain_broker
-        )
+        self.prepare_claude_keychain_broker = providers._prepare_claude_keychain_broker
         self.keychain_broker_patcher = mock.patch.object(
             providers,
             "_prepare_claude_keychain_broker",
@@ -371,12 +395,90 @@ class ProviderPolicyTest(unittest.TestCase):
         control_dir = self.review.workspace_root / ".codex-review"
         state = workspace_runtime._build_control_artifact_state(
             control_dir=control_dir,
+            private_cleanup=self.review.private_cleanup,
         )
         workspace_runtime._write_bounded_json(
             self.review.container_dir / workspace_runtime.CONTROL_ARTIFACT_STATE_NAME,
             state,
             label="helper-private review control state",
         )
+
+    def _restore_private_review_artifacts(self) -> None:
+        for name, payload in self.private_review_artifacts.items():
+            artifact = self.review.container_dir / name
+            artifact.write_bytes(payload)
+            artifact.chmod(0o600)
+        private_cleanup = workspace_runtime._capture_private_cleanup_evidence(
+            self.review.container_dir,
+            expected_container=self.review.private_cleanup.container,
+            require_all=True,
+        )
+        self.review = dataclasses.replace(
+            self.review,
+            private_cleanup=private_cleanup,
+        )
+        self._refresh_control_artifact_state()
+
+    def _replace_attempts_with_forged_stdout(
+        self,
+        *,
+        stdout_name: str,
+        payload: bytes,
+    ) -> pathlib.Path:
+        attempts = self.review.container_dir / "attempts"
+        retained = self.review.container_dir / "attempts-retained"
+        attempts.rename(retained)
+        attempts.mkdir(mode=0o700)
+        (attempts / stdout_name).write_bytes(payload)
+        return retained
+
+    def _bounded_attempt_capture(self, payload: bytes) -> bytes:
+        capture_limit = 4 * 1024 * 1024
+        self.assertGreater(len(payload), capture_limit)
+        midpoint = capture_limit // 2
+        return (
+            payload[:midpoint]
+            + b"\n... bounded capture omitted middle bytes ...\n"
+            + payload[-midpoint:]
+        )
+
+    def _bound_supervision_failure(
+        self,
+        runtime: str,
+        error: Exception,
+    ):
+        def fail(**kwargs):
+            launch = kwargs["launch"]
+            stdout_path, stderr_path = providers._attempt_paths_without_io(
+                kwargs["review"],
+                kwargs["index"],
+                runtime,
+                kwargs["model"],
+            )
+            with launch.open_attempt_file(stdout_path.name):
+                pass
+            with launch.open_attempt_file(stderr_path.name):
+                pass
+            raise error
+
+        return fail
+
+    def test_bound_attempt_logs_force_owner_mode_under_restrictive_umask(
+        self,
+    ) -> None:
+        previous_umask = os.umask(0o777)
+        try:
+            with providers._open_review_launch_binding(self.review) as launch:
+                with launch.open_attempt_file("restrictive-umask.log") as handle:
+                    handle.write(b"review output\n")
+        finally:
+            os.umask(previous_umask)
+
+        attempts = self.review.container_dir / "attempts"
+        artifact = self.review.container_dir / "attempts" / "restrictive-umask.log"
+        self.assertEqual(stat.S_IMODE(attempts.stat().st_mode), 0o700)
+        self.assertEqual(artifact.read_bytes(), b"review output\n")
+        self.assertEqual(stat.S_IMODE(artifact.stat().st_mode), 0o600)
 
     def tearDown(self) -> None:
         self.keychain_runtime_patcher.stop()
@@ -451,14 +553,10 @@ class ProviderPolicyTest(unittest.TestCase):
                 for note in getattr(current, "__notes__", ())
             ):
                 return
-            if (
-                isinstance(
-                    current,
-                    providers.ClaudeCredentialPersistenceDiagnostic,
-                )
-                and providers.CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC
-                in str(current)
-            ):
+            if isinstance(
+                current,
+                providers.ClaudeCredentialPersistenceDiagnostic,
+            ) and providers.CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC in str(current):
                 return
             for related in (current.__cause__, current.__context__):
                 if related is not None:
@@ -574,9 +672,7 @@ class ProviderPolicyTest(unittest.TestCase):
             )
 
     def test_cleanup_diagnostic_fallback_preserves_original_cause(self) -> None:
-        class LegacyInspectionError(
-            providers.ClaudeCredentialInspectionInconclusive
-        ):
+        class LegacyInspectionError(providers.ClaudeCredentialInspectionInconclusive):
             add_note = None
 
         primary = LegacyInspectionError("injected legacy primary")
@@ -602,11 +698,9 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         interruption = LegacyKeyboardInterrupt("injected control flow")
 
-        selected = (
-            providers._attach_claude_persistence_failure_preserving_control_flow(
-                persistence_error,
-                interruption,
-            )
+        selected = providers._attach_claude_persistence_failure_preserving_control_flow(
+            persistence_error,
+            interruption,
         )
 
         self.assertIs(selected, interruption)
@@ -756,8 +850,7 @@ class ProviderPolicyTest(unittest.TestCase):
     def host_ca_safety_rejection(error: ReviewError, *, source: str) -> bool:
         detail = str(error)
         return any(
-            detail.startswith(prefix)
-            and detail.removeprefix(prefix).startswith(source)
+            detail.startswith(prefix) and detail.removeprefix(prefix).startswith(source)
             for prefix in (
                 "Claude review CA source has an unsafe owner: ",
                 "Claude review CA source is group- or world-writable: ",
@@ -786,8 +879,7 @@ class ProviderPolicyTest(unittest.TestCase):
             "private destination"
         )
         unrelated_host_failure = ReviewError(
-            "Claude review CA symlink path contains a loop: "
-            "SSL_CERT_DIR:deadbeef.0"
+            "Claude review CA symlink path contains a loop: SSL_CERT_DIR:deadbeef.0"
         )
         adversarial_host_failure = ReviewError(
             "Claude review CA symlink path contains a loop: "
@@ -821,7 +913,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
     def test_native_macho_dependencies_rejects_interpreter_wrapper(self) -> None:
         wrapper = self.review.source_root / "rg-wrapper"
-        wrapper.write_text("#!/bin/sh\nexec /usr/bin/rg \"$@\"\n", encoding="utf-8")
+        wrapper.write_text('#!/bin/sh\nexec /usr/bin/rg "$@"\n', encoding="utf-8")
         wrapper.chmod(0o755)
 
         with self.assertRaisesRegex(
@@ -937,21 +1029,24 @@ class ProviderPolicyTest(unittest.TestCase):
     def test_claude_safe_mode_security_failure_is_not_candidate_unavailability(
         self,
     ) -> None:
-        with mock.patch.object(
-            providers,
-            "_run_claude_probe",
-            return_value=Completed(
-                argv=("claude", "--help"),
-                returncode=0,
-                stdout=claude_help_fixture(
-                    safe_mode=CLAUDE_SAFE_MODE_DESCRIPTION.replace(
-                        "hooks, MCP",
-                        "hooks still load, MCP",
-                    )
+        with (
+            mock.patch.object(
+                providers,
+                "_run_claude_probe",
+                return_value=Completed(
+                    argv=("claude", "--help"),
+                    returncode=0,
+                    stdout=claude_help_fixture(
+                        safe_mode=CLAUDE_SAFE_MODE_DESCRIPTION.replace(
+                            "hooks, MCP",
+                            "hooks still load, MCP",
+                        )
+                    ),
+                    stderr=b"",
                 ),
-                stderr=b"",
             ),
-        ), self.assertRaises(providers.ClaudeSafeModeContractInvalid):
+            self.assertRaises(providers.ClaudeSafeModeContractInvalid),
+        ):
             providers._require_claude_safe_mode(
                 pathlib.Path("/bin/claude"),
                 {"HOME": str(self.review.container_dir)},
@@ -1020,9 +1115,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     "_ClaudeKeychainCredentialServer",
                     side_effect=bind_error,
                 ),
-                self.assertRaises(
-                    providers.ClaudeCredentialInspectionInconclusive
-                ),
+                self.assertRaises(providers.ClaudeCredentialInspectionInconclusive),
             ):
                 with providers._claude_keychain_credential_server(
                     None,
@@ -1053,9 +1146,7 @@ class ProviderPolicyTest(unittest.TestCase):
     @mock.patch.object(
         providers,
         "_claude_keychain_credential_server",
-        side_effect=providers.ClaudeCredentialInspectionInconclusive(
-            "bind denied"
-        ),
+        side_effect=providers.ClaudeCredentialInspectionInconclusive("bind denied"),
     )
     def test_keychain_runtime_zeroes_credential_when_broker_bind_fails(
         self,
@@ -1382,9 +1473,7 @@ class ProviderPolicyTest(unittest.TestCase):
             assert generation is not None
             server._pending_update_lock.acquire()
             try:
-                self.assertFalse(
-                    server.close_pending_update_publication(0.0)
-                )
+                self.assertFalse(server.close_pending_update_publication(0.0))
             finally:
                 server._pending_update_lock.release()
             self.assertFalse(server.commit_pending_update(generation, publish))
@@ -1490,9 +1579,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 credential = bytearray(
                     oauth_credential_fixture(expires_in_seconds=3600)
                 )
-                pending = bytearray(
-                    oauth_credential_fixture(expires_in_seconds=7200)
-                )
+                pending = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
                 server = providers._ClaudeKeychainCredentialServer(
                     credential,
                     bytes.fromhex("03" * 32),
@@ -1514,9 +1601,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
                 def abandon() -> None:
                     if blocked_step == "abandon":
-                        self.assertTrue(
-                            release_abandonment.wait(timeout=2.0)
-                        )
+                        self.assertTrue(release_abandonment.wait(timeout=2.0))
 
                 def run_shutdown() -> None:
                     try:
@@ -1544,9 +1629,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     ):
                         owner.start()
                         finished_within_bound = completed.wait(timeout=0.2)
-                        publication_closed_within_bound = (
-                            server._abandoned.is_set()
-                        )
+                        publication_closed_within_bound = server._abandoned.is_set()
                 finally:
                     release_abandonment.set()
                     if held_lock is not None:
@@ -1626,11 +1709,9 @@ class ProviderPolicyTest(unittest.TestCase):
 
         started = time.monotonic()
         try:
-            result, error = (
-                providers._bounded_claude_keychain_fail_closed_error(
-                    fail_closed_error,
-                    0.01,
-                )
+            result, error = providers._bounded_claude_keychain_fail_closed_error(
+                fail_closed_error,
+                0.01,
             )
         finally:
             release_callback.set()
@@ -1663,9 +1744,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
         def timeout_error() -> BaseException:
             try:
-                self.assertTrue(
-                    release_timeout_callback.wait(timeout=2.0)
-                )
+                self.assertTrue(release_timeout_callback.wait(timeout=2.0))
                 return RuntimeError("fixture late timeout callback")
             finally:
                 timeout_callback_finished.set()
@@ -1683,11 +1762,9 @@ class ProviderPolicyTest(unittest.TestCase):
                 "CLAUDE_KEYCHAIN_RECOVERY_TIMEOUT_SECONDS",
                 0.01,
             ):
-                result = (
-                    providers._bounded_claude_keychain_quiescence_recovery(
-                        callbacks,
-                        None,
-                    )
+                result = providers._bounded_claude_keychain_quiescence_recovery(
+                    callbacks,
+                    None,
                 )
         finally:
             release_recovery.set()
@@ -1727,9 +1804,7 @@ class ProviderPolicyTest(unittest.TestCase):
                         update_callback,
                     )
                 except OSError:
-                    self.skipTest(
-                        "loopback bind is unavailable in the current sandbox"
-                    )
+                    self.skipTest("loopback bind is unavailable in the current sandbox")
                 with server.credential_lock:
                     server.consumed = True
                 real_stage = server.stage_pending_update
@@ -1822,9 +1897,7 @@ class ProviderPolicyTest(unittest.TestCase):
             if payload == older:
                 older_callback_started.set()
                 if not release_older_callback.wait(timeout=2.0):
-                    raise RuntimeError(
-                        "fixture older callback was not released"
-                    )
+                    raise RuntimeError("fixture older callback was not released")
             return commit_pending(lambda: True)
 
         try:
@@ -1851,10 +1924,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 timeout=2.0,
             ) as sock:
                 sock.sendall(
-                    capability
-                    + b"W"
-                    + len(payload).to_bytes(4, "big")
-                    + payload
+                    capability + b"W" + len(payload).to_bytes(4, "big") + payload
                 )
                 responses[payload] = sock.recv(1)
 
@@ -1929,10 +1999,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 timeout=2.0,
             ) as sock:
                 sock.sendall(
-                    capability
-                    + b"W"
-                    + len(payload).to_bytes(4, "big")
-                    + payload
+                    capability + b"W" + len(payload).to_bytes(4, "big") + payload
                 )
                 return sock.recv(1)
 
@@ -2006,10 +2073,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 timeout=2.0,
             ) as sock:
                 sock.sendall(
-                    capability
-                    + b"W"
-                    + len(payload).to_bytes(4, "big")
-                    + payload
+                    capability + b"W" + len(payload).to_bytes(4, "big") + payload
                 )
                 responses[payload] = sock.recv(1)
 
@@ -2208,6 +2272,44 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertNotIn("injected sensitive lock detail", str(raised.exception))
 
+    def test_helper_credential_lock_forces_new_mode_without_repairing_existing(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            lock_path = pathlib.Path(temporary) / "credential.lock"
+            previous_umask = os.umask(0o777)
+            try:
+                with mock.patch.object(
+                    providers.pathlib,
+                    "Path",
+                    return_value=lock_path,
+                ):
+                    with providers._claude_credential_update_lock("keychain"):
+                        self.assertEqual(
+                            stat.S_IMODE(lock_path.stat().st_mode),
+                            0o600,
+                        )
+            finally:
+                os.umask(previous_umask)
+
+            lock_path.chmod(0o400)
+            with (
+                mock.patch.object(
+                    providers.pathlib,
+                    "Path",
+                    return_value=lock_path,
+                ),
+                self.assertRaises(
+                    (
+                        ReviewError,
+                        providers.ClaudeCredentialInspectionInconclusive,
+                    )
+                ),
+            ):
+                with providers._claude_credential_update_lock("keychain"):
+                    self.fail("unsafe existing helper lock unexpectedly acquired")
+            self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o400)
+
     @unittest.skipUnless(
         hasattr(os, "mkfifo") and hasattr(os, "O_NONBLOCK"),
         "requires POSIX FIFO support",
@@ -2243,8 +2345,10 @@ class ProviderPolicyTest(unittest.TestCase):
                 with providers._claude_credential_update_lock("keychain"):
                     self.fail("FIFO helper lock unexpectedly acquired")
 
-            self.assertEqual(len(requested_flags), 1)
-            self.assertTrue(requested_flags[0] & os.O_NONBLOCK)
+            self.assertEqual(len(requested_flags), 2)
+            self.assertTrue(all(flags & os.O_NONBLOCK for flags in requested_flags))
+            self.assertTrue(requested_flags[0] & os.O_EXCL)
+            self.assertFalse(requested_flags[1] & os.O_CREAT)
 
     def test_claude_keychain_broker_serves_one_in_memory_value(self) -> None:
         if (
@@ -2468,9 +2572,7 @@ class ProviderPolicyTest(unittest.TestCase):
         cases = ("missing", "non-executable")
         for condition in cases:
             with self.subTest(condition=condition):
-                client = (
-                    self.claude_keychain_client.parent / f"security-{condition}"
-                )
+                client = self.claude_keychain_client.parent / f"security-{condition}"
                 if condition == "non-executable":
                     client.write_bytes(b"fixture")
                     client.chmod(0o600)
@@ -2541,9 +2643,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 real_open = providers.os.open
                 real_fstat = providers.os.fstat
                 real_close = providers.os.close
-                chain_code = (
-                    providers._open_absolute_directory_chain_without_symlinks.__wrapped__.__code__
-                )
+                chain_code = providers._open_absolute_directory_chain_without_symlinks.__wrapped__.__code__
                 interrupted = False
 
                 def tracking_open(
@@ -2571,9 +2671,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     locals_map = getattr(frame, "f_locals", {})
                     descriptors = locals_map.get("descriptors", ())
                     candidate = locals_map.get(
-                        "root_descriptor"
-                        if window == "root"
-                        else "next_descriptor"
+                        "root_descriptor" if window == "root" else "next_descriptor"
                     )
                     if (
                         isinstance(candidate, int)
@@ -2649,9 +2747,7 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
             self.assertRaises(SystemExit),
         ):
-            providers._open_claude_credential_config_directory(
-                pathlib.Path("/fixture")
-            )
+            providers._open_claude_credential_config_directory(pathlib.Path("/fixture"))
 
         self.assertEqual(close_calls, [11, 10])
 
@@ -2684,9 +2780,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 "credential home",
             ),
         ):
-            providers._open_claude_credential_config_directory(
-                pathlib.Path("/fixture")
-            )
+            providers._open_claude_credential_config_directory(pathlib.Path("/fixture"))
 
         close_fd.assert_called_once_with(10)
 
@@ -2734,9 +2828,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     "not regular",
                 ),
             ):
-                providers._read_claude_credential_file_from_directory(
-                    config_descriptor
-                )
+                providers._read_claude_credential_file_from_directory(config_descriptor)
         finally:
             os.close(config_descriptor)
 
@@ -2840,9 +2932,7 @@ class ProviderPolicyTest(unittest.TestCase):
             providers.CLAUDE_KEYCHAIN_SECURITY_STDIN_LIMIT_BYTES
         )
         keychain = bytearray(json.dumps(keychain_value).encode())
-        file_credential = bytearray(
-            oauth_credential_fixture(expires_in_seconds=3600)
-        )
+        file_credential = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
         snapshot = providers._ClaudeCredentialFileSnapshot(
             home=self.claude_pwd_home,
             home_identity=(1,),
@@ -2979,11 +3069,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         depth = 10_000
         credential = bytearray(
-            b'{"claudeAiOauth":'
-            + b"[" * depth
-            + b"0"
-            + b"]" * depth
-            + b"}"
+            b'{"claudeAiOauth":' + b"[" * depth + b"0" + b"]" * depth + b"}"
         )
         read_keychain.return_value = credential
 
@@ -2995,11 +3081,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertEqual(credential, bytearray(len(credential)))
         raw_credential = bytearray(
-            b'{"claudeAiOauth":'
-            + b"[" * depth
-            + b"0"
-            + b"]" * depth
-            + b"}"
+            b'{"claudeAiOauth":' + b"[" * depth + b"0" + b"]" * depth + b"}"
         )
         with self.assertRaisesRegex(
             providers.ClaudeCredentialUnsafe,
@@ -3033,12 +3115,12 @@ class ProviderPolicyTest(unittest.TestCase):
             b'"refreshToken":"r","expiresAt":1}}'
         )
         nonfinite = bytearray(
-            b'{"claudeAiOauth":{"accessToken":"a","refreshToken":"r",'
-            b'"expiresAt":NaN}}'
+            b'{"claudeAiOauth":{"accessToken":"a","refreshToken":"r","expiresAt":NaN}}'
         )
         for payload in (duplicate, nonfinite):
-            with self.subTest(payload=payload), self.assertRaises(
-                providers.ClaudeCredentialUnsafe
+            with (
+                self.subTest(payload=payload),
+                self.assertRaises(providers.ClaudeCredentialUnsafe),
             ):
                 providers._validate_claude_local_credential(
                     payload,
@@ -3069,9 +3151,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 ).encode("ascii")
             )
             with self.subTest(field=field):
-                with self.assertRaises(
-                    providers.ClaudeCredentialUnsafe
-                ) as validated:
+                with self.assertRaises(providers.ClaudeCredentialUnsafe) as validated:
                     providers._validate_claude_local_credential(
                         payload,
                         source="fixture",
@@ -3133,9 +3213,7 @@ class ProviderPolicyTest(unittest.TestCase):
         result = providers._read_claude_macos_file_credential()
         assert result is not None
         expected, snapshot = result
-        refreshed_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=-60)
-        )
+        refreshed_value = json.loads(oauth_credential_fixture(expires_in_seconds=-60))
         refreshed_value["claudeAiOauth"]["refreshToken"] = (
             "fixture-" + "rotated-refresh-value"
         )
@@ -3151,14 +3229,16 @@ class ProviderPolicyTest(unittest.TestCase):
             "_read_claude_keychain_credential",
             return_value=None,
         ):
-            self.assertTrue(providers._write_claude_file_credential(
-                self.review,
-                refreshed,
-                expected,
-                snapshot,
-                carrier_snapshot,
-                self.claude_refresh_lock_protocol,
-            ))
+            self.assertTrue(
+                providers._write_claude_file_credential(
+                    self.review,
+                    refreshed,
+                    expected,
+                    snapshot,
+                    carrier_snapshot,
+                    self.claude_refresh_lock_protocol,
+                )
+            )
         self.assertEqual(credential_path.read_bytes(), bytes(refreshed))
         self.assertEqual(stat.S_IMODE(credential_path.stat().st_mode), 0o600)
 
@@ -3178,14 +3258,16 @@ class ProviderPolicyTest(unittest.TestCase):
             "_read_claude_keychain_credential",
             return_value=None,
         ):
-            self.assertFalse(providers._write_claude_file_credential(
-                self.review,
-                newer,
-                stale_expected,
-                stale_snapshot,
-                stale_carrier_snapshot,
-                self.claude_refresh_lock_protocol,
-            ))
+            self.assertFalse(
+                providers._write_claude_file_credential(
+                    self.review,
+                    newer,
+                    stale_expected,
+                    stale_snapshot,
+                    stale_carrier_snapshot,
+                    self.claude_refresh_lock_protocol,
+                )
+            )
         self.assertEqual(credential_path.read_bytes(), replacement)
         for payload in (expected, refreshed, stale_expected, newer):
             payload[:] = b"\x00" * len(payload)
@@ -3391,9 +3473,7 @@ class ProviderPolicyTest(unittest.TestCase):
         def broker(_credential, _capability, *, update_callback=None, **_kwargs):
             assert update_callback is not None
             self.assertTrue(update_callback(refreshed))
-            recovery_root = providers._claude_macos_recovery_root(
-                self.review
-            )
+            recovery_root = providers._claude_macos_recovery_root(self.review)
             durable_carriers = sorted(
                 recovery_root.glob(
                     f"{providers.CLAUDE_MACOS_DURABLE_STAGE_COMMITTED_PREFIX}*"
@@ -3557,9 +3637,7 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         write_file.assert_not_called()
         self.assertIn(str(carrier), str(raised.exception))
-        recovery_artifact = (
-            carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
-        )
+        recovery_artifact = carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
         self.assertEqual(
             getattr(
                 raised.exception,
@@ -3568,9 +3646,7 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
             str(recovery_artifact),
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_artifact"],
             str(recovery_artifact),
@@ -3641,9 +3717,7 @@ class ProviderPolicyTest(unittest.TestCase):
             )
             providers._mark_claude_macos_recovery_cleanup_artifact(
                 failure,
-                carrier
-                / "config"
-                / providers.CLAUDE_CREDENTIAL_FILE_NAME,
+                carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME,
             )
             raise failure
 
@@ -3679,22 +3753,12 @@ class ProviderPolicyTest(unittest.TestCase):
                 "_codex_claude_retained_cleanup_artifact",
                 None,
             ),
-            str(
-                retained
-                / "config"
-                / providers.CLAUDE_CREDENTIAL_FILE_NAME
-            ),
+            str(retained / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME),
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_cleanup_artifact"],
-            str(
-                retained
-                / "config"
-                / providers.CLAUDE_CREDENTIAL_FILE_NAME
-            ),
+            str(retained / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME),
         )
 
     def test_removed_recovery_carrier_fsync_failure_has_no_cleanup_path(
@@ -3754,9 +3818,7 @@ class ProviderPolicyTest(unittest.TestCase):
             self.review,
             raised.exception,
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_cleanup_artifact"],
             str(recovery_root),
@@ -3882,9 +3944,7 @@ class ProviderPolicyTest(unittest.TestCase):
             self.review,
             forwarded,
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_cleanup_artifact"],
             str(config_dir),
@@ -3901,9 +3961,7 @@ class ProviderPolicyTest(unittest.TestCase):
             self.review,
             credential,
         )
-        credential_path = (
-            carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
-        )
+        credential_path = carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
         digest = providers._claude_credential_digest(credential)
         forwarded = providers.ForwardedSignal(signal.SIGTERM)
 
@@ -4149,9 +4207,7 @@ class ProviderPolicyTest(unittest.TestCase):
             expected_digest=expected_digest,
         )
 
-        self.assertIsNone(
-            providers._get_claude_retained_credential_proof(error)
-        )
+        self.assertIsNone(providers._get_claude_retained_credential_proof(error))
         self.assertIsNone(
             getattr(
                 error,
@@ -4215,9 +4271,7 @@ class ProviderPolicyTest(unittest.TestCase):
         allow_legacy_publication = threading.Event()
         writer_errors: list[BaseException] = []
 
-        class BlockingProofError(
-            providers.ClaudeCredentialInspectionInconclusive
-        ):
+        class BlockingProofError(providers.ClaudeCredentialInspectionInconclusive):
             publication_armed = False
 
             def __setattr__(self, name: str, value: object) -> None:
@@ -4228,9 +4282,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 ):
                     proof_published.set()
                     if not allow_legacy_publication.wait(timeout=2.0):
-                        raise RuntimeError(
-                            "fixture proof publication was not released"
-                        )
+                        raise RuntimeError("fixture proof publication was not released")
 
         error = BlockingProofError("fixture publication target")
         error.publication_armed = True
@@ -4287,9 +4339,7 @@ class ProviderPolicyTest(unittest.TestCase):
         ):
             providers._capture_claude_retained_credential_proof(
                 artifact,
-                expected_digest=providers._claude_credential_digest(
-                    credential
-                ),
+                expected_digest=providers._claude_credential_digest(credential),
             )
 
         self.assertIs(raised.exception, forwarded)
@@ -4306,9 +4356,7 @@ class ProviderPolicyTest(unittest.TestCase):
         artifact = carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
         forwarded = providers.ForwardedSignal(signal.SIGTERM)
 
-        class InterruptingClearError(
-            providers.ClaudeCredentialInspectionInconclusive
-        ):
+        class InterruptingClearError(providers.ClaudeCredentialInspectionInconclusive):
             clear_armed = False
 
             def __delattr__(self, name: str) -> None:
@@ -4331,9 +4379,7 @@ class ProviderPolicyTest(unittest.TestCase):
             providers._clear_claude_retained_credential_proof(error)
 
         self.assertIs(raised.exception, forwarded)
-        self.assertIsNone(
-            providers._get_claude_retained_credential_proof(error)
-        )
+        self.assertIsNone(providers._get_claude_retained_credential_proof(error))
         credential[:] = b"\x00" * len(credential)
 
     def test_retained_proof_transfer_interrupt_wipes_credential_payloads(
@@ -4369,9 +4415,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 providers._capture_claude_retained_credential_proof,
                 lambda: providers._capture_claude_retained_credential_proof(
                     artifact,
-                    expected_digest=providers._claude_credential_digest(
-                        credential
-                    ),
+                    expected_digest=providers._claude_credential_digest(credential),
                 ),
             ),
             (
@@ -4834,9 +4878,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 regular_close_count += 1
                 if regular_close_count == 2:
                     failed_descriptor = descriptor
-                    raise OSError(
-                        "injected verified recovery carrier close failure"
-                    )
+                    raise OSError("injected verified recovery carrier close failure")
             real_close(descriptor)
 
         try:
@@ -4869,11 +4911,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 "_codex_claude_retained_credential_artifact",
                 None,
             ),
-            str(
-                carrier
-                / "config"
-                / providers.CLAUDE_CREDENTIAL_FILE_NAME
-            ),
+            str(carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME),
         )
         self.assertIsNone(
             getattr(
@@ -4892,16 +4930,12 @@ class ProviderPolicyTest(unittest.TestCase):
                 credential = bytearray(
                     oauth_credential_fixture(expires_in_seconds=7200)
                 )
-                recovery_root = providers._claude_macos_recovery_root(
-                    self.review
-                )
+                recovery_root = providers._claude_macos_recovery_root(self.review)
                 pending = recovery_root / (
-                    providers.CLAUDE_MACOS_DURABLE_STAGE_PENDING_PREFIX
-                    + failure_kind
+                    providers.CLAUDE_MACOS_DURABLE_STAGE_PENDING_PREFIX + failure_kind
                 )
                 committed = recovery_root / (
-                    providers.CLAUDE_MACOS_DURABLE_STAGE_COMMITTED_PREFIX
-                    + failure_kind
+                    providers.CLAUDE_MACOS_DURABLE_STAGE_COMMITTED_PREFIX + failure_kind
                 )
                 providers._retain_claude_macos_refreshed_credential(
                     self.review,
@@ -4918,9 +4952,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     nonlocal failed_descriptor
                     if stat.S_ISREG(real_fstat(descriptor).st_mode):
                         failed_descriptor = descriptor
-                        raise OSError(
-                            "injected pre-rename carrier close failure"
-                        )
+                        raise OSError("injected pre-rename carrier close failure")
                     real_close(descriptor)
 
                 try:
@@ -4961,10 +4993,8 @@ class ProviderPolicyTest(unittest.TestCase):
                     if failed_descriptor is not None:
                         real_close(failed_descriptor)
 
-                cleanup_artifact = (
-                    self.assert_cleanup_only_macos_recovery_artifact(
-                        raised.exception
-                    )
+                cleanup_artifact = self.assert_cleanup_only_macos_recovery_artifact(
+                    raised.exception
                 )
                 self.assertTrue(cleanup_artifact.is_relative_to(pending))
                 self.assertTrue(pending.is_dir())
@@ -4981,9 +5011,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     oauth_credential_fixture(expires_in_seconds=7200)
                 )
                 credential_bytes = bytes(credential)
-                recovery_root = providers._claude_macos_recovery_root(
-                    self.review
-                )
+                recovery_root = providers._claude_macos_recovery_root(self.review)
                 pending = recovery_root / (
                     providers.CLAUDE_MACOS_DURABLE_STAGE_PENDING_PREFIX
                     + "post-"
@@ -5014,9 +5042,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     nonlocal read_calls
                     read_calls += 1
                     if read_calls == 2 and failure_kind == "read":
-                        raise OSError(
-                            "injected post-rename carrier read failure"
-                        )
+                        raise OSError("injected post-rename carrier read failure")
                     return real_read(review, carrier)
 
                 def fail_post_rename_close(descriptor: int) -> None:
@@ -5025,9 +5051,7 @@ class ProviderPolicyTest(unittest.TestCase):
                         regular_close_count += 1
                         if regular_close_count == 2:
                             failed_descriptor = descriptor
-                            raise OSError(
-                                "injected post-rename carrier close failure"
-                            )
+                            raise OSError("injected post-rename carrier close failure")
                     real_close(descriptor)
 
                 try:
@@ -5086,17 +5110,13 @@ class ProviderPolicyTest(unittest.TestCase):
     def test_durable_stage_post_rename_payload_mismatch_is_cleanup_only(
         self,
     ) -> None:
-        credential = bytearray(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        credential = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
         recovery_root = providers._claude_macos_recovery_root(self.review)
         pending = recovery_root / (
-            providers.CLAUDE_MACOS_DURABLE_STAGE_PENDING_PREFIX
-            + "post-mismatch"
+            providers.CLAUDE_MACOS_DURABLE_STAGE_PENDING_PREFIX + "post-mismatch"
         )
         committed = recovery_root / (
-            providers.CLAUDE_MACOS_DURABLE_STAGE_COMMITTED_PREFIX
-            + "post-mismatch"
+            providers.CLAUDE_MACOS_DURABLE_STAGE_COMMITTED_PREFIX + "post-mismatch"
         )
         providers._retain_claude_macos_refreshed_credential(
             self.review,
@@ -5141,9 +5161,7 @@ class ProviderPolicyTest(unittest.TestCase):
             self.assertEqual(read_calls, 2)
             self.assertFalse(pending.exists())
             self.assertEqual(
-                self.assert_cleanup_only_macos_recovery_artifact(
-                    raised.exception
-                ),
+                self.assert_cleanup_only_macos_recovery_artifact(raised.exception),
                 committed,
             )
         finally:
@@ -5411,9 +5429,7 @@ class ProviderPolicyTest(unittest.TestCase):
         artifact = pathlib.Path(artifact_value)
         self.assertEqual(artifact.parent, config)
         self.assertTrue(
-            artifact.name.startswith(
-                providers.CLAUDE_MACOS_RECOVERY_UPDATE_PREFIX
-            )
+            artifact.name.startswith(providers.CLAUDE_MACOS_RECOVERY_UPDATE_PREFIX)
         )
         self.assertEqual(artifact.read_bytes(), refreshed_bytes)
         self.assertEqual(
@@ -5432,9 +5448,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
     def test_tampered_complete_recovery_temp_is_cleanup_only(self) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
-        refreshed = bytearray(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
         tampered = bytearray(refreshed)
         tampered[-1] = ord("]")
         original_bytes = bytes(original)
@@ -5508,9 +5522,7 @@ class ProviderPolicyTest(unittest.TestCase):
             self.review,
             failure,
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertNotIn("recovery_artifact", report["authentication"])
         self.assertEqual(
             report["authentication"]["recovery_cleanup_artifact"],
@@ -5523,9 +5535,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self,
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
-        refreshed = bytearray(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
         original_bytes = bytes(original)
         carrier = providers._retain_claude_macos_refreshed_credential(
             self.review,
@@ -5705,9 +5715,7 @@ class ProviderPolicyTest(unittest.TestCase):
             self.review,
             failure,
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertNotIn("recovery_artifact", report["authentication"])
         self.assertEqual(
             report["authentication"]["recovery_cleanup_artifact"],
@@ -5823,9 +5831,7 @@ class ProviderPolicyTest(unittest.TestCase):
         def broker(_credential, _capability, *, update_callback=None, **_kwargs):
             assert update_callback is not None
             self.assertTrue(update_callback(first))
-            recovery_root = providers._claude_macos_recovery_root(
-                self.review
-            )
+            recovery_root = providers._claude_macos_recovery_root(self.review)
             first_carriers = sorted(
                 recovery_root.glob(
                     f"{providers.CLAUDE_MACOS_DURABLE_STAGE_COMMITTED_PREFIX}*"
@@ -5834,9 +5840,7 @@ class ProviderPolicyTest(unittest.TestCase):
             self.assertEqual(len(first_carriers), 1)
             self.assertEqual(
                 (
-                    first_carriers[0]
-                    / "config"
-                    / providers.CLAUDE_CREDENTIAL_FILE_NAME
+                    first_carriers[0] / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
                 ).read_bytes(),
                 bytes(first),
             )
@@ -5904,9 +5908,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
         first = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
-        second_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        second_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
         second_value["claudeAiOauth"]["refreshToken"] = (
             "fixture-failed-new-durable-generation-refresh-value"
         )
@@ -5962,9 +5964,7 @@ class ProviderPolicyTest(unittest.TestCase):
             nonlocal first_carrier
             assert update_callback is not None
             self.assertTrue(update_callback(first))
-            recovery_root = providers._claude_macos_recovery_root(
-                self.review
-            )
+            recovery_root = providers._claude_macos_recovery_root(self.review)
             acknowledged = sorted(
                 recovery_root.glob(
                     f"{providers.CLAUDE_MACOS_DURABLE_STAGE_COMMITTED_PREFIX}*"
@@ -5976,9 +5976,7 @@ class ProviderPolicyTest(unittest.TestCase):
             assert first_carrier is not None
             self.assertEqual(
                 (
-                    first_carrier
-                    / "config"
-                    / providers.CLAUDE_CREDENTIAL_FILE_NAME
+                    first_carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
                 ).read_bytes(),
                 bytes(first),
             )
@@ -6039,16 +6037,12 @@ class ProviderPolicyTest(unittest.TestCase):
         invalidate_latest: bool,
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
-        failed_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=3600)
-        )
+        failed_value = json.loads(oauth_credential_fixture(expires_in_seconds=3600))
         failed_value["claudeAiOauth"]["refreshToken"] = (
             "fixture-earlier-verified-failure-refresh"
         )
         failed = bytearray(json.dumps(failed_value).encode())
-        latest_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        latest_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
         latest_value["claudeAiOauth"]["refreshToken"] = (
             "fixture-latest-success-after-verified-failure"
         )
@@ -6114,9 +6108,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 carrier
                 for carrier in carriers
                 if (
-                    carrier
-                    / "config"
-                    / providers.CLAUDE_CREDENTIAL_FILE_NAME
+                    carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
                 ).read_bytes()
                 == latest_bytes
             )
@@ -6207,9 +6199,7 @@ class ProviderPolicyTest(unittest.TestCase):
         third_bytes = bytes(third)
         generation_cap = 3
         byte_cap = (
-            len(first)
-            + len(second)
-            + providers.CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES
+            len(first) + len(second) + providers.CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES
         )
         selected = providers._ClaudeLocalCredential(
             source="macos-keychain",
@@ -6250,12 +6240,8 @@ class ProviderPolicyTest(unittest.TestCase):
                 terminal_claim_calls += 1
                 return True
 
-            self.assertTrue(
-                update_callback(first, commit_pending, claim_terminal)
-            )
-            self.assertTrue(
-                update_callback(second, commit_pending, claim_terminal)
-            )
+            self.assertTrue(update_callback(first, commit_pending, claim_terminal))
+            self.assertTrue(update_callback(second, commit_pending, claim_terminal))
             recovery_root = providers._claude_macos_recovery_root(self.review)
             carriers = sorted(
                 recovery_root.glob(
@@ -6265,17 +6251,13 @@ class ProviderPolicyTest(unittest.TestCase):
             self.assertEqual(len(carriers), 2)
             self.assertEqual(
                 (
-                    carriers[0]
-                    / "config"
-                    / providers.CLAUDE_CREDENTIAL_FILE_NAME
+                    carriers[0] / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
                 ).read_bytes(),
                 bytes(first),
             )
             self.assertEqual(
                 (
-                    carriers[1]
-                    / "config"
-                    / providers.CLAUDE_CREDENTIAL_FILE_NAME
+                    carriers[1] / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
                 ).read_bytes(),
                 second_bytes,
             )
@@ -6285,9 +6267,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 if candidate == second_bytes
             ]
             self.assertEqual(len(staged_copies), 1)
-            self.assertFalse(
-                update_callback(third, commit_pending, claim_terminal)
-            )
+            self.assertFalse(update_callback(third, commit_pending, claim_terminal))
             self.assertEqual(
                 staged_copies[0],
                 b"\x00" * len(second_bytes),
@@ -6301,11 +6281,9 @@ class ProviderPolicyTest(unittest.TestCase):
             self.assertLessEqual(len(carriers), generation_cap)
             self.assertLessEqual(
                 sum(
-                    (
-                        carrier
-                        / "config"
-                        / providers.CLAUDE_CREDENTIAL_FILE_NAME
-                    ).stat().st_size
+                    (carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME)
+                    .stat()
+                    .st_size
                     for carrier in carriers
                 ),
                 byte_cap,
@@ -6314,9 +6292,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 third_bytes,
                 [
                     (
-                        carrier
-                        / "config"
-                        / providers.CLAUDE_CREDENTIAL_FILE_NAME
+                        carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
                     ).read_bytes()
                     for carrier in carriers
                 ],
@@ -6390,19 +6366,11 @@ class ProviderPolicyTest(unittest.TestCase):
         self,
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
-        first_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=3600)
-        )
-        first_value["claudeAiOauth"]["refreshToken"] = (
-            "fixture-lock-free-proof-first"
-        )
+        first_value = json.loads(oauth_credential_fixture(expires_in_seconds=3600))
+        first_value["claudeAiOauth"]["refreshToken"] = "fixture-lock-free-proof-first"
         first = bytearray(json.dumps(first_value).encode())
-        second_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
-        second_value["claudeAiOauth"]["refreshToken"] = (
-            "fixture-lock-free-proof-second"
-        )
+        second_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
+        second_value["claudeAiOauth"]["refreshToken"] = "fixture-lock-free-proof-second"
         second = bytearray(json.dumps(second_value).encode())
         selected = providers._ClaudeLocalCredential(
             source="macos-keychain",
@@ -6635,20 +6603,14 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertNotIn(latest_carrier, complete_carriers)
         recovery_root = providers._claude_macos_recovery_root(self.review)
         self.assertEqual(list(recovery_root.iterdir()), [latest_carrier])
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_carrier"],
             str(latest_carrier),
         )
         self.assertEqual(
             report["authentication"]["recovery_artifact"],
-            str(
-                latest_carrier
-                / "config"
-                / providers.CLAUDE_CREDENTIAL_FILE_NAME
-            ),
+            str(latest_carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME),
         )
         self.assertNotIn(
             "recovery_cleanup_artifact",
@@ -6687,10 +6649,15 @@ class ProviderPolicyTest(unittest.TestCase):
             *,
             expected_digest: bytes,
         ) -> providers._ClaudeRetainedCredentialProof:
-            if fail_capture and complete_carriers and artifact == (
-                complete_carriers[-1]
-                / "config"
-                / providers.CLAUDE_CREDENTIAL_FILE_NAME
+            if (
+                fail_capture
+                and complete_carriers
+                and artifact
+                == (
+                    complete_carriers[-1]
+                    / "config"
+                    / providers.CLAUDE_CREDENTIAL_FILE_NAME
+                )
             ):
                 raise OSError("injected current proof capture failure")
             return real_capture(
@@ -6721,15 +6688,11 @@ class ProviderPolicyTest(unittest.TestCase):
             )
             self.assertEqual(len(all_carriers), 4)
             terminal_carrier = next(
-                carrier
-                for carrier in all_carriers
-                if carrier not in complete_carriers
+                carrier for carrier in all_carriers if carrier not in complete_carriers
             )
             complete_carriers.append(terminal_carrier)
             latest_artifact = (
-                terminal_carrier
-                / "config"
-                / providers.CLAUDE_CREDENTIAL_FILE_NAME
+                terminal_carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
             )
             replacement = latest_artifact.with_name("replacement.json")
             replacement.write_bytes(updates[3])
@@ -6818,9 +6781,7 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
             str(recovery_root),
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertNotIn("recovery_carrier", report["authentication"])
         self.assertNotIn("recovery_artifact", report["authentication"])
         self.assertEqual(
@@ -6956,20 +6917,14 @@ class ProviderPolicyTest(unittest.TestCase):
             sorted(recovery_root.iterdir()),
             [complete_carriers[0], latest_carrier],
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_carrier"],
             str(latest_carrier),
         )
         self.assertEqual(
             report["authentication"]["recovery_artifact"],
-            str(
-                latest_carrier
-                / "config"
-                / providers.CLAUDE_CREDENTIAL_FILE_NAME
-            ),
+            str(latest_carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME),
         )
         self.assertEqual(
             report["authentication"]["recovery_cleanup_artifact"],
@@ -6987,15 +6942,11 @@ class ProviderPolicyTest(unittest.TestCase):
 
         for label, interruption in interruptions:
             with self.subTest(interruption=label):
-                original = bytearray(
-                    oauth_credential_fixture(expires_in_seconds=-60)
-                )
+                original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
                 updates: list[bytearray] = []
                 for generation in range(1, 5):
                     value = json.loads(
-                        oauth_credential_fixture(
-                            expires_in_seconds=3600 * generation
-                        )
+                        oauth_credential_fixture(expires_in_seconds=3600 * generation)
                     )
                     value["claudeAiOauth"]["refreshToken"] = (
                         f"fixture-non-staged-control-flow-{label}-{generation}"
@@ -7007,9 +6958,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     payload=original,
                     expires_at_ms=0,
                     carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
-                        keychain_digest=(
-                            providers._claude_credential_digest(original)
-                        ),
+                        keychain_digest=(providers._claude_credential_digest(original)),
                         file_digest=None,
                         file_snapshot=None,
                     ),
@@ -7025,18 +6974,13 @@ class ProviderPolicyTest(unittest.TestCase):
                     **_kwargs,
                 ):
                     assert update_callback is not None
-                    recovery_root = providers._claude_macos_recovery_root(
-                        self.review
-                    )
+                    recovery_root = providers._claude_macos_recovery_root(self.review)
                     before = set(recovery_root.glob("claude-carrier-*"))
                     for update in updates[:3]:
                         self.assertTrue(update_callback(update))
                     self.assertFalse(update_callback(updates[3]))
                     staged_carriers.extend(
-                        sorted(
-                            set(recovery_root.glob("claude-carrier-*"))
-                            - before
-                        )
+                        sorted(set(recovery_root.glob("claude-carrier-*")) - before)
                     )
                     self.assertEqual(len(staged_carriers), 4)
                     for update in updates:
@@ -7094,9 +7038,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 self.assertTrue(staged_carriers[2].is_dir())
                 self.assertTrue(staged_carriers[3].is_dir())
                 persist.assert_not_called()
-                recovery_root = providers._claude_macos_recovery_root(
-                    self.review
-                )
+                recovery_root = providers._claude_macos_recovery_root(self.review)
                 self.assertEqual(
                     getattr(
                         raised.exception,
@@ -7216,9 +7158,7 @@ class ProviderPolicyTest(unittest.TestCase):
             "_codex_claude_retained_cleanup_artifact",
         ):
             self.assertIsNone(getattr(raised.exception, attribute, None))
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertNotIn("recovery_artifact", report["authentication"])
         self.assertNotIn("recovery_cleanup_artifact", report["authentication"])
 
@@ -7246,9 +7186,7 @@ class ProviderPolicyTest(unittest.TestCase):
         @contextlib.contextmanager
         def broker(_credential, _capability, *, update_callback=None, **_kwargs):
             assert update_callback is not None
-            callback_results.extend(
-                update_callback(update) for update in updates
-            )
+            callback_results.extend(update_callback(update) for update in updates)
             yield 43211
 
         common.write_json(
@@ -7320,9 +7258,7 @@ class ProviderPolicyTest(unittest.TestCase):
             "_codex_claude_retained_cleanup_artifact",
         ):
             self.assertIsNone(getattr(raised.exception, attribute, None))
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertNotIn("recovery_carrier", report["authentication"])
         self.assertNotIn("recovery_artifact", report["authentication"])
 
@@ -7574,9 +7510,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self,
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
-        refreshed = bytearray(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
         selected = providers._ClaudeLocalCredential(
             source="macos-keychain",
             payload=original,
@@ -7625,9 +7559,7 @@ class ProviderPolicyTest(unittest.TestCase):
         def track_fsync(descriptor: int) -> None:
             metadata = providers.os.fstat(descriptor)
             if stat.S_ISDIR(metadata.st_mode):
-                synchronized_directories.add(
-                    (metadata.st_dev, metadata.st_ino)
-                )
+                synchronized_directories.add((metadata.st_dev, metadata.st_ino))
             real_fsync(descriptor)
 
         def track_fullfsync(descriptor: int, command: int) -> int:
@@ -7635,9 +7567,7 @@ class ProviderPolicyTest(unittest.TestCase):
             self.assertEqual(command, 51)
             metadata = providers.os.fstat(descriptor)
             if stat.S_ISDIR(metadata.st_mode):
-                full_synced_directories.add(
-                    (metadata.st_dev, metadata.st_ino)
-                )
+                full_synced_directories.add((metadata.st_dev, metadata.st_ino))
             elif stat.S_ISREG(metadata.st_mode):
                 full_synced_regular_files += 1
             return 0
@@ -7649,12 +7579,8 @@ class ProviderPolicyTest(unittest.TestCase):
         def commit_pending(publish: Callable[[], bool]) -> bool:
             nonlocal publication_checks
             publication_checks += 1
-            self.assertTrue(
-                required_identities.issubset(synchronized_directories)
-            )
-            self.assertTrue(
-                required_identities.issubset(full_synced_directories)
-            )
+            self.assertTrue(required_identities.issubset(synchronized_directories))
+            self.assertTrue(required_identities.issubset(full_synced_directories))
             self.assertGreaterEqual(full_synced_regular_files, 1)
             return publish()
 
@@ -7667,9 +7593,7 @@ class ProviderPolicyTest(unittest.TestCase):
             **_kwargs: object,
         ):
             assert update_callback is not None
-            callback_results.append(
-                update_callback(refreshed, commit_pending)
-            )
+            callback_results.append(update_callback(refreshed, commit_pending))
             yield 43211
 
         common.write_json(
@@ -7741,12 +7665,10 @@ class ProviderPolicyTest(unittest.TestCase):
         ):
             with self.subTest(failure_kind=failure_kind):
                 pending = recovery_root / (
-                    providers.CLAUDE_MACOS_DURABLE_STAGE_PENDING_PREFIX
-                    + failure_kind
+                    providers.CLAUDE_MACOS_DURABLE_STAGE_PENDING_PREFIX + failure_kind
                 )
                 committed = recovery_root / (
-                    providers.CLAUDE_MACOS_DURABLE_STAGE_COMMITTED_PREFIX
-                    + failure_kind
+                    providers.CLAUDE_MACOS_DURABLE_STAGE_COMMITTED_PREFIX + failure_kind
                 )
                 providers._retain_claude_macos_refreshed_credential(
                     self.review,
@@ -7972,15 +7894,12 @@ class ProviderPolicyTest(unittest.TestCase):
         for failure_kind in ("swapped", "loop"):
             with self.subTest(failure_kind=failure_kind):
                 fixture_root = (
-                    self.review.source_root.parent
-                    / f"durable-ancestor-{failure_kind}"
+                    self.review.source_root.parent / f"durable-ancestor-{failure_kind}"
                 )
                 lexical_parent = fixture_root / "workspace-anchor"
                 lexical_source = lexical_parent / "source"
                 lexical_container = (
-                    lexical_source
-                    / ".codex-tmp"
-                    / "isolated-review-symlink-fixture"
+                    lexical_source / ".codex-tmp" / "isolated-review-symlink-fixture"
                 )
                 fixture_root.mkdir(mode=0o700)
                 if failure_kind == "swapped":
@@ -8013,6 +7932,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     head_ref="b" * 40,
                     diff_file=lexical_container / "review.diff",
                     prompt_file=lexical_container / "review.prompt",
+                    private_cleanup=self.review.private_cleanup,
                 )
                 credential = bytearray(
                     oauth_credential_fixture(expires_in_seconds=7200)
@@ -8028,9 +7948,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     )
 
                 if alternate_container is not None:
-                    self.assertFalse(
-                        (alternate_container / "claude-runtime").exists()
-                    )
+                    self.assertFalse((alternate_container / "claude-runtime").exists())
                 credential[:] = b"\x00" * len(credential)
 
     def test_durable_ancestor_fsync_failure_nacks_before_publication(
@@ -8044,20 +7962,14 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         for failed_path in required_paths:
             with self.subTest(path=failed_path.name):
-                original = bytearray(
-                    oauth_credential_fixture(expires_in_seconds=-60)
-                )
-                refreshed = bytearray(
-                    oauth_credential_fixture(expires_in_seconds=7200)
-                )
+                original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+                refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
                 selected = providers._ClaudeLocalCredential(
                     source="macos-keychain",
                     payload=original,
                     expires_at_ms=0,
                     carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
-                        keychain_digest=providers._claude_credential_digest(
-                            original
-                        ),
+                        keychain_digest=providers._claude_credential_digest(original),
                         file_digest=None,
                         file_snapshot=None,
                     ),
@@ -8091,9 +8003,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     **_kwargs: object,
                 ):
                     assert update_callback is not None
-                    callback_results.append(
-                        update_callback(refreshed, commit_pending)
-                    )
+                    callback_results.append(update_callback(refreshed, commit_pending))
                     yield 43211
 
                 common.write_json(
@@ -8145,16 +8055,13 @@ class ProviderPolicyTest(unittest.TestCase):
     def test_durable_stage_byte_quota_exact_boundary_and_plus_one(
         self,
     ) -> None:
-        refreshed = bytearray(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
         refreshed_bytes = bytes(refreshed)
 
         for label, byte_limit, accepted in (
             (
                 "exact",
-                providers.CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES
-                + len(refreshed_bytes),
+                providers.CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES + len(refreshed_bytes),
                 True,
             ),
             (
@@ -8166,17 +8073,13 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
         ):
             with self.subTest(label=label):
-                original = bytearray(
-                    oauth_credential_fixture(expires_in_seconds=-60)
-                )
+                original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
                 selected = providers._ClaudeLocalCredential(
                     source="macos-keychain",
                     payload=original,
                     expires_at_ms=0,
                     carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
-                        keychain_digest=providers._claude_credential_digest(
-                            original
-                        ),
+                        keychain_digest=providers._claude_credential_digest(original),
                         file_digest=None,
                         file_snapshot=None,
                     ),
@@ -8196,9 +8099,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     yield 43211
 
                 updated_snapshot = providers._ClaudeMacOSCarrierSnapshot(
-                    keychain_digest=providers._claude_credential_digest(
-                        refreshed
-                    ),
+                    keychain_digest=providers._claude_credential_digest(refreshed),
                     file_digest=None,
                     file_snapshot=None,
                 )
@@ -8230,9 +8131,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     mock.patch.object(
                         providers,
                         "_retain_claude_macos_refreshed_credential",
-                        wraps=(
-                            providers._retain_claude_macos_refreshed_credential
-                        ),
+                        wraps=(providers._retain_claude_macos_refreshed_credential),
                     ) as retain,
                     mock.patch.object(
                         providers,
@@ -8370,9 +8269,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         first = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
         second = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
-        third_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=10800)
-        )
+        third_value = json.loads(oauth_credential_fixture(expires_in_seconds=10800))
         third_value["claudeAiOauth"]["refreshToken"] = (
             "fixture-latest-cleanup-refresh-value"
         )
@@ -8390,9 +8287,7 @@ class ProviderPolicyTest(unittest.TestCase):
             is_recovery_update = (
                 len(args) >= 2
                 and isinstance(args[0], str)
-                and args[0].startswith(
-                    providers.CLAUDE_MACOS_RECOVERY_UPDATE_PREFIX
-                )
+                and args[0].startswith(providers.CLAUDE_MACOS_RECOVERY_UPDATE_PREFIX)
                 and args[1] == providers.CLAUDE_CREDENTIAL_FILE_NAME
             )
             if is_recovery_update:
@@ -8443,9 +8338,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 self.review,
                 failure,
             )
-            report = common.read_json(
-                self.review.container_dir / "claude-runtime.json"
-            )
+            report = common.read_json(self.review.container_dir / "claude-runtime.json")
             self.assertEqual(
                 report["authentication"]["recovery_artifact"],
                 str(artifact),
@@ -8528,9 +8421,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         for failure_kind in ("stale-fsync", "config-close"):
             with self.subTest(failure_kind=failure_kind):
-                original = bytearray(
-                    oauth_credential_fixture(expires_in_seconds=3600)
-                )
+                original = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
                 updated_value = json.loads(
                     oauth_credential_fixture(expires_in_seconds=7200)
                 )
@@ -8568,9 +8459,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     if stat.S_ISDIR(real_fstat(descriptor).st_mode):
                         directory_fsyncs += 1
                         if directory_fsyncs == 2:
-                            raise OSError(
-                                "injected post-commit stale fsync failure"
-                            )
+                            raise OSError("injected post-commit stale fsync failure")
                     real_fsync(descriptor)
 
                 def track_config_open(
@@ -8605,9 +8494,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     ):
                         close_failed = True
                         failed_descriptor = descriptor
-                        raise OSError(
-                            "injected post-commit config close failure"
-                        )
+                        raise OSError("injected post-commit config close failure")
                     real_close(descriptor)
 
                 try:
@@ -8659,9 +8546,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     if failed_descriptor is not None:
                         real_close(failed_descriptor)
 
-                current = (
-                    config_dir / providers.CLAUDE_CREDENTIAL_FILE_NAME
-                )
+                current = config_dir / providers.CLAUDE_CREDENTIAL_FILE_NAME
                 self.assertEqual(current.read_bytes(), bytes(updated))
                 self.assertEqual(
                     providers._validated_claude_retained_credential_artifact(
@@ -8850,21 +8735,15 @@ class ProviderPolicyTest(unittest.TestCase):
 
         for label, interruption in interruptions:
             with self.subTest(interruption=label):
-                original = bytearray(
-                    oauth_credential_fixture(expires_in_seconds=-60)
-                )
-                refreshed = bytearray(
-                    oauth_credential_fixture(expires_in_seconds=7200)
-                )
+                original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+                refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
                 refreshed_bytes = bytes(refreshed)
                 selected = providers._ClaudeLocalCredential(
                     source="macos-keychain",
                     payload=original,
                     expires_at_ms=0,
                     carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
-                        keychain_digest=providers._claude_credential_digest(
-                            original
-                        ),
+                        keychain_digest=providers._claude_credential_digest(original),
                         file_digest=None,
                         file_snapshot=None,
                     ),
@@ -9272,9 +9151,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
         first = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
-        latest_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        latest_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
         latest_value["claudeAiOauth"]["refreshToken"] = (
             "fixture-malformed-successor-latest-refresh"
         )
@@ -9348,20 +9225,14 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(latest_carrier, complete_carriers[-1])
         recovery_root = providers._claude_macos_recovery_root(self.review)
         self.assertEqual(list(recovery_root.iterdir()), [latest_carrier])
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_carrier"],
             str(latest_carrier),
         )
         self.assertEqual(
             report["authentication"]["recovery_artifact"],
-            str(
-                latest_carrier
-                / "config"
-                / providers.CLAUDE_CREDENTIAL_FILE_NAME
-            ),
+            str(latest_carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME),
         )
 
     def test_failed_new_generation_cleans_unreported_complete_carriers(
@@ -9476,20 +9347,14 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(latest_carrier, complete_carriers[-1])
         recovery_root = providers._claude_macos_recovery_root(self.review)
         self.assertEqual(list(recovery_root.iterdir()), [latest_carrier])
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_carrier"],
             str(latest_carrier),
         )
         self.assertEqual(
             report["authentication"]["recovery_artifact"],
-            str(
-                latest_carrier
-                / "config"
-                / providers.CLAUDE_CREDENTIAL_FILE_NAME
-            ),
+            str(latest_carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME),
         )
         self.assertNotIn(
             "recovery_cleanup_artifact",
@@ -9568,9 +9433,7 @@ class ProviderPolicyTest(unittest.TestCase):
             providers._retained_claude_macos_credential_error(
                 candidate,
                 raised.exception,
-                expected_digest=providers._claude_credential_digest(
-                    credential
-                ),
+                expected_digest=providers._claude_credential_digest(credential),
             ),
             expected,
         )
@@ -9674,10 +9537,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 )
                 setattr(
                     error,
-                    (
-                        "_codex_claude_keychain_handler_"
-                        "quiescence_unproven"
-                    ),
+                    ("_codex_claude_keychain_handler_quiescence_unproven"),
                     True,
                 )
                 raise
@@ -9717,9 +9577,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 False,
             )
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["refresh_persistence"],
             "failed-after-attempt",
@@ -9730,9 +9588,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
         first = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
-        latest_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        latest_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
         latest_value["claudeAiOauth"]["refreshToken"] = (
             "fixture-unquiescent-prior-journal-latest"
         )
@@ -9765,9 +9621,7 @@ class ProviderPolicyTest(unittest.TestCase):
             self.assertTrue(update_callback(first))
             self.assertTrue(update_callback(latest))
             recovery_root = providers._claude_macos_recovery_root(self.review)
-            staged_carriers.extend(
-                sorted(recovery_root.glob("claude-carrier-*"))
-            )
+            staged_carriers.extend(sorted(recovery_root.glob("claude-carrier-*")))
             self.assertEqual(len(staged_carriers), 2)
             quiescence_callbacks.abandon()
             recovery_error = quiescence_callbacks.recover(None)
@@ -9840,9 +9694,7 @@ class ProviderPolicyTest(unittest.TestCase):
             sorted(recovery_root.glob("claude-carrier-*")),
             staged_carriers,
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_carrier"],
             str(latest_carrier),
@@ -9857,9 +9709,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
         first = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
-        second_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        second_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
         second_value["claudeAiOauth"]["refreshToken"] = (
             "fixture-completed-journal-timeout-second"
         )
@@ -9924,17 +9774,13 @@ class ProviderPolicyTest(unittest.TestCase):
             self.assertTrue(update_callback(first))
             self.assertTrue(update_callback(second))
             recovery_root = providers._claude_macos_recovery_root(self.review)
-            staged_carriers.extend(
-                sorted(recovery_root.glob("claude-carrier-*"))
-            )
+            staged_carriers.extend(sorted(recovery_root.glob("claude-carrier-*")))
             self.assertEqual(len(staged_carriers), 2)
             quiescence_callbacks.abandon()
-            timeout_error = (
-                providers._bounded_claude_keychain_quiescence_recovery(
-                    quiescence_callbacks,
-                    bytearray(replacement),
-                    already_abandoned=True,
-                )
+            timeout_error = providers._bounded_claude_keychain_quiescence_recovery(
+                quiescence_callbacks,
+                bytearray(replacement),
+                already_abandoned=True,
             )
             self.assertTrue(replace_started.is_set())
             self.assertIsNotNone(timeout_error)
@@ -10016,11 +9862,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(immediate_state["carrier"], str(latest_carrier))
         self.assertEqual(
             immediate_state["artifact"],
-            str(
-                latest_carrier
-                / "config"
-                / providers.CLAUDE_CREDENTIAL_FILE_NAME
-            ),
+            str(latest_carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME),
         )
         self.assertEqual(immediate_state["cleanup"], str(recovery_root))
         self.assertEqual(len(recovery_threads), 1)
@@ -10032,9 +9874,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
         first = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
-        second_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        second_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
         second_value["claudeAiOauth"]["refreshToken"] = (
             "fixture-recovery-proof-timeout-second"
         )
@@ -10064,9 +9904,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 providers.ClaudeCredentialInspectionInconclusive(
                     "injected post-commit recovery failure"
                 ),
-                expected_digest=providers._claude_credential_digest(
-                    credential
-                ),
+                expected_digest=providers._claude_credential_digest(credential),
             )
 
         @contextlib.contextmanager
@@ -10147,9 +9985,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
         first = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
-        second_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        second_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
         second_value["claudeAiOauth"]["refreshToken"] = (
             "fixture-recovery-temp-proof-timeout-second"
         )
@@ -10176,9 +10012,7 @@ class ProviderPolicyTest(unittest.TestCase):
         ) -> None:
             if (
                 isinstance(source, str)
-                and source.startswith(
-                    providers.CLAUDE_MACOS_RECOVERY_UPDATE_PREFIX
-                )
+                and source.startswith(providers.CLAUDE_MACOS_RECOVERY_UPDATE_PREFIX)
                 and destination == providers.CLAUDE_CREDENTIAL_FILE_NAME
             ):
                 raise OSError("injected recovery temporary rename failure")
@@ -10276,9 +10110,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self,
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
-        refreshed = bytearray(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
         selected = providers._ClaudeLocalCredential(
             source="macos-keychain",
             payload=original,
@@ -10303,9 +10135,7 @@ class ProviderPolicyTest(unittest.TestCase):
         ):
             assert quiescence_callbacks is not None
             quiescence_callbacks.abandon()
-            recovery_error = quiescence_callbacks.recover(
-                bytearray(refreshed)
-            )
+            recovery_error = quiescence_callbacks.recover(bytearray(refreshed))
             self.assertIsNotNone(recovery_error)
             assert recovery_error is not None
             captured["recovery"] = recovery_error
@@ -10373,9 +10203,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
     def test_timeout_reproof_failure_keeps_root_cleanup_scope(self) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
-        refreshed = bytearray(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
         replacement = oauth_credential_fixture(expires_in_seconds=10800)
         selected = providers._ClaudeLocalCredential(
             source="macos-keychain",
@@ -10401,9 +10229,7 @@ class ProviderPolicyTest(unittest.TestCase):
         ):
             assert quiescence_callbacks is not None
             quiescence_callbacks.abandon()
-            recovery_error = quiescence_callbacks.recover(
-                bytearray(refreshed)
-            )
+            recovery_error = quiescence_callbacks.recover(bytearray(refreshed))
             self.assertIsNotNone(recovery_error)
             assert recovery_error is not None
             recovery_proof = providers._get_claude_retained_credential_proof(
@@ -10411,9 +10237,7 @@ class ProviderPolicyTest(unittest.TestCase):
             )
             self.assertIsNotNone(recovery_proof)
             assert recovery_proof is not None
-            replacement_path = recovery_proof.artifact.with_name(
-                "replacement.json"
-            )
+            replacement_path = recovery_proof.artifact.with_name("replacement.json")
             replacement_path.write_bytes(replacement)
             replacement_path.chmod(0o600)
             os.replace(replacement_path, recovery_proof.artifact)
@@ -10480,9 +10304,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
         first = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
-        second_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        second_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
         second_value["claudeAiOauth"]["refreshToken"] = (
             "fixture-inflight-exact-proof-second"
         )
@@ -10515,10 +10337,7 @@ class ProviderPolicyTest(unittest.TestCase):
             event: providers._ClaudeThreadEvent,
             timeout: float | None = None,
         ) -> bool:
-            if (
-                threading.current_thread() is recovery_thread
-                and not event.is_set()
-            ):
+            if threading.current_thread() is recovery_thread and not event.is_set():
                 recovery_wait_started.set()
             return real_event_wait(event, timeout)
 
@@ -10539,17 +10358,13 @@ class ProviderPolicyTest(unittest.TestCase):
             if commit_calls == 2:
                 second_commit_ready.set()
                 if not release_second_commit.wait(timeout=2.0):
-                    raise RuntimeError(
-                        "fixture second durable commit was not released"
-                    )
+                    raise RuntimeError("fixture second durable commit was not released")
                 raise providers._retained_claude_macos_credential_error(
                     committed_carrier,
                     providers.ClaudeCredentialInspectionInconclusive(
                         "injected second post-commit failure"
                     ),
-                    expected_digest=providers._claude_credential_digest(
-                        credential
-                    ),
+                    expected_digest=providers._claude_credential_digest(credential),
                 )
             return committed_carrier
 
@@ -10665,9 +10480,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self,
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
-        refreshed = bytearray(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
         refreshed_digest = providers._claude_credential_digest(refreshed)
         selected = providers._ClaudeLocalCredential(
             source="macos-keychain",
@@ -10693,11 +10506,8 @@ class ProviderPolicyTest(unittest.TestCase):
             *args: object,
             **kwargs: object,
         ) -> None:
-            if (
-                isinstance(source, str)
-                and source.startswith(
-                    providers.CLAUDE_MACOS_DURABLE_STAGE_PENDING_PREFIX
-                )
+            if isinstance(source, str) and source.startswith(
+                providers.CLAUDE_MACOS_DURABLE_STAGE_PENDING_PREFIX
             ):
                 rename_started.set()
                 if not release_rename.wait(timeout=2.0):
@@ -10782,9 +10592,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIs(raised.exception, captured["recovery"])
         self.assertEqual(callback_results, [False])
         self.assertEqual(callback_errors, [])
-        proof = providers._get_claude_retained_credential_proof(
-            captured["recovery"]
-        )
+        proof = providers._get_claude_retained_credential_proof(captured["recovery"])
         self.assertIsNotNone(proof)
         assert proof is not None
         self.assertEqual(proof.digest, refreshed_digest)
@@ -10807,9 +10615,7 @@ class ProviderPolicyTest(unittest.TestCase):
         persist_credential: mock.Mock,
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
-        refreshed = bytearray(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
         refreshed_bytes = bytes(refreshed)
         select_credential.return_value = providers._ClaudeLocalCredential(
             source="macos-keychain",
@@ -10884,17 +10690,12 @@ class ProviderPolicyTest(unittest.TestCase):
                 finally:
                     release_commit.set()
                     callback_thread.join(timeout=2.0)
-                shutdown_error = (
-                    providers.ClaudeCredentialInspectionInconclusive(
-                        "fixture handler quiescence failure"
-                    )
+                shutdown_error = providers.ClaudeCredentialInspectionInconclusive(
+                    "fixture handler quiescence failure"
                 )
                 setattr(
                     shutdown_error,
-                    (
-                        "_codex_claude_keychain_handler_"
-                        "quiescence_unproven"
-                    ),
+                    ("_codex_claude_keychain_handler_quiescence_unproven"),
                     True,
                 )
                 if recovery_error is not None:
@@ -10948,9 +10749,7 @@ class ProviderPolicyTest(unittest.TestCase):
             sorted(recovery_root.glob("claude-carrier-*")),
             [reported],
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_carrier"],
             str(reported),
@@ -11133,9 +10932,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 providers.ClaudeCredentialInspectionInconclusive(
                     "injected post-commit finishing failure"
                 ),
-                expected_digest=providers._claude_credential_digest(
-                    credential
-                ),
+                expected_digest=providers._claude_credential_digest(credential),
             )
 
         @contextlib.contextmanager
@@ -11244,9 +11041,7 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
             str(recovery_root),
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_cleanup_artifact"],
             str(recovery_root),
@@ -11275,10 +11070,7 @@ class ProviderPolicyTest(unittest.TestCase):
         writer: threading.Thread | None = None
         writer_errors: list[BaseException] = []
         real_commit = providers._commit_claude_macos_durable_stage
-        real_abandon = (
-            providers._ClaudeKeychainCredentialServer
-            .try_abandon_and_detach_pending_update
-        )
+        real_abandon = providers._ClaudeKeychainCredentialServer.try_abandon_and_detach_pending_update
 
         def blocking_commit(
             review: providers.ReviewWorkspace,
@@ -11369,15 +11161,9 @@ class ProviderPolicyTest(unittest.TestCase):
                     {},
                     self.claude_refresh_lock_protocol,
                 ) as runtime_env:
-                    port = int(
-                        runtime_env[
-                            providers.CLAUDE_KEYCHAIN_BROKER_PORT_ENV
-                        ]
-                    )
+                    port = int(runtime_env[providers.CLAUDE_KEYCHAIN_BROKER_PORT_ENV])
                     capability = bytes.fromhex(
-                        runtime_env[
-                            providers.CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV
-                        ]
+                        runtime_env[providers.CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV]
                     )
                     with socket.create_connection(
                         ("127.0.0.1", port),
@@ -11446,10 +11232,7 @@ class ProviderPolicyTest(unittest.TestCase):
         writer: threading.Thread | None = None
         writer_responses: list[bytes] = []
         real_commit = providers._commit_claude_macos_durable_stage
-        real_detach = (
-            providers._ClaudeKeychainCredentialServer
-            .try_abandon_and_detach_pending_update
-        )
+        real_detach = providers._ClaudeKeychainCredentialServer.try_abandon_and_detach_pending_update
         detach_calls = 0
 
         def blocking_commit(
@@ -11548,15 +11331,9 @@ class ProviderPolicyTest(unittest.TestCase):
                     {},
                     self.claude_refresh_lock_protocol,
                 ) as runtime_env:
-                    port = int(
-                        runtime_env[
-                            providers.CLAUDE_KEYCHAIN_BROKER_PORT_ENV
-                        ]
-                    )
+                    port = int(runtime_env[providers.CLAUDE_KEYCHAIN_BROKER_PORT_ENV])
                     capability = bytes.fromhex(
-                        runtime_env[
-                            providers.CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV
-                        ]
+                        runtime_env[providers.CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV]
                     )
                     with socket.create_connection(
                         ("127.0.0.1", port),
@@ -11770,15 +11547,9 @@ class ProviderPolicyTest(unittest.TestCase):
                     {},
                     self.claude_refresh_lock_protocol,
                 ) as runtime_env:
-                    port = int(
-                        runtime_env[
-                            providers.CLAUDE_KEYCHAIN_BROKER_PORT_ENV
-                        ]
-                    )
+                    port = int(runtime_env[providers.CLAUDE_KEYCHAIN_BROKER_PORT_ENV])
                     capability = bytes.fromhex(
-                        runtime_env[
-                            providers.CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV
-                        ]
+                        runtime_env[providers.CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV]
                     )
                     with socket.create_connection(
                         ("127.0.0.1", port),
@@ -11837,9 +11608,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertNotIn(b"\x00", writer_responses)
         persist.assert_not_called()
         recovery_root = providers._claude_macos_recovery_root(self.review)
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_cleanup_artifact"],
             str(recovery_root),
@@ -11914,11 +11683,9 @@ class ProviderPolicyTest(unittest.TestCase):
             try:
                 yield 43211
             finally:
-                recovery_error = (
-                    providers._bounded_claude_keychain_quiescence_recovery(
-                        quiescence_callbacks,
-                        bytearray(refreshed_bytes),
-                    )
+                recovery_error = providers._bounded_claude_keychain_quiescence_recovery(
+                    quiescence_callbacks,
+                    bytearray(refreshed_bytes),
                 )
                 self.assertTrue(recovery_started.is_set())
                 failure = providers.ClaudeCredentialInspectionInconclusive(
@@ -11926,10 +11693,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 )
                 setattr(
                     failure,
-                    (
-                        "_codex_claude_keychain_handler_"
-                        "quiescence_unproven"
-                    ),
+                    ("_codex_claude_keychain_handler_quiescence_unproven"),
                     True,
                 )
                 if recovery_error is not None:
@@ -11962,9 +11726,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     "Thread",
                     side_effect=tracking_thread,
                 ),
-                self.assertRaises(
-                    providers.ClaudeCredentialInspectionInconclusive
-                ),
+                self.assertRaises(providers.ClaudeCredentialInspectionInconclusive),
             ):
                 with self.claude_keychain_runtime(
                     self.review,
@@ -11981,9 +11743,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertFalse(recovery_threads[0].is_alive())
         persist_credential.assert_not_called()
         recovery_root = providers._claude_macos_recovery_root(self.review)
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         authentication = report["authentication"]
         reported_paths = tuple(
             pathlib.Path(value)
@@ -12016,9 +11776,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
         first = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
-        second_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        second_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
         second_value["claudeAiOauth"]["refreshToken"] = (
             "fixture-late-existing-replacement-refresh"
         )
@@ -12108,11 +11866,9 @@ class ProviderPolicyTest(unittest.TestCase):
             try:
                 yield 43211
             finally:
-                recovery_error = (
-                    providers._bounded_claude_keychain_quiescence_recovery(
-                        quiescence_callbacks,
-                        bytearray(second_bytes),
-                    )
+                recovery_error = providers._bounded_claude_keychain_quiescence_recovery(
+                    quiescence_callbacks,
+                    bytearray(second_bytes),
                 )
                 self.assertTrue(replace_started.is_set())
                 failure = providers.ClaudeCredentialInspectionInconclusive(
@@ -12120,10 +11876,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 )
                 setattr(
                     failure,
-                    (
-                        "_codex_claude_keychain_handler_"
-                        "quiescence_unproven"
-                    ),
+                    ("_codex_claude_keychain_handler_quiescence_unproven"),
                     True,
                 )
                 if recovery_error is not None:
@@ -12194,9 +11947,7 @@ class ProviderPolicyTest(unittest.TestCase):
             sorted(recovery_root.glob("claude-carrier-*")),
             [reported],
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_carrier"],
             str(reported),
@@ -12286,9 +12037,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 None,
             )
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertNotIn("recovery_carrier", report["authentication"])
         self.assertNotIn("recovery_artifact", report["authentication"])
         persist_credential.assert_not_called()
@@ -12303,9 +12052,7 @@ class ProviderPolicyTest(unittest.TestCase):
         persist_credential: mock.Mock,
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
-        refreshed = bytearray(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
         creation_error = providers.ClaudeCredentialInspectionInconclusive(
             "injected durable stage creation failure"
         )
@@ -12377,9 +12124,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 None,
             )
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertNotIn("recovery_carrier", report["authentication"])
         self.assertNotIn("recovery_artifact", report["authentication"])
         recovery_root = providers._claude_macos_recovery_root(self.review)
@@ -12403,9 +12148,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
         first = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
-        latest_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        latest_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
         latest_value["claudeAiOauth"]["refreshToken"] = (
             "fixture-latest-carrier-reverify"
         )
@@ -12444,9 +12187,7 @@ class ProviderPolicyTest(unittest.TestCase):
             )
             self.assertEqual(len(staged_carriers), 2)
             latest_credential = (
-                staged_carriers[-1]
-                / "config"
-                / providers.CLAUDE_CREDENTIAL_FILE_NAME
+                staged_carriers[-1] / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
             )
             latest_credential.write_bytes(first)
             yield 43211
@@ -12502,9 +12243,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 None,
             )
         )
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_cleanup_artifact"],
             str(recovery_root),
@@ -12528,9 +12267,7 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
         first = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
-        latest_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=7200)
-        )
+        latest_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
         latest_value["claudeAiOauth"]["refreshToken"] = (
             "fixture-latest-carrier-ordering"
         )
@@ -12676,12 +12413,8 @@ class ProviderPolicyTest(unittest.TestCase):
 
         for label, interruption in interruptions:
             with self.subTest(interruption=label):
-                original = bytearray(
-                    oauth_credential_fixture(expires_in_seconds=-60)
-                )
-                first = bytearray(
-                    oauth_credential_fixture(expires_in_seconds=3600)
-                )
+                original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+                first = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
                 second_value = json.loads(
                     oauth_credential_fixture(expires_in_seconds=7200)
                 )
@@ -12689,23 +12422,19 @@ class ProviderPolicyTest(unittest.TestCase):
                     f"fixture-cleanup-control-flow-{label}"
                 )
                 second = bytearray(json.dumps(second_value).encode())
-                select_credential.return_value = (
-                    providers._ClaudeLocalCredential(
-                        source="macos-keychain",
-                        payload=original,
-                        expires_at_ms=0,
-                        carrier_snapshot=(
-                            providers._ClaudeMacOSCarrierSnapshot(
-                                keychain_digest=(
-                                    providers._claude_credential_digest(
-                                        original
-                                    )
-                                ),
-                                file_digest=None,
-                                file_snapshot=None,
-                            )
-                        ),
-                    )
+                select_credential.return_value = providers._ClaudeLocalCredential(
+                    source="macos-keychain",
+                    payload=original,
+                    expires_at_ms=0,
+                    carrier_snapshot=(
+                        providers._ClaudeMacOSCarrierSnapshot(
+                            keychain_digest=(
+                                providers._claude_credential_digest(original)
+                            ),
+                            file_digest=None,
+                            file_snapshot=None,
+                        )
+                    ),
                 )
                 staged_carriers: list[pathlib.Path] = []
 
@@ -12718,9 +12447,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     **_kwargs: object,
                 ):
                     assert update_callback is not None
-                    recovery_root = providers._claude_macos_recovery_root(
-                        self.review
-                    )
+                    recovery_root = providers._claude_macos_recovery_root(self.review)
                     before = set(
                         recovery_root.glob(
                             f"{providers.CLAUDE_MACOS_DURABLE_STAGE_COMMITTED_PREFIX}*"
@@ -12742,9 +12469,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
                 credential_server.side_effect = broker
                 updated_snapshot = providers._ClaudeMacOSCarrierSnapshot(
-                    keychain_digest=providers._claude_credential_digest(
-                        second
-                    ),
+                    keychain_digest=providers._claude_credential_digest(second),
                     file_digest=None,
                     file_snapshot=None,
                 )
@@ -12831,9 +12556,7 @@ class ProviderPolicyTest(unittest.TestCase):
             for update in updates:
                 self.assertTrue(update_callback(update))
             staged_carriers.extend(
-                sorted(
-                    set(recovery_root.glob("claude-carrier-*")) - before
-                )
+                sorted(set(recovery_root.glob("claude-carrier-*")) - before)
             )
             self.assertEqual(len(staged_carriers), 4)
             for update in updates:
@@ -12894,9 +12617,7 @@ class ProviderPolicyTest(unittest.TestCase):
             latest_bytes,
         )
         self.assertEqual(latest_carrier, staged_carriers[-1])
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertIn(
             "recovery_cleanup_artifact",
             report["authentication"],
@@ -12946,9 +12667,7 @@ class ProviderPolicyTest(unittest.TestCase):
                         carrier_snapshot=(
                             providers._ClaudeMacOSCarrierSnapshot(
                                 keychain_digest=(
-                                    providers._claude_credential_digest(
-                                        original
-                                    )
+                                    providers._claude_credential_digest(original)
                                 ),
                                 file_digest=None,
                                 file_snapshot=None,
@@ -12987,9 +12706,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     ):
                         assert update_callback is not None
                         recovery_root = real_recovery_root(self.review)
-                        before = set(
-                            recovery_root.glob("claude-carrier-*")
-                        )
+                        before = set(recovery_root.glob("claude-carrier-*"))
                         expected_results = (
                             (True, True, True, True)
                             if cleanup_mode == "staged"
@@ -13000,12 +12717,7 @@ class ProviderPolicyTest(unittest.TestCase):
                         )
                         self.assertEqual(actual_results, expected_results)
                         staged_carriers.extend(
-                            sorted(
-                                set(
-                                    recovery_root.glob("claude-carrier-*")
-                                )
-                                - before
-                            )
+                            sorted(set(recovery_root.glob("claude-carrier-*")) - before)
                         )
                         self.assertEqual(
                             len(staged_carriers),
@@ -13103,8 +12815,8 @@ class ProviderPolicyTest(unittest.TestCase):
             scope_interruption: BaseException,
         ) -> None:
             with self.subTest(
-                    abandoned_primary=abandoned_primary,
-                    interruption=label,
+                abandoned_primary=abandoned_primary,
+                interruption=label,
             ):
                 marked_primary = (
                     providers.ClaudeCredentialInspectionInconclusive(
@@ -13119,15 +12831,11 @@ class ProviderPolicyTest(unittest.TestCase):
                         "_codex_claude_refresh_persistence_failed",
                         True,
                     )
-                original = bytearray(
-                    oauth_credential_fixture(expires_in_seconds=-60)
-                )
+                original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
                 updates: list[bytearray] = []
                 for generation in range(1, 5):
                     value = json.loads(
-                        oauth_credential_fixture(
-                            expires_in_seconds=3600 * generation
-                        )
+                        oauth_credential_fixture(expires_in_seconds=3600 * generation)
                     )
                     value["claudeAiOauth"]["refreshToken"] = (
                         f"fixture-multi-path-scope-{label}-{generation}"
@@ -13138,9 +12846,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     payload=original,
                     expires_at_ms=0,
                     carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
-                        keychain_digest=(
-                            providers._claude_credential_digest(original)
-                        ),
+                        keychain_digest=(providers._claude_credential_digest(original)),
                         file_digest=None,
                         file_snapshot=None,
                     ),
@@ -13173,9 +12879,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     remove_calls += 1
                     if remove_calls > 2:
                         return
-                    cleanup_error = OSError(
-                        f"injected cleanup failure {remove_calls}"
-                    )
+                    cleanup_error = OSError(f"injected cleanup failure {remove_calls}")
                     providers._mark_claude_macos_recovery_cleanup_artifact(
                         cleanup_error,
                         carrier,
@@ -13205,10 +12909,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     for update in updates:
                         self.assertTrue(update_callback(update))
                     staged_carriers.extend(
-                        sorted(
-                            set(recovery_root.glob("claude-carrier-*"))
-                            - before
-                        )
+                        sorted(set(recovery_root.glob("claude-carrier-*")) - before)
                     )
                     self.assertEqual(len(staged_carriers), 4)
                     try:
@@ -13218,9 +12919,7 @@ class ProviderPolicyTest(unittest.TestCase):
                             raise marked_primary
 
                 updated_snapshot = providers._ClaudeMacOSCarrierSnapshot(
-                    keychain_digest=providers._claude_credential_digest(
-                        updates[-1]
-                    ),
+                    keychain_digest=providers._claude_credential_digest(updates[-1]),
                     file_digest=None,
                     file_snapshot=None,
                 )
@@ -13367,10 +13066,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 )
                 setattr(
                     failure,
-                    (
-                        "_codex_claude_keychain_handler_"
-                        "quiescence_unproven"
-                    ),
+                    ("_codex_claude_keychain_handler_quiescence_unproven"),
                     True,
                 )
                 if persistence_error is not None:
@@ -13474,9 +13170,7 @@ class ProviderPolicyTest(unittest.TestCase):
         persist_credential.assert_called_once()
         notes = getattr(primary, "__notes__", ())
         if notes:
-            self.assertTrue(
-                any("persistence also failed" in note for note in notes)
-            )
+            self.assertTrue(any("persistence also failed" in note for note in notes))
         carrier = self.assert_macos_recovery_carrier(
             primary,
             refreshed_bytes,
@@ -13803,9 +13497,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
     def test_keychain_write_forwarded_signal_is_not_reconciled(self) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=60))
-        refreshed_value = json.loads(
-            oauth_credential_fixture(expires_in_seconds=3600)
-        )
+        refreshed_value = json.loads(oauth_credential_fixture(expires_in_seconds=3600))
         refreshed_value["claudeAiOauth"]["refreshToken"] = (
             "fixture-keychain-forwarded-signal-refresh"
         )
@@ -13937,8 +13629,8 @@ class ProviderPolicyTest(unittest.TestCase):
                     ),
                 )
                 refreshed_digest = providers._claude_credential_digest(refreshed)
-                refreshed_refresh_digest = (
-                    providers._claude_credential_refresh_digest(refreshed)
+                refreshed_refresh_digest = providers._claude_credential_refresh_digest(
+                    refreshed
                 )
                 partial_snapshot = providers._ClaudeMacOSCarrierSnapshot(
                     keychain_digest=carrier_snapshot.keychain_digest,
@@ -15016,9 +14708,7 @@ class ProviderPolicyTest(unittest.TestCase):
         ).encode()
 
         self.assertEqual(
-            providers._parse_copilot_output(
-                stdout, requested_model="claude-opus-4.8"
-            ),
+            providers._parse_copilot_output(stdout, requested_model="claude-opus-4.8"),
             (None, "claude-opus-4.7"),
         )
 
@@ -15038,9 +14728,7 @@ class ProviderPolicyTest(unittest.TestCase):
         ).encode()
 
         self.assertEqual(
-            providers._parse_copilot_output(
-                stdout, requested_model="claude-opus-4.8"
-            ),
+            providers._parse_copilot_output(stdout, requested_model="claude-opus-4.8"),
             (None, None),
         )
 
@@ -15073,9 +14761,7 @@ class ProviderPolicyTest(unittest.TestCase):
         ).encode()
 
         self.assertEqual(
-            providers._parse_copilot_output(
-                stdout, requested_model="claude-opus-4.8"
-            ),
+            providers._parse_copilot_output(stdout, requested_model="claude-opus-4.8"),
             (None, None),
         )
 
@@ -15099,9 +14785,7 @@ class ProviderPolicyTest(unittest.TestCase):
         ).encode()
 
         self.assertEqual(
-            providers._parse_copilot_output(
-                stdout, requested_model="claude-opus-4.8"
-            ),
+            providers._parse_copilot_output(stdout, requested_model="claude-opus-4.8"),
             (None, None),
         )
 
@@ -15136,9 +14820,7 @@ class ProviderPolicyTest(unittest.TestCase):
         ).encode()
 
         self.assertEqual(
-            providers._parse_copilot_output(
-                stdout, requested_model="claude-opus-4.8"
-            ),
+            providers._parse_copilot_output(stdout, requested_model="claude-opus-4.8"),
             (None, None),
         )
 
@@ -15174,9 +14856,7 @@ class ProviderPolicyTest(unittest.TestCase):
         ).encode()
 
         self.assertEqual(
-            providers._parse_copilot_output(
-                stdout, requested_model="claude-opus-4.8"
-            ),
+            providers._parse_copilot_output(stdout, requested_model="claude-opus-4.8"),
             (None, None),
         )
 
@@ -15208,9 +14888,7 @@ class ProviderPolicyTest(unittest.TestCase):
         ).encode()
 
         self.assertEqual(
-            providers._parse_copilot_output(
-                stdout, requested_model="claude-opus-4.8"
-            ),
+            providers._parse_copilot_output(stdout, requested_model="claude-opus-4.8"),
             (None, "claude-opus-4.8"),
         )
 
@@ -15540,9 +15218,7 @@ class ProviderPolicyTest(unittest.TestCase):
     def test_copilot_streams_complete_jsonl_larger_than_memory_capture(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             stdout_path = pathlib.Path(temporary) / "copilot.stdout.log"
-            progress = json.dumps(
-                {"type": "progress", "data": {"padding": "x" * 4096}}
-            )
+            progress = json.dumps({"type": "progress", "data": {"padding": "x" * 4096}})
             with stdout_path.open("w", encoding="utf-8") as handle:
                 while handle.tell() <= 4 * 1024 * 1024:
                     handle.write(progress + "\n")
@@ -15869,8 +15545,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
     def test_linux_prompt_projects_host_paths_and_read_only_guidance(self) -> None:
         host_prompt = (
-            f"Workspace={self.review.workspace_root}\n"
-            f"Diff={self.review.diff_file}\n"
+            f"Workspace={self.review.workspace_root}\nDiff={self.review.diff_file}\n"
         ).encode()
 
         projected = providers._claude_review_prompt(
@@ -15930,8 +15605,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
     def test_macos_prompt_projects_default_paths_to_host_absolutes(self) -> None:
         default_prompt = (
-            b"- Workspace: .\n"
-            b"- Primary diff file: .codex-review/review.diff\n"
+            b"- Workspace: .\n- Primary diff file: .codex-review/review.diff\n"
         )
 
         projected = providers._claude_review_prompt(
@@ -16010,6 +15684,110 @@ class ProviderPolicyTest(unittest.TestCase):
             (self.review.container_dir / "attempts.json").read_text(encoding="utf-8"),
         )
 
+    def test_model_chain_supervision_diagnostic_uses_bound_attempts_directory(
+        self,
+    ) -> None:
+        model = "gpt-5.6-sol"
+        stdout_name = f"01-codex-{model}.stdout.log"
+        stderr_name = f"01-codex-{model}.stderr.log"
+        attempts_path = self.review.container_dir / "attempts"
+        retained = self.review.container_dir / "attempts-retained"
+
+        with providers._open_review_launch_binding(self.review) as launch:
+
+            def fail_after_swap(**_kwargs) -> providers.Attempt:
+                with launch.open_attempt_file(stdout_name) as stdout_file:
+                    stdout_file.write(b"partial reviewer output")
+                with launch.open_attempt_file(stderr_name):
+                    pass
+                attempts_path.rename(retained)
+                attempts_path.mkdir(mode=0o700)
+                (attempts_path / stdout_name).write_bytes(b"forged stdout")
+                (attempts_path / stderr_name).write_bytes(b"forged stderr")
+                raise providers.ReviewTimeoutError("review timed out")
+
+            attempts: list[providers.Attempt] = []
+            with self.assertRaisesRegex(
+                providers.ReviewTimeoutError,
+                "review timed out",
+            ):
+                providers._run_model_chain(
+                    review=self.review,
+                    models=(model,),
+                    runner=fail_after_swap,
+                    runtime="codex",
+                    requested_effort=providers.CODEX_REASONING_EFFORT,
+                    env={},
+                    attempts=attempts,
+                    launch=launch,
+                )
+
+        self.assertEqual(
+            (attempts_path / stderr_name).read_bytes(),
+            b"forged stderr",
+        )
+        self.assertIn(
+            b"review supervision failed: review timed out",
+            (retained / stderr_name).read_bytes(),
+        )
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0].category, "inconclusive")
+
+    def test_failure_attempts_do_not_follow_container_swap_to_victim(self) -> None:
+        container = self.review.container_dir
+        moved_container = container.with_name(f"{container.name}-attempts-bound")
+        victim = container.with_name(f"{container.name}-attempts-victim")
+        victim.mkdir(mode=0o700)
+        victim_attempts = victim / "attempts.json"
+        original_attempts = '[{"keep":"original"}]\n'
+        victim_attempts.write_text(original_attempts, encoding="utf-8")
+        sentinel = victim / "sentinel"
+        sentinel.write_text("keep me\n", encoding="utf-8")
+        real_persist_runner_error = providers._persist_runner_error
+        stderr = io.StringIO()
+
+        def persist_then_replace(review, text):
+            diagnostic_error = real_persist_runner_error(review, text)
+            self.assertIsNone(diagnostic_error)
+            container.rename(moved_container)
+            container.symlink_to(victim, target_is_directory=True)
+            return diagnostic_error
+
+        try:
+            with (
+                mock.patch.object(
+                    providers,
+                    "_persist_runner_error",
+                    side_effect=persist_then_replace,
+                ),
+                contextlib.redirect_stderr(stderr),
+            ):
+                persisted = providers._persist_failure_artifacts(
+                    self.review,
+                    "review failed safely\n",
+                    (),
+                )
+
+            self.assertFalse(persisted)
+            self.assertEqual(
+                victim_attempts.read_text(encoding="utf-8"), original_attempts
+            )
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep me\n")
+            self.assertEqual(
+                (moved_container / "runner-error.txt").read_text(encoding="utf-8"),
+                "review failed safely\n",
+            )
+            self.assertFalse((moved_container / "attempts.json").exists())
+            self.assertIn("review attempts were not persisted", stderr.getvalue())
+        finally:
+            if container.is_symlink():
+                container.unlink()
+            if moved_container.is_dir():
+                moved_container.rename(container)
+            victim_attempts.unlink(missing_ok=True)
+            sentinel.unlink(missing_ok=True)
+            victim.rmdir()
+
     def test_finish_preserves_unicode_separator_at_result_edges(self) -> None:
         final_text = "\u2028No findings.\u2029"
 
@@ -16037,16 +15815,16 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(codex_attempt.call_count, 1)
 
     @mock.patch.object(providers, "child_environment", return_value={})
-    @mock.patch.object(
-        providers,
-        "_codex_attempt",
-        side_effect=providers.ReviewTimeoutError("review timed out"),
-    )
+    @mock.patch.object(providers, "_codex_attempt")
     def test_codex_attempt_timeout_is_inconclusive(
         self,
         codex_attempt: mock.Mock,
         _environment: mock.Mock,
     ) -> None:
+        codex_attempt.side_effect = self._bound_supervision_failure(
+            "codex",
+            providers.ReviewTimeoutError("review timed out"),
+        )
         outcome = providers.run_review(review=self.review, reviewer="codex")
 
         self.assertEqual(outcome.returncode, 75)
@@ -16195,6 +15973,13 @@ class ProviderPolicyTest(unittest.TestCase):
 
         for error_type, failure_class in cases:
             with self.subTest(failure_class=failure_class):
+                self._restore_private_review_artifacts()
+                for suffix in ("stdout.log", "stderr.log"):
+                    (
+                        self.review.container_dir
+                        / "attempts"
+                        / f"01-claude-{providers.CLAUDE_MODELS[0]}.{suffix}"
+                    ).unlink(missing_ok=True)
                 diagnostic = f"private diagnostic for {failure_class}"
                 providers.write_json(
                     self.review.container_dir / "claude-runtime.json",
@@ -16231,7 +16016,10 @@ class ProviderPolicyTest(unittest.TestCase):
                     mock.patch.object(
                         providers,
                         "_claude_attempt",
-                        side_effect=error_type(diagnostic),
+                        side_effect=self._bound_supervision_failure(
+                            "claude",
+                            error_type(diagnostic),
+                        ),
                     ),
                     mock.patch.object(providers, "_copilot_attempt") as copilot_attempt,
                 ):
@@ -16317,11 +16105,7 @@ class ProviderPolicyTest(unittest.TestCase):
         "resolve_reviewer_executable",
         return_value=pathlib.Path("/bin/copilot"),
     )
-    @mock.patch.object(
-        providers,
-        "_copilot_attempt",
-        side_effect=providers.ReviewOutputLimitError("review output exceeded limit"),
-    )
+    @mock.patch.object(providers, "_copilot_attempt")
     def test_copilot_attempt_output_limit_is_inconclusive(
         self,
         copilot_attempt: mock.Mock,
@@ -16329,6 +16113,10 @@ class ProviderPolicyTest(unittest.TestCase):
         _resolve_claude: mock.Mock,
         _environment: mock.Mock,
     ) -> None:
+        copilot_attempt.side_effect = self._bound_supervision_failure(
+            "copilot",
+            providers.ReviewOutputLimitError("review output exceeded limit"),
+        )
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
@@ -16541,9 +16329,7 @@ class ProviderPolicyTest(unittest.TestCase):
         resolve.assert_called_once_with("copilot")
         self.assertIn(
             "secure runtime is unavailable",
-            (self.review.container_dir / "claude-skip.txt").read_text(
-                encoding="utf-8"
-            ),
+            (self.review.container_dir / "claude-skip.txt").read_text(encoding="utf-8"),
         )
 
     @mock.patch.dict(
@@ -16554,9 +16340,7 @@ class ProviderPolicyTest(unittest.TestCase):
     @mock.patch.object(
         providers,
         "_resolve_validated_claude_executable",
-        side_effect=providers.ClaudeProbeSandboxUnavailable(
-            "sandbox unavailable"
-        ),
+        side_effect=providers.ClaudeProbeSandboxUnavailable("sandbox unavailable"),
     )
     @mock.patch.object(providers, "resolve_reviewer_executable")
     @mock.patch.object(providers, "_copilot_attempt")
@@ -16765,9 +16549,7 @@ class ProviderPolicyTest(unittest.TestCase):
         resolve.assert_called_once_with("copilot")
         self.assertIn(
             "only wrapper found",
-            (self.review.container_dir / "claude-skip.txt").read_text(
-                encoding="utf-8"
-            ),
+            (self.review.container_dir / "claude-skip.txt").read_text(encoding="utf-8"),
         )
 
     @mock.patch.object(providers, "child_environment", return_value={})
@@ -16935,10 +16717,8 @@ class ProviderPolicyTest(unittest.TestCase):
         _resolve_claude: mock.Mock,
         _environment: mock.Mock,
     ) -> None:
-        claude_attempt.side_effect = (
-            providers.ClaudeCredentialInspectionInconclusive(
-                "credential source changed while it was read"
-            )
+        claude_attempt.side_effect = providers.ClaudeCredentialInspectionInconclusive(
+            "credential source changed while it was read"
         )
 
         outcome = providers.run_review(
@@ -16967,6 +16747,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
         for consent, condition in cases:
             with self.subTest(consent=consent, condition=condition):
+                self._restore_private_review_artifacts()
                 client = self.claude_keychain_client.parent / (
                     f"late-security-{condition}"
                 )
@@ -16990,9 +16771,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     else:
                         client.chmod(0o600)
                     providers._read_claude_keychain_credential(self.review)
-                    raise AssertionError(
-                        "late Keychain inspection unexpectedly passed"
-                    )
+                    raise AssertionError("late Keychain inspection unexpectedly passed")
 
                 with (
                     mock.patch.object(
@@ -17141,7 +16920,10 @@ class ProviderPolicyTest(unittest.TestCase):
     ) -> None:
         error = providers.ReviewTimeoutError("primary review timeout")
         setattr(error, "_codex_claude_refresh_persistence_failed", True)
-        claude_attempt.side_effect = error
+        claude_attempt.side_effect = self._bound_supervision_failure(
+            "claude",
+            error,
+        )
         providers.write_json(
             self.review.container_dir / "claude-runtime.json",
             {
@@ -17308,6 +17090,7 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         for error in errors:
             with self.subTest(error_type=type(error).__name__):
+                self._restore_private_review_artifacts()
                 claude_attempt.reset_mock()
                 copilot_attempt.reset_mock()
                 resolve.reset_mock()
@@ -17378,9 +17161,7 @@ class ProviderPolicyTest(unittest.TestCase):
         resolve.assert_called_once_with("copilot")
         self.assertIn(
             "trusted rg unavailable",
-            (self.review.container_dir / "claude-skip.txt").read_text(
-                encoding="utf-8"
-            ),
+            (self.review.container_dir / "claude-skip.txt").read_text(encoding="utf-8"),
         )
 
     @mock.patch.dict(
@@ -17396,9 +17177,7 @@ class ProviderPolicyTest(unittest.TestCase):
     @mock.patch.object(
         providers,
         "_with_claude_review_tool_path",
-        side_effect=providers.ClaudeReviewToolUnavailable(
-            "trusted rg unavailable"
-        ),
+        side_effect=providers.ClaudeReviewToolUnavailable("trusted rg unavailable"),
     )
     @mock.patch.object(providers, "resolve_reviewer_executable")
     @mock.patch.object(providers, "_copilot_attempt")
@@ -17576,9 +17355,7 @@ class ProviderPolicyTest(unittest.TestCase):
         resolve.assert_called_once_with("copilot")
         self.assertIn(
             "loopback bind failed",
-            (self.review.container_dir / "claude-skip.txt").read_text(
-                encoding="utf-8"
-            ),
+            (self.review.container_dir / "claude-skip.txt").read_text(encoding="utf-8"),
         )
 
     @mock.patch.object(providers, "child_environment", return_value={})
@@ -17683,6 +17460,7 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         for stdout, stderr in diagnostics:
             with self.subTest(stdout=stdout, stderr=stderr):
+                self._restore_private_review_artifacts()
                 claude_attempt.reset_mock()
                 copilot_attempt.reset_mock()
                 resolve.reset_mock()
@@ -18031,9 +17809,7 @@ class ProviderPolicyTest(unittest.TestCase):
             stdout=json.dumps(
                 {
                     "type": "turn.failed",
-                    "error": {
-                        "message": "Model is not available for your account"
-                    },
+                    "error": {"message": "Model is not available for your account"},
                 }
             ).encode(),
             stderr=b"",
@@ -18120,54 +17896,959 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
         )
 
-    @mock.patch.object(providers, "resolve_reviewer_executable")
-    def test_sensitive_content_blocks_external_reviewer_before_launch(
+    def test_secret_delta_schema_rejects_impossible_status_combinations(
         self,
-        resolve: mock.Mock,
+    ) -> None:
+        public_path = (
+            self.review.workspace_root
+            / ".codex-review"
+            / workspace_runtime.SYNTHETIC_MANIFEST_NAME
+        )
+        private_path = (
+            self.review.container_dir
+            / workspace_runtime.SYNTHETIC_PRIVATE_MANIFEST_NAME
+        )
+        template = json.loads(public_path.read_text(encoding="utf-8"))
+        limitations = template["secret_delta"]["limitations"]
+        invalid_deltas = (
+            (
+                "missing-failure-class",
+                {
+                    "limitations": limitations,
+                    "location_status": "inconclusive",
+                    "status": "inconclusive",
+                    "violations": [],
+                },
+            ),
+            (
+                "clean-with-null-failure-class",
+                {
+                    "failure_class": None,
+                    "limitations": limitations,
+                    "location_status": "complete",
+                    "status": "clean",
+                    "violations": [],
+                },
+            ),
+            (
+                "inconclusive-with-complete-locations",
+                {
+                    "failure_class": "exact-value-scan-incomplete",
+                    "limitations": limitations,
+                    "location_status": "complete",
+                    "status": "inconclusive",
+                    "violations": [],
+                },
+            ),
+            (
+                "violations-without-a-violation",
+                {
+                    "limitations": limitations,
+                    "location_status": "complete",
+                    "status": "violations",
+                    "violations": [],
+                },
+            ),
+        )
+
+        for label, secret_delta in invalid_deltas:
+            with self.subTest(case=label):
+                manifest = json.loads(json.dumps(template))
+                manifest["secret_delta"] = secret_delta
+                encoded = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+                public_path.write_text(encoded, encoding="utf-8")
+                private_path.write_text(encoded, encoding="utf-8")
+                private_path.chmod(0o600)
+                self._refresh_control_artifact_state()
+
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "secret-delta state is invalid",
+                ):
+                    workspace_runtime.validate_external_workspace(self.review)
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        return_value=(pathlib.Path("/bin/claude"), {}),
+    )
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_sensitive_content_reaches_external_reviewer_in_raw_form(
+        self,
+        run_model_chain: mock.Mock,
+        _resolve_claude: mock.Mock,
+        environment: mock.Mock,
     ) -> None:
         secret = "AKIA" + "A" * 16
-        (self.review.workspace_root / "secret.txt").write_text(
+        secret_file = self.review.workspace_root / "secret.txt"
+        secret_file.write_text(
             secret + "\n",
             encoding="utf-8",
         )
+        self.review.diff_file.write_text(
+            "diff --git a/secret.txt b/secret.txt\n+" + secret + "\n",
+            encoding="utf-8",
+        )
+        self._refresh_control_artifact_state()
+        run_model_chain.return_value = ("success", "No findings.")
+
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
             egress_consent="explicit-claude-with-copilot-fallback",
         )
-        self.assertEqual(outcome.returncode, 2)
-        resolve.assert_not_called()
-        self.assertFalse((self.review.container_dir / "egress.json").exists())
-        self.assertFalse((self.review.container_dir / "preflight.json").exists())
-        error = (self.review.container_dir / "runner-error.txt").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("sensitive content preflight", error)
-        self.assertNotIn(secret, error)
 
-    @mock.patch.object(providers, "_codex_attempt")
-    def test_sensitive_content_blocks_codex_before_launch(
+        self.assertEqual(outcome.returncode, 0)
+        self.assertEqual(outcome.final_text, "No findings.")
+        run_model_chain.assert_called_once()
+        environment.assert_called_once()
+        self.assertEqual(secret_file.read_text(encoding="utf-8"), secret + "\n")
+        self.assertIn(secret, self.review.diff_file.read_text(encoding="utf-8"))
+        preflight = json.loads(
+            (self.review.container_dir / "preflight.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            preflight["status"],
+            "review workspace containment and integrity checks passed",
+        )
+        self.assertEqual(preflight["secret_delta"]["status"], "inconclusive")
+        self.assertNotIn(secret, json.dumps(preflight, sort_keys=True))
+        egress = json.loads(
+            (self.review.container_dir / "egress.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            egress["preflight"],
+            "review workspace containment and integrity checks passed",
+        )
+        self.assertEqual(
+            egress["merge_gate"],
+            "secret-delta status is evaluated separately",
+        )
+        self.assertIn(
+            "the complete generated frozen diff without secret redaction",
+            egress["included"],
+        )
+        self.assertFalse(
+            any(
+                (self.review.container_dir / name).exists()
+                for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
+            )
+        )
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_sensitive_content_reaches_codex_in_raw_form(
         self,
-        codex_attempt: mock.Mock,
+        run_model_chain: mock.Mock,
+        environment: mock.Mock,
     ) -> None:
         secret = "AKIA" + "B" * 16
+        config = self.review.workspace_root / "config"
+        config.write_text(
+            "AWS_KEY=" + secret + "\n",
+            encoding="utf-8",
+        )
         self.review.diff_file.write_text(
-            "diff --git a/config b/config\n-AWS_KEY=" + secret + "\n",
+            "diff --git a/config b/config\n+AWS_KEY=" + secret + "\n",
             encoding="utf-8",
         )
         self._refresh_control_artifact_state()
+        run_model_chain.return_value = ("success", "No findings.")
+
         outcome = providers.run_review(
             review=self.review,
             reviewer="codex",
         )
+
+        self.assertEqual(outcome.returncode, 0)
+        self.assertEqual(outcome.final_text, "No findings.")
+        run_model_chain.assert_called_once()
+        environment.assert_called_once()
+        self.assertIn(secret, config.read_text(encoding="utf-8"))
+        self.assertIn(secret, self.review.diff_file.read_text(encoding="utf-8"))
+        preflight = json.loads(
+            (self.review.container_dir / "preflight.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            preflight["status"],
+            "review workspace containment and integrity checks passed",
+        )
+        self.assertEqual(preflight["secret_delta"]["status"], "inconclusive")
+        self.assertNotIn(secret, json.dumps(preflight, sort_keys=True))
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_secret_delta_violation_does_not_add_a_codex_launch_gate(
+        self,
+        run_model_chain: mock.Mock,
+        environment: mock.Mock,
+    ) -> None:
+        repo = pathlib.Path(self.temporary.name) / "prepared-source"
+        repo.mkdir(mode=0o700)
+
+        def git(*args: str) -> bytes:
+            completed = common.run(("git", *args), cwd=repo, check=True)
+            return completed.stdout.strip()
+
+        git("init", "-q")
+        git("config", "user.name", "Codex Test")
+        git("config", "user.email", "codex-test@example.invalid")
+        git("config", "commit.gpgSign", "false")
+        (repo / "README.md").write_text("base\n", encoding="utf-8")
+        git("add", "README.md")
+        git("commit", "-q", "-m", "Base")
+        base = git("rev-parse", "HEAD").decode("ascii")
+
+        secret = b"RuntimeOpaque" + b"Q" * 16 + b"9!"
+        payload = b'password = "' + secret + b'"\n'
+        (repo / "config.txt").write_bytes(payload)
+        git("add", "config.txt")
+        git("commit", "-q", "-m", "Add credential")
+        head = git("rev-parse", "HEAD").decode("ascii")
+
+        review = workspace_runtime.prepare_workspace(
+            repo=repo,
+            base_ref=base,
+            head_ref=head,
+            ownership_handoff=lambda _review: None,
+        )
+        run_model_chain.return_value = ("success", "No findings.")
+
+        outcome = providers.run_review(
+            review=review,
+            reviewer="codex",
+        )
+
+        self.assertEqual(outcome.returncode, 0)
+        self.assertEqual(outcome.final_text, "No findings.")
+        run_model_chain.assert_called_once()
+        environment.assert_called_once()
+        self.assertEqual(
+            (review.workspace_root / "config.txt").read_bytes(),
+            payload,
+        )
+        self.assertIn(secret, review.diff_file.read_bytes())
+        preflight = json.loads(
+            (review.container_dir / "preflight.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            preflight["status"],
+            "review workspace containment and integrity checks passed",
+        )
+        self.assertEqual(preflight["secret_delta"]["status"], "violations")
+        self.assertEqual(
+            preflight["secret_delta"]["violations"][0]["additions"],
+            [
+                {
+                    "line": 1,
+                    "occurrence_count": 1,
+                    "path": "config.txt",
+                    "surface": "blob",
+                }
+            ],
+        )
+        self.assertNotIn(secret.decode("ascii"), json.dumps(preflight, sort_keys=True))
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_prompt_only_provider_secret_reaches_trusted_codex(
+        self,
+        run_model_chain: mock.Mock,
+        environment: mock.Mock,
+    ) -> None:
+        secret = "AKIA" + "C" * 16
+        self.review.prompt_file.write_text(
+            f"Review the removal of {secret}.\n",
+            encoding="utf-8",
+        )
+        self._refresh_control_artifact_state()
+        run_model_chain.return_value = ("success", "No findings.")
+
+        outcome = providers.run_review(
+            review=self.review,
+            reviewer="codex",
+        )
+
+        self.assertEqual(outcome.returncode, 0)
+        self.assertEqual(outcome.final_text, "No findings.")
+        run_model_chain.assert_called_once()
+        environment.assert_called_once()
+        preflight = (self.review.container_dir / "preflight.json").read_text(
+            encoding="utf-8",
+        )
+        self.assertNotIn(secret, preflight)
+        self.assertIn(
+            secret,
+            self.review.prompt_file.read_text(encoding="utf-8"),
+        )
+        self.assertFalse(
+            any(
+                (self.review.container_dir / name).exists()
+                for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
+            )
+        )
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_private_artifact_cleanup_failure_blocks_codex_launch(
+        self,
+        run_model_chain: mock.Mock,
+        environment: mock.Mock,
+    ) -> None:
+        with mock.patch.object(
+            providers,
+            "remove_private_review_artifacts",
+            return_value="unlink denied",
+        ):
+            outcome = providers.run_review(
+                review=self.review,
+                reviewer="codex",
+            )
+
         self.assertEqual(outcome.returncode, 2)
-        codex_attempt.assert_not_called()
+        run_model_chain.assert_not_called()
+        environment.assert_not_called()
         self.assertFalse((self.review.container_dir / "preflight.json").exists())
         error = (self.review.container_dir / "runner-error.txt").read_text(
             encoding="utf-8"
         )
-        self.assertIn("sensitive content preflight", error)
-        self.assertNotIn(secret, error)
+        self.assertIn("private artifact cleanup failed", error)
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_cleanup_failure_after_container_replacement_uses_stderr(
+        self,
+        run_model_chain: mock.Mock,
+        environment: mock.Mock,
+    ) -> None:
+        container = self.review.container_dir
+        moved_container = container.with_name(f"{container.name}-moved")
+        stderr = io.StringIO()
+
+        def replace_container(*_args, **_kwargs):
+            container.rename(moved_container)
+            container.mkdir(mode=0o700)
+            (container / "sentinel").write_text("keep me\n", encoding="utf-8")
+            return "forced cleanup failure"
+
+        try:
+            with (
+                mock.patch.object(
+                    providers,
+                    "remove_private_review_artifacts",
+                    side_effect=replace_container,
+                ),
+                contextlib.redirect_stderr(stderr),
+            ):
+                outcome = providers.run_review(
+                    review=self.review,
+                    reviewer="codex",
+                )
+
+            self.assertEqual(outcome.returncode, 2)
+            run_model_chain.assert_not_called()
+            environment.assert_not_called()
+            self.assertEqual(
+                (container / "sentinel").read_text(encoding="utf-8"),
+                "keep me\n",
+            )
+            self.assertFalse((container / "runner-error.txt").exists())
+            self.assertFalse((moved_container / "runner-error.txt").exists())
+            self.assertIn(
+                "review egress private artifact cleanup failed", stderr.getvalue()
+            )
+            self.assertIn("runner diagnostic was not persisted", stderr.getvalue())
+        finally:
+            if container.is_dir():
+                (container / "sentinel").unlink(missing_ok=True)
+                (container / "runner-error.txt").unlink(missing_ok=True)
+                container.rmdir()
+            if moved_container.is_dir():
+                moved_container.rename(container)
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_container_replacement_during_private_scrub_blocks_launch(
+        self,
+        run_model_chain: mock.Mock,
+        environment: mock.Mock,
+    ) -> None:
+        container = self.review.container_dir
+        moved_container = container.with_name(f"{container.name}-scrubbed")
+        real_unlink = workspace_runtime._unlink_private_review_artifacts
+        stderr = io.StringIO()
+
+        def scrub_then_replace(*args, **kwargs):
+            cleanup_errors = real_unlink(*args, **kwargs)
+            self.assertEqual(cleanup_errors, [])
+            container.rename(moved_container)
+            container.mkdir(mode=0o700)
+            (container / "sentinel").write_text("keep me\n", encoding="utf-8")
+            for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES:
+                (container / name).write_bytes(b"replacement-private-artifact")
+            return cleanup_errors
+
+        try:
+            with (
+                mock.patch.object(
+                    workspace_runtime,
+                    "_unlink_private_review_artifacts",
+                    side_effect=scrub_then_replace,
+                ),
+                contextlib.redirect_stderr(stderr),
+            ):
+                outcome = providers.run_review(
+                    review=self.review,
+                    reviewer="codex",
+                )
+
+            self.assertEqual(outcome.returncode, 2)
+            run_model_chain.assert_not_called()
+            environment.assert_not_called()
+            self.assertEqual(
+                (container / "sentinel").read_text(encoding="utf-8"),
+                "keep me\n",
+            )
+            for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES:
+                self.assertEqual(
+                    (container / name).read_bytes(),
+                    b"replacement-private-artifact",
+                )
+            self.assertFalse((container / "preflight.json").exists())
+            self.assertFalse((moved_container / "preflight.json").exists())
+            self.assertFalse((container / "runner-error.txt").exists())
+            self.assertFalse((moved_container / "runner-error.txt").exists())
+            self.assertIn(
+                "review egress private artifact cleanup failed",
+                stderr.getvalue(),
+            )
+            self.assertIn("runner diagnostic was not persisted", stderr.getvalue())
+        finally:
+            if container.is_dir():
+                for name in (
+                    "sentinel",
+                    "runner-error.txt",
+                    *workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES,
+                ):
+                    (container / name).unlink(missing_ok=True)
+                container.rmdir()
+            if moved_container.is_dir():
+                moved_container.rename(container)
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_completed_scrub_keeps_launch_bound_after_container_swap(
+        self,
+        run_model_chain: mock.Mock,
+        environment: mock.Mock,
+    ) -> None:
+        container = self.review.container_dir
+        moved_container = container.with_name(f"{container.name}-bound")
+        original_prompt = self.review.prompt_file.read_bytes()
+        trusted_file = self.review.workspace_root / "launch-source.txt"
+        trusted_file.write_text("trusted\n", encoding="utf-8")
+        self._refresh_control_artifact_state()
+        real_scrub = providers.remove_private_review_artifacts
+
+        def scrub_then_swap(*args, **kwargs):
+            cleanup_error = real_scrub(*args, **kwargs)
+            self.assertIsNone(cleanup_error)
+            container.rename(moved_container)
+            replacement_workspace = container / "workspace"
+            replacement_control = replacement_workspace / ".codex-review"
+            replacement_control.mkdir(parents=True, mode=0o755)
+            (replacement_workspace / "launch-source.txt").write_text(
+                "replacement\n",
+                encoding="utf-8",
+            )
+            (replacement_control / "review.prompt").write_text(
+                "replacement prompt\n",
+                encoding="utf-8",
+            )
+            bound_prompt = moved_container / "workspace/.codex-review/review.prompt"
+            bound_prompt.rename(bound_prompt.with_name("review.prompt.original"))
+            bound_prompt.write_text("swapped prompt\n", encoding="utf-8")
+            return None
+
+        def inspect_bound_launch(**kwargs):
+            runtime_review = kwargs["review"]
+            launch = kwargs["launch"]
+            self.assertEqual(launch.prompt, original_prompt)
+            self.assertEqual(
+                runtime_review.container_dir.resolve(),
+                moved_container.resolve(),
+            )
+            stdout_path = moved_container / "bound-launch.stdout.log"
+            stderr_path = moved_container / "bound-launch.stderr.log"
+            completed = common.run(
+                (
+                    sys.executable,
+                    "-c",
+                    "from pathlib import Path; print(Path('launch-source.txt').read_text().strip())",
+                ),
+                cwd_fd=launch.workspace_descriptor,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                timeout_seconds=5,
+                output_file_limit_bytes=64 * 1024,
+            )
+            self.assertEqual(completed.returncode, 0)
+            self.assertEqual(completed.stdout, b"trusted\n")
+            return "success", "No findings."
+
+        run_model_chain.side_effect = inspect_bound_launch
+        with mock.patch.object(
+            providers,
+            "remove_private_review_artifacts",
+            side_effect=scrub_then_swap,
+        ):
+            outcome = providers.run_review(
+                review=self.review,
+                reviewer="codex",
+            )
+
+        self.assertEqual(outcome.returncode, 0)
+        self.assertEqual(outcome.final_text, "No findings.")
+        environment.assert_called_once()
+        self.assertTrue((moved_container / "preflight.json").is_file())
+        self.assertFalse((container / "preflight.json").exists())
+        self.assertFalse((container / "egress.json").exists())
+
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_workspace_swapped_between_binding_and_preflight_is_rejected(
+        self,
+        run_model_chain: mock.Mock,
+    ) -> None:
+        container = self.review.container_dir
+        workspace = self.review.workspace_root
+        legal_workspace = container / "workspace-legal"
+        malicious_workspace = container / "workspace-malicious"
+        workspace.rename(legal_workspace)
+        malicious_control = workspace / ".codex-review"
+        malicious_control.mkdir(parents=True, mode=0o755)
+        (malicious_control / "review.prompt").write_text(
+            "attacker prompt\n",
+            encoding="utf-8",
+        )
+        real_open = providers._open_review_launch_binding
+
+        def bind_then_restore(review):
+            launch = real_open(review)
+            workspace.rename(malicious_workspace)
+            legal_workspace.rename(workspace)
+            return launch
+
+        with mock.patch.object(
+            providers,
+            "_open_review_launch_binding",
+            side_effect=bind_then_restore,
+        ):
+            outcome = providers.run_review(
+                review=self.review,
+                reviewer="codex",
+            )
+
+        self.assertEqual(outcome.returncode, 2)
+        run_model_chain.assert_not_called()
+        error = (container / "runner-error.txt").read_text(encoding="utf-8")
+        self.assertIn("workspace escapes its container", error)
+        self.assertFalse((container / "preflight.json").exists())
+
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_prompt_swapped_between_binding_and_preflight_is_rejected(
+        self,
+        run_model_chain: mock.Mock,
+    ) -> None:
+        prompt = self.review.prompt_file
+        legal_prompt = prompt.with_name("review.prompt.legal")
+        malicious_prompt = self.review.container_dir / "bound-malicious-prompt"
+        prompt.rename(legal_prompt)
+        prompt.write_text("attacker prompt\n", encoding="utf-8")
+        real_open = providers._open_review_launch_binding
+
+        def bind_then_restore(review):
+            launch = real_open(review)
+            prompt.rename(malicious_prompt)
+            legal_prompt.rename(prompt)
+            self._refresh_control_artifact_state()
+            return launch
+
+        with mock.patch.object(
+            providers,
+            "_open_review_launch_binding",
+            side_effect=bind_then_restore,
+        ):
+            outcome = providers.run_review(
+                review=self.review,
+                reviewer="codex",
+            )
+
+        self.assertEqual(outcome.returncode, 2)
+        run_model_chain.assert_not_called()
+        error = (self.review.container_dir / "runner-error.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("bound review prompt", error)
+        self.assertFalse((self.review.container_dir / "preflight.json").exists())
+
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_binding_close_failure_is_reported_after_all_close_attempts(
+        self,
+        run_model_chain: mock.Mock,
+    ) -> None:
+        real_close = providers._close_launch_descriptor
+        close_calls: list[int] = []
+
+        def fail_first_close(descriptor: int) -> None:
+            close_calls.append(descriptor)
+            if len(close_calls) == 1:
+                raise OSError(errno.EIO, "injected close failure")
+            real_close(descriptor)
+
+        with mock.patch.object(
+            providers,
+            "_close_launch_descriptor",
+            side_effect=fail_first_close,
+        ):
+            outcome = providers.run_review(
+                review=self.review,
+                reviewer="codex",
+            )
+
+        self.assertEqual(outcome.returncode, 2)
+        self.assertGreaterEqual(len(close_calls), 3)
+        run_model_chain.assert_not_called()
+        error = (self.review.container_dir / "runner-error.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("cannot close bound review control directory", error)
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        return_value=(pathlib.Path("/bin/claude"), {}),
+    )
+    @mock.patch.object(
+        providers,
+        "_prepare_claude_keychain_broker",
+        side_effect=lambda _review, env: env,
+    )
+    @mock.patch.object(
+        providers,
+        "_with_claude_review_tool_path",
+        side_effect=lambda _review, env: env,
+    )
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_claude_egress_stays_in_bound_container_after_scrub_swap(
+        self,
+        run_model_chain: mock.Mock,
+        _review_tool: mock.Mock,
+        _keychain_broker: mock.Mock,
+        _resolve_claude: mock.Mock,
+        environment: mock.Mock,
+    ) -> None:
+        container = self.review.container_dir
+        moved_container = container.with_name(f"{container.name}-claude-bound")
+        real_scrub = providers.remove_private_review_artifacts
+
+        def scrub_then_swap(*args, **kwargs):
+            cleanup_error = real_scrub(*args, **kwargs)
+            self.assertIsNone(cleanup_error)
+            container.rename(moved_container)
+            replacement_control = container / "workspace/.codex-review"
+            replacement_control.mkdir(parents=True, mode=0o755)
+            (replacement_control / "review.prompt").write_text(
+                "replacement prompt\n",
+                encoding="utf-8",
+            )
+            return None
+
+        run_model_chain.return_value = ("success", "No findings.")
+        with mock.patch.object(
+            providers,
+            "remove_private_review_artifacts",
+            side_effect=scrub_then_swap,
+        ):
+            outcome = providers.run_review(
+                review=self.review,
+                reviewer="claude",
+                egress_consent="explicit-claude-with-copilot-fallback",
+            )
+
+        self.assertEqual(outcome.returncode, 0)
+        self.assertEqual(outcome.final_text, "No findings.")
+        environment.assert_called_once()
+        self.assertTrue((moved_container / "preflight.json").is_file())
+        egress = json.loads(
+            (moved_container / "egress.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            egress["consent"],
+            "explicit-claude-with-copilot-fallback",
+        )
+        self.assertEqual(egress["review_contract"], "supplied-diff-no-git")
+        self.assertFalse(egress["named_lane_eligible"])
+        self.assertFalse((container / "preflight.json").exists())
+        self.assertFalse((container / "egress.json").exists())
+
+    def test_unknown_reviewer_does_not_write_replaced_container(self) -> None:
+        container = self.review.container_dir
+        moved_container = container.with_name(f"{container.name}-moved")
+        stderr = io.StringIO()
+        container.rename(moved_container)
+        container.mkdir(mode=0o700)
+        sentinel = container / "sentinel"
+        sentinel.write_text("keep me\n", encoding="utf-8")
+        try:
+            with contextlib.redirect_stderr(stderr):
+                outcome = providers.run_review(
+                    review=self.review,
+                    reviewer="unknown",
+                )
+
+            self.assertEqual(outcome.returncode, 2)
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep me\n")
+            self.assertFalse((container / "runner-error.txt").exists())
+            self.assertFalse((moved_container / "runner-error.txt").exists())
+            self.assertIn("unknown reviewer", stderr.getvalue())
+            self.assertIn("runner diagnostic was not persisted", stderr.getvalue())
+        finally:
+            sentinel.unlink(missing_ok=True)
+            (container / "runner-error.txt").unlink(missing_ok=True)
+            container.rmdir()
+            moved_container.rename(container)
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_post_preflight_failure_does_not_write_replaced_container(
+        self,
+        run_model_chain: mock.Mock,
+        environment: mock.Mock,
+    ) -> None:
+        container = self.review.container_dir
+        moved_container = container.with_name(f"{container.name}-moved")
+        stderr = io.StringIO()
+
+        def replace_container(**_kwargs):
+            container.rename(moved_container)
+            container.mkdir(mode=0o700)
+            (container / "sentinel").write_text("keep me\n", encoding="utf-8")
+            raise FileNotFoundError("reviewer disappeared")
+
+        run_model_chain.side_effect = replace_container
+        try:
+            with contextlib.redirect_stderr(stderr):
+                outcome = providers.run_review(
+                    review=self.review,
+                    reviewer="codex",
+                )
+
+            self.assertEqual(outcome.returncode, 127)
+            environment.assert_called_once()
+            self.assertEqual(
+                (container / "sentinel").read_text(encoding="utf-8"),
+                "keep me\n",
+            )
+            self.assertFalse((container / "runner-error.txt").exists())
+            self.assertFalse((moved_container / "runner-error.txt").exists())
+            self.assertIn("reviewer disappeared", stderr.getvalue())
+            self.assertIn("runner diagnostic was not persisted", stderr.getvalue())
+        finally:
+            if container.is_dir():
+                (container / "sentinel").unlink(missing_ok=True)
+                (container / "runner-error.txt").unlink(missing_ok=True)
+                container.rmdir()
+            if moved_container.is_dir():
+                moved_container.rename(container)
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_private_artifact_replacement_blocks_codex_before_launch(
+        self,
+        run_model_chain: mock.Mock,
+        environment: mock.Mock,
+    ) -> None:
+        for artifact_name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES:
+            with self.subTest(artifact_name=artifact_name):
+                artifact = self.review.container_dir / artifact_name
+                moved_artifact = self.review.container_dir / f"{artifact_name}.moved"
+                original_payload = artifact.read_bytes()
+                artifact.rename(moved_artifact)
+                artifact.write_bytes(original_payload)
+                artifact.chmod(0o600)
+
+                outcome = providers.run_review(
+                    review=self.review,
+                    reviewer="codex",
+                )
+
+                self.assertEqual(outcome.returncode, 2)
+                self.assertEqual(artifact.read_bytes(), original_payload)
+                self.assertEqual(moved_artifact.read_bytes(), original_payload)
+                self.assertFalse(
+                    (self.review.container_dir / "preflight.json").exists()
+                )
+                error = (self.review.container_dir / "runner-error.txt").read_text(
+                    encoding="utf-8"
+                )
+                self.assertIn("do not match preparation identities", error)
+                self.assertIn("does not match preparation identity", error)
+
+                artifact.unlink()
+                moved_artifact.rename(artifact)
+                self._restore_private_review_artifacts()
+        run_model_chain.assert_not_called()
+        environment.assert_not_called()
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_private_container_replacement_blocks_codex_before_launch(
+        self,
+        run_model_chain: mock.Mock,
+        environment: mock.Mock,
+    ) -> None:
+        container = self.review.container_dir
+        moved_container = container.with_name(f"{container.name}-moved")
+        container.rename(moved_container)
+        container.mkdir(mode=0o700)
+        victim = container / "replacement-victim"
+        victim.write_text("keep me\n", encoding="utf-8")
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            outcome = providers.run_review(
+                review=self.review,
+                reviewer="codex",
+            )
+
+        self.assertEqual(outcome.returncode, 2)
+        run_model_chain.assert_not_called()
+        environment.assert_not_called()
+        self.assertEqual(victim.read_text(encoding="utf-8"), "keep me\n")
+        self.assertTrue(
+            all(
+                (moved_container / name).exists()
+                for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
+            )
+        )
+        self.assertFalse((container / "preflight.json").exists())
+        self.assertFalse((moved_container / "preflight.json").exists())
+        self.assertFalse((container / "runner-error.txt").exists())
+        self.assertFalse((moved_container / "runner-error.txt").exists())
+        self.assertIn("review egress workspace preflight failed", stderr.getvalue())
+        self.assertIn(
+            "container does not match preparation identity", stderr.getvalue()
+        )
+        self.assertIn("runner diagnostic was not persisted", stderr.getvalue())
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_private_container_symlink_is_not_used_for_diagnostic(
+        self,
+        run_model_chain: mock.Mock,
+        environment: mock.Mock,
+    ) -> None:
+        container = self.review.container_dir
+        moved_container = container.with_name(f"{container.name}-moved")
+        victim = container.with_name(f"{container.name}-victim")
+        container.rename(moved_container)
+        victim.mkdir(mode=0o700)
+        sentinel = victim / "sentinel"
+        sentinel.write_text("keep me\n", encoding="utf-8")
+        container.symlink_to(victim, target_is_directory=True)
+        stderr = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(stderr):
+                outcome = providers.run_review(
+                    review=self.review,
+                    reviewer="codex",
+                )
+
+            self.assertEqual(outcome.returncode, 2)
+            run_model_chain.assert_not_called()
+            environment.assert_not_called()
+            self.assertTrue(container.is_symlink())
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep me\n")
+            self.assertFalse((victim / "runner-error.txt").exists())
+            self.assertFalse((moved_container / "runner-error.txt").exists())
+            self.assertFalse((victim / "preflight.json").exists())
+            self.assertFalse((moved_container / "preflight.json").exists())
+            self.assertIn("review egress workspace preflight failed", stderr.getvalue())
+            self.assertIn("runner diagnostic was not persisted", stderr.getvalue())
+        finally:
+            container.unlink(missing_ok=True)
+            moved_container.rename(container)
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_missing_private_container_is_not_recreated_for_diagnostic(
+        self,
+        run_model_chain: mock.Mock,
+        environment: mock.Mock,
+    ) -> None:
+        container = self.review.container_dir
+        moved_container = container.with_name(f"{container.name}-moved")
+        container.rename(moved_container)
+        stderr = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(stderr):
+                outcome = providers.run_review(
+                    review=self.review,
+                    reviewer="codex",
+                )
+
+            self.assertEqual(outcome.returncode, 2)
+            run_model_chain.assert_not_called()
+            environment.assert_not_called()
+            self.assertFalse(container.exists())
+            self.assertFalse((moved_container / "runner-error.txt").exists())
+            self.assertIn("review egress workspace preflight failed", stderr.getvalue())
+            self.assertIn("private artifact container is missing", stderr.getvalue())
+            self.assertIn("runner diagnostic was not persisted", stderr.getvalue())
+        finally:
+            if container.is_dir():
+                (container / "runner-error.txt").unlink(missing_ok=True)
+                container.rmdir()
+            if moved_container.is_dir():
+                moved_container.rename(container)
+
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_preflight_builder_failure_scrubs_private_artifacts(
+        self,
+        run_model_chain: mock.Mock,
+    ) -> None:
+        with mock.patch.object(
+            providers,
+            "build_preflight_evidence",
+            side_effect=ReviewError("prospective preflight rejected"),
+        ):
+            outcome = providers.run_review(
+                review=self.review,
+                reviewer="codex",
+            )
+
+        self.assertEqual(outcome.returncode, 2)
+        run_model_chain.assert_not_called()
+        self.assertFalse((self.review.container_dir / "preflight.json").exists())
+        self.assertFalse(
+            any(
+                (self.review.container_dir / name).exists()
+                for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
+            )
+        )
+        error = (self.review.container_dir / "runner-error.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("prospective preflight rejected", error)
+
+    def test_preflight_builder_rejects_fixed_field_shadow(self) -> None:
+        with self.assertRaisesRegex(ReviewError, "shadows fixed preflight fields"):
+            providers.build_preflight_evidence(
+                self.review,
+                {"private_artifacts": "forged"},
+            )
 
     @mock.patch.object(providers, "_review_environment", return_value={})
     @mock.patch.object(providers, "_run_model_chain")
@@ -18185,6 +18866,21 @@ class ProviderPolicyTest(unittest.TestCase):
             self.assertEqual(
                 evidence["review_range"],
                 f"{self.review.base_ref}..{self.review.head_ref}",
+            )
+            self.assertEqual(evidence["private_artifacts"], "removed")
+            self.assertEqual(
+                evidence["status"],
+                "review workspace containment and integrity checks passed",
+            )
+            self.assertEqual(
+                evidence["secret_delta"]["status"],
+                "inconclusive",
+            )
+            self.assertFalse(
+                any(
+                    (self.review.container_dir / name).exists()
+                    for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
+                )
             )
             diff_bytes = self.review.diff_file.read_bytes()
             self.assertEqual(
@@ -18206,9 +18902,10 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertEqual(outcome.returncode, 0)
         self.assertEqual(outcome.final_text, "No findings.")
+        run_model_chain.assert_called_once()
 
     @mock.patch.object(providers, "resolve_reviewer_executable")
-    def test_deleted_generic_token_in_diff_blocks_external_reviewer(
+    def test_tampered_deleted_generic_token_diff_blocks_external_reviewer(
         self,
         resolve: mock.Mock,
     ) -> None:
@@ -18217,7 +18914,6 @@ class ProviderPolicyTest(unittest.TestCase):
             "diff --git a/config b/config\n-AUTH_TOKEN=" + token + "\n",
             encoding="utf-8",
         )
-        self._refresh_control_artifact_state()
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
@@ -18228,49 +18924,110 @@ class ProviderPolicyTest(unittest.TestCase):
         error = (self.review.container_dir / "runner-error.txt").read_text(
             encoding="utf-8"
         )
-        self.assertIn("review.diff (generic-secret-assignment)", error)
+        self.assertIn(
+            "external review diff does not match helper-private control state",
+            error,
+        )
         self.assertNotIn(token, error)
 
-    @mock.patch.object(providers, "resolve_reviewer_executable")
-    def test_deleted_sensitive_path_blocks_external_reviewer(
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        return_value=(pathlib.Path("/bin/claude"), {}),
+    )
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_head_side_sensitive_path_record_reaches_external_reviewer(
         self,
-        resolve: mock.Mock,
+        run_model_chain: mock.Mock,
+        _resolve_claude: mock.Mock,
+        environment: mock.Mock,
     ) -> None:
-        (self.review.workspace_root / ".codex-review/changed-paths.z").write_bytes(
-            b"config/.env.production\0"
+        raw_path = b"config/.env.production"
+        sensitive_path = self.review.workspace_root / os.fsdecode(raw_path)
+        sensitive_path.parent.mkdir(parents=True)
+        sensitive_path.write_text("TRACKED_VALUE=raw\n", encoding="utf-8")
+        self.review.diff_file.write_text(
+            "diff --git a/config/.env.production b/config/.env.production\n"
+            "+TRACKED_VALUE=raw\n",
+            encoding="utf-8",
         )
+        (
+            self.review.workspace_root
+            / ".codex-review"
+            / workspace_runtime.CHANGED_PATH_DIGESTS_NAME
+        ).write_bytes(
+            workspace_runtime._changed_path_digest(
+                workspace_runtime.CHANGED_PATH_HEAD_TAG,
+                raw_path,
+            )
+            + b"\0"
+        )
+        (
+            self.review.container_dir / workspace_runtime.PRIVATE_CHANGED_PATHS_NAME
+        ).write_bytes(workspace_runtime.CHANGED_PATH_HEAD_TAG + raw_path + b"\0")
         self._refresh_control_artifact_state()
+        run_model_chain.return_value = ("success", "No findings.")
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
             egress_consent="explicit-claude-with-copilot-fallback",
         )
-        self.assertEqual(outcome.returncode, 2)
-        resolve.assert_not_called()
-        error = (self.review.container_dir / "runner-error.txt").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn(".env.production (environment-file; changed-path)", error)
 
-    @mock.patch.object(providers, "resolve_reviewer_executable")
-    def test_nested_credential_basename_blocks_external_reviewer(
+        self.assertEqual(outcome.returncode, 0)
+        self.assertEqual(outcome.final_text, "No findings.")
+        run_model_chain.assert_called_once()
+        environment.assert_called_once()
+        self.assertEqual(
+            sensitive_path.read_text(encoding="utf-8"),
+            "TRACKED_VALUE=raw\n",
+        )
+        self.assertIn(
+            "config/.env.production",
+            self.review.diff_file.read_text(encoding="utf-8"),
+        )
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        return_value=(pathlib.Path("/bin/claude"), {}),
+    )
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_nested_credential_basename_reaches_external_reviewer(
         self,
-        resolve: mock.Mock,
+        run_model_chain: mock.Mock,
+        _resolve_claude: mock.Mock,
+        environment: mock.Mock,
     ) -> None:
         credential = self.review.workspace_root / "fixtures/home/.netrc"
         credential.parent.mkdir(parents=True)
         credential.write_text("machine example.invalid\n", encoding="utf-8")
+        self.review.diff_file.write_text(
+            "diff --git a/fixtures/home/.netrc b/fixtures/home/.netrc\n"
+            "+machine example.invalid\n",
+            encoding="utf-8",
+        )
+        self._refresh_control_artifact_state()
+        run_model_chain.return_value = ("success", "No findings.")
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
             egress_consent="explicit-claude-with-copilot-fallback",
         )
-        self.assertEqual(outcome.returncode, 2)
-        resolve.assert_not_called()
-        error = (self.review.container_dir / "runner-error.txt").read_text(
-            encoding="utf-8"
+
+        self.assertEqual(outcome.returncode, 0)
+        self.assertEqual(outcome.final_text, "No findings.")
+        run_model_chain.assert_called_once()
+        environment.assert_called_once()
+        self.assertEqual(
+            credential.read_text(encoding="utf-8"),
+            "machine example.invalid\n",
         )
-        self.assertIn("fixtures/home/.netrc (credential-path)", error)
+        self.assertIn(
+            "fixtures/home/.netrc",
+            self.review.diff_file.read_text(encoding="utf-8"),
+        )
 
     @mock.patch.object(
         providers,
@@ -18317,35 +19074,23 @@ class ProviderPolicyTest(unittest.TestCase):
                                     {
                                         "path": {
                                             "type": "path",
-                                            "path": str(self.review.workspace_root.resolve()),
+                                            "path": str(
+                                                self.review.workspace_root.resolve()
+                                            ),
                                         },
                                         "access": "read",
                                     },
-                                    *[
-                                        {
-                                            "path": {
-                                                "type": "path",
-                                                "path": str(
-                                                    (self.review.workspace_root / name).resolve()
-                                                ),
-                                            },
-                                            "access": "deny",
-                                        }
-                                        for name in (".git", ".codex", ".agents")
-                                    ],
-                                    *[
-                                        {
-                                            "path": {
-                                                "type": "glob_pattern",
-                                                "pattern": str(
-                                                    self.review.workspace_root.resolve()
-                                                    / pattern
-                                                ),
-                                            },
-                                            "access": "deny",
-                                        }
-                                        for pattern in ("*.env", "**/*.env")
-                                    ],
+                                    {
+                                        "path": {
+                                            "type": "path",
+                                            "path": str(
+                                                (
+                                                    self.review.workspace_root / ".git"
+                                                ).resolve()
+                                            ),
+                                        },
+                                        "access": "deny",
+                                    },
                                 ],
                             },
                         },
@@ -18358,11 +19103,23 @@ class ProviderPolicyTest(unittest.TestCase):
 
         def complete(argv, **_kwargs):
             argv = tuple(argv)
-            final_path = pathlib.Path(argv[argv.index("-o") + 1])
-            final_path.parent.mkdir(parents=True, exist_ok=True)
-            final_path.write_text("No findings.\n", encoding="utf-8")
-            stdout = json.dumps(
-                {"type": "thread.started", "thread_id": thread_id}
+            stdout = (
+                "\n".join(
+                    json.dumps(event)
+                    for event in (
+                        {"type": "thread.started", "thread_id": thread_id},
+                        {"type": "turn.started"},
+                        {
+                            "type": "item.completed",
+                            "item": {
+                                "type": "agent_message",
+                                "text": "No findings.",
+                            },
+                        },
+                        {"type": "turn.completed"},
+                    )
+                )
+                + "\n"
             ).encode()
             return Completed(argv=argv, returncode=0, stdout=stdout, stderr=b"")
 
@@ -18383,7 +19140,9 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn('approval_policy="never"', configs)
         self.assertIn('default_permissions="isolated_review"', configs)
         permission_configs = [
-            value for value in configs if value.startswith("permissions.isolated_review=")
+            value
+            for value in configs
+            if value.startswith("permissions.isolated_review=")
         ]
         self.assertEqual(len(permission_configs), 1)
         permission_config = permission_configs[0]
@@ -18398,12 +19157,32 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn('":minimal"="read"', permission_config)
         self.assertIn('":workspace_roots"={"."="read"', permission_config)
         self.assertIn('".git"="deny"', permission_config)
+        self.assertEqual(
+            parsed_permissions["filesystem"][":workspace_roots"],
+            {".": "read", ".git": "deny"},
+        )
+        for tracked_context in (".env", "nested/review.env", ".agents", ".codex"):
+            self.assertNotIn(f'"{tracked_context}"="deny"', permission_config)
         self.assertTrue(
             any("shell_environment_policy.inherit" in value for value in configs)
         )
         self.assertTrue(
             any("shell_environment_policy.set" in value for value in configs)
         )
+        shell_config = next(
+            value
+            for value in configs
+            if value.startswith("shell_environment_policy.set=")
+        )
+        parsed_shell = tomllib.loads(f"profile = {shell_config.partition('=')[2]}")[
+            "profile"
+        ]
+        self.assertEqual(
+            parsed_shell["HOME"],
+            str(self.review.container_dir / "tool-home"),
+        )
+        self.assertNotIn("CODEX_HOME", parsed_shell)
+        self.assertNotIn("OPENAI_API_KEY", parsed_shell)
         self.assertIn("project_doc_max_bytes=0", configs)
         self.assertNotIn("parent-only-secret", "\n".join(configs))
         self.assertIn("--skip-git-repo-check", argv)
@@ -18411,8 +19190,8 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn("--ignore-rules", argv)
         self.assertIn("--strict-config", argv)
         self.assertNotIn("-s", argv)
-        final_path = pathlib.Path(argv[argv.index("-o") + 1])
-        self.assertTrue(final_path.parent.is_dir())
+        self.assertNotIn("-o", argv)
+        self.assertEqual(attempt.final_text, "No findings.")
         self.assertEqual(attempt.effective_model, "gpt-5.6-sol")
         self.assertEqual(attempt.effective_effort, "xhigh")
         self.assertEqual(attempt.category, "success")
@@ -18424,6 +19203,184 @@ class ProviderPolicyTest(unittest.TestCase):
             run_command.call_args.kwargs["output_file_limit_bytes"],
             providers.REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
         )
+
+    def test_codex_stdout_requires_terminal_turn_and_keeps_last_agent_message(
+        self,
+    ) -> None:
+        events = (
+            {"type": "thread.started", "thread_id": "thread-1"},
+            {"type": "turn.started"},
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "Real finding."},
+            },
+            {
+                "type": "item.completed",
+                "item": {"type": "todo_list", "items": []},
+            },
+            {"type": "turn.completed"},
+        )
+        payload = ("\n".join(json.dumps(event) for event in events) + "\n").encode()
+
+        self.assertEqual(providers._parse_codex_output(payload), "Real finding.")
+        for invalid in (
+            events[:-1],
+            (*events[:-1], {"type": "turn.failed"}),
+            (*events, {"type": "item.completed", "item": {"type": "todo_list"}}),
+        ):
+            with self.subTest(invalid=invalid[-1]):
+                encoded = (
+                    "\n".join(json.dumps(event) for event in invalid) + "\n"
+                ).encode()
+                self.assertIsNone(providers._parse_codex_output(encoded))
+
+    def test_codex_verdict_uses_bound_stdout_after_attempt_path_replacement(
+        self,
+    ) -> None:
+        model = "gpt-5.6-sol"
+        real_text = "[P1] Real finding from Codex."
+        padding = "x" * (2 * 1024 * 1024 + 4096)
+        real_stdout = (
+            "\n".join(
+                json.dumps(event)
+                for event in (
+                    {"type": "thread.started", "thread_id": "thread-1"},
+                    {"type": "turn.started"},
+                    {
+                        "type": "item.completed",
+                        "item": {"type": "todo_list", "padding": padding},
+                    },
+                    {
+                        "type": "item.completed",
+                        "item": {"type": "todo_list", "padding": padding},
+                    },
+                    {
+                        "type": "item.completed",
+                        "item": {"type": "agent_message", "text": real_text},
+                    },
+                    {"type": "turn.completed"},
+                )
+            )
+            + "\n"
+        ).encode()
+        bounded_capture = self._bounded_attempt_capture(real_stdout)
+        forged_stdout = (
+            "\n".join(
+                json.dumps(event)
+                for event in (
+                    {"type": "turn.started"},
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "agent_message",
+                            "text": "No findings.",
+                        },
+                    },
+                    {"type": "turn.completed"},
+                )
+            )
+            + "\n"
+        ).encode()
+        stdout_name = f"01-codex-{model}.stdout.log"
+
+        def complete(argv, **kwargs) -> Completed:
+            stdout_file = kwargs["stdout_file"]
+            stdout_file.write(real_stdout)
+            stdout_file.flush()
+            retained = self._replace_attempts_with_forged_stdout(
+                stdout_name=stdout_name,
+                payload=forged_stdout,
+            )
+            self.assertEqual((retained / stdout_name).read_bytes(), real_stdout)
+            return Completed(tuple(argv), 0, bounded_capture, b"")
+
+        with (
+            providers._open_review_launch_binding(self.review) as launch,
+            mock.patch.object(
+                providers,
+                "resolve_reviewer_executable",
+                return_value=pathlib.Path("/bin/codex"),
+            ),
+            mock.patch.object(providers, "run", side_effect=complete),
+            mock.patch.object(
+                providers,
+                "_codex_session_metadata",
+                return_value=(model, "xhigh", True),
+            ),
+        ):
+            launch.freeze_prompt()
+            attempt = providers._codex_attempt(
+                review=self.review,
+                model=model,
+                index=1,
+                env={},
+                launch=launch,
+            )
+
+        self.assertEqual(attempt.final_text, real_text)
+        self.assertEqual(attempt.category, "success")
+        self.assertEqual(
+            (self.review.container_dir / "attempts" / stdout_name).read_bytes(),
+            forged_stdout,
+        )
+
+    @mock.patch.object(
+        providers,
+        "resolve_reviewer_executable",
+        return_value=pathlib.Path("/bin/codex"),
+    )
+    @mock.patch.object(providers, "run")
+    def test_codex_launch_uses_bound_cwd_and_frozen_prompt(
+        self,
+        run_command: mock.Mock,
+        _resolve: mock.Mock,
+    ) -> None:
+        original_prompt = self.review.prompt_file.read_bytes()
+        with providers._open_review_launch_binding(self.review) as launch:
+            launch.freeze_prompt()
+            self.review.prompt_file.write_text(
+                "replacement prompt\n",
+                encoding="utf-8",
+            )
+            run_command.return_value = Completed(
+                argv=("codex",),
+                returncode=1,
+                stdout=b"",
+                stderr=b"review failed",
+            )
+
+            providers._codex_attempt(
+                review=self.review,
+                model="gpt-5.6-sol",
+                index=1,
+                env={},
+                launch=launch,
+            )
+
+            self.assertIsNone(run_command.call_args.kwargs["cwd"])
+            self.assertEqual(
+                run_command.call_args.kwargs["cwd_fd"],
+                launch.workspace_descriptor,
+            )
+            self.assertEqual(run_command.call_args.kwargs["stdin"], original_prompt)
+
+    def test_bound_cwd_exec_failure_precedes_started_callback(self) -> None:
+        missing_executable = pathlib.Path(self.temporary.name) / "missing-reviewer"
+        started = mock.Mock()
+        stdout_path = pathlib.Path(self.temporary.name) / "missing.stdout.log"
+        stderr_path = pathlib.Path(self.temporary.name) / "missing.stderr.log"
+        with providers._open_review_launch_binding(self.review) as launch:
+            with self.assertRaises(FileNotFoundError):
+                common.run(
+                    (str(missing_executable),),
+                    cwd_fd=launch.workspace_descriptor,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                    timeout_seconds=5,
+                    output_file_limit_bytes=64 * 1024,
+                    on_process_started=started,
+                )
+        started.assert_not_called()
 
     def test_codex_rejects_legacy_sandbox_override(self) -> None:
         payload = {
@@ -18462,26 +19419,13 @@ class ProviderPolicyTest(unittest.TestCase):
                             "access": "read",
                         },
                         {"path": {"type": "path", "path": str(root)}, "access": "read"},
-                        *[
-                            {
-                                "path": {
-                                    "type": "path",
-                                    "path": str((root / name).resolve()),
-                                },
-                                "access": "deny",
-                            }
-                            for name in (".git", ".codex", ".agents")
-                        ],
-                        *[
-                            {
-                                "path": {
-                                    "type": "glob_pattern",
-                                    "pattern": str(root / pattern),
-                                },
-                                "access": "deny",
-                            }
-                            for pattern in ("*.env", "**/*.env")
-                        ],
+                        {
+                            "path": {
+                                "type": "path",
+                                "path": str((root / ".git").resolve()),
+                            },
+                            "access": "deny",
+                        },
                         {
                             "path": {"type": "path", "path": str(root.parent)},
                             "access": "read",
@@ -18490,12 +19434,94 @@ class ProviderPolicyTest(unittest.TestCase):
                 },
             },
         }
-        self.assertFalse(
-            providers._codex_permissions_match(
-                payload,
-                review_root=self.review.workspace_root,
-            )
+        for extra_path in (root.parent, pathlib.Path.home().resolve()):
+            with self.subTest(extra_path=extra_path):
+                payload["permission_profile"]["file_system"]["entries"][-1]["path"][
+                    "path"
+                ] = str(extra_path)
+                self.assertFalse(
+                    providers._codex_permissions_match(
+                        payload,
+                        review_root=self.review.workspace_root,
+                    )
+                )
+
+    def test_codex_rejects_profiles_that_hide_frozen_tracked_context(self) -> None:
+        root = self.review.workspace_root.resolve()
+
+        def payload(extra_entry: dict[str, object]) -> dict[str, object]:
+            return {
+                "approval_policy": "never",
+                "sandbox_policy": {"type": "read-only"},
+                "permission_profile": {
+                    "type": "managed",
+                    "network": "restricted",
+                    "file_system": {
+                        "type": "restricted",
+                        "glob_scan_max_depth": 8,
+                        "entries": [
+                            {
+                                "path": {
+                                    "type": "special",
+                                    "value": {"kind": "minimal"},
+                                },
+                                "access": "read",
+                            },
+                            {
+                                "path": {"type": "path", "path": str(root)},
+                                "access": "read",
+                            },
+                            {
+                                "path": {
+                                    "type": "path",
+                                    "path": str((root / ".git").resolve()),
+                                },
+                                "access": "deny",
+                            },
+                            extra_entry,
+                        ],
+                    },
+                },
+            }
+
+        hidden_context_entries = (
+            {
+                "path": {
+                    "type": "path",
+                    "path": str((root / ".codex").resolve()),
+                },
+                "access": "deny",
+            },
+            {
+                "path": {
+                    "type": "path",
+                    "path": str((root / ".agents").resolve()),
+                },
+                "access": "deny",
+            },
+            {
+                "path": {
+                    "type": "glob_pattern",
+                    "pattern": str(root / "*.env"),
+                },
+                "access": "deny",
+            },
+            {
+                "path": {
+                    "type": "glob_pattern",
+                    "pattern": str(root / "**/*.env"),
+                },
+                "access": "deny",
+            },
         )
+        for entry in hidden_context_entries:
+            with self.subTest(entry=entry):
+                self.assertFalse(
+                    providers._codex_permissions_match(
+                        payload(entry),
+                        review_root=root,
+                    )
+                )
 
     def test_codex_allows_only_one_direct_arg_transport_file(self) -> None:
         root = self.review.workspace_root.resolve()
@@ -18520,27 +19546,17 @@ class ProviderPolicyTest(unittest.TestCase):
                                 },
                                 "access": "read",
                             },
-                            {"path": {"type": "path", "path": str(root)}, "access": "read"},
-                            *[
-                                {
-                                    "path": {
-                                        "type": "path",
-                                        "path": str((root / name).resolve()),
-                                    },
-                                    "access": "deny",
-                                }
-                                for name in (".git", ".codex", ".agents")
-                            ],
-                            *[
-                                {
-                                    "path": {
-                                        "type": "glob_pattern",
-                                        "pattern": str(root / pattern),
-                                    },
-                                    "access": "deny",
-                                }
-                                for pattern in ("*.env", "**/*.env")
-                            ],
+                            {
+                                "path": {"type": "path", "path": str(root)},
+                                "access": "read",
+                            },
+                            {
+                                "path": {
+                                    "type": "path",
+                                    "path": str((root / ".git").resolve()),
+                                },
+                                "access": "deny",
+                            },
                             *extra_entries,
                         ],
                     },
@@ -18844,9 +19860,7 @@ class ProviderPolicyTest(unittest.TestCase):
         for failure, expected in cases:
             with (
                 self.subTest(failure=type(failure).__name__),
-                mock.patch.object(
-                    providers, "_claude_linux_host", return_value=host
-                ),
+                mock.patch.object(providers, "_claude_linux_host", return_value=host),
                 mock.patch.object(
                     providers,
                     "validate_claude_linux_executable",
@@ -19035,6 +20049,101 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(attempt.category, "blocked-authentication")
         self.assertEqual(attempt.returncode, 0)
 
+    def test_claude_persistence_diagnostic_uses_bound_attempt_after_path_swap(
+        self,
+    ) -> None:
+        executable = pathlib.Path("/verified/claude")
+        model = providers.CLAUDE_MODELS[0]
+        completed = Completed(
+            argv=("sandbox",),
+            returncode=0,
+            stdout=b"runtime stdout\n",
+            stderr=b"runtime stderr\n",
+        )
+        stdout_name = f"01-claude-{model}.stdout.log"
+        stderr_name = f"01-claude-{model}.stderr.log"
+        forged_stdout = b"forged stdout\n"
+        forged_stderr = b"forged stderr\n"
+
+        def run_after_spawn(*_args: object, **kwargs: object) -> Completed:
+            on_process_started = kwargs.get("on_process_started")
+            assert callable(on_process_started)
+            on_process_started()
+            stdout_file = kwargs["stdout_file"]
+            stderr_file = kwargs["stderr_file"]
+            stdout_file.write(completed.stdout)
+            stdout_file.flush()
+            stderr_file.write(completed.stderr)
+            stderr_file.flush()
+            self._replace_attempts_with_forged_stdout(
+                stdout_name=stdout_name,
+                payload=forged_stdout,
+            )
+            (self.review.container_dir / "attempts" / stderr_name).write_bytes(
+                forged_stderr
+            )
+            return completed
+
+        @contextlib.contextmanager
+        def failing_runtime():
+            yield mock.Mock(argv=("sandbox",), env={})
+            raise providers.LinuxCredentialUnsafe(
+                "host credential changed before refresh writeback"
+            )
+
+        providers.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {
+                "phase": "publisher-and-capabilities-verified",
+                "authentication": {"status": "pending"},
+            },
+        )
+        with (
+            providers._open_review_launch_binding(self.review) as launch,
+            mock.patch.object(providers, "_is_claude_linux_host", return_value=True),
+            mock.patch.object(
+                providers,
+                "_with_claude_review_tool_path",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_prepare_claude_tls_environment",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_linux_review_runtime",
+                return_value=failing_runtime(),
+            ),
+            mock.patch.object(providers, "run", side_effect=run_after_spawn),
+            self.assertRaises(providers.ClaudeCredentialUnsafe) as raised,
+        ):
+            launch.freeze_prompt()
+            providers._claude_attempt(
+                review=self.review,
+                model=model,
+                index=1,
+                env={},
+                executable=executable,
+                launch=launch,
+                refresh_lock_protocol=self.claude_refresh_lock_protocol,
+            )
+
+        attempt = getattr(
+            raised.exception,
+            "_codex_claude_persistence_attempt",
+        )
+        self.assertIsInstance(attempt, providers.Attempt)
+        retained = self.review.container_dir / "attempts-retained"
+        self.assertEqual((retained / stdout_name).read_bytes(), completed.stdout)
+        retained_stderr = (retained / stderr_name).read_bytes()
+        self.assertIn(completed.stderr.rstrip(), retained_stderr)
+        self.assertIn(b"credential refresh persistence", retained_stderr)
+        replacement = self.review.container_dir / "attempts"
+        self.assertEqual((replacement / stdout_name).read_bytes(), forged_stdout)
+        self.assertEqual((replacement / stderr_name).read_bytes(), forged_stderr)
+
     def test_claude_linux_auth_rejection_precedes_inspection_failure(
         self,
     ) -> None:
@@ -19119,48 +20228,47 @@ class ProviderPolicyTest(unittest.TestCase):
             stdout=b"",
             stderr=b"",
         )
-        failure_patches = (
+        failures = (
+            ("capture", "ensure_captured", OSError("attempt capture unavailable")),
+            ("append", "append_stderr", OSError("attempt diagnostic unavailable")),
             (
-                "attempt-directory",
-                mock.patch.object(
-                    pathlib.Path,
-                    "mkdir",
-                    side_effect=OSError("attempt directory unavailable"),
-                ),
-            ),
-            (
-                "empty-log",
-                mock.patch.object(
-                    pathlib.Path,
-                    "touch",
-                    side_effect=OSError("attempt log unavailable"),
-                ),
-            ),
-            (
-                "append",
-                mock.patch.object(
-                    providers,
-                    "_append_attempt_diagnostic",
-                    side_effect=OSError("attempt diagnostic unavailable"),
-                ),
+                "bound-append",
+                "append_stderr",
+                providers.ReviewError("bound attempt diagnostic unavailable"),
             ),
         )
 
-        for index, (label, failure_patch) in enumerate(
-            failure_patches,
+        for index, (label, method, error) in enumerate(
+            failures,
             start=1,
         ):
-            with self.subTest(label=label), failure_patch:
+            with self.subTest(label=label):
+                stdout_path, stderr_path = providers._attempt_paths_without_io(
+                    self.review,
+                    index,
+                    "claude",
+                    providers.CLAUDE_MODELS[0],
+                )
+                output = mock.create_autospec(
+                    providers.AttemptOutput,
+                    instance=True,
+                )
+                output.stdout_path = stdout_path
+                output.stderr_path = stderr_path
+                getattr(output, method).side_effect = error
                 attempt = providers._claude_persistence_failed_attempt(
                     review=self.review,
                     index=index,
                     model=providers.CLAUDE_MODELS[0],
                     completed=completed,
+                    output=output,
                     category="inconclusive",
                 )
 
                 self.assertEqual(attempt.category, "inconclusive")
                 self.assertEqual(attempt.returncode, 1)
+                output.ensure_captured.assert_called_once_with(completed)
+                output.append_stderr.assert_called_once()
 
     def test_auth_rejection_preserves_recovery_when_attempt_log_fails(
         self,
@@ -19192,20 +20300,24 @@ class ProviderPolicyTest(unittest.TestCase):
             str(carrier),
         )
 
-        with mock.patch.object(
-            providers,
-            "_append_attempt_diagnostic",
-            side_effect=OSError("attempt diagnostic unavailable"),
-        ):
-            failure = (
-                providers._claude_auth_rejection_after_credential_inspection(
-                    review=self.review,
-                    index=1,
-                    model=providers.CLAUDE_MODELS[0],
-                    completed=completed,
-                    inspection_error=inspection_error,
-                )
-            )
+        stdout_path, stderr_path = providers._attempt_paths_without_io(
+            self.review,
+            1,
+            "claude",
+            providers.CLAUDE_MODELS[0],
+        )
+        output = mock.create_autospec(providers.AttemptOutput, instance=True)
+        output.stdout_path = stdout_path
+        output.stderr_path = stderr_path
+        output.append_stderr.side_effect = OSError("attempt diagnostic unavailable")
+        failure = providers._claude_auth_rejection_after_credential_inspection(
+            review=self.review,
+            index=1,
+            model=providers.CLAUDE_MODELS[0],
+            completed=completed,
+            output=output,
+            inspection_error=inspection_error,
+        )
 
         self.assertIsInstance(
             failure,
@@ -19365,9 +20477,7 @@ class ProviderPolicyTest(unittest.TestCase):
             try:
                 yield mock.Mock(argv=("sandbox",), env={})
             finally:
-                lifecycle_states.append(
-                    (writer_started(), writer_quiescent())
-                )
+                lifecycle_states.append((writer_started(), writer_quiescent()))
 
         def timeout_after_spawn(*_args: object, **kwargs: object) -> None:
             on_process_started = kwargs.get("on_process_started")
@@ -19428,9 +20538,7 @@ class ProviderPolicyTest(unittest.TestCase):
             try:
                 yield mock.Mock(argv=("sandbox",), env={})
             finally:
-                lifecycle_states.append(
-                    (writer_started(), writer_quiescent())
-                )
+                lifecycle_states.append((writer_started(), writer_quiescent()))
 
         with (
             mock.patch.object(providers, "_is_claude_linux_host", return_value=True),
@@ -19496,9 +20604,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
         assert diagnostic is not None
         self.assertIn(str(carrier), diagnostic)
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_carrier"],
             str(carrier),
@@ -19715,9 +20821,7 @@ class ProviderPolicyTest(unittest.TestCase):
         assert error.detail is not None
         self.assertIn("review process group stopped", error.detail)
         self.assertIn(str(carrier), error.detail)
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["recovery_carrier"],
             str(carrier),
@@ -19748,9 +20852,7 @@ class ProviderPolicyTest(unittest.TestCase):
             providers.CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC,
         )
         self.assertEqual(error.detail, diagnostic)
-        report = common.read_json(
-            self.review.container_dir / "claude-runtime.json"
-        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(
             report["authentication"]["refresh_persistence"],
             "failed-after-attempt",
@@ -19761,11 +20863,9 @@ class ProviderPolicyTest(unittest.TestCase):
         self,
     ) -> None:
         lock_path = pathlib.Path("/fixture/.claude/.oauth_refresh.lock")
-        cleanup_error = (
-            claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
-                "helper-owned lock paths may remain at "
-                f"{lock_path}; confirm that no writer is active before cleanup"
-            )
+        cleanup_error = claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+            "helper-owned lock paths may remain at "
+            f"{lock_path}; confirm that no writer is active before cleanup"
         )
 
         @contextlib.contextmanager
@@ -19844,9 +20944,7 @@ class ProviderPolicyTest(unittest.TestCase):
             try:
                 yield staged
             finally:
-                lifecycle_exit_states.append(
-                    (writer_started(), writer_quiescent())
-                )
+                lifecycle_exit_states.append((writer_started(), writer_quiescent()))
 
         def stage_once(*_args: object, **kwargs: object):
             writer_started = kwargs.get("writer_started")
@@ -20027,9 +21125,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 [(True, True)] * len(providers.CLAUDE_MODELS),
             )
             for call in build_sandbox.call_args_list:
-                self.assertFalse(
-                    call.args[0].node_extra_ca_certs_configured
-                )
+                self.assertFalse(call.args[0].node_extra_ca_certs_configured)
 
             with providers._claude_linux_review_runtime(
                 self.review,
@@ -20160,9 +21256,7 @@ class ProviderPolicyTest(unittest.TestCase):
         for failure, expected in cases:
             with (
                 self.subTest(failure=type(failure).__name__),
-                mock.patch.object(
-                    providers, "_claude_linux_host", return_value=host
-                ),
+                mock.patch.object(providers, "_claude_linux_host", return_value=host),
                 mock.patch.object(
                     providers,
                     "validate_claude_linux_executable",
@@ -20207,7 +21301,9 @@ class ProviderPolicyTest(unittest.TestCase):
         runtime_root.symlink_to(victim, target_is_directory=True)
 
         with (
-            mock.patch.object(providers, "_claude_linux_host", return_value=mock.Mock()),
+            mock.patch.object(
+                providers, "_claude_linux_host", return_value=mock.Mock()
+            ),
             mock.patch.object(providers, "reject_claude_wsl_windows_path"),
             self.assertRaisesRegex(ReviewError, "real directory"),
         ):
@@ -20225,7 +21321,9 @@ class ProviderPolicyTest(unittest.TestCase):
         victim_mode = stat.S_IMODE(victim.stat().st_mode)
 
         with (
-            mock.patch.object(providers, "_claude_linux_host", return_value=mock.Mock()),
+            mock.patch.object(
+                providers, "_claude_linux_host", return_value=mock.Mock()
+            ),
             mock.patch.object(providers, "reject_claude_wsl_windows_path"),
         ):
             runtime_root = providers._claude_linux_runtime_root(self.review)
@@ -20245,7 +21343,9 @@ class ProviderPolicyTest(unittest.TestCase):
         runtime_root.chmod(0o755)
 
         with (
-            mock.patch.object(providers, "_claude_linux_host", return_value=mock.Mock()),
+            mock.patch.object(
+                providers, "_claude_linux_host", return_value=mock.Mock()
+            ),
             mock.patch.object(providers, "reject_claude_wsl_windows_path"),
             self.assertRaisesRegex(ReviewError, "must be 0700"),
         ):
@@ -20261,7 +21361,9 @@ class ProviderPolicyTest(unittest.TestCase):
         )
 
         with (
-            mock.patch.object(providers, "_claude_linux_host", return_value=mock.Mock()),
+            mock.patch.object(
+                providers, "_claude_linux_host", return_value=mock.Mock()
+            ),
             mock.patch.object(
                 providers,
                 "reject_claude_wsl_windows_path",
@@ -20278,7 +21380,9 @@ class ProviderPolicyTest(unittest.TestCase):
         failure = providers.LinuxRuntimeUnsafe("runtime root is on DrvFS")
 
         with (
-            mock.patch.object(providers, "_claude_linux_host", return_value=mock.Mock()),
+            mock.patch.object(
+                providers, "_claude_linux_host", return_value=mock.Mock()
+            ),
             mock.patch.object(
                 providers,
                 "reject_claude_wsl_windows_path",
@@ -20296,7 +21400,9 @@ class ProviderPolicyTest(unittest.TestCase):
         )
 
         with (
-            mock.patch.object(providers, "_claude_linux_host", return_value=mock.Mock()),
+            mock.patch.object(
+                providers, "_claude_linux_host", return_value=mock.Mock()
+            ),
             mock.patch.object(
                 providers,
                 "reject_claude_wsl_windows_path",
@@ -20324,6 +21430,7 @@ class ProviderPolicyTest(unittest.TestCase):
             head_ref="b" * 40,
             diff_file=root / "review.diff",
             prompt_file=root / "review.prompt",
+            private_cleanup=self.review.private_cleanup,
         )
         host = providers.LinuxHost(
             claude_linux.LinuxHostKind.WSL2,
@@ -20396,9 +21503,7 @@ class ProviderPolicyTest(unittest.TestCase):
             "microsoft-standard-WSL2",
         )
         validator = providers._claude_gpg_temp_root_validator(host)
-        mountinfo = (
-            "24 1 0:22 / / rw,relatime - 9p drvfs rw,aname=drvfs"
-        )
+        mountinfo = "24 1 0:22 / / rw,relatime - 9p drvfs rw,aname=drvfs"
 
         with (
             mock.patch.object(
@@ -20553,19 +21658,13 @@ class ProviderPolicyTest(unittest.TestCase):
             candidate,
             version="2.1.202",
             platform_key="linux-x64",
-            gpg_temp_root=(
-                self.review.container_dir / "claude-runtime" / "gpg-tmp"
-            ),
+            gpg_temp_root=(self.review.container_dir / "claude-runtime" / "gpg-tmp"),
             gpg_temp_root_validator=mock.ANY,
             cache_dir=(
-                self.review.container_dir
-                / "claude-runtime"
-                / "provenance-cache"
+                self.review.container_dir / "claude-runtime" / "provenance-cache"
             ),
             snapshot_dir=(
-                self.review.container_dir
-                / "claude-runtime"
-                / "verified-executables"
+                self.review.container_dir / "claude-runtime" / "verified-executables"
             ),
         )
         report = json.loads(
@@ -20761,25 +21860,17 @@ class ProviderPolicyTest(unittest.TestCase):
             linux=True,
         )
 
-        self.assertEqual(
-            arguments[arguments.index("--permission-mode") + 1], "dontAsk"
-        )
+        self.assertEqual(arguments[arguments.index("--permission-mode") + 1], "dontAsk")
         self.assertEqual(arguments[arguments.index("--tools") + 1], "Read")
-        self.assertEqual(
-            arguments[arguments.index("--allowedTools") + 1], "Read(./**)"
-        )
-        cli_denies = set(
-            arguments[arguments.index("--disallowedTools") + 1].split(",")
-        )
+        self.assertEqual(arguments[arguments.index("--allowedTools") + 1], "Read(./**)")
+        cli_denies = set(arguments[arguments.index("--disallowedTools") + 1].split(","))
         self.assertTrue(
             set(providers.CLAUDE_LINUX_FILE_TOOL_DENY_RULES).issubset(cli_denies)
         )
         self.assertTrue({"Grep", "Glob"}.issubset(cli_denies))
         settings_denies = set(json.loads(settings)["permissions"]["deny"])
         self.assertTrue(
-            set(providers.CLAUDE_LINUX_FILE_TOOL_DENY_RULES).issubset(
-                settings_denies
-            )
+            set(providers.CLAUDE_LINUX_FILE_TOOL_DENY_RULES).issubset(settings_denies)
         )
         self.assertIn("Read(//auth/**)", settings_denies)
         self.assertIn("Read(//proc/**)", settings_denies)
@@ -20795,12 +21886,8 @@ class ProviderPolicyTest(unittest.TestCase):
             linux=False,
         )
 
-        self.assertEqual(
-            arguments[arguments.index("--permission-mode") + 1], "default"
-        )
-        self.assertEqual(
-            arguments[arguments.index("--tools") + 1], "Read,Grep,Glob"
-        )
+        self.assertEqual(arguments[arguments.index("--permission-mode") + 1], "default")
+        self.assertEqual(arguments[arguments.index("--tools") + 1], "Read,Grep,Glob")
         self.assertNotIn(
             "Read(//config/**)", json.loads(settings)["permissions"]["deny"]
         )
@@ -21030,6 +22117,143 @@ class ProviderPolicyTest(unittest.TestCase):
             providers.REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
         )
 
+    def test_claude_verdict_uses_bound_stdout_after_attempt_path_replacement(
+        self,
+    ) -> None:
+        model = "claude-opus-4-8"
+
+        def payload(text: str, *, padding: str = "") -> bytes:
+            return json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "result": text,
+                    "modelUsage": {model: {}},
+                    "padding": padding,
+                }
+            ).encode()
+
+        real_text = "[P1] Real finding from Claude."
+        real_stdout = payload(real_text, padding="x" * (4 * 1024 * 1024 + 4096))
+        forged_stdout = payload("No findings.")
+        bounded_capture = self._bounded_attempt_capture(real_stdout)
+        stdout_name = f"01-claude-{model}.stdout.log"
+
+        def complete(argv, **kwargs) -> Completed:
+            started = kwargs.get("on_process_started")
+            if callable(started):
+                started()
+            stdout_file = kwargs["stdout_file"]
+            stdout_file.write(real_stdout)
+            stdout_file.flush()
+            retained = self._replace_attempts_with_forged_stdout(
+                stdout_name=stdout_name,
+                payload=forged_stdout,
+            )
+            self.assertEqual((retained / stdout_name).read_bytes(), real_stdout)
+            return Completed(tuple(argv), 0, bounded_capture, b"")
+
+        with (
+            providers._open_review_launch_binding(self.review) as launch,
+            mock.patch.object(
+                providers,
+                "_with_claude_review_tool_path",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_prepare_claude_tls_environment",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_connect_proxy",
+                return_value=contextlib.nullcontext(43210),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_review_sandbox_profile",
+                return_value="(version 1)(deny default)",
+            ),
+            mock.patch.object(providers, "run", side_effect=complete),
+        ):
+            launch.freeze_prompt()
+            attempt = providers._claude_attempt(
+                review=self.review,
+                model=model,
+                index=1,
+                env={"ANTHROPIC_API_KEY": "test-only"},
+                executable=pathlib.Path("/bin/claude"),
+                launch=launch,
+                refresh_lock_protocol=self.claude_refresh_lock_protocol,
+            )
+
+        self.assertEqual(attempt.final_text, real_text)
+        self.assertEqual(attempt.category, "success")
+        self.assertEqual(
+            (self.review.container_dir / "attempts" / stdout_name).read_bytes(),
+            forged_stdout,
+        )
+
+    def test_claude_macos_rejects_workspace_swap_at_exec_handoff(self) -> None:
+        self.review.prompt_file.write_text(
+            "- Workspace: .\n- Primary diff file: .codex-review/review.diff\n",
+            encoding="utf-8",
+        )
+        workspace = self.review.workspace_root
+        retained = self.review.container_dir / "workspace-retained"
+
+        def swap_before_handoff(_argv, **kwargs) -> Completed:
+            prompt = kwargs["stdin"]
+            self.assertIn(b"- Workspace: .\n", prompt)
+            self.assertIn(
+                b"- Primary diff file: .codex-review/review.diff\n",
+                prompt,
+            )
+            self.assertNotIn(str(workspace).encode(), prompt)
+            workspace.rename(retained)
+            workspace.mkdir(mode=0o700)
+            started = kwargs["on_process_started"]
+            started()
+            self.fail("workspace replacement unexpectedly passed the launch guard")
+
+        with (
+            providers._open_review_launch_binding(self.review) as launch,
+            mock.patch.object(
+                providers,
+                "_with_claude_review_tool_path",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_prepare_claude_tls_environment",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_connect_proxy",
+                return_value=contextlib.nullcontext(43210),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_review_sandbox_profile",
+                return_value="(version 1)(deny default)",
+            ),
+            mock.patch.object(providers, "run", side_effect=swap_before_handoff),
+        ):
+            launch.freeze_prompt()
+            with self.assertRaisesRegex(ReviewError, "workspace path was replaced"):
+                providers._claude_attempt(
+                    review=self.review,
+                    model="claude-opus-4-8",
+                    index=1,
+                    env={"ANTHROPIC_API_KEY": "test-only"},
+                    executable=pathlib.Path("/bin/claude"),
+                    launch=launch,
+                    refresh_lock_protocol=self.claude_refresh_lock_protocol,
+                )
+
     def test_claude_profile_failure_does_not_claim_runtime_launch(self) -> None:
         executable = self.review.container_dir / "verified-claude"
         executable.write_bytes(b"snapshot")
@@ -21133,7 +22357,9 @@ class ProviderPolicyTest(unittest.TestCase):
                 "_prepare_claude_tls_environment",
                 side_effect=lambda _review, env: dict(env),
             ),
-            mock.patch.object(providers, "_claude_keychain_runtime", side_effect=runtime),
+            mock.patch.object(
+                providers, "_claude_keychain_runtime", side_effect=runtime
+            ),
             mock.patch.object(
                 providers,
                 "_claude_connect_proxy",
@@ -21215,7 +22441,9 @@ class ProviderPolicyTest(unittest.TestCase):
                 "_prepare_claude_tls_environment",
                 side_effect=lambda _review, env: dict(env),
             ),
-            mock.patch.object(providers, "_claude_keychain_runtime", side_effect=runtime),
+            mock.patch.object(
+                providers, "_claude_keychain_runtime", side_effect=runtime
+            ),
             mock.patch.object(
                 providers,
                 "_claude_connect_proxy",
@@ -21468,11 +22696,15 @@ class ProviderPolicyTest(unittest.TestCase):
         prepared_file = pathlib.Path(prepared_env["SSL_CERT_FILE"])
         prepared_node_file = pathlib.Path(prepared_env["NODE_EXTRA_CA_CERTS"])
         prepared_dir = pathlib.Path(prepared_env["SSL_CERT_DIR"])
-        self.assertTrue(providers.is_relative_to(prepared_file, self.review.container_dir))
+        self.assertTrue(
+            providers.is_relative_to(prepared_file, self.review.container_dir)
+        )
         self.assertTrue(
             providers.is_relative_to(prepared_node_file, self.review.container_dir)
         )
-        self.assertTrue(providers.is_relative_to(prepared_dir, self.review.container_dir))
+        self.assertTrue(
+            providers.is_relative_to(prepared_dir, self.review.container_dir)
+        )
         node_metadata = prepared_node_file.stat()
         self.assertTrue(stat.S_ISREG(node_metadata.st_mode))
         self.assertEqual(stat.S_IMODE(node_metadata.st_mode), 0o600)
@@ -21997,7 +23229,9 @@ class ProviderPolicyTest(unittest.TestCase):
             return original_read(descriptor, size)
 
         with (
-            mock.patch.object(providers.os, "read", side_effect=replace_link_before_read),
+            mock.patch.object(
+                providers.os, "read", side_effect=replace_link_before_read
+            ),
             self.assertRaisesRegex(
                 providers.ClaudeExecutableInspectionInconclusive,
                 "symlink changed while being read",
@@ -22169,11 +23403,7 @@ class ProviderPolicyTest(unittest.TestCase):
         ):
             providers._claude_linux_ca_bundle(
                 self.review,
-                {
-                    "SSL_CERT_DIR": os.pathsep.join(
-                        str(path) for path in source_dirs
-                    )
-                },
+                {"SSL_CERT_DIR": os.pathsep.join(str(path) for path in source_dirs)},
             )
 
     def test_claude_linux_node_extra_ca_retains_default_trust(self) -> None:
@@ -22851,9 +24081,12 @@ class ProviderPolicyTest(unittest.TestCase):
             "http://corporate-proxy:0",
             "http://corporate-proxy:99999",
         ):
-            with self.subTest(value=value), self.assertRaisesRegex(
-                ReviewError,
-                "upstream proxy .* invalid",
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(
+                    ReviewError,
+                    "upstream proxy .* invalid",
+                ),
             ):
                 with providers._claude_connect_proxy({"https_proxy": value}):
                     self.fail("invalid upstream proxy unexpectedly started")
@@ -22886,9 +24119,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     "_ClaudeProxyServer",
                     side_effect=bind_error,
                 ),
-                self.assertRaises(
-                    providers.ClaudeCredentialInspectionInconclusive
-                ),
+                self.assertRaises(providers.ClaudeCredentialInspectionInconclusive),
             ):
                 with providers._claude_connect_proxy({}):
                     self.fail("failed proxy unexpectedly started")
@@ -23274,8 +24505,7 @@ class ProviderPolicyTest(unittest.TestCase):
         run_command: mock.Mock,
     ) -> None:
         for help_text in (
-            claude_help_fixture()
-            + b"  --safe-mode hooks still load\n",
+            claude_help_fixture() + b"  --safe-mode hooks still load\n",
             claude_help_fixture(
                 safe_mode=CLAUDE_SAFE_MODE_DESCRIPTION.replace(
                     "plugins, hooks, MCP",
@@ -23399,6 +24629,102 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(
             run_command.call_args_list[1].kwargs["output_file_limit_bytes"],
             providers.REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
+        )
+
+    def test_copilot_verdict_uses_bound_stdout_after_attempt_path_replacement(
+        self,
+    ) -> None:
+        model = "claude-opus-4.8"
+
+        def payload(text: str, *, include_padding: bool = False) -> bytes:
+            padding_events = (
+                (
+                    {
+                        "type": "review.progress",
+                        "data": {
+                            "padding": "x" * (2 * 1024 * 1024 + 4096),
+                        },
+                    },
+                )
+                * 2
+                if include_padding
+                else ()
+            )
+            return (
+                "\n".join(
+                    json.dumps(item)
+                    for item in (
+                        {
+                            "type": "session.start",
+                            "data": {"selectedModel": model},
+                        },
+                        {
+                            "type": "assistant.turn_start",
+                            "data": {"turnId": "turn-1"},
+                        },
+                        *padding_events,
+                        {
+                            "type": "assistant.message",
+                            "data": {
+                                "messageId": "message-1",
+                                "content": text,
+                                "model": model,
+                                "toolRequests": [],
+                            },
+                        },
+                        {
+                            "type": "assistant.turn_end",
+                            "data": {"turnId": "turn-1"},
+                        },
+                    )
+                )
+                + "\n"
+            ).encode()
+
+        real_text = "[P1] Real finding from Copilot."
+        real_stdout = payload(real_text, include_padding=True)
+        forged_stdout = payload("No findings.")
+        bounded_capture = self._bounded_attempt_capture(real_stdout)
+        stdout_name = f"01-copilot-{model}.stdout.log"
+
+        def complete(argv, **kwargs) -> Completed:
+            command = tuple(argv)
+            if command[1:] == ("help", "permissions"):
+                help_text = " ".join(providers.COPILOT_PERMISSION_HELP_FRAGMENTS)
+                return Completed(command, 0, help_text.encode(), b"")
+            stdout_file = kwargs["stdout_file"]
+            stdout_file.write(real_stdout)
+            stdout_file.flush()
+            retained = self._replace_attempts_with_forged_stdout(
+                stdout_name=stdout_name,
+                payload=forged_stdout,
+            )
+            self.assertEqual((retained / stdout_name).read_bytes(), real_stdout)
+            return Completed(command, 0, bounded_capture, b"")
+
+        with (
+            providers._open_review_launch_binding(self.review) as launch,
+            mock.patch.object(
+                providers,
+                "resolve_reviewer_executable",
+                return_value=pathlib.Path("/bin/copilot"),
+            ),
+            mock.patch.object(providers, "run", side_effect=complete),
+        ):
+            launch.freeze_prompt()
+            attempt = providers._copilot_attempt(
+                review=self.review,
+                model=model,
+                index=1,
+                env={},
+                launch=launch,
+            )
+
+        self.assertEqual(attempt.final_text, real_text)
+        self.assertEqual(attempt.category, "success")
+        self.assertEqual(
+            (self.review.container_dir / "attempts" / stdout_name).read_bytes(),
+            forged_stdout,
         )
 
     @mock.patch.object(

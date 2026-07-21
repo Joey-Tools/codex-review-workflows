@@ -15,7 +15,19 @@ For every local logical lane:
 - Expose the workspace and Git metadata for read-only reviewer behavior. Disable writes to files, index, refs, config, hooks, remotes, PR state, and other external systems. The canonical Claude CLI's own ordinary credential refresh in trusted real `HOME` is the only planned host-write exception and is not a model-authorized review action; helper credential guarantees do not apply to it. A filesystem read-only sandbox does not prove that state-changing MCP, Plugin, connector, or GitHub tools are absent: the reviewer policy must forbid those actions and the parent must not authorize them. This is a write/behavior contract; it is not a claim that every runtime has an OS-level global host-read whitelist.
 - Keep the model-visible workspace free of generated prompts, diff files, manifests, state directories, and helper control artifacts.
 - If a security preflight needs private evidence, keep it outside the reviewer-visible workspace and never project a full diff into the prompt.
+- Do not use a tracked secret delta as a reviewer-launch gate. The trusted reviewer may inspect the original tracked diff and necessary tracked context, including repository secrets, without redaction or rewriting. Reviewer/runtime authentication credentials, untracked files, unrelated repositories, broad workspace dumps, and home-directory content remain out of scope.
 - Bind the terminal artifact to the exact workspace and range, then clean up the worktree after collection.
+
+## Separate PR/Master Secret Admission
+
+Secret admission is not a named reviewer lane and does not affect whether a lane may start or whether its terminal findings artifact is valid.
+
+- Count each exact raw secret byte value globally over the complete base and head tracked trees, including raw Git path bytes, regular-file blob bytes, and symlink-target bytes. Count gitlink entry paths, but never gitlink object IDs or submodule content.
+- Require only `head_count <= base_count`. Unchanged values, deletions, and moves across paths, surfaces, modes, or offsets pass; first appearance or global count growth violates admission.
+- Do not derive Base64, hex, URL-encoded, escaped, hashed, or other transformed variants. This deliberate limitation means a transformed form is related only if it independently becomes an exact scanner candidate.
+- A genuinely incomplete scan or lost count integrity is `inconclusive`. Report only head-side added locations for positive-delta candidates and omit unchanged occurrences.
+
+When low-level `isolated_review` state is used as PR/master evidence, run `stateful final --state-dir <state_dir>` for the reviewer artifact and then `stateful admission --state-dir <state_dir>` for the independent admission result on that same current-head state. Admission exit `0` is `clean`, `1` violations, `3` pending, and `75` inconclusive. A changed head invalidates both; a successful final never substitutes for admission.
 
 ## Prompt Contract
 
