@@ -461,6 +461,57 @@ class WorkspaceTest(unittest.TestCase):
                 self.assertIsNone(cleanup_workspace(review, keep_container=False))
                 self.assertFalse(review.container_dir.exists())
 
+    def test_bound_file_creators_force_owner_mode_under_restrictive_umask(
+        self,
+    ) -> None:
+        review = self.prepare_range(self.base, self.head)
+        lock_path = review.container_dir / "cleanup.lock"
+        lock_path.unlink(missing_ok=True)
+        lock_handle, lock_error = workspace_runtime.open_bound_review_lock(
+            review.container_dir,
+            expected=review.private_cleanup,
+            name="cleanup.lock",
+        )
+        self.assertIsNone(lock_error)
+        self.assertIsNotNone(lock_handle)
+        assert lock_handle is not None
+        private_path = review.container_dir / "restrictive-umask-private.bin"
+        control_state = workspace_runtime._load_control_artifact_state(
+            container_dir=review.container_dir
+        )
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        container_descriptor = os.open(review.container_dir, directory_flags)
+        previous_umask = os.umask(0o777)
+        try:
+            with workspace_runtime._open_new_private_binary(private_path) as handle:
+                handle.write(b"private artifact\n")
+            self.assertIsNone(
+                workspace_runtime.write_bound_review_text(
+                    review.container_dir,
+                    expected=review.private_cleanup,
+                    name="runner-error.txt",
+                    text="runtime artifact\n",
+                )
+            )
+            workspace_runtime._write_control_artifact_state_at(
+                container_descriptor,
+                control_state,
+            )
+            self.assertIsNone(lock_handle.open_compatibility_lock("cleanup.lock"))
+        finally:
+            os.umask(previous_umask)
+            os.close(container_descriptor)
+            lock_handle.close()
+
+        for artifact in (
+            private_path,
+            review.container_dir / "runner-error.txt",
+            review.container_dir / workspace_runtime.CONTROL_ARTIFACT_STATE_NAME,
+            lock_path,
+        ):
+            with self.subTest(artifact=artifact.name):
+                self.assertEqual(stat.S_IMODE(artifact.stat().st_mode), 0o600)
+
     def test_external_workspace_rejects_group_writable_control_artifact(self) -> None:
         review = prepare_workspace(
             repo=self.repo,

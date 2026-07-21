@@ -2414,18 +2414,19 @@ def _create_private_credential_update(
         candidate = f".{source_name}.codex-review-{secrets.token_hex(16)}"
         try:
             fd = os.open(candidate, flags, 0o600, dir_fd=parent_fd)
-            break
         except FileExistsError:
             continue
         except OSError as error:
             raise LinuxCredentialUnsafe(
                 f"cannot create atomic Claude credential update: {error}"
             ) from error
+        break
     if fd is None:
         raise LinuxCredentialUnsafe(
             "cannot allocate a unique atomic Claude credential update"
         )
     try:
+        os.fchmod(fd, 0o600)
         metadata = os.fstat(fd)
         if (
             not stat.S_ISREG(metadata.st_mode)

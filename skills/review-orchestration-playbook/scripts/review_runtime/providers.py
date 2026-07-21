@@ -984,6 +984,7 @@ class ReviewLaunchBinding:
         if create:
             flags |= os.O_CREAT | os.O_EXCL
         descriptor: int | None = None
+        created = False
         try:
             descriptor = os.open(
                 name,
@@ -991,6 +992,9 @@ class ReviewLaunchBinding:
                 0o600,
                 dir_fd=self.attempts_descriptor,
             )
+            if create:
+                created = True
+                os.fchmod(descriptor, 0o600)
             opened = os.fstat(descriptor)
             current = os.stat(
                 name,
@@ -1000,6 +1004,11 @@ class ReviewLaunchBinding:
         except OSError as error:
             if descriptor is not None:
                 os.close(descriptor)
+            if created:
+                try:
+                    os.unlink(name, dir_fd=self.attempts_descriptor)
+                except OSError:
+                    pass
             action = "create" if create else "open"
             raise ReviewError(f"cannot {action} bound attempt log: {error}") from error
         for metadata in (opened, current):
@@ -2285,12 +2294,28 @@ def _claude_credential_update_lock(name: str) -> Iterator[None]:
     flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     flags |= getattr(os, "O_NONBLOCK", 0)
+    descriptor: int | None = None
+    created = False
     try:
-        descriptor = os.open(path, flags, 0o600)
+        try:
+            descriptor = os.open(path, flags | os.O_EXCL, 0o600)
+            created = True
+        except FileExistsError:
+            descriptor = os.open(path, flags & ~os.O_CREAT)
+        if created:
+            os.fchmod(descriptor, 0o600)
     except OSError as error:
+        if descriptor is not None:
+            os.close(descriptor)
+        if created:
+            try:
+                path.unlink()
+            except OSError:
+                pass
         raise ClaudeCredentialInspectionInconclusive(
             "cannot open the Claude credential update lock safely"
         ) from error
+    assert descriptor is not None
     locked = False
     primary_error: BaseException | None = None
     try:

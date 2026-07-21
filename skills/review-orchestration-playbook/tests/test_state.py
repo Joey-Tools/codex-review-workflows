@@ -20,7 +20,7 @@ from unittest import mock
 SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from review_runtime import cleanup_worker, providers, state  # noqa: E402
+from review_runtime import cleanup_worker, cli, providers, state  # noqa: E402
 from review_runtime.common import (  # noqa: E402
     ReviewError,
     read_json,
@@ -882,7 +882,9 @@ class StatefulLifecycleTest(unittest.TestCase):
                 with self.assertRaises(ReviewError):
                     state._load_state_marker(self.review.container_dir)
 
-    def test_v5_preflight_receipt_schema_is_strict(self) -> None:
+    def test_v5_preflight_receipt_parser_is_strict_and_marker_retains_error(
+        self,
+    ) -> None:
         marker_path = self.review.container_dir / state.STATE_MARKER
         base = state._state_marker_payload(
             self.review,
@@ -903,9 +905,47 @@ class StatefulLifecycleTest(unittest.TestCase):
         )
         for receipt in invalid_receipts:
             with self.subTest(receipt=receipt):
-                write_json(marker_path, {**base, "preflight_receipt": receipt})
                 with self.assertRaises(ReviewError):
-                    state._load_state_marker(self.review.container_dir)
+                    state._parse_preflight_receipt(receipt)
+                write_json(marker_path, {**base, "preflight_receipt": receipt})
+                marker = state._load_state_marker(self.review.container_dir)
+                self.assertIsNone(marker.preflight_receipt)
+                self.assertIsNotNone(marker.preflight_receipt_error)
+
+    def test_v5_marker_keeps_nonreceipt_duplicate_fields_strict(self) -> None:
+        marker_path = self.review.container_dir / state.STATE_MARKER
+        base = state._state_marker_payload(
+            self.review,
+            runner_lock_identity(self.review),
+        )
+        encoded = json.dumps(base, sort_keys=True)
+        duplicated = encoded.replace(
+            '"phase": "ready"',
+            '"phase": "ready", "phase": "ready"',
+            1,
+        )
+        write_text_atomic(marker_path, duplicated + "\n")
+
+        with self.assertRaisesRegex(ReviewError, "duplicate field: phase"):
+            state._load_state_marker(self.review.container_dir)
+
+    def test_v2_marker_keeps_nested_cleanup_duplicates_strict(self) -> None:
+        marker_path = self.review.container_dir / state.STATE_MARKER
+        payload = {
+            "container_dir": str(self.review.container_dir),
+            "private_cleanup": self.review.private_cleanup.to_json(),
+            "version": state.COMPATIBLE_STATE_MARKER_SCHEMA_VERSION,
+        }
+        encoded = json.dumps(payload, sort_keys=True)
+        duplicated = encoded.replace(
+            '"schema_version": 1',
+            '"schema_version": 1, "schema_version": 1',
+            1,
+        )
+        write_text_atomic(marker_path, duplicated + "\n")
+
+        with self.assertRaisesRegex(ReviewError, "duplicate field: schema_version"):
+            state._load_state_marker(self.review.container_dir)
 
     def test_terminal_v1_is_readable_but_requires_manual_recovery(self) -> None:
         self.write_legacy_state()
@@ -1786,6 +1826,108 @@ class StatefulLifecycleTest(unittest.TestCase):
         with mock.patch.object(state, "wait", return_value=0):
             exit_code, text = state.final(self.review.container_dir)
         self.assertEqual((exit_code, text), (0, "No findings."))
+
+    def test_malformed_receipt_is_inconclusive_without_blocking_final(self) -> None:
+        self.write_completed_state()
+        self.write_preflight(self.clean_secret_delta())
+        marker_path = self.review.container_dir / state.STATE_MARKER
+        marker = read_json(marker_path)
+        marker["preflight_receipt"]["algorithm"] = "sha512"
+        write_json(marker_path, marker)
+
+        exit_code, summary = state.admission(self.review.container_dir)
+        self.assertEqual(exit_code, 75)
+        self.assertEqual(summary["status"], "inconclusive")
+        self.assertEqual(summary["failure_class"], "preflight-invalid")
+        self.assertIsNone(summary["secret_delta"])
+        self.assertEqual(state.status(self.review.container_dir)["admission"], summary)
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            cli_exit = cli.main(
+                [
+                    "stateful",
+                    "admission",
+                    "--state-dir",
+                    str(self.review.container_dir),
+                ]
+            )
+        self.assertEqual(cli_exit, 75)
+        self.assertEqual(json.loads(stdout.getvalue()), summary)
+        self.assertEqual(stderr.getvalue(), "")
+
+        lock_path = self.review.container_dir / state.LOCK_FILE
+        with state.open_private_lock_file(
+            lock_path,
+            label="test review runner lock",
+        ) as runner_lock:
+            state.fcntl.flock(
+                runner_lock.fileno(),
+                state.fcntl.LOCK_EX | state.fcntl.LOCK_NB,
+            )
+            with self.assertRaisesRegex(ReviewError, "receipt algorithm is invalid"):
+                state._seal_preflight_receipt(
+                    self.review.container_dir,
+                    review=self.review,
+                    lock_fd=runner_lock.fileno(),
+                )
+
+        final_exit, text = state.final(self.review.container_dir)
+        self.assertEqual((final_exit, text), (0, "No findings."))
+        self.assertFalse(self.review.workspace_root.exists())
+
+    def test_missing_or_duplicate_receipt_is_admission_inconclusive(self) -> None:
+        self.write_completed_state()
+        self.write_preflight(self.clean_secret_delta())
+        marker_path = self.review.container_dir / state.STATE_MARKER
+        valid_marker = read_json(marker_path)
+
+        missing_marker = dict(valid_marker)
+        missing_marker.pop("preflight_receipt")
+        write_json(marker_path, missing_marker)
+        missing_exit, missing = state.admission(self.review.container_dir)
+        self.assertEqual(missing_exit, 75)
+        self.assertEqual(missing["failure_class"], "preflight-invalid")
+
+        receipt = valid_marker["preflight_receipt"]
+        marker_without_receipt = {
+            key: value
+            for key, value in valid_marker.items()
+            if key != "preflight_receipt"
+        }
+        marker_prefix = json.dumps(marker_without_receipt, sort_keys=True)[:-1]
+        duplicate_receipt = (
+            marker_prefix
+            + ', "preflight_receipt": {'
+            + f'"algorithm": "{receipt["algorithm"]}", '
+            + '"algorithm": "sha512", '
+            + f'"schema_version": {receipt["schema_version"]}, '
+            + f'"sha256": "{receipt["sha256"]}", '
+            + f'"size": {receipt["size"]}'
+            + "}}\n"
+        )
+        write_text_atomic(marker_path, duplicate_receipt)
+
+        duplicate_exit, duplicate = state.admission(self.review.container_dir)
+        self.assertEqual(duplicate_exit, 75)
+        self.assertEqual(duplicate["failure_class"], "preflight-invalid")
+
+        receipt_json = json.dumps(receipt, sort_keys=True)
+        duplicate_top_level_receipt = (
+            marker_prefix
+            + f', "preflight_receipt": {receipt_json}'
+            + f', "preflight_receipt": {receipt_json}'
+            + "}\n"
+        )
+        write_text_atomic(marker_path, duplicate_top_level_receipt)
+
+        top_level_exit, top_level = state.admission(self.review.container_dir)
+        self.assertEqual(top_level_exit, 75)
+        self.assertEqual(top_level["failure_class"], "preflight-invalid")
 
     def test_legacy_admission_is_inconclusive(self) -> None:
         self.write_legacy_state()

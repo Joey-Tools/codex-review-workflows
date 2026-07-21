@@ -463,6 +463,21 @@ class ProviderPolicyTest(unittest.TestCase):
 
         return fail
 
+    def test_bound_attempt_logs_force_owner_mode_under_restrictive_umask(
+        self,
+    ) -> None:
+        with providers._open_review_launch_binding(self.review) as launch:
+            previous_umask = os.umask(0o777)
+            try:
+                with launch.open_attempt_file("restrictive-umask.log") as handle:
+                    handle.write(b"review output\n")
+            finally:
+                os.umask(previous_umask)
+
+        artifact = self.review.container_dir / "attempts" / "restrictive-umask.log"
+        self.assertEqual(artifact.read_bytes(), b"review output\n")
+        self.assertEqual(stat.S_IMODE(artifact.stat().st_mode), 0o600)
+
     def tearDown(self) -> None:
         self.keychain_runtime_patcher.stop()
         self.keychain_broker_patcher.stop()
@@ -2255,6 +2270,44 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertNotIn("injected sensitive lock detail", str(raised.exception))
 
+    def test_helper_credential_lock_forces_new_mode_without_repairing_existing(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            lock_path = pathlib.Path(temporary) / "credential.lock"
+            previous_umask = os.umask(0o777)
+            try:
+                with mock.patch.object(
+                    providers.pathlib,
+                    "Path",
+                    return_value=lock_path,
+                ):
+                    with providers._claude_credential_update_lock("keychain"):
+                        self.assertEqual(
+                            stat.S_IMODE(lock_path.stat().st_mode),
+                            0o600,
+                        )
+            finally:
+                os.umask(previous_umask)
+
+            lock_path.chmod(0o400)
+            with (
+                mock.patch.object(
+                    providers.pathlib,
+                    "Path",
+                    return_value=lock_path,
+                ),
+                self.assertRaises(
+                    (
+                        ReviewError,
+                        providers.ClaudeCredentialInspectionInconclusive,
+                    )
+                ),
+            ):
+                with providers._claude_credential_update_lock("keychain"):
+                    self.fail("unsafe existing helper lock unexpectedly acquired")
+            self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o400)
+
     @unittest.skipUnless(
         hasattr(os, "mkfifo") and hasattr(os, "O_NONBLOCK"),
         "requires POSIX FIFO support",
@@ -2290,8 +2343,10 @@ class ProviderPolicyTest(unittest.TestCase):
                 with providers._claude_credential_update_lock("keychain"):
                     self.fail("FIFO helper lock unexpectedly acquired")
 
-            self.assertEqual(len(requested_flags), 1)
-            self.assertTrue(requested_flags[0] & os.O_NONBLOCK)
+            self.assertEqual(len(requested_flags), 2)
+            self.assertTrue(all(flags & os.O_NONBLOCK for flags in requested_flags))
+            self.assertTrue(requested_flags[0] & os.O_EXCL)
+            self.assertFalse(requested_flags[1] & os.O_CREAT)
 
     def test_claude_keychain_broker_serves_one_in_memory_value(self) -> None:
         if (

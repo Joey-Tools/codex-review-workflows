@@ -136,12 +136,17 @@ def write_text_atomic(path: pathlib.Path, text: str) -> None:
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary_path = pathlib.Path(temporary)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        os.fchmod(fd, 0o600)
+        handle = os.fdopen(fd, "w", encoding="utf-8")
+        fd = -1
+        with handle:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_path, path)
     finally:
+        if fd >= 0:
+            os.close(fd)
         temporary_path.unlink(missing_ok=True)
 
 
@@ -162,6 +167,7 @@ def write_bytes_atomic_at(directory_fd: int, name: str, payload: bytes) -> None:
     handle: BinaryIO | None = None
     try:
         descriptor = os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
+        os.fchmod(descriptor, 0o600)
         handle = os.fdopen(descriptor, "wb")
         descriptor = None
         handle.write(payload)

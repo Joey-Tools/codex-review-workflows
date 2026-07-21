@@ -18,6 +18,57 @@ from review_runtime.common import ReviewError  # noqa: E402
 
 
 class ChildEnvironmentTest(unittest.TestCase):
+    def test_atomic_writers_force_owner_mode_under_restrictive_umask(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            path_artifact = root / "path-artifact.txt"
+            directory_descriptor = os.open(root, os.O_RDONLY)
+            previous_umask = os.umask(0o777)
+            try:
+                common.write_text_atomic(path_artifact, "path artifact\n")
+                common.write_bytes_atomic_at(
+                    directory_descriptor,
+                    "bound-artifact.txt",
+                    b"bound artifact\n",
+                )
+            finally:
+                os.umask(previous_umask)
+                os.close(directory_descriptor)
+
+            self.assertEqual(
+                path_artifact.read_text(encoding="utf-8"), "path artifact\n"
+            )
+            self.assertEqual(
+                (root / "bound-artifact.txt").read_bytes(),
+                b"bound artifact\n",
+            )
+            self.assertEqual(path_artifact.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(
+                (root / "bound-artifact.txt").stat().st_mode & 0o777,
+                0o600,
+            )
+
+    def test_path_atomic_writer_closes_descriptor_when_fchmod_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            descriptor = -1
+
+            def fail_fchmod(fd: int, _mode: int) -> None:
+                nonlocal descriptor
+                descriptor = fd
+                raise OSError("forced fchmod failure")
+
+            with (
+                mock.patch.object(common.os, "fchmod", side_effect=fail_fchmod),
+                self.assertRaisesRegex(OSError, "forced fchmod failure"),
+            ):
+                common.write_text_atomic(root / "artifact.txt", "artifact\n")
+
+            self.assertGreaterEqual(descriptor, 0)
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+            self.assertEqual(list(root.iterdir()), [])
+
     def test_tail_text_reads_only_a_bounded_suffix(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = pathlib.Path(temporary) / "review.log"

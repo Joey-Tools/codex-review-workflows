@@ -2268,6 +2268,32 @@ class CredentialStagingTest(unittest.TestCase):
     SYNTH_REFRESH_A = "codex_synth_v1_refresh_a"
     SYNTH_REFRESH_B = "codex_synth_v1_refresh_b"
 
+    def test_private_credential_update_forces_mode_under_restrictive_umask(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            parent_descriptor = os.open(
+                root,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            payload = bytearray(b'{"credential":"synthetic"}\n')
+            previous_umask = os.umask(0o777)
+            try:
+                candidate = claude_linux._create_private_credential_update(
+                    parent_descriptor,
+                    "credential.json",
+                    payload,
+                    owner_uid=os.geteuid(),
+                )
+            finally:
+                os.umask(previous_umask)
+                os.close(parent_descriptor)
+
+            artifact = root / candidate
+            self.assertEqual(artifact.read_bytes(), payload)
+            self.assertEqual(stat.S_IMODE(artifact.stat().st_mode), 0o600)
+
     def _credential(
         self,
         path: pathlib.Path,

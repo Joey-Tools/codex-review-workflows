@@ -181,6 +181,7 @@ class LoadedStateMarker:
     runner_lock: CleanupIdentity | None
     source_root: pathlib.Path | None
     preflight_receipt: PreflightReceipt | None
+    preflight_receipt_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -706,17 +707,34 @@ class ReviewPreparationGuard:
             raise first_error
 
 
-def _reject_duplicate_marker_object(
+class _MarkerObject(dict[str, Any]):
+    duplicate_fields: frozenset[str]
+
+
+def _capture_duplicate_marker_object(
     pairs: list[tuple[str, Any]],
-) -> dict[str, Any]:
-    value: dict[str, Any] = {}
+) -> _MarkerObject:
+    value = _MarkerObject()
+    duplicates: set[str] = set()
     for key, item in pairs:
         if key in value:
-            raise ReviewError(
-                f"isolated-review state marker has duplicate field: {key}"
-            )
+            duplicates.add(key)
         value[key] = item
+    value.duplicate_fields = frozenset(duplicates)
     return value
+
+
+def _first_duplicate_marker_field(value: Any) -> str | None:
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, _MarkerObject):
+            if current.duplicate_fields:
+                return sorted(current.duplicate_fields)[0]
+            pending.extend(current.values())
+        elif isinstance(current, list):
+            pending.extend(current)
+    return None
 
 
 def _parse_preflight_receipt(value: Any) -> PreflightReceipt:
@@ -956,15 +974,32 @@ def _load_state_marker(state_dir: pathlib.Path) -> LoadedStateMarker:
     try:
         marker = json.loads(
             encoded.decode("utf-8"),
-            object_pairs_hook=_reject_duplicate_marker_object,
+            object_pairs_hook=_capture_duplicate_marker_object,
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ReviewError("isolated-review state marker is invalid") from error
     if not isinstance(marker, dict):
         raise ReviewError("isolated-review state marker is not a JSON object")
+    marker_duplicates = (
+        marker.duplicate_fields if isinstance(marker, _MarkerObject) else frozenset()
+    )
+    nonreceipt_marker_duplicates = marker_duplicates - {"preflight_receipt"}
+    if nonreceipt_marker_duplicates:
+        duplicate = sorted(nonreceipt_marker_duplicates)[0]
+        raise ReviewError(
+            f"isolated-review state marker has duplicate field: {duplicate}"
+        )
     version = marker.get("version")
     if type(version) is not int:
         raise ReviewError("isolated-review state marker version is invalid")
+    for field, value in marker.items():
+        if version == STATE_MARKER_SCHEMA_VERSION and field == "preflight_receipt":
+            continue
+        duplicate = _first_duplicate_marker_field(value)
+        if duplicate is not None:
+            raise ReviewError(
+                f"isolated-review state marker has duplicate field: {duplicate}"
+            )
     if version == COMPATIBLE_STATE_MARKER_SCHEMA_VERSION:
         if set(marker) != {"container_dir", "private_cleanup", "version"}:
             raise ReviewError("isolated-review state marker fields are invalid")
@@ -997,7 +1032,15 @@ def _load_state_marker(state_dir: pathlib.Path) -> LoadedStateMarker:
         expected_fields.add("runner_lock")
     if version == STATE_MARKER_SCHEMA_VERSION:
         expected_fields.add("preflight_receipt")
-    if set(marker) != expected_fields:
+    actual_fields = set(marker)
+    missing_receipt = (
+        version == STATE_MARKER_SCHEMA_VERSION
+        and "preflight_receipt" not in actual_fields
+    )
+    required_fields = expected_fields - (
+        {"preflight_receipt"} if missing_receipt else set()
+    )
+    if actual_fields != required_fields:
         raise ReviewError("isolated-review state marker fields are invalid")
     source_root = _validate_v3_marker_layout(
         marker["source_root"],
@@ -1017,6 +1060,30 @@ def _load_state_marker(state_dir: pathlib.Path) -> LoadedStateMarker:
         raise ReviewError(
             "isolated-review preparing marker cannot contain a preflight receipt"
         )
+    preflight_receipt: PreflightReceipt | None = None
+    if "preflight_receipt" in marker_duplicates:
+        preflight_receipt_error: str | None = (
+            "isolated-review state marker has duplicate preflight receipt field"
+        )
+    elif missing_receipt:
+        preflight_receipt_error = "isolated-review preflight receipt field is missing"
+    else:
+        preflight_receipt_error = None
+    receipt_duplicate = _first_duplicate_marker_field(receipt_value)
+    if preflight_receipt_error is None and receipt_duplicate is not None:
+        preflight_receipt_error = (
+            f"isolated-review preflight receipt has duplicate field: "
+            f"{receipt_duplicate}"
+        )
+    elif (
+        preflight_receipt_error is None
+        and version == STATE_MARKER_SCHEMA_VERSION
+        and receipt_value is not None
+    ):
+        try:
+            preflight_receipt = _parse_preflight_receipt(receipt_value)
+        except ReviewError as error:
+            preflight_receipt_error = str(error)
     return LoadedStateMarker(
         version=version,
         phase=phase,
@@ -1027,11 +1094,8 @@ def _load_state_marker(state_dir: pathlib.Path) -> LoadedStateMarker:
             else None
         ),
         source_root=source_root,
-        preflight_receipt=(
-            _parse_preflight_receipt(receipt_value)
-            if version == STATE_MARKER_SCHEMA_VERSION and receipt_value is not None
-            else None
-        ),
+        preflight_receipt=preflight_receipt,
+        preflight_receipt_error=preflight_receipt_error,
     )
 
 
@@ -1246,6 +1310,8 @@ def _seal_preflight_receipt(
             f"secret admission sealing requires a v{STATE_MARKER_SCHEMA_VERSION} "
             "ready state marker"
         )
+    if marker.preflight_receipt_error is not None:
+        raise ReviewError(marker.preflight_receipt_error)
     if marker.preflight_receipt is not None:
         raise ReviewError("secret admission preflight receipt is already sealed")
     payload = _read_modern_bound_state_artifact(
@@ -2221,6 +2287,15 @@ def _admission_status_for_loaded_state(
             status="inconclusive",
             exit_code=75,
             failure_class="legacy-state-no-admission",
+            secret_delta=None,
+        )
+    if marker.preflight_receipt_error is not None:
+        return _admission_result(
+            state_dir=state_dir,
+            review_range=review_range,
+            status="inconclusive",
+            exit_code=75,
+            failure_class="preflight-invalid",
             secret_delta=None,
         )
     if marker.preflight_receipt is None:

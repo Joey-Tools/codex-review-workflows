@@ -429,8 +429,24 @@ class BoundReviewLock:
             | getattr(os, "O_NOFOLLOW", 0)
         )
         descriptor: int | None = None
+        created = False
         try:
-            descriptor = os.open(name, flags, 0o600, dir_fd=self.fileno())
+            try:
+                descriptor = os.open(
+                    name,
+                    flags | os.O_EXCL,
+                    0o600,
+                    dir_fd=self.fileno(),
+                )
+                created = True
+            except FileExistsError:
+                descriptor = os.open(
+                    name,
+                    flags & ~os.O_CREAT,
+                    dir_fd=self.fileno(),
+                )
+            if created:
+                os.fchmod(descriptor, 0o600)
             opened = os.fstat(descriptor)
             current = os.stat(
                 name,
@@ -452,6 +468,11 @@ class BoundReviewLock:
             self._compatibility_descriptor = descriptor
             descriptor = None
         except OSError as error:
+            if created:
+                try:
+                    os.unlink(name, dir_fd=self.fileno())
+                except OSError:
+                    pass
             return f"cannot securely open review runtime compatibility lock: {error}"
         finally:
             if descriptor is not None:
@@ -2250,6 +2271,7 @@ def _write_bound_review_bytes(
                 0o600,
                 dir_fd=container_descriptor,
             )
+            os.fchmod(descriptor, 0o600)
             handle = os.fdopen(descriptor, "wb")
             descriptor = None
             handle.write(encoded)
@@ -3567,6 +3589,7 @@ def _open_new_private_binary(
             0o600,
             dir_fd=parent_descriptor,
         )
+        os.fchmod(descriptor, 0o600)
         if identity_handoff is not None:
             identity_handoff(_cleanup_identity_evidence(os.fstat(descriptor)))
         if creation_mask is not None:
@@ -5738,6 +5761,7 @@ def _write_control_artifact_state_at(
             0o600,
             dir_fd=container_descriptor,
         )
+        os.fchmod(descriptor, 0o600)
         handle = os.fdopen(descriptor, "wb")
         descriptor = None
         handle.write(encoded)
