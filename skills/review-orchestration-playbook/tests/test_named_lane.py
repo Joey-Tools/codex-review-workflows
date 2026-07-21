@@ -28,7 +28,9 @@ from review_runtime.common import (  # noqa: E402
     TRUSTED_PATH,
 )
 from review_runtime.named_lane import (  # noqa: E402
+    SYMLINK_COUNT_LIMIT,
     NamedLaneGuardError,
+    _read_symlink_blobs,
     _validate_materialized_gitlink,
     _validate_materialized_symlink,
     main as named_lane_main,
@@ -158,6 +160,47 @@ class NamedLaneGuardTest(unittest.TestCase):
 
         self.assertEqual(result.symlink_count, 1)
         self.assertEqual(result.guidance_count, 1)
+
+    def test_symlink_targets_use_one_binary_safe_bounded_batch(self) -> None:
+        first_object = "1" * 40
+        second_object = "2" * 40
+        first_target = b"nested/target\nwith-newline"
+        second_target = b"other-target"
+        payload = (
+            f"{first_object} blob {len(first_target)}\n".encode("ascii")
+            + first_target
+            + b"\n"
+            + f"{second_object} blob {len(second_target)}\n".encode("ascii")
+            + second_target
+            + b"\n"
+        )
+
+        with mock.patch(
+            "review_runtime.named_lane._git_capture", return_value=payload
+        ) as capture:
+            targets = _read_symlink_blobs(
+                self.repo.resolve(),
+                (first_object, first_object, second_object),
+            )
+
+        self.assertEqual(targets[first_object], os.fsdecode(first_target))
+        self.assertEqual(targets[second_object], os.fsdecode(second_target))
+        capture.assert_called_once()
+        arguments, keywords = capture.call_args
+        self.assertEqual(arguments[1], ("cat-file", "--batch"))
+        self.assertEqual(
+            keywords["stdin"],
+            bytearray(f"{first_object}\n{second_object}\n".encode("ascii")),
+        )
+
+    def test_symlink_batch_has_an_explicit_aggregate_count_limit(self) -> None:
+        object_ids = tuple(f"{value:040x}" for value in range(SYMLINK_COUNT_LIMIT + 1))
+
+        with mock.patch("review_runtime.named_lane._git_capture") as capture:
+            with self.assertRaisesRegex(NamedLaneGuardError, "too many symlinks"):
+                _read_symlink_blobs(self.repo.resolve(), object_ids)
+
+        capture.assert_not_called()
 
     def test_worktree_path_through_symlink_ancestor_is_allowed(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
@@ -807,6 +850,52 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertFalse((self.repo / "stderr.bin").exists())
         self.assertFalse((displaced_parent / "stdout.bin").exists())
         self.assertFalse((displaced_parent / "stderr.bin").exists())
+
+    def test_output_temp_cleanup_failure_rolls_back_published_leaf(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable("print('captured')\n")
+        stdout = self.root / "cleanup-stdout.bin"
+        stderr = self.root / "cleanup-stderr.bin"
+        real_unlink = os.unlink
+        failed_once = False
+
+        def fail_first_temp_cleanup(
+            path: str | bytes,
+            *arguments: object,
+            **keywords: object,
+        ) -> None:
+            nonlocal failed_once
+            if (
+                not failed_once
+                and isinstance(path, str)
+                and path.startswith(".named-lane-")
+            ):
+                failed_once = True
+                raise OSError("synthetic temporary cleanup failure")
+            real_unlink(path, *arguments, **keywords)
+
+        with mock.patch(
+            "review_runtime.named_lane.os.unlink",
+            side_effect=fail_first_temp_cleanup,
+        ):
+            with self.assertRaisesRegex(
+                NamedLaneGuardError, "temporary cleanup failed"
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=stdout,
+                    stderr_path=stderr,
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=64,
+                )
+
+        self.assertTrue(failed_once)
+        self.assertFalse(stdout.exists())
+        self.assertFalse(stderr.exists())
+        self.assertEqual(list(self.root.glob(".named-lane-*")), [])
 
     def test_cli_classifies_bounded_failures_by_subcommand(self) -> None:
         cases = (

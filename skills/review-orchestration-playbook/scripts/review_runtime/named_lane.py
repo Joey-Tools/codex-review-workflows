@@ -32,6 +32,8 @@ DEFAULT_STREAM_LIMIT_BYTES = 64 * 1024 * 1024
 DEFAULT_PROMPT_LIMIT_BYTES = 256 * 1024
 GIT_OUTPUT_LIMIT_BYTES = 32 * 1024 * 1024
 SYMLINK_TARGET_LIMIT_BYTES = 16 * 1024
+SYMLINK_COUNT_LIMIT = 4_096
+SYMLINK_BATCH_OUTPUT_LIMIT_BYTES = 64 * 1024 * 1024
 FULL_OBJECT_ID = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
 CLAUDE_ENV_PASSTHROUGH_KEYS = (
     "ALL_PROXY",
@@ -99,6 +101,7 @@ def _git_capture(
     *,
     output_limit_bytes: int = GIT_OUTPUT_LIMIT_BYTES,
     allow_no_match: bool = False,
+    stdin: bytearray | None = None,
 ) -> bytes:
     git = resolve_git()
     command = (
@@ -119,6 +122,7 @@ def _git_capture(
     capture = run_bounded_capture(
         command,
         env=_git_environment(),
+        stdin=stdin,
         timeout_seconds=30.0,
         stdout_limit_bytes=output_limit_bytes,
         stderr_limit_bytes=1024 * 1024,
@@ -293,15 +297,58 @@ def _relative_target_stays_inside(
     return True
 
 
-def _read_symlink_blob(root: pathlib.Path, object_id: str) -> str:
+def _read_symlink_blobs(
+    root: pathlib.Path,
+    object_ids: Sequence[str],
+) -> dict[str, str]:
+    if len(object_ids) > SYMLINK_COUNT_LIMIT:
+        raise NamedLaneGuardError("frozen Git tree contains too many symlinks")
+    if not object_ids:
+        return {}
+    unique_object_ids = tuple(dict.fromkeys(object_ids))
+    queries = bytearray(
+        "".join(f"{object_id}\n" for object_id in unique_object_ids).encode("ascii")
+    )
     payload = _git_capture(
         root,
-        ("cat-file", "blob", object_id),
-        output_limit_bytes=SYMLINK_TARGET_LIMIT_BYTES + 1,
+        ("cat-file", "--batch"),
+        output_limit_bytes=SYMLINK_BATCH_OUTPUT_LIMIT_BYTES,
+        stdin=queries,
     )
-    if len(payload) > SYMLINK_TARGET_LIMIT_BYTES or b"\0" in payload:
-        raise NamedLaneGuardError("frozen Git symlink target is invalid")
-    return os.fsdecode(payload)
+    targets: dict[str, str] = {}
+    cursor = 0
+    for expected_object_id in unique_object_ids:
+        header_end = payload.find(b"\n", cursor)
+        if header_end < 0:
+            raise NamedLaneGuardError("malformed Git symlink batch output")
+        header = payload[cursor:header_end].split(b" ")
+        if len(header) != 3:
+            raise NamedLaneGuardError("malformed Git symlink batch header")
+        raw_object_id, object_type, raw_size = header
+        try:
+            object_id = raw_object_id.decode("ascii")
+            size = int(raw_size.decode("ascii"))
+        except (UnicodeDecodeError, ValueError) as error:
+            raise NamedLaneGuardError("malformed Git symlink batch header") from error
+        if (
+            object_id != expected_object_id
+            or object_type != b"blob"
+            or size < 0
+            or size > SYMLINK_TARGET_LIMIT_BYTES
+        ):
+            raise NamedLaneGuardError("frozen Git symlink target is invalid")
+        target_start = header_end + 1
+        target_end = target_start + size
+        if target_end >= len(payload) or payload[target_end : target_end + 1] != b"\n":
+            raise NamedLaneGuardError("malformed Git symlink batch payload")
+        target = payload[target_start:target_end]
+        if b"\0" in target:
+            raise NamedLaneGuardError("frozen Git symlink target is invalid")
+        targets[object_id] = os.fsdecode(target)
+        cursor = target_end + 1
+    if cursor != len(payload):
+        raise NamedLaneGuardError("unexpected Git symlink batch output")
+    return targets
 
 
 def _validate_materialized_symlink(
@@ -484,6 +531,10 @@ def validate_worktree(
     if _status_has_disallowed_changes(status, absent_gitlinks):
         raise NamedLaneGuardError("worktree must be clean before reviewer launch")
     symlinks = [path for path, entry in tree.items() if entry[0] == "120000"]
+    symlink_targets = _read_symlink_blobs(
+        root,
+        [tree[path][2] for path in symlinks],
+    )
     for path in symlinks:
         mode, object_type, object_id = tree[path]
         if mode != "120000" or object_type != "blob":
@@ -491,7 +542,7 @@ def validate_worktree(
         _validate_materialized_symlink(
             root,
             path,
-            _read_symlink_blob(root, object_id),
+            symlink_targets[object_id],
         )
     guidance = {path for path in tree if path.name == "AGENTS.md"}
     guidance.update(_normalize_guidance_path(value) for value in guidance_paths)
@@ -723,6 +774,7 @@ def _open_private_temporary(target: _OutputTarget) -> tuple[int, str]:
 
 def _write_private_bytes(target: _OutputTarget, payload: bytes | bytearray) -> None:
     descriptor, temporary_name = _open_private_temporary(target)
+    published = False
     try:
         os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "wb") as handle:
@@ -738,6 +790,7 @@ def _write_private_bytes(target: _OutputTarget, payload: bytes | bytearray) -> N
                 dst_dir_fd=target.parent_fd,
                 follow_symlinks=False,
             )
+            published = True
         except FileExistsError as error:
             raise NamedLaneGuardError(
                 "Claude output path appeared during write"
@@ -748,11 +801,34 @@ def _write_private_bytes(target: _OutputTarget, payload: bytes | bytearray) -> N
             ) from error
     finally:
         if descriptor >= 0:
-            os.close(descriptor)
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
         try:
             os.unlink(temporary_name, dir_fd=target.parent_fd)
         except FileNotFoundError:
             pass
+        except OSError as cleanup_error:
+            rollback_errors: list[OSError] = []
+            if published:
+                try:
+                    os.unlink(target.path.name, dir_fd=target.parent_fd)
+                except FileNotFoundError:
+                    pass
+                except OSError as error:
+                    rollback_errors.append(error)
+            try:
+                os.unlink(temporary_name, dir_fd=target.parent_fd)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                rollback_errors.append(error)
+            if rollback_errors:
+                raise NamedLaneGuardError(
+                    "Claude output cleanup or rollback remained incomplete"
+                ) from rollback_errors[0]
+            raise NamedLaneGuardError(
+                "Claude output temporary cleanup failed"
+            ) from cleanup_error
 
 
 def _remove_private_output(target: _OutputTarget) -> None:

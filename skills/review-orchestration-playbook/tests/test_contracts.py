@@ -1116,6 +1116,11 @@ class RepositoryContractTest(unittest.TestCase):
             "Do not expand that guard into",
             contracts,
         )
+        for content in (skill, contracts, canonical):
+            self.assertIn("30-second", content)
+            self.assertIn("4,096", content)
+            self.assertIn("16 KiB", content)
+            self.assertIn("64 MiB", content)
 
     def test_named_lane_pristine_guard_covers_hidden_ignored_and_gitlinks(
         self,
@@ -1184,6 +1189,10 @@ class RepositoryContractTest(unittest.TestCase):
             '"hash-object"',
         ):
             self.assertNotIn(overstrict_implementation, runtime)
+        self.assertIn('("cat-file", "--batch")', runtime)
+        self.assertIn("SYMLINK_COUNT_LIMIT", runtime)
+        self.assertIn("SYMLINK_BATCH_OUTPUT_LIMIT_BYTES", runtime)
+        self.assertNotIn('("cat-file", "blob"', runtime)
 
     def test_direct_claude_guard_has_minimal_environment_and_output_paths(
         self,
@@ -1268,6 +1277,8 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("dir_fd=target.parent_fd", runtime)
         self.assertIn("_revalidate_output_parent(stdout)", runtime)
         self.assertIn("_revalidate_output_parent(stderr)", runtime)
+        self.assertIn("Claude output temporary cleanup failed", runtime)
+        self.assertIn("Claude output cleanup or rollback remained incomplete", runtime)
         self.assertIn("Claude output path must not already exist", runtime)
         self.assertIn("Claude output parent must be a real directory", runtime)
         self.assertIn("Claude output parent must not traverse a symlink", runtime)
