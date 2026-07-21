@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import math
 import pathlib
 import subprocess
 import sys
@@ -670,7 +671,7 @@ class RepositoryContractTest(unittest.TestCase):
             )
             for anchor in (
                 "Codex Review Gate Compatibility Status",
-                "pull_request:",
+                "pull_request_target:",
                 "types: [opened, reopened, synchronize, ready_for_review]",
                 "permissions:\n  contents: read",
                 "jobs:\n  compatibility-status:",
@@ -680,7 +681,7 @@ class RepositoryContractTest(unittest.TestCase):
                 self.assertIn(anchor, compatibility)
             self.assertEqual(compatibility.count("\n  compatibility-status:\n"), 1)
             for forbidden in (
-                "pull_request_target:",
+                "pull_request:",
                 "issue_comment:",
                 "pull_request_review:",
                 "schedule:",
@@ -942,10 +943,10 @@ class RepositoryContractTest(unittest.TestCase):
         readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
             encoding="utf-8"
         )
-        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+        probes = (SKILL_ROOT / "references/github-pr-probes.md").read_text(
             encoding="utf-8"
         )
-        probes = (SKILL_ROOT / "references/github-pr-probes.md").read_text(
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
             encoding="utf-8"
         )
         templates = (SKILL_ROOT / "references/review-prompt-templates.md").read_text(
@@ -1027,7 +1028,7 @@ class RepositoryContractTest(unittest.TestCase):
         for scenario in (
             "single, double, triple, and triple already reduced to effective double",
             "Skip this comparison only on the no-PR path",
-            "Only actual PR absence takes the no-PR effective-double path",
+            "Only actual PR absence takes the no-PR path; for requested triple that path is effective double",
             "existing PR on an unsupported host or identity remains on the existing-PR path",
             "an authenticated provider rejection may prove no-start integration/service unavailability",
             "acknowledgement or run/review activity proves start",
@@ -1160,7 +1161,7 @@ class RepositoryContractTest(unittest.TestCase):
             "supported GitHub Cloud PR",
             "sqbu-github.cisco.com",
             "identity in `{hoteng, hoteng_cisco}`",
-            "requested triple; effective double",
+            "`requested: triple`, `effective: double`",
             "Posting the comment requests the third lane but does not complete it",
             "trustworthy terminal current-head result",
             "effective: triple-inconclusive",
@@ -1185,6 +1186,9 @@ class RepositoryContractTest(unittest.TestCase):
             "--strict-mcp-config",
             "--tools Read,Grep,Glob,Bash",
             "--disallowedTools Edit,Write,NotebookEdit,WebFetch,WebSearch,Task",
+            "disableBundledSkills: true",
+            '"disableBundledSkills": true',
+            "`--safe-mode` alone is not evidence that bundled skills are absent",
             '"denyWrite": ["/"]',
             "lane-private local clone or private bare object store plus worktree",
             "not a network clone or prepared-diff materialization",
@@ -1238,7 +1242,7 @@ class RepositoryContractTest(unittest.TestCase):
             "`api_error_status`, when present, is `null` or a whitespace-only string",
             "`permission_denials`, when present, is an empty array",
             "nonempty/malformed `permission_denials` fails closed",
-            "A verified CLI version with no reviewed expected-init schema is also inconclusive",
+            "A CLI version other than exact `2.1.212` is blocked before review input is exposed",
             "does not prove the final merged native sandbox",
             "merged admin-managed permission arrays",
             "path-rule evaluation",
@@ -1259,7 +1263,7 @@ class RepositoryContractTest(unittest.TestCase):
 
         envelope_anchor = "A missing, duplicate, malformed, out-of-order, or trailing contract event makes the lane `inconclusive`"
         classifier_anchor = "A structurally valid terminal event that fails the success acceptance schema is passed to the failure classifier below"
-        permission_anchor = "Classify a structurally valid permission denial, exact-model mismatch, or configuration/policy mismatch as `blocked`"
+        permission_anchor = "Classify a structurally valid permission denial, output truncation/abnormal stop, exact-model mismatch, or configuration/policy mismatch as `blocked`"
         authentication_anchor = "Classify a structurally valid recognized login-expired, HTTP 401, or authentication-refresh error as `blocked-authentication`"
         for anchor in (
             envelope_anchor,
@@ -1329,39 +1333,142 @@ class RepositoryContractTest(unittest.TestCase):
             identities["claude-opus-4-7"]["accepted_model_usage_keys"],
             ["claude-opus-4-7", "claude-opus-4.7"],
         )
+        accepted_auxiliary_keys = set(schema["accepted_auxiliary_model_usage_keys"])
+        self.assertEqual(
+            accepted_auxiliary_keys,
+            {"claude-haiku-4-5-20251001"},
+        )
+        all_primary_keys = {
+            key
+            for identity in identities.values()
+            for key in identity["accepted_model_usage_keys"]
+        }
         allowed_terminal_fields = set(schema["terminal_result"]["required_fields"])
         allowed_terminal_fields.update(schema["terminal_result"]["optional_fields"])
+        optional_contracts = schema["terminal_result"]["optional_field_contracts"]
+        self.assertEqual(
+            set(schema["terminal_result"]["optional_fields"]),
+            set(optional_contracts),
+        )
+        self.assertEqual(
+            optional_contracts["stop_reason"],
+            {
+                "rule": "enum",
+                "accepted_values": [None, "end_turn"],
+                "failure": "blocked",
+            },
+        )
+        self.assertEqual(optional_contracts["structured_output"]["rule"], "null")
+
+        def optional_value_is_valid(rule: str, value: object, contract: dict) -> bool:
+            if rule == "nonnegative_integer":
+                return type(value) is int and value >= 0
+            if rule == "positive_integer":
+                return type(value) is int and value > 0
+            if rule == "nonnegative_finite_number":
+                return (
+                    type(value) in (int, float) and math.isfinite(value) and value >= 0
+                )
+            if rule == "nonempty_string":
+                return isinstance(value, str) and bool(value.strip())
+            if rule == "object":
+                return isinstance(value, dict)
+            if rule == "enum":
+                return value in contract["accepted_values"]
+            if rule == "null":
+                return value is None
+            if rule == "explicitly_empty":
+                return (
+                    value is None
+                    or value in ("", [], {})
+                    or (isinstance(value, str) and not value.strip())
+                )
+            if rule == "null_or_whitespace_string":
+                return value is None or (isinstance(value, str) and not value.strip())
+            if rule == "empty_array":
+                return value == []
+            self.fail(f"unknown optional-field rule: {rule}")
 
         observed = {}
         for case in schema["contract_cases"]:
             identity = identities[case["requested_model"]]
+            requested_keys = set(identity["accepted_model_usage_keys"])
+            observed_model_keys = set(case["model_usage_keys"])
+            other_primary_keys = all_primary_keys - requested_keys
+            unknown_model_keys = observed_model_keys - (
+                requested_keys | other_primary_keys | accepted_auxiliary_keys
+            )
             unknown_fields = (
                 set(case["extra_terminal_fields"]) - allowed_terminal_fields
             )
+            optional_failures = {
+                optional_contracts[field]["failure"]
+                for field, value in case["optional_terminal_values"].items()
+                if field not in optional_contracts
+                or not optional_value_is_valid(
+                    optional_contracts[field]["rule"],
+                    value,
+                    optional_contracts[field],
+                )
+            }
             if unknown_fields:
                 outcome = "inconclusive"
             elif case["init_model"] != identity["init_model"]:
                 outcome = "blocked"
-            elif not set(case["model_usage_keys"]).intersection(
-                identity["accepted_model_usage_keys"]
-            ):
+            elif observed_model_keys.intersection(other_primary_keys):
                 outcome = "blocked"
+            elif unknown_model_keys:
+                outcome = "inconclusive"
+            elif not observed_model_keys.intersection(requested_keys):
+                outcome = "blocked"
+            elif "inconclusive" in optional_failures:
+                outcome = "inconclusive"
+            elif "blocked" in optional_failures:
+                outcome = "blocked"
+            elif optional_failures:
+                outcome = "inconclusive"
             else:
                 outcome = "accept"
             observed[case["name"]] = outcome
             self.assertEqual(outcome, case["expected"], case["name"])
 
         self.assertEqual(observed["reviewed_terminal_alias"], "accept")
+        self.assertEqual(observed["reviewed_auxiliary_model"], "accept")
         self.assertEqual(observed["silent_model_fallback"], "blocked")
+        self.assertEqual(observed["mixed_primary_model_substitution"], "blocked")
+        self.assertEqual(observed["unknown_model_usage_key"], "inconclusive")
+        self.assertEqual(observed["truncated_stop_reason"], "blocked")
+        self.assertEqual(observed["unexpected_structured_output"], "inconclusive")
+        self.assertEqual(observed["invalid_optional_metric"], "inconclusive")
         self.assertEqual(observed["unknown_error_field"], "inconclusive")
         for anchor in (
             "equals the requested concrete model string exactly",
             "the only reviewed terminal aliases",
-            "`claude-opus-4-8` request with only a `claude-opus-4-7` key",
+            "The only reviewed auxiliary key",
+            "with only or with both a `claude-opus-4-7` key",
+            "`stop_reason`, when present, is exactly `null` or `end_turn`",
+            "Any other value—including `max_tokens`",
+            "`structured_output`, when present, is exactly `null`",
             "closed top-level allowlist",
             "Any other terminal field",
         ):
             self.assertIn(anchor, canonical)
+
+        self.assertIn("require exactly Claude Code `2.1.212`", canonical)
+        self.assertIn(
+            "does not make another CLI version eligible for this named direct lane",
+            canonical,
+        )
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn(
+            "currently requires the publisher-verified Claude Code CLI version to be exactly `2.1.212`",
+            skill,
+        )
+        self.assertIn("its broader helper version range", skill)
+        self.assertNotIn(
+            "obtain its version using a fixed credential-free environment and require `>=2.1.211,<3.0.0`",
+            canonical,
+        )
 
     def test_unsupported_mismatched_pr_stays_effective_double_but_not_ready(
         self,
@@ -1372,21 +1479,30 @@ class RepositoryContractTest(unittest.TestCase):
         readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
             encoding="utf-8"
         )
-        documents = [agents_policy, readiness]
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        templates = (SKILL_ROOT / "references/review-prompt-templates.md").read_text(
+            encoding="utf-8"
+        )
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        probes = (SKILL_ROOT / "references/github-pr-probes.md").read_text(
+            encoding="utf-8"
+        )
+        documents = [agents_policy, readiness, skill, templates, contracts, probes]
         if CI_PROFILE == "canonical":
             documents.append((REPO_ROOT / "README.md").read_text(encoding="utf-8"))
 
+        causal_contract = "For the same mismatch on an already unsupported PR, keep `requested: triple`, `effective: double`, and report readiness `blocked-authorization`; do not treat the mismatch as making the already-unavailable lane triple-inconclusive or as permitting readiness to continue."
         for content in documents:
-            self.assertIn("still-eligible", content)
-            self.assertIn("effective double", content)
-            self.assertIn("blocked-authorization", content)
-        for content in (agents_policy, *documents[2:]):
-            self.assertIn("already unsupported", content)
-            self.assertIn("keep requested triple/effective double", content)
+            self.assertIn(causal_contract, content)
 
     def test_main_workflow_checks_existing_pr_head_before_local_lanes(self) -> None:
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
         readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+        probes = (SKILL_ROOT / "references/github-pr-probes.md").read_text(
             encoding="utf-8"
         )
 
@@ -1399,6 +1515,22 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("Skip this comparison only on the no-PR path", readiness)
         self.assertIn(head_preflight, skill)
         self.assertLess(skill.index(head_preflight), skill.index(run_codex))
+        self.assertIn(
+            "PR/full-workflow request or any standalone named review request",
+            skill,
+        )
+        self.assertIn(
+            "PR/full-workflow request or standalone named review associated with an existing PR",
+            readiness,
+        )
+        self.assertIn(
+            "standalone single, double, or triple request may locate an already-existing PR read-only",
+            readiness,
+        )
+        self.assertLess(
+            probes.index("Any existing PR with current `headRefOid != head_sha`"),
+            probes.index("Only after an existing PR is head-aligned"),
+        )
 
     def test_named_lanes_block_lazy_fetch_before_reviewer_launch(self) -> None:
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")

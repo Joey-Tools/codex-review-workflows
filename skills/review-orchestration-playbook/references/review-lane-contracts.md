@@ -69,6 +69,7 @@ This rule applies even when a direct diff would fit in the current prompt. It av
 - Host `sqbu-github.cisco.com` and any operating identity in `{hoteng, hoteng_cisco}` are unsupported for this lane; a requested triple review uses effective double and records the reason.
 - Missing integration, unsupported host/identity, or an unavailable GitHub Codex service produces effective double only when directly known or proved by authenticated provider evidence. Findings from a running service do not.
 - An existing supported PR whose current `headRefOid` does not equal the frozen `head_sha` remains a triple candidate, not an unavailable lane. If the parent did not separately authorize publishing or changing the PR head, leave the PR unchanged and report `requested: triple`, `effective: triple-inconclusive`, with GitHub lane status `blocked-authorization`.
+- For the same mismatch on an already unsupported PR, keep `requested: triple`, `effective: double`, and report readiness `blocked-authorization`; do not treat the mismatch as making the already-unavailable lane triple-inconclusive or as permitting readiness to continue.
 - Missing response, timeout, generic request/HTTP failure, or guessed integration state is `effective: triple-inconclusive`, not unavailable.
 - Once acknowledgement or run/review activity proves service start, malformed, stale, ambiguous, or transiently incomplete evidence is `effective: triple-inconclusive`, not effective double.
 

@@ -16,6 +16,9 @@
       ]
     }
   },
+  "accepted_auxiliary_model_usage_keys": [
+    "claude-haiku-4-5-20251001"
+  ],
   "terminal_result": {
     "required_fields": [
       "type",
@@ -38,7 +41,65 @@
       "errors",
       "api_error_status",
       "permission_denials"
-    ]
+    ],
+    "optional_field_contracts": {
+      "duration_ms": {
+        "rule": "nonnegative_integer",
+        "failure": "inconclusive"
+      },
+      "duration_api_ms": {
+        "rule": "nonnegative_integer",
+        "failure": "inconclusive"
+      },
+      "num_turns": {
+        "rule": "positive_integer",
+        "failure": "inconclusive"
+      },
+      "session_id": {
+        "rule": "nonempty_string",
+        "failure": "inconclusive"
+      },
+      "total_cost_usd": {
+        "rule": "nonnegative_finite_number",
+        "failure": "inconclusive"
+      },
+      "usage": {
+        "rule": "object",
+        "failure": "inconclusive"
+      },
+      "uuid": {
+        "rule": "nonempty_string",
+        "failure": "inconclusive"
+      },
+      "stop_reason": {
+        "rule": "enum",
+        "accepted_values": [
+          null,
+          "end_turn"
+        ],
+        "failure": "blocked"
+      },
+      "structured_output": {
+        "rule": "null",
+        "failure": "inconclusive"
+      },
+      "error": {
+        "rule": "explicitly_empty",
+        "failure": "classify"
+      },
+      "errors": {
+        "rule": "explicitly_empty",
+        "failure": "classify"
+      },
+      "api_error_status": {
+        "rule": "null_or_whitespace_string",
+        "failure": "classify"
+      },
+      "permission_denials": {
+        "rule": "empty_array",
+        "failure": "blocked"
+      }
+    }
   },
   "contract_cases": [
     {
@@ -48,6 +109,7 @@
       "model_usage_keys": [
         "claude-opus-4-8"
       ],
+      "optional_terminal_values": {},
       "extra_terminal_fields": [],
       "expected": "accept"
     },
@@ -58,6 +120,22 @@
       "model_usage_keys": [
         "claude-opus-4.8"
       ],
+      "optional_terminal_values": {},
+      "extra_terminal_fields": [],
+      "expected": "accept"
+    },
+    {
+      "name": "reviewed_auxiliary_model",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-8",
+      "model_usage_keys": [
+        "claude-opus-4-8",
+        "claude-haiku-4-5-20251001"
+      ],
+      "optional_terminal_values": {
+        "stop_reason": "end_turn",
+        "structured_output": null
+      },
       "extra_terminal_fields": [],
       "expected": "accept"
     },
@@ -68,8 +146,74 @@
       "model_usage_keys": [
         "claude-opus-4-7"
       ],
+      "optional_terminal_values": {},
       "extra_terminal_fields": [],
       "expected": "blocked"
+    },
+    {
+      "name": "mixed_primary_model_substitution",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-8",
+      "model_usage_keys": [
+        "claude-opus-4-8",
+        "claude-opus-4-7"
+      ],
+      "optional_terminal_values": {},
+      "extra_terminal_fields": [],
+      "expected": "blocked"
+    },
+    {
+      "name": "unknown_model_usage_key",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-8",
+      "model_usage_keys": [
+        "claude-opus-4-8",
+        "claude-haiku-future"
+      ],
+      "optional_terminal_values": {},
+      "extra_terminal_fields": [],
+      "expected": "inconclusive"
+    },
+    {
+      "name": "truncated_stop_reason",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-8",
+      "model_usage_keys": [
+        "claude-opus-4-8"
+      ],
+      "optional_terminal_values": {
+        "stop_reason": "max_tokens"
+      },
+      "extra_terminal_fields": [],
+      "expected": "blocked"
+    },
+    {
+      "name": "unexpected_structured_output",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-8",
+      "model_usage_keys": [
+        "claude-opus-4-8"
+      ],
+      "optional_terminal_values": {
+        "structured_output": {
+          "review": "No findings."
+        }
+      },
+      "extra_terminal_fields": [],
+      "expected": "inconclusive"
+    },
+    {
+      "name": "invalid_optional_metric",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-8",
+      "model_usage_keys": [
+        "claude-opus-4-8"
+      ],
+      "optional_terminal_values": {
+        "duration_ms": -1
+      },
+      "extra_terminal_fields": [],
+      "expected": "inconclusive"
     },
     {
       "name": "unknown_error_field",
@@ -78,6 +222,7 @@
       "model_usage_keys": [
         "claude-opus-4-8"
       ],
+      "optional_terminal_values": {},
       "extra_terminal_fields": [
         "fatal_error"
       ],
