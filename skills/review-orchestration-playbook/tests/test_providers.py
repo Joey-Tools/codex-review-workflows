@@ -289,6 +289,7 @@ def _blocked_keychain_handler_worker(connection: object, mode: str) -> None:
 
 class ProviderPolicyTest(unittest.TestCase):
     def setUp(self) -> None:
+        self.host_platform = sys.platform
         self.temporary = tempfile.TemporaryDirectory()
         root = pathlib.Path(self.temporary.name).resolve()
         # Security fixtures must not inherit a permissive host or CI umask.
@@ -497,7 +498,7 @@ class ProviderPolicyTest(unittest.TestCase):
             providers._require_claude_keychain_identity_directory
         )
         self.identity_directory_patcher = None
-        if sys.platform != "darwin":
+        if self.host_platform != "darwin":
             self.identity_directory_patcher = mock.patch.object(
                 providers,
                 "_require_claude_keychain_identity_directory",
@@ -598,7 +599,7 @@ class ProviderPolicyTest(unittest.TestCase):
             providers.CLAUDE_KEYCHAIN_BROKER_EXECUTABLE_ENV,
             str(self.claude_broker),
         )
-        if sys.platform == "darwin":
+        if self.host_platform == "darwin":
             with self.claude_keychain_runtime_impl(
                 review,
                 prepared,
@@ -607,29 +608,28 @@ class ProviderPolicyTest(unittest.TestCase):
                 yield runtime_env
             return
 
-        runtime_root = review.container_dir / "claude-runtime"
+        with tempfile.TemporaryDirectory(
+            prefix=providers.CLAUDE_KEYCHAIN_BROKER_DIRECTORY_PREFIX,
+        ) as identity_directory_raw:
+            identity_directory = pathlib.Path(identity_directory_raw)
+            identity_directory.chmod(0o700)
 
-        def allocate_identity_directory(_review: ReviewWorkspace) -> pathlib.Path:
-            path = pathlib.Path(
-                tempfile.mkdtemp(
-                    prefix=providers.CLAUDE_KEYCHAIN_BROKER_DIRECTORY_PREFIX,
-                    dir=runtime_root,
-                )
-            )
-            path.chmod(0o700)
-            return path
+            def allocate_identity_directory(
+                _review: ReviewWorkspace,
+            ) -> pathlib.Path:
+                return identity_directory
 
-        with mock.patch.object(
-            providers,
-            "_allocate_claude_keychain_identity_directory",
-            side_effect=allocate_identity_directory,
-        ):
-            with self.claude_keychain_runtime_impl(
-                review,
-                prepared,
-                refresh_lock_protocol,
-            ) as runtime_env:
-                yield runtime_env
+            with mock.patch.object(
+                providers,
+                "_allocate_claude_keychain_identity_directory",
+                side_effect=allocate_identity_directory,
+            ):
+                with self.claude_keychain_runtime_impl(
+                    review,
+                    prepared,
+                    refresh_lock_protocol,
+                ) as runtime_env:
+                    yield runtime_env
 
     def fake_claude_keychain_endpoint(
         self,

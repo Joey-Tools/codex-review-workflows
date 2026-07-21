@@ -369,7 +369,14 @@ metadata behavior.
   policy: managed-auth fixtures now execute the selected Python 3.13 runtime,
   live no-child integration skips hosts that do not match its exact production
   macOS pin, and cross-platform provider tests use scoped macOS identity
-  doubles while retaining direct fail-closed coverage for non-macOS hosts.
+  doubles while retaining direct fail-closed coverage for non-macOS hosts. The
+  first follow-up Ubuntu run found that individual tests could mutate the
+  shared `sys.platform` object and that a deep checkout path exceeded Linux's
+  Unix-socket limit. The fixture now captures the real host before per-test
+  mocks and uses a short, unique, owner-only temporary identity directory on
+  non-Darwin hosts. A Python 3.13 forced-Linux harness reran the exact five
+  failures successfully before the complete 1,428-test host suite passed with
+  5 skips.
 - Post-review remediation validation used only Python 3.13. The host-level
   canonical suite ran 1,428 tests with 5 skips, and the independent supervisor
   suite ran 272 tests with 4 skips. The 39-test repository contract suite,
