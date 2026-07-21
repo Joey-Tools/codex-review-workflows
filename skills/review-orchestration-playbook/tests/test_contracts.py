@@ -153,6 +153,93 @@ def _secret_admission_repository_policy_files(
 
 
 class RepositoryContractTest(unittest.TestCase):
+    def test_change_delivery_resolves_one_version_per_toolchain(self) -> None:
+        skill = (
+            SKILL_SCOPE_ROOT / "skills/change-delivery-workflow/SKILL.md"
+        ).read_text(encoding="utf-8")
+
+        anchors = (
+            "每个 runtime/toolchain",
+            "采用单版本还是多版本形态",
+            "明确要求本地多版本验证",
+            "本次改动目标就是跨版本兼容性",
+            "才选择多版本形态",
+            "否则使用单版本形态",
+        )
+        cursor = 0
+        for anchor in anchors:
+            cursor = skill.index(anchor, cursor) + len(anchor)
+
+        single_version_anchors = (
+            "只按 authority/instruction/config 是否存在选择最高优先级来源",
+            "不预先判断其能否解析或是否兼容",
+            "the user 对本地验证版本的 instruction",
+            "repo-local policy 对本地验证版本的 instruction",
+            "version-selection config 或 pin",
+            "兼容性范围本身不算 version-selection pin",
+            "可用的 repo 常规 runner 或项目工具默认解析",
+            "本机已安装版本 inventory",
+            "只有当前 authority/config/runner/inventory 来源完全不存在时才检查下一个来源",
+            "选中来源后再解析并验证",
+            "选定 instruction 显式委托给一个具名 repo 机制",
+            "该机制属于选中来源的解析过程",
+            "若选中 installed inventory",
+            "canonical version ordering",
+            "满足项目约束的最高已安装版本",
+            "明确允许 prerelease",
+            "才把 prerelease 纳入候选",
+            "最终必须得到唯一且与项目约束兼容的版本",
+            "若选中来源内部冲突、无法唯一解析或不兼容",
+            "停止并报告 blocker，不得静默降级",
+            "将所选 version 及其来源固定用于同一轮验证并记录",
+        )
+        cursor = skill.index("单版本形态下")
+        for anchor in single_version_anchors:
+            cursor = skill.index(anchor, cursor) + len(anchor)
+        self.assertIn(
+            "同一 runtime/toolchain 的最低支持版本和 CI matrix 本身不构成本地多版本门禁",
+            skill,
+        )
+        self.assertLess(skill.index("否则使用单版本形态"), skill.index("单版本形态下"))
+        self.assertIn("在多版本形态下", skill)
+        self.assertLess(skill.index("单版本形态下"), skill.index("在多版本形态下"))
+        multi_version_anchors = (
+            "只按 authority/instruction/declaration 是否存在选择最高优先级来源",
+            "不预先判断其是否能解析为有效集合",
+            "the user 或本次任务对本地多版本验证的 instruction",
+            "repo-local policy 对本地多版本验证的 instruction",
+            "repo 明确声明的 supported-version set",
+            "repo 的 CI matrix",
+            "只有当前 authority/instruction/declaration 完全不存在时才检查下一个来源",
+            "选中来源后再解析并验证",
+            "选定 instruction 显式委托给具名 repo 声明",
+            "该声明属于选中来源的解析过程",
+            "最终集合必须有限、非空、无重复且每个版本都与项目兼容",
+            "选定来源后不比较或合并其他较低优先级来源",
+            "较低优先级来源的不同集合不构成冲突",
+            "来源冲突仅指选中来源及其显式委托的解析过程内部",
+            "若选中来源内部冲突、只能得到开放范围或无法确定有限集合",
+            "停止并报告 blocker",
+            "不得根据本机已安装版本任意扩张集合",
+            "记录最终版本集合及其来源",
+        )
+        cursor = skill.index("在多版本形态下")
+        for anchor in multi_version_anchors:
+            cursor = skill.index(anchor, cursor) + len(anchor)
+        self.assertIn("只有 suite 已证明顺序复用安全时", skill)
+        self.assertIn("才可在同一 checkout 串行执行", skill)
+        self.assertIn("版本敏感的 checkout 产物、缓存或状态", skill)
+        self.assertIn("独立 worktree/cache/state", skill)
+        self.assertIn("或在版本间显式清理并重建", skill)
+        self.assertIn("无论使用一个还是多个 worktree", skill)
+        self.assertIn("为每次运行分配唯一值或命名空间", skill)
+        self.assertIn("否则必须跨所有 worktree 串行执行", skill)
+        self.assertIn("已证明为当前任务专属且可丢弃", skill)
+        self.assertIn("才可在版本间显式 clean/reset", skill)
+        self.assertIn("若状态为共享、所有权不清或不可安全丢弃", skill)
+        self.assertIn("需要额外权限时请求明确授权", skill)
+        self.assertIn("只有 checkout-local 与机器级资源都已证明隔离时才可并发", skill)
+
     def test_cleanup_only_legacy_0664_lock_migration_is_private_and_ordered(
         self,
     ) -> None:
