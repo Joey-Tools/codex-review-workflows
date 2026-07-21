@@ -22,7 +22,9 @@ from review_runtime import (  # noqa: E402
     claude_capabilities,
     claude_linux,
     claude_refresh_lock,
+    cli,
     providers,
+    state,
 )
 
 
@@ -120,6 +122,27 @@ def _claude_auth_repository_policy_files(
                 repo_root
                 / "docs/project_journal/2026/07/"
                 / "2026-07-17-claude-auth-carriers-c17a11.md"
+            ),
+        }
+    elif profile != "private":
+        raise AssertionError(f"unsupported repository policy profile: {profile}")
+    return {
+        name: path.read_text(encoding="utf-8") for name, path in policy_paths.items()
+    }
+
+
+def _secret_admission_repository_policy_files(
+    repo_root: pathlib.Path,
+    profile: str,
+) -> dict[str, str]:
+    policy_paths: dict[str, pathlib.Path] = {}
+    if profile == "canonical":
+        policy_paths = {
+            "AGENTS.md": _repository_agents_path(repo_root, profile),
+            "project journal": (
+                repo_root
+                / "docs/project_journal/2026/07/"
+                / "2026-07-17-secret-reduction-gate-7f1703.md"
             ),
         }
     elif profile != "private":
@@ -265,6 +288,195 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertIn("Stop after bounded retries", readiness)
 
+    def test_secret_delta_is_admission_only_for_trusted_reviewer_input(
+        self,
+    ) -> None:
+        repository_policy = _secret_admission_repository_policy_files(
+            REPO_ROOT,
+            CI_PROFILE,
+        )
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        helper_contract = (SKILL_ROOT / "references/helper-contract.md").read_text(
+            encoding="utf-8"
+        )
+        readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("including repository secrets", skill)
+        self.assertIn("including tracked repository secrets", helper_contract)
+        self.assertIn(
+            "tracked `.codex`, `.agents`, and environment files are intentionally readable",
+            helper_contract,
+        )
+        self.assertIn(
+            "do not redact, rewrite, or suppress reviewer-visible tracked content",
+            skill,
+        )
+        self.assertIn(
+            "Secret admission never delays, suppresses, redacts, or gates reviewer launch",
+            helper_contract,
+        )
+        self.assertIn(
+            "does not suppress this trusted reviewer",
+            readiness,
+        )
+        if "AGENTS.md" in repository_policy:
+            agents = repository_policy["AGENTS.md"]
+            self.assertIn("including tracked repository secrets", agents)
+            self.assertIn(
+                "Secret-delta analysis never blocks a named reviewer launch",
+                agents,
+            )
+        if "project journal" in repository_policy:
+            journal = repository_policy["project journal"]
+            self.assertIn("including repository secrets", journal)
+            self.assertIn(
+                "including tracked `.env`, `.agents`, and `.codex` paths",
+                journal,
+            )
+            self.assertIn(
+                "must not prevent the reviewer from starting",
+                journal,
+            )
+
+    def test_exact_raw_secret_growth_is_the_only_admission_violation(
+        self,
+    ) -> None:
+        repository_policy = _secret_admission_repository_policy_files(
+            REPO_ROOT,
+            CI_PROFILE,
+        )
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        helper_contract = (SKILL_ROOT / "references/helper-contract.md").read_text(
+            encoding="utf-8"
+        )
+        readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+
+        policy = {
+            **repository_policy,
+            "SKILL.md": skill,
+            "helper-contract.md": helper_contract,
+            "pr-readiness.md": readiness,
+        }
+        for name, content in policy.items():
+            with self.subTest(policy=name):
+                self.assertIn("head_count <= base_count", content)
+
+        self.assertIn("Only a first appearance or global count growth blocks", skill)
+        self.assertIn("A first appearance or any growth blocks", helper_contract)
+        self.assertIn("Do not derive Base64, hex, URL-encoded", skill)
+        self.assertIn("No unembedded counter", helper_contract)
+        self.assertIn("do not derive Base64 or other encodings", readiness)
+        self.assertIn(
+            "Report only head-side added locations",
+            skill,
+        )
+        self.assertIn("Unchanged occurrences are omitted", helper_contract)
+        self.assertIn("positive-delta candidates", readiness)
+        if "AGENTS.md" in repository_policy:
+            agents = repository_policy["AGENTS.md"]
+            self.assertIn("Only a first appearance or count growth blocks", agents)
+            self.assertIn("Do not derive Base64, hex, URL-encoded", agents)
+        if "project journal" in repository_policy:
+            journal = repository_policy["project journal"]
+            self.assertIn("blocks only first appearance or growth", journal)
+            self.assertIn(
+                "does not derive canonical Base64, URL encoding, hexadecimal",
+                journal,
+            )
+            self.assertIn(
+                "only detectable additions for a candidate whose global count grows",
+                journal,
+            )
+
+    def test_stateful_secret_admission_is_a_separate_current_head_gate(self) -> None:
+        repository_policy = _secret_admission_repository_policy_files(
+            REPO_ROOT,
+            CI_PROFILE,
+        )
+        policy = {
+            **repository_policy,
+            "SKILL.md": (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8"),
+            "helper-contract.md": (
+                SKILL_ROOT / "references/helper-contract.md"
+            ).read_text(encoding="utf-8"),
+            "pr-readiness.md": (SKILL_ROOT / "references/pr-readiness.md").read_text(
+                encoding="utf-8"
+            ),
+        }
+        for name, text in policy.items():
+            with self.subTest(policy=name):
+                self.assertIn("stateful final", text)
+                self.assertIn("stateful admission", text)
+                self.assertLess(
+                    text.index("stateful final"),
+                    text.index("stateful admission"),
+                )
+        exit_code_policy = ["helper-contract.md", "pr-readiness.md"]
+        if "AGENTS.md" in policy:
+            exit_code_policy.append("AGENTS.md")
+        if "project journal" in policy:
+            exit_code_policy.append("project journal")
+        for name in exit_code_policy:
+            with self.subTest(exit_code_policy=name):
+                for exit_code in ("0", "1", "3", "75"):
+                    self.assertIn(f"exit `{exit_code}`", policy[name])
+
+        self.assertIn("Admission exit `0` is `clean`", policy["SKILL.md"])
+        self.assertIn(
+            "the only status that permits PR/master/merge-ready",
+            policy["helper-contract.md"],
+        )
+        self.assertIn(
+            "the only result that permits PR/master/merge-ready",
+            policy["pr-readiness.md"],
+        )
+        self.assertIn("These checks are independent", policy["SKILL.md"])
+        self.assertIn("final may succeed when admission", policy["helper-contract.md"])
+        self.assertIn("`stateful final` remains independent", policy["pr-readiness.md"])
+        if "project journal" in policy:
+            journal = policy["project journal"]
+            self.assertIn("is the only permitting result", journal)
+            self.assertIn("reviewer final is independent", journal)
+
+    def test_admission_receipt_and_runner_policy_are_bound_to_the_launch(
+        self,
+    ) -> None:
+        seal_source = inspect.getsource(state._seal_preflight_receipt)
+        admission_source = inspect.getsource(state._admission_status_for_loaded_state)
+        read_preflight_source = inspect.getsource(state._read_bound_preflight)
+        start_source = inspect.getsource(state.start)
+        run_state_source = inspect.getsource(state.run_state)
+        cli_source = inspect.getsource(cli.main)
+
+        self.assertEqual(state.BOUND_STATE_MARKER_SCHEMA_VERSION, 4)
+        self.assertEqual(state.STATE_MARKER_SCHEMA_VERSION, 5)
+        self.assertEqual(state.PREFLIGHT_RECEIPT_SCHEMA_VERSION, 1)
+        self.assertLess(
+            seal_source.index("validate_inherited_runner_lock_lease"),
+            seal_source.index("_read_modern_bound_state_artifact"),
+        )
+        self.assertIn("hashlib.sha256(payload).hexdigest()", seal_source)
+        self.assertIn("receipt = marker.preflight_receipt", read_preflight_source)
+        self.assertIn("len(payload) != receipt.size", read_preflight_source)
+        self.assertIn("runner-sealed", read_preflight_source)
+        self.assertIn("legacy-state-no-preflight-receipt", admission_source)
+        self.assertIn("preflight-unsealed", admission_source)
+
+        for source in (start_source, cli_source):
+            self.assertIn('"--reviewer"', source)
+            self.assertIn('"--egress-consent"', source)
+        self.assertIn("expected_reviewer=parsed.reviewer", cli_source)
+        self.assertIn("expected_egress_consent=parsed.egress_consent", cli_source)
+        self.assertIn("state_reviewer != expected_reviewer", run_state_source)
+        self.assertIn(
+            "state_egress_consent != expected_egress_consent",
+            run_state_source,
+        )
+
     def test_claude_runtime_and_clear_context_codex_agent_models_are_pinned(
         self,
     ) -> None:
@@ -376,7 +588,9 @@ class RepositoryContractTest(unittest.TestCase):
             hasattr(providers, "CLAUDE_ATTEMPT_CREDENTIAL_VALIDITY_SECONDS")
         )
 
-        attempt_source = inspect.getsource(providers._claude_attempt)
+        attempt_source = inspect.getsource(
+            providers._claude_attempt
+        ) + inspect.getsource(providers._claude_attempt_with_output)
         pwd_home_source = inspect.getsource(providers._claude_pwd_home)
         select_source = inspect.getsource(providers._select_claude_macos_credential)
         validate_source = inspect.getsource(
@@ -595,8 +809,10 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("_finish_claude_auth_required", run_review_source)
         self.assertIn("validate_external_workspace", run_review_source)
         self.assertIn(
-            "sensitive-content and escaping-symlink checks passed", run_review_source
+            "review workspace containment and integrity checks passed",
+            run_review_source,
         )
+        self.assertIn("secret-delta status is evaluated separately", run_review_source)
 
         current_policy = "\n".join(
             (
@@ -748,6 +964,22 @@ class RepositoryContractTest(unittest.TestCase):
                 "unsupported repository policy profile",
             ):
                 _claude_auth_repository_policy_files(repo_root, "unknown")
+
+    def test_secret_admission_policy_files_match_distribution_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = pathlib.Path(temp_dir)
+
+            self.assertEqual(
+                _secret_admission_repository_policy_files(repo_root, "private"),
+                {},
+            )
+            with self.assertRaises(FileNotFoundError):
+                _secret_admission_repository_policy_files(repo_root, "canonical")
+            with self.assertRaisesRegex(
+                AssertionError,
+                "unsupported repository policy profile",
+            ):
+                _secret_admission_repository_policy_files(repo_root, "unknown")
 
     def test_reviewed_ci_snapshots_keep_the_intended_status_guards(self) -> None:
         canonical = (CI_FIXTURE_ROOT / "canonical.yml").read_text(encoding="utf-8")

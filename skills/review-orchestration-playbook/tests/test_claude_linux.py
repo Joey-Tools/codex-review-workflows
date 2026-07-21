@@ -2782,6 +2782,31 @@ class CredentialStagingTest(unittest.TestCase):
         self.assertTrue(all(path.is_dir() for path in lease.paths))
         self._assert_refresh_lock_descriptors_closed(lease)
         self.assertIsNotNone(snapshot.diagnostic)
+    def test_private_credential_update_forces_mode_under_restrictive_umask(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            parent_descriptor = os.open(
+                root,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            payload = bytearray(b'{"credential":"synthetic"}\n')
+            previous_umask = os.umask(0o777)
+            try:
+                candidate = claude_linux._create_private_credential_update(
+                    parent_descriptor,
+                    "credential.json",
+                    payload,
+                    owner_uid=os.geteuid(),
+                )
+            finally:
+                os.umask(previous_umask)
+                os.close(parent_descriptor)
+
+            artifact = root / candidate
+            self.assertEqual(artifact.read_bytes(), payload)
+            self.assertEqual(stat.S_IMODE(artifact.stat().st_mode), 0o600)
 
     def _credential(
         self,
@@ -7790,7 +7815,9 @@ class CredentialStagingTest(unittest.TestCase):
                 try:
                     release_writeback.set()
                     self.assertEqual(len(watchers), 1)
-                    watchers[0]._thread.join(timeout=3.0)
+                    deadline = time.monotonic() + 3.0
+                    while watchers[0].is_alive() and time.monotonic() < deadline:
+                        time.sleep(0.01)
                     self.assertFalse(watchers[0].is_alive())
                     host = json.loads(source.read_text(encoding="utf-8"))
                     self.assertEqual(
@@ -14696,6 +14723,55 @@ class SandboxCommandTest(unittest.TestCase):
             ("/workspace", "/home/reviewer", "/tmp"),
         )
         self.assertEqual(command[probe_index + 5], str(hidden_home.resolve()))
+
+    def test_descriptor_workspace_mount_is_shared_by_probe_and_review(self) -> None:
+        descriptor = os.open(
+            self.workspace,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+
+        def runner(argv, **kwargs):
+            calls.append((tuple(argv), kwargs))
+            return _capture(stdout=claude_linux.PROBE_SUCCESS)
+
+        try:
+            spec = dataclasses.replace(
+                self.spec,
+                workspace_descriptor=descriptor,
+            )
+            review_command = claude_linux.build_sandbox_command(
+                spec,
+                _linux_review_arguments(),
+            )
+            hidden_home = self.root / "host-home-descriptor"
+            hidden_home.mkdir()
+            claude_linux.run_isolation_probe(
+                spec,
+                self.workspace / "README.md",
+                host_home=hidden_home,
+                runner=runner,
+            )
+        finally:
+            os.close(descriptor)
+
+        expected_mount = ("--ro-bind-fd", str(descriptor), "/workspace")
+        review_triples = tuple(
+            zip(
+                review_command.argv,
+                review_command.argv[1:],
+                review_command.argv[2:],
+            )
+        )
+        self.assertIn(expected_mount, review_triples)
+        self.assertNotIn(str(self.workspace.resolve()), review_command.argv)
+        self.assertEqual(review_command.pass_fds, (descriptor,))
+        probe_command, probe_kwargs = calls[0]
+        self.assertIn(
+            expected_mount,
+            tuple(zip(probe_command, probe_command[1:], probe_command[2:])),
+        )
+        self.assertEqual(probe_kwargs["pass_fds"], (descriptor,))
 
     def test_rejects_unexpected_auth_environment(self) -> None:
         with self.assertRaisesRegex(claude_linux.LinuxRuntimeError, "unsupported"):

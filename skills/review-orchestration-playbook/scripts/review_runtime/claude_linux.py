@@ -533,6 +533,7 @@ class SandboxSpec:
     ca_bundle: pathlib.Path | None = None
     ca_bundle_identity: TrustedPathIdentity | None = None
     node_extra_ca_certs_configured: bool = False
+    workspace_descriptor: int | None = None
 
 
 @dataclass(frozen=True)
@@ -543,6 +544,7 @@ class SandboxCommand:
     home_path: pathlib.PurePosixPath
     tmp_path: pathlib.PurePosixPath
     config_path: pathlib.PurePosixPath
+    pass_fds: tuple[int, ...] = ()
 
 
 class CaptureResult(Protocol):
@@ -1710,14 +1712,21 @@ def _run_tool_probe(
     argv: Iterable[str],
     *,
     timeout_seconds: float = TOOL_PROBE_TIMEOUT_SECONDS,
+    pass_fds: Iterable[int] = (),
 ) -> CaptureResult:
     try:
+        arguments: dict[str, object] = {
+            "env": fixed_host_tool_environment(),
+            "timeout_seconds": timeout_seconds,
+            "stdout_limit_bytes": TOOL_PROBE_OUTPUT_LIMIT_BYTES,
+            "stderr_limit_bytes": TOOL_PROBE_OUTPUT_LIMIT_BYTES,
+        }
+        inherited_fds = tuple(pass_fds)
+        if inherited_fds:
+            arguments["pass_fds"] = inherited_fds
         return runner(
             tuple(str(item) for item in argv),
-            env=fixed_host_tool_environment(),
-            timeout_seconds=timeout_seconds,
-            stdout_limit_bytes=TOOL_PROBE_OUTPUT_LIMIT_BYTES,
-            stderr_limit_bytes=TOOL_PROBE_OUTPUT_LIMIT_BYTES,
+            **arguments,
         )
     except (ReviewError, ForwardedSignal):
         raise
@@ -1830,35 +1839,52 @@ def probe_bwrap(
     """Run the namespace/capability shape used by the real sandbox."""
 
     require_supported_host(host)
-    command = (
-        str(toolchain.bwrap),
-        "--die-with-parent",
-        "--new-session",
-        "--unshare-user",
-        "--unshare-pid",
-        "--unshare-net",
-        "--unshare-ipc",
-        "--unshare-uts",
-        "--unshare-cgroup",
-        "--cap-drop",
-        "ALL",
-        "--disable-userns",
-        "--clearenv",
-        "--setenv",
-        "PATH",
-        "/usr/bin:/bin",
-        "--ro-bind",
-        "/",
-        "/",
-        "--proc",
-        "/proc",
-        "--dev",
-        "/dev",
-        "--",
-        str(toolchain.rg),
-        "--version",
-    )
-    result = _run_tool_probe(runner, command)
+    root_descriptor: int | None = None
+    try:
+        root_descriptor = os.open(
+            "/",
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0),
+        )
+        command = (
+            str(toolchain.bwrap),
+            "--die-with-parent",
+            "--new-session",
+            "--unshare-user",
+            "--unshare-pid",
+            "--unshare-net",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--unshare-cgroup",
+            "--cap-drop",
+            "ALL",
+            "--disable-userns",
+            "--clearenv",
+            "--setenv",
+            "PATH",
+            "/usr/bin:/bin",
+            "--ro-bind-fd",
+            str(root_descriptor),
+            "/",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--",
+            str(toolchain.rg),
+            "--version",
+        )
+        result = _run_tool_probe(
+            runner,
+            command,
+            pass_fds=(root_descriptor,),
+        )
+    except OSError as error:
+        raise LinuxRuntimeInspectionInconclusive(
+            f"cannot prepare bubblewrap descriptor-mount probe: {error}"
+        ) from error
+    finally:
+        if root_descriptor is not None:
+            os.close(root_descriptor)
     if result.returncode != 0 or not bytes(result.stdout).lower().startswith(
         b"ripgrep "
     ):
@@ -3208,18 +3234,19 @@ def _create_private_credential_update(
         candidate = f".{source_name}.codex-review-{secrets.token_hex(16)}"
         try:
             fd = os.open(candidate, flags, 0o600, dir_fd=parent_fd)
-            break
         except FileExistsError:
             continue
         except OSError as error:
             raise LinuxCredentialUnsafe(
                 f"cannot create atomic Claude credential update: {error}"
             ) from error
+        break
     if fd is None:
         raise LinuxCredentialUnsafe(
             "cannot allocate a unique atomic Claude credential update"
         )
     try:
+        os.fchmod(fd, 0o600)
         metadata = os.fstat(fd)
         if (
             not stat.S_ISREG(metadata.st_mode)
@@ -8179,10 +8206,49 @@ def _validate_sandbox_spec(spec: SandboxSpec) -> SandboxSpec:
     require_supported_host(spec.host)
     owner_uid = os.getuid()
     helper_root = _validate_private_directory(spec.helper_root, owner_uid=owner_uid)
+    workspace_descriptor = spec.workspace_descriptor
+    descriptor_metadata_before: os.stat_result | None = None
+    path_metadata_before: os.stat_result | None = None
+    if workspace_descriptor is not None:
+        if isinstance(workspace_descriptor, bool) or not isinstance(
+            workspace_descriptor, int
+        ):
+            raise LinuxRuntimeError("workspace descriptor must be an integer")
+        try:
+            descriptor_metadata_before = os.fstat(workspace_descriptor)
+            path_metadata_before = spec.workspace.stat()
+        except OSError as error:
+            raise LinuxRuntimeInspectionInconclusive(
+                f"cannot inspect descriptor-backed review workspace: {error}"
+            ) from error
     workspace = spec.workspace.resolve(strict=True)
     if not workspace.is_dir():
         raise LinuxRuntimeError(f"review workspace is not a directory: {workspace}")
     _validate_workspace_symlink_boundary(workspace)
+    if workspace_descriptor is not None:
+        try:
+            descriptor_metadata_after = os.fstat(workspace_descriptor)
+            path_metadata_after = spec.workspace.stat()
+        except OSError as error:
+            raise LinuxRuntimeInspectionInconclusive(
+                f"cannot revalidate descriptor-backed review workspace: {error}"
+            ) from error
+        assert descriptor_metadata_before is not None
+        assert path_metadata_before is not None
+        metadata = (
+            descriptor_metadata_before,
+            path_metadata_before,
+            descriptor_metadata_after,
+            path_metadata_after,
+        )
+        if any(not stat.S_ISDIR(item.st_mode) for item in metadata):
+            raise LinuxRuntimeError(
+                "descriptor-backed review workspace is not a directory"
+            )
+        if len({(item.st_dev, item.st_ino) for item in metadata}) != 1:
+            raise LinuxRuntimeInspectionInconclusive(
+                "descriptor-backed review workspace path changed during validation"
+            )
     if _is_relative_to(helper_root, workspace) or _is_relative_to(
         workspace, helper_root
     ):
@@ -8263,6 +8329,7 @@ def _validate_sandbox_spec(spec: SandboxSpec) -> SandboxSpec:
         ca_bundle=ca_bundle,
         ca_bundle_identity=ca_bundle_identity,
         node_extra_ca_certs_configured=spec.node_extra_ca_certs_configured,
+        workspace_descriptor=workspace_descriptor,
     )
 
 
@@ -8610,7 +8677,18 @@ def build_sandbox_command(
     for directory in _mount_directories(file_destinations, directory_destinations):
         command.extend(("--dir", str(directory)))
     command.extend(("--proc", "/proc", "--dev", "/dev"))
-    command.extend(("--ro-bind", str(validated.workspace), str(SANDBOX_WORKSPACE)))
+    workspace_pass_fds: tuple[int, ...] = ()
+    if validated.workspace_descriptor is None:
+        command.extend(("--ro-bind", str(validated.workspace), str(SANDBOX_WORKSPACE)))
+    else:
+        command.extend(
+            (
+                "--ro-bind-fd",
+                str(validated.workspace_descriptor),
+                str(SANDBOX_WORKSPACE),
+            )
+        )
+        workspace_pass_fds = (validated.workspace_descriptor,)
     command.extend(("--bind", str(validated.helper_home), str(SANDBOX_HOME)))
     command.extend(("--bind", str(validated.helper_tmp), str(SANDBOX_TMP)))
     command.extend(
@@ -8688,6 +8766,7 @@ def build_sandbox_command(
         SANDBOX_HOME,
         SANDBOX_TMP,
         SANDBOX_CONFIG,
+        workspace_pass_fds,
     )
 
 
@@ -8742,6 +8821,7 @@ def run_isolation_probe(
         runner,
         command.argv,
         timeout_seconds=PROBE_TIMEOUT_SECONDS,
+        pass_fds=command.pass_fds,
     )
     if result.returncode != 0 or bytes(result.stdout) != PROBE_SUCCESS:
         detail = bytes(result.stderr).decode("utf-8", errors="replace").strip()
