@@ -262,6 +262,227 @@ class NamedClaudePreflightTest(unittest.TestCase):
             self.assertEqual(value["source"], "active-installed")
             self.assertEqual(value["selected_version"], "2.1.216")
 
+    def test_home_retarget_during_active_fallback_is_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            first_home = root / "first-home"
+            first_home.mkdir()
+            second_home = root / "second-home"
+            installed = second_home / ".local/share/claude/versions/2.1.216"
+            self._write_candidate(installed, version="2.1.216")
+            active = second_home / ".local/bin/claude"
+            active.parent.mkdir(parents=True)
+            active.symlink_to(installed)
+            home = root / "home"
+            home.symlink_to(first_home, target_is_directory=True)
+            original_active_candidate = preflight_module._active_home_candidate
+
+            def retarget_before_active_fallback(**kwargs):  # type: ignore[no-untyped-def]
+                home.unlink()
+                home.symlink_to(second_home, target_is_directory=True)
+                return original_active_candidate(**kwargs)
+
+            verifier = mock.Mock(
+                side_effect=AssertionError(
+                    "a retargeted HOME must stop before candidate verification"
+                )
+            )
+            with mock.patch.object(
+                preflight_module,
+                "_active_home_candidate",
+                side_effect=retarget_before_active_fallback,
+            ):
+                value = preflight_module.preflight(home=home, verifier=verifier)
+
+            verifier.assert_not_called()
+            self.assertEqual(value["classification"], "inconclusive")
+            self.assertEqual(value["reason"], "candidate-inspection-inconclusive")
+
+    def test_dangling_home_stops_before_trusted_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve(strict=True)
+            home = root / "home"
+            home.symlink_to(root / "missing-home", target_is_directory=True)
+            trusted = root / "trusted-claude"
+            self._write_candidate(trusted)
+            verifier = mock.Mock(
+                side_effect=AssertionError(
+                    "a dangling HOME must stop before trusted fallback"
+                )
+            )
+
+            with mock.patch.object(
+                preflight_module,
+                "TRUSTED_ACTIVE_PATHS",
+                (trusted,),
+            ):
+                value = preflight_module.preflight(home=home, verifier=verifier)
+
+            verifier.assert_not_called()
+            self.assertEqual(value["classification"], "inconclusive")
+            self.assertEqual(value["reason"], "candidate-inspection-inconclusive")
+
+    def test_existing_relative_home_stops_before_trusted_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve(strict=True)
+            real_home = root / "home"
+            real_home.mkdir()
+            relative_home = pathlib.Path(os.path.relpath(real_home, pathlib.Path.cwd()))
+            trusted = root / "trusted-claude"
+            self._write_candidate(trusted)
+            verifier = mock.Mock(
+                side_effect=AssertionError(
+                    "a relative HOME must stop before trusted fallback"
+                )
+            )
+
+            with mock.patch.object(
+                preflight_module,
+                "TRUSTED_ACTIVE_PATHS",
+                (trusted,),
+            ):
+                value = preflight_module.preflight(
+                    home=relative_home,
+                    verifier=verifier,
+                )
+
+            verifier.assert_not_called()
+            self.assertEqual(value["classification"], "inconclusive")
+            self.assertEqual(value["reason"], "candidate-inspection-inconclusive")
+
+    def test_dangling_home_ancestor_stops_before_trusted_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve(strict=True)
+            dangling_parent = root / "dangling-parent"
+            dangling_parent.symlink_to(
+                root / "missing-parent",
+                target_is_directory=True,
+            )
+            home = dangling_parent / "home"
+            trusted = root / "trusted-claude"
+            self._write_candidate(trusted)
+            verifier = mock.Mock(
+                side_effect=AssertionError(
+                    "a dangling HOME ancestor must stop before trusted fallback"
+                )
+            )
+
+            with mock.patch.object(
+                preflight_module,
+                "TRUSTED_ACTIVE_PATHS",
+                (trusted,),
+            ):
+                value = preflight_module.preflight(home=home, verifier=verifier)
+
+            verifier.assert_not_called()
+            self.assertEqual(value["classification"], "inconclusive")
+            self.assertEqual(value["reason"], "candidate-inspection-inconclusive")
+
+    def test_exact_missing_home_and_trusted_path_allow_ordered_fallback(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve(strict=True)
+            home = root / "missing-home"
+            missing_trusted = root / "missing-trusted/bin/claude"
+            missing_trusted.parent.mkdir(parents=True)
+            installed = root / "versions/2.1.216"
+            self._write_candidate(installed, version="2.1.216")
+            trusted = root / "trusted/bin/claude"
+            trusted.parent.mkdir(parents=True)
+            trusted.symlink_to(installed)
+
+            with mock.patch.object(
+                preflight_module,
+                "TRUSTED_ACTIVE_PATHS",
+                (missing_trusted, trusted),
+            ):
+                value = preflight_module.preflight(
+                    home=home,
+                    verifier=self._verified_with_probe,
+                )
+
+            self.assertEqual(value["classification"], "accepted")
+            self.assertEqual(value["source"], "active-installed")
+            self.assertEqual(value["selected_version"], "2.1.216")
+
+    def test_dangling_trusted_ancestor_stops_lower_priority_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve(strict=True)
+            home = root / "missing-home"
+            dangling_root = root / "dangling-root"
+            dangling_root.symlink_to(
+                root / "missing-root",
+                target_is_directory=True,
+            )
+            higher = dangling_root / "bin/claude"
+            lower = root / "lower/bin/claude"
+            self._write_candidate(lower)
+            verifier = mock.Mock(
+                side_effect=AssertionError(
+                    "a dangling trusted ancestor must stop ordered fallback"
+                )
+            )
+
+            with mock.patch.object(
+                preflight_module,
+                "TRUSTED_ACTIVE_PATHS",
+                (higher, lower),
+            ):
+                value = preflight_module.preflight(home=home, verifier=verifier)
+
+            verifier.assert_not_called()
+            self.assertEqual(value["classification"], "inconclusive")
+            self.assertEqual(value["reason"], "candidate-inspection-inconclusive")
+
+    def test_trusted_candidate_replacement_after_selection_is_inconclusive(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve(strict=True)
+            home = root / "missing-home"
+            installed = root / "versions/2.1.216"
+            self._write_candidate(installed, version="2.1.216")
+            trusted = root / "trusted/bin/claude"
+            trusted.parent.mkdir(parents=True)
+            trusted.symlink_to(installed)
+            original_exists = preflight_module._candidate_exists
+            replaced = False
+
+            def replace_after_selection(path: pathlib.Path) -> bool:
+                nonlocal replaced
+                if path == trusted and not replaced:
+                    replaced = True
+                    replacement = trusted.with_name("claude.replacement")
+                    replacement.symlink_to(installed)
+                    os.replace(replacement, trusted)
+                    return True
+                return original_exists(path)
+
+            verifier = mock.Mock(
+                side_effect=AssertionError(
+                    "a replaced trusted candidate must not be verified"
+                )
+            )
+            with (
+                mock.patch.object(
+                    preflight_module,
+                    "TRUSTED_ACTIVE_PATHS",
+                    (trusted,),
+                ),
+                mock.patch.object(
+                    preflight_module,
+                    "_candidate_exists",
+                    side_effect=replace_after_selection,
+                ),
+            ):
+                value = preflight_module.preflight(home=home, verifier=verifier)
+
+            verifier.assert_not_called()
+            self.assertTrue(replaced)
+            self.assertEqual(value["classification"], "inconclusive")
+            self.assertEqual(value["reason"], "candidate-inspection-inconclusive")
+
     def test_out_of_range_and_prerelease_versions_stop_before_verification(
         self,
     ) -> None:
@@ -654,6 +875,35 @@ class NamedClaudePreflightTest(unittest.TestCase):
             self.assertEqual(value["classification"], "inconclusive")
             self.assertEqual(value["reason"], "candidate-inspection-inconclusive")
 
+    def test_dangling_active_ancestor_stops_before_trusted_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            home = root / "home"
+            dangling_active_ancestor = home / ".local/bin"
+            dangling_active_ancestor.parent.mkdir(parents=True)
+            dangling_active_ancestor.symlink_to(
+                root / "missing-bin",
+                target_is_directory=True,
+            )
+            trusted = root / "trusted-claude"
+            self._write_candidate(trusted)
+            verifier = mock.Mock(
+                side_effect=AssertionError(
+                    "a dangling higher-priority active path must stop selection"
+                )
+            )
+
+            with mock.patch.object(
+                preflight_module,
+                "TRUSTED_ACTIVE_PATHS",
+                (trusted,),
+            ):
+                value = preflight_module.preflight(home=home, verifier=verifier)
+
+            verifier.assert_not_called()
+            self.assertEqual(value["classification"], "inconclusive")
+            self.assertEqual(value["reason"], "candidate-inspection-inconclusive")
+
     def test_malformed_side_by_side_ancestor_stops_before_trusted_fallback(
         self,
     ) -> None:
@@ -749,6 +999,7 @@ class NamedClaudePreflightTest(unittest.TestCase):
             home = root / "home"
             parent = home / ".local/share/claude"
             parent.mkdir(parents=True)
+            (parent / "versions").mkdir()
             active = home / ".local/bin/claude"
             self._write_candidate(active)
             verifier = mock.Mock(
@@ -763,7 +1014,6 @@ class NamedClaudePreflightTest(unittest.TestCase):
                 nonlocal observed_missing
                 if path == "versions" and not observed_missing:
                     observed_missing = True
-                    (parent / "versions").mkdir()
                     raise FileNotFoundError(
                         errno.ENOENT,
                         "synthetic initially absent side-by-side root",
@@ -792,14 +1042,15 @@ class NamedClaudePreflightTest(unittest.TestCase):
             active = home / ".local/bin/claude"
             self._write_candidate(side_by_side)
             self._write_candidate(active)
+            canonical_side_by_side = side_by_side.resolve(strict=True)
             original_exists = preflight_module._candidate_exists
             observed = False
 
             def observe_then_remove(path: pathlib.Path) -> bool:
                 nonlocal observed
-                if path == side_by_side and not observed:
+                if path == canonical_side_by_side and not observed:
                     observed = True
-                    path.unlink()
+                    side_by_side.unlink()
                     return True
                 return original_exists(path)
 

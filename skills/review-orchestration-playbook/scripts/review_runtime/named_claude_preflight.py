@@ -82,6 +82,7 @@ class Candidate:
     path: pathlib.Path
     source: str
     version_hint: str | None = None
+    path_identity: Mapping[str, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -301,9 +302,10 @@ def _candidate_exists(path: pathlib.Path) -> bool:
     return True
 
 
-def _revalidate_side_by_side_chain(
+def _revalidate_home_chain(
     *,
     home: pathlib.Path,
+    resolved_home: pathlib.Path,
     home_descriptor: int,
     home_identity: Mapping[str, int],
     components: Sequence[_BoundDirectoryComponent],
@@ -320,10 +322,15 @@ def _revalidate_side_by_side_chain(
                 os.fstat(home_descriptor),
                 os.fstat(reopened_home),
                 home.stat(),
+                resolved_home.stat(follow_symlinks=False),
             )
         ):
             raise _CandidateInspectionInconclusive(
                 "Claude Code install home changed during inspection"
+            )
+        if home.resolve(strict=True) != resolved_home:
+            raise _CandidateInspectionInconclusive(
+                "Claude Code install home resolved target changed during inspection"
             )
         for component in components:
             named = os.stat(
@@ -337,13 +344,13 @@ def _revalidate_side_by_side_chain(
                 for metadata in (named, opened)
             ):
                 raise _CandidateInspectionInconclusive(
-                    "side-by-side Claude Code install path changed during inspection"
+                    "Claude Code install path changed during inspection"
                 )
     except _CandidateInspectionInconclusive:
         raise
     except OSError as error:
         raise _CandidateInspectionInconclusive(
-            "cannot revalidate the side-by-side Claude Code install path"
+            "cannot revalidate the Claude Code install path"
         ) from error
     finally:
         if reopened_home >= 0:
@@ -355,8 +362,492 @@ def _revalidate_side_by_side_chain(
                 ) from error
 
 
-def _highest_compatible_side_by_side(home: pathlib.Path) -> Candidate | None:
-    root = home / SIDE_BY_SIDE_RELATIVE_ROOT
+def _confirm_exact_missing_home(home: pathlib.Path) -> None:
+    if not home.is_absolute() or not home.name:
+        raise _CandidateInspectionInconclusive(
+            f"cannot verify that Claude Code install home is absent: {home}"
+        )
+    parent = home.parent
+    descriptor = -1
+    operation_error: BaseException | None = None
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0)
+    try:
+        try:
+            parent_before = parent.stat()
+            resolved_parent = parent.resolve(strict=True)
+            resolved_before = resolved_parent.stat(follow_symlinks=False)
+            descriptor = os.open(parent, flags)
+            opened = os.fstat(descriptor)
+            parent_after = parent.stat()
+        except (OSError, RuntimeError) as error:
+            raise _CandidateInspectionInconclusive(
+                f"cannot inspect the parent of Claude Code install home {home}"
+            ) from error
+        parent_identity = _identity_from_stat(opened)
+        if (
+            any(
+                _identity_from_stat(metadata) != parent_identity
+                for metadata in (parent_before, resolved_before, parent_after)
+            )
+            or parent.resolve(strict=True) != resolved_parent
+        ):
+            raise _CandidateInspectionInconclusive(
+                "Claude Code install home parent changed during inspection"
+            )
+        for _attempt in range(2):
+            try:
+                os.stat(
+                    home.name,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                if error.errno != errno.ENOENT:
+                    raise _CandidateInspectionInconclusive(
+                        f"cannot confirm that Claude Code install home is absent: {home}"
+                    ) from error
+            else:
+                raise _CandidateInspectionInconclusive(
+                    "Claude Code install home has a dangling or unstable path entry"
+                )
+            _revalidate_home_chain(
+                home=parent,
+                resolved_home=resolved_parent,
+                home_descriptor=descriptor,
+                home_identity=parent_identity,
+                components=(),
+            )
+    except _CandidateInspectionInconclusive as error:
+        operation_error = error
+        raise
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                if operation_error is not None:
+                    operation_error.add_note(
+                        "the Claude Code install home parent descriptor could not be closed"
+                    )
+                else:
+                    raise _CandidateInspectionInconclusive(
+                        "cannot close the Claude Code install home parent"
+                    ) from error
+
+
+def _confirm_missing_home_component(
+    *,
+    name: str,
+    parent_descriptor: int,
+    home: pathlib.Path,
+    resolved_home: pathlib.Path,
+    home_descriptor: int,
+    home_identity: Mapping[str, int],
+    components: Sequence[_BoundDirectoryComponent],
+) -> None:
+    _revalidate_home_chain(
+        home=home,
+        resolved_home=resolved_home,
+        home_descriptor=home_descriptor,
+        home_identity=home_identity,
+        components=components,
+    )
+    try:
+        os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError as error:
+        if error.errno != errno.ENOENT:
+            raise _CandidateInspectionInconclusive(
+                "cannot confirm that a Claude Code install path is absent"
+            ) from error
+        _revalidate_home_chain(
+            home=home,
+            resolved_home=resolved_home,
+            home_descriptor=home_descriptor,
+            home_identity=home_identity,
+            components=components,
+        )
+        return
+    raise _CandidateInspectionInconclusive(
+        "a Claude Code install path appeared during absence verification"
+    )
+
+
+def _revalidate_absolute_chain(
+    *,
+    root_descriptor: int,
+    root_identity: Mapping[str, int],
+    components: Sequence[_BoundDirectoryComponent],
+) -> None:
+    try:
+        if any(
+            _identity_from_stat(metadata) != root_identity
+            for metadata in (os.fstat(root_descriptor), os.stat("/"))
+        ):
+            raise _CandidateInspectionInconclusive(
+                "trusted Claude Code install root changed during inspection"
+            )
+        for component in components:
+            named = os.stat(
+                component.name,
+                dir_fd=component.parent_descriptor,
+                follow_symlinks=False,
+            )
+            opened = os.fstat(component.descriptor)
+            if any(
+                _identity_from_stat(metadata) != component.identity
+                for metadata in (named, opened)
+            ):
+                raise _CandidateInspectionInconclusive(
+                    "trusted Claude Code install path changed during inspection"
+                )
+    except _CandidateInspectionInconclusive:
+        raise
+    except OSError as error:
+        raise _CandidateInspectionInconclusive(
+            "cannot revalidate the trusted Claude Code install path"
+        ) from error
+
+
+def _confirm_missing_absolute_component(
+    *,
+    name: str,
+    parent_descriptor: int,
+    root_descriptor: int,
+    root_identity: Mapping[str, int],
+    components: Sequence[_BoundDirectoryComponent],
+) -> None:
+    _revalidate_absolute_chain(
+        root_descriptor=root_descriptor,
+        root_identity=root_identity,
+        components=components,
+    )
+    try:
+        os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except OSError as error:
+        if error.errno != errno.ENOENT:
+            raise _CandidateInspectionInconclusive(
+                "cannot confirm that a trusted Claude Code install path is absent"
+            ) from error
+        _revalidate_absolute_chain(
+            root_descriptor=root_descriptor,
+            root_identity=root_identity,
+            components=components,
+        )
+        return
+    raise _CandidateInspectionInconclusive(
+        "a trusted Claude Code install path appeared during absence verification"
+    )
+
+
+def _select_trusted_candidate(path: pathlib.Path) -> Candidate | None:
+    parts = path.parts
+    if not path.is_absolute() or len(parts) < 2 or parts[0] != "/":
+        raise _CandidateInspectionInconclusive(
+            f"trusted Claude Code install path is not canonical: {path}"
+        )
+    names = parts[1:]
+    if any(name in {"", ".", ".."} for name in names):
+        raise _CandidateInspectionInconclusive(
+            f"trusted Claude Code install path is not canonical: {path}"
+        )
+    directory_flags = (
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0)
+    )
+    component_flags = directory_flags | getattr(os, "O_NOFOLLOW", 0)
+    descriptors: list[int] = []
+    components: list[_BoundDirectoryComponent] = []
+    operation_error: BaseException | None = None
+    try:
+        try:
+            root_descriptor = os.open("/", directory_flags)
+            descriptors.append(root_descriptor)
+            root_identity = _identity_from_stat(os.fstat(root_descriptor))
+        except OSError as error:
+            raise _CandidateInspectionInconclusive(
+                "cannot open the trusted Claude Code install root"
+            ) from error
+
+        for name in names[:-1]:
+            parent_descriptor = descriptors[-1]
+            try:
+                before = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                if error.errno == errno.ENOENT:
+                    _confirm_missing_absolute_component(
+                        name=name,
+                        parent_descriptor=parent_descriptor,
+                        root_descriptor=root_descriptor,
+                        root_identity=root_identity,
+                        components=components,
+                    )
+                    return None
+                raise _CandidateInspectionInconclusive(
+                    f"cannot inspect trusted Claude Code install path {path}"
+                ) from error
+            if not stat.S_ISDIR(before.st_mode):
+                raise _CandidateInspectionInconclusive(
+                    "trusted Claude Code install path contains a non-directory component"
+                )
+            try:
+                descriptor = os.open(
+                    name,
+                    component_flags,
+                    dir_fd=parent_descriptor,
+                )
+                descriptors.append(descriptor)
+                opened = os.fstat(descriptor)
+                after = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                raise _CandidateInspectionInconclusive(
+                    f"cannot open trusted Claude Code install path {path}"
+                ) from error
+            identity = _identity_from_stat(opened)
+            if any(
+                _identity_from_stat(metadata) != identity
+                for metadata in (before, after)
+            ) or not stat.S_ISDIR(opened.st_mode):
+                raise _CandidateInspectionInconclusive(
+                    "trusted Claude Code install path changed while opening"
+                )
+            components.append(
+                _BoundDirectoryComponent(
+                    parent_descriptor=parent_descriptor,
+                    name=name,
+                    descriptor=descriptor,
+                    identity=identity,
+                )
+            )
+
+        candidate_name = names[-1]
+        parent_descriptor = descriptors[-1]
+        try:
+            candidate_metadata = os.stat(
+                candidate_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            if error.errno == errno.ENOENT:
+                _confirm_missing_absolute_component(
+                    name=candidate_name,
+                    parent_descriptor=parent_descriptor,
+                    root_descriptor=root_descriptor,
+                    root_identity=root_identity,
+                    components=components,
+                )
+                return None
+            raise _CandidateInspectionInconclusive(
+                f"cannot inspect trusted Claude Code candidate {path}"
+            ) from error
+        candidate_identity = _identity_from_stat(candidate_metadata)
+        _revalidate_absolute_chain(
+            root_descriptor=root_descriptor,
+            root_identity=root_identity,
+            components=components,
+        )
+        try:
+            candidate_after = os.stat(
+                candidate_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise _CandidateInspectionInconclusive(
+                f"cannot revalidate trusted Claude Code candidate {path}"
+            ) from error
+        if _identity_from_stat(candidate_after) != candidate_identity:
+            raise _CandidateInspectionInconclusive(
+                "trusted Claude Code candidate changed during selection"
+            )
+        return Candidate(
+            path,
+            "active-installed",
+            path_identity=candidate_identity,
+        )
+    except _CandidateInspectionInconclusive as error:
+        operation_error = error
+        raise
+    finally:
+        cleanup_error: OSError | None = None
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                cleanup_error = error
+        if cleanup_error is not None:
+            if operation_error is not None:
+                operation_error.add_note(
+                    "a trusted Claude Code path descriptor could not be closed"
+                )
+            else:
+                raise _CandidateInspectionInconclusive(
+                    "cannot close the trusted Claude Code install path"
+                ) from cleanup_error
+
+
+def _active_home_candidate(
+    *,
+    home: pathlib.Path,
+    resolved_home: pathlib.Path,
+    home_descriptor: int,
+    home_identity: Mapping[str, int],
+    component_flags: int,
+    priority_components: Sequence[_BoundDirectoryComponent],
+) -> Candidate | None:
+    descriptors: list[int] = []
+    components: list[_BoundDirectoryComponent] = []
+    operation_error: BaseException | None = None
+    try:
+        parent_descriptor = home_descriptor
+        for name in ACTIVE_HOME_RELATIVE_PATH.parts[:-1]:
+            try:
+                before = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                if error.errno == errno.ENOENT:
+                    _confirm_missing_home_component(
+                        name=name,
+                        parent_descriptor=parent_descriptor,
+                        home=home,
+                        resolved_home=resolved_home,
+                        home_descriptor=home_descriptor,
+                        home_identity=home_identity,
+                        components=(*priority_components, *components),
+                    )
+                    return None
+                raise _CandidateInspectionInconclusive(
+                    "cannot inspect the active Claude Code install path"
+                ) from error
+            if not stat.S_ISDIR(before.st_mode):
+                raise _CandidateInspectionInconclusive(
+                    "the active Claude Code install path contains a "
+                    "non-directory component"
+                )
+            try:
+                descriptor = os.open(
+                    name,
+                    component_flags,
+                    dir_fd=parent_descriptor,
+                )
+                descriptors.append(descriptor)
+                opened = os.fstat(descriptor)
+                after = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                raise _CandidateInspectionInconclusive(
+                    "cannot open the active Claude Code install path"
+                ) from error
+            identity = _identity_from_stat(opened)
+            if any(
+                _identity_from_stat(metadata) != identity
+                for metadata in (before, after)
+            ) or not stat.S_ISDIR(opened.st_mode):
+                raise _CandidateInspectionInconclusive(
+                    "the active Claude Code install path changed while opening"
+                )
+            components.append(
+                _BoundDirectoryComponent(
+                    parent_descriptor=parent_descriptor,
+                    name=name,
+                    descriptor=descriptor,
+                    identity=identity,
+                )
+            )
+            parent_descriptor = descriptor
+
+        candidate_name = ACTIVE_HOME_RELATIVE_PATH.name
+        try:
+            candidate_metadata = os.stat(
+                candidate_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            if error.errno == errno.ENOENT:
+                _confirm_missing_home_component(
+                    name=candidate_name,
+                    parent_descriptor=parent_descriptor,
+                    home=home,
+                    resolved_home=resolved_home,
+                    home_descriptor=home_descriptor,
+                    home_identity=home_identity,
+                    components=(*priority_components, *components),
+                )
+                return None
+            raise _CandidateInspectionInconclusive(
+                "cannot inspect the active Claude Code candidate"
+            ) from error
+        candidate_identity = _identity_from_stat(candidate_metadata)
+        _revalidate_home_chain(
+            home=home,
+            resolved_home=resolved_home,
+            home_descriptor=home_descriptor,
+            home_identity=home_identity,
+            components=(*priority_components, *components),
+        )
+        try:
+            candidate_after = os.stat(
+                candidate_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise _CandidateInspectionInconclusive(
+                "cannot revalidate the active Claude Code candidate"
+            ) from error
+        if _identity_from_stat(candidate_after) != candidate_identity:
+            raise _CandidateInspectionInconclusive(
+                "the active Claude Code candidate changed during selection"
+            )
+        return Candidate(
+            resolved_home / ACTIVE_HOME_RELATIVE_PATH,
+            "active-installed",
+            path_identity=candidate_identity,
+        )
+    except _CandidateInspectionInconclusive as error:
+        operation_error = error
+        raise
+    finally:
+        cleanup_error: OSError | None = None
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                cleanup_error = error
+        if cleanup_error is not None:
+            if operation_error is not None:
+                operation_error.add_note(
+                    "an active Claude Code path descriptor could not be closed"
+                )
+            else:
+                raise _CandidateInspectionInconclusive(
+                    "cannot close the active Claude Code install path"
+                ) from cleanup_error
+
+
+def _select_home_candidate(home: pathlib.Path) -> Candidate | None:
+    if not home.is_absolute():
+        raise _CandidateInspectionInconclusive(
+            f"Claude Code install home must be absolute: {home}"
+        )
     home_flags = (
         os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0)
     )
@@ -369,6 +860,7 @@ def _highest_compatible_side_by_side(home: pathlib.Path) -> Candidate | None:
             home_before = home.stat()
         except OSError as error:
             if error.errno == errno.ENOENT:
+                _confirm_exact_missing_home(home)
                 return None
             raise _CandidateInspectionInconclusive(
                 f"cannot inspect Claude Code install home {home}"
@@ -387,13 +879,21 @@ def _highest_compatible_side_by_side(home: pathlib.Path) -> Candidate | None:
                 f"cannot open Claude Code install home {home}"
             ) from error
         home_identity = _identity_from_stat(home_opened)
+        try:
+            resolved_home = home.resolve(strict=True)
+            resolved_metadata = resolved_home.stat(follow_symlinks=False)
+        except (OSError, RuntimeError) as error:
+            raise _CandidateInspectionInconclusive(
+                "cannot resolve the Claude Code install home"
+            ) from error
         if any(
             _identity_from_stat(metadata) != home_identity
-            for metadata in (home_before, home_after)
+            for metadata in (home_before, home_after, resolved_metadata)
         ):
             raise _CandidateInspectionInconclusive(
                 "Claude Code install home changed while opening"
             )
+        root = resolved_home / SIDE_BY_SIDE_RELATIVE_ROOT
 
         for name in SIDE_BY_SIDE_RELATIVE_ROOT.parts:
             parent_descriptor = descriptors[-1]
@@ -405,34 +905,22 @@ def _highest_compatible_side_by_side(home: pathlib.Path) -> Candidate | None:
                 )
             except OSError as error:
                 if error.errno == errno.ENOENT:
-                    _revalidate_side_by_side_chain(
+                    _confirm_missing_home_component(
+                        name=name,
+                        parent_descriptor=parent_descriptor,
                         home=home,
+                        resolved_home=resolved_home,
                         home_descriptor=home_descriptor,
                         home_identity=home_identity,
                         components=components,
                     )
-                    try:
-                        os.stat(
-                            name,
-                            dir_fd=parent_descriptor,
-                            follow_symlinks=False,
-                        )
-                    except OSError as recheck_error:
-                        if recheck_error.errno != errno.ENOENT:
-                            raise _CandidateInspectionInconclusive(
-                                "cannot confirm that the side-by-side Claude "
-                                "Code install path is absent"
-                            ) from recheck_error
-                        _revalidate_side_by_side_chain(
-                            home=home,
-                            home_descriptor=home_descriptor,
-                            home_identity=home_identity,
-                            components=components,
-                        )
-                        return None
-                    raise _CandidateInspectionInconclusive(
-                        "the side-by-side Claude Code install path appeared "
-                        "during absence verification"
+                    return _active_home_candidate(
+                        home=home,
+                        resolved_home=resolved_home,
+                        home_descriptor=home_descriptor,
+                        home_identity=home_identity,
+                        component_flags=component_flags,
+                        priority_components=components,
                     )
                 raise _CandidateInspectionInconclusive(
                     f"cannot inspect side-by-side Claude Code installs under {root}"
@@ -476,7 +964,9 @@ def _highest_compatible_side_by_side(home: pathlib.Path) -> Candidate | None:
                 )
             )
 
-        compatible: list[tuple[tuple[int, int, int], pathlib.Path]] = []
+        compatible: list[
+            tuple[tuple[int, int, int], pathlib.Path, Mapping[str, int]]
+        ] = []
         count = 0
         with os.scandir(descriptors[-1]) as entries:
             for entry in entries:
@@ -489,17 +979,55 @@ def _highest_compatible_side_by_side(home: pathlib.Path) -> Candidate | None:
                     parsed = parse_compatible_release_version(entry.name)
                 except ClaudeVersionPolicyError:
                     continue
-                compatible.append((parsed, root / entry.name))
-        _revalidate_side_by_side_chain(
+                try:
+                    entry_metadata = entry.stat(follow_symlinks=False)
+                except OSError as error:
+                    raise _CandidateInspectionInconclusive(
+                        "cannot inspect a side-by-side Claude Code candidate"
+                    ) from error
+                compatible.append(
+                    (parsed, root / entry.name, _identity_from_stat(entry_metadata))
+                )
+        _revalidate_home_chain(
             home=home,
+            resolved_home=resolved_home,
             home_descriptor=home_descriptor,
             home_identity=home_identity,
             components=components,
         )
         if not compatible:
-            return None
-        _parsed, selected = max(compatible, key=lambda item: item[0])
-        return Candidate(selected, "side-by-side-compatible", selected.name)
+            return _active_home_candidate(
+                home=home,
+                resolved_home=resolved_home,
+                home_descriptor=home_descriptor,
+                home_identity=home_identity,
+                component_flags=component_flags,
+                priority_components=components,
+            )
+        _parsed, selected, selected_identity = max(
+            compatible,
+            key=lambda item: item[0],
+        )
+        try:
+            selected_after = os.stat(
+                selected.name,
+                dir_fd=descriptors[-1],
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise _CandidateInspectionInconclusive(
+                "cannot revalidate the selected side-by-side Claude Code candidate"
+            ) from error
+        if _identity_from_stat(selected_after) != selected_identity:
+            raise _CandidateInspectionInconclusive(
+                "the selected side-by-side Claude Code candidate changed"
+            )
+        return Candidate(
+            selected,
+            "side-by-side-compatible",
+            selected.name,
+            selected_identity,
+        )
     except _CandidateInspectionInconclusive as error:
         operation_error = error
         raise
@@ -541,16 +1069,14 @@ def select_candidate(
         raise _ArgumentError("--claude-version requires --claude-path")
 
     if home is not None:
-        side_by_side = _highest_compatible_side_by_side(home)
-        if side_by_side is not None:
-            return side_by_side
-        active_home = home / ACTIVE_HOME_RELATIVE_PATH
-        if _candidate_exists(active_home):
-            return Candidate(active_home, "active-installed")
+        home_candidate = _select_home_candidate(home)
+        if home_candidate is not None:
+            return home_candidate
 
     for active in TRUSTED_ACTIVE_PATHS:
-        if _candidate_exists(active):
-            return Candidate(active, "active-installed")
+        trusted_candidate = _select_trusted_candidate(active)
+        if trusted_candidate is not None:
+            return trusted_candidate
     return None
 
 
@@ -560,12 +1086,28 @@ def _resolve_candidate(candidate: Candidate) -> pathlib.Path:
             raise _CandidateInspectionInconclusive(str(candidate.path))
         raise _CandidateUnavailable(str(candidate.path))
     try:
+        path_before = candidate.path.lstat()
+        if (
+            candidate.path_identity is not None
+            and _identity_from_stat(path_before) != candidate.path_identity
+        ):
+            raise _CandidateInspectionInconclusive(
+                f"selected candidate path identity changed: {candidate.path}"
+            )
         resolved = candidate.path.resolve(strict=True)
         metadata = resolved.stat(follow_symlinks=False)
+        path_after = candidate.path.lstat()
     except (FileNotFoundError, NotADirectoryError, RuntimeError) as error:
         raise _CandidateInspectionInconclusive(str(candidate.path)) from error
     except OSError as error:
         raise _CandidateInspectionInconclusive(str(candidate.path)) from error
+    if candidate.path_identity is not None and any(
+        _identity_from_stat(value) != candidate.path_identity
+        for value in (path_before, path_after)
+    ):
+        raise _CandidateInspectionInconclusive(
+            f"selected candidate path identity changed: {candidate.path}"
+        )
     if not stat.S_ISREG(metadata.st_mode) or not os.access(resolved, os.X_OK):
         raise _CandidateUnavailable(str(resolved))
     return resolved
