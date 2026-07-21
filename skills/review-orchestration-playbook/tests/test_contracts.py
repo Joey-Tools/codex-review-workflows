@@ -131,6 +131,27 @@ def _claude_auth_repository_policy_files(
     }
 
 
+def _secret_admission_repository_policy_files(
+    repo_root: pathlib.Path,
+    profile: str,
+) -> dict[str, str]:
+    policy_paths: dict[str, pathlib.Path] = {}
+    if profile == "canonical":
+        policy_paths = {
+            "AGENTS.md": _repository_agents_path(repo_root, profile),
+            "project journal": (
+                repo_root
+                / "docs/project_journal/2026/07/"
+                / "2026-07-17-secret-reduction-gate-7f1703.md"
+            ),
+        }
+    elif profile != "private":
+        raise AssertionError(f"unsupported repository policy profile: {profile}")
+    return {
+        name: path.read_text(encoding="utf-8") for name, path in policy_paths.items()
+    }
+
+
 class RepositoryContractTest(unittest.TestCase):
     def test_cleanup_only_legacy_0664_lock_migration_is_private_and_ordered(
         self,
@@ -183,7 +204,10 @@ class RepositoryContractTest(unittest.TestCase):
     def test_secret_delta_is_admission_only_for_trusted_reviewer_input(
         self,
     ) -> None:
-        agents = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        repository_policy = _secret_admission_repository_policy_files(
+            REPO_ROOT,
+            CI_PROFILE,
+        )
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
         helper_contract = (SKILL_ROOT / "references/helper-contract.md").read_text(
             encoding="utf-8"
@@ -191,22 +215,12 @@ class RepositoryContractTest(unittest.TestCase):
         readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
             encoding="utf-8"
         )
-        journal = (
-            REPO_ROOT
-            / "docs/project_journal/2026/07/"
-            / "2026-07-17-secret-reduction-gate-7f1703.md"
-        ).read_text(encoding="utf-8")
 
-        self.assertIn("including tracked repository secrets", agents)
         self.assertIn("including repository secrets", skill)
         self.assertIn("including tracked repository secrets", helper_contract)
-        self.assertIn("including repository secrets", journal)
         self.assertIn(
             "do not redact, rewrite, or suppress reviewer-visible tracked content",
             skill,
-        )
-        self.assertIn(
-            "Secret-delta analysis never blocks a named reviewer launch", agents
         )
         self.assertIn(
             "Secret admission never delays, suppresses, redacts, or gates reviewer launch",
@@ -216,15 +230,28 @@ class RepositoryContractTest(unittest.TestCase):
             "does not suppress this trusted reviewer",
             readiness,
         )
-        self.assertIn(
-            "must not prevent the reviewer from starting",
-            journal,
-        )
+        if "AGENTS.md" in repository_policy:
+            agents = repository_policy["AGENTS.md"]
+            self.assertIn("including tracked repository secrets", agents)
+            self.assertIn(
+                "Secret-delta analysis never blocks a named reviewer launch",
+                agents,
+            )
+        if "project journal" in repository_policy:
+            journal = repository_policy["project journal"]
+            self.assertIn("including repository secrets", journal)
+            self.assertIn(
+                "must not prevent the reviewer from starting",
+                journal,
+            )
 
     def test_exact_raw_secret_growth_is_the_only_admission_violation(
         self,
     ) -> None:
-        agents = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        repository_policy = _secret_admission_repository_policy_files(
+            REPO_ROOT,
+            CI_PROFILE,
+        )
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
         helper_contract = (SKILL_ROOT / "references/helper-contract.md").read_text(
             encoding="utf-8"
@@ -232,48 +259,51 @@ class RepositoryContractTest(unittest.TestCase):
         readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
             encoding="utf-8"
         )
-        journal = (
-            REPO_ROOT
-            / "docs/project_journal/2026/07/"
-            / "2026-07-17-secret-reduction-gate-7f1703.md"
-        ).read_text(encoding="utf-8")
 
-        for name, policy in {
-            "AGENTS.md": agents,
+        policy = {
+            **repository_policy,
             "SKILL.md": skill,
             "helper-contract.md": helper_contract,
             "pr-readiness.md": readiness,
-            "project journal": journal,
-        }.items():
+        }
+        for name, content in policy.items():
             with self.subTest(policy=name):
-                self.assertIn("head_count <= base_count", policy)
+                self.assertIn("head_count <= base_count", content)
 
-        self.assertIn("Only a first appearance or count growth blocks", agents)
         self.assertIn("Only a first appearance or global count growth blocks", skill)
         self.assertIn("A first appearance or any growth blocks", helper_contract)
-        self.assertIn("blocks only first appearance or growth", journal)
-        self.assertIn("Do not derive Base64, hex, URL-encoded", agents)
         self.assertIn("Do not derive Base64, hex, URL-encoded", skill)
         self.assertIn("No unembedded counter", helper_contract)
         self.assertIn("do not derive Base64 or other encodings", readiness)
-        self.assertIn(
-            "does not derive canonical Base64, URL encoding, hexadecimal",
-            journal,
-        )
         self.assertIn(
             "Report only head-side added locations",
             skill,
         )
         self.assertIn("Unchanged occurrences are omitted", helper_contract)
         self.assertIn("positive-delta candidates", readiness)
-        self.assertIn(
-            "only detectable additions for a candidate whose global count grows",
-            journal,
-        )
+        if "AGENTS.md" in repository_policy:
+            agents = repository_policy["AGENTS.md"]
+            self.assertIn("Only a first appearance or count growth blocks", agents)
+            self.assertIn("Do not derive Base64, hex, URL-encoded", agents)
+        if "project journal" in repository_policy:
+            journal = repository_policy["project journal"]
+            self.assertIn("blocks only first appearance or growth", journal)
+            self.assertIn(
+                "does not derive canonical Base64, URL encoding, hexadecimal",
+                journal,
+            )
+            self.assertIn(
+                "only detectable additions for a candidate whose global count grows",
+                journal,
+            )
 
     def test_stateful_secret_admission_is_a_separate_current_head_gate(self) -> None:
+        repository_policy = _secret_admission_repository_policy_files(
+            REPO_ROOT,
+            CI_PROFILE,
+        )
         policy = {
-            "AGENTS.md": (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8"),
+            **repository_policy,
             "SKILL.md": (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8"),
             "helper-contract.md": (
                 SKILL_ROOT / "references/helper-contract.md"
@@ -281,11 +311,6 @@ class RepositoryContractTest(unittest.TestCase):
             "pr-readiness.md": (SKILL_ROOT / "references/pr-readiness.md").read_text(
                 encoding="utf-8"
             ),
-            "project journal": (
-                REPO_ROOT
-                / "docs/project_journal/2026/07/"
-                / "2026-07-17-secret-reduction-gate-7f1703.md"
-            ).read_text(encoding="utf-8"),
         }
         for name, text in policy.items():
             with self.subTest(policy=name):
@@ -295,12 +320,12 @@ class RepositoryContractTest(unittest.TestCase):
                     text.index("stateful final"),
                     text.index("stateful admission"),
                 )
-        for name in (
-            "AGENTS.md",
-            "helper-contract.md",
-            "pr-readiness.md",
-            "project journal",
-        ):
+        exit_code_policy = ["helper-contract.md", "pr-readiness.md"]
+        if "AGENTS.md" in policy:
+            exit_code_policy.append("AGENTS.md")
+        if "project journal" in policy:
+            exit_code_policy.append("project journal")
+        for name in exit_code_policy:
             with self.subTest(exit_code_policy=name):
                 for exit_code in ("0", "1", "3", "75"):
                     self.assertIn(f"exit `{exit_code}`", policy[name])
@@ -314,11 +339,13 @@ class RepositoryContractTest(unittest.TestCase):
             "the only result that permits PR/master/merge-ready",
             policy["pr-readiness.md"],
         )
-        self.assertIn("is the only permitting result", policy["project journal"])
         self.assertIn("These checks are independent", policy["SKILL.md"])
         self.assertIn("final may succeed when admission", policy["helper-contract.md"])
         self.assertIn("`stateful final` remains independent", policy["pr-readiness.md"])
-        self.assertIn("reviewer final is independent", policy["project journal"])
+        if "project journal" in policy:
+            journal = policy["project journal"]
+            self.assertIn("is the only permitting result", journal)
+            self.assertIn("reviewer final is independent", journal)
 
     def test_admission_receipt_and_runner_policy_are_bound_to_the_launch(
         self,
@@ -831,6 +858,22 @@ class RepositoryContractTest(unittest.TestCase):
                 "unsupported repository policy profile",
             ):
                 _claude_auth_repository_policy_files(repo_root, "unknown")
+
+    def test_secret_admission_policy_files_match_distribution_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = pathlib.Path(temp_dir)
+
+            self.assertEqual(
+                _secret_admission_repository_policy_files(repo_root, "private"),
+                {},
+            )
+            with self.assertRaises(FileNotFoundError):
+                _secret_admission_repository_policy_files(repo_root, "canonical")
+            with self.assertRaisesRegex(
+                AssertionError,
+                "unsupported repository policy profile",
+            ):
+                _secret_admission_repository_policy_files(repo_root, "unknown")
 
     def test_reviewed_ci_snapshots_keep_the_intended_status_guards(self) -> None:
         canonical = (CI_FIXTURE_ROOT / "canonical.yml").read_text(encoding="utf-8")
