@@ -5,6 +5,7 @@ import io
 import json
 import os
 import pathlib
+import shutil
 import signal
 import stat
 import subprocess
@@ -85,6 +86,25 @@ class NamedLaneGuardTest(unittest.TestCase):
         )
         executable.chmod(0o755)
         return executable.resolve()
+
+    def test_entrypoint_does_not_write_import_bytecode(self) -> None:
+        scripts = self.root / "scripts"
+        scripts.mkdir()
+        shutil.copy2(SCRIPTS / "named_lane_guard", scripts / "named_lane_guard")
+        shutil.copytree(
+            SCRIPTS / "review_runtime",
+            scripts / "review_runtime",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+
+        subprocess.run(
+            (sys.executable, str(scripts / "named_lane_guard"), "--help"),
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertEqual(list(scripts.rglob("__pycache__")), [])
 
     def add_gitlink(self, path: str = "vendor") -> str:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")

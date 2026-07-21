@@ -9,6 +9,8 @@ import sys
 if sys.version_info < (3, 10):
     raise SystemExit("named_lane_guard requires Python 3.10 or later")
 
+sys.dont_write_bytecode = True
+
 from review_runtime.named_lane import main
 
 
