@@ -39,6 +39,7 @@ description: "Run a local pre-commit delivery gate for non-trivial repo changes:
 - squash-merge repo 的 PR-bound journal 应写成目标分支合并后的稳定状态；临时 `ready for review` / `waiting for merge` 放 PR body 或 comments。
 
 5. 运行本地/internal review。
+- 启动任何 formal named lane 前，加载 authoritative active `$review-orchestration-playbook`，并按其契约使用 shipped `scripts/named_lane_guard` 完成该 frozen worktree/head 的启动前 guard；不要在这个 skill 复制或弱化详细规则。
 - 默认且唯一可计为 named single review 的本地门禁是用 `fork_turns="none"`（或平台等价的零继承上下文启动方式）启动的 Codex `reviewer` agent；不要用普通 coding subagent、inherited-context subagent 或 parent-thread continuation 代替。
 - 为 reviewer 创建独立 clean Git worktree，固定 `base_sha..head_sha`，并保持整个 lane read-only。Prompt 只提供 review-control metadata：worktree、两个 SHA、instruction-loading order、read-only/evidence limits、review focus/non-goals 和 output contract；不要预先生成、粘贴或附加 full diff、changed-file content、suspected finding 或另一 reviewer 的结果。Reviewer 先加载 review skill 与 repo-wide `AGENTS.md`，取得 changed-path metadata 后再加载适用的 path-scoped `AGENTS.md`、domain skills 与 project guidance，最后自行用 bounded Git/tool calls 获取和审查该 range。
 - `reviewer` agent 必须使用 skill 配置的 Codex model、最高配置 reasoning effort 和 read-only sandbox；如果该形态不可用，报告 blocked/inconclusive，不要静默降级或用旧 helper 补位。

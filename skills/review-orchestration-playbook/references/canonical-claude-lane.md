@@ -4,15 +4,20 @@ Use this contract for the actual Anthropic Claude Code lane in named double and 
 
 ## Workspace And Process
 
-1. Create a lane-unique clean Git working tree at the same frozen `head_sha` used by the Codex lane. Prefer a lane-private local clone or private bare object store plus worktree under the task's temporary root, so required Git metadata does not live under the denied implementation checkout. This is a local Git setup step, not a network clone or prepared-diff materialization. With `GIT_NO_LAZY_FETCH=1` and `GIT_TERMINAL_PROMPT=0`, prove that the exact range and both endpoint trees are locally complete without rendering a full diff; hydrate missing objects before freezing or block the lane. Remove remote URLs before model launch. Verify clean status, exact `HEAD`, both commits, and bounded read-only range queries.
+1. Create a lane-unique clean Git working tree at the same frozen `head_sha` used by the Codex lane. Prefer a lane-private local clone or private bare object store plus worktree under the task's temporary root, so required Git metadata does not live under the denied implementation checkout. This is a local Git setup step, not a network clone or prepared-diff materialization. With `GIT_NO_LAZY_FETCH=1` and `GIT_TERMINAL_PROMPT=0`, prove that the exact range and both endpoint trees are locally complete without rendering a full diff; hydrate missing objects before freezing or block the lane. Remove remote URLs before model launch. Verify clean status, exact `HEAD`, both commits, and bounded read-only range queries. As the final parent-owned preflight immediately before launch, run the shipped `scripts/named_lane_guard validate-worktree` on that exact clean worktree/head under [review-lane-contracts.md](review-lane-contracts.md); a failure is `blocked-safety` and forbids process launch.
 2. Start a new actual `claude` process with its working directory set to that worktree. Do not use `--continue`, `--resume`, `--from-pr`, `--fork-session`, or `--worktree`.
 3. Preserve the real user `HOME` as Claude's trusted authentication and CLI control plane. The model-visible review scope is the detached working tree plus only its lane-private Git metadata/object paths that read-only Git needs for the frozen refs.
 4. Send the small control prompt through stdin. Do not create a prompt or diff file in the worktree, and do not send a prepared diff, changed-file contents, Codex findings, or parent suspicions.
 
-The canonical launch is a direct Claude Code invocation, not a call to any helper reviewer:
+The canonical launch uses the shipped `scripts/named_lane_guard run-claude` process-only supervisor, not any helper reviewer. Send the bounded control prompt on stdin, use distinct private stdout/stderr artifact paths outside the real worktree, and pass the exact revalidated absolute, non-symlink actual Claude executable after `--`. The supervisor must make that executable its direct child `argv[0]` without a shell:
 
 ```text
-claude
+scripts/named_lane_guard run-claude
+  --worktree <absolute-clean-worktree>
+  --stdout-path <private-stdout-path-outside-worktree>
+  --stderr-path <private-stderr-path-outside-worktree>
+  --
+  <exact-revalidated-absolute-claude-path>
   --print
   --model <claude-opus-4-8-or-authorized-4-7>
   --effort max
@@ -42,9 +47,17 @@ The canonical direct lane uses the user's installed actual Claude Code executabl
 2. obtain its version using a fixed credential-free environment and require `>=2.1.211,<3.0.0`;
 3. verify the fixed Anthropic release-signing key, signed per-version manifest, expected platform artifact, exact size, and SHA-256 of the stable resolved installed file, using `verify_claude_release` or equivalent checks;
 4. validate the advertised option/capability surface only after publisher verification; and
-5. immediately before launch, revalidate the same path identity, signed artifact size, and SHA-256, launch that exact resolved path directly, then revalidate it again after process completion. Any drift or uncertainty makes the lane inconclusive.
+5. immediately before launch, revalidate the same path identity, signed artifact size, and SHA-256, pass that exact path to `scripts/named_lane_guard run-claude` for direct-child launch, then revalidate it again after process completion. Any drift or uncertainty makes the lane inconclusive.
 
 This direct lane does not call `snapshot_verified_claude_executable`, copy the CLI into a helper-owned executable snapshot, or inherit the helper's dependency-closure, outer-sandbox, credential-carrier, catalog, guarded-writeback, or recovery contracts. It intentionally trusts the host-installed executable path and ordinary host runtime to remain stable between the parent checks; those checks do not claim the stronger immutability of the helper snapshot. Record only non-secret provenance metadata such as resolved path, version, platform, artifact digest, and verification state.
+
+## Process Supervisor Contract
+
+`scripts/named_lane_guard run-claude` accepts only a bounded control prompt and launches the exact revalidated Claude path with direct argv/no shell. For a production named lane, retain its fixed 1,800-second monotonic deadline and 64 MiB limit for each of stdout and stderr (128 MiB aggregate); do not weaken them through the CLI's test-oriented limit overrides. The supervisor applies the shipped runtime's process-group TERM/KILL/drain/reap cleanup, and normal leader exit does not bypass bounded drain or descendant cleanup.
+
+Only complete structured terminal output collected after successful cleanup and reaping may become review evidence. Timeout, either-stream overflow, drain or reap failure, residual descendants/process leak, or malformed/partial terminal output is `inconclusive`. Never accept a partial tail, silently downgrade the model, or fall back to another provider.
+
+This guard is deliberately narrow. `validate-worktree` provides symlink containment and `run-claude` provides process supervision; neither prepares a diff, performs review logic, establishes executable provenance, configures or attests the sandbox, authenticates Claude, scans general content/secrets, or provides `isolated_review` helper guarantees.
 
 ## Authentication Control Plane
 
@@ -119,4 +132,4 @@ The control prompt must require Claude to:
 6. avoid direct reads outside the logical review workspace and every mutation;
 7. return findings only, or exactly `No findings.` when clean.
 
-Accept only a complete structured terminal success from the actual Claude process. Verify the requested/effective model when the runtime reports it, extract the findings verbatim, and bind them to the frozen range in the parent-owned lane record. Progress, tool traces, partial JSON, silent model substitution, and helper output do not count.
+Accept only a complete structured terminal success from the actual Claude process after the supervisor has completed drain, process-group cleanup, descendant checks, and reap. Verify the requested/effective model when the runtime reports it, extract the findings verbatim, and bind them to the frozen range in the parent-owned lane record. Progress, tool traces, stdout/stderr tails, partial JSON, silent model substitution, and helper output do not count.

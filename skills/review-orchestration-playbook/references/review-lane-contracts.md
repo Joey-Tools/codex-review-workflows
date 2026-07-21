@@ -10,6 +10,8 @@ For every local logical lane:
 - Create a lane-unique clean Git worktree at `head_sha`. Do not reuse the implementation checkout or another reviewer's checkout.
 - Before launch, require `git status --porcelain` to be empty, `HEAD` to equal `head_sha`, both frozen commits to resolve, and read-only `git diff base_sha..head_sha` queries to work.
 - With `GIT_NO_LAZY_FETCH=1` and `GIT_TERMINAL_PROMPT=0`, use parent-owned read-only Git plumbing to verify local object completeness for the exact range and both endpoint trees without rendering or persisting a full diff. If any required object is missing, hydrate it deliberately before freezing or report the lane blocked. Do not launch a reviewer that could trigger a promisor-remote fetch, credential helper, or interactive authentication while inspecting the frozen scope.
+- As the final parent-owned preflight immediately before Codex spawn or Claude process launch, run `scripts/named_lane_guard validate-worktree --worktree <absolute-clean-worktree> --head <full-head-sha>`, adding one `--guidance <repo-relative-path>` for each applicable tracked project-guidance file. The guard is symlink-containment only: it allows stable tracked source symlinks whose materialized and tracked targets agree and whose full resolution remains inside the worktree; it rejects absolute targets, lexical escape, final or transitive escape, and unstable or mismatched tracked symlinks without reading an escaping target. It also requires every tracked `AGENTS.md` plus every supplied guidance path to be an ordinary non-symlink regular file inside the worktree. Any guard failure is terminal `blocked` with reason `blocked-safety`; do not spawn or launch the lane.
+- Do not expand that guard into raw-object workspace or instruction snapshots, supplied/prepared diffs, immutable guidance snapshots, or a general secret/content scan. Conditional repository-required or suspicion-driven security scanning remains a separate parent-owned decision.
 - Expose the workspace and Git metadata for read-only reviewer behavior. Disable writes to files, index, refs, config, hooks, remotes, PR state, and other external systems. The canonical Claude CLI's own ordinary credential refresh in trusted real `HOME` is the only planned host-write exception and is not a model-authorized review action; helper credential guarantees do not apply to it. A filesystem read-only sandbox does not prove that state-changing MCP, Plugin, connector, or GitHub tools are absent: the reviewer policy must forbid those actions and the parent must not authorize them. This is a write/behavior contract; it is not a claim that every runtime has an OS-level global host-read whitelist.
 - Keep the model-visible workspace free of generated prompts, diff files, manifests, state directories, and helper control artifacts.
 - If a security preflight needs private evidence, keep it outside the reviewer-visible workspace and never project a full diff into the prompt.
@@ -40,6 +42,7 @@ This rule applies even when a direct diff would fit in the current prompt. It av
 
 ## Codex Single-Lane Contract
 
+- Complete `validate-worktree` successfully on this exact worktree/head immediately before spawn.
 - Use the dedicated `reviewer` agent with `fork_turns="none"`, or the platform-equivalent zero-inherited-turn launch.
 - The reviewer reads applicable instructions and skills from its normal environment and the frozen worktree.
 - The reviewer has read-only Git/source tools and obtains the diff itself.
@@ -50,12 +53,14 @@ This rule applies even when a direct diff would fit in the current prompt. It av
 
 - Use an actual Claude Code process in a second lane-unique clean Git worktree.
 - Apply the same clear-context, instruction-loading, no-prepared-diff, bounded-tool, exact-range, and read-only requirements as the Codex lane.
-- Launch `claude` directly from that worktree under [canonical-claude-lane.md](canonical-claude-lane.md). The `.git`-free `isolated_review` helper is not the launcher for this lane.
+- Complete `validate-worktree` successfully on this exact worktree/head, then launch the exact revalidated actual `claude` executable through `scripts/named_lane_guard run-claude` under [canonical-claude-lane.md](canonical-claude-lane.md). The guard makes Claude its direct child with direct argv/no shell; the `.git`-free `isolated_review` helper is not the launcher or reviewer for this lane.
 - Do not give Claude the Codex artifact, parent reasoning, or suspected findings.
 - Use the detached worktree as review scope and real `HOME` as the trusted Claude CLI control plane. The model may have `Read`, `Grep`, `Glob`, and sandboxed `Bash`.
 - Treat the native selected-deny sandbox accurately: launch must request global `denyWrite` and critical-sensitive-root `denyRead`; those requested controls define the native-sandbox enforcement boundary, but `allowRead` is not a global host-read whitelist. Sandboxed Bash can technically read another host path that is not covered by `denyRead`; the prompt/model scope must explicitly forbid every outside-workspace read.
 - Treat Claude Code 2.1.212 `system/init` and capability output as evidence for only the fields it reports. It cannot attest the final merged sandbox, merged managed permission arrays, or actual path-rule evaluation; record the sandbox controls as requested configuration, not independently verified effective enforcement.
 - Apply **Canonical Executable Provenance** from [canonical-claude-lane.md](canonical-claude-lane.md). [claude-runtime-trust.md](claude-runtime-trust.md) supplies shared signed-manifest verification primitives, version bounds, and failure vocabulary only; its helper executable snapshot, dependency closure, outer sandbox, credential broker/carrier/catalog, guarded-writeback, and recovery rules do not apply to this direct lane.
+- The process-only supervisor accepts a bounded prompt, enforces a 1,800-second monotonic deadline, caps stdout and stderr at 64 MiB each (128 MiB aggregate), and applies the shipped process-group TERM/KILL/drain/reap cleanup. Only full structured terminal output accepted after cleanup may count. Timeout, either-stream overflow, drain/reap failure, residual descendants/process leak, or malformed/partial terminal output is `inconclusive`; never accept a partial tail or use provider/model fallback.
+- The guard supplies only symlink containment and process supervision. It does not prepare the diff, perform review logic, establish executable provenance, provide sandbox or authentication guarantees, scan general content/secrets, or inherit any helper-only guarantee.
 - A different provider cannot satisfy this lane. Model fallback within Claude Code remains one lane; provider substitution does not.
 
 ## GitHub Codex Lane Contract
@@ -99,12 +104,12 @@ The orchestrator stores that verbatim reviewer output in a separate lane record 
 
 Commands, tests, or residual risk may be added when the orchestrator can independently observe them. They are optional metadata and must not be demanded from a reviewer whose raw output contract is findings-only.
 
-Only a complete lane record with final raw reviewer output counts. Intermediate reasoning, stdout tails, tool traces, keepalives, retry attempts, and model fallbacks do not create additional lanes.
+Only a complete lane record with final raw reviewer output counts. For Claude, the full structured terminal output is not eligible until the supervisor has finished drain, process-group cleanup, descendant checks, and reap successfully. Intermediate reasoning, stdout tails, tool traces, keepalives, retry attempts, and model fallbacks do not create additional lanes.
 
 ## Failure And Rerun Contract
 
-- `blocked`: deterministic authentication, permission, configuration, policy, unsupported runtime, or missing required provider.
-- `inconclusive`: transient/capacity/timeout/network failure or no trustworthy terminal artifact.
+- `blocked`: deterministic authentication, permission, configuration, policy, unsupported runtime, missing required provider, or a `validate-worktree` safety failure (`blocked-safety`).
+- `inconclusive`: transient/capacity/timeout/network failure, Claude output overflow, drain/reap or descendant-cleanup uncertainty, malformed/partial output, or no trustworthy terminal artifact.
 - Actionable findings invalidate a clean claim until fixed and rereviewed.
 - A changed `head_sha` invalidates every artifact tied to the old head.
 - Rerun every requested local lane affected by the change; rerun the GitHub lane only when it is supported and part of the effective shape.

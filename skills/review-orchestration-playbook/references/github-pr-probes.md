@@ -32,9 +32,39 @@ gh api --hostname <host> repos/<owner>/<repo>/issues/<number>/comments \
   --jq '[.[] | {id,user:.user.login,created_at,updated_at,html_url,body}]'
 ```
 
-Treat `gh api --hostname <host> user --jq .login` as the operating identity for this invocation; `gh auth status` is supporting account/host context, not the identity value by itself. Keep the request URL/time, accepted terminal result URL/time/author, and exact `headRefOid`. Prefer a review whose `commit_id` equals `headRefOid`. If Codex answers only through an issue comment, require that the request and response both post after the head became current, that the author is the expected Codex integration identity, and that `headRefOid` stayed unchanged through acceptance. Re-read `headRefOid` before accepting the result. Any push invalidates earlier GitHub Codex evidence and requires a fresh request on the new head.
+Treat `gh api --hostname <host> user --jq .login` as the operating identity for this invocation; `gh auth status` is supporting account/host context, not the identity value by itself. Keep the request URL/time, accepted terminal result URL/time/author, and exact `headRefOid`. Prefer a review whose `commit_id` equals `headRefOid`; this is the strongest ordinary current-head binding. Require the expected Codex integration identity and a review time after the current-head request. Re-read `headRefOid` before accepting the result. Any push invalidates earlier GitHub Codex evidence and requires a fresh request on the new head.
 
-Posting `@codex review` is request transport, not completion or proof that the service started. An authenticated response from the expected GitHub/Codex identity, bound to the unchanged current head, may prove no-start unavailability when it explicitly rejects the request because the integration is missing/unsupported or the service is unavailable. An acknowledgement, run/check identity, or review activity proves service start. No response, unknown author, absent review/comment, request-comment failure, rate limit, permission error, timeout, or generic HTTP/network failure proves neither unavailable nor clean; report `triple-inconclusive`.
+### Issue-comment-only correlation
+
+This is an evidence-correlation rule inside the existing GitHub Codex lane, not another review lane or readiness gate. Apply it whenever the only candidate terminal result or authenticated no-start rejection is an issue comment.
+
+Keep a request ledger across the PR's issue-comment history. For every exact `@codex review` request, record its comment ID, URL, time, and the full `headRefOid` observed when it was posted. Keep the request unresolved until trustworthy correlated terminal or no-start evidence resolves it. A later push or head change invalidates that request for the new head but does **not** resolve the older request.
+
+Before considering correlation, require all of the following:
+
+- the candidate comment author is the expected GitHub Codex integration identity;
+- the current request was posted after the accepted head became current, and the candidate response was posted after that request; and
+- the same full `headRefOid` remained current from the request through the final acceptance reread.
+
+Then require one of these correlation paths:
+
+1. **Explicit binding:** trusted provider evidence ties the candidate to the exact request comment ID/URL or to a run/check identity already tied to that request, **or** the candidate names the full exact current `headRefOid`. A completion comment such as `Reviewed commit: <headRefOid>` is sufficient even when it contains no request link.
+2. **Unambiguous fallback:** when the candidate has no explicit request, run, or head marker, the current request is the sole still-unresolved `@codex review` request across **all** recorded heads, and no other `@codex review` request intervened between it and the candidate response.
+
+Do not infer resolution from a head change, infer request identity from similar wording, or pair a response to the nearest request by timestamp alone. If an older request remains unresolved and the candidate lacks explicit binding, or if any intervening request makes the fallback ambiguous, classify the third lane as `triple-inconclusive`.
+
+| Candidate evidence | Decision |
+| --- | --- |
+| Expected-author review with `commit_id == headRefOid`, after the current request | Accept as the preferred strong current-head binding. |
+| Expected-author issue comment on a stable current head that names the full current SHA, for example `Reviewed commit: <headRefOid>` | Accept; an exact SHA is sufficient without a request URL. |
+| Expected-author issue comment on a stable current head tied to the exact request ID/URL or its already-linked run identity | Accept. |
+| Marker-free expected-author issue comment; this request is the sole unresolved request across all heads and no request intervened | Accept only through the unambiguous fallback. |
+| Marker-free comment after a new-head request while an older-head request remains unresolved, or after an intervening request | `triple-inconclusive`; the head change and nearest timestamp do not disambiguate it. |
+| Unknown author, response before the request, or head changed before acceptance | Reject as untrustworthy or stale; report `triple-inconclusive` unless separate authenticated evidence proves no-start unavailability. |
+
+The same issue-comment correlation rule governs an authenticated no-start rejection. Only after the comment is correlated may its explicit missing-integration or service-unavailable statement justify effective double; an uncorrelated or generic rejection remains `triple-inconclusive`.
+
+Posting `@codex review` is request transport, not completion or proof that the service started. An authenticated response from the expected GitHub/Codex identity, correlated under the rule above and bound to the unchanged current head, may prove no-start unavailability when it explicitly rejects the request because the integration is missing/unsupported or the service is unavailable. An acknowledgement, run/check identity, or review activity proves service start. No response, unknown author, absent review/comment, request-comment failure, rate limit, permission error, timeout, or generic HTTP/network failure proves neither unavailable nor clean; report `triple-inconclusive`.
 
 Classify precisely:
 

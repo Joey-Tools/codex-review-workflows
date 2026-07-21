@@ -897,6 +897,40 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertIn("after service start means triple-inconclusive", interface)
 
+    def test_github_codex_issue_comments_require_request_correlation(self) -> None:
+        probes = (SKILL_ROOT / "references/github-pr-probes.md").read_text(
+            encoding="utf-8"
+        )
+        readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+
+        for anchor in (
+            "Keep a request ledger across the PR's issue-comment history",
+            "does **not** resolve the older request",
+            "the full exact current `headRefOid`",
+            "the current request is the sole still-unresolved `@codex review` request",
+            "no other `@codex review` request intervened",
+            "pair a response to the nearest request by timestamp alone",
+            "an older-head request remains unresolved",
+            "`triple-inconclusive`",
+            "`commit_id == headRefOid`",
+        ):
+            self.assertIn(anchor, probes)
+
+        self.assertIn(
+            "the request-ledger and correlation rule",
+            readiness,
+        )
+        self.assertIn(
+            "An older request remains unresolved across a head change",
+            readiness,
+        )
+        self.assertIn(
+            "without explicit correlation, that ambiguity is `triple-inconclusive`",
+            readiness,
+        )
+
     def test_named_single_prompt_uses_clear_context_codex_without_a_full_diff(
         self,
     ) -> None:
@@ -1046,6 +1080,83 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("never let the reviewer trigger an on-demand fetch", skill)
         self.assertIn("forbid `fetch`, `pull`", templates)
         self.assertNotIn("prepared full diff", contracts)
+
+    def test_named_lanes_use_the_narrow_shipped_guard_before_launch(self) -> None:
+        agents = _repository_agents_path(REPO_ROOT, CI_PROFILE).read_text(
+            encoding="utf-8"
+        )
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+
+        for content in (agents, skill, contracts, canonical):
+            self.assertIn("scripts/named_lane_guard", content)
+            self.assertIn("validate-worktree", content)
+        for anchor in (
+            "stable tracked source symlinks",
+            "absolute targets",
+            "transitive escape",
+            "unstable or mismatched tracked symlinks",
+            "ordinary non-symlink regular file",
+            "without reading an escaping target",
+            "blocked-safety",
+        ):
+            self.assertIn(anchor, contracts)
+        for overreach in (
+            "raw-object workspace",
+            "immutable guidance snapshots",
+            "general secret/content scan",
+        ):
+            self.assertIn(overreach, contracts)
+        self.assertIn(
+            "Do not expand that guard into",
+            contracts,
+        )
+
+    def test_direct_claude_guard_has_finite_process_boundaries(self) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        entrypoint_path = SCRIPTS / "named_lane_guard"
+        entrypoint = entrypoint_path.read_text(encoding="utf-8")
+        runtime = (SCRIPTS / "review_runtime/named_lane.py").read_text(
+            encoding="utf-8"
+        )
+
+        for content in (skill, contracts, canonical):
+            self.assertIn("scripts/named_lane_guard run-claude", content)
+            self.assertIn("1,800-second monotonic deadline", content)
+            self.assertIn("64 MiB", content)
+            self.assertIn("128 MiB aggregate", content)
+            self.assertIn("TERM/KILL/drain/reap", content)
+            self.assertIn("direct", content)
+            self.assertIn("inconclusive", content)
+            self.assertIn("partial", content)
+        for non_guarantee in (
+            "prepare",
+            "review logic",
+            "executable provenance",
+            "authenticate",
+            "general content/secrets",
+        ):
+            self.assertIn(non_guarantee, contracts)
+        self.assertIn("direct child `argv[0]`", canonical)
+        self.assertIn("direct argv/no shell", canonical)
+        self.assertIn("Only complete structured terminal output", canonical)
+        self.assertNotEqual(entrypoint_path.stat().st_mode & 0o111, 0)
+        self.assertIn("named_lane_guard requires Python 3.10 or later", entrypoint)
+        self.assertIn("from review_runtime.named_lane import main", entrypoint)
+        self.assertIn("DEFAULT_TIMEOUT_SECONDS = 1_800.0", runtime)
+        self.assertIn("DEFAULT_STREAM_LIMIT_BYTES = 64 * 1024 * 1024", runtime)
+        self.assertIn("run_bounded_capture", runtime)
 
     def test_named_lane_keeps_raw_findings_separate_from_parent_metadata(
         self,
