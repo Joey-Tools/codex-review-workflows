@@ -672,16 +672,29 @@ def _claude_auth_repository_policy_files(
 
 
 class RepositoryContractTest(unittest.TestCase):
-    def test_change_delivery_runtime_matrix_scope_and_isolation(self) -> None:
+    def test_change_delivery_resolves_one_runtime_before_matrix(self) -> None:
         skill = (
             SKILL_SCOPE_ROOT / "skills/change-delivery-workflow/SKILL.md"
         ).read_text(encoding="utf-8")
 
+        anchors = (
+            "本地默认只运行一个确定的 runtime/version",
+            "the user 明确指定的版本",
+            "repo-local policy、repo 固定配置或既有 runner 解析出的版本",
+            "项目工具默认值",
+            "本机已安装且与项目兼容的最新版本",
+        )
+        cursor = 0
+        for anchor in anchors:
+            cursor = skill.index(anchor, cursor) + len(anchor)
+        self.assertIn("记录实际采用的 runtime/version", skill)
         self.assertIn(
             "最低支持版本和 CI matrix 本身不构成本地多版本门禁",
             skill,
         )
-        self.assertIn("其余声明的版本继续由 CI 覆盖", skill)
+        self.assertIn("明确要求本地多版本验证", skill)
+        self.assertIn("本次改动目标就是跨版本兼容性", skill)
+        self.assertIn("才扩成本地多版本验证", skill)
         self.assertIn("必须串行执行", skill)
         self.assertIn("独立 worktree/cache/state", skill)
         self.assertIn("只有 suite 已证明隔离时才可在同一 checkout 并发", skill)

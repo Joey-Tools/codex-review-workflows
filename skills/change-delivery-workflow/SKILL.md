@@ -27,7 +27,8 @@ description: "Run a local pre-commit delivery gate for non-trivial repo changes:
 
 3. 跑构建和测试。
 - 优先选择当前 repo 最宽但合理的验证：build、unit tests、integration tests、e2e。
-- 本地 runtime/version 范围只取 the user 或 repo-local policy 明确要求的集合。最低支持版本和 CI matrix 本身不构成本地多版本门禁，除非本次改动就是跨版本兼容性；其余声明的版本继续由 CI 覆盖。
+- 本地默认只运行一个确定的 runtime/version，并在同一轮验证中固定使用该选择。依次采用：the user 明确指定的版本；repo-local policy、repo 固定配置或既有 runner 解析出的版本（例如 `.python-version` 或 repo 常规的 `uv run`）；项目工具默认值；本机已安装且与项目兼容的最新版本。记录实际采用的 runtime/version。
+- 最低支持版本和 CI matrix 本身不构成本地多版本门禁。只有 the user 或 repo-local policy 明确要求本地多版本验证，或本次改动目标就是跨版本兼容性时，才扩成本地多版本验证。
 - 确需本地多版本验证时，先识别共享的 checkout 产物、缓存、固定端口和其他可变状态。测试可能共享这些资源时，必须串行执行，或为每个版本使用独立 worktree/cache/state；只有 suite 已证明隔离时才可在同一 checkout 并发。
 - 失败时回到最早受影响步骤修复，再重跑受影响验证。
 - 无法运行的 gate 要明确说明原因和风险，不得声称已覆盖。

@@ -14,14 +14,15 @@ superseded_by:
 
 ## Summary
 
-- Kept local runtime validation scoped to versions explicitly required by the user or repository policy.
+- Resolved one deterministic local runtime by default instead of expanding minimum-version or CI declarations into a local matrix.
 - Required serial execution or isolated mutable state when a necessary multi-version suite cannot prove same-checkout concurrency is safe.
 
 ## Current State
 
-- Minimum supported versions and CI matrices no longer imply an unrequested local runtime matrix.
+- Local validation first uses an explicit user or repository version, then a repository-pinned or runner-resolved version, then the tool default, and finally the newest installed compatible version.
+- The selected runtime stays fixed for the validation pass and is recorded in the evidence.
+- Minimum supported versions and CI matrices do not imply an unrequested local runtime matrix.
 - Cross-version compatibility changes may still validate multiple runtimes locally.
-- Declared versions outside the local scope remain covered by CI.
 - Multi-version validation that shares checkout output, caches, fixed ports, or mutable state runs serially or with isolated worktrees, caches, and state.
 
 ## Next Steps
@@ -30,8 +31,9 @@ superseded_by:
 
 ## Evidence
 
-- Daily Skill Friction found two independent tasks where unrequested concurrent Python 3.10 and 3.13 suites interfered through shared checkout state and required user correction.
-- A repository contract test preserves both the runtime-scope and isolation requirements.
+- Daily Skill Friction found two independent tasks where an unrequested concurrent two-version Python matrix interfered through shared checkout state and required user correction.
+- A repository contract test preserves the single-runtime resolution order, matrix scope, and isolation requirements.
 - `uv run --isolated --with pyyaml python3 .../quick_validate.py skills/change-delivery-workflow` passed.
-- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py' -q` passed 1,062 tests with 4 skips under Python 3.13 after rerunning outside the sandbox for loopback-bind permission.
+- `project_journal.py validate --repo ...` passed.
+- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py' -q` passed 1,062 tests with 4 skips under the single resolved Python 3.13.0 runtime; loopback-binding tests ran outside the sandbox.
 - `git diff --check` passed.
