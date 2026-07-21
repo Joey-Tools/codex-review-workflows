@@ -97,14 +97,23 @@ class NamedLaneGuardTest(unittest.TestCase):
         return executable.resolve()
 
     def copy_guard_bundle(self) -> tuple[pathlib.Path, pathlib.Path]:
-        scripts = self.root / f"scripts-{time.monotonic_ns()}"
-        scripts.mkdir()
+        bundle = self.root / f"bundle-{time.monotonic_ns()}"
+        scripts = bundle / "scripts"
+        scripts.mkdir(parents=True)
         guard = scripts / "named_lane_guard"
         shutil.copy2(SCRIPTS / "named_lane_guard", guard)
+        shutil.copy2(SCRIPTS / "named_claude_preflight", scripts)
+        shutil.copy2(SCRIPTS / "validate_claude_stream.py", scripts)
         shutil.copytree(
             SCRIPTS / "review_runtime",
             scripts / "review_runtime",
             ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+        references = bundle / "references"
+        references.mkdir()
+        shutil.copy2(
+            SCRIPTS.parent / "references/claude-2.1.212-stream-schema.json",
+            references,
         )
         return scripts, guard
 
@@ -127,16 +136,43 @@ class NamedLaneGuardTest(unittest.TestCase):
             *arguments,
         )
 
+    def install_unchecked_pyc(
+        self,
+        source_path: pathlib.Path,
+        marker: pathlib.Path,
+        *,
+        label: str,
+    ) -> pathlib.Path:
+        malicious_source = self.root / f"malicious-{label}-{time.monotonic_ns()}.py"
+        malicious_source.write_text(
+            "import pathlib\n"
+            f"pathlib.Path({str(marker)!r}).write_text('loaded')\n"
+            f"raise RuntimeError('malicious {label} pyc executed')\n",
+            encoding="utf-8",
+        )
+        cache_path = pathlib.Path(importlib.util.cache_from_source(str(source_path)))
+        cache_path.parent.mkdir(exist_ok=True)
+        py_compile.compile(
+            str(malicious_source),
+            cfile=str(cache_path),
+            doraise=True,
+            invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+        )
+        return cache_path
+
     def guard_probe_command(
         self,
         guard: pathlib.Path,
         body: str,
+        *,
+        guard_arguments: tuple[str, ...] = (),
     ) -> tuple[str, ...]:
         probe = self.root / f"guard-probe-{time.monotonic_ns()}.py"
         probe.write_text(
             "import pathlib\n"
             "import sys\n"
             f"guard = pathlib.Path({str(guard)!r})\n"
+            f"sys.argv = [str(guard), *{guard_arguments!r}]\n"
             "source = guard.read_bytes()\n"
             "namespace = {\n"
             "    '__name__': '_named_lane_guard_probe',\n"
@@ -154,12 +190,20 @@ class NamedLaneGuardTest(unittest.TestCase):
             str(probe),
         )
 
-    def guard_failure_probe_command(self, guard: pathlib.Path) -> tuple[str, ...]:
+    def guard_failure_probe_command(
+        self,
+        guard: pathlib.Path,
+        *,
+        guard_arguments: tuple[str, ...] = (),
+        namespace_roots: tuple[str, ...] = ("review_runtime",),
+    ) -> tuple[str, ...]:
         probe = self.root / f"guard-failure-probe-{time.monotonic_ns()}.py"
         probe.write_text(
             "import pathlib\n"
             "import sys\n"
             f"guard = pathlib.Path({str(guard)!r})\n"
+            f"sys.argv = [str(guard), *{guard_arguments!r}]\n"
+            f"namespace_roots = {namespace_roots!r}\n"
             "namespace = {\n"
             "    '__name__': '_named_lane_guard_probe',\n"
             "    '__file__': str(guard),\n"
@@ -170,8 +214,10 @@ class NamedLaneGuardTest(unittest.TestCase):
             "    failure = str(error)\n"
             "else:\n"
             "    raise RuntimeError('guard unexpectedly loaded a failing runtime')\n"
-            "remaining = sorted(name for name in sys.modules "
-            "if name == 'review_runtime' or name.startswith('review_runtime.'))\n"
+            "remaining = sorted(name for name in sys.modules if any(\n"
+            "    name == root or name.startswith(f'{root}.')\n"
+            "    for root in namespace_roots\n"
+            "))\n"
             "if remaining:\n"
             "    raise RuntimeError(f'partial runtime modules remained: {remaining}')\n"
             "print(failure)\n",
@@ -381,6 +427,453 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertFalse(argparse_marker.exists())
         self.assertFalse(json_marker.exists())
         self.assertFalse(pyc_marker.exists())
+
+    def test_preflight_entrypoint_loads_only_bound_manifest_sources(self) -> None:
+        scripts, guard = self.copy_guard_bundle()
+        runtime = scripts / "review_runtime"
+        wrapper_marker = self.root / "preflight-wrapper.marker"
+        json_marker = self.root / "preflight-json-shadow.marker"
+        ssl_marker = self.root / "preflight-ssl-shadow.marker"
+        pyc_marker = self.root / "preflight-provenance-pyc.marker"
+        (scripts / "named_claude_preflight").write_text(
+            f"#!/bin/sh\nprintf loaded > {str(wrapper_marker)!r}\nexit 97\n",
+            encoding="utf-8",
+        )
+        (scripts / "named_claude_preflight").chmod(0o755)
+        for module_name, marker in (("json", json_marker), ("ssl", ssl_marker)):
+            (scripts / f"{module_name}.py").write_text(
+                "import pathlib\n"
+                f"pathlib.Path({str(marker)!r}).write_text('loaded')\n"
+                f"raise RuntimeError('malicious {module_name} shadow executed')\n",
+                encoding="utf-8",
+            )
+        for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+            (runtime / f"claude_provenance{suffix}").write_bytes(
+                b"not an extension module"
+            )
+        self.install_unchecked_pyc(
+            runtime / "claude_provenance.py",
+            pyc_marker,
+            label="claude-provenance",
+        )
+
+        expected_origins = {
+            "review_runtime": str(runtime / "__init__.py"),
+            "review_runtime.common": str(runtime / "common.py"),
+            "review_runtime.claude_refresh_lock": str(
+                runtime / "claude_refresh_lock.py"
+            ),
+            "review_runtime.claude_linux": str(runtime / "claude_linux.py"),
+            "review_runtime.claude_provenance": str(runtime / "claude_provenance.py"),
+            "review_runtime.named_claude_preflight": str(
+                runtime / "named_claude_preflight.py"
+            ),
+        }
+        expected_key = str(runtime / "claude_code_release.asc")
+        body = (
+            "import json\n"
+            f"expected = {expected_origins!r}\n"
+            f"expected_key = {expected_key!r}\n"
+            "observed = {}\n"
+            "for name, origin in expected.items():\n"
+            "    module = sys.modules[name]\n"
+            "    observed[name] = module.__spec__.origin\n"
+            "    if module.__file__ != origin or module.__spec__.origin != origin:\n"
+            "        raise RuntimeError(f'unexpected bound origin for {name}')\n"
+            "if list(sys.modules['review_runtime'].__path__):\n"
+            "    raise RuntimeError('bound package search path must remain closed')\n"
+            "loaded = sorted(name for name in sys.modules "
+            "if name == 'review_runtime' or name.startswith('review_runtime.'))\n"
+            "if loaded != sorted(expected):\n"
+            "    raise RuntimeError(f'unexpected preflight closure: {loaded}')\n"
+            "key = sys.modules['review_runtime.claude_provenance']."
+            "CLAUDE_RELEASE_KEY_PATH\n"
+            "if str(key) != expected_key:\n"
+            "    raise RuntimeError(f'unexpected release key path: {key}')\n"
+            "key_bytes = sys.modules['review_runtime.claude_provenance']."
+            "CLAUDE_RELEASE_KEY_BYTES\n"
+            "if key_bytes != pathlib.Path(expected_key).read_bytes():\n"
+            "    raise RuntimeError('release key bytes were not bound exactly')\n"
+            "if namespace['_MAIN_ARGV'] != ('--sentinel',):\n"
+            "    raise RuntimeError(f'arguments not forwarded: "
+            "{namespace['_MAIN_ARGV']!r}')\n"
+            "print(json.dumps(observed, sort_keys=True))\n"
+        )
+        completed = subprocess.run(
+            self.guard_probe_command(
+                guard,
+                body,
+                guard_arguments=("preflight-claude", "--sentinel"),
+            ),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(json.loads(completed.stdout), expected_origins)
+        self.assertFalse(wrapper_marker.exists())
+        self.assertFalse(json_marker.exists())
+        self.assertFalse(ssl_marker.exists())
+        self.assertFalse(pyc_marker.exists())
+
+    def test_preflight_entrypoint_uses_bound_linux_runtime_modules(self) -> None:
+        scripts, guard = self.copy_guard_bundle()
+        runtime = scripts / "review_runtime"
+        body = (
+            "import pathlib\n"
+            "import types\n"
+            "package = sys.modules['review_runtime']\n"
+            "linux = sys.modules['review_runtime.claude_linux']\n"
+            "provenance = sys.modules['review_runtime.claude_provenance']\n"
+            f"expected_linux = {str(runtime / 'claude_linux.py')!r}\n"
+            "if package.claude_linux is not linux:\n"
+            "    raise RuntimeError('package did not retain the bound Linux module')\n"
+            "if linux.__spec__.origin != expected_linux:\n"
+            "    raise RuntimeError(f'unexpected Linux origin: "
+            "{linux.__spec__.origin}')\n"
+            "host = object()\n"
+            "closure = object()\n"
+            "calls = []\n"
+            "linux.detect_host = lambda: host\n"
+            "def collect(actual_host, executable, **kwargs):\n"
+            "    calls.append(('collect', actual_host, executable, kwargs))\n"
+            "    return closure\n"
+            "def revalidate(actual_closure):\n"
+            "    calls.append(('revalidate', actual_closure))\n"
+            "    return actual_closure\n"
+            "linux.collect_host_runtime_closure = collect\n"
+            "linux.revalidate_host_runtime_closure = revalidate\n"
+            "provenance.sys = types.SimpleNamespace(platform='linux')\n"
+            "executable = pathlib.Path('/bound/gpg')\n"
+            "trusted = provenance._prepare_trusted_gpg_runtime(executable)\n"
+            "if trusted.linux_closure is not closure:\n"
+            "    raise RuntimeError('Linux closure was not returned')\n"
+            "provenance._revalidate_trusted_gpg_runtime(trusted)\n"
+            "if calls[0][0:3] != ('collect', host, executable):\n"
+            "    raise RuntimeError(f'unexpected Linux collection call: {calls[0]}')\n"
+            "if calls[1] != ('revalidate', closure):\n"
+            "    raise RuntimeError(f'unexpected Linux revalidation call: {calls[1]}')\n"
+            "print(linux.__spec__.origin)\n"
+        )
+        completed = subprocess.run(
+            self.guard_probe_command(
+                guard,
+                body,
+                guard_arguments=("preflight-claude",),
+            ),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), str(runtime / "claude_linux.py"))
+
+    def test_validator_entrypoint_loads_only_bound_manifest_source(self) -> None:
+        scripts, guard = self.copy_guard_bundle()
+        argparse_marker = self.root / "validator-argparse-shadow.marker"
+        json_marker = self.root / "validator-json-shadow.marker"
+        pyc_marker = self.root / "validator-pyc.marker"
+        for module_name, marker in (
+            ("argparse", argparse_marker),
+            ("json", json_marker),
+        ):
+            (scripts / f"{module_name}.py").write_text(
+                "import pathlib\n"
+                f"pathlib.Path({str(marker)!r}).write_text('loaded')\n"
+                f"raise RuntimeError('malicious {module_name} shadow executed')\n",
+                encoding="utf-8",
+            )
+        for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+            (scripts / f"validate_claude_stream{suffix}").write_bytes(
+                b"not an extension module"
+            )
+        self.install_unchecked_pyc(
+            scripts / "validate_claude_stream.py",
+            pyc_marker,
+            label="validate-claude-stream",
+        )
+
+        expected_origin = str(scripts / "validate_claude_stream.py")
+        expected_schema = str(
+            scripts.parent / "references/claude-2.1.212-stream-schema.json"
+        )
+        body = (
+            "module = sys.modules['validate_claude_stream']\n"
+            f"expected_origin = {expected_origin!r}\n"
+            f"expected_schema = {expected_schema!r}\n"
+            "if module.__file__ != expected_origin:\n"
+            "    raise RuntimeError(f'unexpected validator file: {module.__file__}')\n"
+            "if module.__spec__.origin != expected_origin:\n"
+            "    raise RuntimeError(f'unexpected validator origin: "
+            "{module.__spec__.origin}')\n"
+            "if module.__package__ != '':\n"
+            "    raise RuntimeError(f'unexpected validator package: "
+            "{module.__package__!r}')\n"
+            "if str(module.SCHEMA_PATH) != expected_schema:\n"
+            "    raise RuntimeError(f'unexpected schema path: {module.SCHEMA_PATH}')\n"
+            "if module.SCHEMA_BYTES != pathlib.Path(expected_schema).read_bytes():\n"
+            "    raise RuntimeError('schema bytes were not bound exactly')\n"
+            "loaded = sorted(name for name in sys.modules "
+            "if name == 'validate_claude_stream' "
+            "or name.startswith('validate_claude_stream.'))\n"
+            "if loaded != ['validate_claude_stream']:\n"
+            "    raise RuntimeError(f'unexpected validator closure: {loaded}')\n"
+            "if namespace['_MAIN_ARGV'] != ('--sentinel',):\n"
+            "    raise RuntimeError(f'arguments not forwarded: "
+            "{namespace['_MAIN_ARGV']!r}')\n"
+            "print(module.__spec__.origin)\n"
+        )
+        completed = subprocess.run(
+            self.guard_probe_command(
+                guard,
+                body,
+                guard_arguments=("validate-claude-stream", "--sentinel"),
+            ),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), expected_origin)
+        self.assertFalse(argparse_marker.exists())
+        self.assertFalse(json_marker.exists())
+        self.assertFalse(pyc_marker.exists())
+
+    def test_control_companions_must_be_ordinary_non_symlink_files(self) -> None:
+        cases = (
+            (
+                "preflight-claude",
+                lambda scripts: scripts / "review_runtime/claude_code_release.asc",
+            ),
+            (
+                "validate-claude-stream",
+                lambda scripts: scripts.parent
+                / "references/claude-2.1.212-stream-schema.json",
+            ),
+        )
+        for subcommand, companion_path in cases:
+            for replacement_type in ("symlink", "directory"):
+                with self.subTest(
+                    subcommand=subcommand,
+                    replacement_type=replacement_type,
+                ):
+                    scripts, guard = self.copy_guard_bundle()
+                    companion = companion_path(scripts)
+                    payload = companion.read_bytes()
+                    companion.unlink()
+                    if replacement_type == "symlink":
+                        target = self.root / f"companion-{time.monotonic_ns()}"
+                        target.write_bytes(payload)
+                        companion.symlink_to(target)
+                    else:
+                        companion.mkdir()
+
+                    completed = subprocess.run(
+                        self.isolated_guard_command(guard, subcommand),
+                        check=False,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+
+                    self.assertNotEqual(completed.returncode, 0)
+                    self.assertIn(
+                        f"{companion.name} must be an ordinary non-symlink regular file",
+                        completed.stderr,
+                    )
+
+    def test_control_companion_same_content_replacement_is_allowed(self) -> None:
+        scripts, guard = self.copy_guard_bundle()
+        schema = scripts.parent / "references/claude-2.1.212-stream-schema.json"
+        replacement = schema.with_name("replacement-schema.json")
+        body = (
+            "import os\n"
+            f"schema = pathlib.Path({str(schema)!r})\n"
+            f"replacement = pathlib.Path({str(replacement)!r})\n"
+            "replacement.write_bytes(schema.read_bytes())\n"
+            "os.replace(replacement, schema)\n"
+            "result = namespace['main'](('--help',))\n"
+            "if result != 3:\n"
+            "    raise RuntimeError(f'unexpected validator result: {result}')\n"
+            "print('same-content replacement accepted')\n"
+        )
+        completed = subprocess.run(
+            self.guard_probe_command(
+                guard,
+                body,
+                guard_arguments=("validate-claude-stream",),
+            ),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            completed.stdout.splitlines()[-1],
+            "same-content replacement accepted",
+        )
+
+    def test_control_companion_content_is_revalidated_before_main(self) -> None:
+        scripts, guard = self.copy_guard_bundle()
+        schema = scripts.parent / "references/claude-2.1.212-stream-schema.json"
+        body = (
+            "import os\n"
+            f"schema = pathlib.Path({str(schema)!r})\n"
+            "before = os.stat(schema, follow_symlinks=False)\n"
+            "with schema.open('r+b') as stream:\n"
+            "    original = stream.read(1)\n"
+            "    stream.seek(0)\n"
+            "    stream.write(b'X' if original != b'X' else b'Y')\n"
+            "    stream.flush()\n"
+            "    os.fsync(stream.fileno())\n"
+            "after = os.stat(schema, follow_symlinks=False)\n"
+            "identity = lambda value: (value.st_dev, value.st_ino, value.st_mode, "
+            "value.st_uid, value.st_size)\n"
+            "if identity(before) != identity(after):\n"
+            "    raise RuntimeError('fixture did not preserve companion identity')\n"
+            "try:\n"
+            "    namespace['main'](())\n"
+            "except SystemExit as error:\n"
+            "    failure = str(error)\n"
+            "else:\n"
+            "    raise RuntimeError('guard accepted companion content drift')\n"
+            "if 'companion content changed' not in failure:\n"
+            "    raise RuntimeError(f'unexpected guard failure: {failure}')\n"
+            "print(failure)\n"
+        )
+        completed = subprocess.run(
+            self.guard_probe_command(
+                guard,
+                body,
+                guard_arguments=("validate-claude-stream",),
+            ),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("companion content changed", completed.stdout)
+
+    def test_control_consumer_uses_bound_bytes_after_final_revalidation(self) -> None:
+        scripts, guard = self.copy_guard_bundle()
+        schema = scripts.parent / "references/claude-2.1.212-stream-schema.json"
+        replacement = schema.with_name("post-validation-schema.json")
+        body = (
+            "import os\n"
+            f"schema = pathlib.Path({str(schema)!r})\n"
+            f"replacement = pathlib.Path({str(replacement)!r})\n"
+            "module = sys.modules['validate_claude_stream']\n"
+            "original_validate = namespace['_validate_bound_companion']\n"
+            "initial_binding = original_validate(schema)\n"
+            "replacement.write_bytes(b'not valid JSON')\n"
+            "def validate_then_replace(path):\n"
+            "    binding = original_validate(path)\n"
+            "    os.replace(replacement, path)\n"
+            "    return binding\n"
+            "namespace['_validate_bound_companion'] = validate_then_replace\n"
+            "def consume(_argv):\n"
+            "    return module._load_contract()['claude_code_version']\n"
+            "guarded = namespace['_guard_companions'](\n"
+            "    consume, ((schema, initial_binding),)\n"
+            ")\n"
+            "version = guarded(())\n"
+            "if version != '2.1.212':\n"
+            "    raise RuntimeError(f'unexpected bound schema version: {version}')\n"
+            "if schema.read_bytes() != b'not valid JSON':\n"
+            "    raise RuntimeError('fixture did not replace the schema path')\n"
+            "print(version)\n"
+        )
+        completed = subprocess.run(
+            self.guard_probe_command(
+                guard,
+                body,
+                guard_arguments=("validate-claude-stream",),
+            ),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "2.1.212")
+
+    def test_optional_control_load_failures_roll_back_their_namespaces(self) -> None:
+        cases = (
+            (
+                "preflight-claude",
+                "review_runtime",
+                lambda scripts: scripts / "review_runtime/named_claude_preflight.py",
+            ),
+            (
+                "validate-claude-stream",
+                "validate_claude_stream",
+                lambda scripts: scripts / "validate_claude_stream.py",
+            ),
+        )
+        for subcommand, namespace_root, source_path in cases:
+            with self.subTest(subcommand=subcommand):
+                scripts, guard = self.copy_guard_bundle()
+                source = source_path(scripts)
+                source.write_text(
+                    source.read_text(encoding="utf-8")
+                    + "\nraise RuntimeError('synthetic optional loader failure')\n",
+                    encoding="utf-8",
+                )
+
+                completed = subprocess.run(
+                    self.guard_failure_probe_command(
+                        guard,
+                        guard_arguments=(subcommand,),
+                        namespace_roots=(namespace_root,),
+                    ),
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertIn("runtime execution failed", completed.stdout)
+
+    def test_validator_subcommand_forwards_only_following_arguments(self) -> None:
+        _, guard = self.copy_guard_bundle()
+        missing_input = self.root / "missing-stream.jsonl"
+        completed = subprocess.run(
+            self.isolated_guard_command(
+                guard,
+                "validate-claude-stream",
+                "--cwd",
+                str(self.repo.resolve()),
+                "--model",
+                "claude-opus-4-8",
+                "--api-key-source",
+                "none",
+                "--process-returncode",
+                "0",
+                "--input",
+                str(missing_input),
+            ),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 3, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertEqual(result["classification"], "inconclusive")
+        self.assertIn("stream.input-unreadable", result["reasons"])
 
     def test_entrypoint_rejects_unbound_runtime_file_types(self) -> None:
         for replacement_type in ("symlink", "directory"):

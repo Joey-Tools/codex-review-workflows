@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import inspect
+import json
+import math
 import pathlib
 import subprocess
 import sys
@@ -63,6 +65,9 @@ EXPECTED_CLAUDE_2_1_211_LOCK_ARTIFACTS = {
 
 
 CI_FIXTURE_ROOT = SKILL_ROOT / "tests" / "fixtures" / "ci"
+COMPATIBILITY_WORKFLOW_FIXTURE = (
+    SKILL_ROOT / "tests" / "fixtures" / "compat" / "codex-review-gate.yml"
+)
 CI_PROFILE_BY_SKILL_LAYOUT = {
     pathlib.Path("skills/review-orchestration-playbook"): "canonical",
     pathlib.Path("personal_codex/skills/review-orchestration-playbook"): "private",
@@ -392,55 +397,101 @@ class RepositoryContractTest(unittest.TestCase):
                 journal,
             )
 
-    def test_stateful_secret_admission_is_a_separate_current_head_gate(self) -> None:
+    def test_direct_secret_admission_is_required_without_a_reviewer(self) -> None:
         repository_policy = _secret_admission_repository_policy_files(
             REPO_ROOT,
             CI_PROFILE,
         )
-        policy = {
+        required_policy = {
             **repository_policy,
             "SKILL.md": (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8"),
-            "helper-contract.md": (
-                SKILL_ROOT / "references/helper-contract.md"
-            ).read_text(encoding="utf-8"),
             "pr-readiness.md": (SKILL_ROOT / "references/pr-readiness.md").read_text(
                 encoding="utf-8"
             ),
+            "review-lane-contracts.md": (
+                SKILL_ROOT / "references/review-lane-contracts.md"
+            ).read_text(encoding="utf-8"),
+            "egress-consent.md": (
+                SKILL_ROOT / "references/egress-consent.md"
+            ).read_text(encoding="utf-8"),
         }
-        for name, text in policy.items():
+        for name, text in required_policy.items():
             with self.subTest(policy=name):
-                self.assertIn("stateful final", text)
-                self.assertIn("stateful admission", text)
-                self.assertLess(
-                    text.index("stateful final"),
-                    text.index("stateful admission"),
+                lowered = text.lower()
+                self.assertIn("secret-admission", text)
+                self.assertIn("admission-only-no-reviewer", text)
+                self.assertIn("exit", lowered)
+                self.assertIn("`0`", text)
+                self.assertIn("`1`", text)
+                self.assertIn("`75`", text)
+                self.assertNotIn(
+                    "Obtain one low-level stateful helper state",
+                    text,
                 )
-        exit_code_policy = ["helper-contract.md", "pr-readiness.md"]
-        if "AGENTS.md" in policy:
-            exit_code_policy.append("AGENTS.md")
-        if "project journal" in policy:
-            exit_code_policy.append("project journal")
-        for name in exit_code_policy:
-            with self.subTest(exit_code_policy=name):
-                for exit_code in ("0", "1", "3", "75"):
-                    self.assertIn(f"exit `{exit_code}`", policy[name])
 
-        self.assertIn("Admission exit `0` is `clean`", policy["SKILL.md"])
+        helper = (SKILL_ROOT / "references/helper-contract.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("stateful final", helper)
+        self.assertIn("stateful admission", helper)
+        self.assertLess(
+            helper.index("stateful final"), helper.index("stateful admission")
+        )
+        self.assertIn("retained only", helper)
+        self.assertIn("starts no reviewer", helper)
+        self.assertNotIn("only PR/master/merge-ready admission success", helper)
+
+        readiness = required_policy["pr-readiness.md"]
+        self.assertNotIn("same-state current-head exact-secret admission", readiness)
+        self.assertIn("direct current-head exact-secret admission", readiness)
+        for name in (
+            "SKILL.md",
+            "pr-readiness.md",
+            "review-lane-contracts.md",
+            "egress-consent.md",
+        ):
+            with self.subTest(cleanup_contract=name):
+                self.assertIn("temporary_cleanup_status", required_policy[name])
+        if "AGENTS.md" in repository_policy:
+            self.assertIn(
+                "temporary_cleanup_status",
+                repository_policy["AGENTS.md"],
+            )
+
+    def test_stateful_secret_admission_is_a_separate_current_head_gate(self) -> None:
+        helper = (SKILL_ROOT / "references/helper-contract.md").read_text(
+            encoding="utf-8"
+        )
+        readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("stateful final", helper)
+        self.assertIn("stateful admission", helper)
+        self.assertLess(
+            helper.index("stateful final"), helper.index("stateful admission")
+        )
+        for exit_code in ("0", "1", "3", "75"):
+            self.assertIn(f"exit `{exit_code}`", helper)
         self.assertIn(
-            "the only status that permits PR/master/merge-ready",
-            policy["helper-contract.md"],
+            "successful optional helper-state check, not the required PR/master/merge-ready admission producer",
+            helper,
         )
         self.assertIn(
+            "schema-v5 `stateful final` / `stateful admission` compatibility contract",
+            readiness,
+        )
+        self.assertIn(
+            "compatible `stateful final` / `stateful admission` pair remains helper-only evidence",
+            contracts,
+        )
+        self.assertNotIn(
             "the only result that permits PR/master/merge-ready",
-            policy["pr-readiness.md"],
+            helper,
         )
-        self.assertIn("These checks are independent", policy["SKILL.md"])
-        self.assertIn("final may succeed when admission", policy["helper-contract.md"])
-        self.assertIn("`stateful final` remains independent", policy["pr-readiness.md"])
-        if "project journal" in policy:
-            journal = policy["project journal"]
-            self.assertIn("is the only permitting result", journal)
-            self.assertIn("reviewer final is independent", journal)
 
     def test_admission_receipt_and_runner_policy_are_bound_to_the_launch(
         self,
@@ -524,8 +575,10 @@ class RepositoryContractTest(unittest.TestCase):
             "sole lane that satisfies a named single review",
             "separate clean Git worktree",
             "Keep the workspace read-only",
-            "independently trusted control-plane bundle path/version/digest",
-            "load the trusted review skill",
+            "exact prompt-provided authoritative review skill",
+            "independently trusted control-plane bundle",
+            "absolute path, version, and SHA-256 digest",
+            "load that trusted review skill",
             "domain skill",
             "AGENTS.md",
             "project-guidance document",
@@ -879,6 +932,79 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("review-orchestration-playbook/tests", workflow)
         self.assertNotIn("external-review-playbook", workflow)
         self.assertNotIn("copilot-review-playbook", workflow)
+        if CI_PROFILE == "canonical":
+            compatibility_path = REPO_ROOT / ".github/workflows/codex-review-gate.yml"
+            compatibility = compatibility_path.read_text(encoding="utf-8")
+            self.assertEqual(
+                compatibility_path.read_bytes(),
+                COMPATIBILITY_WORKFLOW_FIXTURE.read_bytes(),
+                "compatibility status workflow differs from the reviewed safety snapshot",
+            )
+            for anchor in (
+                "Codex Review Gate Compatibility Status",
+                "pull_request_target:",
+                "types: [opened, reopened, synchronize, ready_for_review]",
+                "workflow_dispatch:",
+                "permissions: {}",
+                "jobs:\n  compatibility-status:",
+                "if: github.event_name == 'pull_request_target'",
+                "name: codex/review-gate compatibility publisher",
+                "permissions:\n      statuses: write",
+                "GH_TOKEN: ${{ github.token }}",
+                "HEAD_SHA: ${{ github.event.pull_request.head.sha }}",
+                "REPOSITORY: ${{ github.repository }}",
+                'gh api --method POST "repos/${REPOSITORY}/statuses/${HEAD_SHA}"',
+                "backfill-open-pull-requests:",
+                "if: github.event_name == 'workflow_dispatch'",
+                "Backfill exact current pull request heads",
+                "pull-requests: read\n      statuses: write",
+                "readonly MAX_ENUMERATION_PASSES=6",
+                "for ((pass = 1; pass <= MAX_ENUMERATION_PASSES; pass++)); do",
+                '"repos/${REPOSITORY}/pulls?state=all&sort=created&direction=asc&per_page=100"',
+                "([.[][]] | sort_by(.number)) as $pulls",
+                'map(select(.state == "open") | "\\(.number)\\t\\(.head.sha)")',
+                '"RETRY_PAGINATION"',
+                "validated_head_shas=()",
+                'gh api --method POST "repos/${REPOSITORY}/statuses/${head_sha}"',
+                '"${current_snapshot}" == "${previous_snapshot}"',
+                "did not stabilize after ${MAX_ENUMERATION_PASSES} authenticated enumeration passes",
+                '"${GITHUB_REF}" != "refs/heads/${DEFAULT_BRANCH}"',
+                "-f state=success",
+                "-f context=codex/review-gate",
+                "Compatibility only; no reviewer or review lane.",
+            ):
+                self.assertIn(anchor, compatibility)
+            self.assertEqual(compatibility.count("\n  compatibility-status:\n"), 1)
+            self.assertEqual(
+                compatibility.count("\n  backfill-open-pull-requests:\n"), 1
+            )
+            self.assertEqual(compatibility.count("gh api --paginate --slurp"), 1)
+            enumeration = compatibility.index("gh api --paginate --slurp")
+            publication = compatibility.index(
+                'gh api --method POST "repos/${REPOSITORY}/statuses/${head_sha}"'
+            )
+            stabilization = compatibility.index(
+                '"${current_snapshot}" == "${previous_snapshot}"'
+            )
+            self.assertLess(enumeration, stabilization)
+            self.assertLess(stabilization, publication)
+            self.assertNotIn("workflow_dispatch:\n    inputs:", compatibility)
+            for forbidden in (
+                "pull_request:",
+                "issue_comment:",
+                "pull_request_review:",
+                "schedule:",
+                "pull-requests: write",
+                "issues: write",
+                "codex-review-gate-action",
+                "@codex review",
+                "\n      - uses:",
+                "actions/checkout",
+                "github.sha",
+                "github.event.inputs",
+                "pulls?state=open&",
+            ):
+                self.assertNotIn(forbidden, compatibility)
 
     def test_ci_matches_the_reviewed_repo_profile_snapshot(self) -> None:
         actual = (REPO_ROOT / ".github/workflows/ci.yml").read_bytes()
@@ -1043,18 +1169,19 @@ class RepositoryContractTest(unittest.TestCase):
         for anchor in (
             "Single / single review / single internal review | One fresh-context Codex reviewer.",
             "Double / double review / local double review | Single plus one actual Claude Code reviewer.",
-            "Triple / triple review | Double plus exact `@codex review` on a supported GitHub Cloud PR",
+            "Triple / triple review | Double plus exact `@codex review` on an exact-host `github.com` PR",
             "Each logical lane receives its own workspace",
             "intentional review-anchor commit",
             "separate clean Git worktree at `head_sha` for each lane",
             "Enforce read-only reviewer behavior",
             '`fork_turns="none"`',
             "review-control metadata",
-            "independently trusted control-plane bundle before launch",
+            "independently trusted bundle pinned outside",
+            "exact authoritative playbook path/version in the prompt",
             "Both local lanes follow the same discovery order",
             "path-scoped `AGENTS.md`, repo-local domain skills, tracked project guidance, then hunks",
-            "Codex first loads the trusted playbook",
-            "Do not prepare, paste, attach, or point",
+            "Codex must load exactly the parent-named authoritative source",
+            "Do not prepare, paste, attach, or point either reviewer to a full diff",
             "existing frozen-diff Codex helper is not this lane and does not satisfy single review",
             "actual Claude Code process in a second clean Git worktree",
             "A Copilot, Cursor, OpenCode, or other model-family result does not satisfy the Claude Code lane",
@@ -1070,13 +1197,71 @@ class RepositoryContractTest(unittest.TestCase):
             "instruction-loading order, read-only and evidence limits",
             "for both local lanes, the same discovery order",
             "path-scoped `AGENTS.md`, repo-local domain skills, tracked project guidance, then hunks",
-            "load the trusted playbook from the external bundle",
+            "exact authoritative playbook path/version selected by the parent",
+            "independently trusted external bundle pinned outside the candidate range",
             "compute or persist a reviewer-visible full diff",
             '`fork_turns="none"`',
             "Use an actual Claude Code process in a second lane-unique clean Git worktree",
             "A different provider cannot satisfy this lane",
         ):
             self.assertIn(anchor, contracts)
+
+    def test_report_only_review_never_implicitly_authorizes_an_anchor_commit(
+        self,
+    ) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+        agents_policy = _repository_agents_path(REPO_ROOT, CI_PROFILE).read_text(
+            encoding="utf-8"
+        )
+        interface = (SKILL_ROOT / "agents/openai.yaml").read_text(encoding="utf-8")
+        causal_anchors = [
+            (
+                skill,
+                "When the intended review scope includes dirty or untracked state that no committed range represents, report review preparation as `blocked-authorization`",
+            ),
+            (
+                contracts,
+                "when its intended scope includes dirty or untracked state that no committed range represents, report review preparation as `blocked-authorization`",
+            ),
+            (
+                readiness,
+                "implementation checkout is dirty and no committed review range exists, report review preparation as `blocked-authorization`",
+            ),
+            (
+                agents_policy,
+                "Reserve `blocked-authorization` for intended dirty/untracked state that would require an unauthorized anchor commit",
+            ),
+            (
+                interface,
+                "intended dirty/untracked state without a representing committed range is blocked-authorization",
+            ),
+        ]
+        if CI_PROFILE == "canonical":
+            readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+            causal_anchors.append(
+                (
+                    readme,
+                    "Use `blocked-authorization` when the intended scope includes dirty or untracked state that would require an unauthorized anchor commit",
+                )
+            )
+        for document, anchor in causal_anchors:
+            with self.subTest(anchor=anchor):
+                self.assertIn(anchor, document)
+
+        active_documents = [skill, contracts, readiness, agents_policy, interface]
+        if CI_PROFILE == "canonical":
+            active_documents.append(readme)
+        for document in active_documents:
+            self.assertNotIn(
+                "If implementation changes are uncommitted, create an intentional review-anchor commit",
+                document,
+            )
 
     def test_github_codex_fallback_and_pr_readiness_preserve_the_shape(
         self,
@@ -1085,16 +1270,22 @@ class RepositoryContractTest(unittest.TestCase):
         readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
             encoding="utf-8"
         )
+        probes = (SKILL_ROOT / "references/github-pr-probes.md").read_text(
+            encoding="utf-8"
+        )
         contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
             encoding="utf-8"
         )
-        probes = (SKILL_ROOT / "references/github-pr-probes.md").read_text(
+        templates = (SKILL_ROOT / "references/review-prompt-templates.md").read_text(
+            encoding="utf-8"
+        )
+        agents_policy = _repository_agents_path(REPO_ROOT, CI_PROFILE).read_text(
             encoding="utf-8"
         )
         interface = (SKILL_ROOT / "agents/openai.yaml").read_text(encoding="utf-8")
 
         for anchor in (
-            "missing PR, unsupported host or integration, unavailable GitHub Codex service, or unsupported enterprise identity",
+            "missing PR, unsupported host or integration, unavailable GitHub Codex service, or unsupported operating identity",
             "sqbu-github.cisco.com",
             "operating identity is in `{hoteng, hoteng_cisco}`",
             "Report `requested: triple`, `effective: double`, and the concrete reason",
@@ -1104,8 +1295,8 @@ class RepositoryContractTest(unittest.TestCase):
         for anchor in (
             "It never adds a hidden local Codex review",
             "Each lane gets its own clean Git worktree, clear reviewer context, and read-only access",
-            "Never generate or inject a full diff for the reviewer",
-            "persist `requested: triple`, `effective: double`, and a concrete reason",
+            "never prepare or inject a full diff",
+            "Persist `requested: triple`, `effective: double`, and a concrete reason",
             "exact `@codex review` comment",
             "effective: triple-inconclusive",
         ):
@@ -1115,6 +1306,72 @@ class RepositoryContractTest(unittest.TestCase):
             contracts,
         )
         self.assertIn("effective: triple-inconclusive", contracts)
+        self.assertIn(
+            "with GitHub lane status `blocked-authorization`",
+            contracts,
+        )
+        exact_head_documents = (agents_policy, skill, contracts, templates)
+        for document in exact_head_documents:
+            self.assertIn("`headRefOid` does not equal", document)
+        self.assertIn("`headRefOid != head_sha`", probes)
+        for document in (*exact_head_documents, probes):
+            self.assertIn("blocked-authorization", document)
+            self.assertNotIn("does not contain the frozen head", document)
+            self.assertNotIn("does not contain the intended frozen head", document)
+        intended_range_anchor = "Preserve any parent-provided frozen `base_sha..head_sha` as the intended range"
+        separate_pr_head_anchor = "record the current `headRefOid` separately as `pr_head_oid`; never overwrite the intended `head_sha` with it"
+        compare_anchor = "Compare `pr_head_oid` with the intended `head_sha` before running local lanes or reading PR CI, conversation, ruleset, mergeability, or other readiness state"
+        run_lanes_anchor = "Run the requested local lanes"
+        classify_anchor = "make only the pre-request classifications that available evidence can prove"
+        eligible_anchor = (
+            "Unknown pre-request integration/service status does not block the request"
+        )
+        for anchor in (
+            intended_range_anchor,
+            separate_pr_head_anchor,
+            compare_anchor,
+            classify_anchor,
+            eligible_anchor,
+        ):
+            self.assertIn(anchor, readiness)
+        self.assertLess(
+            readiness.index(intended_range_anchor), readiness.index(compare_anchor)
+        )
+        self.assertLess(
+            readiness.index(separate_pr_head_anchor), readiness.index(compare_anchor)
+        )
+        self.assertLess(
+            readiness.index(compare_anchor), readiness.index(run_lanes_anchor)
+        )
+        read_readiness_anchor = (
+            "Read required CI/check state and unresolved PR conversations"
+        )
+        self.assertLess(
+            readiness.index(compare_anchor), readiness.index(read_readiness_anchor)
+        )
+        self.assertLess(
+            readiness.index(run_lanes_anchor), readiness.index(classify_anchor)
+        )
+        for scenario in (
+            "a selected PR in single, double, triple, and triple already reduced to effective double",
+            "No comparison exists for explicit-range-only standalone single/double with no selected PR",
+            "Only authenticated actual PR absence takes the no-PR path",
+            "existing PR on an unsupported host or identity remains on the existing-PR path",
+            "an authenticated provider rejection may prove no-start integration/service unavailability",
+            "acknowledgement or run/review activity proves start",
+        ):
+            self.assertIn(scenario, readiness)
+        self.assertNotIn(
+            "Only for an existing supported third-lane candidate",
+            readiness,
+        )
+        self.assertNotIn(
+            "Supported: a GitHub Cloud PR where the Codex review integration is available",
+            readiness,
+        )
+        self.assertIn(
+            "do not require PR-only fields when no PR was selected", readiness
+        )
         self.assertIn(
             "any operating identity in `{hoteng, hoteng_cisco}`",
             contracts,
@@ -1187,6 +1444,456 @@ class RepositoryContractTest(unittest.TestCase):
             readiness,
         )
 
+    def test_review_scope_and_github_provider_identity_are_fail_closed(
+        self,
+    ) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+        probes = (SKILL_ROOT / "references/github-pr-probes.md").read_text(
+            encoding="utf-8"
+        )
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        templates = (SKILL_ROOT / "references/review-prompt-templates.md").read_text(
+            encoding="utf-8"
+        )
+        egress = (SKILL_ROOT / "references/egress-consent.md").read_text(
+            encoding="utf-8"
+        )
+        agents_policy = _repository_agents_path(REPO_ROOT, CI_PROFILE).read_text(
+            encoding="utf-8"
+        )
+        interface = (SKILL_ROOT / "agents/openai.yaml").read_text(encoding="utf-8")
+        delivery = (
+            _repository_policy_scope_root(REPO_ROOT, CI_PROFILE)
+            / "skills/change-delivery-workflow/SKILL.md"
+        ).read_text(encoding="utf-8")
+
+        for content in (skill, readiness, probes, contracts, agents_policy, interface):
+            self.assertIn("blocked-input", content)
+            self.assertIn("explicit", content)
+            self.assertIn("target", content)
+        for content in (skill, readiness, probes, contracts):
+            self.assertIn("exact current head repository/branch", content)
+            self.assertIn("no-PR", content)
+            self.assertIn("explicit committed range", content)
+            self.assertIn("explicitly named target/base", content)
+            self.assertIn("blocked-authorization", content)
+        self.assertIn(
+            "More than one required PR candidate leaves the GitHub/PR-specific lane `blocked-input` until the caller names a PR",
+            skill,
+        )
+        self.assertIn(
+            "An authenticated successful lookup returning `[]` proves the no-PR path",
+            probes,
+        )
+        for content in (readiness, probes, contracts):
+            self.assertIn(
+                "Explicit-range-only standalone single/double",
+                content,
+            )
+            self.assertIn("no PR probe", content)
+            self.assertIn("A frozen range", content)
+            self.assertIn("never selects a PR", content)
+            self.assertIn("required explicit PR selector is absent", content)
+            self.assertIn("local lanes may still run", content.lower())
+        self.assertNotIn("require an explicit PR or frozen range", readiness)
+        self.assertNotIn("supplies an explicit PR or frozen range", probes)
+        self.assertIn(
+            "an existing frozen range allows only the local lanes to run; the GitHub/PR-specific lane remains `blocked-input` until the caller names the PR",
+            readiness,
+        )
+        self.assertIn(
+            "a frozen range does not cure that ambiguity",
+            probes,
+        )
+        self.assertIn(
+            "report the GitHub lane `blocked-input` and the overall shape `requested: triple`, `effective: triple-inconclusive`",
+            readiness,
+        )
+        self.assertIn("--method GET --paginate --slurp", probes)
+        self.assertIn("-f 'head=<head-owner>:<current-branch>'", probes)
+        self.assertNotIn(
+            "pulls?state=open&head=<head-owner>:<current-branch>",
+            probes,
+        )
+
+        identity_documents = (
+            skill,
+            readiness,
+            probes,
+            contracts,
+            templates,
+            egress,
+            agents_policy,
+            interface,
+            delivery,
+        )
+        for content in identity_documents:
+            self.assertIn("github.com", content)
+            self.assertIn("chatgpt-codex-connector[bot]", content)
+            self.assertIn("chatgpt-codex-connector", content)
+        for content in (skill, readiness, probes, contracts, templates, egress):
+            self.assertIn("Bot", content)
+        self.assertIn('user.login == "chatgpt-codex-connector[bot]"', probes)
+        self.assertIn('user.type == "Bot"', probes)
+        self.assertIn('app.slug == "chatgpt-codex-connector"', probes)
+        self.assertIn(
+            "Accept a review artifact only when request isolation is proved, its `commit_id` equals `headRefOid`",
+            probes,
+        )
+        for anchor in (
+            "server `created_at`",
+            "strictly later",
+            "Evidence from an earlier request on the same unchanged head is stale",
+        ):
+            self.assertIn(anchor, probes)
+        for anchor in (
+            "complete terminal provider-authored",
+            "findings payload",
+            "fully paginated associated inline review comment",
+            "terminal",
+            "issue-comment body",
+        ):
+            for content in (
+                skill,
+                readiness,
+                contracts,
+                templates,
+                egress,
+                agents_policy,
+                interface,
+                delivery,
+            ):
+                with self.subTest(payload_anchor=anchor):
+                    self.assertIn(anchor, content)
+        for content in (
+            skill,
+            readiness,
+            contracts,
+            templates,
+            egress,
+            agents_policy,
+            interface,
+            delivery,
+        ):
+            with self.subTest(payload_failure_contract=content[:40]):
+                lowered = content.lower()
+                self.assertIn("missing", lowered)
+                self.assertIn("ambiguous", lowered)
+                self.assertIn("triple-inconclusive", lowered)
+        if CI_PROFILE == "canonical":
+            for content in (
+                (REPO_ROOT / "README.md").read_text(encoding="utf-8"),
+                (
+                    REPO_ROOT
+                    / "docs/project_journal/2026/07/"
+                    / "2026-07-20-review-policy-migration-7f2001.md"
+                ).read_text(encoding="utf-8"),
+            ):
+                self.assertIn("complete terminal provider-authored", content)
+                self.assertIn("fully paginated associated inline", content)
+                self.assertRegex(
+                    content,
+                    r"terminal(?: exact-bot)? issue-comment body",
+                )
+
+        for content in (readiness, probes, contracts):
+            with self.subTest(check_only_document=content[:40]):
+                self.assertIn("service-start evidence only", content)
+                self.assertIn("never completes triple", content)
+                self.assertIn('status == "completed"', content)
+                self.assertIn('conclusion == "success"', content)
+                self.assertIn("same-App check may be unrelated", content)
+                self.assertIn("check success can coexist", content)
+        self.assertNotIn("Accept a check/run only when", probes)
+
+        for anchor in (
+            "'repos/<owner>/<repo>/pulls/<number>/reviews?per_page=100'",
+            "body}]'",
+            "'repos/<owner>/<repo>/pulls/<number>/reviews/<review_id>/comments?per_page=100'",
+            "pull_request_review_id",
+            "'repos/<owner>/<repo>/issues/<number>/comments?per_page=100'",
+            "COMMENTED",
+            "APPROVED",
+            "CHANGES_REQUESTED",
+            "never `PENDING`",
+        ):
+            self.assertIn(anchor, probes)
+        self.assertGreaterEqual(probes.count("--method GET --paginate --slurp"), 4)
+        self.assertIn(
+            "Do not use `gh pr view --repo` for this host-sensitive preflight",
+            probes,
+        )
+        host_bound_metadata_probe = (
+            "gh api --hostname <host> --method GET \\\n"
+            "  repos/<owner>/<repo>/pulls/<number>"
+        )
+        self.assertGreaterEqual(probes.count(host_bound_metadata_probe), 2)
+        self.assertNotIn("gh pr view <number> --repo <owner>/<repo>", probes)
+        request_isolation_documents = {
+            "skill": skill,
+            "PR readiness": readiness,
+            "GitHub probes": probes,
+            "lane contracts": contracts,
+            "prompt templates": templates,
+            "repository policy": agents_policy,
+            "skill interface": interface,
+        }
+        full_history_documents = {
+            "PR readiness": readiness,
+            "GitHub probes": probes,
+            "lane contracts": contracts,
+            "prompt templates": templates,
+            "skill interface": interface,
+        }
+        if CI_PROFILE == "canonical":
+            readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+            migration_journal = (
+                REPO_ROOT
+                / "docs/project_journal/2026/07/"
+                / "2026-07-20-review-policy-migration-7f2001.md"
+            ).read_text(encoding="utf-8")
+            request_isolation_documents.update(
+                {
+                    "README": readme,
+                    "migration journal": migration_journal,
+                }
+            )
+            full_history_documents.update(
+                {
+                    "README": readme,
+                    "migration journal": migration_journal,
+                }
+            )
+        for name, content in request_isolation_documents.items():
+            normalized = content.lower()
+            with self.subTest(request_isolation_document=name):
+                self.assertIn("at most one", normalized)
+                self.assertIn("never post a second", normalized)
+                self.assertIn("base-changed-same-head", normalized)
+                self.assertIn("empty or anchor commit", normalized)
+                self.assertIn(
+                    "timestamps prove ordering, not request/run lineage",
+                    normalized,
+                )
+        for name, content in full_history_documents.items():
+            with self.subTest(full_history_document=name):
+                self.assertIn("older request", content)
+                self.assertIn("might overlap", content)
+                self.assertIn("triple-inconclusive", content)
+                self.assertIn("check/run", content)
+                self.assertIn("started_at", content)
+                self.assertIn(
+                    "re-read complete authenticated request history immediately before",
+                    content.lower(),
+                )
+        for content in (readiness, probes, contracts):
+            self.assertIn("race", content)
+        self.assertIn(
+            "post the exact comment below only when complete authenticated history proves that no accepted exact request exists for the unchanged head",
+            templates,
+        )
+        self.assertIn(
+            "Otherwise reuse the one recorded request and do not post another",
+            templates,
+        )
+        self.assertIn("non-null `started_at` strictly later than the request", probes)
+        self.assertIn(
+            "review/comment APIs expose no request/run identifier",
+            readiness,
+        )
+        self.assertNotIn("expected Codex integration identity", probes)
+
+        for anchor in (
+            "Resolve the local frozen range and PR selector independently",
+            "base_sha == pr_merge_base and head_sha == pr_head_oid",
+            "same-head/different-base range is blocked-input scope-mismatch",
+        ):
+            self.assertIn(anchor, interface)
+
+    def test_base_only_retarget_precedes_scope_mismatch_and_preserves_authority(
+        self,
+    ) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+        probes = (SKILL_ROOT / "references/github-pr-probes.md").read_text(
+            encoding="utf-8"
+        )
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        templates = (SKILL_ROOT / "references/review-prompt-templates.md").read_text(
+            encoding="utf-8"
+        )
+
+        priority_anchor = (
+            "before applying the generic same-head/different-base "
+            "`scope-mismatch` branch"
+        )
+        authority_documents = (skill, readiness, probes, contracts, templates)
+        for content in authority_documents:
+            with self.subTest(authority_document=content[:40]):
+                normalized = content.lower()
+                self.assertIn(priority_anchor, normalized)
+                self.assertIn("caller-supplied", content)
+                self.assertIn("pr-derived", content)
+                self.assertIn("range_origin", content)
+                self.assertIn("base-only-retarget-state-machine.json", content)
+                self.assertIn("base-changed-same-head", content)
+
+        workflow = skill.split("## Workflow", 1)[1].lower()
+        self.assertLess(
+            workflow.index(priority_anchor),
+            workflow.index("otherwise a selected pr's explicit frozen range satisfies"),
+        )
+
+        selected_pr_preflight = readiness.split("After a PR is selected", 1)[1]
+        selected_pr_preflight = selected_pr_preflight.split(
+            "Reserve `blocked-authorization`", 1
+        )[0].lower()
+        self.assertLess(
+            selected_pr_preflight.index("base-only-retarget-state-machine.json"),
+            selected_pr_preflight.index("otherwise require exact equality"),
+        )
+
+        gate_sequence = readiness.split("## Gate Sequence", 1)[1].lower()
+        self.assertLess(
+            gate_sequence.index(priority_anchor),
+            gate_sequence.index("otherwise, when no explicit range exists"),
+        )
+
+        probe_classification = probes.split("Classify precisely", 1)[1].lower()
+        self.assertLess(
+            probe_classification.index("post-request base-only retarget"),
+            probe_classification.index("any other selected pr"),
+        )
+        self.assertIn(
+            "stops before local lanes",
+            selected_pr_preflight,
+        )
+        self.assertIn(
+            "a recovery pass proceeds to the local lanes",
+            selected_pr_preflight,
+        )
+
+    def test_base_only_retarget_state_machine_allows_only_authorized_recovery(
+        self,
+    ) -> None:
+        machine_path = SKILL_ROOT / "references/base-only-retarget-state-machine.json"
+        machine = json.loads(machine_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(machine["version"], 1)
+        self.assertEqual(
+            machine["event"],
+            "request-time-merge-base-changed-with-same-head",
+        )
+        self.assertEqual(
+            machine["range_origin"],
+            {
+                "record_location": "parent-owned-audit",
+                "required_fields": ["kind", "base_sha", "head_sha"],
+                "allowed_kinds": ["caller-supplied", "pr-derived"],
+                "original_caller_endpoints_are_immutable": True,
+            },
+        )
+        self.assertEqual(
+            machine["github_lane"],
+            {
+                "action": "never-post-replacement-same-head",
+                "status": "triple-inconclusive",
+            },
+        )
+
+        transitions = {entry["name"]: entry for entry in machine["transitions"]}
+        self.assertEqual(
+            set(transitions),
+            {
+                "missing-range-origin",
+                "stale-caller-range",
+                "forbidden-parent-rewrite-of-caller-range",
+                "caller-supplied-current-recovery",
+                "stale-pr-derived-range",
+                "pr-derived-current-recovery",
+            },
+        )
+        expected_actions = {
+            "missing-range-origin": (
+                "unknown",
+                "any",
+                "any",
+                "stop-before-local-lanes",
+                "range-origin-unverified",
+            ),
+            "stale-caller-range": (
+                "caller-supplied",
+                "inherited-stale",
+                False,
+                "stop-before-local-lanes",
+                "base-changed-same-head",
+            ),
+            "forbidden-parent-rewrite-of-caller-range": (
+                "caller-supplied",
+                "parent-rederived-current",
+                True,
+                "stop-before-local-lanes",
+                "caller-authority-required",
+            ),
+            "caller-supplied-current-recovery": (
+                "caller-supplied",
+                "caller-supplied-current",
+                True,
+                "run-local-lanes",
+                "local-recovery-authorized",
+            ),
+            "stale-pr-derived-range": (
+                "pr-derived",
+                "inherited-stale",
+                False,
+                "stop-before-local-lanes",
+                "base-changed-same-head",
+            ),
+            "pr-derived-current-recovery": (
+                "pr-derived",
+                "normally-rederived-current",
+                True,
+                "run-local-lanes",
+                "local-recovery-authorized",
+            ),
+        }
+        for name, expected in expected_actions.items():
+            transition = transitions[name]
+            actual = (
+                transition["invalidated_origin"],
+                transition["recovery_source"],
+                transition["current_range_equals_current_pr"],
+                transition["local_action"],
+                transition["reason"],
+            )
+            with self.subTest(transition=name):
+                self.assertEqual(actual, expected)
+
+        for path in (
+            SKILL_ROOT / "SKILL.md",
+            SKILL_ROOT / "references/pr-readiness.md",
+            SKILL_ROOT / "references/review-lane-contracts.md",
+            SKILL_ROOT / "references/github-pr-probes.md",
+            SKILL_ROOT / "references/review-prompt-templates.md",
+        ):
+            content = path.read_text(encoding="utf-8")
+            with self.subTest(state_machine_reference=str(path)):
+                self.assertIn("base-only-retarget-state-machine.json", content)
+                self.assertIn("range_origin", content)
+                self.assertIn("caller-supplied", content)
+                self.assertIn("pr-derived", content)
+                self.assertIn("run", content.lower())
+                self.assertIn("local lane", content.lower())
+
     def test_named_single_prompt_uses_clear_context_codex_without_a_full_diff(
         self,
     ) -> None:
@@ -1208,9 +1915,15 @@ class RepositoryContractTest(unittest.TestCase):
             "Trusted control-plane bundle version: {trusted_bundle_version}",
             "Trusted control-plane bundle SHA-256: {trusted_bundle_sha256}",
             "Sanitized Git argv prefix (exact token sequence): {sanitized_git_argv_prefix}",
+            "Authoritative review skill path: {review_skill_path}",
+            "Authoritative review skill version/digest: {review_skill_version_or_digest}",
             "clean, independent, read-only Git worktree",
             "does not include a prebuilt full diff",
             "obtain range metadata, changed paths, hunks",
+            "verify that the exact authoritative review skill path above exists",
+            "missing or mismatched",
+            "never choose another installed copy",
+            "Load exactly that review skill",
             "load the trusted review skill",
             "domain skill",
             "AGENTS.md",
@@ -1282,12 +1995,16 @@ class RepositoryContractTest(unittest.TestCase):
         assert_shared_discovery_order(double)
         for anchor in (
             "@codex review",
-            "supported GitHub Cloud PR",
+            "exact-host `github.com` PR",
             "sqbu-github.cisco.com",
             "identity in `{hoteng, hoteng_cisco}`",
-            "requested triple; effective double",
+            "`requested: triple`, `effective: double`",
             "Posting the comment requests the third lane but does not complete it",
-            "trustworthy terminal current-head result",
+            "complete terminal provider-authored current-head findings payload",
+            "service-start evidence only",
+            "never completes triple or proves clean/no-findings",
+            "effective: triple-inconclusive",
+            "GitHub lane status `blocked-authorization`",
         ):
             self.assertIn(anchor, triple)
         self.assertNotIn("equivalent", triple)
@@ -1308,6 +2025,9 @@ class RepositoryContractTest(unittest.TestCase):
             "--strict-mcp-config",
             "--tools Read,Grep,Glob,Bash",
             "--disallowedTools Edit,Write,NotebookEdit,WebFetch,WebSearch,Task",
+            "disableBundledSkills: true",
+            '"disableBundledSkills": true',
+            "`--safe-mode` alone is not evidence that bundled skills are absent",
             '"denyWrite": ["/"]',
             "lane-private local clone or private bare object store plus worktree",
             "not a network clone or prepared-diff materialization",
@@ -1323,6 +2043,642 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             self.assertIn(anchor, contract)
         self.assertNotIn("Primary diff:", contract)
+
+    def test_named_claude_exact_version_preflight_is_fail_closed(self) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        helper_path = SCRIPTS / "named_claude_preflight"
+        helper = helper_path.read_text(encoding="utf-8")
+        module = (SCRIPTS / "review_runtime/named_claude_preflight.py").read_text(
+            encoding="utf-8"
+        )
+        provenance = (SCRIPTS / "review_runtime/claude_provenance.py").read_text(
+            encoding="utf-8"
+        )
+
+        for content in (skill, contracts, canonical):
+            for anchor in (
+                "named_claude_preflight",
+                "2.1.212",
+                "$HOME/.local/share/claude/versions/2.1.212",
+                "exact-version-unavailable",
+                "exact-version-mismatch",
+                "publisher-verification-failed",
+                "candidate-inspection-inconclusive",
+                "fixed credential-free environment",
+                "never downloads",
+                "active symlink",
+                "<resolved-exact-claude-path>",
+                "a fresh descriptor-bound hash of the mutable source against the signed size and SHA-256 before acceptance",
+                "stat identity alone is not sufficient",
+            ):
+                self.assertIn(anchor, content)
+            self.assertIn(
+                "no separate mandatory `--help` or advertised-capability probe",
+                content,
+            )
+            self.assertNotIn("capability verification", content)
+            self.assertNotIn(
+                "validate the advertised option/capability surface", content
+            )
+            normalized = content.lower()
+            self.assertIn("separate", normalized)
+            self.assertIn("explicit", normalized)
+            self.assertIn("official installer", normalized)
+            self.assertIn("does not authorize installation", normalized)
+            self.assertIn("double", content)
+            self.assertIn("blocked", content)
+            self.assertIn("triple", content)
+        for content in (skill, contracts):
+            for anchor in (
+                "Candidate presence is tri-state",
+                "stops priority fallback as `candidate-inspection-inconclusive`",
+                "descriptor-bound strong source identity",
+                "including `ctime`",
+                "private digest-verified executable snapshot",
+                "never against the mutable installation path",
+                "Source-identity or digest drift is inconclusive and takes precedence over an observed wrong version",
+            ):
+                self.assertIn(anchor, content)
+        for anchor in (
+            "explicit absolute `--claude-path` override",
+            "An explicit override is authoritative",
+            "including an active `2.1.216`",
+            "empty stdin",
+            "fixed `/` cwd",
+            "no prompt, credential, repository, range, PR, or workspace input",
+            "one bounded JSON object",
+            "fixed resolved absolute path",
+            "effective shape may be double",
+            "effective double is still incomplete and blocked",
+            "Caller `PATH` entries are ignored",
+            "before any version probe",
+            "private digest-verified executable snapshot",
+            "Scripts, interpreter wrappers, wrong signed artifacts, and caller-`PATH` candidates are never executed",
+            "resolves the configured system temporary parent to its canonical path",
+            "macOS `/tmp -> /private/tmp`",
+            "Never collapse inspection uncertainty into deterministic unavailability",
+        ):
+            self.assertIn(anchor, canonical)
+        self.assertTrue(helper_path.is_file())
+        self.assertTrue(helper.startswith("#!/usr/bin/env python3\n"))
+        for anchor in (
+            'REQUIRED_CLAUDE_VERSION = "2.1.212"',
+            '"explicit-override"',
+            '"side-by-side-exact"',
+            '"active-installed"',
+            '"HOME": "/nonexistent"',
+            'VERSION_PROBE_CWD = pathlib.Path("/")',
+            "stdin=None",
+            '"classification": classification',
+            '"exact-version-unavailable"',
+            '"exact-version-mismatch"',
+            '"publisher-verification-failed"',
+            "verify_claude_release(",
+            "materialize_verified_executable(",
+            "def _verified_source_matches_signed_artifact(",
+            "version_probe(snapshot.executable)",
+            '"ctime_ns"',
+            '"executable-identity-drift"',
+            '"/opt/homebrew/bin/claude"',
+            '"/usr/local/bin/claude"',
+        ):
+            self.assertIn(anchor, module)
+        self.assertIn("source_identity", provenance)
+        self.assertIn("_stat_identity(opened_before)", provenance)
+        self.assertIn("_require_verified_source_identity", provenance)
+        self.assertNotIn("version_probe(resolved)", module)
+        self.assertNotIn("shutil.which", module)
+        self.assertLess(
+            module.index("verified = verifier(resolved, version_probe)"),
+            module.index("completed = verified.probe_result"),
+        )
+        self.assertLess(
+            module.index(
+                "if after_resolved != resolved or not _verified_source_matches_signed_artifact("
+            ),
+            module.index("if observed_version != REQUIRED_CLAUDE_VERSION:"),
+        )
+
+    def test_canonical_claude_stream_evidence_is_unique_exact_and_fail_closed(
+        self,
+    ) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        runtime = (SKILL_ROOT / "references/claude-runtime-trust.md").read_text(
+            encoding="utf-8"
+        )
+        validator_path = SCRIPTS / "validate_claude_stream.py"
+        validator = validator_path.read_text(encoding="utf-8")
+        stream_schema = json.loads(
+            (SKILL_ROOT / "references/claude-2.1.212-stream-schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+        for anchor in (
+            "## Structured Init And Terminal Evidence",
+            "first nonblank record",
+            "sole event with `type: system` and `subtype: init`",
+            "last nonblank record",
+            "sole event with `type: result`",
+            "`subtype` is the string `success`",
+            "`is_error` is the boolean `false`",
+            "`cwd` equals the resolved lane-unique clean worktree exactly",
+            "`permissionMode` equals `dontAsk`",
+            "duplicate-free set exactly equal to `Read`, `Grep`, `Glob`, and `Bash`",
+            "`mcp_servers`, `slash_commands`, `skills`, and `plugins`",
+            "`claude_code_version` equals the publisher-verified preflight version",
+            "`apiKeySource` is exactly the string `none`",
+            "validator/schema compatibility surface can represent `ANTHROPIC_API_KEY`",
+            "current `run-claude` launcher exposes no API-key input",
+            "`ANTHROPIC_API_KEY` therefore cannot satisfy this canonical lane",
+            "`result` is a required string whose `strip()` value is nonempty",
+            "`modelUsage` is a required nonempty object",
+            "every key is a nonempty model-ID string",
+            "every value is an object",
+            "`error` and `errors`, when present, are explicitly empty",
+            "`api_error_status`, when present, is `null` or a whitespace-only string",
+            "`permission_denials`, when present, is an empty array",
+            "nonempty/malformed `permission_denials` fails closed",
+            "A CLI version other than exact `2.1.212` is blocked before review input is exposed",
+            "does not prove the final merged native sandbox",
+            "merged admin-managed permission arrays",
+            "path-rule evaluation",
+            "floating-point tokens are parsed",
+            "negative underflow",
+            "`-h`, `--help`",
+            "Exit status zero is reserved for `accepted` output",
+            "A bare child exit code 401",
+            "non-authentication refresh failure",
+            "Generic token counting, usage, budget, quota, capacity, rate-limit, or limit failures are not authentication evidence",
+            "credential-file or other ambiguous credential I/O",
+            "terminal.model-entitlement-denial",
+            "terminal.organization-policy-denial",
+        ):
+            self.assertIn(anchor, canonical)
+        for content in (skill, contracts, runtime):
+            self.assertIn("exactly one leading `system/init`", content)
+            self.assertIn("one trailing terminal `result`", content)
+            self.assertIn("fail closed", content.lower())
+        for content in (skill, contracts):
+            self.assertIn("--process-returncode <child-returncode>", content)
+            self.assertIn("optional nonempty `session_id`", content)
+            self.assertIn("unknown init field", content)
+            self.assertIn("missing, invalid, or nonzero child return code", content)
+            self.assertIn("structured `blocked` or `blocked-authentication`", content)
+            self.assertIn("bare exit code", content)
+        for content in (skill, contracts, canonical):
+            self.assertIn("validate_claude_stream.py", content)
+            self.assertIn("classification: accepted", content)
+        self.assertIn("outside the reviewer-visible workspace", skill)
+        for content in (contracts, canonical):
+            self.assertIn(
+                "outside the model-visible worktree",
+                " ".join(content.split()),
+            )
+        self.assertTrue(validator_path.is_file())
+        self.assertTrue(validator.startswith("#!/usr/bin/env python3\n"))
+        for anchor in (
+            "MAX_SCHEMA_BYTES",
+            "max_bytes: int = 8 * 1024 * 1024",
+            "object_pairs_hook=_reject_duplicate_keys",
+            "parse_constant=_reject_nonstandard_constant",
+            "parse_float=_bounded_parse_float",
+            "MAX_JSON_FLOAT_CHARACTERS",
+            "MAX_JSON_FLOAT_SIGNIFICAND_DIGITS",
+            "MAX_JSON_FLOAT_EXPLICIT_EXPONENT_MAGNITUDE",
+            '"accepted": 0',
+            '"blocked": 1',
+            '"blocked-authentication": 2',
+            '"inconclusive": 3',
+            '"--process-returncode"',
+            '"process.returncode.invalid"',
+            '"process.returncode.nonzero"',
+            '"init.unknown-field"',
+            "INIT_OPTIONAL_FIELDS",
+        ):
+            self.assertIn(anchor, validator)
+        init_contract = stream_schema["init_event"]
+        self.assertEqual(
+            stream_schema["process_returncode"],
+            {
+                "rule": "exact_int",
+                "missing_or_invalid": {
+                    "classification": "inconclusive",
+                    "reason": "process.returncode.invalid",
+                },
+                "accepted_requires": 0,
+                "nonzero_precedence": {
+                    "accepted": {
+                        "classification": "inconclusive",
+                        "reason": "process.returncode.nonzero",
+                    },
+                    "blocked": "preserve",
+                    "blocked-authentication": "preserve",
+                    "inconclusive": {
+                        "classification": "inconclusive",
+                        "append_reason": "process.returncode.nonzero",
+                    },
+                },
+            },
+        )
+        self.assertFalse(init_contract["additional_fields"])
+        self.assertEqual(init_contract["optional_fields"], ["session_id"])
+        self.assertEqual(
+            init_contract["optional_field_contracts"]["session_id"],
+            {"rule": "nonempty_string", "failure": "inconclusive"},
+        )
+        self.assertNotIn("when the runtime reports it", canonical)
+
+    def test_canonical_claude_structured_errors_have_one_failure_classifier(
+        self,
+    ) -> None:
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+
+        envelope_anchor = "A missing, duplicate, malformed, out-of-order, or trailing contract event makes the lane `inconclusive`"
+        classifier_anchor = "A structurally valid terminal event that fails the success acceptance schema is passed to the failure classifier below"
+        permission_anchor = "Classify a structurally valid permission denial, output truncation/abnormal stop, exact-model mismatch, or configuration/policy mismatch as `blocked`"
+        authentication_anchor = "Classify only a structurally valid recognized `Login expired`, explicit HTTP/status 401, explicit OAuth/credential/login/authentication/token refresh error, or directly adjacent expired/invalid/unauthorized authentication state as `blocked-authentication`"
+        token_non_authentication_anchor = "Generic token counting, usage, budget, quota, capacity, rate-limit, or limit errors"
+        init_blocker_anchor = "When a non-success terminal follows any deterministic init or terminal blocker, absence of error prose preserves `blocked`"
+        fallback_anchor = "The validator emits `classification: blocked` with machine reason `terminal.model-entitlement-denial` or `terminal.organization-policy-denial`"
+        for anchor in (
+            envelope_anchor,
+            classifier_anchor,
+            permission_anchor,
+            authentication_anchor,
+            token_non_authentication_anchor,
+            init_blocker_anchor,
+            fallback_anchor,
+        ):
+            self.assertIn(anchor, canonical)
+        self.assertNotIn("out-of-order, error-bearing, or trailing", canonical)
+        self.assertLess(
+            canonical.index(envelope_anchor), canonical.index(classifier_anchor)
+        )
+        self.assertLess(
+            canonical.index(classifier_anchor), canonical.index(permission_anchor)
+        )
+        self.assertLess(
+            canonical.index(classifier_anchor), canonical.index(authentication_anchor)
+        )
+
+    def test_codex_authoritative_playbook_source_is_parent_selected_and_exact(
+        self,
+    ) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        policy_scope = _repository_policy_scope_root(REPO_ROOT, CI_PROFILE)
+        reviewer = (policy_scope / "agents/reviewer.toml").read_text(encoding="utf-8")
+        agents_policy = _repository_agents_path(REPO_ROOT, CI_PROFILE).read_text(
+            encoding="utf-8"
+        )
+        templates = (SKILL_ROOT / "references/review-prompt-templates.md").read_text(
+            encoding="utf-8"
+        )
+        change_delivery = (
+            SKILL_ROOT.parent / "change-delivery-workflow/SKILL.md"
+        ).read_text(encoding="utf-8")
+
+        for content in (skill, contracts, reviewer, change_delivery):
+            normalized = content.lower()
+            self.assertRegex(
+                normalized,
+                r"normally(?: this is)? the active installed copy",
+            )
+            self.assertIn("missing or mismatched", normalized)
+        for content in (skill, contracts, reviewer, agents_policy, change_delivery):
+            normalized = content.lower()
+            self.assertIn("candidate-head markdown", normalized)
+            self.assertIn("review subject", normalized)
+            self.assertIn("independently trusted", normalized)
+        self.assertIn("pinned outside", contracts)
+        self.assertNotIn(
+            "must be the frozen repo-local copy at the review head",
+            change_delivery,
+        )
+        self.assertIn(
+            "exact parent-selected authoritative playbook path/version or digest",
+            change_delivery,
+        )
+        for content in (skill, contracts, reviewer, change_delivery):
+            self.assertNotIn("from its normal skill environment", content)
+        for anchor in (
+            "Authoritative review skill path: {review_skill_path}",
+            "Authoritative review skill version/digest: {review_skill_version_or_digest}",
+            "verify that the exact authoritative review skill path above exists",
+            "report the lane blocked",
+            "never choose another installed copy",
+        ):
+            self.assertIn(anchor, templates)
+        self.assertNotIn("{review_skill_path_or_version}", templates)
+
+    def test_claude_2_1_212_schema_closes_models_and_terminal_fields(self) -> None:
+        schema_path = SKILL_ROOT / "references/claude-2.1.212-stream-schema.json"
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertEqual(schema["claude_code_version"], "2.1.212")
+        self.assertEqual(
+            schema["stream_contract"]["first_nonblank_event"],
+            {"type": "system", "subtype": "init"},
+        )
+        self.assertEqual(
+            schema["stream_contract"]["last_nonblank_event"],
+            {"type": "result"},
+        )
+        self.assertEqual(schema["stream_contract"]["init_event_count"], 1)
+        self.assertEqual(schema["stream_contract"]["result_event_count"], 1)
+        self.assertTrue(
+            schema["stream_contract"]["matching_session_id_when_both_present"]
+        )
+        self.assertEqual(schema["stream_contract"]["max_bytes"], 8 * 1024 * 1024)
+        self.assertEqual(
+            schema["stream_contract"]["floating_number_representation"], "decimal"
+        )
+        self.assertEqual(schema["stream_contract"]["max_float_characters"], 256)
+        self.assertEqual(schema["stream_contract"]["max_float_significand_digits"], 128)
+        self.assertEqual(
+            schema["stream_contract"]["max_float_explicit_exponent_magnitude"], 308
+        )
+        init_contract = schema["init_event"]
+        self.assertFalse(init_contract["additional_fields"])
+        self.assertEqual(init_contract["optional_fields"], ["session_id"])
+        self.assertEqual(
+            init_contract["optional_field_contracts"]["session_id"],
+            {"rule": "nonempty_string", "failure": "inconclusive"},
+        )
+        self.assertEqual(
+            set(init_contract["required_fields"]),
+            {
+                "type",
+                "subtype",
+                "cwd",
+                "permissionMode",
+                "tools",
+                "mcp_servers",
+                "slash_commands",
+                "skills",
+                "plugins",
+                "model",
+                "claude_code_version",
+                "apiKeySource",
+            },
+        )
+        self.assertEqual(
+            set(init_contract["field_contracts"]["tools"]["values"]),
+            {"Read", "Grep", "Glob", "Bash"},
+        )
+        self.assertEqual(
+            init_contract["field_contracts"]["permissionMode"]["value"],
+            "dontAsk",
+        )
+        identities = schema["model_identity"]
+        self.assertEqual(
+            identities["claude-opus-4-8"]["accepted_model_usage_keys"],
+            ["claude-opus-4-8", "claude-opus-4.8"],
+        )
+        self.assertEqual(
+            identities["claude-opus-4-7"]["accepted_model_usage_keys"],
+            ["claude-opus-4-7", "claude-opus-4.7"],
+        )
+        accepted_auxiliary_keys = set(schema["accepted_auxiliary_model_usage_keys"])
+        self.assertEqual(
+            accepted_auxiliary_keys,
+            {"claude-haiku-4-5-20251001"},
+        )
+        all_primary_keys = {
+            key
+            for identity in identities.values()
+            for key in identity["accepted_model_usage_keys"]
+        }
+        allowed_terminal_fields = set(schema["terminal_result"]["required_fields"])
+        allowed_terminal_fields.update(schema["terminal_result"]["optional_fields"])
+        optional_contracts = schema["terminal_result"]["optional_field_contracts"]
+        self.assertEqual(
+            set(schema["terminal_result"]["optional_fields"]),
+            set(optional_contracts),
+        )
+        self.assertEqual(
+            optional_contracts["stop_reason"],
+            {
+                "rule": "enum",
+                "accepted_values": [None, "end_turn"],
+                "failure": "blocked",
+            },
+        )
+        self.assertEqual(optional_contracts["structured_output"]["rule"], "null")
+
+        def optional_value_is_valid(rule: str, value: object, contract: dict) -> bool:
+            if rule == "nonnegative_integer":
+                return type(value) is int and value >= 0
+            if rule == "positive_integer":
+                return type(value) is int and value > 0
+            if rule == "nonnegative_finite_number":
+                return (
+                    type(value) in (int, float) and math.isfinite(value) and value >= 0
+                )
+            if rule == "nonempty_string":
+                return isinstance(value, str) and bool(value.strip())
+            if rule == "object":
+                return isinstance(value, dict)
+            if rule == "enum":
+                return value in contract["accepted_values"]
+            if rule == "null":
+                return value is None
+            if rule == "explicitly_empty":
+                return (
+                    value is None
+                    or value in ("", [], {})
+                    or (isinstance(value, str) and not value.strip())
+                )
+            if rule == "null_or_whitespace_string":
+                return value is None or (isinstance(value, str) and not value.strip())
+            if rule == "empty_array":
+                return value == []
+            self.fail(f"unknown optional-field rule: {rule}")
+
+        observed = {}
+        for case in schema["contract_cases"]:
+            identity = identities[case["requested_model"]]
+            requested_keys = set(identity["accepted_model_usage_keys"])
+            observed_model_keys = set(case["model_usage_keys"])
+            other_primary_keys = all_primary_keys - requested_keys
+            unknown_model_keys = observed_model_keys - (
+                requested_keys | other_primary_keys | accepted_auxiliary_keys
+            )
+            unknown_fields = (
+                set(case["extra_terminal_fields"]) - allowed_terminal_fields
+            )
+            optional_failures = set()
+            for field, value in case["optional_terminal_values"].items():
+                contract = optional_contracts.get(field)
+                if contract is None:
+                    optional_failures.add("inconclusive")
+                elif not optional_value_is_valid(contract["rule"], value, contract):
+                    optional_failures.add(contract["failure"])
+
+            blocked_evidence = any(
+                (
+                    case["init_model"] != identity["init_model"],
+                    bool(observed_model_keys.intersection(other_primary_keys)),
+                    not observed_model_keys.intersection(requested_keys),
+                    "blocked" in optional_failures,
+                )
+            )
+            inconclusive_evidence = any(
+                (
+                    bool(unknown_fields),
+                    bool(unknown_model_keys),
+                    "inconclusive" in optional_failures,
+                    bool(optional_failures - {"blocked", "inconclusive"}),
+                )
+            )
+            if blocked_evidence and inconclusive_evidence:
+                outcome = "inconclusive"
+            elif inconclusive_evidence:
+                outcome = "inconclusive"
+            elif blocked_evidence:
+                outcome = "blocked"
+            else:
+                outcome = "accept"
+            observed[case["name"]] = outcome
+            self.assertEqual(outcome, case["expected"], case["name"])
+
+        self.assertEqual(observed["reviewed_terminal_alias"], "accept")
+        self.assertEqual(observed["reviewed_auxiliary_model"], "accept")
+        self.assertEqual(observed["silent_model_fallback"], "blocked")
+        self.assertEqual(observed["mixed_primary_model_substitution"], "blocked")
+        self.assertEqual(observed["unknown_model_usage_key"], "inconclusive")
+        self.assertEqual(
+            observed["mixed_primary_and_unknown_model_evidence"],
+            "inconclusive",
+        )
+        self.assertEqual(observed["truncated_stop_reason"], "blocked")
+        self.assertEqual(observed["unexpected_structured_output"], "inconclusive")
+        self.assertEqual(observed["invalid_optional_metric"], "inconclusive")
+        self.assertEqual(observed["unknown_error_field"], "inconclusive")
+        for anchor in (
+            "equals the requested concrete model string exactly",
+            "the only reviewed terminal aliases",
+            "The only reviewed auxiliary key",
+            "with only or with both a `claude-opus-4-7` key",
+            "`stop_reason`, when present, is exactly `null` or `end_turn`",
+            "Any other value—including `max_tokens`",
+            "`structured_output`, when present, is exactly `null`",
+            "closed top-level allowlist",
+            "Any other terminal field",
+        ):
+            self.assertIn(anchor, canonical)
+
+        self.assertIn("require exactly Claude Code `2.1.212`", canonical)
+        self.assertIn(
+            "does not make another CLI version eligible for this named direct lane",
+            canonical,
+        )
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn(
+            "currently requires the publisher-verified Claude Code CLI version to be exactly `2.1.212`",
+            skill,
+        )
+        self.assertIn("its broader helper version range", skill)
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "including its exact Claude Code `2.1.212` gate before review input is exposed",
+            contracts,
+        )
+        self.assertIn("its broader helper version range", contracts)
+        self.assertNotIn(
+            "obtain its version using a fixed credential-free environment and require `>=2.1.211,<3.0.0`",
+            canonical,
+        )
+
+    def test_unsupported_mismatched_pr_stays_effective_double_but_not_ready(
+        self,
+    ) -> None:
+        agents_policy = _repository_agents_path(REPO_ROOT, CI_PROFILE).read_text(
+            encoding="utf-8"
+        )
+        readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        templates = (SKILL_ROOT / "references/review-prompt-templates.md").read_text(
+            encoding="utf-8"
+        )
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        probes = (SKILL_ROOT / "references/github-pr-probes.md").read_text(
+            encoding="utf-8"
+        )
+        documents = [agents_policy, readiness, skill, templates, contracts, probes]
+        if CI_PROFILE == "canonical":
+            documents.append((REPO_ROOT / "README.md").read_text(encoding="utf-8"))
+
+        causal_contract = "For the same mismatch on an already unsupported PR, keep `requested: triple`, `effective: double`, and report readiness `blocked-authorization`; do not treat the mismatch as making the already-unavailable lane triple-inconclusive or as permitting readiness to continue."
+        for content in documents:
+            self.assertIn(causal_contract, content)
+
+    def test_main_workflow_checks_existing_pr_head_before_local_lanes(self) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+        probes = (SKILL_ROOT / "references/github-pr-probes.md").read_text(
+            encoding="utf-8"
+        )
+
+        head_preflight = "compare it with the intended `head_sha` before creating or running any local lane"
+        run_codex = "Run the fresh-context Codex lane"
+        for content in (skill, readiness):
+            self.assertIn("selected existing PR", content)
+            self.assertIn("single, double, triple", content)
+        self.assertIn(
+            "explicit-range-only standalone single/double with no selected PR and the proven no-PR path have no PR-head comparison",
+            skill,
+        )
+        self.assertIn(
+            "No comparison exists for explicit-range-only standalone single/double with no selected PR, or for the authenticated no-PR path",
+            readiness,
+        )
+        self.assertIn(head_preflight, skill)
+        self.assertLess(skill.index(head_preflight), skill.index(run_codex))
+        self.assertIn(
+            "PR/full-workflow request or any standalone named review request",
+            skill,
+        )
+        self.assertIn(
+            "PR/full-workflow request or standalone named review associated with an existing PR",
+            readiness,
+        )
+        self.assertIn(
+            "A standalone triple or PR-specific request may perform the narrow read-only PR lookup",
+            readiness,
+        )
+        self.assertLess(
+            probes.index("Any existing PR with current `headRefOid != head_sha`"),
+            probes.index("Only after an existing PR is head-aligned"),
+        )
 
     def test_named_lanes_block_lazy_fetch_before_reviewer_launch(self) -> None:
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
@@ -1385,33 +2741,132 @@ class RepositoryContractTest(unittest.TestCase):
 
     def test_named_lane_runtime_import_closure_matches_control_manifest(self) -> None:
         guard = SCRIPTS / "named_lane_guard"
-        probe = "\n".join(
-            (
-                "import json",
-                "import pathlib",
-                "import sys",
-                f"guard = pathlib.Path({str(guard)!r})",
-                "namespace = {'__name__': '_guard_contract_probe', "
-                "'__file__': str(guard)}",
-                "exec(compile(guard.read_bytes(), str(guard), 'exec'), namespace)",
-                "print(json.dumps(sorted(name for name in sys.modules "
-                "if name == 'review_runtime' or name.startswith('review_runtime.'))))",
+
+        def loaded_bound_modules(*profile_args: str) -> list[str]:
+            probe = "\n".join(
+                (
+                    "import json",
+                    "import pathlib",
+                    "import sys",
+                    f"guard = pathlib.Path({str(guard)!r})",
+                    f"sys.argv = [str(guard), *{list(profile_args)!r}]",
+                    "namespace = {'__name__': '_guard_contract_probe', "
+                    "'__file__': str(guard)}",
+                    "exec(compile(guard.read_bytes(), str(guard), 'exec'), namespace)",
+                    "print(json.dumps(sorted(name for name in sys.modules "
+                    "if name == 'review_runtime' "
+                    "or name.startswith('review_runtime.') "
+                    "or name == 'validate_claude_stream')))",
+                )
             )
+            completed = subprocess.run(
+                (sys.executable, "-I", "-B", "-S", "-c", probe),
+                cwd=REPO_ROOT,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            return json.loads(completed.stdout)
+
+        self.assertEqual(
+            loaded_bound_modules(),
+            ["review_runtime", "review_runtime.common", "review_runtime.named_lane"],
         )
-        completed = subprocess.run(
-            (sys.executable, "-I", "-B", "-S", "-c", probe),
-            cwd=REPO_ROOT,
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+        self.assertEqual(
+            loaded_bound_modules("preflight-claude"),
+            [
+                "review_runtime",
+                "review_runtime.claude_linux",
+                "review_runtime.claude_provenance",
+                "review_runtime.claude_refresh_lock",
+                "review_runtime.common",
+                "review_runtime.named_claude_preflight",
+            ],
+        )
+        self.assertEqual(
+            loaded_bound_modules("validate-claude-stream"),
+            ["validate_claude_stream"],
         )
 
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(
-            completed.stdout.strip(),
-            '["review_runtime", "review_runtime.common", "review_runtime.named_lane"]',
+        entrypoint = guard.read_text(encoding="utf-8")
+        for anchor in (
+            "_DEFAULT_RUNTIME_SOURCES",
+            "_CLAUDE_PREFLIGHT_SOURCES",
+            "_CLAUDE_STREAM_VALIDATOR_SOURCES",
+            "_load_default_entrypoint",
+            "_load_claude_preflight_entrypoint",
+            "_load_claude_stream_validator_entrypoint",
+            '"review_runtime.claude_refresh_lock"',
+            '"claude_refresh_lock.py"',
+            '"review_runtime.claude_linux"',
+            '"claude_linux.py"',
+            '"CLAUDE_RELEASE_KEY_BYTES"',
+            '"SCHEMA_BYTES"',
+            'argv[0] == "preflight-claude"',
+            'argv[0] == "validate-claude-stream"',
+        ):
+            self.assertIn(anchor, entrypoint)
+        self.assertNotIn("sys.path.insert", entrypoint)
+        self.assertNotIn("from review_runtime", entrypoint)
+
+    def test_named_claude_profiles_consume_guard_bound_companion_bytes(
+        self,
+    ) -> None:
+        guard = (SCRIPTS / "named_lane_guard").read_text(encoding="utf-8")
+        provenance = (SCRIPTS / "review_runtime/claude_provenance.py").read_text(
+            encoding="utf-8"
         )
+        validator = (SCRIPTS / "validate_claude_stream.py").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+
+        for binding in ("CLAUDE_RELEASE_KEY_BYTES", "SCHEMA_BYTES"):
+            self.assertIn(f'"{binding}"', guard)
+        self.assertIn("byte_bindings", guard)
+        self.assertIn("_CompanionBinding = bytes", guard)
+        companion_validator = guard.split("def _validate_bound_companion(", 1)[1].split(
+            "def _guard_companions(", 1
+        )[0]
+        self.assertIn("return payload", companion_validator)
+        self.assertNotIn("return identity", companion_validator)
+        companion_guard = guard.split("def _guard_companions(", 1)[1].split(
+            "def _load_default_entrypoint(", 1
+        )[0]
+        self.assertNotIn("actual_binding[0]", companion_guard)
+        self.assertNotIn("actual_binding[1]", companion_guard)
+        self.assertIn("actual_binding != expected_binding", companion_guard)
+        self.assertNotIn("st_mtime", companion_guard)
+        self.assertNotIn("st_ctime", companion_guard)
+
+        self.assertIn("CLAUDE_RELEASE_KEY_BYTES: bytes | None = None", provenance)
+        self.assertIn("bound_release_key = CLAUDE_RELEASE_KEY_BYTES", provenance)
+        self.assertIn("if bound_release_key is None:", provenance)
+        self.assertIn("release_key = bytes(bound_release_key)", provenance)
+        self.assertEqual(provenance.count("CLAUDE_RELEASE_KEY_PATH.read_bytes()"), 1)
+
+        self.assertIn("SCHEMA_BYTES: bytes | None = None", validator)
+        self.assertIn("bound_schema = SCHEMA_BYTES", validator)
+        self.assertIn("if bound_schema is None:", validator)
+        self.assertIn("raw = bytes(bound_schema)", validator)
+        self.assertEqual(validator.count('SCHEMA_PATH.open("rb")'), 1)
+
+        for anchor in (
+            "retains those exact immutable bytes",
+            "gives that same buffer to the consumer",
+            "must not reopen the companion path after final validation",
+            "compares only complete bytes across the two reads",
+            "does not compare dev/ino, `mtime`, or `ctime` across them",
+            "same-content ordinary-file replacement is allowed",
+            "same-inode and same-size content change",
+            "CLAUDE_RELEASE_KEY_BYTES",
+            "without reopening `CLAUDE_RELEASE_KEY_PATH`",
+            "SCHEMA_BYTES",
+            "without reopening `SCHEMA_PATH`",
+        ):
+            self.assertIn(anchor, contracts)
 
     def test_self_policy_migration_uses_an_external_trusted_control_plane(
         self,
@@ -1432,10 +2887,11 @@ class RepositoryContractTest(unittest.TestCase):
         )
 
         for content in (agents, reviewer, skill, contracts, templates):
-            self.assertIn("candidate-head Markdown", content)
-            self.assertIn("review subject", content)
-            self.assertIn("candidate-head Python", content)
-            self.assertIn("trusted", content)
+            normalized = content.lower()
+            self.assertIn("candidate-head markdown", normalized)
+            self.assertIn("review subject", normalized)
+            self.assertIn("candidate-head python", normalized)
+            self.assertIn("trusted", normalized)
         for content in (agents, skill, contracts, templates):
             self.assertIn("absolute", content)
             self.assertIn("version", content)
@@ -1445,6 +2901,31 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("merge and release", contracts)
         self.assertIn("activate the new guard", contracts)
         self.assertIn("Ordinary implementation tests", contracts)
+        manifest_paths = (
+            "agents/reviewer.toml",
+            "skills/review-orchestration-playbook/SKILL.md",
+            "skills/review-orchestration-playbook/references/canonical-claude-lane.md",
+            "skills/review-orchestration-playbook/references/claude-2.1.212-stream-schema.json",
+            "skills/review-orchestration-playbook/references/claude-runtime-trust.md",
+            "skills/review-orchestration-playbook/references/review-lane-contracts.md",
+            "skills/review-orchestration-playbook/references/review-prompt-templates.md",
+            "skills/review-orchestration-playbook/scripts/named_claude_preflight",
+            "skills/review-orchestration-playbook/scripts/named_lane_guard",
+            "skills/review-orchestration-playbook/scripts/review_runtime/__init__.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/claude_code_release.asc",
+            "skills/review-orchestration-playbook/scripts/review_runtime/claude_linux.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/claude_provenance.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/claude_refresh_lock.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/common.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/named_claude_preflight.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/named_lane.py",
+            "skills/review-orchestration-playbook/scripts/validate_claude_stream.py",
+        )
+        manifest_clause = (
+            "; ".join(f"`{path}`" for path in manifest_paths[:-1])
+            + f"; and `{manifest_paths[-1]}`."
+        )
+        self.assertIn(manifest_clause, contracts)
         for anchor in (
             "publisher-provided release identifier or frozen commit ID",
             "canonical UTF-8 manifest",
@@ -1452,22 +2933,93 @@ class RepositoryContractTest(unittest.TestCase):
             "contains both `agents/` and `skills/` as the single bundle root",
             "agents/reviewer.toml",
             "skills/review-orchestration-playbook/SKILL.md",
+            "skills/review-orchestration-playbook/references/claude-2.1.212-stream-schema.json",
             "skills/review-orchestration-playbook/references/review-lane-contracts.md",
             "skills/review-orchestration-playbook/references/review-prompt-templates.md",
             "skills/review-orchestration-playbook/references/canonical-claude-lane.md",
             "skills/review-orchestration-playbook/references/claude-runtime-trust.md",
+            "skills/review-orchestration-playbook/scripts/named_claude_preflight",
             "skills/review-orchestration-playbook/scripts/named_lane_guard",
             "skills/review-orchestration-playbook/scripts/review_runtime/__init__.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/claude_code_release.asc",
+            "skills/review-orchestration-playbook/scripts/review_runtime/claude_linux.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/claude_provenance.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/claude_refresh_lock.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/named_claude_preflight.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/named_lane.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/common.py",
-            "immediately before each guard/launcher use and Codex spawn",
+            "skills/review-orchestration-playbook/scripts/validate_claude_stream.py",
+            "immediately before each guard, Claude preflight, stream-validator, Claude-launch, and Codex-spawn use",
             "Recompute it after each lane",
             "exact bytes must match the manifest entry",
+            "exact three-source bound-source raw loader",
+            "default guard code-origin/import boundary",
+            "exact six-source closure",
+            "must not widen this control-plane closure to `review_runtime.workspace`, `review_runtime.prompt`, or `review_runtime.synthetic_tokens`",
+            "preflight-claude",
+            "validate-claude-stream",
         ):
             self.assertIn(anchor, contracts)
         self.assertNotIn(
             "use the repo-local playbook from the frozen review head",
             agents,
+        )
+
+    def test_named_claude_control_plane_profiles_have_distinct_boundaries(
+        self,
+    ) -> None:
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        boundaries = contracts.split(
+            "### Claude Control-Plane Sequence And Boundaries",
+            1,
+        )[1].split("## GitHub Codex Lane Contract", 1)[0]
+
+        formal_prefix = (
+            "<trusted-python-absolute-path> -I -B -S "
+            "<trusted-bundle-absolute-path>/skills/review-orchestration-playbook/"
+            "scripts/named_lane_guard"
+        )
+        for profile in ("preflight-claude", "validate-claude-stream"):
+            self.assertIn(f"{formal_prefix} {profile}", contracts)
+        for anchor in (
+            "exact three-source bound-source raw loader",
+            "default eager runtime closure",
+            "review_runtime.claude_refresh_lock",
+            "review_runtime.claude_linux",
+            "review_runtime.claude_provenance",
+            "review_runtime.named_claude_preflight",
+            "claude_code_release.asc",
+            "standalone validator source",
+            "stream-schema companion",
+            "same bounded bytes retained through final validation",
+            "must not reopen the companion path after final validation",
+            "compatibility wrapper",
+            "never the formal named-lane or self-policy-migration entry",
+            "never execute the candidate wrapper/importer",
+            "fixed `--api-key-source none`",
+            "child's exact `returncode` from the guard's machine result",
+            "8 MiB stream cap",
+            "64 MiB stdout cap",
+        ):
+            self.assertIn(anchor, contracts)
+
+        ordered_controls = (
+            "trusted bundle digest binds",
+            "selects and publisher-verifies",
+            "final clean/safety launch gate",
+            "launches the exact preflight-selected",
+            "runs only after successful supervision cleanup",
+        )
+        positions = [boundaries.index(anchor) for anchor in ordered_controls]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("default guard code-origin/import boundary", contracts)
+        self.assertIn(
+            "Neither profile may use the candidate wrapper, ordinary bundle-path "
+            "import resolution, a candidate-head source/schema, or a path re-read "
+            "in place of the bound bytes.",
+            contracts,
         )
 
     def test_repo_visible_git_includes_are_blocked_without_expansion(self) -> None:
@@ -1855,7 +3407,9 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("sys.flags.dont_write_bytecode", entrypoint)
         self.assertIn("invoked with -I -B -S", entrypoint)
         self.assertIn("_read_bound_source", entrypoint)
-        self.assertIn("_load_bound_runtime", entrypoint)
+        self.assertIn("_load_bound_sources", entrypoint)
+        self.assertIn("_load_default_entrypoint", entrypoint)
+        self.assertIn("_select_entrypoint", entrypoint)
         self.assertIn('("review_runtime", "__init__.py", True)', entrypoint)
         self.assertIn('("review_runtime.common", "common.py", False)', entrypoint)
         self.assertIn(
@@ -1865,7 +3419,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("from review_runtime", entrypoint)
         self.assertLess(
             entrypoint.index("sys.flags.no_site"),
-            entrypoint.index("main = _load_bound_runtime()"),
+            entrypoint.index("main, _MAIN_ARGV = _select_entrypoint"),
         )
         self.assertIn("DEFAULT_TIMEOUT_SECONDS = 1_800.0", runtime)
         self.assertIn("DEFAULT_STREAM_LIMIT_BYTES = 64 * 1024 * 1024", runtime)
@@ -2014,12 +3568,17 @@ class RepositoryContractTest(unittest.TestCase):
             "ordinary local Claude CLI login",
             "only authentication interface",
             "trusted control plane",
-            "own ordinary authentication",
             "accepts no API key",
             "OAuth-token environment interface",
+            "ordinary CLI-owned authentication and runtime state",
+            "credential refresh and possible cache or tool-result artifacts",
+            "not model-authorized review mutations",
             "does not use the low-level helper's credential broker",
             "blocked-authentication",
             "claude auth login",
+            "`--no-session-persistence` disables resumable session persistence",
+            "does not make the CLI process or real `HOME` immutable",
+            "does not take or verify a complete real-`HOME` diff",
         ):
             self.assertIn(anchor, canonical)
         canonical_runtime = runtime[
@@ -2039,13 +3598,32 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("explicitly authorized API key", canonical_runtime)
         self.assertIn("only API-key/OAuth-token credentials", canonical)
         self.assertIn(
-            "organization policy forbids ordinary CLI credential refresh", canonical
+            "organization policy forbids ordinary CLI control-plane writes", canonical
         )
         self.assertIn("The canonical lane does not use or", runtime)
         self.assertIn("helper's credential-lock catalog", runtime)
+        self.assertIn(
+            "The canonical lane does not enumerate or attest every CLI-owned `HOME` write",
+            runtime,
+        )
+        self.assertIn("helper's credential-lock", runtime)
         self.assertIn("Do not apply its catalog, broker, carrier, lock", runtime)
         self.assertIn("do not apply to this direct real-`HOME` lane", skill)
-        self.assertIn("a narrow CLI control-plane exception", skill)
+        for content in (skill, lane_contracts, canonical, runtime):
+            self.assertIn(
+                "ordinary CLI-owned authentication and runtime state",
+                content,
+            )
+            self.assertIn("credential refresh", content)
+            self.assertIn("cache or tool-result artifacts", content)
+            self.assertIn("not model-authorized", content)
+            for overclaim in (
+                "only planned host write",
+                "only planned host-write exception",
+                "does not authorize any other host write",
+                "a narrow CLI control-plane exception",
+            ):
+                self.assertNotIn(overclaim, content)
         self.assertIn("Apply **Canonical Executable Provenance**", lane_contracts)
         self.assertIn("recovery rules do not apply to this direct lane", lane_contracts)
         self.assertNotIn("authentication, credential-recovery", lane_contracts)
@@ -2193,6 +3771,11 @@ class RepositoryContractTest(unittest.TestCase):
         ]
         if CI_PROFILE == "canonical":
             active_policy.append(REPO_ROOT / "README.md")
+            compatibility = (
+                REPO_ROOT / ".github/workflows/codex-review-gate.yml"
+            ).read_text(encoding="utf-8")
+            self.assertIn("Compatibility Status", compatibility)
+            self.assertNotIn("\n      - uses:", compatibility)
         retired = (
             "independent-codex-pr-review",
             "offline-frozen-diff-review",
@@ -2342,6 +3925,98 @@ class RepositoryContractTest(unittest.TestCase):
             skill,
         )
         self.assertIn("No named shape authorizes a substitute external reviewer", skill)
+
+    def test_selected_pr_requires_exact_merge_base_and_head_range(self) -> None:
+        agents_policy = _repository_agents_path(REPO_ROOT, CI_PROFILE).read_text(
+            encoding="utf-8"
+        )
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+        probes = (SKILL_ROOT / "references/github-pr-probes.md").read_text(
+            encoding="utf-8"
+        )
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        templates = (SKILL_ROOT / "references/review-prompt-templates.md").read_text(
+            encoding="utf-8"
+        )
+        policy_documents = {
+            "repository policy": agents_policy,
+            "skill": skill,
+            "PR readiness": readiness,
+            "lane contracts": contracts,
+            "prompt templates": templates,
+        }
+        if CI_PROFILE == "canonical":
+            policy_documents["README"] = (REPO_ROOT / "README.md").read_text(
+                encoding="utf-8"
+            )
+
+        exact_range = "`base_sha == pr_merge_base` and `head_sha == pr_head_oid`"
+        for name, content in policy_documents.items():
+            with self.subTest(policy_document=name):
+                self.assertIn("pr-lifecycle-unverified", content)
+                self.assertIn("selected-pr-closed", content)
+                self.assertIn("already-merged", content)
+                self.assertIn("baseRefName", content)
+                self.assertIn("baseRefOid", content)
+                self.assertIn("headRefOid", content)
+                self.assertIn("git merge-base --all", content)
+                self.assertIn(exact_range, content)
+                self.assertIn("same-head/different-base", content)
+                self.assertIn("`blocked-input` (`scope-mismatch`)", content)
+                self.assertIn("do not silently rewrite", content)
+                self.assertIn("whole-PR coverage", content)
+                self.assertIn("point-in-time snapshots", content.lower())
+
+        self.assertIn("base_sha:.base.sha", probes)
+        self.assertIn(
+            "--jq '{number,url:.html_url,state,merged,merged_at,baseRefName:.base.ref,baseRefOid:.base.sha,headRefOid:.head.sha}'",
+            probes,
+        )
+        self.assertIn('state == "open"', probes)
+        self.assertIn("merged == false", probes)
+        self.assertIn("merged_at == null", probes)
+        for content in (readiness, probes, contracts):
+            self.assertIn("`COMMENTED`, `APPROVED`, or `CHANGES_REQUESTED`", content)
+            self.assertIn("`DISMISSED`", content)
+            self.assertIn("triple-inconclusive", content)
+
+        interface = (SKILL_ROOT / "agents/openai.yaml").read_text(encoding="utf-8")
+        self.assertIn("state=open, merged=false, and merged_at=null", interface)
+        self.assertIn("pr-lifecycle-unverified", interface)
+        self.assertIn("selected-pr-closed", interface)
+        self.assertIn("point-in-time snapshots", interface)
+        self.assertNotIn("non-PENDING", interface)
+        self.assertIn("gh api --hostname <host> --method GET", probes)
+        self.assertNotIn("gh pr view <number> --repo <owner>/<repo>", probes)
+        self.assertIn("exactly one full merge-base result", probes)
+        self.assertIn("head_sha == pr_head_oid", probes)
+        self.assertIn("base_sha != pr_merge_base", probes)
+        self.assertIn("GIT_NO_LAZY_FETCH=1", probes)
+        self.assertIn("GIT_TERMINAL_PROMPT=0", probes)
+        self.assertIn("Zero/multiple merge bases", readiness)
+        self.assertIn("Missing/ambiguous metadata, objects", skill)
+        self.assertIn("point-in-time snapshots", probes.lower())
+        self.assertIn("do not prove", probes.lower())
+
+        preflight_anchor = "independently query and record lifecycle"
+        run_lanes_anchor = "Run the requested local lanes"
+        read_state_anchor = "Read required CI/check state"
+        post_request_anchor = "Otherwise post the one exact `@codex review` comment"
+        for later_anchor in (run_lanes_anchor, read_state_anchor, post_request_anchor):
+            self.assertLess(
+                readiness.index(preflight_anchor), readiness.index(later_anchor)
+            )
+
+        for content in (agents_policy, skill, readiness, contracts, probes, templates):
+            self.assertIn(
+                "explicit-range-only standalone single/double with no selected pr",
+                content.lower(),
+            )
 
 
 if __name__ == "__main__":

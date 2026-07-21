@@ -29,6 +29,7 @@ from .workspace import (
     cleanup_workspace,
     prepare_workspace,
     remove_private_review_artifacts,
+    secret_admission,
     validate_authoring_catalog_scanner_contract,
 )
 
@@ -135,6 +136,25 @@ def _build_synthetic_tokens_parser() -> argparse.ArgumentParser:
     audit_parser.add_argument("--ref", required=True)
     audit_parser.add_argument("--exemption", required=True)
     return parser
+
+
+def _build_secret_admission_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="isolated_review secret-admission")
+    parser.add_argument("--repo", default=".", help="Source Git repository.")
+    parser.add_argument("--base-ref", required=True, help="Frozen base commit-ish.")
+    parser.add_argument("--head-ref", required=True, help="Frozen head commit-ish.")
+    return parser
+
+
+def _run_secret_admission(argv: list[str]) -> int:
+    args = _build_secret_admission_parser().parse_args(argv)
+    exit_code, summary = secret_admission(
+        repo=pathlib.Path(args.repo),
+        base_ref=args.base_ref,
+        head_ref=args.head_ref,
+    )
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    return exit_code
 
 
 def _run_synthetic_tokens(argv: list[str]) -> int:
@@ -379,6 +399,8 @@ def main(argv: list[str] | None = None) -> int:
             return _run_stateful(arguments[1:], script_path=script_path)
         if arguments and arguments[0] == "synthetic-tokens":
             return _run_synthetic_tokens(arguments[1:])
+        if arguments and arguments[0] == "secret-admission":
+            return _run_secret_admission(arguments[1:])
         return _run_foreground(_build_parser().parse_args(arguments))
     except ForwardedSignal as error:
         if error.detail:

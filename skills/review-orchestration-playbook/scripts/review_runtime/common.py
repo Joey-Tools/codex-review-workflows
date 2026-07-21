@@ -1284,6 +1284,26 @@ def is_relative_to(path: pathlib.Path, parent: pathlib.Path) -> bool:
     return True
 
 
+def symlink_target_stays_within_workspace(
+    link_relative_path: pathlib.PurePosixPath,
+    target_text: str,
+) -> bool:
+    """Return whether a relative symlink target stays inside the frozen root."""
+
+    target = pathlib.PurePosixPath(target_text)
+    if target.is_absolute():
+        return False
+    depth = len(link_relative_path.parent.parts)
+    for component in target.parts:
+        if component == "..":
+            if depth == 0:
+                return False
+            depth -= 1
+        elif component not in {"", "."}:
+            depth += 1
+    return True
+
+
 def child_environment(
     *,
     container_dir: pathlib.Path,

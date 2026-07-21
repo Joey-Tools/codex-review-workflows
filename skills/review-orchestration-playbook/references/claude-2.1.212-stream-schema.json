@@ -1,0 +1,471 @@
+{
+  "claude_code_version": "2.1.212",
+  "process_returncode": {
+    "rule": "exact_int",
+    "missing_or_invalid": {
+      "classification": "inconclusive",
+      "reason": "process.returncode.invalid"
+    },
+    "accepted_requires": 0,
+    "nonzero_precedence": {
+      "accepted": {
+        "classification": "inconclusive",
+        "reason": "process.returncode.nonzero"
+      },
+      "blocked": "preserve",
+      "blocked-authentication": "preserve",
+      "inconclusive": {
+        "classification": "inconclusive",
+        "append_reason": "process.returncode.nonzero"
+      }
+    }
+  },
+  "stream_contract": {
+    "encoding": "utf-8",
+    "format": "jsonl",
+    "blank_lines": "ignored",
+    "top_level": "object",
+    "duplicate_keys": "reject",
+    "nonstandard_constants": "reject",
+    "unpaired_surrogates": "reject",
+    "max_integer_digits": 128,
+    "floating_number_representation": "decimal",
+    "max_float_characters": 256,
+    "max_float_significand_digits": 128,
+    "max_float_explicit_exponent_magnitude": 308,
+    "max_bytes": 8388608,
+    "max_lines": 10000,
+    "max_line_bytes": 1048576,
+    "first_nonblank_event": {
+      "type": "system",
+      "subtype": "init"
+    },
+    "last_nonblank_event": {
+      "type": "result"
+    },
+    "init_event_count": 1,
+    "result_event_count": 1,
+    "matching_session_id_when_both_present": true
+  },
+  "init_event": {
+    "required_fields": [
+      "type",
+      "subtype",
+      "cwd",
+      "permissionMode",
+      "tools",
+      "mcp_servers",
+      "slash_commands",
+      "skills",
+      "plugins",
+      "model",
+      "claude_code_version",
+      "apiKeySource"
+    ],
+    "additional_fields": false,
+    "optional_fields": [
+      "session_id"
+    ],
+    "field_contracts": {
+      "type": {
+        "rule": "constant",
+        "value": "system",
+        "malformed_failure": "inconclusive",
+        "mismatch_failure": "inconclusive"
+      },
+      "subtype": {
+        "rule": "constant",
+        "value": "init",
+        "malformed_failure": "inconclusive",
+        "mismatch_failure": "inconclusive"
+      },
+      "cwd": {
+        "rule": "exact_resolved_cli_argument",
+        "argument": "cwd",
+        "malformed_failure": "inconclusive",
+        "mismatch_failure": "blocked"
+      },
+      "permissionMode": {
+        "rule": "constant",
+        "value": "dontAsk",
+        "malformed_failure": "inconclusive",
+        "mismatch_failure": "blocked"
+      },
+      "tools": {
+        "rule": "duplicate_free_exact_set",
+        "values": [
+          "Read",
+          "Grep",
+          "Glob",
+          "Bash"
+        ],
+        "malformed_failure": "inconclusive",
+        "mismatch_failure": "blocked"
+      },
+      "mcp_servers": {
+        "rule": "empty_array",
+        "malformed_failure": "inconclusive",
+        "mismatch_failure": "blocked"
+      },
+      "slash_commands": {
+        "rule": "empty_array",
+        "malformed_failure": "inconclusive",
+        "mismatch_failure": "blocked"
+      },
+      "skills": {
+        "rule": "empty_array",
+        "malformed_failure": "inconclusive",
+        "mismatch_failure": "blocked"
+      },
+      "plugins": {
+        "rule": "empty_array",
+        "malformed_failure": "inconclusive",
+        "mismatch_failure": "blocked"
+      },
+      "model": {
+        "rule": "exact_cli_argument",
+        "argument": "model",
+        "malformed_failure": "inconclusive",
+        "mismatch_failure": "blocked"
+      },
+      "claude_code_version": {
+        "rule": "constant",
+        "value": "2.1.212",
+        "malformed_failure": "inconclusive",
+        "mismatch_failure": "blocked"
+      },
+      "apiKeySource": {
+        "rule": "exact_cli_argument",
+        "argument": "api_key_source",
+        "accepted_arguments": [
+          "none",
+          "ANTHROPIC_API_KEY"
+        ],
+        "malformed_failure": "inconclusive",
+        "mismatch_failure": "blocked"
+      }
+    },
+    "optional_field_contracts": {
+      "session_id": {
+        "rule": "nonempty_string",
+        "failure": "inconclusive"
+      }
+    }
+  },
+  "model_identity": {
+    "claude-opus-4-8": {
+      "init_model": "claude-opus-4-8",
+      "accepted_model_usage_keys": [
+        "claude-opus-4-8",
+        "claude-opus-4.8"
+      ]
+    },
+    "claude-opus-4-7": {
+      "init_model": "claude-opus-4-7",
+      "accepted_model_usage_keys": [
+        "claude-opus-4-7",
+        "claude-opus-4.7"
+      ]
+    }
+  },
+  "accepted_auxiliary_model_usage_keys": [
+    "claude-haiku-4-5-20251001"
+  ],
+  "terminal_result": {
+    "additional_fields": false,
+    "required_fields": [
+      "type",
+      "subtype",
+      "is_error"
+    ],
+    "optional_fields": [
+      "result",
+      "modelUsage",
+      "duration_ms",
+      "duration_api_ms",
+      "num_turns",
+      "session_id",
+      "total_cost_usd",
+      "usage",
+      "uuid",
+      "stop_reason",
+      "structured_output",
+      "error",
+      "errors",
+      "api_error_status",
+      "permission_denials"
+    ],
+    "optional_field_contracts": {
+      "result": {
+        "rule": "variant_specific",
+        "failure": "inconclusive"
+      },
+      "modelUsage": {
+        "rule": "variant_specific",
+        "failure": "classify"
+      },
+      "duration_ms": {
+        "rule": "nonnegative_integer",
+        "failure": "inconclusive"
+      },
+      "duration_api_ms": {
+        "rule": "nonnegative_integer",
+        "failure": "inconclusive"
+      },
+      "num_turns": {
+        "rule": "positive_integer",
+        "failure": "inconclusive"
+      },
+      "session_id": {
+        "rule": "nonempty_string",
+        "failure": "inconclusive"
+      },
+      "total_cost_usd": {
+        "rule": "nonnegative_finite_number",
+        "failure": "inconclusive"
+      },
+      "usage": {
+        "rule": "object",
+        "failure": "inconclusive"
+      },
+      "uuid": {
+        "rule": "nonempty_string",
+        "failure": "inconclusive"
+      },
+      "stop_reason": {
+        "rule": "enum",
+        "accepted_values": [
+          null,
+          "end_turn"
+        ],
+        "failure": "blocked"
+      },
+      "structured_output": {
+        "rule": "null",
+        "failure": "inconclusive"
+      },
+      "error": {
+        "rule": "explicitly_empty",
+        "failure": "classify"
+      },
+      "errors": {
+        "rule": "explicitly_empty",
+        "failure": "classify"
+      },
+      "api_error_status": {
+        "rule": "null_or_whitespace_string",
+        "failure": "classify"
+      },
+      "permission_denials": {
+        "rule": "empty_array",
+        "failure": "blocked"
+      }
+    },
+    "variants": {
+      "success": {
+        "match": {
+          "subtype": "success",
+          "is_error": false
+        },
+        "required_fields": [
+          "result",
+          "modelUsage"
+        ],
+        "field_contracts": {
+          "result": {
+            "rule": "nonempty_string",
+            "failure": "inconclusive"
+          },
+          "modelUsage": {
+            "rule": "requested_model_usage",
+            "failure": "classify"
+          }
+        }
+      },
+      "failure": {
+        "match": {
+          "subtype": {
+            "rule": "string_not_equal",
+            "value": "success"
+          },
+          "is_error": true
+        },
+        "required_fields": [],
+        "optional_fields": [
+          "result",
+          "modelUsage"
+        ],
+        "field_contracts": {
+          "result": {
+            "rule": "string",
+            "failure": "inconclusive"
+          },
+          "modelUsage": {
+            "rule": "requested_model_usage",
+            "failure": "classify"
+          }
+        },
+        "recognized_failure_classes": {
+          "authentication": {
+            "classification": "blocked-authentication",
+            "reason": "terminal.authentication-error"
+          },
+          "model_entitlement": {
+            "classification": "blocked",
+            "reason": "terminal.model-entitlement-denial"
+          },
+          "organization_policy": {
+            "classification": "blocked",
+            "reason": "terminal.organization-policy-denial"
+          },
+          "mixed_or_ambiguous": {
+            "classification": "inconclusive",
+            "reason": "terminal.unclassified-error"
+          }
+        },
+        "unclassified_failure": "inconclusive"
+      }
+    }
+  },
+  "contract_cases": [
+    {
+      "name": "primary_exact",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-8",
+      "model_usage_keys": [
+        "claude-opus-4-8"
+      ],
+      "optional_terminal_values": {},
+      "extra_terminal_fields": [],
+      "expected": "accept"
+    },
+    {
+      "name": "reviewed_terminal_alias",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-8",
+      "model_usage_keys": [
+        "claude-opus-4.8"
+      ],
+      "optional_terminal_values": {},
+      "extra_terminal_fields": [],
+      "expected": "accept"
+    },
+    {
+      "name": "reviewed_auxiliary_model",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-8",
+      "model_usage_keys": [
+        "claude-opus-4-8",
+        "claude-haiku-4-5-20251001"
+      ],
+      "optional_terminal_values": {
+        "stop_reason": "end_turn",
+        "structured_output": null
+      },
+      "extra_terminal_fields": [],
+      "expected": "accept"
+    },
+    {
+      "name": "silent_model_fallback",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-7",
+      "model_usage_keys": [
+        "claude-opus-4-7"
+      ],
+      "optional_terminal_values": {},
+      "extra_terminal_fields": [],
+      "expected": "blocked"
+    },
+    {
+      "name": "mixed_primary_model_substitution",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-8",
+      "model_usage_keys": [
+        "claude-opus-4-8",
+        "claude-opus-4-7"
+      ],
+      "optional_terminal_values": {},
+      "extra_terminal_fields": [],
+      "expected": "blocked"
+    },
+    {
+      "name": "unknown_model_usage_key",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-8",
+      "model_usage_keys": [
+        "claude-opus-4-8",
+        "claude-haiku-future"
+      ],
+      "optional_terminal_values": {},
+      "extra_terminal_fields": [],
+      "expected": "inconclusive"
+    },
+    {
+      "name": "mixed_primary_and_unknown_model_evidence",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-8",
+      "model_usage_keys": [
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-unknown-future"
+      ],
+      "optional_terminal_values": {},
+      "extra_terminal_fields": [],
+      "expected": "inconclusive"
+    },
+    {
+      "name": "truncated_stop_reason",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-8",
+      "model_usage_keys": [
+        "claude-opus-4-8"
+      ],
+      "optional_terminal_values": {
+        "stop_reason": "max_tokens"
+      },
+      "extra_terminal_fields": [],
+      "expected": "blocked"
+    },
+    {
+      "name": "unexpected_structured_output",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-8",
+      "model_usage_keys": [
+        "claude-opus-4-8"
+      ],
+      "optional_terminal_values": {
+        "structured_output": {
+          "review": "No findings."
+        }
+      },
+      "extra_terminal_fields": [],
+      "expected": "inconclusive"
+    },
+    {
+      "name": "invalid_optional_metric",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-8",
+      "model_usage_keys": [
+        "claude-opus-4-8"
+      ],
+      "optional_terminal_values": {
+        "duration_ms": -1
+      },
+      "extra_terminal_fields": [],
+      "expected": "inconclusive"
+    },
+    {
+      "name": "unknown_error_field",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-8",
+      "model_usage_keys": [
+        "claude-opus-4-8"
+      ],
+      "optional_terminal_values": {},
+      "extra_terminal_fields": [
+        "fatal_error"
+      ],
+      "expected": "inconclusive"
+    }
+  ]
+}

@@ -4,85 +4,144 @@ Use these recipes when `$review-orchestration-playbook` needs PR metadata, revie
 
 ## GitHub Codex Availability And Current-Head Evidence
 
-Before requesting the third lane, record the PR URL, host, authenticated/operating identity, and `headRefOid`.
+Before requesting the third lane, record the PR URL, host, authenticated/operating identity, lifecycle tuple `state` / `merged` / `merged_at`, `baseRefName`, `baseRefOid`, and `headRefOid`, then independently validate the selected PR's unique local merge base. Only exact `state == "open"`, `merged == false`, and `merged_at == null` is an eligible lifecycle.
 
-- The lane is supported only on GitHub Cloud when the Codex review integration is available for the active identity.
-- Treat host `sqbu-github.cisco.com` and any operating identity in `{hoteng, hoteng_cisco}` as unsupported.
-- When no PR or an unsupported host/identity is directly known, record `requested: triple`, `effective: double`, and the exact reason without posting a request. Treat missing integration/service as unavailable only when authenticated provider evidence proves it; absence, timeout, permission error, or generic HTTP/network failure is inconclusive.
-- On a supported PR, post the exact `@codex review` comment after the frozen head becomes current.
+- The only supported host is exact `github.com`. Every other host is unsupported, including `sqbu-github.cisco.com` and every GitHub Enterprise host.
+- Treat any operating identity in `{hoteng, hoteng_cisco}` as unsupported. Another identity on `github.com` is only an eligible candidate; it does not by itself prove that the integration or service is available.
+- When authenticated discovery proves no PR, or an unsupported host/identity is directly known, record `requested: triple`, `effective: double`, and the exact reason without posting a request. Treat missing integration/service as unavailable only when authenticated evidence from the exact accepted provider identity below proves it; absence, timeout, permission error, or generic HTTP/network failure is inconclusive.
+- On a supported PR, allow at most one acceptable exact `@codex review` request per unchanged head. Reuse the recorded request when one already exists; never post a second request on that same `headRefOid`.
 
-Use typed metadata before and after the request:
+## Deterministic Range And PR Discovery
+
+Resolve the local range and PR selector independently. Preserve an explicit frozen `base_sha..head_sha` as the authoritative local-lane range before any PR probe. Explicit-range-only standalone single/double needs no PR probe. A frozen range never selects a PR: PR-specific work and triple use an explicitly named PR, otherwise the complete set of open PRs associated with the exact current head repository/branch. Exactly one associated PR selects it. More than one is `blocked-input` for the GitHub/PR-specific lane because the required explicit PR selector is absent; the caller must name the PR, and a frozen range does not cure that ambiguity. Fully scoped local lanes may still run, while any lane that still depends on PR selection stays blocked. Do not select a candidate by recency, base, number, draft state, or title. Once a PR is selected, its explicit frozen range satisfies PR-specific readiness or triple completion only when `base_sha == pr_merge_base` and `head_sha == pr_head_oid`.
+
+First obtain the exact current branch and head repository owner. A detached HEAD or unknown head owner cannot drive implicit PR association. Then use an authenticated, paginated lookup and retain the returned candidate array:
+
+```sh
+git branch --show-current
+
+gh api --hostname <host> --method GET --paginate --slurp \
+  repos/<owner>/<repo>/pulls \
+  -f state=open \
+  -f 'head=<head-owner>:<current-branch>' \
+  -f per_page=100 \
+  --jq '[.[][] | {number,html_url,base_ref:.base.ref,base_sha:.base.sha,head_ref:.head.ref,head_sha:.head.sha,head_owner:.head.repo.owner.login}]'
+```
+
+An authenticated successful lookup returning `[]` proves the no-PR path. A failed, partial, unauthenticated, or ambiguous probe does not. No PR does not define the local review range: require either an explicit committed range or an explicitly named target/base, then resolve and freeze `<merge_base>..HEAD`. Never guess the target/base from repository defaults, upstream configuration, branch names, or conventions. Missing scope input from an otherwise clean checkout is `blocked-input`; use `blocked-authorization` only when the intended scope includes dirty/untracked state and an unauthorized branch or anchor commit would be required to represent it.
+
+For the selected PR, obtain authenticated metadata independently from the caller's range and bind the request to the already discovered host. Do not use `gh pr view --repo` for this host-sensitive preflight because that form does not preserve `<host>`:
+
+```sh
+gh api --hostname <host> --method GET \
+  repos/<owner>/<repo>/pulls/<number> \
+  --jq '{number,url:.html_url,state,merged,merged_at,baseRefName:.base.ref,baseRefOid:.base.sha,headRefOid:.head.sha}'
+
+GIT_NO_LAZY_FETCH=1 GIT_TERMINAL_PROMPT=0 git cat-file -e '<pr_base_oid>^{commit}'
+GIT_NO_LAZY_FETCH=1 GIT_TERMINAL_PROMPT=0 git cat-file -e '<pr_head_oid>^{commit}'
+GIT_NO_LAZY_FETCH=1 GIT_TERMINAL_PROMPT=0 git merge-base --all <pr_base_oid> <pr_head_oid>
+```
+
+Require the exact open lifecycle tuple, non-empty `baseRefName`, full immutable base/head OIDs, locally complete commit objects, and exactly one full merge-base result; record it as `pr_merge_base`. Missing, contradictory, or ambiguous lifecycle metadata is `blocked-input` (`pr-lifecycle-unverified`) and `triple-inconclusive`. A selected closed-unmerged PR is `blocked-input` (`selected-pr-closed`): never post a request or claim readiness; when a separately valid frozen local range exists and no request/service start occurred, its third lane is directly unavailable and requested triple may run as effective double. A selected merged PR is terminal `already-merged` (or `blocked-input` / `selected-pr-merged` when the caller requires blocker vocabulary), and no request, CI, or merge loop continues. An observed closed or merged state at any mandated snapshot after request/service start invalidates its evidence and remains `triple-inconclusive`; never retroactively call it effective double. Missing or ambiguous base/head metadata, missing local objects, and zero or multiple merge bases are `blocked-input` (`scope-unverified`), not permission to guess or fetch lazily. If no explicit range exists, freeze `pr_merge_base..pr_head_oid`. If one exists, require exact endpoint equality. A same-head/different-base range is `blocked-input` (`scope-mismatch`): preserve the caller's range, do not silently rewrite it, do not start or count PR-specific lanes from it, and never describe any range-only findings as whole-PR coverage. Explicit-range-only standalone single/double with no selected PR remains unaffected.
+
+Use host-bound REST metadata before and after the request, including the selected PR's base identity. Fully paginate and slurp every list that participates in request isolation or the provider findings payload:
 
 ```sh
 gh auth status --hostname <host>
 gh api --hostname <host> user --jq .login
 
-gh pr view <number> --repo <owner>/<repo> \
-  --json number,url,headRefOid,comments,reviews \
-  --jq '{number,url,headRefOid,comments,reviews}'
+gh api --hostname <host> --method GET \
+  repos/<owner>/<repo>/pulls/<number> \
+  --jq '{number,url:.html_url,state,merged,merged_at,baseRefName:.base.ref,baseRefOid:.base.sha,headRefOid:.head.sha}'
 
-gh pr comment <number> --repo <owner>/<repo> --body '@codex review'
+gh api --hostname <host> --method POST \
+  repos/<owner>/<repo>/issues/<number>/comments \
+  -f body='@codex review' \
+  --jq '{id,html_url,created_at}'
 
-gh api --hostname <host> repos/<owner>/<repo>/pulls/<number>/reviews \
-  --paginate \
-  --jq '[.[] | {id,user:.user.login,commit_id,submitted_at,state,html_url}]'
+gh api --hostname <host> --method GET --paginate --slurp \
+  'repos/<owner>/<repo>/pulls/<number>/reviews?per_page=100' \
+  --jq '[.[][] | {id,user:{login:.user.login,type:.user.type},commit_id,submitted_at,state,html_url,body}]'
 
-gh api --hostname <host> repos/<owner>/<repo>/issues/<number>/comments \
-  --paginate \
-  --jq '[.[] | {id,user:.user.login,created_at,updated_at,html_url,body}]'
+gh api --hostname <host> --method GET --paginate --slurp \
+  'repos/<owner>/<repo>/issues/<number>/comments?per_page=100' \
+  --jq '[.[][] | {id,user:{login:.user.login,type:.user.type},app_slug:.performed_via_github_app.slug,created_at,updated_at,html_url,body}]'
+
+gh api --hostname <host> --method GET --paginate --slurp \
+  'repos/<owner>/<repo>/pulls/<number>/reviews/<review_id>/comments?per_page=100' \
+  --jq '[.[][] | {id,pull_request_review_id,user:{login:.user.login,type:.user.type},commit_id,original_commit_id,path,line,original_line,side,html_url,body}]'
+
+gh api --hostname <host> --method GET --paginate --slurp \
+  'repos/<owner>/<repo>/commits/<head_sha>/check-runs?per_page=100' \
+  --jq '[.[].check_runs[] | {id,name,status,conclusion,head_sha,started_at,completed_at,details_url,app_slug:.app.slug}]'
 ```
 
-Treat `gh api --hostname <host> user --jq .login` as the operating identity for this invocation; `gh auth status` is supporting account/host context, not the identity value by itself. Keep the request URL/time, accepted terminal result URL/time/author, and exact `headRefOid`. Prefer a review whose `commit_id` equals `headRefOid`; this is the strongest ordinary current-head binding. Require the expected Codex integration identity and a review time after the current-head request. Re-read `headRefOid` before accepting the result. Any push invalidates earlier GitHub Codex evidence and requires a fresh request on the new head.
+Treat `gh api --hostname <host> user --jq .login` as the operating identity for this invocation; `gh auth status` is supporting account/host context, not the identity value by itself. Re-read the exact request from the authenticated API and keep its ID, URL, and server `created_at`, the surrounding before/after lifecycle plus `baseRefName` / `baseRefOid` / `headRefOid` observations, immutable selected-PR `range_origin.kind` / `base_sha` / `head_sha`, and the accepted terminal result URL/time/author. The origin kind is exactly `caller-supplied` or `pr-derived`; never infer it from a later parent-provided range or overwrite original caller endpoints. Revalidate the exact open lifecycle tuple during initial selected-PR preflight, immediately before posting, immediately before accepting a result, and during final readiness/merge verification. Immediately before accepting the result, also revalidate both endpoint objects, recompute the unique `pr_merge_base`, and require the frozen range still to equal `pr_merge_base..pr_head_oid`; an observed non-open lifecycle at a mandated snapshot, a changed head, or a changed merge base invalidates whole-PR lane evidence.
+
+These REST lifecycle reads are point-in-time snapshots. They do not prove that no intermediate close-and-reopen occurred between mandated probes. Do not claim a complete lifecycle-history attestation from them. If separately collected, authenticated, fully paginated lifecycle-event history shows a post-start close, reopen, or merge, invalidate the evidence; missing event-history evidence does not strengthen the snapshot claim.
 
 ### Issue-comment-only correlation
 
-This is an evidence-correlation rule inside the existing GitHub Codex lane, not another review lane or readiness gate. Apply it whenever the only candidate terminal result or authenticated no-start rejection is an issue comment.
+This is an evidence-correlation rule inside the existing GitHub Codex lane, not another review lane or readiness gate. Apply it only when the candidate terminal result or authenticated no-start rejection is an issue comment, and only after the selected-PR lifecycle, whole-PR range, one-request-per-head, exact-provider-identity, complete-payload, and pagination requirements in this document have passed.
 
-Keep a request ledger across the PR's issue-comment history. For every exact `@codex review` request, record its comment ID, URL, time, and the full `headRefOid` observed when it was posted. Keep the request unresolved until trustworthy correlated terminal or no-start evidence resolves it. A later push or head change invalidates that request for the new head but does **not** resolve the older request.
+Keep a request ledger across the PR's issue-comment history. For every exact `@codex review` request, record its API comment ID, URL, server `created_at`, the full `headRefOid` and `pr_merge_base` observed when it was posted, and the surrounding lifecycle/base/head snapshots. Keep the request unresolved until trustworthy correlated terminal or no-start evidence resolves it. A later push or head change invalidates that request for the new head but does **not** resolve the older request; an older-head request remains unresolved until correlated evidence closes it.
 
 Before considering correlation, require all of the following:
 
-- the candidate comment author is the expected GitHub Codex integration identity;
-- the current request was posted after the accepted head became current, and the candidate response was posted after that request; and
-- the same full `headRefOid` remained current from the request through the final acceptance reread.
+- the candidate comment has exact REST `user.login == "chatgpt-codex-connector[bot]"` and exact `user.type == "Bot"`;
+- the current request was posted after the accepted head became current, the candidate's non-null server `created_at` is strictly later than that request's server `created_at`, and the body is an unambiguous terminal findings/no-findings payload rather than acknowledgement or progress;
+- the exact open lifecycle, full `headRefOid`, unique `pr_merge_base`, and frozen whole-PR range remained valid from the request through the final acceptance reread; and
+- complete authenticated request history and the parent audit exclude multiple requests on the accepted head and every other request whose run/result might overlap, except where the explicit full-current-SHA path below disambiguates an unresolved request on a different head.
 
 For a terminal completion, require one of these correlation paths:
 
-1. **Explicit binding:** trusted provider evidence ties the candidate to the exact request comment ID/URL or to a run/check identity already tied to that request, **or** the candidate names the full exact current `headRefOid`. A completion comment such as `Reviewed commit: <headRefOid>` is sufficient even when it contains no request link.
+1. **Explicit binding:** trusted provider evidence ties the candidate to the exact request comment ID/URL or to a provider run/check identity already tied to that request, **or** the candidate names the full exact current `headRefOid`. The full-SHA path disambiguates an older request on a different head, but it never cures multiple requests on the accepted head, incomplete authenticated history, a base-only retarget, or any other failed isolation requirement.
 2. **Unambiguous fallback:** when the candidate has no explicit request, run, or head marker, the current request is the sole still-unresolved `@codex review` request across **all** recorded heads, and no other `@codex review` request intervened between it and the candidate response.
 
-Do not infer resolution from a head change, infer request identity from similar wording, or pair a response to the nearest request by timestamp alone. If an older request remains unresolved and the candidate lacks explicit binding, or if any intervening request makes the fallback ambiguous, classify the third lane as `triple-inconclusive`.
+Do not infer resolution from a head change, infer request identity from similar wording, or pair a response to the nearest request by timestamp alone. If an older request remains unresolved and the candidate lacks one of the bindings above, or if any intervening request makes the fallback ambiguous, classify the third lane as `triple-inconclusive`.
 
-An authenticated no-start rejection has a stricter request-binding requirement because a full SHA proves only which head the response concerns, not which same-head request it rejects. Accept no-start correlation only when trusted provider evidence ties the rejection to the exact request comment ID/URL or to a provider request/dispatch identity already tied to that request, or when the same sole-unresolved/no-intervening fallback applies. A delayed SHA-only rejection while another same-head request remains unresolved is `triple-inconclusive`, even when the head stayed current. An acknowledgement or actual run, check, or review activity proves service start and therefore cannot supply no-start fallback evidence.
+An authenticated no-start rejection has a stricter request-binding requirement because a full SHA proves only which head the response concerns, not which same-head request it rejects. Accept no-start correlation only when trusted provider evidence ties the rejection to the exact request comment ID/URL or to a provider request/dispatch identity already tied to that request, or when the same sole-unresolved/no-intervening fallback applies. A SHA-only delayed no-start rejection while another same-head request remains unresolved is `triple-inconclusive`, even when the head stayed current. An acknowledgement or actual run, check, or review activity from the exact provider identity, or an exact-App current-head post-request check/run, proves service start and therefore cannot supply no-start fallback evidence.
 
 | Candidate evidence | Decision |
 | --- | --- |
-| Expected-author review with `commit_id == headRefOid`, after the current request | Accept as the preferred strong current-head binding. |
-| Expected-author completion comment on a stable current head that names the full current SHA, for example `Reviewed commit: <headRefOid>` | Accept the completion; an exact SHA is sufficient without a request URL. |
-| Expected-author issue comment on a stable current head tied to the exact request ID/URL or its already-linked run identity | Accept. |
-| Marker-free expected-author issue comment; this request is the sole unresolved request across all heads and no request intervened | Accept only through the unambiguous fallback. |
-| Expected-author no-start rejection tied to the exact request/dispatch identity, or covered by the sole-unresolved/no-intervening fallback | Correlate it; only an explicit missing-integration/service-unavailable rejection may then prove effective double. |
-| SHA-only delayed no-start rejection while another request on the same head remains unresolved | `triple-inconclusive`; the SHA binds the head but not the rejected request. |
+| Exact-bot review with `commit_id == headRefOid`, terminal submitted state, complete associated payload, and isolated post-request history | Accept as the preferred strong current-head binding. |
+| Exact-bot terminal completion comment on a stable whole-PR range that names the full exact current `headRefOid` | Accept only when complete history proves one request on that head and the SHA disambiguates any unresolved different-head request. |
+| Exact-bot terminal issue comment tied to the exact request ID/URL or its already-linked provider run identity | Accept after every lifecycle, range, payload, and isolation requirement passes. |
+| Marker-free exact-bot terminal issue comment; this request is the sole unresolved request across all heads and no request intervened | Accept only through the unambiguous fallback. |
+| Exact-bot no-start rejection tied to the exact request/dispatch identity, or covered by the sole-unresolved/no-intervening fallback | Correlate it; only an explicit missing-integration/service-unavailable rejection before service start may then prove effective double. |
+| SHA-only delayed no-start rejection while another same-head request remains unresolved | `triple-inconclusive`; the SHA binds the head but not the rejected request. |
 | Marker-free comment after a new-head request while an older-head request remains unresolved, or after an intervening request | `triple-inconclusive`; the head change and nearest timestamp do not disambiguate it. |
-| Unknown author, response before the request, or head changed before acceptance | Reject as untrustworthy or stale; report `triple-inconclusive` unless separate authenticated evidence proves no-start unavailability. |
+| Unknown/lookalike author, nonterminal or incomplete body, response before the request, or head/range/lifecycle changed before acceptance | Reject as untrustworthy, incomplete, or stale; report `triple-inconclusive` unless separate exact-provider evidence proves properly request-bound no-start unavailability. |
 
-Only after an authenticated no-start rejection satisfies its stricter request/dispatch binding or the sole-unresolved fallback may an explicit missing-integration or service-unavailable statement justify effective double. A full SHA by itself, an uncorrelated rejection, or a generic rejection remains `triple-inconclusive`.
+Only after an exact-bot no-start rejection satisfies its stricter request/dispatch binding or the sole-unresolved fallback may an explicit missing-integration or service-unavailable statement justify effective double. A full SHA by itself, an uncorrelated rejection, a generic rejection, or any exact-App check/run after the request remains `triple-inconclusive` for completion; the check/run proves service start only.
 
-Posting `@codex review` is request transport, not completion or proof that the service started. An authenticated response from the expected GitHub/Codex identity, correlated under the rule above and bound to the unchanged current head, may prove no-start unavailability when it explicitly rejects the request because the integration is missing/unsupported or the service is unavailable. An acknowledgement, run/check identity, or review activity proves service start. No response, unknown author, absent review/comment, request-comment failure, rate limit, permission error, timeout, or generic HTTP/network failure proves neither unavailable nor clean; report `triple-inconclusive`.
+Before posting, inspect authenticated complete issue-comment history and the bounded audit record. For one unchanged `headRefOid`, exactly one exact `@codex review` request may be accepted. Never post a second exact request while that head is unchanged: if the recorded request already exists, keep waiting for or validating it. Re-read complete authenticated request history immediately before accepting any result. If multiple exact requests were posted on the same head—including a second request that raced with preflight—or history/audit evidence cannot exclude an older request whose run/result could overlap, timestamps alone cannot select a winner and the lane is `triple-inconclusive`. A new push starts a new head epoch, but a result without request/run association still cannot be attributed to the new request while an older request might overlap.
 
-Classify precisely:
+Before applying the generic same-head/different-base `scope-mismatch` branch, compare an accepted same-head request's audited request-time merge base with current `pr_merge_base` and apply [base-only-retarget-state-machine.json](base-only-retarget-state-machine.json). If it changed while `headRefOid` remained unchanged, the old request/result no longer covers the whole PR and the same-head request limit prevents a replacement. Missing origin, stale-range, and unauthorized parent-rewrite transitions stop before local lanes. An exact current range newly supplied by the caller recovers local lanes for caller-origin state; normal exact-current rederivation recovers them for PR-derived state. Either recovery proceeds to local lanes but keeps readiness `blocked-input` (`base-changed-same-head`) plus `requested: triple`, `effective: triple-inconclusive`, and neither permits another same-head request. Eligibility returns only after a separately authorized ordinary change produces a new head, and no empty or anchor commit may manufacture that epoch.
 
-- No PR, unsupported host/identity, or authenticated no-start missing-integration/service-unavailable evidence: third lane unavailable; effective double.
+Server timestamps prove ordering, not request/run lineage. Accept a review artifact only when request isolation is proved, its `commit_id` equals `headRefOid`, its non-null `submitted_at` is strictly later than the one current request's `created_at`, and its exact API state unambiguously denotes a submitted terminal review (`COMMENTED`, `APPROVED`, or `CHANGES_REQUESTED`; never `PENDING`, `DISMISSED`, missing, or unknown). Fetch that review's `body` and the fully paginated associated inline-comment list through its exact `<review_id>`. Require every inline record's `pull_request_review_id` to equal that review ID and every payload author to have the exact accepted bot identity. The combined body/comments payload must unambiguously report the complete findings outcome; a clean claim additionally requires an explicit provider-authored no-findings statement and zero associated actionable findings. If Codex answers through an issue comment, require request isolation, require its non-null `created_at` to be strictly later than that exact request, require both comments to post after the head became current, require the exact accepted provider identity below, require `headRefOid` and the whole-PR range to stay unchanged through acceptance, and require the body to unambiguously state a terminal completed findings/no-findings outcome rather than acknowledgement or progress. Review and issue-comment APIs expose no request/run identifier; when any older request might overlap, their later timestamps do not establish attribution and the result is `triple-inconclusive`. Re-read `headRefOid` and the whole-PR range before accepting any result. Evidence from an earlier request on the same unchanged head is stale. Any push invalidates earlier GitHub Codex evidence and permits at most one fresh request on the new head.
+
+Posting `@codex review` is request transport, not completion or proof that the service started. Accept a provider-authored terminal findings payload only when REST reports exact `user.login == "chatgpt-codex-connector[bot]"` and exact `user.type == "Bot"`. A review payload is the selected review body plus every fully paginated associated inline review comment; an issue-comment payload is its terminal body. Missing or ambiguous payload, terminal nature, pagination completeness, or review/comment association is `triple-inconclusive`. When app/check evidence is used for service-start detection, accept only exact `app.slug == "chatgpt-codex-connector"`, exact current `head_sha`, and non-null `started_at` strictly later than the request; a matching check name is not identity evidence. A check/run is service-start evidence only and never completes triple or proves a clean/no-findings result, even when `status == "completed"`, `conclusion == "success"`, and `completed_at` is post-request. A same-App check may be unrelated to the requested review, and check success can coexist with provider review findings. These comparisons are case-sensitive; missing, unknown, or lookalike authors/apps do not prove service start, a terminal result, or an authenticated no-start rejection.
+
+An authenticated response from that exact accepted provider identity, bound to the unchanged current head, may prove no-start unavailability when it explicitly rejects the request because the integration is missing/unsupported or the service is unavailable. An acknowledgement or review activity from the exact accepted provider identity, or an exact-App current-head post-request check/run, proves service start only. No response, unknown author/app, absent review/comment, request-comment failure, rate limit, permission error, timeout, generic HTTP/network failure, or check-only evidence proves clean completion; report `triple-inconclusive` when no complete terminal exact-bot findings payload follows.
+
+Classify precisely, applying selected-PR range alignment before the availability branch:
+
+- A post-request base-only retarget with unchanged `pr_head_oid` is readiness `blocked-input` (`base-changed-same-head`) and `effective: triple-inconclusive`; invalidate the old whole-PR evidence but never post a replacement same-head request.
+- Any other selected PR whose explicit range has `head_sha == pr_head_oid` but `base_sha != pr_merge_base` is readiness `blocked-input` (`scope-mismatch`). Do not rewrite the explicit range or count its local findings as whole-PR review evidence.
+- Any existing PR with current `headRefOid != head_sha` and no separate PR-mutation authorization is a readiness `blocked-authorization` result. For a still-eligible PR, report `requested: triple`, `effective: triple-inconclusive`, and GitHub lane status `blocked-authorization`.
+- For the same mismatch on an already unsupported PR, keep `requested: triple`, `effective: double`, and report readiness `blocked-authorization`; do not treat the mismatch as making the already-unavailable lane triple-inconclusive or as permitting readiness to continue.
+- Only after an existing PR is head-aligned and its frozen range is exactly `pr_merge_base..pr_head_oid`, classify unsupported host/identity or authenticated no-start missing-integration/service-unavailable evidence as third-lane unavailable and effective double. No PR is also effective double without a selected-PR range comparison.
 - Service ran and returned findings: available lane with findings; fix and rerequest after the new head.
 - Missing or ambiguous evidence that proves neither unavailable nor started: `requested: triple`, `effective: triple-inconclusive`.
-- A started service with ambiguous authorship, stale head, malformed result, or transiently incomplete evidence: `requested: triple`, `effective: triple-inconclusive`; do not reinterpret it as effective double or clean evidence.
+- A started service with ambiguous authorship, stale head/range, malformed or nonterminal payload, incomplete pagination or association, or check-only evidence: `requested: triple`, `effective: triple-inconclusive`; do not reinterpret it as effective double, completed triple, or clean evidence.
 
 ## Prefer Typed `gh`
 
 Start with stable typed `gh` forms:
 
 - `gh pr view --json ...`
-- `gh pr view <number> --json number,url,state,isDraft,baseRefName,headRefName,headRefOid,mergeStateStatus,mergeable,reviewDecision,statusCheckRollup`
+- `gh pr view <number> --json number,url,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,mergeStateStatus,mergeable,reviewDecision,statusCheckRollup`
 - `gh pr checks <number>`
 - `gh pr status`
 - `gh api repos/<owner>/<repo>/branches/<base>/protection`
