@@ -23,6 +23,9 @@ SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from review_runtime import claude_linux, claude_refresh_lock  # noqa: E402
+from independent_codex_pr_review.tests.synthetic_fixtures import (  # noqa: E402
+    SYNTHETIC_REFRESH_TOKEN,
+)
 
 
 _AMBIENT_TOOL_ENV_POISON = {
@@ -2265,7 +2268,7 @@ class CredentialStagingTest(unittest.TestCase):
     SYNTH_ACCESS_EXPIRED = "codex_synth_v1_access_expired"
     SYNTH_ACCESS_A = "codex_synth_v1_access_a"
     SYNTH_ACCESS_B = "codex_synth_v1_access_b"
-    SYNTH_REFRESH_A = "codex_synth_v1_refresh_a"
+    SYNTH_REFRESH_A = SYNTHETIC_REFRESH_TOKEN
     SYNTH_REFRESH_B = "codex_synth_v1_refresh_b"
 
     def test_private_credential_update_forces_mode_under_restrictive_umask(

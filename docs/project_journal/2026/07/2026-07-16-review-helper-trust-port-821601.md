@@ -561,3 +561,13 @@ metadata behavior.
   project-journal validator, the official skill validator, and `git diff
   --check` pass. The exact-head trusted-Mac live gate still follows the final
   push, as required by repository policy.
+- Direct exact-secret admission on the first aligned PR head found one
+  positive-count synthetic refresh-token fixture: the same catalog value was
+  retained once by the provider tests and added once by the independent
+  supervisor tests. The fixture now has one canonical literal in the
+  self-contained independent test package, and both suites import that shared
+  value. This preserves the baseline global raw occurrence count without
+  splitting the value or weakening admission. Python 3.13 focused validation
+  passes 14 independent auth-carrier tests and 156 provider tests with 1
+  expected platform skip; exact-range admission is rerun against the resulting
+  signed commit before review resumes.

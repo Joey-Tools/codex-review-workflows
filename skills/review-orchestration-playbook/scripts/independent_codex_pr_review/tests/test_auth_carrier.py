@@ -17,9 +17,9 @@ from review_supervisor.auth_carrier import (
     ExternalAuthEvidence,
 )
 from review_supervisor.codex_executable import ExtendedMetadataEvidence
+from tests.synthetic_fixtures import SYNTHETIC_REFRESH_TOKEN
 
 
-SYNTHETIC_REFRESH_TOKEN = "codex_synth_v1_refresh_a"  # Catalog id: refresh-a.
 CLEAN_METADATA = ExtendedMetadataEvidence(
     acl_entry_count=0,
     xattrs=(),
