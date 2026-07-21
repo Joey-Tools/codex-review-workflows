@@ -218,6 +218,11 @@ def _blocked_keychain_handler_worker(connection: object, mode: str) -> None:
                 "CLAUDE_KEYCHAIN_RECOVERY_TIMEOUT_SECONDS",
                 0.15,
             ),
+            mock.patch.object(
+                providers,
+                "_require_claude_keychain_identity_directory",
+                side_effect=lambda path: path,
+            ),
         ):
             with providers._claude_keychain_credential_server(
                 credential,
@@ -488,6 +493,17 @@ class ProviderPolicyTest(unittest.TestCase):
         self.require_claude_keychain_identity_socket = (
             providers._require_claude_keychain_identity_socket
         )
+        self.require_claude_keychain_identity_directory = (
+            providers._require_claude_keychain_identity_directory
+        )
+        self.identity_directory_patcher = None
+        if sys.platform != "darwin":
+            self.identity_directory_patcher = mock.patch.object(
+                providers,
+                "_require_claude_keychain_identity_directory",
+                side_effect=lambda path: path,
+            )
+            self.identity_directory_patcher.start()
         self.identity_socket_patcher = mock.patch.object(
             providers,
             "_require_claude_keychain_identity_socket",
@@ -526,6 +542,8 @@ class ProviderPolicyTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.installed_broker_patcher.stop()
         self.identity_socket_patcher.stop()
+        if self.identity_directory_patcher is not None:
+            self.identity_directory_patcher.stop()
         self.verified_broker_patcher.stop()
         self.macos_tls_bundle_match_patcher.stop()
         self.macos_tls_patcher.stop()
@@ -580,12 +598,38 @@ class ProviderPolicyTest(unittest.TestCase):
             providers.CLAUDE_KEYCHAIN_BROKER_EXECUTABLE_ENV,
             str(self.claude_broker),
         )
-        with self.claude_keychain_runtime_impl(
-            review,
-            prepared,
-            refresh_lock_protocol,
-        ) as runtime_env:
-            yield runtime_env
+        if sys.platform == "darwin":
+            with self.claude_keychain_runtime_impl(
+                review,
+                prepared,
+                refresh_lock_protocol,
+            ) as runtime_env:
+                yield runtime_env
+            return
+
+        runtime_root = review.container_dir / "claude-runtime"
+
+        def allocate_identity_directory(_review: ReviewWorkspace) -> pathlib.Path:
+            path = pathlib.Path(
+                tempfile.mkdtemp(
+                    prefix=providers.CLAUDE_KEYCHAIN_BROKER_DIRECTORY_PREFIX,
+                    dir=runtime_root,
+                )
+            )
+            path.chmod(0o700)
+            return path
+
+        with mock.patch.object(
+            providers,
+            "_allocate_claude_keychain_identity_directory",
+            side_effect=allocate_identity_directory,
+        ):
+            with self.claude_keychain_runtime_impl(
+                review,
+                prepared,
+                refresh_lock_protocol,
+            ) as runtime_env:
+                yield runtime_env
 
     def fake_claude_keychain_endpoint(
         self,
@@ -1503,7 +1547,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 "changed while resolved",
             ),
         ):
-            providers._require_claude_keychain_identity_directory(identity)
+            self.require_claude_keychain_identity_directory(identity)
 
     def test_claude_identity_directory_close_failure_is_inconclusive(self) -> None:
         identity = self.review.container_dir / "identity-close"
@@ -1526,7 +1570,18 @@ class ProviderPolicyTest(unittest.TestCase):
                 "cannot close",
             ),
         ):
-            providers._require_claude_keychain_identity_directory(identity)
+            self.require_claude_keychain_identity_directory(identity)
+
+    def test_darwin_volume_inode_path_rejects_non_macos(self) -> None:
+        metadata = os.stat(self.review.container_dir, follow_symlinks=False)
+        with (
+            mock.patch.object(providers.sys, "platform", "linux"),
+            self.assertRaisesRegex(
+                providers.ClaudeExecutableInspectionInconclusive,
+                "require macOS",
+            ),
+        ):
+            providers._darwin_volume_inode_path(metadata)
 
     def test_claude_identity_socket_requires_same_canonical_socket(self) -> None:
         stable_directory = self.claude_broker.parent / "stable"

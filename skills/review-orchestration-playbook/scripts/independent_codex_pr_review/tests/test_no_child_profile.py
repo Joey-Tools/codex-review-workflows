@@ -844,6 +844,22 @@ class NoChildProfileDarwinIntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
+        runtime = profile._runtime_fingerprint()
+        pin = profile.PINNED_RUNTIME
+        observed_runtime = (
+            runtime.macos_product_version,
+            runtime.macos_build_version,
+            runtime.darwin_release,
+        )
+        pinned_runtime = (
+            pin.macos_product_version,
+            pin.macos_build_version,
+            pin.darwin_release,
+        )
+        if observed_runtime != pinned_runtime:
+            raise unittest.SkipTest(
+                "live no-child profile checks require the exact pinned macOS runtime"
+            )
         cls._parent_limit_before = resource.getrlimit(resource.RLIMIT_NPROC)
         test_root = pathlib.Path(__file__).resolve().parent
         cls._temporary = tempfile.TemporaryDirectory(

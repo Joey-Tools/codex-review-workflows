@@ -285,7 +285,6 @@ class _RefreshLaunchCapability(ManagedAuthRefreshLaunchCapability):
 def run_authenticated_review(
     *,
     codex_executable: pathlib.Path,
-    aggregate_schema_path: pathlib.Path,
     runtime_root: pathlib.Path,
     repo: pathlib.Path,
     helper_root: pathlib.Path,
@@ -295,19 +294,22 @@ def run_authenticated_review(
     requested_model: str,
     requested_reasoning_effort: str,
     lifecycle: ProcessLifecycle,
+    aggregate_schema_path: pathlib.Path | None = None,
     auth_path: pathlib.Path | None = None,
     liveness_checkpoint: Callable[[], None] = lambda: None,
 ) -> AuthenticatedReviewResult:
     _require_python_313()
-    paths = _validated_inputs(
-        codex_executable=codex_executable,
-        aggregate_schema_path=aggregate_schema_path,
-        runtime_root=runtime_root,
-        repo=repo,
-        helper_root=helper_root,
-        retention_root=retention_root,
-        checkout_root=checkout_root,
-    )
+    input_paths = {
+        "codex_executable": codex_executable,
+        "runtime_root": runtime_root,
+        "repo": repo,
+        "helper_root": helper_root,
+        "retention_root": retention_root,
+        "checkout_root": checkout_root,
+    }
+    if aggregate_schema_path is not None:
+        input_paths["aggregate_schema_path"] = aggregate_schema_path
+    paths = _validated_inputs(**input_paths)
     if not isinstance(prompt, bytes):
         raise TypeError("review prompt must be bytes")
     if not prompt:
@@ -333,7 +335,7 @@ def run_authenticated_review(
         except AuthCarrierRefreshRequired:
             refresh = _run_auth_refresh(
                 codex_executable=paths["codex_executable"],
-                aggregate_schema_path=paths["aggregate_schema_path"],
+                aggregate_schema_path=paths.get("aggregate_schema_path"),
                 exclusions=_exclusion_roots(paths),
                 auth_path=selected_auth_path,
                 lease=lease,
@@ -353,7 +355,7 @@ def run_authenticated_review(
 
         process, state, auth_checks = _run_review(
             codex_executable=paths["codex_executable"],
-            aggregate_schema_path=paths["aggregate_schema_path"],
+            aggregate_schema_path=paths.get("aggregate_schema_path"),
             exclusions=_exclusion_roots(paths),
             auth_path=selected_auth_path,
             auth=auth,
@@ -398,7 +400,7 @@ def run_authenticated_review(
 def _run_auth_refresh(
     *,
     codex_executable: pathlib.Path,
-    aggregate_schema_path: pathlib.Path,
+    aggregate_schema_path: pathlib.Path | None,
     exclusions: ExecutableExclusionRoots,
     auth_path: pathlib.Path,
     lease: _RuntimeLease,
@@ -419,6 +421,11 @@ def _run_auth_refresh(
     launch: _PreparedCustodiedLaunch | None = None
     capability: _RefreshLaunchCapability | None = None
     completed = False
+    schema_work_root = (
+        lease.make_directory("auth-refresh-schema-work")
+        if aggregate_schema_path is None
+        else None
+    )
     try:
         liveness_checkpoint()
         custody = authenticate_codex_executable(
@@ -426,6 +433,7 @@ def _run_auth_refresh(
             snapshot_parent=snapshot_parent,
             exclusion_roots=exclusions,
             aggregate_schema_path=aggregate_schema_path,
+            schema_work_root=schema_work_root,
             snapshot_protection_verifier=verifier,
             quiescence_verifier=_verify_quiescence,
         )
@@ -498,7 +506,7 @@ def _run_auth_refresh(
 def _run_review(
     *,
     codex_executable: pathlib.Path,
-    aggregate_schema_path: pathlib.Path,
+    aggregate_schema_path: pathlib.Path | None,
     exclusions: ExecutableExclusionRoots,
     auth_path: pathlib.Path,
     auth: ExternalAuthEvidence,
@@ -524,6 +532,11 @@ def _run_review(
     result: AppServerProcessResult | None = None
     process_boundary_entered = False
     auth_checks = {"launch": False, "serialization": False}
+    schema_work_root = (
+        lease.make_directory("review-schema-work")
+        if aggregate_schema_path is None
+        else None
+    )
     try:
         liveness_checkpoint()
         custody = authenticate_codex_executable(
@@ -531,6 +544,7 @@ def _run_review(
             snapshot_parent=snapshot_parent,
             exclusion_roots=exclusions,
             aggregate_schema_path=aggregate_schema_path,
+            schema_work_root=schema_work_root,
             snapshot_protection_verifier=verifier,
             quiescence_verifier=_verify_quiescence,
         )

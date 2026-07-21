@@ -221,6 +221,7 @@ class ReviewExecutionTests(unittest.TestCase):
             try:
                 custody = _Custody(fd, snapshot)
                 lifecycle = _Lifecycle()
+                lease = _Lease(root / "run")
                 checkpoints = 0
 
                 def require_outer() -> None:
@@ -234,20 +235,29 @@ class ReviewExecutionTests(unittest.TestCase):
                         execution,
                         "authenticate_codex_executable",
                         return_value=custody,
-                    ),
+                    ) as authenticate,
                     patch.object(execution, "_prepare_custodied_launch") as prepare,
                     self.assertRaisesRegex(RuntimeError, "synthetic outer EOF"),
                 ):
                     execution._run_auth_refresh(
                         codex_executable=snapshot,
-                        aggregate_schema_path=root / "schema.json",
+                        aggregate_schema_path=None,
                         exclusions=Mock(),
                         auth_path=root / "home" / ".codex" / "auth.json",
-                        lease=_Lease(root / "run"),
+                        lease=lease,
                         lifecycle=lifecycle,
                         liveness_checkpoint=require_outer,
                     )
 
+                schema_work_root = authenticate.call_args.kwargs["schema_work_root"]
+                self.assertEqual(
+                    schema_work_root,
+                    lease.root / "auth-refresh-schema-work",
+                )
+                self.assertEqual(schema_work_root.stat().st_mode & 0o777, 0o700)
+                self.assertIsNone(
+                    authenticate.call_args.kwargs["aggregate_schema_path"]
+                )
                 prepare.assert_not_called()
                 self.assertEqual(lifecycle.events, [])
                 self.assertEqual(custody.events, ["quiescent", "cleanup"])
@@ -529,6 +539,7 @@ class ReviewExecutionTests(unittest.TestCase):
                     fail_parent_revalidation=True,
                 )
                 lifecycle = _Lifecycle()
+                lease = _Lease(root / "run")
                 process = _launched()
                 launch = execution._PreparedCustodiedLaunch(
                     custody=custody,
@@ -558,7 +569,7 @@ class ReviewExecutionTests(unittest.TestCase):
                         execution,
                         "authenticate_codex_executable",
                         return_value=custody,
-                    ),
+                    ) as authenticate,
                     patch.object(
                         execution,
                         "_prepare_custodied_launch",
@@ -576,11 +587,11 @@ class ReviewExecutionTests(unittest.TestCase):
                 ):
                     execution._run_review(
                         codex_executable=snapshot,
-                        aggregate_schema_path=root / "schema.json",
+                        aggregate_schema_path=None,
                         exclusions=Mock(),
                         auth_path=root / "auth.json",
                         auth=Mock(),
-                        lease=_Lease(root / "run"),
+                        lease=lease,
                         prompt=b"review",
                         requested_model="gpt-5.6-sol",
                         requested_reasoning_effort="xhigh",
@@ -588,6 +599,12 @@ class ReviewExecutionTests(unittest.TestCase):
                         liveness_checkpoint=lambda: None,
                     )
 
+                schema_work_root = authenticate.call_args.kwargs["schema_work_root"]
+                self.assertEqual(schema_work_root, lease.root / "review-schema-work")
+                self.assertEqual(schema_work_root.stat().st_mode & 0o777, 0o700)
+                self.assertIsNone(
+                    authenticate.call_args.kwargs["aggregate_schema_path"]
+                )
                 self.assertEqual(
                     lifecycle.events,
                     [

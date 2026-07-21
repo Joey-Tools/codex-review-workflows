@@ -10,6 +10,7 @@ import pathlib
 import resource
 import select
 import signal
+import sys
 import textwrap
 import time
 import unittest
@@ -33,7 +34,9 @@ from review_supervisor.auth_refresh import (
 from tests.support import owned_temporary_directory
 
 
-PYTHON_313 = "/opt/homebrew/bin/python3.13"
+if sys.version_info[:2] != (3, 13):
+    raise RuntimeError("managed-auth integration fixtures require Python 3.13")
+PYTHON_313 = str(pathlib.Path(sys.executable).resolve(strict=True))
 _ORIGINAL_EXECVE = os.execve
 _TEST_PROFILE_SHA256 = hashlib.sha256(b"test no-child profile").hexdigest()
 
@@ -1291,7 +1294,7 @@ class ManagedAuthRefreshTests(unittest.TestCase):
                     snapshot=snapshot,
                     neutral_cwd=neutral,
                     environment=environment,
-                    limits=self._limits(),
+                    limits=self._limits(total_seconds=5.0),
                 )
             self.assertEqual(raised.exception.code, "codex-home-mismatch")
             self._assert_process_gone(pid_path)

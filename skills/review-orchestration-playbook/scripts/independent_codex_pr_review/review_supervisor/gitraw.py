@@ -833,6 +833,14 @@ def check_attributes(
     paths: tuple[bytes, ...],
 ) -> None:
     input_bytes = b"\0".join(paths) + b"\0"
+    accepted_value_bytes = len(b"unspecified")
+    fixed_record_bytes = (
+        len(b"filter") + len(b"working-tree-encoding") + accepted_value_bytes * 2 + 6
+    )
+    stdout_limit = max(
+        8192,
+        sum(len(path) * 2 + fixed_record_bytes for path in paths),
+    )
     argv = (
         info.git_executable,
         "-c",
@@ -849,7 +857,7 @@ def check_attributes(
         cwd=registration.worktree,
         environment=_view_environment(info, registration, view),
         timeout=120,
-        stdout_limit=max(8192, len(input_bytes) * 4 + 4096),
+        stdout_limit=stdout_limit,
         stderr_limit=8192,
         input_bytes=input_bytes,
     )

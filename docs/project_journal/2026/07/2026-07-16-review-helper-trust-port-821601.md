@@ -344,11 +344,12 @@ metadata behavior.
   conditions before attempt, prompt, or worktree creation; complete Codex
   signature, version, schema, snapshot, and auth verification remains in `run`
   before any model request.
-- Final integrated-head validation used only Python 3.13 as requested. The
-  host-level canonical suite ran 1,427 tests with 5 skips, and the independent
-  supervisor suite ran 271 tests with 4 skips. Ruff lint and the independent
-  package format gate, Python 3.13 compileall, Bash syntax, ShellCheck,
-  actionlint, canonical CI fixture equality, project-journal validation, the
+- Pre-remediation integrated-head validation used only Python 3.13 as
+  requested. The host-level canonical suite ran 1,427 tests with 5 skips, and
+  the independent supervisor suite ran 271 tests with 4 skips. Ruff lint,
+  the independent package format gate, Python 3.13 compileall, Bash syntax,
+  ShellCheck, actionlint, canonical CI fixture equality, project-journal
+  validation, the
   official skill validator, `git diff --check`, and broker developer byte
   reproduction all pass. The hosted-only broker `--check` remains a required
   `macos-26` CI gate because this host does not provide the pinned
@@ -358,3 +359,21 @@ metadata behavior.
   17F113 and SDK 26.5 build 25F70 match the developer installation. The build
   gate now selects separately reviewed developer and hosted-runner digest sets
   while requiring both contexts to reproduce the same tracked broker bytes.
+- A fresh-context Codex review found that the production reviewer referenced an
+  untracked aggregate-schema sidecar and that `check-attr` under-budgeted legal
+  output for many short paths. Production now generates each stage's schema
+  from the authenticated snapshot in a lease-owned `0700` work root. The
+  attribute budget now covers the exact two-record `unset`/`unspecified`
+  encoding and has a 200-short-path regression.
+- Hosted CI also exposed test-environment drift without weakening production
+  policy: managed-auth fixtures now execute the selected Python 3.13 runtime,
+  live no-child integration skips hosts that do not match its exact production
+  macOS pin, and cross-platform provider tests use scoped macOS identity
+  doubles while retaining direct fail-closed coverage for non-macOS hosts.
+- Post-review remediation validation used only Python 3.13. The host-level
+  canonical suite ran 1,428 tests with 5 skips, and the independent supervisor
+  suite ran 272 tests with 4 skips. The 39-test repository contract suite,
+  Ruff lint and format checks, compileall, Bash syntax, ShellCheck, actionlint,
+  canonical CI fixture equality, project-journal validation, the official
+  skill validator, broker developer byte reproduction, and `git diff --check`
+  all pass.

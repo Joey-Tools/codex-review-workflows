@@ -2585,11 +2585,6 @@ def run_reviewer(
     )
     result, execution_failed = _run_authenticated_review_boundary(
         codex_executable=pathlib.Path(state["codex_executable"]),
-        aggregate_schema_path=(
-            tool_root()
-            / ".generated-appserver-schema"
-            / "codex_app_server_protocol.v2.schemas.json"
-        ),
         runtime_root=attempt_dir / "review-runtime",
         repo=pathlib.Path(state["repo"]),
         helper_root=tool_root(),

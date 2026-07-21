@@ -189,9 +189,11 @@ attempt，然后重新执行完整 admission。中断的 `reclaiming` 状态可�
 
 ## Reviewer Invocation
 
-运行时不经过 shell 或 `eval`。Codex source 先经过 path/FD identity、codesign、version、
-schema 和 SHA-256 验证，再复制到 owner-only snapshot；只有 snapshot 可以执行。实际
-reviewer argv 固定为 app-server stdio，并附带完整的 no-execution strict-config overrides：
+运行时不经过 shell 或 `eval`。Codex source 先经过 path/FD identity、codesign、version
+和 SHA-256 验证，再复制到 owner-only snapshot；只有 snapshot 可以执行。每个
+auth-refresh 和 reviewer stage 都由该 snapshot 在 lease-owned `0700` work root 中生成并
+验证 aggregate schema，不依赖 checkout 或安装目录中的 sidecar。实际 reviewer argv
+固定为 app-server stdio，并附带完整的 no-execution strict-config overrides：
 
 ```bash
 /OWNER-ONLY/SNAPSHOT/codex app-server \

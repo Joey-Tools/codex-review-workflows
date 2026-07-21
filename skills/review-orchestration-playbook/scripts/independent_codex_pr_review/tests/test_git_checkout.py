@@ -24,6 +24,7 @@ from review_supervisor.gitraw import (
     RepositoryInfo,
     _parse_tree_record,
     add_detached_worktree,
+    check_attributes,
     enumerate_tree,
     enumerate_registration,
     initialize_index,
@@ -234,6 +235,44 @@ class RawGitProtocolTests(unittest.TestCase):
 
 @unittest.skipUnless(GIT.is_file(), "/usr/bin/git is required")
 class RawGitCheckoutTests(unittest.TestCase):
+    def test_check_attributes_accepts_many_short_unspecified_paths(self) -> None:
+        paths = tuple(f"p{index:03d}".encode("ascii") for index in range(200))
+        output = b"".join(
+            (
+                path
+                + b"\0filter\0unspecified\0"
+                + path
+                + b"\0working-tree-encoding\0unspecified\0"
+            )
+            for path in paths
+        )
+        info = SimpleNamespace(
+            git_executable=str(GIT),
+            common_git_dir=pathlib.Path("/repo/.git"),
+        )
+        registration = SimpleNamespace(
+            registration=pathlib.Path("/repo/.git/worktrees/review"),
+            worktree=pathlib.Path("/repo/review"),
+        )
+
+        def run_with_limit(
+            *_args: object,
+            **kwargs: object,
+        ) -> tuple[int, bytes, bytes]:
+            self.assertEqual(kwargs["stdout_limit"], len(output))
+            return 0, output, b""
+
+        with mock.patch(
+            "review_supervisor.gitraw.run_bounded",
+            side_effect=run_with_limit,
+        ):
+            check_attributes(
+                info,
+                registration,
+                pathlib.Path("/repo/sanitized-view"),
+                paths,
+            )
+
     def test_runtime_cleanup_keeps_parent_descriptors_and_settles_exactly(self) -> None:
         with owned_temporary_directory("git-cleanup-") as root:
             repo, base_sha, head_sha = _build_repository(root)

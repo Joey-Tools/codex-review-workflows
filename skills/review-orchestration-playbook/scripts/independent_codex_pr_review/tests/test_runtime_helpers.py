@@ -685,6 +685,7 @@ class RuntimeHelperTests(unittest.TestCase):
             ),
         )
         self.assertEqual(len(execution_calls), 1)
+        self.assertNotIn("aggregate_schema_path", execution_calls[0])
         model_prompt = execution_calls[0]["prompt"]
         self.assertIsInstance(model_prompt, bytes)
         self.assertGreater(len(model_prompt), len(diff))
