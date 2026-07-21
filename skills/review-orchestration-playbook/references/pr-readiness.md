@@ -13,7 +13,7 @@ Use this reference after the local delivery gate has produced a reviewable commi
 ## Effective Review Shape
 
 - Use the canonical definitions in the parent skill. A PR/full-workflow request with no named shape defaults to single.
-- PR readiness adds CI, conversation, base/head, and merge-policy gates to the effective review shape. It never adds a hidden local Codex review.
+- PR readiness adds CI, conversation, base/head, exact-secret admission, and merge-policy gates to the effective review shape. It never adds a hidden local Codex review; the low-level stateful helper run that supplies admission evidence is explicit, is never counted as a named local lane, and cannot replace one.
 - When triple is requested but GitHub Codex is unavailable, continue with effective double and report the downgrade reason.
 - A missing or failed local lane remains blocked/inconclusive; GitHub fallback cannot turn it into a clean double.
 
@@ -22,16 +22,18 @@ Use this reference after the local delivery gate has produced a reviewable commi
 1. Establish or reuse the PR only when the parent request separately authorizes PR mutation. For a bare triple-review request, reuse an already-existing supported PR only; otherwise take the no-PR effective-double path. Read repository metadata, review threads, required checks, rulesets, base branch, and current head with the bounded probes in [github-pr-probes.md](github-pr-probes.md).
 2. Record the PR head and freeze the local range as `<merge_base>..<head_sha>`.
 3. Run the requested local lanes under [review-lane-contracts.md](review-lane-contracts.md). Each lane gets its own clean Git worktree, clear reviewer context, and read-only access. Never generate or inject a full diff for the reviewer.
-4. If triple was requested, classify GitHub Codex availability:
+4. Obtain one low-level stateful helper state for the exact current-head range under the separately authorized reviewer and egress policy. A secret violation or inconclusive count does not suppress this trusted reviewer: it receives the original tracked supplied diff, prompt, and permitted context without redaction or delay. Harvest `stateful final --state-dir <state_dir>` first, then run `stateful admission --state-dir <state_dir>` on that same state. `stateful final` remains independent and may succeed when admission blocks or is inconclusive. This supplied-diff/no-Git helper result is not a named lane.
+5. Count each exact raw value globally across tracked raw path bytes, regular blobs, and symlink targets, and require `head_count <= base_count`; for this count, do not derive Base64 or other encodings. Admission exit `0` requires a valid schema-v5 runner-sealed preflight receipt plus `secret_delta.status=clean` and is the only result that permits PR/master/merge-ready; exit `1` is a violation, exit `3` is pending, and exit `75` is inconclusive. Schema-v4 helper state remains usable for `status`, `wait`, `final`, and cleanup but lacks the receipt and therefore fails admission closed. For positive-delta candidates, violation evidence lists only added head locations: raw path plus one-based line for text additions, `line: null` for new-path or binary fallbacks, and line `1` for symlink targets. Unchanged occurrences are omitted; incomplete mapping is inconclusive.
+6. If triple was requested, classify GitHub Codex availability:
    - Supported: a GitHub Cloud PR where the Codex review integration is available for the active identity.
    - Unavailable: no PR, missing integration, unsupported host/service, host `sqbu-github.cisco.com`, or any operating identity in `{hoteng, hoteng_cisco}`, when the condition is directly known or proved by authenticated provider evidence.
    - Inconclusive: missing response, timeout, generic request/HTTP failure, or any state that proves neither unavailability nor a trustworthy result.
    - On unavailable, persist `requested: triple`, `effective: double`, and a concrete reason, then continue the double-review readiness gate.
-5. For a supported third lane, post the exact `@codex review` comment after `head_sha` becomes current. Record the comment URL/time. The comment write is not completion or proof of service start. An authenticated provider rejection may prove no-start integration/service unavailability; acknowledgement or run/review activity proves start. Accept only a terminal result bound to the same head.
-6. Read required CI/check state and unresolved PR conversations. Distinguish required checks from informational jobs and stale runs from current-head runs.
-7. Apply actionable findings in the implementation workspace, rerun affected tests, publish the new head, and invalidate every earlier review artifact whose range/head changed.
-8. Repeat the affected local lanes, the supported GitHub Codex request, CI checks, and conversation scan until the effective shape and all delivery gates are clean or a crisp blocker remains.
-9. Recheck base/head, mergeability, approval/ruleset requirements, and the repository's merge model immediately before reporting merge-ready or merging.
+7. For a supported third lane, post the exact `@codex review` comment after `head_sha` becomes current. Record the comment URL/time. The comment write is not completion or proof of service start. An authenticated provider rejection may prove no-start integration/service unavailability; acknowledgement or run/review activity proves start. Accept only a terminal result bound to the same head.
+8. Read required CI/check state and unresolved PR conversations. Distinguish required checks from informational jobs and stale runs from current-head runs.
+9. Apply actionable findings in the implementation workspace, rerun affected tests, publish the new head, and invalidate every earlier named-lane artifact, low-level helper final, and admission result whose range/head changed.
+10. Repeat the affected local lanes, low-level current-head helper final/admission pair, supported GitHub Codex request, CI checks, and conversation scan until the effective shape and all delivery gates are clean or a crisp blocker remains.
+11. Recheck base/head, mergeability, same-state current-head admission exit `0`, approval/ruleset requirements, and the repository's merge model immediately before reporting merge-ready or merging.
 
 ## GitHub Codex Evidence
 
@@ -60,9 +62,10 @@ Report:
 - repository/PR URL, base, head branch, and current head SHA;
 - requested and effective review shape;
 - each local lane's workspace/range, runtime/model, terminal status, and findings;
+- the low-level helper state/range, reviewer-final status, schema-v5 preflight-receipt binding, and secret-admission exit/status;
 - GitHub Codex current-head evidence or the explicit triple-to-double reason;
 - required CI/check state and unresolved-conversation count;
 - mergeability/ruleset state and merge authorization;
 - tests actually run, workspaces cleaned/retained, and any blocker.
 
-Do not call the PR merge-ready when a required lane in the effective shape, required check, unresolved actionable conversation, or branch/ruleset gate remains non-clean.
+Do not call the PR merge-ready when a required lane in the effective shape, the same-state current-head exact-secret admission, a required check, an unresolved actionable conversation, or a branch/ruleset gate remains non-clean.

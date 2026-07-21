@@ -531,9 +531,7 @@ class WslWindowsFilesystemProvenanceTest(unittest.TestCase):
                 "\n".join(
                     (
                         self._root_mount(),
-                        self._mount(
-                            "/run/review", file_system="tmpfs", source="tmpfs"
-                        ),
+                        self._mount("/run/review", file_system="tmpfs", source="tmpfs"),
                     )
                 ),
             ),
@@ -603,9 +601,7 @@ class WslWindowsFilesystemProvenanceTest(unittest.TestCase):
         ):
             with (
                 self.subTest(source=source),
-                self.assertRaises(
-                    claude_linux.LinuxRuntimeInspectionInconclusive
-                ),
+                self.assertRaises(claude_linux.LinuxRuntimeInspectionInconclusive),
             ):
                 claude_linux.reject_wsl_windows_path(
                     pathlib.Path("/review-state/runtime"),
@@ -649,8 +645,7 @@ class WslWindowsFilesystemProvenanceTest(unittest.TestCase):
 
     def test_nsfs_namespace_root_coexists_with_native_and_wsl_mounts(self) -> None:
         nsfs = (
-            "71 24 0:65 net:[4026531840] /run/netns/review rw,relatime - "
-            "nsfs nsfs rw"
+            "71 24 0:65 net:[4026531840] /run/netns/review rw,relatime - nsfs nsfs rw"
         )
         child_nsfs = (
             "72 24 0:66 time_for_children:[4026531834] "
@@ -677,8 +672,7 @@ class WslWindowsFilesystemProvenanceTest(unittest.TestCase):
 
     def test_non_nsfs_opaque_root_fails_closed(self) -> None:
         opaque_ext4 = (
-            "71 24 0:65 net:[4026531840] /unrelated rw,relatime - "
-            "ext4 /dev/sdb rw"
+            "71 24 0:65 net:[4026531840] /unrelated rw,relatime - ext4 /dev/sdb rw"
         )
 
         with self.assertRaisesRegex(
@@ -701,10 +695,7 @@ class WslWindowsFilesystemProvenanceTest(unittest.TestCase):
         )
 
         for root in malformed_roots:
-            mount = (
-                f"71 24 0:65 {root} /run/netns/review rw,relatime - "
-                "nsfs nsfs rw"
-            )
+            mount = f"71 24 0:65 {root} /run/netns/review rw,relatime - nsfs nsfs rw"
             with (
                 self.subTest(root=root),
                 self.assertRaisesRegex(
@@ -746,9 +737,7 @@ class WslWindowsFilesystemProvenanceTest(unittest.TestCase):
                 self.wsl2,
                 mountinfo_text="\n".join((self._root_mount(), windows, unknown)),
             )
-        with self.assertRaises(
-            claude_linux.LinuxRuntimeInspectionInconclusive
-        ):
+        with self.assertRaises(claude_linux.LinuxRuntimeInspectionInconclusive):
             claude_linux.reject_wsl_windows_path(
                 pathlib.Path("/review-state/runtime"),
                 self.wsl2,
@@ -1163,8 +1152,7 @@ class ElfInspectionTest(unittest.TestCase):
                         claude_linux.os,
                         "pread",
                         return_value=(
-                            b"not-elf"
-                            + b"\x00" * (claude_linux.ELF_HEADER_SIZE - 7)
+                            b"not-elf" + b"\x00" * (claude_linux.ELF_HEADER_SIZE - 7)
                         ),
                     ),
                     claude_linux.LinuxRuntimeError,
@@ -1485,8 +1473,7 @@ class RuntimeLibraryTrustTest(unittest.TestCase):
                 (2, 27),
             ),
             (
-                "ld.so (Ubuntu GLIBC 2.39-0ubuntu8.7) "
-                "stable release version 2.39.\n",
+                "ld.so (Ubuntu GLIBC 2.39-0ubuntu8.7) stable release version 2.39.\n",
                 (2, 39),
             ),
         ):
@@ -1722,8 +1709,7 @@ class RuntimeLibraryTrustTest(unittest.TestCase):
 
             self.assertTrue(
                 any(
-                    dependency.destination
-                    == pathlib.PurePosixPath("/lib/libc.so.6")
+                    dependency.destination == pathlib.PurePosixPath("/lib/libc.so.6")
                     for dependency in closure.dependencies
                 )
             )
@@ -1756,9 +1742,7 @@ class RuntimeLibraryTrustTest(unittest.TestCase):
             library.chmod(0o644)
             writable.chmod(0o777)
 
-            with self.assertRaisesRegex(
-                claude_linux.LinuxRuntimeUnsafe, "writable"
-            ):
+            with self.assertRaisesRegex(claude_linux.LinuxRuntimeUnsafe, "writable"):
                 claude_linux._capture_trusted_path_identity(
                     library,
                     trusted_owner_uids=self.trusted_owners,
@@ -1826,9 +1810,7 @@ class RuntimeLibraryTrustTest(unittest.TestCase):
             ldd = root / "ldd"
             ldd.write_text("test-only\n", encoding="utf-8")
             ldd.chmod(0o500)
-            with self.assertRaises(
-                claude_linux.LinuxRuntimeInspectionInconclusive
-            ):
+            with self.assertRaises(claude_linux.LinuxRuntimeInspectionInconclusive):
                 claude_linux.collect_runtime_libraries(
                     self.host,
                     (executable,),
@@ -1989,9 +1971,7 @@ class RuntimeLibraryTrustTest(unittest.TestCase):
         self,
     ) -> None:
         with (
-            tempfile.TemporaryDirectory(
-                dir=pathlib.Path(__file__).parent
-            ) as raw_tools,
+            tempfile.TemporaryDirectory(dir=pathlib.Path(__file__).parent) as raw_tools,
             tempfile.TemporaryDirectory(dir="/tmp") as raw_private,
         ):
             tools = pathlib.Path(raw_tools)
@@ -2014,9 +1994,7 @@ class RuntimeLibraryTrustTest(unittest.TestCase):
                     executable_owner_uids=self.trusted_owners,
                 )
 
-            self.assertTrue(
-                closure.executable_identity.allow_root_sticky_temp_ancestor
-            )
+            self.assertTrue(closure.executable_identity.allow_root_sticky_temp_ancestor)
             self.assertTrue(
                 closure.executable_identity.ignore_parent_directory_content_changes
             )
@@ -2290,6 +2268,32 @@ class CredentialStagingTest(unittest.TestCase):
     SYNTH_REFRESH_A = "codex_synth_v1_refresh_a"
     SYNTH_REFRESH_B = "codex_synth_v1_refresh_b"
 
+    def test_private_credential_update_forces_mode_under_restrictive_umask(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            parent_descriptor = os.open(
+                root,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            payload = bytearray(b'{"credential":"synthetic"}\n')
+            previous_umask = os.umask(0o777)
+            try:
+                candidate = claude_linux._create_private_credential_update(
+                    parent_descriptor,
+                    "credential.json",
+                    payload,
+                    owner_uid=os.geteuid(),
+                )
+            finally:
+                os.umask(previous_umask)
+                os.close(parent_descriptor)
+
+            artifact = root / candidate
+            self.assertEqual(artifact.read_bytes(), payload)
+            self.assertEqual(stat.S_IMODE(artifact.stat().st_mode), 0o600)
+
     def _credential(
         self,
         path: pathlib.Path,
@@ -2343,9 +2347,7 @@ class CredentialStagingTest(unittest.TestCase):
             stat.S_IMODE(staged.credential_path.stat().st_mode),
             0o600,
         )
-        retained = json.loads(
-            staged.credential_path.read_text(encoding="utf-8")
-        )
+        retained = json.loads(staged.credential_path.read_text(encoding="utf-8"))
         self.assertEqual(
             retained["claudeAiOauth"]["refreshToken"],
             expected_refresh_token,
@@ -2550,9 +2552,7 @@ class CredentialStagingTest(unittest.TestCase):
                     home.symlink_to(replacement_home, target_is_directory=True)
 
             self.assertEqual(
-                (
-                    retained_home / ".claude" / ".credentials.json"
-                ).read_bytes(),
+                (retained_home / ".claude" / ".credentials.json").read_bytes(),
                 original_payload,
             )
             self.assertEqual(
@@ -3045,9 +3045,7 @@ class CredentialStagingTest(unittest.TestCase):
                         refresh_token=self.SYNTH_REFRESH_B,
                     )
                     refreshed.replace(staged.credential_path)
-                    (staged.config_dir / ".oauth_refresh.lock").mkdir(
-                        mode=0o700
-                    )
+                    (staged.config_dir / ".oauth_refresh.lock").mkdir(mode=0o700)
 
             assert staged is not None
             self.assertIn(str(staged.carrier_root), str(raised.exception))
@@ -3231,7 +3229,9 @@ class CredentialStagingTest(unittest.TestCase):
             self.assertEqual(source.stat().st_ino, original_inode)
             self.assertEqual(list(helper.iterdir()), [])
 
-    def test_concurrent_source_change_makes_refresh_writeback_inconclusive(self) -> None:
+    def test_concurrent_source_change_makes_refresh_writeback_inconclusive(
+        self,
+    ) -> None:
         now = time.time()
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -3378,8 +3378,7 @@ class CredentialStagingTest(unittest.TestCase):
                 self.assertTrue(joined.is_set())
                 self.assertFalse(
                     any(
-                        thread.name
-                        == "codex-claude-staged-credential-watcher"
+                        thread.name == "codex-claude-staged-credential-watcher"
                         and thread.is_alive()
                         for thread in threading.enumerate()
                     )
@@ -3520,10 +3519,7 @@ class CredentialStagingTest(unittest.TestCase):
                     owner.join(timeout=3.0)
                     if watchers:
                         deadline = time.monotonic() + 3.0
-                        while (
-                            watchers[0].is_alive()
-                            and time.monotonic() < deadline
-                        ):
+                        while watchers[0].is_alive() and time.monotonic() < deadline:
                             time.sleep(0.01)
                         self.assertFalse(watchers[0].is_alive())
 
@@ -3657,10 +3653,7 @@ class CredentialStagingTest(unittest.TestCase):
                 ):
                     candidate, _identity = stable
                     value = json.loads(candidate)
-                    if (
-                        value["claudeAiOauth"]["refreshToken"]
-                        == self.SYNTH_REFRESH_B
-                    ):
+                    if value["claudeAiOauth"]["refreshToken"] == self.SYNTH_REFRESH_B:
                         candidate_read.set()
                         self.assertTrue(release_candidate.wait(timeout=5.0))
                 return stable
@@ -3746,10 +3739,7 @@ class CredentialStagingTest(unittest.TestCase):
                     release_candidate.set()
                     self.assertEqual(len(watchers), 1)
                     deadline = time.monotonic() + 3.0
-                    while (
-                        watchers[0].is_alive()
-                        and time.monotonic() < deadline
-                    ):
+                    while watchers[0].is_alive() and time.monotonic() < deadline:
                         time.sleep(0.01)
                     self.assertFalse(watchers[0].is_alive())
                     self.assertFalse(background_writeback_called.is_set())
@@ -3862,10 +3852,7 @@ class CredentialStagingTest(unittest.TestCase):
                     release_writeback.set()
                     self.assertEqual(len(watchers), 1)
                     deadline = time.monotonic() + 3.0
-                    while (
-                        watchers[0].is_alive()
-                        and time.monotonic() < deadline
-                    ):
+                    while watchers[0].is_alive() and time.monotonic() < deadline:
                         time.sleep(0.01)
                     self.assertFalse(watchers[0].is_alive())
                     host = json.loads(source.read_text(encoding="utf-8"))
@@ -4100,13 +4087,9 @@ class CredentialStagingTest(unittest.TestCase):
     def test_staged_read_combines_operation_error_with_visible_lock_paths(
         self,
     ) -> None:
-        lock_path = pathlib.Path(
-            "/fixture/claude-carrier/config/.oauth_refresh.lock"
-        )
-        cleanup_error = (
-            claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
-                "injected refresh-lock cleanup timeout"
-            )
+        lock_path = pathlib.Path("/fixture/claude-carrier/config/.oauth_refresh.lock")
+        cleanup_error = claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+            "injected refresh-lock cleanup timeout"
         )
         setattr(
             cleanup_error,
@@ -4136,9 +4119,7 @@ class CredentialStagingTest(unittest.TestCase):
                 "_read_valid_credential",
                 side_effect=operation_error,
             ),
-            self.assertRaises(
-                claude_linux.LinuxCredentialUnsafe
-            ) as raised,
+            self.assertRaises(claude_linux.LinuxCredentialUnsafe) as raised,
         ):
             claude_linux._read_staged_credential_under_lock(
                 staged,
@@ -4160,13 +4141,9 @@ class CredentialStagingTest(unittest.TestCase):
     def test_writeback_wrapper_preserves_combined_refresh_lock_paths(
         self,
     ) -> None:
-        lock_path = pathlib.Path(
-            "/fixture/claude-carrier/config/.oauth_refresh.lock"
-        )
-        cleanup_error = (
-            claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
-                "injected refresh-lock cleanup timeout"
-            )
+        lock_path = pathlib.Path("/fixture/claude-carrier/config/.oauth_refresh.lock")
+        cleanup_error = claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+            "injected refresh-lock cleanup timeout"
         )
         setattr(
             cleanup_error,
@@ -4174,9 +4151,7 @@ class CredentialStagingTest(unittest.TestCase):
             (str(lock_path),),
         )
         operation_error = OSError(5, "injected writeback failure")
-        combined = claude_linux._primary_cleanup_error(
-            [operation_error, cleanup_error]
-        )
+        combined = claude_linux._primary_cleanup_error([operation_error, cleanup_error])
         self.assertIs(combined, operation_error)
         staged = claude_linux.StagedCredential(
             lock_path.parents[1],
@@ -5135,7 +5110,10 @@ class CredentialStagingTest(unittest.TestCase):
     def test_removes_partial_credential_after_finalize_failure(self) -> None:
         now = time.time()
         for operation in ("fsync", "fchmod"):
-            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(operation=operation),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 root = pathlib.Path(temporary)
                 helper = root / "helper"
                 helper.mkdir(mode=0o700)
@@ -5588,11 +5566,7 @@ class CredentialStagingTest(unittest.TestCase):
             nested = root / "deeply-nested.json"
             depth = 10_000
             nested.write_bytes(
-                b'{"claudeAiOauth":'
-                + b"[" * depth
-                + b"0"
-                + b"]" * depth
-                + b"}"
+                b'{"claudeAiOauth":' + b"[" * depth + b"0" + b"]" * depth + b"}"
             )
             nested.chmod(0o600)
 
@@ -5792,9 +5766,12 @@ class SandboxCommandTest(unittest.TestCase):
             ("missing-carrier-root", direct_config),
             ("wrong-config-leaf", wrong_leaf),
         ):
-            with self.subTest(case=label), self.assertRaisesRegex(
-                claude_linux.LinuxRuntimeError,
-                "dedicated carrier root",
+            with (
+                self.subTest(case=label),
+                self.assertRaisesRegex(
+                    claude_linux.LinuxRuntimeError,
+                    "dedicated carrier root",
+                ),
             ):
                 claude_linux.build_sandbox_command(
                     dataclasses.replace(self.spec, config_dir=config_dir),
@@ -5832,9 +5809,12 @@ class SandboxCommandTest(unittest.TestCase):
                 dataclasses.replace(self.spec, helper_tmp=carrier_tmp),
             ),
         ):
-            with self.subTest(case=label), self.assertRaisesRegex(
-                claude_linux.LinuxRuntimeError,
-                "authentication carrier must not overlap",
+            with (
+                self.subTest(case=label),
+                self.assertRaisesRegex(
+                    claude_linux.LinuxRuntimeError,
+                    "authentication carrier must not overlap",
+                ),
             ):
                 claude_linux.build_sandbox_command(
                     spec,
@@ -6212,6 +6192,55 @@ class SandboxCommandTest(unittest.TestCase):
         )
         self.assertEqual(command[probe_index + 5], str(hidden_home.resolve()))
 
+    def test_descriptor_workspace_mount_is_shared_by_probe_and_review(self) -> None:
+        descriptor = os.open(
+            self.workspace,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+
+        def runner(argv, **kwargs):
+            calls.append((tuple(argv), kwargs))
+            return _capture(stdout=claude_linux.PROBE_SUCCESS)
+
+        try:
+            spec = dataclasses.replace(
+                self.spec,
+                workspace_descriptor=descriptor,
+            )
+            review_command = claude_linux.build_sandbox_command(
+                spec,
+                _linux_review_arguments(),
+            )
+            hidden_home = self.root / "host-home-descriptor"
+            hidden_home.mkdir()
+            claude_linux.run_isolation_probe(
+                spec,
+                self.workspace / "README.md",
+                host_home=hidden_home,
+                runner=runner,
+            )
+        finally:
+            os.close(descriptor)
+
+        expected_mount = ("--ro-bind-fd", str(descriptor), "/workspace")
+        review_triples = tuple(
+            zip(
+                review_command.argv,
+                review_command.argv[1:],
+                review_command.argv[2:],
+            )
+        )
+        self.assertIn(expected_mount, review_triples)
+        self.assertNotIn(str(self.workspace.resolve()), review_command.argv)
+        self.assertEqual(review_command.pass_fds, (descriptor,))
+        probe_command, probe_kwargs = calls[0]
+        self.assertIn(
+            expected_mount,
+            tuple(zip(probe_command, probe_command[1:], probe_command[2:])),
+        )
+        self.assertEqual(probe_kwargs["pass_fds"], (descriptor,))
+
     def test_rejects_unexpected_auth_environment(self) -> None:
         with self.assertRaisesRegex(claude_linux.LinuxRuntimeError, "unsupported"):
             claude_linux.build_sandbox_command(
@@ -6345,7 +6374,10 @@ class LauncherSignalCancellationTest(unittest.TestCase):
         self.assertIn("prepare_child_signal_state(restore_mask)", source)
         self.assertIn("raise(SIGSTOP)", source)
         self.assertIn("release_child_process_group(workload)", source)
-        self.assertLess(source.index("proxy_pid = proxy;"), source.index("signal restore after proxy launch"))
+        self.assertLess(
+            source.index("proxy_pid = proxy;"),
+            source.index("signal restore after proxy launch"),
+        )
         self.assertLess(
             source.index("workload_pid = workload;"),
             source.index("signal restore after workload launch"),
