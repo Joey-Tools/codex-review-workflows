@@ -593,3 +593,16 @@ metadata behavior.
   repository contract test. The final local gate also passes all 1,825 main
   tests with 6 expected platform skips, all 299 deterministic independent tests
   with zero skips, and all 57 repository contract tests.
+- The final pre-review integration merges `origin/master` at
+  `0af66e7cc247d05276d9059d689677ed2d279283`. Semantic conflict resolution
+  preserves both this branch's descriptor-bound reviewer launch and the newer
+  refresh-transaction ownership, signal-mask, broker-identity, and durable
+  recovery contracts. Validation used only Python 3.13: the exact post-format
+  main suite passed all 2,257 tests with 6 host-gated skips, the deterministic
+  independent supervisor suite passed all 299 tests with zero skips, and the
+  post-format Linux runtime suite passed all 251 tests with 1 host-gated skip.
+  Ruff lint and the PR-range format gate, compileall, strict launcher C syntax,
+  Bash syntax, ShellCheck, actionlint, canonical CI fixture equality, both
+  official skill validations, project-journal validation, synthetic-token
+  catalog validation, broker developer byte reproduction, and `git diff
+  --check` pass. No local Python 3.10 run was performed.

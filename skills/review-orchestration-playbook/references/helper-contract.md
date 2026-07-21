@@ -118,13 +118,15 @@ Current recovery-artifact publication is source-content-bound rather than path-d
 A bounded heartbeat join timeout leaves the lock lease release-started rather
 than release-complete. The owner performs one further bounded cleanup attempt
 while preserving the first timeout as the primary diagnostic. If both joins
-time out, report the exact helper-owned lock paths, classify cleanup as
-inconclusive, and pause for controlled operator cleanup only after confirming
-that no credential writer remains. Never silently mark those possibly orphaned
-directories as completed cleanup.
+time out, classify cleanup as inconclusive. Intentionally retained shared
+refresh-lock directories never authorize a lexical recovery or cleanup
+pathname; report only descriptor-bound residue. Pause for controlled operator
+cleanup only after confirming that no credential writer remains. Never
+silently mark possibly orphaned directories as completed cleanup.
 
 ## Snapshot And Safety
 
+- A catalogued local-login attempt owns one host refresh transaction before its first credential read. The same certified primary and legacy lock lease spans carrier selection, runtime credential exposure and network refresh, durable recovery staging, process-group or broker quiescence, the Linux/WSL2 watcher and final drain, and verified host commit. macOS persistence and snapshot checks and Linux/WSL2 writeback reuse the outer lease rather than nesting another host acquisition; staged-carrier locks remain independent. A second helper cannot copy or expose the host credential until the first transaction ends, and it must read the post-transaction host state after acquiring its own lease. A safe no-rotation attempt or a fully verified latest rotation releases normally. Unproven writer quiescence, an unpersisted rotation, retained carrier, or cleanup uncertainty abandons the lease: heartbeat and owned descriptors stop, the shared lock directories remain as a stale fence, and the lane pauses without automatic deletion, login guidance, or Copilot fallback. Every intentionally retained shared refresh lock reports descriptor-bound residue only; path-owned and borrowed-descriptor anchors alike provide no lexical recovery or cleanup pathname. API-key mode skips the local-login transaction.
 - The helper requires `--base-ref` and `--head-ref`, resolves both to commits before launch, and rejects the range unless base is an ancestor of head. A diverged range reports the merge base to use instead of silently reviewing a two-endpoint diff with unrelated target-branch changes.
 - It creates a `.git`-free frozen snapshot by streaming raw tree blobs from the head under source-repo `.codex-tmp/`; Git archive attributes, checkout filters, hooks, and repository config cannot rewrite that snapshot. Before writing each regular blob, it enforces a 64 MiB per-file limit plus a 512 MiB/100,000-entry total snapshot budget, and caps streamed tree metadata at 128 MiB. It also limits complete changed-path and raw-diff metadata to 128 MiB and 100,000 logical paths and streams a binary metadata-only `--submodule=short` artifact for the exact range through a 128 MiB output cap. Every head path must also fit the cleanup recursion capacity, including the extra materialized directory level for a gitlink, and an over-depth entry is rejected before that entry is materialized. Snapshot, tree, diff, and materialization budget exhaustion fails prelaunch and removes the partial container. Each secret discovery or count pass uses its existing 512 MiB blob-input budget as an admission-only limit; exhaustion makes secret admission `inconclusive` and must not remove an otherwise valid snapshot or delay, suppress, or redact reviewer input.
 - `.codex-tmp` must be a real in-repository directory owned by the current user, never a symlink or group/other writable. Each random review container is created relative to a verified no-follow directory descriptor with owner-only `0700` permissions.

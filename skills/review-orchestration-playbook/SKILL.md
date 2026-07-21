@@ -133,7 +133,11 @@ The `isolated_review` helper retains a frozen, `.git`-free, prepared-diff runtim
 - Do not count a supplied-diff helper run as the Claude Code lane of a named double/triple review.
 - Do not add helper preflight, fallback, or retry attempts to the review count.
 - For helper-only Claude diagnostics, use `explicit-claude-review`; use `explicit-claude-with-copilot-fallback` only after separate user consent explicitly authorizes both destinations. Named `double`/`triple` phrases and legacy `double-review`/`triple-review` values are not low-level helper consent markers.
+- For a catalogued low-level-helper local-login artifact, acquire the certified host refresh locks before the first credential read and retain one outer transaction lease through credential exposure, reviewer/broker quiescence, rotation persistence, and final verification. Release only after quiescence and persistence are proven; otherwise retain descriptor-bound stale-fence evidence and pause without automatic deletion or Copilot fallback. Explicit `ANTHROPIC_API_KEY` mode does not enter this carrier transaction.
+- Intentionally retained shared refresh-lock directories never authorize a lexical recovery or cleanup pathname; report only descriptor-bound residue.
+- The low-level helper accepts publisher-verified Claude Code versions `>=2.1.211,<3.0.0`, but local-login refresh writeback additionally requires an exact signed artifact in its credential-lock catalog. It does not run an OAuth freshness warmup: an expired access token may refresh inside the isolated carrier, while `Login expired`, HTTP 401, or refresh failure pauses and directs the user to reauthenticate. Authentication failure never authorizes Copilot.
 - Read [helper-contract.md](references/helper-contract.md) before modifying or debugging the helper.
+- Read [claude-runtime-trust.md](references/claude-runtime-trust.md) before changing the helper's version, provenance, platform, sandbox, capability-probe, carrier, or refresh-transaction behavior.
 
 ## Guardrails
 
