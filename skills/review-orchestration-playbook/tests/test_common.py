@@ -330,6 +330,19 @@ class ChildEnvironmentTest(unittest.TestCase):
 
         live_members.assert_called_once_with(12345)
 
+    def test_process_cleanup_reaps_child_after_group_members_exit(self) -> None:
+        process = mock.Mock(pid=12345)
+        process.poll.return_value = 0
+        with (
+            mock.patch.object(common, "_process_group_exists", return_value=False),
+            mock.patch.object(common, "signal_process_group") as forward,
+        ):
+            common.terminate_process_group(process)
+
+        process.poll.assert_called_once_with()
+        forward.assert_not_called()
+        process.wait.assert_not_called()
+
     @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork")
     def test_logged_command_rejects_descendant_holding_output_stream(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

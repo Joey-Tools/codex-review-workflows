@@ -509,6 +509,14 @@ def validate_worktree(
             ("ls-files", "--cached", "--full-name", "-v", "-z", "--"),
         )
     )
+    # Status may interpret a materialized gitfile and traverse outside the
+    # worktree, so reject every populated gitlink before invoking it.
+    gitlink_states = {
+        path: _validate_materialized_gitlink(root, path) for path in gitlinks
+    }
+    absent_gitlinks = frozenset(
+        path for path, state in gitlink_states.items() if state == "absent"
+    )
     status = _git_capture(
         root,
         (
@@ -521,12 +529,6 @@ def validate_worktree(
             "--no-renames",
             "--",
         ),
-    )
-    gitlink_states = {
-        path: _validate_materialized_gitlink(root, path) for path in gitlinks
-    }
-    absent_gitlinks = frozenset(
-        path for path, state in gitlink_states.items() if state == "absent"
     )
     if _status_has_disallowed_changes(status, absent_gitlinks):
         raise NamedLaneGuardError("worktree must be clean before reviewer launch")

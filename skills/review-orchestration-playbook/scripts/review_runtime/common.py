@@ -425,7 +425,9 @@ def terminate_process_group(
                 process.kill()
                 process.wait()
         return
-    if not _process_group_exists(process.pid):
+    # Linux may report a zombie-only process group as absent. Poll before
+    # returning so the direct child is reaped and cannot leak a Popen warning.
+    if not _process_group_exists(process.pid) and process.poll() is not None:
         return
     if not signal_already_sent:
         signal_process_group(process, initial_signal)

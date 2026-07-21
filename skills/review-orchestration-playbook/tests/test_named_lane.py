@@ -356,6 +356,27 @@ class NamedLaneGuardTest(unittest.TestCase):
         with self.assertRaisesRegex(NamedLaneGuardError, "initialized"):
             validate_worktree(self.repo.resolve(), head)
 
+    def test_materialized_gitlink_is_rejected_before_external_gitdir_access(
+        self,
+    ) -> None:
+        head = self.add_gitlink()
+        gitlink = self.repo / "vendor"
+        gitlink.mkdir()
+        external_gitdir = self.root / "external.git"
+        external_gitdir.mkdir()
+        git(external_gitdir, "init", "--bare")
+        (gitlink / ".git").write_text(
+            f"gitdir: {external_gitdir}\n",
+            encoding="utf-8",
+        )
+
+        external_gitdir.chmod(0)
+        try:
+            with self.assertRaisesRegex(NamedLaneGuardError, "uninitialized"):
+                validate_worktree(self.repo.resolve(), head)
+        finally:
+            external_gitdir.chmod(0o700)
+
     def test_initialized_unpopulated_submodule_is_rejected_end_to_end(self) -> None:
         head = self.add_deinitialized_gitlink()
         git(
