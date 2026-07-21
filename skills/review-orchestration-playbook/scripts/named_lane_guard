@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pathlib
 import sys
 
 
@@ -12,18 +11,287 @@ if sys.version_info < (3, 10):
 if not (
     sys.flags.isolated
     and sys.flags.ignore_environment
+    and sys.flags.no_site
     and sys.flags.no_user_site
     and sys.flags.dont_write_bytecode
 ):
     raise SystemExit(
         "named_lane_guard requires a prevalidated absolute Python interpreter "
-        "invoked with -I -B"
+        "invoked with -I -B -S"
     )
 
-sys.dont_write_bytecode = True
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import importlib.machinery
+import importlib.util
+import os
+import pathlib
+import stat
+import types
 
-from review_runtime.named_lane import main  # noqa: E402
+
+_SOURCE_LIMIT_BYTES = 1024 * 1024
+_RUNTIME_SOURCES = (
+    ("review_runtime", "__init__.py", True),
+    ("review_runtime.common", "common.py", False),
+    ("review_runtime.named_lane", "named_lane.py", False),
+)
+
+
+class _BoundSourceLoader:
+    def __init__(
+        self,
+        module_name: str,
+        origin: str,
+        code: types.CodeType,
+    ) -> None:
+        self.module_name = module_name
+        self.origin = origin
+        self.code = code
+
+    def create_module(
+        self,
+        _spec: importlib.machinery.ModuleSpec,
+    ) -> types.ModuleType | None:
+        return None
+
+    def exec_module(self, module: types.ModuleType) -> None:
+        if module.__name__ != self.module_name:
+            raise ImportError("bound source loader module mismatch")
+        exec(self.code, module.__dict__)
+
+    def get_filename(self, fullname: str) -> str:
+        if fullname != self.module_name:
+            raise ImportError("bound source loader module mismatch")
+        return self.origin
+
+
+def _fail(message: str, error: BaseException | None = None) -> SystemExit:
+    failure = SystemExit(f"named_lane_guard cannot load bound runtime: {message}")
+    if error is not None:
+        failure.__cause__ = error
+    return failure
+
+
+def _source_identity(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_size,
+    )
+
+
+def _directory_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+    )
+
+
+def _read_bound_source(path: pathlib.Path, directory_descriptor: int) -> bytes:
+    try:
+        lexical_metadata = os.stat(
+            path.name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    except (NotImplementedError, OSError) as error:
+        raise _fail(f"cannot inspect {path.name}", error)
+    if not stat.S_ISREG(lexical_metadata.st_mode) or stat.S_ISLNK(
+        lexical_metadata.st_mode
+    ):
+        raise _fail(f"{path.name} must be an ordinary non-symlink regular file")
+
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        raise _fail("this platform cannot open bound sources without following links")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | no_follow
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path.name, flags, dir_fd=directory_descriptor)
+        opened_metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(opened_metadata.st_mode):
+            raise _fail(f"{path.name} changed to a non-regular file")
+        if _source_identity(opened_metadata) != _source_identity(lexical_metadata):
+            raise _fail(f"{path.name} identity changed before reading")
+
+        payload = bytearray()
+        while len(payload) <= _SOURCE_LIMIT_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(64 * 1024, _SOURCE_LIMIT_BYTES + 1 - len(payload)),
+            )
+            if not chunk:
+                break
+            payload.extend(chunk)
+        if len(payload) > _SOURCE_LIMIT_BYTES:
+            raise _fail(f"{path.name} exceeds the bound source size limit")
+        final_metadata = os.fstat(descriptor)
+        if _source_identity(final_metadata) != _source_identity(opened_metadata):
+            raise _fail(f"{path.name} identity changed while reading")
+        if len(payload) != opened_metadata.st_size:
+            raise _fail(f"{path.name} content changed while reading")
+        return bytes(payload)
+    except SystemExit:
+        raise
+    except OSError as error:
+        raise _fail(f"cannot read {path.name}", error)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _new_bound_module(
+    module_name: str,
+    origin: pathlib.Path,
+    code: types.CodeType,
+    *,
+    is_package: bool,
+) -> types.ModuleType:
+    origin_text = str(origin)
+    loader = _BoundSourceLoader(module_name, origin_text, code)
+    spec = importlib.machinery.ModuleSpec(
+        module_name,
+        loader,
+        origin=origin_text,
+        is_package=is_package,
+    )
+    spec.has_location = True
+    if is_package:
+        # Keep the package closed: every allowed relative import is preloaded below.
+        spec.submodule_search_locations = []
+    module = importlib.util.module_from_spec(spec)
+    module.__cached__ = None
+    return module
+
+
+def _load_bound_runtime() -> object:
+    scripts_root = pathlib.Path(__file__).resolve().parent
+    runtime_root = scripts_root / "review_runtime"
+    try:
+        runtime_metadata = runtime_root.lstat()
+    except OSError as error:
+        raise _fail("cannot inspect review_runtime directory", error)
+    if not stat.S_ISDIR(runtime_metadata.st_mode) or stat.S_ISLNK(
+        runtime_metadata.st_mode
+    ):
+        raise _fail("review_runtime must be an ordinary non-symlink directory")
+
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    directory_only = getattr(os, "O_DIRECTORY", None)
+    if no_follow is None or directory_only is None:
+        raise _fail("this platform cannot bind the review_runtime directory safely")
+    directory_descriptor: int | None = None
+    try:
+        directory_descriptor = os.open(
+            runtime_root,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | no_follow | directory_only,
+        )
+        opened_runtime_metadata = os.fstat(directory_descriptor)
+        if not stat.S_ISDIR(opened_runtime_metadata.st_mode) or (
+            _directory_identity(opened_runtime_metadata)
+            != _directory_identity(runtime_metadata)
+        ):
+            raise _fail("review_runtime directory identity changed before reading")
+
+        sources: dict[str, tuple[pathlib.Path, bytes, bool]] = {}
+        for module_name, source_name, is_package in _RUNTIME_SOURCES:
+            source_path = runtime_root / source_name
+            sources[module_name] = (
+                source_path,
+                _read_bound_source(source_path, directory_descriptor),
+                is_package,
+            )
+        try:
+            final_runtime_metadata = runtime_root.lstat()
+        except OSError as error:
+            raise _fail("cannot revalidate review_runtime directory", error)
+        if not stat.S_ISDIR(final_runtime_metadata.st_mode) or stat.S_ISLNK(
+            final_runtime_metadata.st_mode
+        ):
+            raise _fail("review_runtime directory changed to an unsafe type")
+        if _directory_identity(final_runtime_metadata) != _directory_identity(
+            opened_runtime_metadata
+        ):
+            raise _fail("review_runtime directory identity changed while reading")
+    except SystemExit:
+        raise
+    except OSError as error:
+        raise _fail("cannot bind review_runtime directory", error)
+    finally:
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
+
+    code_objects: dict[str, types.CodeType] = {}
+    for module_name, (source_path, payload, _is_package) in sources.items():
+        try:
+            code_objects[module_name] = compile(
+                payload,
+                str(source_path),
+                "exec",
+                dont_inherit=True,
+            )
+        except Exception as error:
+            raise _fail(f"cannot compile {source_path.name}", error)
+
+    runtime_names = tuple(
+        module_name for module_name, _source_name, _is_package in _RUNTIME_SOURCES
+    )
+    preexisting = sorted(
+        name
+        for name in sys.modules
+        if name == "review_runtime" or name.startswith("review_runtime.")
+    )
+    if preexisting:
+        raise _fail("a review_runtime module was already loaded")
+
+    modules = {
+        module_name: _new_bound_module(
+            module_name,
+            source_path,
+            code_objects[module_name],
+            is_package=is_package,
+        )
+        for module_name, (source_path, _payload, is_package) in sources.items()
+    }
+    sys.modules.update(modules)
+    try:
+        for module_name, _source_name, _is_package in _RUNTIME_SOURCES:
+            loader = modules[module_name].__loader__
+            if not isinstance(loader, _BoundSourceLoader):
+                raise ImportError("bound source loader metadata changed")
+            loader.exec_module(modules[module_name])
+        loaded_runtime_names = {
+            name
+            for name in sys.modules
+            if name == "review_runtime" or name.startswith("review_runtime.")
+        }
+        if loaded_runtime_names != set(runtime_names) or any(
+            sys.modules.get(name) is not modules[name] for name in runtime_names
+        ):
+            raise ImportError("bound runtime module closure changed during loading")
+        entrypoint = getattr(modules["review_runtime.named_lane"], "main", None)
+        if not callable(entrypoint):
+            raise ImportError("bound named-lane entrypoint is missing or not callable")
+    except BaseException as error:
+        for module_name in reversed(runtime_names):
+            sys.modules.pop(module_name, None)
+        for module_name in tuple(sys.modules):
+            if module_name.startswith("review_runtime."):
+                sys.modules.pop(module_name, None)
+        raise _fail("runtime execution failed", error)
+    package = modules["review_runtime"]
+    package.common = modules["review_runtime.common"]
+    package.named_lane = modules["review_runtime.named_lane"]
+    return entrypoint
+
+
+sys.dont_write_bytecode = True
+main = _load_bound_runtime()
 
 
 if __name__ == "__main__":

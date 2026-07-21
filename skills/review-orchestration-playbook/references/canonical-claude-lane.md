@@ -2,7 +2,7 @@
 
 Use this contract for the actual Anthropic Claude Code lane in named double and triple review. Do not route this lane through `isolated_review`: that helper materializes a supplied diff in a `.git`-free workspace and is diagnostic-only.
 
-The trusted guard is non-executable Python source. Every shorter guard spelling below is an argv-tail placeholder and must actually be launched through the recorded, revalidated absolute Python interpreter as `<trusted-python-absolute-path> -I -B <trusted-bundle-absolute-path>/scripts/named_lane_guard ...` under the fixed clean parent environment in [review-lane-contracts.md](review-lane-contracts.md); never execute the guard path directly or resolve Python through ambient `PATH`.
+The trusted guard is non-executable Python source and loads only its manifest-bound runtime source bytes, without ordinary bundle-path import resolution. Every shorter guard spelling below is an argv-tail placeholder and must actually be launched through the recorded, revalidated absolute Python interpreter as `<trusted-python-absolute-path> -I -B -S <trusted-bundle-absolute-path>/scripts/named_lane_guard ...` under the fixed clean parent environment in [review-lane-contracts.md](review-lane-contracts.md); never execute the guard path directly, resolve Python through ambient `PATH`, load global or user site initialization, or accept bytecode/native-extension substitutes.
 
 ## Workspace And Process
 
@@ -14,7 +14,7 @@ The trusted guard is non-executable Python source. Every shorter guard spelling 
 The canonical launch uses the same parent-recorded absolute trusted guard's `run-claude` process-only supervisor, not any helper reviewer. Send the bounded control prompt on stdin, use distinct private stdout/stderr artifact paths outside the real worktree, and pass the exact revalidated absolute, non-symlink actual Claude executable after `--`. The supervisor must make that executable its direct child `argv[0]` without a shell:
 
 ```text
-<trusted-python-absolute-path> -I -B <trusted-bundle-absolute-path>/scripts/named_lane_guard run-claude
+<trusted-python-absolute-path> -I -B -S <trusted-bundle-absolute-path>/scripts/named_lane_guard run-claude
   --worktree <absolute-clean-worktree>
   --stdout-path <private-stdout-path-outside-worktree>
   --stderr-path <private-stderr-path-outside-worktree>

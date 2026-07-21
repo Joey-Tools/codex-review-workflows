@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import contextlib
 import io
+import importlib.machinery
+import importlib.util
 import json
 import os
 import pathlib
+import py_compile
 import shutil
 import signal
 import stat
@@ -13,6 +16,7 @@ import sys
 import tempfile
 import time
 import unittest
+import venv
 from unittest import mock
 
 
@@ -108,13 +112,77 @@ class NamedLaneGuardTest(unittest.TestCase):
         self,
         guard: pathlib.Path,
         *arguments: str,
+        python_executable: pathlib.Path | None = None,
     ) -> tuple[str, ...]:
+        if python_executable is None:
+            python_executable = pathlib.Path(sys.executable).resolve()
+        self.assertTrue(python_executable.is_absolute())
+        self.assertTrue(python_executable.is_file())
+        return (
+            str(python_executable),
+            "-I",
+            "-B",
+            "-S",
+            str(guard),
+            *arguments,
+        )
+
+    def guard_probe_command(
+        self,
+        guard: pathlib.Path,
+        body: str,
+    ) -> tuple[str, ...]:
+        probe = self.root / f"guard-probe-{time.monotonic_ns()}.py"
+        probe.write_text(
+            "import pathlib\n"
+            "import sys\n"
+            f"guard = pathlib.Path({str(guard)!r})\n"
+            "source = guard.read_bytes()\n"
+            "namespace = {\n"
+            "    '__name__': '_named_lane_guard_probe',\n"
+            "    '__file__': str(guard),\n"
+            "}\n"
+            "exec(compile(source, str(guard), 'exec'), namespace)\n"
+            f"{body}",
+            encoding="utf-8",
+        )
         return (
             str(pathlib.Path(sys.executable).resolve()),
             "-I",
             "-B",
-            str(guard),
-            *arguments,
+            "-S",
+            str(probe),
+        )
+
+    def guard_failure_probe_command(self, guard: pathlib.Path) -> tuple[str, ...]:
+        probe = self.root / f"guard-failure-probe-{time.monotonic_ns()}.py"
+        probe.write_text(
+            "import pathlib\n"
+            "import sys\n"
+            f"guard = pathlib.Path({str(guard)!r})\n"
+            "namespace = {\n"
+            "    '__name__': '_named_lane_guard_probe',\n"
+            "    '__file__': str(guard),\n"
+            "}\n"
+            "try:\n"
+            "    exec(compile(guard.read_bytes(), str(guard), 'exec'), namespace)\n"
+            "except SystemExit as error:\n"
+            "    failure = str(error)\n"
+            "else:\n"
+            "    raise RuntimeError('guard unexpectedly loaded a failing runtime')\n"
+            "remaining = sorted(name for name in sys.modules "
+            "if name == 'review_runtime' or name.startswith('review_runtime.'))\n"
+            "if remaining:\n"
+            "    raise RuntimeError(f'partial runtime modules remained: {remaining}')\n"
+            "print(failure)\n",
+            encoding="utf-8",
+        )
+        return (
+            str(pathlib.Path(sys.executable).resolve()),
+            "-I",
+            "-B",
+            "-S",
+            str(probe),
         )
 
     def test_entrypoint_does_not_write_import_bytecode(self) -> None:
@@ -169,6 +237,340 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertFalse(fake_python_marker.exists())
         self.assertFalse(sitecustomize_marker.exists())
 
+    def test_entrypoint_skips_global_sitecustomize_with_no_site(self) -> None:
+        _, guard = self.copy_guard_bundle()
+        environment_root = self.root / "sitecustomize-environment"
+        venv.EnvBuilder(with_pip=False).create(environment_root)
+        interpreter = environment_root / (
+            "Scripts/python.exe" if os.name == "nt" else "bin/python"
+        )
+        self.assertTrue(interpreter.is_file())
+
+        purelib_probe = subprocess.run(
+            (
+                str(interpreter),
+                "-I",
+                "-B",
+                "-c",
+                "import sysconfig; print(sysconfig.get_path('purelib'))",
+            ),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(purelib_probe.returncode, 0, purelib_probe.stderr)
+        site_packages = pathlib.Path(purelib_probe.stdout.strip())
+        self.assertTrue(site_packages.is_dir())
+        marker = self.root / "global-sitecustomize.marker"
+        (site_packages / "sitecustomize.py").write_text(
+            f"import pathlib\npathlib.Path({str(marker)!r}).write_text('loaded')\n",
+            encoding="utf-8",
+        )
+
+        unsafe_guard = subprocess.run(
+            (str(interpreter), "-I", "-B", str(guard), "--help"),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertNotEqual(unsafe_guard.returncode, 0)
+        self.assertIn("invoked with -I -B -S", unsafe_guard.stderr)
+        self.assertEqual(marker.read_text(encoding="utf-8"), "loaded")
+        marker.unlink()
+
+        guarded = subprocess.run(
+            self.isolated_guard_command(
+                guard,
+                "--help",
+                python_executable=interpreter,
+            ),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertEqual(guarded.returncode, 0, guarded.stderr)
+        self.assertIn("usage:", guarded.stdout)
+        self.assertFalse(marker.exists())
+
+    def test_entrypoint_loads_only_bound_runtime_sources(self) -> None:
+        scripts, guard = self.copy_guard_bundle()
+        runtime = scripts / "review_runtime"
+        argparse_marker = self.root / "argparse-shadow.marker"
+        json_marker = self.root / "json-shadow.marker"
+        pyc_marker = self.root / "common-pyc.marker"
+        for module_name, marker in (
+            ("argparse", argparse_marker),
+            ("json", json_marker),
+        ):
+            (scripts / f"{module_name}.py").write_text(
+                "import pathlib\n"
+                f"pathlib.Path({str(marker)!r}).write_text('loaded')\n"
+                f"raise RuntimeError('malicious {module_name} shadow executed')\n",
+                encoding="utf-8",
+            )
+
+        for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+            (runtime / f"common{suffix}").write_bytes(b"not an extension module")
+
+        malicious_common = self.root / "malicious-common.py"
+        malicious_common.write_text(
+            "import pathlib\n"
+            f"pathlib.Path({str(pyc_marker)!r}).write_text('loaded')\n"
+            "raise RuntimeError('malicious common pyc executed')\n",
+            encoding="utf-8",
+        )
+        common_cache = pathlib.Path(
+            importlib.util.cache_from_source(str(runtime / "common.py"))
+        )
+        common_cache.parent.mkdir()
+        py_compile.compile(
+            str(malicious_common),
+            cfile=str(common_cache),
+            doraise=True,
+            invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+        )
+
+        expected_origins = {
+            "review_runtime": str(runtime / "__init__.py"),
+            "review_runtime.common": str(runtime / "common.py"),
+            "review_runtime.named_lane": str(runtime / "named_lane.py"),
+        }
+        body = (
+            "import json\n"
+            f"expected = {expected_origins!r}\n"
+            f"forbidden_paths = {{{str(scripts)!r}, {str(runtime)!r}}}\n"
+            "if forbidden_paths.intersection(sys.path):\n"
+            "    raise RuntimeError('candidate control path leaked into sys.path')\n"
+            "observed = {}\n"
+            "for name, origin in expected.items():\n"
+            "    module = sys.modules[name]\n"
+            "    observed[name] = {\n"
+            "        'file': module.__file__,\n"
+            "        'origin': module.__spec__.origin,\n"
+            "        'cached': module.__cached__,\n"
+            "    }\n"
+            "    if module.__file__ != origin or module.__spec__.origin != origin:\n"
+            "        raise RuntimeError(f'unexpected bound origin for {name}')\n"
+            "if list(sys.modules['review_runtime'].__path__):\n"
+            "    raise RuntimeError('bound package search path must remain closed')\n"
+            "loaded = sorted(name for name in sys.modules "
+            "if name == 'review_runtime' or name.startswith('review_runtime.'))\n"
+            "if loaded != sorted(expected):\n"
+            "    raise RuntimeError(f'unexpected runtime closure: {loaded}')\n"
+            "print(json.dumps(observed, sort_keys=True))\n"
+        )
+        completed = subprocess.run(
+            self.guard_probe_command(guard, body),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        observed = json.loads(completed.stdout)
+        self.assertEqual(
+            {name: details["origin"] for name, details in observed.items()},
+            expected_origins,
+        )
+        self.assertTrue(all(details["cached"] is None for details in observed.values()))
+        self.assertFalse(argparse_marker.exists())
+        self.assertFalse(json_marker.exists())
+        self.assertFalse(pyc_marker.exists())
+
+    def test_entrypoint_rejects_unbound_runtime_file_types(self) -> None:
+        for replacement_type in ("symlink", "directory"):
+            with self.subTest(replacement_type=replacement_type):
+                scripts, guard = self.copy_guard_bundle()
+                common = scripts / "review_runtime/common.py"
+                common_payload = common.read_bytes()
+                common.unlink()
+                if replacement_type == "symlink":
+                    target = self.root / f"common-target-{time.monotonic_ns()}.py"
+                    target.write_bytes(common_payload)
+                    common.symlink_to(target)
+                else:
+                    common.mkdir()
+
+                completed = subprocess.run(
+                    self.isolated_guard_command(guard, "--help"),
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(
+                    "common.py must be an ordinary non-symlink regular file",
+                    completed.stderr,
+                )
+
+    def test_entrypoint_fails_closed_when_bound_source_cannot_be_read(self) -> None:
+        scripts, guard = self.copy_guard_bundle()
+        common = scripts / "review_runtime/common.py"
+        probe = self.root / "guard-read-failure-probe.py"
+        probe.write_text(
+            "import os\n"
+            "import pathlib\n"
+            "import sys\n"
+            f"guard = pathlib.Path({str(guard)!r})\n"
+            f"blocked = {common.name!r}\n"
+            "real_open = os.open\n"
+            "def guarded_open(path, flags, *args, **kwargs):\n"
+            "    if os.fspath(path) == blocked:\n"
+            "        raise PermissionError('synthetic source read denial')\n"
+            "    return real_open(path, flags, *args, **kwargs)\n"
+            "os.open = guarded_open\n"
+            "namespace = {\n"
+            "    '__name__': '_named_lane_guard_probe',\n"
+            "    '__file__': str(guard),\n"
+            "}\n"
+            "try:\n"
+            "    exec(compile(guard.read_bytes(), str(guard), 'exec'), namespace)\n"
+            "except SystemExit as error:\n"
+            "    failure = str(error)\n"
+            "else:\n"
+            "    raise RuntimeError('guard unexpectedly accepted an unreadable source')\n"
+            "finally:\n"
+            "    os.open = real_open\n"
+            "if 'cannot read common.py' not in failure:\n"
+            "    raise RuntimeError(f'unexpected guard failure: {failure}')\n"
+            "print(failure)\n",
+            encoding="utf-8",
+        )
+        completed = subprocess.run(
+            (
+                str(pathlib.Path(sys.executable).resolve()),
+                "-I",
+                "-B",
+                "-S",
+                str(probe),
+            ),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("cannot read common.py", completed.stdout)
+
+    def test_entrypoint_rolls_back_partial_bound_runtime_modules(self) -> None:
+        scripts, guard = self.copy_guard_bundle()
+        named_lane = scripts / "review_runtime/named_lane.py"
+        named_lane.write_text(
+            named_lane.read_text(encoding="utf-8")
+            + "\nraise RuntimeError('synthetic runtime execution failure')\n",
+            encoding="utf-8",
+        )
+        completed = subprocess.run(
+            self.guard_failure_probe_command(guard),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("runtime execution failed", completed.stdout)
+
+    def test_entrypoint_precompiles_all_sources_before_execution(self) -> None:
+        scripts, guard = self.copy_guard_bundle()
+        package_marker = self.root / "package-executed-before-compile.marker"
+        package = scripts / "review_runtime/__init__.py"
+        package.write_text(
+            package.read_text(encoding="utf-8")
+            + "\nimport pathlib\n"
+            + f"pathlib.Path({str(package_marker)!r}).write_text('executed')\n",
+            encoding="utf-8",
+        )
+        (scripts / "review_runtime/named_lane.py").write_text(
+            "def invalid syntax\n",
+            encoding="utf-8",
+        )
+
+        completed = subprocess.run(
+            self.guard_failure_probe_command(guard),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("cannot compile named_lane.py", completed.stdout)
+        self.assertFalse(package_marker.exists())
+
+    def test_entrypoint_rolls_back_when_entrypoint_is_missing(self) -> None:
+        scripts, guard = self.copy_guard_bundle()
+        (scripts / "review_runtime/named_lane.py").write_text(
+            "from __future__ import annotations\nfrom .common import ReviewError\n",
+            encoding="utf-8",
+        )
+
+        completed = subprocess.run(
+            self.guard_failure_probe_command(guard),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("runtime execution failed", completed.stdout)
+
+    def test_entrypoint_rejects_preexisting_runtime_module_collisions(self) -> None:
+        for collision in ("review_runtime", "review_runtime.attacker"):
+            with self.subTest(collision=collision):
+                _, guard = self.copy_guard_bundle()
+                probe = self.root / f"guard-collision-{time.monotonic_ns()}.py"
+                probe.write_text(
+                    "import pathlib\n"
+                    "import sys\n"
+                    "import types\n"
+                    f"guard = pathlib.Path({str(guard)!r})\n"
+                    f"collision = {collision!r}\n"
+                    "sentinel = types.ModuleType(collision)\n"
+                    "sys.modules[collision] = sentinel\n"
+                    "namespace = {\n"
+                    "    '__name__': '_named_lane_guard_probe',\n"
+                    "    '__file__': str(guard),\n"
+                    "}\n"
+                    "try:\n"
+                    "    exec(compile(guard.read_bytes(), str(guard), 'exec'), namespace)\n"
+                    "except SystemExit as error:\n"
+                    "    failure = str(error)\n"
+                    "else:\n"
+                    "    raise RuntimeError('guard accepted a preexisting module')\n"
+                    "if sys.modules.get(collision) is not sentinel:\n"
+                    "    raise RuntimeError('guard replaced the preexisting module')\n"
+                    "if 'already loaded' not in failure:\n"
+                    "    raise RuntimeError(f'unexpected guard failure: {failure}')\n"
+                    "print(failure)\n",
+                    encoding="utf-8",
+                )
+                completed = subprocess.run(
+                    (
+                        str(pathlib.Path(sys.executable).resolve()),
+                        "-I",
+                        "-B",
+                        "-S",
+                        str(probe),
+                    ),
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertIn("already loaded", completed.stdout)
+
     def test_entrypoint_is_source_only_and_fails_closed_without_isolation(
         self,
     ) -> None:
@@ -193,7 +595,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         )
 
         self.assertNotEqual(completed.returncode, 0)
-        self.assertIn("invoked with -I -B", completed.stderr)
+        self.assertIn("invoked with -I -B -S", completed.stderr)
 
     def add_gitlink(self, path: str = "vendor") -> str:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
@@ -1845,11 +2247,8 @@ class NamedLaneGuardTest(unittest.TestCase):
         stderr_path = self.root / "prompt-timeout.stderr"
         started = time.monotonic()
         process = subprocess.Popen(
-            (
-                str(pathlib.Path(sys.executable).resolve()),
-                "-I",
-                "-B",
-                str(SCRIPTS / "named_lane_guard"),
+            self.isolated_guard_command(
+                SCRIPTS / "named_lane_guard",
                 "run-claude",
                 "--worktree",
                 str(self.repo.resolve()),

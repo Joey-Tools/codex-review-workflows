@@ -1384,19 +1384,22 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("64 MiB", content)
 
     def test_named_lane_runtime_import_closure_matches_control_manifest(self) -> None:
+        guard = SCRIPTS / "named_lane_guard"
         probe = "\n".join(
             (
                 "import json",
+                "import pathlib",
                 "import sys",
-                "sys.dont_write_bytecode = True",
-                f"sys.path.insert(0, {str(SCRIPTS)!r})",
-                "import review_runtime.named_lane",
+                f"guard = pathlib.Path({str(guard)!r})",
+                "namespace = {'__name__': '_guard_contract_probe', "
+                "'__file__': str(guard)}",
+                "exec(compile(guard.read_bytes(), str(guard), 'exec'), namespace)",
                 "print(json.dumps(sorted(name for name in sys.modules "
                 "if name == 'review_runtime' or name.startswith('review_runtime.'))))",
             )
         )
         completed = subprocess.run(
-            (sys.executable, "-I", "-c", probe),
+            (sys.executable, "-I", "-B", "-S", "-c", probe),
             cwd=REPO_ROOT,
             check=False,
             stdout=subprocess.PIPE,
@@ -1847,10 +1850,23 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("named_lane_guard requires Python 3.10 or later", entrypoint)
         self.assertIn("sys.flags.isolated", entrypoint)
         self.assertIn("sys.flags.ignore_environment", entrypoint)
+        self.assertIn("sys.flags.no_site", entrypoint)
         self.assertIn("sys.flags.no_user_site", entrypoint)
         self.assertIn("sys.flags.dont_write_bytecode", entrypoint)
-        self.assertIn("invoked with -I -B", entrypoint)
-        self.assertIn("from review_runtime.named_lane import main", entrypoint)
+        self.assertIn("invoked with -I -B -S", entrypoint)
+        self.assertIn("_read_bound_source", entrypoint)
+        self.assertIn("_load_bound_runtime", entrypoint)
+        self.assertIn('("review_runtime", "__init__.py", True)', entrypoint)
+        self.assertIn('("review_runtime.common", "common.py", False)', entrypoint)
+        self.assertIn(
+            '("review_runtime.named_lane", "named_lane.py", False)', entrypoint
+        )
+        self.assertNotIn("sys.path.insert", entrypoint)
+        self.assertNotIn("from review_runtime", entrypoint)
+        self.assertLess(
+            entrypoint.index("sys.flags.no_site"),
+            entrypoint.index("main = _load_bound_runtime()"),
+        )
         self.assertIn("DEFAULT_TIMEOUT_SECONDS = 1_800.0", runtime)
         self.assertIn("DEFAULT_STREAM_LIMIT_BYTES = 64 * 1024 * 1024", runtime)
         self.assertIn("_read_control_prompt", runtime)
